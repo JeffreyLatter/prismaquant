@@ -166,7 +166,9 @@ def test_assignment_artifact_bytes_cb_uses_exact_tensor_and_shared_sidecar():
         source_manifest=None,
         cb_serialization_context=CBSerializationContext.production(),
     )
-    tensor_bytes = 2 * 64 * (4 * 16 + 9)
+    # Static fused-W4A4 contract adds one canonical F32
+    # input_global_scale scalar per FP4-CB target.
+    tensor_bytes = 2 * 64 * (4 * 16 + 9) + 2 * 4
     sidecar_bytes = 2 * 256 * 4 * 2
     assert result["floor_bytes"] == 1234
     assert result["cb_tensor_payload_bytes"] == tensor_bytes
@@ -177,6 +179,9 @@ def test_assignment_artifact_bytes_cb_uses_exact_tensor_and_shared_sidecar():
     assert result["artifact_byte_scope"] == "safetensors_tensor_data_spans"
     assert result["export_directory_bytes"] is None
     assert result["cb_serialized_payload"]["global_scale_bytes"] == 0
+    assert result["cb_serialized_payload"][
+        "input_global_scale_bytes"
+    ] == 8
 
 
 def test_assignment_artifact_bytes_missing_stats_stay_in_floor():
@@ -226,6 +231,51 @@ def test_nvfp4_global_sidecar_bytes_dense_and_packed():
     # gate_up_proj: two on-disk projections per expert -> 8·E·2
     assert fp.nvfp4_global_sidecar_bytes(
         "model.layers.0.mlp.experts.gate_up_proj", (256, 128, 32)) == 16 * 256
+    # Text-calibration-excluded stock targets are W4A16: one F32 weight
+    # global per emitted Linear, with no input_global_scale tensor.
+    assert fp.nvfp4_global_sidecar_bytes(
+        "model.visual.blocks.0.mlp.fc1",
+        (128, 64),
+        weight_only=True,
+    ) == 4
+    assert fp.nvfp4_global_sidecar_bytes(
+        "model.layers.0.mlp.experts.gate_up_proj",
+        (256, 128, 32),
+        weight_only=True,
+    ) == 8 * 256
+
+
+def test_assignment_artifact_bytes_honors_weight_only_nvfp4_marker():
+    name = "model.visual.blocks.0.mlp.fc1"
+    shape = (4, 16)
+    stats = {
+        name: {
+            "n_params": 64,
+            "in_features": 16,
+            "out_features": 4,
+            fp.NVFP4_WEIGHT_ONLY_STATS_KEY: True,
+        },
+    }
+    result = fp.assignment_artifact_bytes(
+        {name: "NVFP4"},
+        stats,
+        source_total_bytes=128,
+        source_manifest=None,
+        regime="bf16",
+    )
+    assert result["artifact_bytes"] == (
+        fr.get_format("NVFP4").memory_bytes_for_shape(shape) + 4
+    )
+
+    from prismaquant.kl_measurement import assignment_bit_total
+
+    assert assignment_bit_total(
+        stats,
+        {name: "NVFP4"},
+        {"NVFP4": fr.get_format("NVFP4")},
+    ) == 8.0 * (
+        fr.get_format("NVFP4").memory_bytes_for_shape(shape) + 4
+    )
 
 
 def test_assignment_artifact_bytes_packed_nvfp4_counts_per_expert_globals():

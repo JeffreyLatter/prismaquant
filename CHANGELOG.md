@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.5.1 — 2026-08-01
+
+This patch release makes fused NVFP4 W4A4 artifact eligibility explicit and
+auditable while keeping fused serving opt-in. It does not claim default
+enablement or a served-quality promotion.
+
+### Versioned fused-activation contract
+
+- Added one versioned NVFP4 W4A4 execution contract for production FP4-CB
+  exports, including calibrated per-target `input_global_scale` tensors,
+  fused-sibling scale unification, and a digest binding the serialized mapping.
+- Added fail-closed coverage and provenance checks plus a serve-faithful
+  activation-QDQ oracle. Legacy and unstamped research artifacts remain
+  readable by their baseline paths but are not eligible for static fused
+  dispatch; Gridbook's explicit rowwise fused research path remains available.
+
+### Streaming and exact accounting
+
+- Made resident and streaming exporters share the same activation-contract and
+  served-target namespace rules, including packed-expert calibration synthesis.
+- Accounted for FP4-CB activation-scale tensors and stock NVFP4 sidecars in
+  whole-artifact bytes and bit totals, including weight-only W4A16 targets.
+
+### One scale policy owner
+
+- Consolidated activation-scale formulas, fused-unit grouping, calibration,
+  and legacy compatibility behavior in one producer-owned module so native and
+  CB exporters cannot silently drift into different contracts.
+
 ## 0.5.0 — 2026-08-01
 
 This release establishes the production boundary between PrismaQuant and

@@ -90,6 +90,11 @@ if [[ "$EXPORT_CONTAINER" == "nvfp4_cb" ]]; then
   # final export must describe the same layout and shared sidecars.
   : "${CB_CODEBOOK_SOURCE:=lattice}"
   : "${CB_SCALE_CODING:=two_tier}"
+  # Static fused-W4A4 activation metadata is calibrated from the same probe
+  # cache as the weighted CB render.  MSE-grid is a deterministic producer
+  # policy, not a quality claim: Gridbook still keeps fused dispatch opt-in
+  # until the served KL/PPL gate closes for the concrete artifact.
+  : "${NVFP4_ACTIVATION_SCALE_POLICY:=mse_grid_calibrated.v1}"
   : "${CB_SCALE_SWEEP:=1}"
   : "${PRISMAQUANT_CB_ENCODE_TIER:=balanced}"
   if [[ "$CB_CODEBOOK_SOURCE" == "learned" ]]; then
@@ -2030,6 +2035,8 @@ if [[ "$EXPORT_CONTAINER" == "nvfp4_cb" ]]; then
     --layer-config "${WORK_DIR}/artifacts/layer_config.json"
     --out "$CB_OUT"
     --col-weights "$CB_COL_WEIGHTS"
+    --activation-cache-dir "${WORK_DIR}/act"
+    --activation-scale-policy "$NVFP4_ACTIVATION_SCALE_POLICY"
     --codebook-source "$CB_CODEBOOK_SOURCE"
     --codebook-iters "$CB_CODEBOOK_ITERS"
     --codebook-seed "$CB_CODEBOOK_SEED"

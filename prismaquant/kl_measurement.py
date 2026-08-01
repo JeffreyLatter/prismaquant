@@ -48,7 +48,10 @@ from prismaquant.nvfp4_cb_footprint import (
     is_cb_format,
     validate_cb_assignment_serialization_stamps,
 )
-from prismaquant.footprint import nvfp4_global_sidecar_bytes
+from prismaquant.footprint import (
+    NVFP4_WEIGHT_ONLY_STATS_KEY,
+    nvfp4_global_sidecar_bytes,
+)
 
 KLScope = Literal["last_token", "full_sequence"]
 
@@ -214,7 +217,11 @@ def assignment_bit_total(
             total += 8.0 * _memory_bytes_for_format(stats[name], spec)
             if spec.name == "NVFP4":
                 total += 8.0 * nvfp4_global_sidecar_bytes(
-                    str(name), _shape_from_stats(dict(stats[name]))
+                    str(name),
+                    _shape_from_stats(dict(stats[name])),
+                    weight_only=bool(
+                        stats[name].get(NVFP4_WEIGHT_ONLY_STATS_KEY, False)
+                    ),
                 )
     if cb_assignment:
         if cb_serialization_context is None:

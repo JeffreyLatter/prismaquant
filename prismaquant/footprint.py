@@ -34,10 +34,12 @@ safetensors header (``data_offsets``), with no weight load and no torch.
 128×128 block scale), so the body term is exact per shape rather than via a
 nominal scalar bpp. Packed-MoE experts (3D shape) are handled by feeding the
 ``(num_experts, out, in)`` shape through the same primitive. NVFP4 additionally
-ships two fp32 global sidecars per emitted 2-D Linear (``weight_global_scale``
-+ ``input_global_scale``, 8 bytes) that ``memory_bytes_for_shape`` does not
-count; :func:`nvfp4_global_sidecar_bytes` adds them (per expert × on-disk
-projection for packed 3-D tensors).
+ships an fp32 ``weight_global_scale`` and, for calibrated W4A4 targets, an fp32
+``input_global_scale`` that ``memory_bytes_for_shape`` does not count.
+Visual/audio/MTP targets excluded from text calibration are explicitly marked
+weight-only W4A16 and ship only the weight scalar.
+:func:`nvfp4_global_sidecar_bytes` adds the exact one- or two-scalar payload
+(per expert × on-disk projection for packed 3-D tensors).
 
 There is exactly ONE way to run that identity: :func:`assignment_artifact_bytes`
 (and :func:`floor_bytes_for_model` for the model-path convenience form, which
@@ -503,10 +505,16 @@ def check_floor_non_negative(
         "ship a selection computed from this floor.")
 
 
-# fp32 weight_global_scale + fp32 input_global_scale per emitted NVFP4
-# 2-D Linear (verified against shipped-artifact safetensors headers:
-# both are F32 scalars, 4 bytes each).
-_NVFP4_GLOBAL_SIDECAR_BYTES_PER_LINEAR = 8
+# Stats identity used by allocator/validation accounting when the exporter
+# deliberately emits stock NVFP4 as weight-only W4A16. This is an explicit
+# producer contract, not a qname heuristic: callers set it from the resolved
+# model profile's checkpoint-to-live mapping.
+NVFP4_WEIGHT_ONLY_STATS_KEY = "_nvfp4_weight_only"
+
+# Both sidecars are F32 scalars. A regular W4A4 Linear ships one of each;
+# weight-only visual/audio/MTP targets ship only weight_global_scale.
+_NVFP4_WEIGHT_GLOBAL_SCALE_BYTES_PER_LINEAR = 4
+_NVFP4_INPUT_GLOBAL_SCALE_BYTES_PER_LINEAR = 4
 
 # On-disk projection count for packed 3-D expert tensors, keyed by the
 # assignment key's leaf name. Mirrors the exporter's
@@ -520,21 +528,31 @@ _NVFP4_GLOBAL_SIDECAR_BYTES_PER_LINEAR = 8
 _PACKED_LEAF_PROJECTIONS = {"gate_up_proj": 2}
 
 
-def nvfp4_global_sidecar_bytes(qname: str, shape: tuple[int, ...]) -> int:
+def nvfp4_global_sidecar_bytes(
+    qname: str,
+    shape: tuple[int, ...],
+    *,
+    weight_only: bool = False,
+) -> int:
     """Bytes of the fp32 NVFP4 global sidecars the export emits.
 
-    Every emitted NVFP4 2-D Linear ships ``weight_global_scale`` +
-    ``input_global_scale`` (fp32 scalars, 8 bytes). A packed 3-D expert
+    Regular W4A4 targets ship ``weight_global_scale`` +
+    ``input_global_scale`` (two fp32 scalars, 8 bytes). Explicit
+    ``weight_only=True`` targets ship only ``weight_global_scale`` (4 bytes),
+    matching the visual/audio/MTP W4A16 export group. A packed 3-D expert
     tensor ``(E, out, in)`` is split into E × P per-expert 2-D Linears on
-    disk (P = on-disk projection count, 2 for ``gate_up_proj``), each with
-    its own pair — 8·E·P bytes. ``memory_bytes_for_shape`` counts weight +
-    group-scale bytes only, so this is additive.
+    disk (P = on-disk projection count, 2 for ``gate_up_proj``).
+    ``memory_bytes_for_shape`` counts weight + group-scale bytes only, so this
+    is additive.
     """
+    per_linear = _NVFP4_WEIGHT_GLOBAL_SCALE_BYTES_PER_LINEAR
+    if not weight_only:
+        per_linear += _NVFP4_INPUT_GLOBAL_SCALE_BYTES_PER_LINEAR
     if len(shape) == 3:
         leaf = qname.rsplit(".", 1)[-1]
         n_proj = _PACKED_LEAF_PROJECTIONS.get(leaf, 1)
-        return _NVFP4_GLOBAL_SIDECAR_BYTES_PER_LINEAR * int(shape[0]) * n_proj
-    return _NVFP4_GLOBAL_SIDECAR_BYTES_PER_LINEAR
+        return per_linear * int(shape[0]) * n_proj
+    return per_linear
 
 
 def assignment_artifact_bytes(
@@ -638,7 +656,11 @@ def assignment_artifact_bytes(
         else:
             body_quant += fr.get_format(name).memory_bytes_for_shape(shape)
         if name == "NVFP4":
-            body_quant += nvfp4_global_sidecar_bytes(qname, shape)
+            body_quant += nvfp4_global_sidecar_bytes(
+                qname,
+                shape,
+                weight_only=bool(entry.get(NVFP4_WEIGHT_ONLY_STATS_KEY, False)),
+            )
         if source_manifest is None:
             reenc_by_name[qname] = reencoded_source_bytes_for_shape(
                 shape, regime)

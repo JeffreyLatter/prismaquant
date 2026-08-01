@@ -7,8 +7,8 @@ upload. A release is:
 ```bash
 # 1. bump the version in pyproject.toml and CHANGELOG.md, merge it to main
 # 2. tag and push the tag
-git tag -a v0.5.0 -m "prismaquant 0.5.0"
-git push origin v0.5.0
+git tag -a v0.5.1 -m "prismaquant 0.5.1"
+git push origin v0.5.1
 ```
 
 The workflow then builds, gates, publishes to PyPI via OIDC, and creates the
@@ -30,7 +30,7 @@ So: **if trusted publishing is intended, the first upload must come from the
 workflow. Never token-upload a rehearsal first.**
 
 As of 2026-08-01, the `prismaquant` project exists and releases 0.2.0 through
-0.4.1 were published successfully by this workflow through trusted OIDC. The
+0.5.0 were published successfully by this workflow through trusted OIDC. The
 active configuration is therefore **case 2** below. Case 1 is retained only for
 maintainers creating a new sibling project.
 

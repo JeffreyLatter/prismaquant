@@ -18,6 +18,9 @@ tensor verbatim (bf16 passthrough), and emit:
     explicit legacy-v1 E4M3-direct; fp8 index bits only);
   * ``<name>.weight_scale`` fp32 (out_features,) — fp8 families only (fp8 has no
     on-disk scale plane; the plane is per-output-channel);
+  * ``<name>.input_global_scale`` fp32 (1,) — production-contracted FP4-CB
+    targets only, calibrated under the sole top-level static W4A4 execution
+    contract; historical/research payloads omit both scalar and contract;
   * ``cb_codebook.<ref>.<fmt>[.sub{i}]`` fp16 — the resolved codebook, shipped
     **once** per (ref, format): ``ref = "lattice"`` for the fixed lattice,
     ``ref = "<role>"`` for a shared per-(role) learned codebook;
@@ -68,6 +71,14 @@ from prismaquant.nvfp4_cb_footprint import (
     validate_cb_sidecar_tensors,
     validate_cb_assignment_serialization_stamps,
     validate_cb_serialization_context_stamp,
+)
+from prismaquant.nvfp4_activation_contract import (
+    NVFP4_ACTIVATION_CONTRACT_SCHEMA,
+    NVFP4_ACTIVATION_EXECUTION,
+    build_execution_contract,
+    calibrated_input_global_scales,
+    input_global_scale_tensor,
+    resolve_input_global_scale_policy,
 )
 
 # This exporter's own declaration of what the mixed CB container can carry —
@@ -464,6 +475,8 @@ def export_nvfp4_cb(
     scale_sweep: bool = True,
     scale_coding: str = cb.SCALE_CODING_TWO_TIER,
     allow_unstamped_research: bool = False,
+    activation_cache_dir: str | Path | None = None,
+    activation_scale_policy: str | None = None,
 ) -> dict[str, int]:
     """Export a CB checkpoint. See module docstring / LAYOUT.md for the layout.
 
@@ -508,6 +521,22 @@ def export_nvfp4_cb(
     _recipe_cb_render_identity = _recipe_payload.get("cb_render_identity")
     if _recipe_cb_render_identity is None and isinstance(_recipe_meta, dict):
         _recipe_cb_render_identity = _recipe_meta.get("cb_render_identity")
+    production_recipe_stamped = (
+        _recipe_cb_context_stamp is not None or bool(_recipe_cb_tensor_stamps)
+    )
+    _claimed_activation_contract = (
+        _recipe_cb_context_stamp.get("activation_contract")
+        if isinstance(_recipe_cb_context_stamp, dict)
+        else None
+    )
+    if _claimed_activation_contract not in (
+        None,
+        NVFP4_ACTIVATION_CONTRACT_SCHEMA,
+    ):
+        raise ValueError(
+            "export_nvfp4_cb: unsupported activation contract "
+            f"{_claimed_activation_contract!r}"
+        )
     _whole_artifact_budget = whole_artifact_budget_from_assignment_payload(
         _recipe_payload,
         where="export_nvfp4_cb layer config",
@@ -678,6 +707,31 @@ def export_nvfp4_cb(
         for _m in _members:
             _nvfp4_shared_global[_m] = _shared
 
+    def _resident_export_target(qname: str) -> str:
+        resolved = _resolve_skeleton(qname, skeleton, _profile)
+        return (
+            resolved[:-len(".weight")]
+            if resolved.endswith(".weight")
+            else resolved
+        )
+
+    # Versioned fused-W4A4 activation contract.  The CB serialization stamp is
+    # the production/research boundary: v3 claims the contract and therefore
+    # requires complete calibrated coverage; v2/unstamped research emits
+    # neither JSON contract nor scalar tensors and is fused-ineligible.
+    fp4_activation_targets = {
+        qname
+        for qname, (grid, _mode, _k) in cb_targets.items()
+        if grid == "fp4"
+    } | {
+        qname
+        for qname, fmt in stock_targets.items()
+        if fmt == "NVFP4" and qname not in sidecar_stock
+    }
+    activation_execution_contract = None
+    activation_scales_by_physical_target: dict[str, float] = {}
+    activation_scale_policy_id = None
+
     # --- Resolve/train codebooks, grouped by (ref, format). ---
     provided = spec.get("codebooks", {}) if source == "learned" else {}
     train = bool(spec.get("train", False))
@@ -747,6 +801,12 @@ def export_nvfp4_cb(
         codebook_source=source,
         scale_sweep=bool(scale_sweep),
         encode_tier=resolve_cb_encode_tier(),
+        activation_contract=_claimed_activation_contract,
+        activation_execution=(
+            NVFP4_ACTIVATION_EXECUTION
+            if _claimed_activation_contract is not None
+            else None
+        ),
         codebook_refs={
             qname: _codebook_tensor_names(ref, fmt, codebook)
             for qname, (ref, fmt, codebook, _kind) in target_cb.items()
@@ -757,9 +817,6 @@ def export_nvfp4_cb(
         _recipe_cb_context_stamp,
         serialization_context,
         where="export_nvfp4_cb",
-    )
-    production_recipe_stamped = (
-        _recipe_cb_context_stamp is not None or bool(_recipe_cb_tensor_stamps)
     )
     if production_recipe_stamped and cb_targets:
         validate_cb_assignment_serialization_stamps(
@@ -805,6 +862,54 @@ def export_nvfp4_cb(
             "identity"
         )
 
+    # Fit only after every persisted producer identity is validated.  Besides
+    # giving deterministic failure ordering, this avoids loading a potentially
+    # multi-GB activation cache for an assignment that cannot be exported.
+    if _claimed_activation_contract is not None and fp4_activation_targets:
+        if activation_cache_dir is None:
+            raise ValueError(
+                "export_nvfp4_cb: production FP4 activation contract requires "
+                "activation_cache_dir; refusing uncalibrated fused W4A4"
+            )
+        activation_scale_policy_id = resolve_input_global_scale_policy(
+            activation_scale_policy
+        )
+        from prismaquant.moe_imatrix import (
+            synthesize_packed_expert_activation_samples,
+        )
+
+        packed_candidates = {
+            qname for qname in fp4_activation_targets
+            if qname.endswith((".gate_up_proj", ".down_proj"))
+        }
+        supplemental_samples = (
+            synthesize_packed_expert_activation_samples(
+                model_dir,
+                activation_cache_dir,
+                packed_candidates,
+                _profile,
+                device=device,
+            )
+            if packed_candidates and _profile is not None
+            else {}
+        )
+        logical_scales = calibrated_input_global_scales(
+            fp4_activation_targets,
+            activation_cache_dir=activation_cache_dir,
+            policy=activation_scale_policy_id,
+            profile=_profile,
+            supplemental_activations=supplemental_samples,
+            calibration_device=device,
+        )
+        (
+            activation_execution_contract,
+            activation_scales_by_physical_target,
+        ) = build_execution_contract(
+            logical_scales,
+            policy=activation_scale_policy_id,
+            target_name=_resident_export_target,
+        )
+
     # --- Pack targets; copy everything else verbatim. ---
     out_tensors: dict[str, torch.Tensor] = {}
     cb_tensor_blobs: dict[str, torch.Tensor] = {}
@@ -812,6 +917,7 @@ def export_nvfp4_cb(
     cb_output_tensor_names: set[str] = set()
     verified_cb_source_qnames: set[str] = set()
     actual_cb_tensor_bytes = 0
+    emitted_activation_scale_targets: set[str] = set()
     counts: Counter[str] = Counter()
     ignore: list[str] = []
     packed_qnames = set(cb_targets)
@@ -919,6 +1025,7 @@ def export_nvfp4_cb(
             out_tensors[packed_name] = packed_out
             cb_output_tensor_names.add(packed_name)
             scale_bytes = 0
+            input_scale_bytes = 0
             if grid == "fp8":
                 ws = fields["scales"].reshape(
                     *w.shape[:-1]).to(torch.float32).cpu().contiguous()
@@ -936,7 +1043,32 @@ def export_nvfp4_cb(
                 raise AssertionError(
                     f"{canon}: FP4-CB unexpectedly priced an FP8 row scale"
                 )
-            actual = packed_bytes + scale_bytes
+            if grid == "fp4" and _claimed_activation_contract is not None:
+                try:
+                    input_scale = activation_scales_by_physical_target[
+                        ckpt_qname
+                    ]
+                except KeyError:
+                    raise AssertionError(
+                        f"{canon}: claimed FP4 activation contract has no "
+                        f"physical scalar for {ckpt_qname!r}"
+                    ) from None
+                input_scale_tensor = input_global_scale_tensor(input_scale)
+                input_scale_bytes = (
+                    input_scale_tensor.numel()
+                    * input_scale_tensor.element_size()
+                )
+                input_scale_name = ckpt_qname + ".input_global_scale"
+                out_tensors[input_scale_name] = input_scale_tensor
+                cb_output_tensor_names.add(input_scale_name)
+                emitted_activation_scale_targets.add(ckpt_qname)
+            if input_scale_bytes != payload["input_global_scale_bytes"]:
+                raise AssertionError(
+                    f"{canon}: serialized input_global_scale is "
+                    f"{input_scale_bytes}B, accounting expected "
+                    f"{payload['input_global_scale_bytes']}B"
+                )
+            actual = packed_bytes + scale_bytes + input_scale_bytes
             if actual != payload["tensor_payload_bytes"]:
                 raise AssertionError(
                     f"{canon}: emitted {actual}B of CB tensor payload, "
@@ -962,11 +1094,18 @@ def export_nvfp4_cb(
                 ).to(device),
                 fmt,
                 nvfp4_global_real_override=override,
+                input_global_scale_override=(
+                    activation_scales_by_physical_target.get(ckpt_qname)
+                    if fmt == "NVFP4"
+                    else None
+                ),
             )
             for suffix, t in packed.items():
                 if canon in sidecar_stock and "input" in suffix:
                     continue        # weight-only sidecar group (see above)
                 out_tensors[f"{ckpt_qname}.{suffix}"] = t.cpu().contiguous()
+                if suffix == "input_global_scale":
+                    emitted_activation_scale_targets.add(ckpt_qname)
             counts[assignment[canon]] += 1
         else:
             # Verbatim (BF16 passthrough, norms, embeddings, visual encoder,
@@ -992,6 +1131,17 @@ def export_nvfp4_cb(
         raise AssertionError(
             "CB serialized-payload coverage does not match assignment: "
             f"missing={missing[:5]}, extra={extra[:5]}"
+        )
+    if activation_execution_contract is not None and (
+        emitted_activation_scale_targets
+        != set(activation_scales_by_physical_target)
+    ):
+        raise AssertionError(
+            "NVFP4 activation scalar coverage differs from the claimed "
+            "execution contract: missing="
+            f"{sorted(set(activation_scales_by_physical_target) - emitted_activation_scale_targets)[:8]}, "
+            "extra="
+            f"{sorted(emitted_activation_scale_targets - set(activation_scales_by_physical_target))[:8]}"
         )
     serialized_payload = cb_assignment_payload_breakdown(
         {qname: assignment[qname] for qname in cb_targets},
@@ -1054,7 +1204,9 @@ def export_nvfp4_cb(
         serialized_payload_summary=serialized_payload_summary,
         serialization_context=serialization_context,
         cb_render_identity=_recipe_cb_render_identity,
+        activation_execution_contract=activation_execution_contract,
         git_commit=_git_commit(),
+        cb_target_name=_resident_export_target,
         delegated_target_name=_delegated_target_name,
         weight_only_stock_targets=sidecar_stock,
         streaming_provenance=None,
@@ -1130,6 +1282,23 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--out", required=True, help="output checkpoint dir")
     ap.add_argument("--col-weights", required=True,
                     help="pickle: {qname: per-column importance tensor}")
+    ap.add_argument(
+        "--activation-cache-dir",
+        default=None,
+        help="probe activation cache used to calibrate the versioned static "
+        "W4A4 input_global_scale contract",
+    )
+    ap.add_argument(
+        "--activation-scale-policy",
+        default=None,
+        choices=sorted((
+            "legacy_6_over_calibration_amax.v1",
+            "full_e4m3_range_448x6_over_calibration_amax.v1",
+            "mse_grid_calibrated.v1",
+        )),
+        help="explicit static W4A4 scale policy; default preserves the "
+        "PRISMAQUANT_NVFP4_INPUT_GSCALE_FP8_RANGE compatibility setting",
+    )
     ap.add_argument("--codebook-source", default="lattice",
                     choices=["lattice", "learned"],
                     help="fixed lattice sidecar or shared per-role "
@@ -1169,6 +1338,8 @@ def main(argv: list[str] | None = None) -> None:
         scale_sweep=not args.no_scale_sweep,
         scale_coding=args.scale_coding,
         allow_unstamped_research=args.allow_unstamped_research,
+        activation_cache_dir=args.activation_cache_dir,
+        activation_scale_policy=args.activation_scale_policy,
     )
     size = sum(p.stat().st_size for p in Path(args.out).glob("*")) / 1e9
     print(f"wrote {args.out} ({size:.3f} GB)")

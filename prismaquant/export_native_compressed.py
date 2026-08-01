@@ -79,6 +79,7 @@ except ModuleNotFoundError:
             yield
 from safetensors.torch import save_file
 
+from . import nvfp4_activation_contract as _nvfp4_activation_contract
 from .allocator_candidates import (
     PASSTHROUGH_SOURCE_REQUIREMENTS,
     _scan_source_dtype_manifest,
@@ -119,8 +120,8 @@ from .nvfp4_cb_footprint import (
 # stable across the transformers 4.x -> 5.x break.
 # ---------------------------------------------------------------------------
 FLOAT_TO_E2M1 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
-NVFP4_MAX = 6.0     # max(|FLOAT_TO_E2M1|)
-FP8_E4M3_MAX = 448.0  # max representable in torch.float8_e4m3fn
+NVFP4_MAX = _nvfp4_activation_contract.FP4_E2M1_MAX
+FP8_E4M3_MAX = _nvfp4_activation_contract.FP8_E4M3_MAX
 NVFP4_SCALE_RULE_ENV = "PRISMAQUANT_NVFP4_SCALE_RULE"
 NVFP4_SCALE_RULE_STATIC_6 = "static_6"
 NVFP4_SCALE_RULE_FOUR_OVER_SIX_MSE = "four_over_six_mse"
@@ -871,17 +872,16 @@ def pack_fp4_indices(fp4_indices: torch.Tensor, last_dim: int) -> torch.Tensor:
     return (pairs[..., 0] | (pairs[..., 1] << 4)).to(torch.uint8)
 
 
-DEFAULT_INPUT_GLOBAL_SCALE = 1.0  # uncalibrated fallback; matches
-# compressed-tensors generate_gparam's nan/inf -> 1.0 "no global
-# scaling" fallback for uncalibrated tensors.
+DEFAULT_INPUT_GLOBAL_SCALE = (
+    _nvfp4_activation_contract.UNCALIBRATED_INPUT_GLOBAL_SCALE
+)  # uncalibrated fallback; matches
+# compressed-tensors' 1.0 "no global scaling" fallback for uncalibrated or
+# degenerate nonpositive tensors.
 
-# FP4 E2M1 maximum representable value. Used to rescale activations so
-# they fit inside the FP4 grid after the per-tensor scale divide.
-_FP4_E2M1_MAX = 6.0
-# FP8 E4M3 maximum (alias of FP8_E4M3_MAX above, kept next to
-# _FP4_E2M1_MAX because the two together define the compressed-tensors
-# input_global_scale convention below).
-_FP8_E4M3_MAX = FP8_E4M3_MAX
+# Compatibility aliases retained for external callers/tests.  The versioned
+# activation-contract module is the sole owner of their values and policy.
+_FP4_E2M1_MAX = _nvfp4_activation_contract.FP4_E2M1_MAX
+_FP8_E4M3_MAX = _nvfp4_activation_contract.FP8_E4M3_MAX
 
 
 def _nvfp4_input_gscale_fp8_range_enabled() -> bool:
@@ -901,37 +901,36 @@ def _nvfp4_input_gscale_fp8_range_enabled() -> bool:
     only behind a per-artifact served A/B (the scale is a free
     post-export knob: patch input_global_scale in place, re-measure).
     """
-    return os.environ.get(
-        "PRISMAQUANT_NVFP4_INPUT_GSCALE_FP8_RANGE", "0") == "1"
+    return (
+        _nvfp4_activation_contract.resolve_input_global_scale_policy()
+        == _nvfp4_activation_contract.FULL_E4M3_INPUT_GLOBAL_SCALE_POLICY
+    )
 
 
 def _nvfp4_input_global_scale_from_max_abs(max_abs: float) -> float:
     """input_global_scale for a calibrated activation ``max_abs``.
 
-    Convention (compressed_tensors.quantization.utils.generate_gparam):
-    ``G = FP8_E4M3_MAX * FP4_E2M1_MAX / amax``. vLLM computes each
-    16-block's FP8-stored activation scale as ``fp8(block_amax / 6 * G)``
-    and compensates via alpha, so the dequant identity is invariant to
-    ``G`` — its only function is placing the serve-time block scales in
-    FP8's representable range (0, 448].
+    The shared policy owner selects the legacy ``6 / amax`` bytes by default
+    or the explicit compressed-tensors ``448 * 6 / amax`` opt-in.  This
+    compatibility wrapper never defines a second formula.
     """
-    max_abs = float(max_abs)
-    if max_abs <= 0.0:
-        return float(DEFAULT_INPUT_GLOBAL_SCALE)
-    if _nvfp4_input_gscale_fp8_range_enabled():
-        return float(_FP8_E4M3_MAX * _FP4_E2M1_MAX / max_abs)
-    return float(_FP4_E2M1_MAX / max_abs)
+    return _nvfp4_activation_contract.input_global_scale_from_max_abs(
+        max_abs,
+        policy=(
+            _nvfp4_activation_contract.resolve_input_global_scale_policy()
+        ),
+        nonpositive_fallback=(
+            _nvfp4_activation_contract.UNCALIBRATED_INPUT_GLOBAL_SCALE
+        ),
+    )
 
 
 def compute_nvfp4_input_global_scale(activations: torch.Tensor) -> float:
     """Per-tensor input_global_scale from cached activations.
 
-    Returns ``FP8_E4M3_MAX * FP4_E2M1_MAX / max(|activations|)`` — the
-    compressed-tensors ``generate_gparam`` convention, so serve-time
-    activation block scales (``fp8(block_amax / 6 * G)``) span the whole
-    FP8 range instead of collapsing into subnormals. Activations can be
-    any shape; we flatten for the max. See
-    ``_nvfp4_input_global_scale_from_max_abs`` for the kill-switch.
+    Activations can have any shape.  The shared activation-contract policy
+    converts their maximum absolute value and preserves the legacy all-zero
+    fallback required for byte-compatible native export.
     """
     max_abs = float(activations.detach().abs().max().item())
     return _nvfp4_input_global_scale_from_max_abs(max_abs)
@@ -942,6 +941,26 @@ def compute_nvfp4_input_global_scale(activations: torch.Tensor) -> float:
 # when no explicit override is passed in. Keyed by the recipe name
 # (post-profile.live_to_recipe_name remap). None means "not computed".
 _INPUT_GLOBAL_SCALES: dict[str, float] | None = None
+
+
+def _resolve_nvfp4_input_global_scale(
+    override: float | None = None,
+    *,
+    target: str | None = None,
+) -> float:
+    """Legacy native-export compatibility delegate.
+
+    The uncalibrated fallback preserves existing native artifact bytes.  Its
+    presence is also why this exporter does not claim the versioned Gridbook
+    fused-W4A4 activation contract.
+    """
+
+    return _nvfp4_activation_contract.resolve_input_global_scale_value(
+        override,
+        target=target,
+        calibrated_scales=_INPUT_GLOBAL_SCALES,
+        allow_uncalibrated_fallback=True,
+    )
 
 # Module-level raw-activation cache populated by main() when
 # --activation-cache-dir is provided AND any of the activation-aware
@@ -1281,8 +1300,8 @@ def _serving_atomic_units(
 ) -> tuple[tuple[_ServingUnit, ...], dict[str, str]]:
     """Serving-atomic units among ``names``, from the profile accessors.
 
-    Grouping is asked of the model profile — `_fused_group_key_for_name`
-    (the exporter's own fused-sibling key, the same
+    Grouping is asked of the shared activation-contract policy through the
+    compatibility delegate `_fused_group_key_for_name` (the same
     `fused_sibling_group` / `fused_sibling_leaf_mapping` chain the
     fused-coherence gate in `build_quantization_config` derives its
     sibling sets from) and `profile.packed_expert_format_group` (what
@@ -2274,12 +2293,7 @@ def _pack_production_cached_2d(
                 group_size=16,
                 global_real_override=nvfp4_global_real_override,
             )
-        input_scale = (
-            _INPUT_GLOBAL_SCALES.get(linear_name) if _INPUT_GLOBAL_SCALES
-            else None
-        )
-        if input_scale is None:
-            input_scale = DEFAULT_INPUT_GLOBAL_SCALE
+        input_scale = _resolve_nvfp4_input_global_scale(target=linear_name)
         return {
             "weight_packed": wp,
             "weight_scale": ws,
@@ -2382,9 +2396,8 @@ def _packed_expert_input_global_scale(
     *,
     cache: "ProductionWeightCache | None" = None,
 ) -> float | None:
-    """Calibrated W4A4 input_global_scale (FP8_MAX*FP4_MAX/max_abs, the
-    generate_gparam convention) for a packed-expert tensor, read from the
-    production cache's per-param activation max_abs.
+    """Policy-resolved W4A4 input_global_scale for a packed-expert tensor,
+    read from the production cache's per-param activation max_abs.
 
     Returns ``None`` when no cache/scale is available, so the caller falls back
     to ``DEFAULT_INPUT_GLOBAL_SCALE`` (only on the no-cache research path).
@@ -4632,58 +4645,20 @@ def _split_packed_expert_tensor(
 # weight_global_scale. We compute the max over each fused group's natural
 # global_scale and force every sibling to use it.
 #
-# Legacy fallback for callers that do not pass a ModelProfile. New model
-# families should declare fused groups in their profile structure spec.
-_FUSED_DENSE_PATTERNS = [
-    (re.compile(r"^(?P<pre>.+)\.self_attn\.(?P<sib>q_proj|k_proj|v_proj)$"),
-     ("q_proj", "k_proj", "v_proj")),
-    (re.compile(r"^(?P<pre>.+)\.mlp\.(?P<sib>gate_proj|up_proj)$"),
-     ("gate_proj", "up_proj")),
-    (re.compile(r"^(?P<pre>.+)\.mlp\.shared_expert\.(?P<sib>gate_proj|up_proj)$"),
-     ("gate_proj", "up_proj")),
-    (re.compile(r"^(?P<pre>.+)\.linear_attn\.(?P<sib>in_proj_qkv|in_proj_z)$"),
-     ("in_proj_qkv", "in_proj_z")),
-    (re.compile(r"^(?P<pre>.+)\.linear_attn\.(?P<sib>in_proj_a|in_proj_b)$"),
-     ("in_proj_a", "in_proj_b")),
-]
-
-
 def _fused_dense_group(name: str) -> tuple[str, tuple[str, ...]] | None:
-    """Return (group_key, sibling_member_names) if `name` is part of a
-    known fused dense Linear group; else None. group_key is the parent
-    prefix used to bucket siblings together."""
-    for pat, members in _FUSED_DENSE_PATTERNS:
-        m = pat.match(name)
-        if m:
-            return (m.group("pre"), members)
-    return None
+    """Compatibility delegate for the shared fusion catalog."""
+
+    return _nvfp4_activation_contract.fused_dense_group(name)
 
 
 def _fused_group_key_for_name(name: str, profile=None) -> str | None:
-    group_fn = getattr(profile, "fused_sibling_group", None)
-    if callable(group_fn):
-        try:
-            group = group_fn(name)
-        except Exception:
-            group = None
-        if group:
-            return str(group)
-    mapping_fn = getattr(profile, "fused_sibling_leaf_mapping", None)
-    if callable(mapping_fn) and "." in name:
-        try:
-            mapping = mapping_fn()
-        except Exception:
-            mapping = None
-        if mapping:
-            prefix, leaf = name.rsplit(".", 1)
-            for fused, members in mapping.items():
-                if leaf in set(str(member) for member in members):
-                    return f"{prefix}.{fused}"
-    fallback = _fused_dense_group(name)
-    if fallback is None:
-        return None
-    prefix, members = fallback
-    return f"{prefix}::__fused__:{','.join(members)}"
+    """Legacy error-tolerant delegate to the shared fusion policy."""
+
+    return _nvfp4_activation_contract.fused_sibling_group_key(
+        name,
+        profile=profile,
+        tolerate_profile_errors=True,
+    )
 
 
 def _unify_input_global_scales_across_fused_siblings(
@@ -4691,63 +4666,14 @@ def _unify_input_global_scales_across_fused_siblings(
     *,
     profile=None,
 ) -> dict[str, float]:
-    """Post-process per-Linear input_global_scale values so fused-
-    sibling groups share one scale.
+    """Compatibility delegate for the shared conservative scale join."""
 
-    vLLM concatenates q/k/v (and gate/up) into a single fused Linear
-    at load time and applies ONE input_global_scale to the forward
-    pass. If the siblings' scales don't match, vLLM warns and reduces
-    accuracy.
-
-    Siblings receive the same upstream activation, so their
-    `compute_nvfp4_input_global_scale` outputs are theoretically
-    identical — but capture + subsampling order introduces float-
-    precision drift in practice.  The stored values are reciprocals
-    (s = FP8_MAX·FP4_MAX / max_abs, or legacy 6 / max_abs under the
-    ``PRISMAQUANT_NVFP4_INPUT_GSCALE_FP8_RANGE=0`` kill-switch); the
-    conservative join is therefore ``min(vals)`` under either
-    convention (smallest reciprocal == largest max_abs == loosest
-    clipping), so the fused Linear never truncates any sibling's
-    activations. Siblings that weren't NVFP4-assigned pass through
-    unchanged.
-    """
-    # Bucket siblings by fused group.
-    groups: dict[str, list[str]] = {}
-    for name in scales:
-        g = _fused_group_key_for_name(name, profile)
-        if g is None:
-            continue
-        groups.setdefault(g, []).append(name)
-
-    out = dict(scales)
-    n_unified = 0
-    max_drift = 0.0
-    for key, members in groups.items():
-        members = [m for m in members if m in scales]
-        if len(members) < 2:
-            continue
-        vals = [scales[m] for m in members]
-        # input_global_scale stores FP8_MAX·FP4_MAX / max_abs (reciprocal
-        # convention, see compute_nvfp4_input_global_scale).  To pick a
-        # JOINT scale that doesn't over-clip ANY sibling's activations we
-        # want the smallest reciprocal == largest max_abs == loosest
-        # clipping.
-        # Previously this used max(vals), which under the reciprocal
-        # convention yields the TIGHTEST clipping — over-clipping the
-        # sibling with the largest activation range.  In practice fused
-        # siblings have similar activation distributions, so the drift
-        # is small, but min() is the correct conservative join.
-        joint = min(vals)
-        drift = max(abs(joint - v) for v in vals)
-        max_drift = max(max_drift, drift)
-        for m in members:
-            out[m] = joint
-        n_unified += 1
-    if n_unified:
-        print(f"[export-stream] unified input_global_scale across "
-              f"{n_unified} fused-sibling groups "
-              f"(max pre-unify drift: {max_drift:.3e})", flush=True)
-    return out
+    return _nvfp4_activation_contract.unify_fused_sibling_input_global_scales(
+        scales,
+        profile=profile,
+        tolerate_profile_errors=True,
+        diagnostic_prefix="[export-stream]",
+    )
 
 
 def _compute_nvfp4_joint_global(
@@ -4827,14 +4753,10 @@ def _quantize_2d(
     scale shared across all siblings. vLLM warns when sibling scales
     differ and reports degraded accuracy; sharing avoids both.
 
-    `input_global_scale_override`: per-Linear activation scale computed
-    from calibration — `FP8_MAX * FP4_MAX / max_abs(cached_activations)`
-    (the compressed-tensors `generate_gparam` convention) so serve-time
-    FP8-stored activation block scales span the whole FP8 range. If
-    None, falls back to `DEFAULT_INPUT_GLOBAL_SCALE` (1.0). Calibrated
-    values typically improve PPL noticeably on NVFP4 weights because
-    otherwise vLLM's runtime activation quant uses an undersized
-    dynamic range.
+    `input_global_scale_override`: explicit per-Linear activation scale.  If
+    absent, the shared resolver checks the calibrated mapping and finally the
+    legacy `DEFAULT_INPUT_GLOBAL_SCALE` (1.0).  That fallback preserves native
+    artifact semantics but does not qualify the versioned fused contract.
 
     `gptq_enabled` and `scale_sweep_enabled` compose activation-aware passes
     on NVFP4, MXFP4, FP8_E4M3/FP8_E5M2, and MXFP8_E4M3/MXFP8_E5M2 paths. Each
@@ -5002,11 +4924,10 @@ def _quantize_2d(
 
         # Step 4: final NVFP4 pack. `w_work` is the post-GPTQ,
         # post-act-round, post-scale-sweep weight.
-        input_scale = input_global_scale_override
-        if input_scale is None and linear_name is not None and _INPUT_GLOBAL_SCALES:
-            input_scale = _INPUT_GLOBAL_SCALES.get(linear_name)
-        if input_scale is None:
-            input_scale = DEFAULT_INPUT_GLOBAL_SCALE
+        input_scale = _resolve_nvfp4_input_global_scale(
+            input_global_scale_override,
+            target=linear_name,
+        )
 
         # compute_only path: return the dequantized weight WITHOUT freezing
         # it into FP4 codes. Its only production consumer was block-output
@@ -5571,12 +5492,7 @@ def _quantize_2d_nvfp4_group_batched(
             weights[i], group_size=16,
             global_real_override=override,
         )
-        input_scale = (
-            _INPUT_GLOBAL_SCALES.get(recipe_key) if _INPUT_GLOBAL_SCALES
-            else None
-        )
-        if input_scale is None:
-            input_scale = DEFAULT_INPUT_GLOBAL_SCALE
+        input_scale = _resolve_nvfp4_input_global_scale(target=recipe_key)
         out.append({
             "weight_packed": wp,
             "weight_scale": ws,
@@ -7412,6 +7328,12 @@ def build_quantization_config(
     `profile` controls the architecture-specific bits: name remap,
     per-expert MoE / MTP regexes. Defaults to `DefaultProfile()` (plain
     names, no catch-all regexes) when omitted.
+
+    This legacy compressed-tensors container intentionally does not publish
+    ``execution_contracts.nvfp4_w4a4``.  Its optional/defaulted activation
+    scalars preserve existing native artifact bytes but cannot attest the
+    strict Gridbook fused-W4A4 activation contract; only the versioned CB
+    export path may emit that record after complete calibration.
     """
     from .model_profiles import DefaultProfile
     profile = profile or DefaultProfile()

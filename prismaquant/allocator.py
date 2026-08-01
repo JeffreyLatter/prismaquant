@@ -138,7 +138,10 @@ from .production_weight_cache import (
     project_cb_render_identity,
     validate_cb_render_provenance,
 )
-from .footprint import nvfp4_global_sidecar_bytes
+from .footprint import (
+    NVFP4_WEIGHT_ONLY_STATS_KEY,
+    nvfp4_global_sidecar_bytes,
+)
 from .serving_profiles import (
     check_serving_format,
     require_per_role_expert_scheme_support,
@@ -611,6 +614,35 @@ def _is_visual_linear(name: str) -> bool:
     return bool(_VISUAL_PREFIX_RE.match(name))
 
 
+def _mark_weight_only_nvfp4_stats(
+    stats: Mapping[str, Mapping[str, object]],
+    profile,
+) -> dict[str, dict[str, object]]:
+    """Stamp targets that the mixed exporter emits as stock W4A16.
+
+    The exporter classifies a sidecar target by the same profile mapping:
+    ``checkpoint_to_live_name(..., multimodal=False) is None`` means text
+    calibration cannot cover that module, so stock NVFP4 drops
+    ``input_global_scale``. Persist that decision in the accounting stats
+    rather than re-deriving it from a visual/audio/MTP name heuristic.
+    """
+    mapper = getattr(profile, "checkpoint_to_live_name", None)
+    if not callable(mapper):
+        return {str(name): dict(entry) for name, entry in stats.items()}
+    marked: dict[str, dict[str, object]] = {}
+    for raw_name, raw_entry in stats.items():
+        name = str(raw_name)
+        entry = dict(raw_entry)
+        try:
+            live_name = mapper(name + ".weight", multimodal=False)
+        except TypeError:
+            live_name = mapper(name + ".weight")
+        if live_name is None:
+            entry[NVFP4_WEIGHT_ONLY_STATS_KEY] = True
+        marked[name] = entry
+    return marked
+
+
 def apply_visual_format_override(
     assignment: dict[str, str],
     visual_format: str,
@@ -829,7 +861,11 @@ def _build_bit_attribution(
 
         if bits is not None and fmt == "NVFP4" and isinstance(entry, dict):
             bits += 8.0 * nvfp4_global_sidecar_bytes(
-                name, _shape_from_stats(entry)
+                name,
+                _shape_from_stats(entry),
+                weight_only=bool(
+                    entry.get(NVFP4_WEIGHT_ONLY_STATS_KEY, False)
+                ),
             )
 
         bpp = (bits / n_params) if (bits is not None and n_params) else None
@@ -1158,6 +1194,7 @@ def discover_visual_linear_stats_from_source(
             "n_params": out_features * in_features,
             "out_features": out_features,
             "in_features": in_features,
+            NVFP4_WEIGHT_ONLY_STATS_KEY: True,
             "source_dtype": (
                 "bf16" if dtype == "BF16"
                 else "fp8" if dtype.startswith("F8_")
@@ -1984,6 +2021,7 @@ def main():
             f"(sample: {allocation_excluded[:8]})",
             flush=True,
         )
+    stats = _mark_weight_only_nvfp4_stats(stats, model_profile)
     accounting_stats = dict(stats)
 
     if args.formats:
@@ -2040,11 +2078,18 @@ def main():
                 "tensor mapping"
             )
         try:
+            from prismaquant.nvfp4_activation_contract import (
+                NVFP4_ACTIVATION_CONTRACT_SCHEMA,
+                NVFP4_ACTIVATION_EXECUTION,
+            )
+
             cb_serialization_context = CBSerializationContext(
                 scale_coding=args.cb_scale_coding,
                 codebook_source=args.cb_codebook_source,
                 scale_sweep=args.cb_scale_sweep == "1",
                 encode_tier=args.cb_encode_tier,
+                activation_contract=NVFP4_ACTIVATION_CONTRACT_SCHEMA,
+                activation_execution=NVFP4_ACTIVATION_EXECUTION,
                 codebook_content_digests=codebook_digests,
             )
         except ValueError as exc:
@@ -2450,6 +2495,10 @@ def main():
         if probe_model_path
         else {}
     )
+    source_visual_stats = _mark_weight_only_nvfp4_stats(
+        source_visual_stats,
+        model_profile,
+    )
     source_only_visual_stats = {
         name: entry
         for name, entry in source_visual_stats.items()
@@ -2503,7 +2552,13 @@ def main():
             cb_serialization_context=cb_serialization_context,
         )
         global_bytes = (
-            nvfp4_global_sidecar_bytes(qname, shape)
+            nvfp4_global_sidecar_bytes(
+                qname,
+                shape,
+                weight_only=bool(
+                    entry.get(NVFP4_WEIGHT_ONLY_STATS_KEY, False)
+                ),
+            )
             if fmt == "NVFP4"
             else 0
         )
@@ -2725,7 +2780,11 @@ def main():
                 total += 8.0 * memory_map[fmt]
                 if fmt == "NVFP4":
                     total += 8.0 * nvfp4_global_sidecar_bytes(
-                        name, _shape_from_stats(entry)
+                        name,
+                        _shape_from_stats(entry),
+                        weight_only=bool(
+                            entry.get(NVFP4_WEIGHT_ONLY_STATS_KEY, False)
+                        ),
                     )
                 continue
             shape = _shape_from_stats(entry)
@@ -2737,7 +2796,13 @@ def main():
             )
             total += 8.0 * payload_bytes
             if fmt == "NVFP4":
-                total += 8.0 * nvfp4_global_sidecar_bytes(name, shape)
+                total += 8.0 * nvfp4_global_sidecar_bytes(
+                    name,
+                    shape,
+                    weight_only=bool(
+                        entry.get(NVFP4_WEIGHT_ONLY_STATS_KEY, False)
+                    ),
+                )
         if missing and require_all_stats:
             raise AssertionError(
                 "exact assignment payload has no shape/stats for "

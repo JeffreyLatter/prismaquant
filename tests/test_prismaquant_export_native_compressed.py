@@ -1882,6 +1882,19 @@ class TestBuildQuantizationConfig(unittest.TestCase):
         # is_activation_quantization_format check enables W4A4 dispatch.
         self.assertEqual(nvfp4["format"], "nvfp4-pack-quantized")
 
+    def test_legacy_native_config_does_not_claim_versioned_fused_contract(self):
+        qc = build_quantization_config(
+            {"model.layers.0.mlp.down_proj": "NVFP4"},
+            bf16_passthrough=set(),
+        )
+
+        self.assertEqual(qc["quant_method"], "compressed-tensors")
+        self.assertNotIn("execution_contracts", qc)
+        self.assertNotIn(
+            enc._nvfp4_activation_contract.NVFP4_ACTIVATION_CONTRACT_KEY,
+            qc,
+        )
+
     def test_lfm2_experts_use_canonical_vllm_scheme_names(self):
         # LFM2.5 names experts w1/w3/w2 on disk, but vLLM's FusedMoE scheme
         # detection (get_moe_method) and ignore matching probe the canonical
@@ -2713,6 +2726,51 @@ class TestFusedSiblingJointGlobalScale(unittest.TestCase):
             g = _fused_dense_group(f"model.layers.7.linear_attn.{sib}")
             self.assertIsNotNone(g, f"missing fused-group pattern for {sib}")
             self.assertEqual(set(g[1]), {"in_proj_qkv", "in_proj_z"})
+
+    def test_native_fusion_compatibility_apis_delegate_to_contract_owner(self):
+        shared = enc._nvfp4_activation_contract
+        profile = object()
+        sentinel_group = ("shared", ("a", "b"))
+        with patch.object(
+            shared,
+            "fused_dense_group",
+            return_value=sentinel_group,
+        ) as dense:
+            self.assertIs(enc._fused_dense_group("layer.a"), sentinel_group)
+            dense.assert_called_once_with("layer.a")
+
+        with patch.object(
+            shared,
+            "fused_sibling_group_key",
+            return_value="shared.ab",
+        ) as key:
+            self.assertEqual(
+                enc._fused_group_key_for_name("layer.a", profile),
+                "shared.ab",
+            )
+            key.assert_called_once_with(
+                "layer.a",
+                profile=profile,
+                tolerate_profile_errors=True,
+            )
+
+        expected = {"layer.a": 0.25, "layer.b": 0.25}
+        with patch.object(
+            shared,
+            "unify_fused_sibling_input_global_scales",
+            return_value=expected,
+        ) as unify:
+            actual = enc._unify_input_global_scales_across_fused_siblings(
+                {"layer.a": 0.5, "layer.b": 0.25},
+                profile=profile,
+            )
+            self.assertIs(actual, expected)
+            unify.assert_called_once_with(
+                {"layer.a": 0.5, "layer.b": 0.25},
+                profile=profile,
+                tolerate_profile_errors=True,
+                diagnostic_prefix="[export-stream]",
+            )
 
     def test_compute_nvfp4_joint_global_picks_max(self):
         from prismaquant.export_native_compressed import (
@@ -4207,6 +4265,57 @@ class TestNvfp4InputGlobalScale(unittest.TestCase):
         s = compute_nvfp4_input_global_scale(acts)
         self.assertEqual(s, DEFAULT_INPUT_GLOBAL_SCALE)
 
+    def test_legacy_formula_delegates_to_versioned_policy_owner(self):
+        shared = enc._nvfp4_activation_contract
+        policy = shared.LEGACY_INPUT_GLOBAL_SCALE_POLICY
+        with patch.object(
+            shared,
+            "resolve_input_global_scale_policy",
+            return_value=policy,
+        ) as resolve, patch.object(
+            shared,
+            "input_global_scale_from_max_abs",
+            return_value=7.25,
+        ) as calibrate:
+            self.assertEqual(
+                enc._nvfp4_input_global_scale_from_max_abs(3.0),
+                7.25,
+            )
+            resolve.assert_called_once_with()
+            calibrate.assert_called_once_with(
+                3.0,
+                policy=policy,
+                nonpositive_fallback=(
+                    shared.UNCALIBRATED_INPUT_GLOBAL_SCALE
+                ),
+            )
+
+    def test_legacy_default_resolution_delegates_with_explicit_opt_in(self):
+        shared = enc._nvfp4_activation_contract
+        saved = enc._INPUT_GLOBAL_SCALES
+        enc._INPUT_GLOBAL_SCALES = {"layer.q_proj": 3.0}
+        try:
+            with patch.object(
+                shared,
+                "resolve_input_global_scale_value",
+                return_value=2.5,
+            ) as resolve:
+                self.assertEqual(
+                    enc._resolve_nvfp4_input_global_scale(
+                        2.0,
+                        target="layer.q_proj",
+                    ),
+                    2.5,
+                )
+                resolve.assert_called_once_with(
+                    2.0,
+                    target="layer.q_proj",
+                    calibrated_scales={"layer.q_proj": 3.0},
+                    allow_uncalibrated_fallback=True,
+                )
+        finally:
+            enc._INPUT_GLOBAL_SCALES = saved
+
     def test_quantize_2d_reads_override(self):
         import torch
         from prismaquant.export_native_compressed import _quantize_2d
@@ -4231,6 +4340,27 @@ class TestNvfp4InputGlobalScale(unittest.TestCase):
                 float(out["input_global_scale"].item()), 3.14, places=4)
         finally:
             m._INPUT_GLOBAL_SCALES = saved
+
+    def test_override_precedence_preserves_serialized_f32_value(self):
+        weight = torch.randn(32, 32)
+        saved = enc._INPUT_GLOBAL_SCALES
+        try:
+            enc._INPUT_GLOBAL_SCALES = {"foo.bar.q_proj": 3.14}
+            out = enc._quantize_2d(
+                weight,
+                "NVFP4",
+                linear_name="foo.bar.q_proj",
+                input_global_scale_override=2.5,
+            )
+        finally:
+            enc._INPUT_GLOBAL_SCALES = saved
+
+        expected = torch.tensor([2.5], dtype=torch.float32)
+        self.assertTrue(torch.equal(out["input_global_scale"], expected))
+        self.assertTrue(torch.equal(
+            out["input_global_scale"].view(torch.uint8),
+            expected.view(torch.uint8),
+        ))
 
 
 class TestActivationAwarePasses(unittest.TestCase):
