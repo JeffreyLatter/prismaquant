@@ -64,6 +64,14 @@ def test_weight_session_allows_mxfp8_rtn_fallback_when_not_strict():
     assert diag["n_cache_misses"] == 1
 
 
+def test_weight_session_never_uses_unweighted_cb_rtn_fallback():
+    model = _ModelWithBody().eval()
+    session = WeightSession(model, strict_production_cache=False)
+
+    with pytest.raises(RuntimeError, match="required for CB fallback"):
+        session.initialize({"model.proj": "NVFP4_CB_K16"}, units=[])
+
+
 def test_initialize_does_not_record_format_when_materialization_fails(monkeypatch):
     model = _ModelWithBody().eval()
     session = WeightSession(model, strict_production_cache=False)

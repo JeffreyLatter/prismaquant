@@ -135,4 +135,16 @@ def test_core_recipe_defaults_are_pinned():
     assert ': "${SELECTION_MODE:=surrogate}"' in script
     assert ': "${SELECTION_MODE:=validated-surrogate}"' in script
     assert ': "${TARGET_DISK_GB:=}"' in script
+    assert ': "${ARTIFACT_OVERHEAD_RESERVE_BYTES:=}"' in script
+    assert '--artifact-overhead-reserve-bytes "$ARTIFACT_OVERHEAD_RESERVE_BYTES"' in script
+    assert "TARGET_DISK_GB requires ARTIFACT_OVERHEAD_RESERVE_BYTES" in script
     assert ': "${VALIDATED_FRONTIER_PICK:=budget}"' in script
+
+
+def test_learned_cb_pipeline_is_blocked_before_production_stages():
+    script = _run_pipeline_script()
+
+    gate = "learned CB is research-only until one immutable value-bearing"
+    assert gate in script
+    assert script.index(gate) < script.index("python3 -m prismaquant.allocator")
+    assert "Learned production is accepted" not in script

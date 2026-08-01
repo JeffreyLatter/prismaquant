@@ -15,7 +15,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from prismaquant.aura_cost import compute_aura_cost
+from prismaquant.aura_cost import _delta_w, compute_aura_cost
 from prismaquant.kl_fisher import fisher_quadratic_form
 
 
@@ -55,6 +55,70 @@ class _FakeCache:
 def _ids(batch=2, seqlen=8, vocab=64, seed=0):
     g = torch.Generator().manual_seed(seed)
     return torch.randint(0, vocab, (batch, seqlen), generator=g)
+
+
+def test_aura_cb_delta_refuses_unweighted_direct_fallback():
+    with pytest.raises(RuntimeError, match="requires a production-cache render"):
+        _delta_w(
+            "layer.q_proj",
+            "NVFP4_CB_K16",
+            torch.randn(2, 256),
+            cache=None,
+        )
+
+
+def test_aura_cb_provenance_comes_from_cache_not_current_env(monkeypatch):
+    from prismaquant.nvfp4_cb_footprint import (
+        CBSerializationContext,
+        cb_serialization_context_stamp,
+    )
+    from prismaquant.production_weight_cache import (
+        ProductionWeightCache,
+        bind_cb_render_identity_source_weights,
+        build_production_cache_cb_render_identity,
+    )
+
+    torch.manual_seed(9)
+    model = TinyLM().eval()
+    fmt = "NVFP4_CB_K16"
+    context = CBSerializationContext.legacy_v1()
+    col_weights = {"body": torch.ones(model.body.in_features)}
+    identity = build_production_cache_cb_render_identity(
+        {"body": (fmt,)},
+        cb_serialization_context=context,
+        col_weights=col_weights,
+        render_levers={"weighted_vq": True},
+        render_mechanism_plan=[],
+    )
+    identity = bind_cb_render_identity_source_weights(
+        identity,
+        {"body": model.body.weight.detach()},
+    )
+    cache = ProductionWeightCache(
+        weights={
+            ("body", fmt): model.body.weight.detach().clone() + 0.03125,
+        },
+        levers={"weighted_vq": True},
+        metadata={"cb_render_identity": identity},
+    )
+    monkeypatch.setenv("CB_SCALE_CODING", "two_tier")
+    monkeypatch.setenv("CB_CODEBOOK_SOURCE", "lattice")
+
+    payload = compute_aura_cost(
+        model,
+        _ids(batch=1, seqlen=4),
+        [fmt],
+        n_probes=1,
+        n_linear_chunks=1,
+        production_cache=cache,
+        require_production_cache=True,
+        min_free_gib=0.0,
+    )
+
+    assert payload["provenance"]["cb_serialized_payload"] == (
+        identity["cb_serialized_payload"]
+    )
+    assert payload["provenance"]["cb_render_identity"] == identity
 
 
 def test_estimator_matches_exact_fisher_quadratic():
@@ -427,5 +491,3 @@ def test_aura_guard_allows_dense_only_models():
     model = nn.Sequential(nn.Linear(16, 16, bias=False))
 
     assert _guard_packed_expert_coverage(model) == []
-
-

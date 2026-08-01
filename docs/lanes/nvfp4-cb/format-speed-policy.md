@@ -1,5 +1,14 @@
 # Speed-aware format policy: fp8-CB at ~4.5 bpw vs native NVFP4
 
+> **SUPERSEDED AS PRODUCTION POLICY (2026-07-31).** Keep the dated timing
+> observations below as historical evidence only. The 503/503 screen, blanket
+> decode-neutrality inference, and `quality + lambda*time` objective are not
+> ship rules. Production selection minimizes measured/predicted quality loss
+> subject to exact whole-artifact bytes, separate p95 TTFT and p95 ITL/p05 TPS
+> SLOs, resident+KV+peak-scratch memory, backend/shape/TP legality, and
+> serving-unit coupling. Final decisions require same-session served quality
+> and end-to-end timings under an explicitly recorded execution contract.
+
 2026-07-27, per Robert's directive ("seriously consider where it's truly
 appropriate to take the speed hit for the purposes of accuracy"). Every
 number below is measured; sources cited inline.

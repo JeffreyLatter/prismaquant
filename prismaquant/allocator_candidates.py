@@ -15,16 +15,59 @@ from .allocator_solver import (
     _shape_from_stats,
     predicted_dloss,
 )
+from .nvfp4_cb_footprint import (
+    CBSerializationContext,
+    cb_tensor_payload_breakdown,
+    is_cb_format,
+)
 from .serving_profiles import (
     check_serving_format,
     check_serving_shape,
 )
 
-
 PASSTHROUGH_SOURCE_REQUIREMENTS: dict[str, str] = {
     "FP8_SOURCE": "fp8",
     "BF16": "bf16",
 }
+
+
+def serialized_candidate_payload(
+    spec: fr.FormatSpec,
+    shape: tuple[int, ...],
+    *,
+    qname: str,
+    cb_serialization_context: CBSerializationContext | None,
+) -> tuple[int, str | None, str | None]:
+    """Return producer payload bytes + identity for one candidate tensor.
+
+    A CB FormatSpec intentionally describes only the historical nominal body;
+    it cannot encode layout-v1/v2, FP8 row scales, or shared codebook identity.
+    Those formats must use the versioned producer accountant.  Refusing a
+    missing context prevents an old ``4k+16`` estimate from silently leaking
+    back into a production-v2 allocation.
+    """
+    if not is_cb_format(spec.name):
+        return int(spec.memory_bytes_for_shape(shape)), None, None
+    if cb_serialization_context is None:
+        raise ValueError(
+            f"{qname}: exact bytes for {spec.name} require an explicit "
+            "CBSerializationContext (scale coding/layout + codebook identity); "
+            "refusing to price the legacy FormatSpec approximation"
+        )
+    item = cb_tensor_payload_breakdown(
+        spec.name,
+        shape,
+        qname=qname,
+        context=cb_serialization_context,
+    )
+    return (
+        int(item["tensor_payload_bytes"]),
+        (str(item["identity_key"])
+         if item.get("identity_key") is not None else None),
+        (str(item["sidecar_identity_key"])
+         if item.get("sidecar_identity_key") is not None else None),
+    )
+
 
 def _is_passthrough_format(format_name: str) -> bool:
     return format_name in PASSTHROUGH_SOURCE_REQUIREMENTS
@@ -517,6 +560,7 @@ def build_candidates(stats: dict, costs: dict, formats: list[fr.FormatSpec],
                      source_manifest: dict[str, str] | None = None,
                      target_profile: str | None = None,
                      mask_records: list[dict] | None = None,
+                     cb_serialization_context: CBSerializationContext | None = None,
                      ) -> dict[str, list[Candidate]]:
     """Build runtime-legal format candidates for every measured Linear.
 
@@ -622,11 +666,31 @@ def build_candidates(stats: dict, costs: dict, formats: list[fr.FormatSpec],
                 unpriceable.setdefault(name, []).append(spec.name)
                 continue
             source_counts[cost_entry_source(s, entry, spec.name)] += 1
+            (
+                memory_bytes,
+                serialized_identity,
+                serialized_sidecar_identity,
+            ) = serialized_candidate_payload(
+                spec,
+                shape,
+                qname=name,
+                cb_serialization_context=cb_serialization_context,
+            )
+            s.setdefault("_memory_bytes_by_format", {})[spec.name] = memory_bytes
+            if serialized_identity is not None:
+                s.setdefault("_serialized_identity_by_format", {})[
+                    spec.name
+                ] = serialized_identity
+                s.setdefault("_serialized_sidecar_identity_by_format", {})[
+                    spec.name
+                ] = serialized_sidecar_identity
             cands.append(Candidate(
                 fmt=spec.name,
-                bits_per_param=spec.effective_bits_for_shape(shape),
-                memory_bytes=spec.memory_bytes_for_shape(shape),
+                bits_per_param=8.0 * memory_bytes / max(int(math.prod(shape)), 1),
+                memory_bytes=memory_bytes,
                 predicted_dloss=priced,
+                serialized_identity=serialized_identity,
+                serialized_sidecar_identity=serialized_sidecar_identity,
             ))
         if cands:
             out[name] = cands
@@ -884,6 +948,12 @@ def aggregate_fused_siblings(
                 )
             )
 
+        member_by_name = {
+            member: {
+                candidate.fmt: candidate for candidate in candidates[member]
+            }
+            for member in members
+        }
         cands = []
         for spec in formats:
             if spec.name not in member_format_intersection:
@@ -891,10 +961,23 @@ def aggregate_fused_siblings(
             entry = super_cost.get(spec.name)
             if entry is None or "error" in entry:
                 continue
-            total_bytes = 0
-            for m in members:
-                shape = _shape_from_stats(stats[m])
-                total_bytes += spec.memory_bytes_for_shape(shape)
+            total_bytes = sum(
+                int(member_by_name[m][spec.name].memory_bytes) for m in members
+            )
+            serialized_identities = sorted({
+                identity
+                for m in members
+                for identity in (member_by_name[m][spec.name].serialized_identity,)
+                if identity is not None
+            })
+            serialized_sidecar_identities = sorted({
+                identity
+                for m in members
+                for identity in (
+                    member_by_name[m][spec.name].serialized_sidecar_identity,
+                )
+                if identity is not None
+            })
             bits_per_param = 8.0 * total_bytes / max(n_params, 1)
             stats_ext[super_name]["_memory_bytes_by_format"][spec.name] = total_bytes
             entry_fmt = super_cost_entry_fmt.get(spec.name, spec.name)
@@ -912,6 +995,17 @@ def aggregate_fused_siblings(
                 bits_per_param=bits_per_param,
                 memory_bytes=total_bytes,
                 predicted_dloss=max(predicted, 0.0),
+                serialized_identity=(
+                    json.dumps(serialized_identities, separators=(",", ":"))
+                    if serialized_identities else None
+                ),
+                serialized_sidecar_identity=(
+                    json.dumps(
+                        serialized_sidecar_identities,
+                        separators=(",", ":"),
+                    )
+                    if serialized_sidecar_identities else None
+                ),
             ))
         if not cands:
             # Unreachable via the intersection (a common candidate format
@@ -1132,6 +1226,36 @@ def aggregate_packed_serving_groups(
                 bits_per_param=8.0 * total_bytes / max(n_params, 1),
                 memory_bytes=total_bytes,
                 predicted_dloss=max(hedged_pred, 0.0),
+                serialized_identity=(
+                    json.dumps(sorted({
+                        identity
+                        for m in members
+                        for identity in (
+                            member_cands[m][spec.name].serialized_identity,
+                        )
+                        if identity is not None
+                    }), separators=(",", ":"))
+                    if any(
+                        member_cands[m][spec.name].serialized_identity is not None
+                        for m in members
+                    ) else None
+                ),
+                serialized_sidecar_identity=(
+                    json.dumps(sorted({
+                        identity
+                        for m in members
+                        for identity in (
+                            member_cands[m][spec.name]
+                            .serialized_sidecar_identity,
+                        )
+                        if identity is not None
+                    }), separators=(",", ":"))
+                    if any(
+                        member_cands[m][spec.name]
+                        .serialized_sidecar_identity is not None
+                        for m in members
+                    ) else None
+                ),
             ))
         if not cands:
             # No format is legal for every member; aggregating would drop the

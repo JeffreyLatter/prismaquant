@@ -1,5 +1,9 @@
 # Hy3 295B ultra-low-bpp — NVFP4-CB lane (running log)
 
+> Historical run log. Resume observations below describe the July 2026
+> implementation and are not a current capability: as of 2026-07-31 the
+> producer rejects unbound resume/delta reuse and requires a fresh output.
+
 **Model:** tencent Hy3 295B-A21B (hy_v3, 80 layers, 192 experts top-8,
 router `mlp.router.gate.weight` + `mlp.expert_bias`), BF16 source 557 GB
 (non-preview release, verified). **NO QUALITY CLAIMS** (standing rule: a

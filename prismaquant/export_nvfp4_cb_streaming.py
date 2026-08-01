@@ -49,21 +49,23 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import inspect
 import json
+import os
 import pickle
 import re
 import struct
 from collections import Counter
+from functools import wraps
 from pathlib import Path
 
 import torch
 from safetensors import safe_open
 
 from prismaquant import nvfp4_cb_formats as cb
-from prismaquant.layer_config import load_assignment
-from prismaquant.model_profiles import detect_profile
 from prismaquant.export_nvfp4_cb import (
     _canonical_qname,
+    _codebook_tensor_names,
     _codebook_tensors,
     _export_base_name,
     _git_commit,
@@ -71,6 +73,25 @@ from prismaquant.export_nvfp4_cb import (
     _role_of,
     _to_device,
     _try_resolve_skeleton,
+)
+from prismaquant.layer_config import load_assignment
+from prismaquant.model_profiles import detect_profile
+from prismaquant.export_output_safety import (
+    prepare_fresh_export_directory,
+    transactional_directory_output,
+)
+from prismaquant.nvfp4_cb_footprint import (
+    CBSerializationContext,
+    cb_assignment_payload_breakdown,
+    cb_payload_summary,
+    cb_serialization_metadata_from_assignment_payload,
+    cb_tensor_payload_breakdown,
+    finalize_cb_export_artifact_inventory,
+    resolve_cb_encode_tier,
+    whole_artifact_budget_from_assignment_payload,
+    validate_cb_sidecar_tensors,
+    validate_cb_assignment_serialization_stamps,
+    validate_cb_serialization_context_stamp,
 )
 
 # safetensors dtype string codes for the tensors we emit.
@@ -110,9 +131,16 @@ class _LazySkeleton:
             with safe_open(single, framework="pt", device="cpu") as f:
                 self.weight_map = {k: "model.safetensors" for k in f.keys()}
         self._open: dict[str, object] = {}
-        # fp8-block weight_scale_inv sibling map (native-fp8 sources), keyed by
-        # the base name (so `dequant_weight` can apply it on read).
-        self._block_size: tuple[int, int] | None = None
+        try:
+            self._profile = detect_profile(str(self.dir))
+        except Exception:
+            self._profile = None
+        from prismaquant.cb_source_decode import build_cb_source_fp8_scale_map
+
+        # Profile-aware map: legacy `.weight_scale_inv`, DSv4 `.scale`, nested
+        # text/multimodal namespaces, and explicitly declared MXFP4 experts all
+        # share the exact loader-side decode contract.
+        self._fp8_scale_inv_map = build_cb_source_fp8_scale_map(self.dir)
 
     def __contains__(self, name: str) -> bool:
         return name in self.weight_map
@@ -148,38 +176,27 @@ class _LazySkeleton:
     def load(self, name: str) -> torch.Tensor:
         return self._handle(name).get_tensor(name)
 
-    def _fp8_block(self) -> tuple[int, int]:
-        if self._block_size is None:
-            cfg = self.dir / "config.json"
-            bs = (128, 128)
-            if cfg.exists():
-                qc = json.loads(cfg.read_text()).get(
-                    "quantization_config", {}) or {}
-                wbs = qc.get("weight_block_size")
-                if isinstance(wbs, (list, tuple)) and len(wbs) == 2:
-                    bs = (int(wbs[0]), int(wbs[1]))
-            self._block_size = bs
-        return self._block_size
-
     def dequant_weight(self, weight_key: str) -> torch.Tensor:
         """Return the weight as fp32 for encoding. bf16/fp16 sources cast
-        straight through; native-fp8 sources apply the ``weight_scale_inv``
-        block scale (``layer_streaming._dequant_fp8_block_weight``) — the
-        DSv4/MiniMax fp8-block ingestion path."""
+        through the BF16 load contract; native-FP8 and declared MXFP4 sources
+        use layer_streaming's profile-resolved scale/decode path (legacy
+        ``weight_scale_inv`` and architecture-specific pairs such as DSv4's
+        ``.scale`` siblings)."""
+        from prismaquant.cb_source_decode import (
+            cb_source_weight_bf16_value,
+            checkpoint_weight_to_live_name,
+        )
+
         w = self.load(weight_key)
-        if w.dtype == torch.float8_e4m3fn:
-            base = weight_key[:-len(".weight")]
-            sname = base + ".weight_scale_inv"
-            if sname in self.weight_map:
-                from prismaquant.layer_streaming import (
-                    _dequant_fp8_block_weight,
-                )
-                scale = self.load(sname).float()
-                deq = _dequant_fp8_block_weight(
-                    w, scale, block=self._fp8_block(), name=base)
-                return deq.float()
-            # per-tensor-scale fp8 (rare) — fall through to raw cast.
-        return w.to(torch.float32)
+        live_weight_name = checkpoint_weight_to_live_name(
+            weight_key,
+            profile=self._profile,
+        )
+        return cb_source_weight_bf16_value(
+            w,
+            model_weight_name=live_weight_name,
+            fp8_scale_inv_map=self._fp8_scale_inv_map,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -245,7 +262,7 @@ class _StreamWriter:
     def names(self) -> list[str]:
         return [e[0] for e in self._entries]
 
-    def write(self, path: Path) -> None:
+    def write(self, path: Path, *, before_publish=None) -> None:
         header: dict[str, dict] = {}
         off = 0
         for name, dtype, shape, _, _ in self._entries:
@@ -257,100 +274,87 @@ class _StreamWriter:
         hjson = json.dumps(header, separators=(",", ":")).encode("utf-8")
         data0 = 8 + len(hjson)
 
-        # RESUME: offsets are analytic and producers deterministic, so a
-        # partial file identifies exactly which entries are already complete.
-        # Only resume a file whose header matches this plan bit-for-bit
-        # (same assignment/codebooks); otherwise start over.
-        skip = 0
-        if path.exists():
-            size = path.stat().st_size
-            ok = False
-            if size >= data0:
-                with open(path, "rb") as f:
-                    (hlen,) = struct.unpack("<Q", f.read(8))
-                    ok = hlen == len(hjson) and f.read(hlen) == hjson
-            if ok:
-                while skip < len(self._entries):
-                    name = self._entries[skip][0]
-                    if data0 + header[name]["data_offsets"][1] > size:
-                        break
-                    skip += 1
-                # Sibling producers share state (fp8 weight_scale reads the
-                # scale its cb_qweight pack produced) — back the boundary up
-                # to the start of the export-base group. Re-produced entries
-                # rewrite identical bytes (producers are deterministic).
-                base = lambda i: self._entries[i][0].rsplit(".", 1)[0]
-                while 0 < skip < len(self._entries) and \
-                        base(skip) == base(skip - 1):
-                    skip -= 1
-                print(f"[export-cb-stream] resuming {path.name}: "
-                      f"{skip}/{len(self._entries)} entries already written",
-                      flush=True)
-            else:
-                path.unlink()
+        # A safetensors header binds names/dtypes/shapes, not the source
+        # weights, imatrix, codebooks, or exporter implementation.  Reusing a
+        # same-shaped partial file can therefore preserve bytes produced by a
+        # different render while every final span/size assertion still passes.
+        # Resume stays disabled until the header carries one immutable digest
+        # covering all of those producer inputs.
+        if os.path.lexists(path):
+            raise RuntimeError(
+                f"{path}: refusing an unbound streaming resume. The existing "
+                "file header does not prove source/imatrix/codebook/exporter "
+                "identity; use a fresh output directory."
+            )
+        temp_path = path.with_name(f".{path.name}.tmp")
+        if os.path.lexists(temp_path):
+            raise RuntimeError(
+                f"{temp_path}: refusing to overwrite a stale or aliased "
+                "streaming-export temporary file"
+            )
 
         cuda = torch.cuda.is_available()
-        with open(path, "r+b" if skip else "wb") as f:
-            if skip:
-                first = self._entries[skip][0] if skip < len(self._entries) \
-                    else None
-                f.truncate(data0 + (header[first]["data_offsets"][0]
-                                    if first else off))
-                f.seek(0, 2)
-            else:
+        owns_temp = False
+        try:
+            with open(temp_path, "xb") as f:
+                owns_temp = True
                 f.write(struct.pack("<Q", len(hjson)))
                 f.write(hjson)
-            for i, (name, dtype, shape, producer, copy_src) in enumerate(
-                    self._entries[skip:], start=skip):
-                if copy_src is not None:
-                    # DELTA-EXPORT: stream the tensor's raw bytes straight from
-                    # a prior artifact's shard at the recorded offset (no torch
-                    # round-trip; dtype/shape/layout are pinned identical by the
-                    # eligibility gate). Chunked so peak residency stays tiny.
-                    src_path, foff, nb = copy_src
-                    if nb != _nbytes(dtype, shape):
+                for i, (name, dtype, shape, producer, copy_src) in enumerate(
+                        self._entries):
+                    if copy_src is not None:
+                        # DELTA-EXPORT: stream raw bytes from a prior artifact.
+                        src_path, foff, nb = copy_src
+                        if nb != _nbytes(dtype, shape):
+                            raise AssertionError(
+                                f"{name}: copy_src {nb}B != declared "
+                                f"{_nbytes(dtype, shape)}B")
+                        with open(src_path, "rb") as sf:
+                            sf.seek(foff)
+                            remaining = nb
+                            while remaining:
+                                chunk = sf.read(min(remaining, 1 << 24))
+                                if not chunk:
+                                    raise AssertionError(
+                                        f"{name}: prior artifact truncated at "
+                                        f"offset {foff} (needed {nb}B)")
+                                f.write(chunk)
+                                remaining -= len(chunk)
+                        if i % 50 == 0 or nb > (1 << 30):
+                            print(f"[export-cb-stream] {i + 1}/"
+                                  f"{len(self._entries)} {name} copied "
+                                  f"{nb / 2**30:.2f}G from prior", flush=True)
+                        continue
+                    t = producer()
+                    if t.dtype != dtype or tuple(t.shape) != shape:
                         raise AssertionError(
-                            f"{name}: copy_src {nb}B != declared "
-                            f"{_nbytes(dtype, shape)}B")
-                    with open(src_path, "rb") as sf:
-                        sf.seek(foff)
-                        remaining = nb
-                        while remaining:
-                            chunk = sf.read(min(remaining, 1 << 24))
-                            if not chunk:
-                                raise AssertionError(
-                                    f"{name}: prior artifact truncated at "
-                                    f"offset {foff} (needed {nb}B)")
-                            f.write(chunk)
-                            remaining -= len(chunk)
-                    if i % 50 == 0 or nb > (1 << 30):
-                        print(f"[export-cb-stream] {i + 1}/"
-                              f"{len(self._entries)} {name} copied "
-                              f"{nb / 2**30:.2f}G from prior", flush=True)
-                    continue
-                t = producer()
-                if t.dtype != dtype or tuple(t.shape) != shape:
-                    raise AssertionError(
-                        f"{name}: produced {t.dtype}{tuple(t.shape)} != "
-                        f"declared {dtype}{shape}")
-                b = _raw_bytes(t)
-                if len(b) != _nbytes(dtype, shape):
-                    raise AssertionError(f"{name}: byte count mismatch")
-                f.write(b)
-                del t, b
-                if cuda:
-                    # Unified-memory hygiene: differently-shaped 10GB-class
-                    # pack transients must not accumulate as cached segments
-                    # (Hy3 2026-07-19 global OOM 2GB into the write).
-                    torch.cuda.empty_cache()
-                    if i % 20 == 0 or _nbytes(dtype, shape) > (1 << 30):
-                        print(f"[export-cb-stream] {i + 1}/"
-                              f"{len(self._entries)} {name} "
-                              f"cuda alloc "
-                              f"{torch.cuda.memory_allocated() / 2**30:.1f}G "
-                              f"reserved "
-                              f"{torch.cuda.memory_reserved() / 2**30:.1f}G",
-                              flush=True)
+                            f"{name}: produced {t.dtype}{tuple(t.shape)} != "
+                            f"declared {dtype}{shape}")
+                    b = _raw_bytes(t)
+                    if len(b) != _nbytes(dtype, shape):
+                        raise AssertionError(f"{name}: byte count mismatch")
+                    f.write(b)
+                    del t, b
+                    if cuda:
+                        # Unified-memory hygiene: differently-shaped 10GB-class
+                        # pack transients must not accumulate as cached segments.
+                        torch.cuda.empty_cache()
+                        if i % 20 == 0 or _nbytes(dtype, shape) > (1 << 30):
+                            print(f"[export-cb-stream] {i + 1}/"
+                                  f"{len(self._entries)} {name} "
+                                  f"cuda alloc "
+                                  f"{torch.cuda.memory_allocated() / 2**30:.1f}G "
+                                  f"reserved "
+                                  f"{torch.cuda.memory_reserved() / 2**30:.1f}G",
+                                  flush=True)
+            if before_publish is not None:
+                before_publish()
+            os.replace(temp_path, path)
+            owns_temp = False
+        except Exception:
+            if owns_temp and os.path.lexists(temp_path):
+                temp_path.unlink()
+            raise
 
 
 # ---------------------------------------------------------------------------
@@ -621,6 +625,32 @@ def _reuse_verify_and_report(prior, reuse, reuse_verify, reuse_prior,
 # Streaming export
 # ---------------------------------------------------------------------------
 
+def _reject_disabled_reuse_before_output_transaction(function):
+    """Preserve the quarantine gate ahead of any resume/output interpretation."""
+    signature = inspect.signature(function)
+
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        bound = signature.bind(*args, **kwargs)
+        bound.apply_defaults()
+        if bound.arguments.get("reuse_prior") is not None:
+            raise RuntimeError(
+                "DELTA-EXPORT reuse is disabled: the prior artifact is not "
+                "bound to exact source-content, imatrix, codebook, and "
+                "exporter-ABI identity for every copied tensor. Re-encode "
+                "into a fresh output directory."
+            )
+        return function(*args, **kwargs)
+
+    return wrapped
+
+
+@_reject_disabled_reuse_before_output_transaction
+@transactional_directory_output(
+    source_parameter="model_dir",
+    output_parameter="out_dir",
+    where="export_nvfp4_cb_streaming",
+)
 def export_nvfp4_cb_streaming(
     model_dir: str | Path,
     layer_config_path: str | Path,
@@ -630,10 +660,11 @@ def export_nvfp4_cb_streaming(
     shared_codebook_spec: dict | None = None,
     device: str | None = None,
     scale_sweep: bool = True,
-    scale_coding: str = cb.SCALE_CODING_V1,
+    scale_coding: str = cb.SCALE_CODING_TWO_TIER,
     subset_prefixes: list[str] | None = None,
     reuse_prior: str | Path | None = None,
     reuse_verify: int = 3,
+    allow_unstamped_research: bool = False,
 ) -> dict[str, int]:
     """Streaming counterpart of :func:`export_nvfp4_cb.export_nvfp4_cb`. Same
     signature + container; peak residency ~= one source tensor + codebooks.
@@ -647,24 +678,29 @@ def export_nvfp4_cb_streaming(
     Used to export just the MTP sidecar (``model.layers.80.``) without dragging
     the ~550 GB body through as bf16 passthrough.
 
-    ``reuse_prior`` (opt-in DELTA-EXPORT; default ``None`` == byte-identical to
-    today) points at a PRIOR artifact dir. On a re-allocation of the same source
-    most CB/stock targets keep their exact ``(format, scheme, codebook)``, so
-    their re-encode would reproduce byte-identical tensors (the producers are
-    deterministic — the RESUME contract). Such targets are byte-copied straight
-    from the prior's shard file(s) instead of re-encoded; ineligible/changed
-    targets encode fresh, silently. ``reuse_verify`` (default 3, env
-    ``PRISMAQUANT_EXPORT_REUSE_VERIFY``) freshly re-encodes N random copy-eligible
-    CB targets and byte-compares them against the copied bytes — any mismatch
-    means the determinism contract broke and ABORTS the export (nothing is
-    written). FP8_SOURCE + BF16 passthrough deliberately stay on the source path
-    (verbatim/raw already, and a cross-artifact copy has no IO win but adds a
-    wrong-prior footgun the CB-only verification would not catch)."""
+    ``reuse_prior`` is reserved but currently fails closed. The prior gate did
+    not bind exact source content, treated an imatrix mismatch as a warning,
+    sampled only some CB targets, and copied stock targets on dtype/shape alone.
+    Reuse may return only after one immutable producer-input identity covers
+    source bytes, imatrix, codebooks, scheme, and exporter ABI for every copied
+    tensor. ``reuse_verify`` is retained only for CLI compatibility while reuse
+    is blocked."""
     model_dir = Path(model_dir)
     out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    if reuse_prior is not None:
+        raise RuntimeError(
+            "DELTA-EXPORT reuse is disabled: the prior artifact is not bound "
+            "to exact source-content, imatrix, codebook, and exporter-ABI "
+            "identity for every copied tensor. Re-encode into a fresh output "
+            "directory."
+        )
     if scale_coding not in (cb.SCALE_CODING_V1, cb.SCALE_CODING_TWO_TIER):
         raise ValueError(f"unknown scale_coding {scale_coding!r}")
+    out_dir = prepare_fresh_export_directory(
+        model_dir,
+        out_dir,
+        where="export_nvfp4_cb_streaming",
+    )
     subset_prefixes = list(subset_prefixes) if subset_prefixes else None
     prior = _PriorArtifact(reuse_prior) if reuse_prior else None
     reuse = {"copied": 0, "encoded": 0, "verified": 0,
@@ -677,6 +713,19 @@ def export_nvfp4_cb_streaming(
         raise ValueError(f"shared_codebook_spec source must be lattice/learned")
 
     assignment = load_assignment(layer_config_path)
+    _recipe_payload = json.loads(Path(layer_config_path).read_text())
+    _recipe_cb_context_stamp, _recipe_cb_tensor_stamps = (
+        cb_serialization_metadata_from_assignment_payload(_recipe_payload)
+    )
+    _recipe_meta = _recipe_payload.get("__prismaquant__", {})
+    _recipe_cb_render_identity = _recipe_payload.get("cb_render_identity")
+    if _recipe_cb_render_identity is None and isinstance(_recipe_meta, dict):
+        _recipe_cb_render_identity = _recipe_meta.get("cb_render_identity")
+    _whole_artifact_budget = whole_artifact_budget_from_assignment_payload(
+        _recipe_payload,
+        where="export_nvfp4_cb_streaming layer config",
+        assignment=assignment,
+    )
     skeleton = _LazySkeleton(model_dir)
     try:
         profile = detect_profile(str(model_dir))
@@ -893,6 +942,68 @@ def export_nvfp4_cb_streaming(
         for q in qnames:
             target_cb[q] = (ref, fmt, codebooks[(ref, fmt)], kind)
 
+    materialized_codebook_tensors = {
+        name: tensor
+        for (ref, fmt), codebook in codebooks.items()
+        for name, tensor in _codebook_tensors(ref, fmt, codebook).items()
+    }
+    materialized_codebook_digests = {
+        name: hashlib.sha256(
+            tensor.to(torch.float16).cpu().contiguous().numpy().tobytes()
+        ).hexdigest()
+        for name, tensor in materialized_codebook_tensors.items()
+    }
+    serialization_context = CBSerializationContext(
+        scale_coding=scale_coding,
+        codebook_source=source,
+        scale_sweep=bool(scale_sweep),
+        encode_tier=resolve_cb_encode_tier(),
+        codebook_refs={
+            qname: _codebook_tensor_names(ref, fmt, codebook)
+            for qname, (ref, fmt, codebook, _kind) in target_cb.items()
+        },
+        codebook_content_digests=materialized_codebook_digests,
+    )
+    validate_cb_serialization_context_stamp(
+        _recipe_cb_context_stamp,
+        serialization_context,
+        where="export_nvfp4_cb_streaming",
+    )
+    production_recipe_stamped = (
+        _recipe_cb_context_stamp is not None or bool(_recipe_cb_tensor_stamps)
+    )
+    if cb_targets and _recipe_cb_render_identity is not None:
+        from prismaquant.production_weight_cache import (
+            validate_cb_render_identity_metadata,
+        )
+
+        validate_cb_render_identity_metadata(
+            _recipe_cb_render_identity,
+            expected_context=serialization_context,
+            expected_formats_by_qname={
+                qname: (assignment[qname],) for qname in sorted(cb_targets)
+            },
+            col_weights=col_weights,
+            where="export_nvfp4_cb_streaming assignment render identity",
+        )
+    elif cb_targets and production_recipe_stamped:
+        raise ValueError(
+            "export_nvfp4_cb_streaming: stamped production CB assignment is "
+            "missing its value-bearing render identity"
+        )
+    elif cb_targets and not allow_unstamped_research:
+        raise ValueError(
+            "export_nvfp4_cb_streaming: CB export requires a value-bearing "
+            "render identity; pass allow_unstamped_research=True only for "
+            "an explicit non-production experiment"
+        )
+    elif _recipe_cb_render_identity is not None:
+        raise ValueError(
+            "export_nvfp4_cb_streaming: non-CB assignment carries a stale "
+            "CB render identity"
+        )
+    verified_cb_source_qnames: set[str] = set()
+
     # DELTA-EXPORT: a CB group's codebook is a byte-copy input, so compare this
     # run's serialized codebook against the prior sidecar ONCE per (ref, fmt).
     # A group whose codebook differs makes every target on it re-encode.
@@ -917,6 +1028,9 @@ def export_nvfp4_cb_streaming(
     source_set = set(source_targets)
     stock_set = set(stock_targets)
     emitted_bases: set[str] = set()   # checkpoint tensor keys we consume
+    cb_serialized_shapes: dict[str, tuple[int, ...]] = {}
+    cb_output_tensor_names: set[str] = set()
+    planned_cb_tensor_bytes = 0
 
     # CB + FP8_SOURCE targets (keyed by canonical/recipe qname).
     for qname in list(cb_targets) + list(source_targets):
@@ -924,12 +1038,13 @@ def export_nvfp4_cb_streaming(
         kind, h = _resolve_target(qname)
         if qname in source_set:
             wkey = _try_resolve_skeleton(qname, skeleton, profile)
-            skey = _try_resolve_skeleton(qname, skeleton, profile,
-                                         ".weight_scale_inv")
-            if wkey is None or skey is None or \
+            scale_entry = skeleton._fp8_scale_inv_map.get(qname + ".weight")
+            skey = scale_entry[1] if scale_entry is not None else None
+            if wkey is None or skey not in skeleton or \
                     skeleton.get_dtype(wkey) != torch.float8_e4m3fn:
                 raise ValueError(
-                    f"{qname}: FP8_SOURCE but source is not native fp8")
+                    f"{qname}: FP8_SOURCE but source is not native fp8 with "
+                    "a profile-resolved serialized scale")
             emitted_bases.add(wkey)
             emitted_bases.add(skey)
             wsh = skeleton.get_shape(wkey)
@@ -955,6 +1070,19 @@ def export_nvfp4_cb_streaming(
             emitted_bases.add(h)
         packed_shape = ((shape[0], shape[1], n_sb * ts) if len(shape) == 3
                         else (rows, n_sb * ts))
+        payload = cb_tensor_payload_breakdown(
+            fmt,
+            shape,
+            qname=qname,
+            context=serialization_context,
+        )
+        planned_packed_bytes = _nbytes(torch.uint8, packed_shape)
+        if planned_packed_bytes != payload["packed_weight_bytes"]:
+            raise AssertionError(
+                f"{qname}: streaming cb_qweight plan is "
+                f"{planned_packed_bytes}B, accounting expected "
+                f"{payload['packed_weight_bytes']}B"
+            )
         state: dict = {}
 
         def _pack(qname=qname, h=(kind, h), grid=grid, mode=mode, k=k,
@@ -962,17 +1090,40 @@ def export_nvfp4_cb_streaming(
                   packed_shape=packed_shape, state=state):
             packed, scale = _stream_pack_target(
                 skeleton, profile, h, qname, grid, mode, k, codebook,
-                col_weights[qname], scale_sweep, coding, shape, device)
+                col_weights[qname], scale_sweep, coding, shape, device,
+                serialization_context.encode_tier,
+                _recipe_cb_render_identity,
+                verified_cb_source_qnames)
             state["scale"] = scale
             return packed.reshape(packed_shape)
 
         qw_name = export_base + ".cb_qweight"
         scale_shape = tuple(int(d) for d in shape[:-1])
         scale_name = export_base + ".weight_scale"
+        planned_scale_bytes = (
+            _nbytes(torch.float32, scale_shape) if grid == "fp8" else 0
+        )
+        if planned_scale_bytes != payload["fp8_row_scale_bytes"]:
+            raise AssertionError(
+                f"{qname}: streaming row-scale plan is "
+                f"{planned_scale_bytes}B, accounting expected "
+                f"{payload['fp8_row_scale_bytes']}B"
+            )
+        planned_tensor_bytes = planned_packed_bytes + planned_scale_bytes
+        if planned_tensor_bytes != payload["tensor_payload_bytes"]:
+            raise AssertionError(
+                f"{qname}: streaming CB tensor plan is "
+                f"{planned_tensor_bytes}B, accounting expected "
+                f"{payload['tensor_payload_bytes']}B"
+            )
+        cb_serialized_shapes[qname] = tuple(int(dim) for dim in shape)
+        planned_cb_tensor_bytes += planned_tensor_bytes
         # Planned output tensors (name, dtype, shape) — the eligibility gate.
         expected = [(qw_name, torch.uint8, packed_shape)]
+        cb_output_tensor_names.add(qw_name)
         if grid == "fp8":
             expected.append((scale_name, torch.float32, scale_shape))
+            cb_output_tensor_names.add(scale_name)
 
         # DELTA-EXPORT eligibility: same format + scheme signature + byte-equal
         # codebook + every planned output already present in the prior at the
@@ -1007,7 +1158,10 @@ def export_nvfp4_cb_streaming(
                        qw_name=qw_name, scale_name=scale_name):
                 packed, scale = _stream_pack_target(
                     skeleton, profile, h, qname, grid, mode, k, codebook,
-                    col_weights[qname], scale_sweep, coding, shape, device)
+                    col_weights[qname], scale_sweep, coding, shape, device,
+                    serialization_context.encode_tier,
+                    _recipe_cb_render_identity,
+                    verified_cb_source_qnames)
                 out = {qw_name: packed.reshape(packed_shape)}
                 if scale is not None:
                     out[scale_name] = scale.reshape(scale_shape).to(
@@ -1100,13 +1254,18 @@ def export_nvfp4_cb_streaming(
             for proj, ids in projs.items():
                 for e, base in ids.items():
                     consumed_expert_bases.add(base + ".weight")
+    resolved_source_scale_keys = {
+        entry[1] for entry in skeleton._fp8_scale_inv_map.values()
+    }
     for name in skeleton.keys():
         if subset_prefixes is not None and \
                 not any(name.startswith(p) for p in subset_prefixes):
             continue   # outside the declared subset (e.g. non-MTP body layers)
         if name in emitted_bases or name in consumed_expert_bases:
             continue
-        if name.endswith(".weight_scale_inv"):
+        if name in resolved_source_scale_keys or name.endswith(
+            ".weight_scale_inv"
+        ):
             continue   # consumed with its fp8 weight, or an unused sidecar
         ckpt_qname = (name[:-len(".weight")] if name.endswith(".weight")
                       else None)
@@ -1123,15 +1282,46 @@ def export_nvfp4_cb_streaming(
         counts["copied"] += 1
 
     # --- Codebook sidecar (small; in-memory) + config + write. ---
-    cb_tensor_blobs: dict[str, torch.Tensor] = {}
-    for (ref, fmt), codebook in codebooks.items():
-        for tname, blob in _codebook_tensors(ref, fmt, codebook).items():
-            cb_tensor_blobs[tname] = blob
+    cb_tensor_blobs: dict[str, torch.Tensor] = dict(
+        materialized_codebook_tensors
+    )
     codebook_file = "cb_codebooks.pqcb" if cb_tensor_blobs else None
+    if set(cb_serialized_shapes) != set(cb_targets):
+        missing = sorted(set(cb_targets) - set(cb_serialized_shapes))
+        extra = sorted(set(cb_serialized_shapes) - set(cb_targets))
+        raise AssertionError(
+            "streaming CB payload coverage does not match assignment: "
+            f"missing={missing[:5]}, extra={extra[:5]}"
+        )
+    serialized_payload = cb_assignment_payload_breakdown(
+        {qname: assignment[qname] for qname in cb_targets},
+        cb_serialized_shapes,
+        context=serialization_context,
+    )
+    if _recipe_cb_context_stamp is not None or _recipe_cb_tensor_stamps:
+        validate_cb_assignment_serialization_stamps(
+            {qname: assignment[qname] for qname in cb_targets},
+            cb_serialized_shapes,
+            context=serialization_context,
+            stamps=_recipe_cb_tensor_stamps,
+            where="export_nvfp4_cb_streaming",
+        )
+    if planned_cb_tensor_bytes != serialized_payload["tensor_payload_bytes"]:
+        raise AssertionError(
+            f"streaming CB plan is {planned_cb_tensor_bytes}B, accounting "
+            f"expected {serialized_payload['tensor_payload_bytes']}B"
+        )
+    validate_cb_sidecar_tensors(
+        serialized_payload,
+        cb_tensor_blobs,
+        where="export_nvfp4_cb_streaming",
+    )
+    serialized_payload_summary = cb_payload_summary(serialized_payload)
     quant_config = _build_config(
         assignment, cb_targets, source_targets, stock_targets, by_group,
         codebooks, col_weights, cb_tensor_blobs, ignore, codebook_file,
-        scale_coding, source, profile)
+        scale_coding, source, profile, serialized_payload_summary,
+        serialization_context, _recipe_cb_render_identity)
 
     # DELTA-EXPORT: verify sampled copies + log the summary BEFORE writing (an
     # abort here leaves no partial artifact). No-op when reuse is disabled.
@@ -1143,12 +1333,27 @@ def export_nvfp4_cb_streaming(
     print(f"[export-cb-stream] streaming {len(writer.names())} tensors ...",
           flush=True)
     from safetensors.torch import save_file
-    writer.write(out_dir / "model.safetensors")
+
+    def _assert_source_coverage_before_publish():
+        if (
+            _recipe_cb_render_identity is not None
+            and verified_cb_source_qnames != set(cb_targets)
+        ):
+            raise AssertionError(
+                "streaming CB source-value validation did not cover the exact "
+                "assignment: missing="
+                f"{sorted(set(cb_targets) - verified_cb_source_qnames)[:8]}, "
+                "extra="
+                f"{sorted(verified_cb_source_qnames - set(cb_targets))[:8]}"
+            )
+
+    writer.write(
+        out_dir / "model.safetensors",
+        before_publish=_assert_source_coverage_before_publish,
+    )
     if cb_tensor_blobs:
         save_file(cb_tensor_blobs, str(out_dir / codebook_file),
                   metadata={"format": "pt"})
-    (out_dir / "quant_config.json").write_text(
-        json.dumps(quant_config, indent=2, sort_keys=True))
     src_config = model_dir / "config.json"
     config = json.loads(src_config.read_text()) if src_config.exists() else {}
     config["quantization_config"] = {
@@ -1163,11 +1368,29 @@ def export_nvfp4_cb_streaming(
         p = model_dir / aux
         if p.exists():
             (out_dir / aux).write_bytes(p.read_bytes())
+    # Persist and assert a final filesystem inventory distinct from the CB
+    # tensor-data payload contract.  This includes both safetensors headers,
+    # JSON configs, tokenizer assets, and all other regular output files.
+    finalize_cb_export_artifact_inventory(
+        out_dir,
+        quant_config,
+        serialized_payload=serialized_payload_summary,
+        cb_tensor_names=sorted(cb_output_tensor_names),
+        codebook_file=codebook_file,
+        expected_model_files=["model.safetensors"],
+        whole_artifact_budget_bytes=(
+            int(_whole_artifact_budget["budget_bytes"])
+            if _whole_artifact_budget is not None
+            else None
+        ),
+    )
     return dict(counts)
 
 
 def _stream_pack_target(skeleton, profile, resolved, qname, grid, mode, k,
-                        codebook, cw, scale_sweep, coding, shape, device):
+                        codebook, cw, scale_sweep, coding, shape, device,
+                        encode_tier, cb_render_identity,
+                        verified_source_qnames):
     """Pack ONE target, streaming experts. Returns (packed uint8 (rows,bytes)
     or (E,out,bytes), scale-plane fp32 or None). Per-expert scales make
     per-expert packing byte-identical to whole-stack packing."""
@@ -1175,9 +1398,21 @@ def _stream_pack_target(skeleton, profile, resolved, qname, grid, mode, k,
     cbook = _to_device(codebook, device)
     if kind == "tensor":
         w = skeleton.dequant_weight(h).to(device)
+        if cb_render_identity is not None:
+            from prismaquant.production_weight_cache import (
+                validate_cb_render_source_weight,
+            )
+            validate_cb_render_source_weight(
+                cb_render_identity,
+                qname,
+                w,
+                where="export_nvfp4_cb_streaming source tensor",
+            )
+            verified_source_qnames.add(qname)
         packed, fields = cb.nvfp4_cb_pack(
             w, k, grid=grid, mode=mode, col_weights=cw.to(device),
-            codebook=cbook, scale_sweep=scale_sweep, scale_coding=coding)
+            codebook=cbook, scale_sweep=scale_sweep, scale_coding=coding,
+            encode_tier=encode_tier)
         if w.dim() == 3:
             packed = packed.reshape(w.shape[0], w.shape[1], -1)
         scale = (fields["scales"].reshape(*w.shape[:-1]).cpu()
@@ -1192,9 +1427,21 @@ def _stream_pack_target(skeleton, profile, resolved, qname, grid, mode, k,
     n = _n_experts(grp)
     w = torch.stack([_expert_weight(skeleton, prefix, packed_proj, grp, e)
                      for e in range(n)]).to(device)
+    if cb_render_identity is not None:
+        from prismaquant.production_weight_cache import (
+            validate_cb_render_source_weight,
+        )
+        validate_cb_render_source_weight(
+            cb_render_identity,
+            qname,
+            w,
+            where="export_nvfp4_cb_streaming expert stack",
+        )
+        verified_source_qnames.add(qname)
     packed, fields = cb.nvfp4_cb_pack(
         w, k, grid=grid, mode=mode, col_weights=cw.to(device),
-        codebook=cbook, scale_sweep=scale_sweep, scale_coding=coding)
+        codebook=cbook, scale_sweep=scale_sweep, scale_coding=coding,
+        encode_tier=encode_tier)
     packed = packed.reshape(w.shape[0], w.shape[1], -1)
     scale = (fields["scales"].reshape(*w.shape[:-1]).cpu()
              if grid == "fp8" else None)
@@ -1227,7 +1474,9 @@ def _train_shared_codebook_streaming(skeleton, profile, expert_groups,
 
 def _build_config(assignment, cb_targets, source_targets, stock_targets,
                   by_group, codebooks, col_weights, cb_tensor_blobs, ignore,
-                  codebook_file, scale_coding, source, profile):
+                  codebook_file, scale_coding, source, profile,
+                  serialized_payload_summary, serialization_context,
+                  cb_render_identity):
     """quant_config.json — mirrors export_nvfp4_cb's config emitter exactly
     (CB config_groups keyed by scheme signature + stock-CT / FP8_SOURCE groups
     in the exact compressed-tensors vocabulary + provenance)."""
@@ -1313,9 +1562,19 @@ def _build_config(assignment, cb_targets, source_targets, stock_targets,
             "git_commit": _git_commit(), "assignment_sha256": assignment_sha,
             "imatrix_sha256": imatrix_sha, "codebook_sha256": codebook_sha,
             "codebook_source": source, "scale_coding": scale_coding,
+            "scale_sweep": serialization_context.scale_sweep,
+            "encode_tier": serialization_context.encode_tier,
+            "renderer_abi": serialization_context.renderer_abi,
             "streaming": True, "cb_targets": len(cb_targets),
             "stock_ct_targets": len(stock_targets),
             "fp8_source_targets": len(source_targets),
+            "serialized_payload": serialized_payload_summary,
+            "render_identity_verified": bool(
+                cb_render_identity is not None
+            ),
+            **({
+                "cb_render_identity": cb_render_identity,
+            } if cb_render_identity is not None else {}),
         },
     }
     if scale_coding == cb.SCALE_CODING_TWO_TIER:
@@ -1335,8 +1594,20 @@ def main(argv=None) -> None:
     ap.add_argument("--codebook-iters", type=int, default=4)
     ap.add_argument("--codebook-seed", type=int, default=0)
     ap.add_argument("--no-scale-sweep", action="store_true")
-    ap.add_argument("--scale-coding", default=cb.SCALE_CODING_V1,
-                    choices=[cb.SCALE_CODING_V1, cb.SCALE_CODING_TWO_TIER])
+    ap.add_argument(
+        "--allow-unstamped-research",
+        action="store_true",
+        help="unsafe research-only escape hatch for a bare CB assignment; "
+        "production recipes must carry a source/imatrix-complete render "
+        "identity",
+    )
+    ap.add_argument(
+        "--scale-coding",
+        default=cb.SCALE_CODING_TWO_TIER,
+        choices=[cb.SCALE_CODING_V1, cb.SCALE_CODING_TWO_TIER],
+        help="production layout-v2 two-tier coding (default), or explicit "
+        "legacy v1 for backward-compatible artifacts",
+    )
     ap.add_argument("--device", default=None)
     ap.add_argument("--subset-prefix", action="append", default=None,
                     metavar="PREFIX",
@@ -1345,19 +1616,17 @@ def main(argv=None) -> None:
                          "MTP sidecar; every allocation target must fall within "
                          "it. Default: whole-model passthrough.")
     ap.add_argument("--reuse-prior", default=None, metavar="DIR",
-                    help="opt-in DELTA-EXPORT: byte-copy CB/stock targets whose "
-                         "(format, scheme, codebook) are unchanged from this "
-                         "PRIOR artifact dir instead of re-encoding; the delta "
-                         "encodes fresh. Env PRISMAQUANT_EXPORT_REUSE_PRIOR is "
-                         "the fallback. Default: encode everything.")
+                    help="reserved DELTA-EXPORT input; currently fails closed "
+                         "until exact source/imatrix/codebook/exporter identity "
+                         "is implemented. Env PRISMAQUANT_EXPORT_REUSE_PRIOR "
+                         "is also rejected.")
     ap.add_argument("--reuse-verify", type=int, default=None, metavar="N",
-                    help="reuse safety: fresh re-encode N random copy-eligible "
-                         "CB targets and byte-check them (default 3, env "
-                         "PRISMAQUANT_EXPORT_REUSE_VERIFY); a mismatch aborts.")
+                    help="reserved compatibility option while DELTA-EXPORT is "
+                         "disabled (default 3; env "
+                         "PRISMAQUANT_EXPORT_REUSE_VERIFY)")
     args = ap.parse_args(argv)
     from prismaquant.gpu_guard import require_cuda_hot_path
     require_cuda_hot_path("export_nvfp4_cb_streaming")
-    import os
     reuse_prior = args.reuse_prior or os.environ.get(
         "PRISMAQUANT_EXPORT_REUSE_PRIOR") or None
     reuse_verify = (args.reuse_verify if args.reuse_verify is not None
@@ -1379,7 +1648,8 @@ def main(argv=None) -> None:
         shared_codebook_spec=spec, device=args.device,
         scale_sweep=not args.no_scale_sweep, scale_coding=args.scale_coding,
         subset_prefixes=args.subset_prefix, reuse_prior=reuse_prior,
-        reuse_verify=reuse_verify)
+        reuse_verify=reuse_verify,
+        allow_unstamped_research=args.allow_unstamped_research)
     size = sum(p.stat().st_size for p in Path(args.out).glob("*")) / 1e9
     print(f"wrote {args.out} ({size:.3f} GB)")
     for fmt, n in sorted(counts.items()):

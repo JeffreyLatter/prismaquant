@@ -16,6 +16,7 @@ import pytest
 
 from prismaquant import footprint as fp
 from prismaquant import format_registry as fr
+from prismaquant.nvfp4_cb_footprint import CBSerializationContext
 
 
 def _write_safetensors(path, tensors):
@@ -135,6 +136,47 @@ def test_assignment_artifact_bytes_bf16_passthrough_is_floor_equivalent():
         source_total_bytes=3264, regime="bf16", source_manifest=None,
     )
     assert r["artifact_bytes"] == 3264
+
+
+def test_assignment_artifact_bytes_cb_uses_exact_tensor_and_shared_sidecar():
+    names = ["layer.0.q_proj", "layer.1.q_proj"]
+    stats = {
+        name: {
+            "n_params": 64 * 256,
+            "in_features": 256,
+            "out_features": 64,
+        }
+        for name in names
+    }
+    source_total = 2 * 64 * 256 * 2 + 1234
+    assignment = {name: "NVFP4_CB_K16" for name in names}
+    with pytest.raises(ValueError, match="CBSerializationContext"):
+        fp.assignment_artifact_bytes(
+            assignment,
+            stats,
+            source_total_bytes=source_total,
+            regime="bf16",
+            source_manifest=None,
+        )
+    result = fp.assignment_artifact_bytes(
+        assignment,
+        stats,
+        source_total_bytes=source_total,
+        regime="bf16",
+        source_manifest=None,
+        cb_serialization_context=CBSerializationContext.production(),
+    )
+    tensor_bytes = 2 * 64 * (4 * 16 + 9)
+    sidecar_bytes = 2 * 256 * 4 * 2
+    assert result["floor_bytes"] == 1234
+    assert result["cb_tensor_payload_bytes"] == tensor_bytes
+    assert result["cb_codebook_sidecar_bytes"] == sidecar_bytes
+    assert result["body_quant_bytes"] == tensor_bytes + sidecar_bytes
+    assert result["artifact_bytes"] == 1234 + tensor_bytes + sidecar_bytes
+    assert result["artifact_payload_bytes"] == result["artifact_bytes"]
+    assert result["artifact_byte_scope"] == "safetensors_tensor_data_spans"
+    assert result["export_directory_bytes"] is None
+    assert result["cb_serialized_payload"]["global_scale_bytes"] == 0
 
 
 def test_assignment_artifact_bytes_missing_stats_stay_in_floor():

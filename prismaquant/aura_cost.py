@@ -51,6 +51,10 @@ from prismaquant.kl_fisher import (
     token_count_for_logits,
 )
 from prismaquant.perturbed_x_cache import calibration_data_hash
+from prismaquant.nvfp4_cb_footprint import (
+    cb_cost_provenance,
+    is_cb_format,
+)
 
 SCHEMA = "prismaquant.aura_cost.v1"
 
@@ -226,11 +230,18 @@ def _delta_w(
                 f"for ({name!r}, {fmt!r}); refusing silent RTN fallback. Build the "
                 f"cache for this (Linear, format) or drop --require-production-cache.")
     spec = fr.get_format(fmt)
+    if is_cb_format(spec.name):
+        raise RuntimeError(
+            f"{name}={spec.name}: AURA CB delta requires a production-cache "
+            "render with the production col_weights/codebook contract; "
+            "refusing the unweighted direct fallback"
+        )
     qdq = getattr(spec, "quantize_dequantize", None)
     if qdq is None:
         return None
     try:
-        return qdq(weight.float()) - weight.float(), "rtn"
+        rendered = qdq(weight.float())
+        return rendered - weight.float(), "rtn"
     except Exception:
         return None
 
@@ -405,6 +416,22 @@ def compute_aura_cost(
     names = list(linears.keys())
     fmts = [fr.canonical_format_name(f) for f in formats]
     nonzero_fmts = [f for f in fmts if f not in _ZERO_COST_FORMATS]
+    cb_provenance: dict[str, object] = {}
+    if any(is_cb_format(fmt) for fmt in fmts):
+        if production_cache is None:
+            raise RuntimeError(
+                "AURA CB cost requires a ProductionWeightCache with a "
+                "persisted CB render identity"
+            )
+        from prismaquant.production_weight_cache import (
+            production_cache_cb_render_provenance,
+        )
+
+        cb_provenance = production_cache_cb_render_provenance(
+            production_cache,
+            require_for_formats=fmts,
+            where="AURA production cache",
+        )
     # Passthrough-rule guard (opt-in; default off keeps the output byte-for-byte
     # identical). BF16 zero-cost is only valid when the source weight is already
     # bf16/fp16 -- on an fp32-source model loaded as fp32, casting W to BF16 is a
@@ -755,6 +782,11 @@ def compute_aura_cost(
             "dw_rendered_rows": n_rendered,
             "dw_rtn_fallback_rows": n_rtn,
             "git_commit": _git_commit(),
+            **(
+                cb_provenance
+                if cb_provenance
+                else cb_cost_provenance(fmts)
+            ),
         },
     }
 

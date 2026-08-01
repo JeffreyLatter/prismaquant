@@ -8,6 +8,10 @@ from prismaquant.allocator import (
     _write_bit_attribution_reports,
 )
 from prismaquant.allocator_solver import Candidate
+from prismaquant.nvfp4_cb_footprint import (
+    CBSerializationContext,
+    cb_assignment_payload_breakdown,
+)
 
 
 def test_parse_role_distinguishes_dense_attn_mlp():
@@ -63,10 +67,11 @@ def test_build_bit_attribution_buckets_and_body_totals():
     qnames = {r["qname"] for r in per_linear}
     assert not any("mtp." in q or "visual" in q for q in qnames)
 
-    # bits = 8 * memory_bytes; bpp = bits / n_params.
+    # Bits include the exact serialized tensor payload plus format-global
+    # sidecars. NVFP4 emits two fp32 scale scalars per 2-D Linear (8 B).
     q = next(r for r in per_linear if r["role"] == "q_proj")
-    assert q["bits"] == 8.0 * 512
-    assert q["bpp"] == (8.0 * 512) / 1024
+    assert q["bits"] == 8.0 * (512 + 8)
+    assert q["bpp"] == (8.0 * (512 + 8)) / 1024
     assert q["predicted_dloss"] == 0.01
     assert q["h_trace"] == 0.5
 
@@ -91,9 +96,55 @@ def test_build_bit_attribution_null_dloss_when_no_candidate():
     row = per_linear[0]
     # No fabricated dloss; bits still recovered from the memory map.
     assert row["predicted_dloss"] is None
-    assert row["bits"] == 8.0 * 512
+    assert row["bits"] == 8.0 * (512 + 8)
     assert buckets[0]["sum_predicted_dloss"] is None
     assert buckets[0]["predicted_dloss_coverage"] == "0/1"
+
+
+def test_build_bit_attribution_deduplicates_shared_cb_sidecar():
+    fmt = "FP8_CB_K36"
+    assignment = {
+        "model.layers.0.self_attn.q_proj": fmt,
+        "model.layers.1.self_attn.q_proj": fmt,
+    }
+    stats = {
+        name: {
+            "n_params": 2 * 256,
+            "out_features": 2,
+            "in_features": 256,
+            "h_trace": 1.0,
+        }
+        for name in assignment
+    }
+    context = CBSerializationContext.production()
+    exact = cb_assignment_payload_breakdown(
+        assignment,
+        {name: (2, 256) for name in assignment},
+        context=context,
+    )
+    candidates = {
+        name: [Candidate(
+            fmt,
+            0.0,
+            int(exact["per_tensor"][name]["tensor_payload_bytes"]),
+            0.01,
+        )]
+        for name in assignment
+    }
+    _buckets, _rows, totals = _build_bit_attribution(
+        assignment,
+        candidates,
+        stats.get,
+        format_specs={},
+        cb_serialization_context=context,
+    )
+    assert totals["body_tensor_payload_bits"] == (
+        8 * exact["tensor_payload_bytes"]
+    )
+    assert totals["body_shared_cb_sidecar_bits"] == (
+        8 * exact["codebook_sidecar_bytes"]
+    )
+    assert totals["body_assignment_payload_bits"] == 8 * exact["total_bytes"]
 
 
 def test_write_bit_attribution_reports_emit_files(tmp_path):
@@ -111,14 +162,17 @@ def test_write_bit_attribution_reports_emit_files(tmp_path):
     }
     jpath = tmp_path / "attr.json"
     cpath = tmp_path / "attr.csv"
+    exact_bpp = (8.0 * (512 + 8) + 8.0 * 2048) / (1024 + 2048)
     _write_bit_attribution_reports(
         str(jpath), str(cpath),
-        target_bits=5.0, achieved_bits=4.9,
+        target_bits=5.0, achieved_bits=exact_bpp,
         assignment_expanded=assignment, candidates=candidates,
         stats_entry_for=stats.get, format_specs={})
 
     payload = json.loads(jpath.read_text())
-    assert payload["schema"] == "prismaquant.allocator.bit_attribution.v1"
+    assert payload["schema"] == "prismaquant.allocator.bit_attribution.v2"
+    assert payload["body_bits_per_param"] == exact_bpp
+    assert payload["body_shared_cb_sidecar_bits"] == 0
     assert payload["n_body_linears"] == 2
     assert len(payload["buckets"]) == 2
     csv_text = cpath.read_text()

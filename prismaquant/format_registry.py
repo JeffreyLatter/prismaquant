@@ -905,9 +905,15 @@ register_format(_make_gguf_spec("IQ4_NL", 4, 32, 16))     # 18 B / 32 = 4.5
 # NVFP4-CB / FP8-CB vector-quantization codebook family (custom out-of-tree
 # vLLM plugin lane; NOT stock compressed-tensors — see docs/lanes/nvfp4-cb).
 # The k-bit VQ index stream lives in scale_bits (fp4 family, weight_bits=0,
-# group_size=256 so effective_bits = k/8 + 0.5 exactly) or in weight_bits as
-# k/8 bits/param (fp8 family, per-output-channel fp32 scale, group_size=0 so
-# effective_bits_for_shape = k/8 + 32/in_features exactly). quantize_dequantize
+# group_size=256).  FormatSpec retains the legacy-v1 4k+16 nominal field for
+# old generic consumers; exact producer paths use CBSerializationContext and
+# price/render production layout-v2 as 4k+9.  FP8's FormatSpec likewise omits
+# its shape-dependent FP32 row-scale plane.  Consequently neither
+# ``effective_bits`` nor ``effective_bits_for_shape`` is authoritative for CB.
+# The FP8 index body is represented by the same group_size=256 superblock
+# stream as FP4-CB. Its per-output-channel FP32 scale cannot be represented by
+# that single-plane FormatSpec, so only the context-bound accountant adds the
+# shape-dependent 32/in_features term. quantize_dequantize
 # is the weighted-VQ closure that also feeds the (Milestone B) byte packer;
 # activations are byte-identical to NVFP4 (fp4) / FP8 dynamic (fp8).
 def _make_nvfp4_cb_spec(k: int) -> FormatSpec:
@@ -924,6 +930,9 @@ def _make_nvfp4_cb_spec(k: int) -> FormatSpec:
                              act_data_type="nv_fp4_with_static_gs",
                              act_group_size=16, act_dynamic=True)
         ),
+        # Kept at v1 for direct legacy/research callers. Producer-cost paths
+        # bind CBSerializationContext explicitly; a FormatSpec alone cannot
+        # establish the artifact layout/codebook identity.
         quantize_dequantize=make_nvfp4_cb_qdq(k, "fp4", "product"),
         activation_quantize_dequantize=_make_rtn("fp4_e2m1", 16),
     )

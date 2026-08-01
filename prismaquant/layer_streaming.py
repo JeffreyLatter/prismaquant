@@ -290,7 +290,12 @@ def _build_fp8_scale_inv_map(model_path: str, *,
     # `.weight_scale_inv`-suffix scan.
     from .model_profiles import detect_profile
     profile = detect_profile(model_path)
-    explicit = profile.fp8_scale_pairs(model_path)
+    fp8_scale_pairs = getattr(profile, "fp8_scale_pairs", None)
+    explicit = (
+        fp8_scale_pairs(model_path)
+        if callable(fp8_scale_pairs)
+        else None
+    )
     if explicit is not None:
         return Fp8ScaleInvMap(
             explicit,

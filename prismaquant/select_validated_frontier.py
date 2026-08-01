@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import statistics
@@ -16,6 +17,15 @@ from prismaquant.layer_config import (
     read_layer_config_metadata,
 )
 from prismaquant.saturation_select import find_saturation_bpp
+from prismaquant.nvfp4_cb_footprint import (
+    CB_ASSIGNMENT_IDENTITIES_FIELD,
+    CB_TENSOR_IDENTITY_FIELD,
+    assignment_serialization_sha256,
+    cb_serialization_metadata_from_assignment_payload,
+    cb_serialization_context_from_stamp,
+    is_cb_format,
+    whole_artifact_budget_from_assignment_payload,
+)
 
 
 def _load_json(path: str | Path):
@@ -57,11 +67,19 @@ def _saturation_pick(frontier: Sequence[Mapping], z: float) -> tuple[int, dict]:
 
 def _load_assignment(path: str | Path) -> dict[str, str]:
     payload = _load_json(path)
+    return _assignment_from_payload(payload, where=str(path))
+
+
+def _assignment_from_payload(
+    payload: Mapping[str, object],
+    *,
+    where: str,
+) -> dict[str, str]:
     raw = payload.get("assignment") if isinstance(payload, Mapping) else None
     if raw is None and isinstance(payload, Mapping):
         raw = payload
     if not isinstance(raw, Mapping):
-        raise ValueError(f"{path}: expected assignment JSON object")
+        raise ValueError(f"{where}: expected assignment JSON object")
     # Entries may be format-name strings ({qname: "NVFP4"}) or AutoRound-style
     # dicts ({qname: {"data_type": "nv_fp", "bits": 4, ...}}); str().upper() on
     # a dict silently fabricates a garbage format name. Strings go through the
@@ -79,10 +97,18 @@ def _load_assignment(path: str | Path) -> dict[str, str]:
     }
 
 
-def _layer_config_from_assignment(assignment: Mapping[str, str]) -> dict:
+def _layer_config_from_assignment(
+    assignment: Mapping[str, str],
+    *,
+    cb_serialization_stamps: Mapping[str, object] | None = None,
+) -> dict:
     out = {}
     for name, fmt in sorted(assignment.items()):
         out[str(name)] = fr.get_format(str(fmt).strip().upper()).autoround_config()
+        if cb_serialization_stamps is not None and name in cb_serialization_stamps:
+            out[str(name)][CB_TENSOR_IDENTITY_FIELD] = str(
+                cb_serialization_stamps[name]
+            )
     return out
 
 
@@ -263,14 +289,18 @@ def _row_metric(row: Mapping, metric: str) -> float | None:
 
 
 def _artifact_bytes_for_row(row: Mapping) -> int | None:
-    """Exact artifact bytes for a measured row, or None when unpriced.
+    """Conservative whole-artifact selection bound, or None when unpriced.
 
-    Prefers a value already on the row; otherwise reads `artifact_bytes` out
-    of the allocator's Pareto assignment payload at `row["path"]` (stamped by
-    `allocator.py` from `footprint.assignment_artifact_bytes`, the same
-    accounting the allocator's own byte-budget selector uses).
+    A raw safetensors tensor-span estimate is deliberately not accepted as a
+    directory budget. Modern allocator payloads expose
+    ``whole_artifact_upper_bound_bytes`` (tensor spans + operator reserve) and
+    keep ``artifact_bytes`` only as a scope-stamped compatibility alias.
     """
-    direct = row.get("artifact_bytes")
+    direct = row.get("whole_artifact_upper_bound_bytes")
+    if direct is None and str(row.get("artifact_byte_scope", "")).startswith(
+        "selection_upper_bound_"
+    ):
+        direct = row.get("artifact_bytes")
     if direct is not None:
         try:
             return int(direct)
@@ -283,7 +313,13 @@ def _artifact_bytes_for_row(row: Mapping) -> int | None:
         payload = _load_json(path)
     except Exception:
         return None
-    value = payload.get("artifact_bytes") if isinstance(payload, Mapping) else None
+    value = None
+    if isinstance(payload, Mapping):
+        value = payload.get("whole_artifact_upper_bound_bytes")
+        if value is None and str(payload.get("artifact_byte_scope", "")).startswith(
+            "selection_upper_bound_"
+        ):
+            value = payload.get("artifact_bytes")
     if value is None:
         return None
     try:
@@ -317,6 +353,8 @@ def measured_rows(
             "bpp": bpp_f,
             "format_counts": dict(row.get("format_counts", {}) or {}),
             "changed_vs_base": int(row.get("changed_vs_base", 0) or 0),
+            "assignment_hash": row.get("assignment_hash"),
+            "assignment_sha256": row.get("assignment_sha256"),
             "mse": dict(row.get("mse", {}) or {}),
             # The surrogate the allocator optimized. validate_assignments_kl emits
             # it nested as mse.predicted_dloss_sum; a top-level surrogate_loss (e.g.
@@ -327,11 +365,19 @@ def measured_rows(
                 if row.get("surrogate_loss") is not None
                 else (row.get("mse") or {}).get("predicted_dloss_sum")
             ),
-            # Exact exported footprint (re-vet R1). validate_assignments_kl
-            # does not emit it; the allocator stamps it into the Pareto
-            # assignment payload the row points at, so the byte budget is
-            # readable by the selector that owns the ship decision.
+            # Conservative whole-artifact selection bound. Final exact
+            # recursive bytes are enforced by the exporter.
             "artifact_bytes": _artifact_bytes_for_row(row),
+            **({
+                "resolved_assignment_payload": dict(
+                    row["resolved_assignment_payload"]
+                ),
+                "resolved_assignment_payload_sha256": row.get(
+                    "resolved_assignment_payload_sha256"
+                ),
+            } if isinstance(
+                row.get("resolved_assignment_payload"), Mapping
+            ) else {}),
             "kl_repeats": list(row.get("kl_repeats", []) or []),
             "kl_std": row.get("kl_std"),
             "kl_stderr": row.get("kl_stderr"),
@@ -729,9 +775,11 @@ def select_frontier_point(
                     if row.get("artifact_bytes") is None]
         if unpriced:
             raise ValueError(
-                "--mode budget needs exact artifact bytes on every frontier "
+                "--mode budget needs a tensor-payload + non-tensor-reserve "
+                "whole-artifact upper bound on every frontier "
                 f"row; {len(unpriced)} are unpriced (e.g. {unpriced[:3]}). "
-                "Re-run the allocator so it stamps artifact_bytes into the "
+                "Re-run the allocator with --target-disk-gb and an explicit "
+                "--artifact-overhead-reserve-bytes so it stamps the bound into "
                 "Pareto assignment payloads.")
         fitting = [i for i, row in enumerate(frontier)
                    if float(row["artifact_bytes"]) <= float(budget_bytes)]
@@ -801,8 +849,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                  "saturation", "budget"),
         default="kneedle",
         help="Frontier pick. 'budget' = min measured KL among the rows whose "
-             "EXACT exported footprint fits --target-disk-gb (re-vet R1: the "
-             "card is the constraint, measured KL is the objective). "
+             "tensor payload plus operator-supplied non-tensor reserve fits "
+             "--target-disk-gb; export then enforces exact recursive file "
+             "bytes (re-vet R1: the card is the constraint, measured KL is "
+             "the objective). "
              "'saturation' = unconstrained bit-rate selector: "
              "lowest bpp whose KL is within --sat-z stderr of the high-bpp "
              "asymptote (needs a real per-bpp stderr, i.e. validate with "
@@ -863,6 +913,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--output-assignment", required=True)
     parser.add_argument("--output-summary", required=True)
     args = parser.parse_args(argv)
+    requested_budget_bytes = None
+    if args.mode == "budget":
+        if (
+            args.target_disk_gb is None
+            or not math.isfinite(args.target_disk_gb)
+            or args.target_disk_gb <= 0
+        ):
+            parser.error(
+                "--mode budget requires a positive finite --target-disk-gb"
+            )
+        requested_budget_bytes = int(math.floor(args.target_disk_gb * 1e9))
     # This stage is pure JSON/frontier post-processing. GPU-or-bust applies to
     # tensor hot paths (probe, render, export, validation), not this selector.
     payload = _load_json(args.validation_json)
@@ -895,8 +956,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         tail_veto=tail_veto,
         tail_eta=tail_eta_arg,
         vetoed=vetoed_rows,
-        budget_bytes=(None if args.target_disk_gb is None
-                      else float(args.target_disk_gb) * 1e9),
+        budget_bytes=requested_budget_bytes,
     )
     saturation = None
     if args.mode == "saturation":
@@ -946,20 +1006,170 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "eta": float(eta_value),
                 "source": eta_source,
             })
-    assignment = _load_assignment(selected["path"])
-    layer_config = _layer_config_from_assignment(assignment)
+    resolved_payload = selected.get("resolved_assignment_payload")
+    if isinstance(resolved_payload, Mapping):
+        selected_payload = dict(resolved_payload)
+        resolved_payload_sha256 = hashlib.sha256(
+            json.dumps(
+                selected_payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8")
+        ).hexdigest()
+        if selected.get("resolved_assignment_payload_sha256") != (
+            resolved_payload_sha256
+        ):
+            raise ValueError(
+                "resolved measured assignment payload does not match the "
+                "identity bound to its KL result"
+            )
+        assignment = _assignment_from_payload(
+            selected_payload,
+            where=f"resolved measured assignment {selected.get('label')!r}",
+        )
+        actual_assignment_sha256 = assignment_serialization_sha256(assignment)
+        row_assignment_sha256 = selected.get("assignment_sha256")
+        payload_assignment_sha256 = selected_payload.get("assignment_sha256")
+        if (
+            row_assignment_sha256 != actual_assignment_sha256
+            or payload_assignment_sha256 != actual_assignment_sha256
+        ):
+            raise ValueError(
+                "resolved measured assignment does not match the exact "
+                "assignment identity bound to its KL result"
+            )
+    else:
+        # Backwards-compatible path for validation files produced before the
+        # validator persisted its exact base+candidate merge. New production
+        # validation always takes the resolved branch above.
+        selected_payload = _load_json(selected["path"])
+        assignment = _load_assignment(selected["path"])
+    selected_cb_context, selected_cb_stamps = (
+        cb_serialization_metadata_from_assignment_payload(selected_payload)
+        if isinstance(selected_payload, Mapping)
+        else (None, {})
+    )
+    selected_cb_names = {
+        str(name) for name, fmt in assignment.items() if is_cb_format(fmt)
+    }
+    if selected_cb_names and selected_cb_context is None:
+        raise ValueError(
+            "selected CB assignment is missing its global serialized-payload "
+            "context"
+        )
+    if selected_cb_context is not None and not selected_cb_stamps:
+        raise ValueError(
+            "selected CB assignment carries a global serialized-payload "
+            "context but no per-layer identities; refusing to carry a stale "
+            "global stamp onto unverifiable tensors"
+        )
+    if selected_cb_names and not selected_cb_stamps:
+        raise ValueError(
+            "selected CB assignment is missing its per-layer serialization "
+            "identities"
+        )
+    if selected_cb_stamps and selected_cb_context is None:
+        raise ValueError(
+            "selected CB assignment carries per-layer serialization identities "
+            "without their global context"
+        )
+    if selected_cb_stamps:
+        stamped_names = set(selected_cb_stamps)
+        missing = sorted(selected_cb_names - stamped_names)
+        extra = sorted(stamped_names - selected_cb_names)
+        if missing or extra:
+            raise ValueError(
+                "selected CB assignment serialization identities do not match "
+                f"its CB tensors: missing={missing[:8]}, extra={extra[:8]}"
+            )
+    selected_cb_render_identity = selected_payload.get("cb_render_identity")
+    if selected_cb_names:
+        from prismaquant.production_weight_cache import (
+            validate_cb_render_provenance,
+        )
+
+        selected_context_object = cb_serialization_context_from_stamp(
+            selected_cb_context,
+            where="selected frontier CB context",
+        )
+        _render_context, selected_cb_render_identity = (
+            validate_cb_render_provenance(
+                selected_payload,
+                expected_context=selected_context_object,
+                expected_formats_by_qname={
+                    name: (assignment[name],)
+                    for name in sorted(selected_cb_names)
+                },
+                where="selected frontier CB render identity",
+            )
+        )
+    elif selected_cb_render_identity is not None:
+        raise ValueError(
+            "selected non-CB assignment carries a stale CB render identity"
+        )
+    selected_budget = whole_artifact_budget_from_assignment_payload(
+        selected_payload,
+        where=f"selected frontier assignment {selected['path']}",
+        assignment=assignment,
+    )
+    if args.mode == "budget":
+        if selected_budget is None:
+            raise ValueError(
+                "selected budget-mode assignment has no whole_artifact_budget "
+                "stamp; refusing to emit an assignment without the exporter's "
+                "hard recursive-byte gate"
+            )
+        stamped_budget = int(selected_budget["budget_bytes"])
+        if stamped_budget != requested_budget_bytes:
+            raise ValueError(
+                "selected assignment whole-artifact budget differs from "
+                f"--target-disk-gb: stamp={stamped_budget}B, "
+                f"requested={requested_budget_bytes}B"
+            )
+        selected_upper = selected.get("artifact_bytes")
+        stamped_upper = int(
+            selected_budget["selection_whole_artifact_upper_bound_bytes"]
+        )
+        if selected_upper is None or int(selected_upper) != stamped_upper:
+            raise ValueError(
+                "selected row whole-artifact upper bound does not reconcile "
+                f"with its assignment stamp: row={selected_upper!r}, "
+                f"stamp={stamped_upper}B"
+            )
+    selected_cb_stamps_arg = selected_cb_stamps or None
+    layer_config = _layer_config_from_assignment(
+        assignment,
+        cb_serialization_stamps=selected_cb_stamps_arg,
+    )
 
     layer_config_path = Path(args.output_layer_config)
     # This stage OVERWRITES the allocator's layer_config.json, so it must carry
     # the allocator's reserved metadata forward — the exporter reads the
     # resolved serving profile from there (re-vet R11), and dropping it would
     # re-open the allocator/export profile split this run just closed.
-    carried = read_layer_config_metadata(layer_config_path)
-    if carried:
-        carried = dict(carried)
+    carried = dict(read_layer_config_metadata(layer_config_path))
+    # The selected payload, not the overwritten destination file, owns
+    # assignment-coupled identities.  Otherwise selecting a non-CB point after
+    # a CB allocator run carries a stale global stamp while dropping every
+    # per-layer identity, which exporters previously accepted via truthiness.
+    carried.pop("cb_serialized_payload", None)
+    carried.pop("cb_render_identity", None)
+    carried.pop("whole_artifact_budget", None)
+    if (
+        carried
+        or selected_cb_context is not None
+        or selected_budget is not None
+    ):
         carried["selected_by"] = f"validated_frontier:{args.mode}"
         carried["selected_label"] = selected.get("label")
         carried["selected_achieved_bits"] = selected.get("bpp")
+        if selected_cb_context is not None:
+            carried["cb_serialized_payload"] = dict(selected_cb_context)
+            carried["cb_render_identity"] = selected_cb_render_identity
+        if selected_budget is not None:
+            carried["whole_artifact_budget"] = dict(selected_budget)
         layer_config[LAYER_CONFIG_META_KEY] = carried
     layer_config_path.parent.mkdir(parents=True, exist_ok=True)
     layer_config_path.write_text(json.dumps(layer_config, indent=2, sort_keys=True) + "\n")
@@ -969,6 +1179,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         "selection_mode": args.mode,
         "selected": selected,
         "assignment": dict(sorted(assignment.items())),
+        **({
+            "cb_serialized_payload": dict(selected_cb_context),
+            "cb_render_identity": selected_cb_render_identity,
+        } if selected_cb_context is not None else {}),
+        **({
+            CB_ASSIGNMENT_IDENTITIES_FIELD: dict(sorted(
+                (str(name), str(value))
+                for name, value in selected_cb_stamps.items()
+            )),
+        } if selected_cb_stamps else {}),
+        **({
+            "whole_artifact_budget": dict(selected_budget),
+        } if selected_budget is not None else {}),
     }
     assignment_path = Path(args.output_assignment)
     assignment_path.parent.mkdir(parents=True, exist_ok=True)

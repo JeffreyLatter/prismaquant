@@ -1,4 +1,5 @@
 import pickle
+import os
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -10,6 +11,7 @@ import torch.nn as nn
 from prismaquant.incremental_measure_quant_cost import (
     _run_cost_measurement,
     _scheduled_probe_targets,
+    cost_shard_is_reusable,
     merge_cost_pickles,
 )
 from prismaquant.measure_quant_cost import (
@@ -105,6 +107,115 @@ class TestIncrementalMeasureQuantCost(unittest.TestCase):
                 "model.layers.0.mlp.experts",
             },
         )
+
+    def test_nonempty_cb_cost_shard_resume_is_fail_closed(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "cb.pkl"
+            payload = {
+                "costs": {
+                    "layer.0": {
+                        "NVFP4_CB_K16": {"output_mse": 1.0},
+                    },
+                },
+                "formats": ["NVFP4_CB_K16"],
+                "meta": {"incremental_shard": {"kind": "body"}},
+            }
+            with path.open("wb") as fh:
+                pickle.dump(payload, fh)
+
+            expected = {"formats": ["NVFP4_CB_K16"]}
+            self.assertFalse(cost_shard_is_reusable(path, expected))
+
+            payload["costs"] = {}
+            with path.open("wb") as fh:
+                pickle.dump(payload, fh)
+            self.assertTrue(cost_shard_is_reusable(path, expected))
+
+    def test_merge_cb_cost_shards_preserves_exact_value_identity(self):
+        from prismaquant.nvfp4_cb_footprint import CBSerializationContext
+        from prismaquant.production_weight_cache import (
+            bind_cb_render_identity_source_weights,
+            build_production_cache_cb_render_identity,
+        )
+
+        fmt = "NVFP4_CB_K16"
+        context = CBSerializationContext.production()
+        col_weights = {
+            "layer.0": torch.arange(256, dtype=torch.float32),
+            "layer.1": torch.arange(256, dtype=torch.float32) + 1,
+        }
+        source_weights = {
+            "layer.0": torch.arange(512, dtype=torch.float32).reshape(2, 256),
+            "layer.1": torch.arange(512, dtype=torch.float32).reshape(2, 256) + 2,
+        }
+
+        def identity(name):
+            value = build_production_cache_cb_render_identity(
+                {name: [fmt]},
+                cb_serialization_context=context,
+                col_weights=col_weights,
+                render_levers={"weighted_vq": True},
+                render_mechanism_plan=[],
+            )
+            return bind_cb_render_identity_source_weights(
+                value,
+                {name: source_weights[name]},
+            )
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            col_path = root / "col.pkl"
+            with col_path.open("wb") as fh:
+                pickle.dump(col_weights, fh)
+            paths = []
+            for index, name in enumerate(("layer.0", "layer.1")):
+                value = identity(name)
+                path = root / f"{index}.pkl"
+                with path.open("wb") as fh:
+                    pickle.dump({
+                        "costs": {name: {fmt: {"output_mse": 1.0}}},
+                        "formats": [fmt],
+                        "provenance": {
+                            "cb_serialized_payload": value[
+                                "cb_serialized_payload"
+                            ],
+                            "cb_render_identity": value,
+                        },
+                        "meta": {},
+                    }, fh)
+                paths.append(path)
+            out = root / "merged.pkl"
+            settings = {
+                "CB_SCALE_CODING": "two_tier",
+                "CB_CODEBOOK_SOURCE": "lattice",
+                "CB_SCALE_SWEEP": "1",
+                "PRISMAQUANT_CB_ENCODE_TIER": "balanced",
+                "PRISMAQUANT_CB_COL_WEIGHTS": str(col_path),
+            }
+            with patch.dict(os.environ, settings, clear=False), patch(
+                "prismaquant.measure_quant_cost._CB_CW_CACHE",
+                None,
+            ):
+                merge_cost_pickles(paths, out)
+            with out.open("rb") as fh:
+                merged = pickle.load(fh)
+            render_identity = merged["provenance"]["cb_render_identity"]
+            self.assertEqual(
+                render_identity["col_weights_qnames"],
+                ["layer.0", "layer.1"],
+            )
+            self.assertTrue(render_identity["source_weights_complete"])
+
+            changed = dict(col_weights)
+            changed["layer.1"] = changed["layer.1"].clone()
+            changed["layer.1"][0] += 7.0
+            with col_path.open("wb") as fh:
+                pickle.dump(changed, fh)
+            with patch.dict(os.environ, settings, clear=False), patch(
+                "prismaquant.measure_quant_cost._CB_CW_CACHE",
+                None,
+            ), self.assertRaisesRegex(ValueError, "col_weights identity differs"):
+                merge_cost_pickles(paths, root / "changed.pkl")
 
     def test_batched_cost_matches_unbatched_for_grouped_linears(self):
         torch.manual_seed(0)

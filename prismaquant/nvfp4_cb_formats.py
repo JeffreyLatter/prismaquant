@@ -1180,10 +1180,10 @@ def _sweep_encode_two_tier_moment(w2d: torch.Tensor, mode: str, cb,
     reachable set. Selection order and tie rules mirror the exact path
     (strict <, first-legal wins).
 
-    NOTE: layout-v2 is opt-in (CB_SCALE_CODING=v1 is the pipeline default and
-    the critical 27B/35B path); its W*16 windowed-entry search does not batch
-    cleanly (the launch-bound fix targets the v1 fp8 lane), so this keeps the
-    original bit-preserving structure."""
+    NOTE: layout-v2 is the production writer default. Its W*16
+    windowed-entry search does not batch cleanly (the launch-bound fix targets
+    the v1/fp8-shaped search), so this keeps the original bit-preserving
+    structure. Legacy-v1 remains an explicit read/reproduction mode."""
     rows, in_f = w2d.shape
     n_sb = in_f // SUPERBLOCK
     dev = str(w2d.device)
@@ -1341,8 +1341,9 @@ def nvfp4_cb_fields(w: torch.Tensor, k: int, *, grid: str = "fp4",
 
     ``scale_coding``: ``"v1"`` (default; bare e4m3 plane) or ``"two_tier"``
     (layout v2, fp4 only: per-superblock E8M0 super + 4-bit sub codes; the
-    stored plane is still the composed E4M3-exact per-group scale). v2 stays
-    opt-in until the spec's serving gates (G1/G3/G4) clear.
+    stored plane is still the composed E4M3-exact per-group scale). The low-
+    level codec defaults to v1 for read compatibility; production callers bind
+    an explicit serialization context and select v2.
 
     Returns at least {"indices", "scales"}; the resolved codebook is echoed
     back under "codebook" so reconstruct and the packer share one table.
@@ -1521,8 +1522,10 @@ def predict_cb_ladder_costs(w: torch.Tensor, ks: tuple[int, ...], *,
 #
 # Per 256-weight superblock along the input dim:
 #   * 4k index bytes — 32 k-bit codewords (one per 8-dim vector), LSB-first;
-#   * fp4 only: 16 E4M3 group scale bytes (identical to NVFP4's block scales).
-# type_size = 4k + 16 (fp4) / 4k (fp8), integer for every k. The packed tensor
+#   * fp4 v1: 16 E4M3 group-scale bytes;
+#   * production fp4 v2: 9 two-tier bytes (one E8M0 super + eight packed
+#     subscale-nibble bytes).
+# type_size = 4k + 16 (fp4 v1), 4k + 9 (fp4 v2), or 4k (fp8). The packed tensor
 # is 2-D uint8 (rows, bytes_per_row) — NEVER a flat 1-D buffer (the GGUF
 # lesson: a flat store loses the logical row/superblock structure the reader
 # and serving kernel index into). fp8 ships NO scale plane in the weight bytes;
@@ -1551,8 +1554,9 @@ def nvfp4_cb_effective_bits(k: int, grid: str = "fp4",
                             scale_coding: str = SCALE_CODING_V1) -> float:
     """Version-keyed body bpw (spec §2): fp4 v1 ``k/8 + 0.5``, fp4 v2
     two-tier ``k/8 + 0.28125``, fp8 ``k/8`` (per-channel scale separate).
-    The REGISTERED FormatSpecs stay on v1 accounting until the spec's
-    serving gates clear (a v2 artifact may only ship served M1-native)."""
+    Registered FormatSpec rates are nominal compatibility metadata; exact
+    producer pricing is versioned by ``CBSerializationContext`` and asserted
+    against the serialized payload."""
     return _type_size(k, grid, scale_coding) * 8.0 / SUPERBLOCK
 
 

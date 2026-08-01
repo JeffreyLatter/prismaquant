@@ -38,6 +38,145 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from . import format_registry as fr
+from .nvfp4_cb_footprint import (
+    cb_cost_provenance,
+    cb_quantize_dequantize_for_context,
+    cb_serialization_context_from_env,
+)
+
+
+def _cb_cost_quantize_dequantize(
+    spec: fr.FormatSpec,
+    weight: torch.Tensor,
+    *,
+    col_weights: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Render CB weights under the producer context stamped on cost.pkl."""
+    if col_weights is None:
+        raise RuntimeError(
+            f"{spec.name}: production CB cost render has no col_weights; "
+            "export is imatrix-weighted, so an unweighted cost row would "
+            "describe different bytes"
+        )
+    return cb_quantize_dequantize_for_context(
+        spec,
+        weight,
+        context=cb_serialization_context_from_env(
+            require_explicit=True,
+            where="CB local cost render",
+        ),
+        col_weights=col_weights,
+    )
+
+
+def cost_payload_provenance(specs: list[fr.FormatSpec]) -> dict:
+    """Identity fields shared by monolithic and incremental cost writers."""
+    has_cb = any(spec.family in _CB_COST_FAMILIES for spec in specs)
+    context = (
+        cb_serialization_context_from_env(
+            require_explicit=True,
+            where="CB cost producer",
+        )
+        if has_cb else None
+    )
+    return cb_cost_provenance(specs, context=context)
+
+
+def cb_render_provenance_for_results(
+    model: nn.Module,
+    results: dict,
+    specs: list[fr.FormatSpec],
+    *,
+    profile=None,
+    render_levers: dict[str, object] | None = None,
+    where: str,
+) -> dict[str, object]:
+    """Build source/imatrix-complete provenance for measured CB rows."""
+    cb_names = {
+        spec.name for spec in specs if spec.family in _CB_COST_FAMILIES
+    }
+    if not cb_names:
+        return cost_payload_provenance(specs)
+    scope: dict[str, list[str]] = {}
+    for qname, per_format in results.items():
+        if not isinstance(per_format, dict):
+            continue
+        measured = sorted(
+            fmt for fmt in cb_names
+            if isinstance(per_format.get(fmt), dict)
+            and "error" not in per_format[fmt]
+        )
+        if measured:
+            scope[str(qname)] = measured
+    base = cost_payload_provenance(specs)
+    if not scope:
+        # Empty visual/MTP shards carry the exact global producer context but
+        # no value identity: no CB row exists to project or consume.
+        return base
+
+    col_weights = {
+        qname: _cb_col_weights_lookup(qname)
+        for qname in scope
+    }
+    missing_col = sorted(
+        qname for qname, value in col_weights.items() if value is None
+    )
+    if missing_col:
+        raise ValueError(
+            f"{where}: measured CB rows are missing exact col_weights; "
+            f"sample={missing_col[:8]}"
+        )
+
+    targets = set(scope)
+    source_weights: dict[str, torch.Tensor] = {}
+    for param_name, param in model.named_parameters():
+        candidates = [str(param_name)]
+        if str(param_name).endswith(".weight"):
+            candidates.append(str(param_name)[:-7])
+        for candidate in candidates:
+            resolved = resolve_cost_target_name(candidate, targets, profile)
+            if resolved in targets and resolved not in source_weights:
+                source_weights[resolved] = param.detach()
+    missing_source = sorted(targets - set(source_weights))
+    if missing_source:
+        raise ValueError(
+            f"{where}: cannot bind exact decoded source weights for measured "
+            f"CB rows; sample={missing_source[:8]}"
+        )
+
+    from .production_weight_cache import (
+        _resolve_production_render_levers,
+        _resolve_render_mechanism_plan,
+        bind_cb_render_identity_source_weights,
+        build_production_cache_cb_render_identity,
+    )
+
+    resolved_levers = _resolve_production_render_levers(
+        render_levers or {"weighted_vq": True}
+    )
+    mechanism_plan = _resolve_render_mechanism_plan(resolved_levers)
+    context = cb_serialization_context_from_env(
+        require_explicit=True,
+        where=where,
+    )
+    identity = build_production_cache_cb_render_identity(
+        scope,
+        cb_serialization_context=context,
+        col_weights=col_weights,
+        render_levers=resolved_levers,
+        render_mechanism_plan=mechanism_plan,
+    )
+    identity = bind_cb_render_identity_source_weights(
+        identity,
+        source_weights,
+        require_complete=True,
+        where=where,
+    )
+    base["cb_serialized_payload"] = dict(
+        identity["cb_serialized_payload"]
+    )
+    base["cb_render_identity"] = identity
+    return base
 
 
 def _packed_expert_parent_for_projection(profile, projection_name: str) -> str | None:
@@ -713,11 +852,15 @@ def measure_unbatched(model: nn.Module, act_cache: "ActivationIndex",
                     W_hat = gguf_quantize_dequantize(
                         W.clone(), spec.name, col_weights=gguf_qw,
                     )
-                elif spec.family in _CB_COST_FAMILIES and gguf_qw is not None:
-                    # Lockstep: the CB exporter ships imatrix-weighted VQ bytes,
-                    # so the cost render applies the same col_weights.
-                    W_hat = spec.quantize_dequantize(
-                        W.clone(), col_weights=gguf_qw,
+                elif spec.family in _CB_COST_FAMILIES:
+                    # Lockstep: layout-v1/v2 changes the reachable FP4 scale
+                    # set, not just its byte count. Render under the same
+                    # CBSerializationContext the cost payload records and the
+                    # exporter later validates.
+                    W_hat = _cb_cost_quantize_dequantize(
+                        spec,
+                        W.clone(),
+                        col_weights=gguf_qw,
                     )
                 else:
                     W_hat = spec.quantize_dequantize(W.clone())
@@ -1524,7 +1667,8 @@ def _batched_quantize(
         # scales are per-group-16, fp8 scales per-output-channel; lattice fixed).
         n = stacked_w.shape[0]
         return torch.stack([
-            spec.quantize_dequantize(
+            _cb_cost_quantize_dequantize(
+                spec,
                 stacked_w[i].clone(),
                 col_weights=_item_col_weights(col_weights, i, n),
             )
@@ -2156,10 +2300,18 @@ def run_cost_pass(model: nn.Module,
 
     out_path = Path(output_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    provenance = cb_render_provenance_for_results(
+        model,
+        results,
+        specs,
+        profile=model_profile,
+        where="monolithic CB cost",
+    )
     with open(out_path, "wb") as f:
         pickle.dump({
             "costs": results,
             "formats": [s.name for s in specs],
+            "provenance": provenance,
             "meta": {
                 "model": model_name,
                 "probe": probe_path,

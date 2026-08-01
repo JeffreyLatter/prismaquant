@@ -5,9 +5,9 @@ Covers the three harness modules authored for Phase 0:
   * index_entropy       — index-stream entropy / redundancy
   * emu_forward_kl      — whole-model emulated forward KL-vs-BF16 (GPU)
 
-These are format-agnostic: they use the already-registered GGUF/NVFP4 formats
-plus the §2 CB byte parameters, so they do not depend on the (separately
-authored) nvfp4_cb_formats.py registration landing first.
+The payload tests cross-check the accounting formulas against the codebook
+tensors the real exporter materializes, including every registered product and
+signed rung.
 """
 
 from __future__ import annotations
@@ -18,54 +18,93 @@ from pathlib import Path
 import pytest
 import torch
 
-from prismaquant.nvfp4_cb_footprint import cb_footprint
 from prismaquant.index_entropy import index_entropy
-
+from prismaquant.nvfp4_cb_footprint import (
+    CB_SERIALIZED_PAYLOAD_SCHEMA,
+    CBSerializationContext,
+    cb_assignment_payload_breakdown,
+    cb_footprint,
+    cb_serialization_context_stamp,
+    cb_tensor_payload_breakdown,
+    codebook_sidecar_payload_bytes,
+    codebook_subtable_shapes,
+    validate_cb_sidecar_tensors,
+    validate_cb_serialization_context_stamp,
+)
 
 # ---------------------------------------------------------------------------
-# Footprint — reproduces the docs §1.2 bpw table exactly (fixed lattice)
+# Footprint — exact producer payload (v2 default; explicit v1 compatibility)
 # ---------------------------------------------------------------------------
 
-# From docs/lanes/nvfp4-cb/format-pipeline.md §1.2: (k, bpw, type_size B/256).
-_SEC_1_2 = [
-    (12, 2.000, 64), (13, 2.125, 68), (14, 2.250, 72), (15, 2.375, 76),
-    (16, 2.500, 80), (17, 2.625, 84), (18, 2.750, 88), (19, 2.875, 92),
-    (20, 3.000, 96), (21, 3.125, 100), (22, 3.250, 104), (23, 3.375, 108),
-    (24, 3.500, 112),
-]
 
+def _learned_context(fmt: str, role: str = "w") -> CBSerializationContext:
+    count = len(codebook_subtable_shapes(fmt))
+    base = f"cb_codebook.{role}.{fmt}"
+    refs = [base] if count == 1 else [
+        f"{base}.sub{index}" for index in range(count)
+    ]
+    return CBSerializationContext.production(
+        codebook_source="learned",
+        codebook_content_digests={
+            ref: f"{index + 1:064x}" for index, ref in enumerate(refs)
+        },
+    )
 
-@pytest.mark.parametrize("k,bpw,type_size", _SEC_1_2)
-def test_footprint_reproduces_section_1_2_bpw(k, bpw, type_size):
-    # in_features multiple of 256, out arbitrary → registry-exact.
+@pytest.mark.parametrize("k", range(12, 25))
+def test_footprint_production_fp4_v2_is_4k_plus_9(k):
     shape = (128, 256)
     n = shape[0] * shape[1]
     fmt = f"NVFP4_CB_K{k}"
     fp = cb_footprint({"w": fmt}, {"w": shape})
-    # Fixed-lattice body bpw is exactly k/8 + 0.5.
-    assert fp["body_bpw"] == pytest.approx(bpw, abs=1e-9)
-    # type_size (bytes per 256 weights) matches the table.
-    expected_body_bytes = (n // 256) * type_size
+    expected_type_size = 4 * k + 9
+    expected_body_bytes = (n // 256) * expected_type_size
     assert fp["body_bytes"] == expected_body_bytes
+    assert fp["body_bpw"] == pytest.approx(
+        expected_type_size * 8 / 256, abs=1e-9
+    )
     assert fp["per_tensor"]["w"]["k"] == k
-    # No learned codebook ⇒ no sidecar; only the per-tensor global scale sits
-    # on top of the registry-exact body.
-    assert fp["sidecar_bytes"] == 0
-    assert fp["global_scale_bytes"] == 4
+    assert fp["sidecar_bytes"] == codebook_sidecar_payload_bytes(fmt)
+    assert fp["global_scale_bytes"] == 0
+    assert fp["schema"] == CB_SERIALIZED_PAYLOAD_SCHEMA
+    assert fp["serialization_context"]["layout_version"] == 2
 
 
-def test_footprint_adds_learned_sidecar():
+def test_legacy_fp4_v1_read_accounting_is_explicit_4k_plus_16():
+    shape = (128, 256)
+    fmt = "NVFP4_CB_K16"
+    fp = cb_footprint(
+        {"w": fmt},
+        {"w": shape},
+        context=CBSerializationContext.legacy_v1(),
+    )
+    assert fp["body_bytes"] == shape[0] * (4 * 16 + 16)
+    assert fp["serialization_context"] == {
+        "scale_coding": "v1",
+        "layout_version": 1,
+        "codebook_source": "lattice",
+        "scale_sweep": True,
+        "encode_tier": "balanced",
+        "renderer_abi": "prismaquant.nvfp4_cb_renderer.v1",
+    }
+    assert fp["global_scale_bytes"] == 0
+
+
+def test_lattice_and_learned_product_codebooks_have_real_fp16_sidecars():
     k = 16
     shape = (256, 256)
     fmt = f"NVFP4_CB_K{k}"
     base = cb_footprint({"w": fmt}, {"w": shape})
     learned = cb_footprint(
-        {"w": fmt}, {"w": shape}, codebook_sources={"w": "learned"})
-    expected_sidecar = (1 << k) * 4  # 2^k entries × 4 bytes = 256 KB
-    assert base["sidecar_bytes"] == 0
+        {"w": fmt}, {"w": shape}, context=_learned_context(fmt))
+    # k16 product codebook = two (2^8, 4) FP16 subtables = 4096 B.
+    expected_sidecar = 2 * (1 << 8) * 4 * 2
+    assert codebook_subtable_shapes(fmt) == ((256, 4), (256, 4))
+    assert base["sidecar_bytes"] == expected_sidecar
     assert learned["sidecar_bytes"] == expected_sidecar
-    assert learned["total_bytes"] == base["total_bytes"] + expected_sidecar
-    # Body bpw is unchanged (registry-exact); total bpw is strictly larger.
+    assert learned["total_bytes"] == base["total_bytes"]
+    # Physical byte size is the same; sharing identity is not.
+    assert base["sidecars"][0]["codebook_source"] == "lattice"
+    assert learned["sidecars"][0]["codebook_source"] == "learned"
     assert learned["body_bpw"] == pytest.approx(base["body_bpw"], abs=1e-9)
     assert learned["total_bpw"] > learned["body_bpw"]
 
@@ -74,12 +113,19 @@ def test_footprint_shared_codebook_charged_once():
     k = 12
     shape = (256, 256)
     fmt = f"NVFP4_CB_K{k}"
-    src = {"a": {"learned": "cb", "group": "role0"},
-           "b": {"learned": "cb", "group": "role0"}}
+    count = len(codebook_subtable_shapes(fmt))
+    refs = [f"cb_codebook.role0.{fmt}.sub{index}" for index in range(count)]
+    context = CBSerializationContext.production(
+        codebook_source="learned",
+        codebook_refs={name: refs for name in ("a", "b")},
+        codebook_content_digests={
+            ref: f"{index + 1:064x}" for index, ref in enumerate(refs)
+        },
+    )
     fp = cb_footprint(
-        {"a": fmt, "b": fmt}, {"a": shape, "b": shape}, codebook_sources=src)
+        {"a": fmt, "b": fmt}, {"a": shape, "b": shape}, context=context)
     # One shared codebook for both tensors → charged once.
-    assert fp["sidecar_bytes"] == (1 << k) * 4
+    assert fp["sidecar_bytes"] == codebook_sidecar_payload_bytes(fmt) == 1024
 
 
 @pytest.mark.parametrize("k", [36, 40, 44, 48])
@@ -92,30 +138,130 @@ def test_footprint_fp8_cb_bpw_exact(k):
     # counted exactly once whether the registered spec folds the plane into
     # its body (group_size=0/scale_bits=32) or the fallback charges it under
     # channel_scale_bytes.
-    expected_total = n * k // 64 + 4 * out_f
-    assert fp["body_bytes"] + fp["channel_scale_bytes"] == expected_total
-    assert fp["total_bytes"] == expected_total
+    tensor_payload = n * k // 64 + 4 * out_f
+    sidecar = codebook_sidecar_payload_bytes(fmt)
+    assert fp["body_bytes"] + fp["channel_scale_bytes"] == tensor_payload
+    assert fp["total_bytes"] == tensor_payload + sidecar
     assert fp["global_scale_bytes"] == 0
-    assert fp["sidecar_bytes"] == 0
-    # bpw = k/8 + 32*out/(out*in) exactly.
+    assert fp["sidecar_bytes"] == sidecar
+    # Total bpw also includes the once-per-artifact FP16 product subtables.
     assert fp["total_bpw"] == pytest.approx(
-        k / 8.0 + 32.0 * out_f / n, abs=1e-12)
+        8.0 * (tensor_payload + sidecar) / n, abs=1e-12)
     assert fp["per_tensor"]["w"]["cb_family"] == "fp8"
     assert fp["per_tensor"]["w"]["k"] == k
 
 
-def test_footprint_fp8_cb_learned_sidecar_8_bytes_per_entry():
+def test_fp8_cb_codebook_is_four_fp16_subtables_for_both_sources():
     k = 36
     out_f, in_f = 64, 256
     fmt = f"FP8_CB_K{k}"
     base = cb_footprint({"w": fmt}, {"w": (out_f, in_f)})
     learned = cb_footprint(
-        {"w": fmt}, {"w": (out_f, in_f)}, codebook_sources={"w": "learned"})
-    # FP8_CB learned entry = 8 FP8 codes = 8 bytes/entry (vs 4 for NVFP4_CB).
-    expected_sidecar = (1 << k) * 8
-    assert base["sidecar_bytes"] == 0
+        {"w": fmt}, {"w": (out_f, in_f)}, context=_learned_context(fmt))
+    expected_sidecar = 4 * (1 << 9) * 2 * 2
+    assert codebook_subtable_shapes(fmt) == ((512, 2),) * 4
+    assert base["sidecar_bytes"] == expected_sidecar
     assert learned["sidecar_bytes"] == expected_sidecar
-    assert learned["total_bytes"] == base["total_bytes"] + expected_sidecar
+    assert learned["total_bytes"] == base["total_bytes"]
+
+
+def test_signed_codebook_shape_and_assignment_deduplication():
+    fmt = "NVFP4_CB_S16"
+    ctx = _learned_context(fmt, "q_proj")
+    assignment = {"layer.0.q_proj": fmt, "layer.1.q_proj": fmt}
+    shapes = {name: (64, 256) for name in assignment}
+    result = cb_assignment_payload_breakdown(
+        assignment, shapes, context=ctx
+    )
+    assert codebook_subtable_shapes(fmt) == ((256, 8),)
+    assert result["codebook_sidecar_bytes"] == 256 * 8 * 2
+    assert len(result["sidecars"]) == 1
+    assert result["global_scale_bytes"] == 0
+
+
+def test_odd_product_k_splits_larger_subtables_first():
+    assert codebook_subtable_shapes("NVFP4_CB_K13") == (
+        (128, 4),
+        (64, 4),
+    )
+
+
+_REGISTERED_CB_FORMATS = (
+    [f"NVFP4_CB_K{k}" for k in range(12, 25)]
+    + [f"NVFP4_CB_S{k}" for k in range(13, 17)]
+    + [f"FP8_CB_K{k}" for k in range(28, 49)]
+)
+
+
+@pytest.mark.parametrize("fmt", _REGISTERED_CB_FORMATS)
+def test_sidecar_formula_matches_exporter_tensor_shapes_and_bytes(fmt):
+    from prismaquant import nvfp4_cb_formats as cb
+    from prismaquant.export_nvfp4_cb import _codebook_tensors, _parse_cb_format
+
+    grid, mode, k = _parse_cb_format(fmt)
+    codebook = cb._resolve_codebook(
+        k, grid, mode, None, torch.device("cpu")
+    )
+    blobs = _codebook_tensors("lattice", fmt, codebook)
+    assert tuple(tuple(blob.shape) for blob in blobs.values()) == (
+        codebook_subtable_shapes(fmt)
+    )
+    assert all(blob.dtype == torch.float16 for blob in blobs.values())
+    actual_bytes = sum(
+        blob.numel() * blob.element_size() for blob in blobs.values()
+    )
+    assert actual_bytes == codebook_sidecar_payload_bytes(fmt)
+    payload = cb_assignment_payload_breakdown(
+        {"layer.w": fmt},
+        {"layer.w": (64, 256)},
+        context=CBSerializationContext.production(),
+    )
+    assert validate_cb_sidecar_tensors(
+        payload, blobs, where="unit"
+    ) == actual_bytes
+    assert codebook_subtable_shapes("FP8_CB_K37") == (
+        (1024, 2),
+        (512, 2),
+        (512, 2),
+        (512, 2),
+    )
+
+
+def test_tensor_breakdown_requires_exact_context_and_shape():
+    with pytest.raises(ValueError, match="requires layout_version=2"):
+        CBSerializationContext(
+            scale_coding="two_tier",
+            layout_version=1,
+            codebook_source="lattice",
+        )
+    with pytest.raises(ValueError, match="CBSerializationContext"):
+        cb_tensor_payload_breakdown(
+            "NVFP4_CB_K16", (64, 256), qname="w", context=None
+        )
+    ctx = CBSerializationContext.production()
+    with pytest.raises(ValueError, match="divisible"):
+        cb_tensor_payload_breakdown(
+            "NVFP4_CB_K16", (64, 255), qname="w", context=ctx
+        )
+
+
+def test_recipe_context_stamp_rejects_export_layout_drift():
+    digests = _learned_context("NVFP4_CB_K16").codebook_content_digests
+    production = CBSerializationContext.production(
+        codebook_source="learned", codebook_content_digests=digests
+    )
+    stamp = cb_serialization_context_stamp(production)
+    validate_cb_serialization_context_stamp(
+        stamp, production, where="unit"
+    )
+    with pytest.raises(ValueError, match="differs from allocator recipe"):
+        validate_cb_serialization_context_stamp(
+            stamp,
+            CBSerializationContext.legacy_v1(
+                codebook_source="learned", codebook_content_digests=digests
+            ),
+            where="unit",
+        )
 
 
 def test_footprint_mixed_registry_format():

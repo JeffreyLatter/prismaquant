@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import io
 import json
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -287,6 +288,42 @@ class TestPerturbedXExportInputs(unittest.TestCase):
 
 
 class TestIncrementalSafetensorsWriter(unittest.TestCase):
+    def test_rejects_symlink_output_directory(self):
+        from prismaquant.export_native_compressed import (
+            IncrementalSafetensorsWriter,
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            target = root / "target"
+            target.mkdir()
+            output = root / "output"
+            output.symlink_to(target, target_is_directory=True)
+
+            with self.assertRaisesRegex(RuntimeError, "real directory"):
+                IncrementalSafetensorsWriter(output, shard_bytes=32)
+
+            self.assertTrue(output.is_symlink())
+            self.assertEqual(list(target.iterdir()), [])
+
+    def test_rejects_preexisting_high_index_temp_shard(self):
+        from prismaquant.export_native_compressed import (
+            IncrementalSafetensorsWriter,
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            out_dir = Path(td)
+            stale = out_dir / ".model-99999.safetensors.tmp"
+            stale.write_bytes(b"partial-old-export")
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "preexisting native temporary shard",
+            ):
+                IncrementalSafetensorsWriter(out_dir, shard_bytes=32)
+
+            self.assertEqual(stale.read_bytes(), b"partial-old-export")
+
     def test_finalizes_multi_shard_index_without_temp_files(self):
         from safetensors.torch import load_file
 
@@ -296,6 +333,11 @@ class TestIncrementalSafetensorsWriter(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td:
             out_dir = Path(td)
+            (out_dir / "model.safetensors").write_bytes(b"stale-single")
+            (out_dir / "model-99999-of-99999.safetensors").write_bytes(
+                b"stale-shard"
+            )
+            (out_dir / "tokenizer.json").write_text("keep")
             writer = IncrementalSafetensorsWriter(out_dir, shard_bytes=32)
             writer.add_tensors({
                 "b.weight": torch.ones(4, dtype=torch.float32),
@@ -316,6 +358,11 @@ class TestIncrementalSafetensorsWriter(unittest.TestCase):
                 {"a.weight", "b.weight", "c.weight"},
             )
             self.assertEqual(index["metadata"]["total_size"], 64)
+            self.assertFalse((out_dir / "model.safetensors").exists())
+            self.assertFalse(
+                (out_dir / "model-99999-of-99999.safetensors").exists()
+            )
+            self.assertEqual((out_dir / "tokenizer.json").read_text(), "keep")
 
             loaded = {}
             for shard_name in set(index["weight_map"].values()):
@@ -329,6 +376,229 @@ class TestIncrementalSafetensorsWriter(unittest.TestCase):
             self.assertTrue(torch.equal(
                 loaded["c.weight"], torch.arange(16, dtype=torch.int8)
             ))
+
+    def test_single_shard_replaces_stale_shards_and_index_only(self):
+        from prismaquant.export_native_compressed import (
+            IncrementalSafetensorsWriter,
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            out_dir = Path(td)
+            (out_dir / "model-00001-of-00002.safetensors").write_bytes(b"old")
+            (out_dir / "model-00002-of-00002.safetensors").write_bytes(b"old")
+            (out_dir / "model.safetensors.index.json").write_text("{}")
+            (out_dir / "config.json").write_text('{"keep": true}')
+
+            writer = IncrementalSafetensorsWriter(out_dir, shard_bytes=1024)
+            writer.add_tensors({"a.weight": torch.ones(4)})
+            writer.finalize()
+
+            self.assertTrue((out_dir / "model.safetensors").exists())
+            self.assertFalse(
+                (out_dir / "model.safetensors.index.json").exists()
+            )
+            self.assertFalse(list(out_dir.glob("model-*-of-*.safetensors")))
+            self.assertEqual(
+                (out_dir / "config.json").read_text(), '{"keep": true}'
+            )
+
+
+class TestNativeExportOutputSafety(unittest.TestCase):
+    @staticmethod
+    def _argv(model: Path, output: Path, layer_config: Path) -> list[str]:
+        return [
+            "export_native_compressed",
+            "--model",
+            str(model),
+            "--layer-config",
+            str(layer_config),
+            "--output",
+            str(output),
+        ]
+
+    def test_main_rejects_in_place_and_symlink_alias_before_model_load(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            model = root / "model"
+            model.mkdir()
+            source = model / "model.safetensors"
+            source.write_bytes(b"source-must-survive")
+            layer_config = root / "assignment.json"
+            layer_config.write_text("{}")
+
+            for output in (model, root / "model-alias"):
+                if output != model:
+                    output.symlink_to(model, target_is_directory=True)
+                with patch.object(
+                    sys,
+                    "argv",
+                    self._argv(model, output, layer_config),
+                ):
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        "resolve to the same path",
+                    ):
+                        enc.main()
+
+            self.assertEqual(source.read_bytes(), b"source-must-survive")
+            self.assertTrue((root / "model-alias").is_symlink())
+
+    def test_main_rejects_stale_aux_before_model_load(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            model = root / "model"
+            model.mkdir()
+            (model / "model.safetensors").write_bytes(b"source")
+            layer_config = root / "assignment.json"
+            layer_config.write_text("{}")
+            output = root / "output"
+            output.mkdir()
+            stale = output / "modeling_old_remote_code.py"
+            stale.write_text("STALE = True\n")
+
+            with patch.object(
+                sys,
+                "argv",
+                self._argv(model, output, layer_config),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "is not empty"):
+                    enc.main()
+
+            self.assertEqual(stale.read_text(), "STALE = True\n")
+            self.assertEqual(set(output.iterdir()), {stale})
+
+    def test_main_rejects_ancestor_descendant_output_trees(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            layer_config = root / "assignment.json"
+            layer_config.write_text("{}")
+
+            model = root / "model"
+            model.mkdir()
+            payload = model / "model.safetensors"
+            payload.write_bytes(b"source-one")
+            nested_output = model / "exported"
+            with patch.object(
+                sys,
+                "argv",
+                self._argv(model, nested_output, layer_config),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "ancestor/descendant",
+                ):
+                    enc.main()
+            self.assertFalse(nested_output.exists())
+            self.assertEqual(payload.read_bytes(), b"source-one")
+
+            outer_output = root / "outer-output"
+            nested_model = outer_output / "model"
+            nested_model.mkdir(parents=True)
+            nested_payload = nested_model / "model.safetensors"
+            nested_payload.write_bytes(b"source-two")
+            with patch.object(
+                sys,
+                "argv",
+                self._argv(nested_model, outer_output, layer_config),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "ancestor/descendant",
+                ):
+                    enc.main()
+            self.assertEqual(nested_payload.read_bytes(), b"source-two")
+            self.assertEqual(set(outer_output.iterdir()), {nested_model})
+
+    def test_main_transaction_cleans_post_model_budget_failure(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            model = root / "model"
+            model.mkdir()
+            (model / "model.safetensors").write_bytes(b"source")
+            layer_config = root / "assignment.json"
+            layer_config.write_text("{}")
+            output = root / "output"
+            output.mkdir()
+            before = output.stat()
+            export_cache = root / "export-cache"
+            export_cache.mkdir()
+            (export_cache / "layer_000.pt").write_bytes(b"resume")
+
+            def fail_after_model(argv):
+                index = argv.index("--output")
+                staged = Path(argv[index + 1])
+                self.assertNotEqual(staged, output)
+                (staged / "model.safetensors").write_bytes(b"over-budget")
+                raise RuntimeError("hard whole-artifact budget exceeded")
+
+            with patch.object(
+                sys,
+                "argv",
+                self._argv(model, output, layer_config)
+                + ["--export-cache-dir", str(export_cache)],
+            ), patch.object(enc, "_main_impl", side_effect=fail_after_model):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "hard whole-artifact budget",
+                ):
+                    enc.main()
+
+            after = output.stat()
+            self.assertEqual(
+                (after.st_dev, after.st_ino),
+                (before.st_dev, before.st_ino),
+            )
+            self.assertEqual(list(output.iterdir()), [])
+            self.assertEqual(list(root.glob(".output.tmp-*")), [])
+            self.assertEqual(
+                (export_cache / "layer_000.pt").read_bytes(),
+                b"resume",
+            )
+
+    def test_main_transaction_publishes_then_prints_final_serve_path(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            model = root / "model"
+            model.mkdir()
+            (model / "model.safetensors").write_bytes(b"source")
+            layer_config = root / "assignment.json"
+            layer_config.write_text("{}")
+            output = root / "output"
+            export_cache = root / "export-cache"
+            export_cache.mkdir()
+            (export_cache / "layer_000.pt").write_bytes(b"resume")
+
+            def succeed(argv):
+                index = argv.index("--output")
+                staged = Path(argv[index + 1])
+                self.assertFalse(output.exists())
+                (staged / "model.safetensors").write_bytes(b"complete")
+                return "finished"
+
+            with patch.object(
+                sys,
+                "argv",
+                self._argv(model, output, layer_config)
+                + ["--export-cache-dir", str(export_cache)],
+            ), patch.object(
+                enc,
+                "_main_impl",
+                side_effect=succeed,
+            ), patch("builtins.print") as printed:
+                self.assertEqual(enc.main(), "finished")
+
+            self.assertEqual(
+                (output / "model.safetensors").read_bytes(),
+                b"complete",
+            )
+            self.assertEqual(list(root.glob(".output.tmp-*")), [])
+            self.assertFalse(export_cache.exists())
+            rendered = "\n".join(
+                " ".join(str(arg) for arg in call.args)
+                for call in printed.call_args_list
+            )
+            self.assertIn(str(output.resolve()), rendered)
+            self.assertNotIn(".output.tmp-", rendered)
 
 
 class TestGroupedExportQuantization(unittest.TestCase):

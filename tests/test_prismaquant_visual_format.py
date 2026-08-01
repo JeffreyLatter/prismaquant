@@ -27,7 +27,9 @@ from safetensors.torch import save_file
 
 from prismaquant.allocator import (
     apply_visual_format_override,
+    discover_visual_linear_stats_from_source,
     discover_visual_linears_from_source,
+    validate_source_visual_passthrough_contract,
     _is_visual_linear,
 )
 from prismaquant.export_native_compressed import (
@@ -116,6 +118,56 @@ class TestDiscoverVisualLinearsFromSource(unittest.TestCase):
             "model.visual.blocks.0.attn.qkv",
             "model.visual.blocks.1.mlp.fc1",
         })
+
+    def test_discovery_retains_exact_shape_and_source_dtype(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            name = "model.visual.blocks.0.attn.qkv"
+            save_file(
+                {f"{name}.weight": torch.zeros(
+                    48, 16, dtype=torch.bfloat16
+                )},
+                str(tmp / "model.safetensors"),
+            )
+            stats = discover_visual_linear_stats_from_source(str(tmp))
+        self.assertEqual(stats[name], {
+            "n_params": 48 * 16,
+            "out_features": 48,
+            "in_features": 16,
+            "source_dtype": "bf16",
+            "has_fp8_scale": False,
+        })
+        validate_source_visual_passthrough_contract(stats, "BF16")
+
+    def test_non_bf16_source_cannot_receive_bf16_passthrough_budget(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            name = "model.visual.blocks.0.attn.qkv"
+            save_file(
+                {f"{name}.weight": torch.zeros(
+                    48, 16, dtype=torch.float32
+                )},
+                str(tmp / "model.safetensors"),
+            )
+            stats = discover_visual_linear_stats_from_source(str(tmp))
+        with self.assertRaisesRegex(
+            ValueError, "passthrough contract.*incompatible source dtype/scale"
+        ):
+            validate_source_visual_passthrough_contract(stats, "BF16")
+
+    def test_fp8_source_passthrough_requires_scale_sibling(self):
+        stats = {
+            "model.visual.blocks.0.attn.qkv": {
+                "source_dtype": "fp8",
+                "has_fp8_scale": False,
+            },
+        }
+        with self.assertRaisesRegex(
+            ValueError, "passthrough contract.*incompatible source dtype/scale"
+        ):
+            validate_source_visual_passthrough_contract(stats, "FP8_SOURCE")
 
     def test_discover_returns_empty_when_no_visual(self):
         import tempfile

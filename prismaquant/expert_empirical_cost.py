@@ -46,6 +46,12 @@ import torch.nn.functional as F
 
 from prismaquant import format_registry as fr
 from prismaquant.emu_forward_kl import _qdq_accepts_col_weights
+from prismaquant.nvfp4_cb_footprint import (
+    cb_cost_provenance,
+    cb_quantize_dequantize_for_context,
+    cb_serialization_context_from_env,
+    validate_cb_cost_provenance,
+)
 
 SCHEMA = "prismaquant.expert_empirical_cost.v1"
 PASSTHROUGH_FORMATS = {"BF16", "FP8_SOURCE"}
@@ -266,6 +272,16 @@ def _quantize_unit_inplace(
     """
     spec = fr.get_format(fmt)
     qdq = spec.quantize_dequantize
+    if spec.family in _CB_FAMILIES:
+        context = cb_serialization_context_from_env()
+
+        def qdq(weight, col_weights=None):
+            return cb_quantize_dequantize_for_context(
+                spec,
+                weight,
+                context=context,
+                col_weights=col_weights,
+            )
     weighted = _qdq_accepts_col_weights(spec)
     for pn in param_names:
         w = getattr(mod, pn).data
@@ -906,6 +922,13 @@ def merge_cost_payloads(
             f"the base payload and the expert empirical pass (e.g. "
             f"{sorted(overlap)[:3]}). The base run must omit packed experts "
             f"(or pass replace_experts for the CB-lane replace semantics).")
+    canonical_formats = _canon_formats(formats)
+    validate_cb_cost_provenance(
+        base,
+        canonical_formats,
+        context=cb_serialization_context_from_env(),
+        where="expert empirical merge base",
+    )
     if overlap:
         for name in overlap:
             base_costs.pop(name)
@@ -918,7 +941,7 @@ def merge_cost_payloads(
     merged["stats"] = base_stats
     merged["costs"] = base_costs
     merged["schema"] = SCHEMA
-    merged["formats"] = _canon_formats(formats)
+    merged["formats"] = canonical_formats
     return merged
 
 
@@ -933,6 +956,20 @@ def backfill_missing_from_base(
     the backfilled names, and records them in provenance for honesty: these
     rows carry the baseline estimator, not the AURA adjoint.
     """
+    formats = list(payload.get("formats", []) or [])
+    context = cb_serialization_context_from_env()
+    validate_cb_cost_provenance(
+        payload,
+        formats,
+        context=context,
+        where="expert empirical backfill destination",
+    )
+    validate_cb_cost_provenance(
+        base_cost,
+        formats,
+        context=context,
+        where="expert empirical backfill source",
+    )
     base_costs = dict(base_cost.get("costs", {}) or {})
     base_stats = dict(base_cost.get("stats", {}) or {})
     added: list[str] = []
@@ -1133,6 +1170,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "expert_sample": int(args.expert_sample),
         "max_units": int(args.max_units),
         "unit_filter": args.unit_filter,
+        **cb_cost_provenance(formats),
     }
 
     if args.merge_base:

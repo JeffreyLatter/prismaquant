@@ -713,7 +713,6 @@ def write_report(arms, agg, entropy, targets, n_dim, n_head):
 
 RESULTS1B = WORK.parent / "exp1b" / "results"
 CB_ENTRY_BYTES = 4          # NVFP4 codebook entry: 8 FP4 codes = 4 bytes
-NVFP4_GLOBAL_SCALE_BYTES = 4
 
 
 def role_of(qname: str) -> str:
@@ -1396,8 +1395,8 @@ def write_report_1b(targets):
 
 # ===========================================================================
 # EXP-1c — v2 premium-flip re-measurement (two-tier scale coding, balanced
-# tier). The v2 rungs are exact matched-bytes twins of the IQ2 ladder at
-# −0.03125 bpw each (two-tier-scale-spec.md §2.1); this measures whether the
+# tier). The v2 rungs are research-analytic near-rate comparators to the IQ2
+# ladder at −0.03125 bpw each (two-tier-scale-spec.md §2.1); this measures whether the
 # exp-1b native-FP4 premium (+0.15 bpw) is eliminated. Decisive quality gate
 # before the 27B production run.
 # ===========================================================================
@@ -1437,24 +1436,35 @@ def build_arms_1c() -> list[Arm1c]:
 
 
 def footprint_1c(arm: Arm1c, targets: dict) -> dict:
+    """Return the exp-1c research-analytic payload estimate.
+
+    This deliberately describes only the encoded tensor bodies plus the
+    experiment's packed-FP4 learned product-codebook tables.  It is not a
+    production artifact/container byte count, and NVFP4-CB has no separate
+    four-byte global-scale tensor.
+    """
     from prismaquant.nvfp4_cb_formats import nvfp4_cb_effective_bits
     n_params = sum(int(o) * int(i) for o, i in targets.values())
     if arm.kind == "iq":
         spec = fr.get_format(arm.fmt)
         body = sum(spec.memory_bytes_for_shape(s) for s in targets.values())
         sidecar = 0
-        global_scale = 0
+        byte_scope = "research_analytic_format_tensor_payload"
     else:
         bpw = nvfp4_cb_effective_bits(arm.k, "fp4", arm.scale_coding)
         body = int(round(bpw * n_params / 8.0))
         # shared product sub-tables: 2 × 2^(k/2) 4-dim entries × 2 B, per role
         entries = sum(1 << b for b in _bit_split(arm.k, 2))
         sidecar = len({role_of(q) for q in targets}) * entries * _SUB4_ENTRY_BYTES
-        global_scale = NVFP4_GLOBAL_SCALE_BYTES * len(targets)
-    total = body + sidecar + global_scale
+        byte_scope = (
+            "research_analytic_cb_body_plus_packed_fp4_role_codebooks"
+        )
+    total = body + sidecar
     return {"body_bpw": 8.0 * body / n_params, "body_bytes": body,
-            "sidecar_bytes": sidecar, "total_bytes": total,
-            "total_bpw": 8.0 * total / n_params, "n_params": n_params}
+            "sidecar_bytes": sidecar, "global_scale_bytes": 0,
+            "total_bytes": total, "total_bpw": 8.0 * total / n_params,
+            "n_params": n_params, "byte_scope": byte_scope,
+            "production_exact": False}
 
 
 def run_arm_seed_1c(arm: Arm1c, seed, model, targets, imatrix, foot):
@@ -1491,6 +1501,9 @@ def run_arm_seed_1c(arm: Arm1c, seed, model, targets, imatrix, foot):
            "body_bpw": foot["body_bpw"], "total_bpw": foot["total_bpw"],
            "total_bytes": foot["total_bytes"],
            "sidecar_bytes": foot["sidecar_bytes"],
+           "global_scale_bytes": foot["global_scale_bytes"],
+           "byte_scope": foot["byte_scope"],
+           "production_exact": foot["production_exact"],
            "provenance": {**res["provenance"], "git_commit": _git_commit()}}
     out_path.write_text(json.dumps(rec, indent=2))
     return rec
@@ -1525,9 +1538,15 @@ def write_report_1c(targets):
              "8192 tok; W4A4 act emulation for CB, weight-only for IQ — each "
              "format in its served bucket). 27B + served vLLM KL remain the "
              "promotion bar.\n")
+    L.append("> **BYTE SCOPE — research analytic, not production exact.** "
+             "The table counts encoded tensor bodies plus the experiment's "
+             "packed-FP4 per-role codebook tables only; it excludes artifact "
+             "container/metadata overhead. NVFP4-CB has no separate global "
+             "scale tensor.\n")
     L.append("Two-tier v2 scale coding (two-tier-scale-spec.md) fixed the fp4 "
              "subnormal-collapse defect AND cut scale bytes 0.500→0.28125 bpw, "
-             "making NVFP4_CB_K14/K16/K18 exact matched-bytes twins of "
+             "making NVFP4_CB_K14/K16/K18 research-analytic near-rate "
+             "comparators to "
              "IQ2_XXS/IQ2_XS/IQ2_S at −0.03125 bpw each. exp-1b measured the "
              "v1 native-FP4 premium at +0.15 bpw; this experiment re-measures "
              "it. Encoder: shared-per-role learned product codebooks, "

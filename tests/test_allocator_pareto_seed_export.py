@@ -90,7 +90,7 @@ def test_allocator_exports_expanded_pareto_seed_assignments(tmp_path):
     saw_mxfp8 = False
     for row in manifest["candidates"]:
         payload = json.loads(Path(row["path"]).read_text())
-        assert payload["schema"] == "prismaquant.allocator.pareto_assignment.v1"
+        assert payload["schema"] == "prismaquant.allocator.pareto_assignment.v2"
         assignment = payload["assignment"]
         assert set(assignment) == expected_assignment_names
         assert all(".__siblings__." not in name for name in assignment)
@@ -192,7 +192,9 @@ def test_allocator_excludes_fixed_quantized_mtp_from_body_budget(tmp_path):
         row = next(csv.DictReader(f))
 
     assert row["feasible"] == "True"
-    assert float(row["achieved_bits"]) == 4.5
+    # Exact assignment payload accounting includes the two fp32 global-scale
+    # scalars emitted for each NVFP4 Linear (8 B / 16,384 params here).
+    assert float(row["achieved_bits"]) == 4.50390625
     assert float(row["predicted_dloss"]) == 100.0
     assert float(row["aux_fixed_predicted_dloss"]) == 7.0
     assert float(row["total_predicted_dloss_with_aux"]) == 107.0

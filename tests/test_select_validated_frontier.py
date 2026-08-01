@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 import sys
@@ -7,6 +8,18 @@ from pathlib import Path
 
 import math
 
+import pytest
+import torch
+
+from prismaquant.nvfp4_cb_footprint import (
+    CBSerializationContext,
+    assignment_serialization_sha256,
+    cb_serialization_context_stamp,
+)
+from prismaquant.production_weight_cache import (
+    bind_cb_render_identity_source_weights,
+    build_production_cache_cb_render_identity,
+)
 from prismaquant.select_validated_frontier import (
     DEFAULT_TAIL_ETA,
     DEFAULT_TAIL_VETO,
@@ -24,6 +37,48 @@ from prismaquant.select_validated_frontier import (
     tail_veto_inert_reason,
     worst_rank_inversion,
 )
+
+
+def _production_cb_stamp(formats=("NVFP4_CB_K16",)):
+    return cb_serialization_context_stamp(
+        CBSerializationContext.production(), formats=formats
+    )
+
+
+def _canonical_payload_sha256(payload):
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _complete_cb_render_identity(formats_by_qname):
+    context = CBSerializationContext.production()
+    qnames = sorted(formats_by_qname)
+    col_weights = {
+        qname: torch.linspace(0.1, 1.0, 256)
+        for qname in qnames
+    }
+    identity = build_production_cache_cb_render_identity(
+        formats_by_qname,
+        cb_serialization_context=context,
+        col_weights=col_weights,
+        render_levers={"weighted_vq": True},
+        render_mechanism_plan=[],
+    )
+    assert identity is not None
+    return bind_cb_render_identity_source_weights(
+        identity,
+        {
+            qname: torch.full((2, 256), index, dtype=torch.float32)
+            for index, qname in enumerate(qnames, start=1)
+        },
+    )
 
 
 def _sat_results(stderr):
@@ -263,6 +318,11 @@ def test_select_validated_frontier_cli_writes_layer_config(tmp_path):
         }],
     }))
     layer_config = tmp_path / "layer_config.json"
+    layer_config.write_text(json.dumps({
+        "__prismaquant__": {
+            "cb_serialized_payload": _production_cb_stamp(),
+        },
+    }))
     assignment_out = tmp_path / "selected_assignment.json"
     summary = tmp_path / "selection.json"
 
@@ -298,6 +358,499 @@ def test_select_validated_frontier_cli_writes_layer_config(tmp_path):
 
     selected = json.loads(summary.read_text())["selected"]
     assert selected["label"] == "candidate"
+
+
+def test_selector_preserves_cb_global_and_per_layer_serialization_identity(
+    tmp_path,
+):
+    qname = "model.layers.0.self_attn.q_proj"
+    assignment = {qname: "NVFP4_CB_K16"}
+    render_identity = _complete_cb_render_identity(assignment)
+    context = render_identity["cb_serialized_payload"]
+    identity = "exact-tensor-identity"
+    assignment_path = tmp_path / "candidate_cb.json"
+    assignment_path.write_text(json.dumps({
+        "schema": "prismaquant.allocator.pareto_assignment.v1",
+        "cb_serialized_payload": context,
+        "cb_render_identity": render_identity,
+        "cb_serialized_identities": {
+            qname: identity,
+        },
+        "assignment": assignment,
+    }))
+    validation_path = tmp_path / "validation.json"
+    validation_path.write_text(json.dumps({
+        "results": [{
+            "label": "candidate_cb",
+            "path": str(assignment_path),
+            "bpp": 2.3,
+            "last_token_kl": 0.01,
+            "format_counts": {"NVFP4_CB_K16": 1},
+        }],
+    }))
+    layer_config = tmp_path / "layer_config.json"
+    assignment_out = tmp_path / "selected_assignment.json"
+    summary = tmp_path / "selection.json"
+
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "prismaquant.select_validated_frontier",
+            "--validation-json",
+            str(validation_path),
+            "--mode",
+            "best-kl",
+            "--output-layer-config",
+            str(layer_config),
+            "--output-assignment",
+            str(assignment_out),
+            "--output-summary",
+            str(summary),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        check=True,
+    )
+
+    emitted_layer = json.loads(layer_config.read_text())
+    assert emitted_layer["__prismaquant__"]["cb_serialized_payload"] == context
+    assert emitted_layer["__prismaquant__"][
+        "cb_render_identity"
+    ] == render_identity
+    assert emitted_layer[qname][
+        "cb_serialized_identity"
+    ] == identity
+    emitted_assignment = json.loads(assignment_out.read_text())
+    assert emitted_assignment["cb_serialized_payload"] == context
+    assert emitted_assignment["cb_render_identity"] == render_identity
+    assert emitted_assignment["cb_serialized_identities"] == {
+        qname: identity,
+    }
+
+
+def test_selector_uses_validator_resolved_full_assignment_not_raw_delta(tmp_path):
+    body = "model.layers.0.self_attn.q_proj"
+    visual = "model.visual.blocks.0.mlp.fc1"
+    assignment = {
+        body: "NVFP4_CB_K16",
+        visual: "NVFP4_CB_K16",
+    }
+    render_identity = _complete_cb_render_identity(assignment)
+    context = render_identity["cb_serialized_payload"]
+    raw_path = tmp_path / "raw_delta.json"
+    raw_path.write_text(json.dumps({
+        "assignment": {body: "NVFP4_CB_K16"},
+        "cb_serialized_payload": context,
+        "cb_serialized_identities": {body: "body-identity"},
+    }))
+    resolved = {
+        "schema": "prismaquant.validated_resolved_assignment.v1",
+        "source_path": str(raw_path),
+        "assignment": assignment,
+        "cb_serialized_payload": context,
+        "cb_render_identity": render_identity,
+        "cb_serialized_identities": {
+            body: "body-identity",
+            visual: "visual-identity",
+        },
+    }
+    resolved["assignment_sha256"] = assignment_serialization_sha256(
+        resolved["assignment"]
+    )
+    validation_path = tmp_path / "validation.json"
+    validation_path.write_text(json.dumps({
+        "results": [{
+            "label": "candidate",
+            "path": str(raw_path),
+            "bpp": 2.3,
+            "last_token_kl": 0.01,
+            "assignment_sha256": resolved["assignment_sha256"],
+            "resolved_assignment_payload": resolved,
+            "resolved_assignment_payload_sha256": (
+                _canonical_payload_sha256(resolved)
+            ),
+        }],
+    }))
+    layer_config = tmp_path / "layer_config.json"
+    assignment_out = tmp_path / "selected_assignment.json"
+
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "prismaquant.select_validated_frontier",
+            "--validation-json",
+            str(validation_path),
+            "--mode",
+            "best-kl",
+            "--output-layer-config",
+            str(layer_config),
+            "--output-assignment",
+            str(assignment_out),
+            "--output-summary",
+            str(tmp_path / "selection.json"),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        check=True,
+    )
+
+    emitted = json.loads(assignment_out.read_text())
+    assert emitted["assignment"] == resolved["assignment"]
+    assert emitted["cb_serialized_identities"] == (
+        resolved["cb_serialized_identities"]
+    )
+    assert emitted["cb_render_identity"] == render_identity
+    emitted_layer = json.loads(layer_config.read_text())
+    assert emitted_layer[visual]["cb_serialized_identity"] == "visual-identity"
+
+
+@pytest.mark.parametrize("splice", ["assignment", "cb_render_identity"])
+def test_selector_rejects_spliced_resolved_assignment_payload(tmp_path, splice):
+    qname = "model.layers.0.self_attn.q_proj"
+    assignment = {qname: "NVFP4_CB_K16"}
+    render_identity = _complete_cb_render_identity(assignment)
+    raw_path = tmp_path / "candidate.json"
+    raw_path.write_text(json.dumps({"assignment": assignment}))
+    resolved = {
+        "schema": "prismaquant.validated_resolved_assignment.v1",
+        "source_path": str(raw_path),
+        "assignment": assignment,
+        "assignment_sha256": assignment_serialization_sha256(assignment),
+        "cb_serialized_payload": render_identity["cb_serialized_payload"],
+        "cb_render_identity": render_identity,
+        "cb_serialized_identities": {qname: "exact-tensor-identity"},
+    }
+    validator_payload_sha256 = _canonical_payload_sha256(resolved)
+    spliced_payload = json.loads(json.dumps(resolved))
+    if splice == "assignment":
+        spliced_payload["assignment"][qname] = "NVFP4_CB_K14"
+    else:
+        spliced_payload["cb_render_identity"][
+            "col_weights_content_sha256"
+        ][qname] = "0" * 64
+
+    validation_path = tmp_path / "validation.json"
+    validation_path.write_text(json.dumps({
+        "results": [{
+            "label": "spliced",
+            "path": str(raw_path),
+            "bpp": 2.3,
+            "last_token_kl": 0.01,
+            "assignment_sha256": resolved["assignment_sha256"],
+            "resolved_assignment_payload": spliced_payload,
+            "resolved_assignment_payload_sha256": validator_payload_sha256,
+        }],
+    }))
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "prismaquant.select_validated_frontier",
+            "--validation-json",
+            str(validation_path),
+            "--mode",
+            "best-kl",
+            "--output-layer-config",
+            str(tmp_path / "layer_config.json"),
+            "--output-assignment",
+            str(tmp_path / "selected_assignment.json"),
+            "--output-summary",
+            str(tmp_path / "selection.json"),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert (
+        "resolved measured assignment payload does not match the identity "
+        "bound to its KL result"
+    ) in (result.stderr + result.stdout)
+
+
+def test_selector_carries_non_cb_whole_artifact_budget_to_layer_config(tmp_path):
+    assignment = {
+        "model.layers.0.self_attn.q_proj": "NVFP4",
+    }
+    budget = {
+        "schema": "prismaquant.whole_artifact_budget.v2",
+        "scope": "all_regular_files_recursive",
+        "budget_bytes": 10_000,
+        "selection_tensor_payload_bytes": 8_000,
+        "selection_non_tensor_reserve_bytes": 1_000,
+        "selection_whole_artifact_upper_bound_bytes": 9_000,
+        "selection_assignment_sha256": assignment_serialization_sha256(
+            assignment
+        ),
+        "selection_contract": (
+            "tensor_payload_plus_operator_supplied_non_tensor_reserve"
+        ),
+        "final_contract": "stat_all_regular_files_recursive_fail_closed",
+    }
+    assignment_path = tmp_path / "candidate.json"
+    assignment_path.write_text(json.dumps({
+        "whole_artifact_budget": budget,
+        "assignment": assignment,
+    }))
+    validation_path = tmp_path / "validation.json"
+    validation_path.write_text(json.dumps({
+        "results": [{
+            "label": "candidate",
+            "path": str(assignment_path),
+            "bpp": 4.5,
+            "last_token_kl": 0.01,
+        }],
+    }))
+    layer_config = tmp_path / "layer_config.json"
+    assignment_out = tmp_path / "selected_assignment.json"
+
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "prismaquant.select_validated_frontier",
+            "--validation-json",
+            str(validation_path),
+            "--mode",
+            "best-kl",
+            "--output-layer-config",
+            str(layer_config),
+            "--output-assignment",
+            str(assignment_out),
+            "--output-summary",
+            str(tmp_path / "selection.json"),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        check=True,
+    )
+
+    emitted_layer = json.loads(layer_config.read_text())
+    assert emitted_layer["__prismaquant__"]["whole_artifact_budget"] == budget
+    assert "cb_serialized_payload" not in emitted_layer["__prismaquant__"]
+    emitted_assignment = json.loads(assignment_out.read_text())
+    assert emitted_assignment["whole_artifact_budget"] == budget
+
+
+def test_selector_rejects_global_cb_stamp_without_per_layer_identities(tmp_path):
+    assignment_path = tmp_path / "candidate_cb.json"
+    assignment_path.write_text(json.dumps({
+        "cb_serialized_payload": _production_cb_stamp(),
+        "assignment": {
+            "model.layers.0.self_attn.q_proj": "NVFP4_CB_K16",
+        },
+    }))
+    validation_path = tmp_path / "validation.json"
+    validation_path.write_text(json.dumps({
+        "results": [{
+            "label": "candidate_cb",
+            "path": str(assignment_path),
+            "bpp": 2.3,
+            "last_token_kl": 0.01,
+        }],
+    }))
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "prismaquant.select_validated_frontier",
+            "--validation-json",
+            str(validation_path),
+            "--mode",
+            "best-kl",
+            "--output-layer-config",
+            str(tmp_path / "layer_config.json"),
+            "--output-assignment",
+            str(tmp_path / "selected_assignment.json"),
+            "--output-summary",
+            str(tmp_path / "selection.json"),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert "global serialized-payload context but no per-layer identities" in (
+        result.stderr + result.stdout
+    )
+
+
+def test_selector_rejects_cb_assignment_with_no_serialization_metadata(tmp_path):
+    assignment_path = tmp_path / "candidate_cb.json"
+    assignment_path.write_text(json.dumps({
+        "assignment": {
+            "model.layers.0.self_attn.q_proj": "NVFP4_CB_K16",
+        },
+    }))
+    validation_path = tmp_path / "validation.json"
+    validation_path.write_text(json.dumps({
+        "results": [{
+            "label": "candidate_cb",
+            "path": str(assignment_path),
+            "bpp": 2.3,
+            "last_token_kl": 0.01,
+        }],
+    }))
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "prismaquant.select_validated_frontier",
+            "--validation-json",
+            str(validation_path),
+            "--mode",
+            "best-kl",
+            "--output-layer-config",
+            str(tmp_path / "layer_config.json"),
+            "--output-assignment",
+            str(tmp_path / "selected_assignment.json"),
+            "--output-summary",
+            str(tmp_path / "selection.json"),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert "missing its global serialized-payload context" in (
+        result.stderr + result.stdout
+    )
+
+
+@pytest.mark.parametrize(
+    "case,stamp_budget,stamp_upper,expected_error",
+    [
+        (
+            "missing_stamp",
+            None,
+            None,
+            "has no whole_artifact_budget stamp",
+        ),
+        (
+            "wrong_budget",
+            11_000,
+            9_000,
+            "budget differs from --target-disk-gb",
+        ),
+        (
+            "wrong_upper",
+            10_000,
+            8_000,
+            "upper bound does not reconcile",
+        ),
+    ],
+)
+def test_budget_selector_requires_reconciled_export_gate(
+    tmp_path, case, stamp_budget, stamp_upper, expected_error,
+):
+    assignment_payload = {
+        "assignment": {
+            "model.layers.0.self_attn.q_proj": "NVFP4",
+        },
+    }
+    if stamp_budget is not None:
+        reserve = 1_000
+        assignment_payload["whole_artifact_budget"] = {
+            "schema": "prismaquant.whole_artifact_budget.v2",
+            "scope": "all_regular_files_recursive",
+            "budget_bytes": stamp_budget,
+            "selection_tensor_payload_bytes": stamp_upper - reserve,
+            "selection_non_tensor_reserve_bytes": reserve,
+            "selection_whole_artifact_upper_bound_bytes": stamp_upper,
+            "selection_assignment_sha256": assignment_serialization_sha256(
+                assignment_payload["assignment"]
+            ),
+            "selection_contract": (
+                "tensor_payload_plus_operator_supplied_non_tensor_reserve"
+            ),
+            "final_contract": (
+                "stat_all_regular_files_recursive_fail_closed"
+            ),
+        }
+    assignment_path = tmp_path / f"{case}.json"
+    assignment_path.write_text(json.dumps(assignment_payload))
+    validation_path = tmp_path / "validation.json"
+    validation_path.write_text(json.dumps({
+        "results": [{
+            "label": case,
+            "path": str(assignment_path),
+            "bpp": 4.5,
+            "last_token_kl": 0.01,
+            "whole_artifact_upper_bound_bytes": 9_000,
+        }],
+    }))
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "prismaquant.select_validated_frontier",
+            "--validation-json",
+            str(validation_path),
+            "--mode",
+            "budget",
+            "--target-disk-gb",
+            "0.00001",  # floor(1e-5 * 1e9) = 10,000 bytes
+            "--tail-veto",
+            "none",
+            "--output-layer-config",
+            str(tmp_path / "layer_config.json"),
+            "--output-assignment",
+            str(tmp_path / "selected_assignment.json"),
+            "--output-summary",
+            str(tmp_path / "selection.json"),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert expected_error in (result.stderr + result.stdout)
+
+
+def test_selector_rejects_stale_cb_stamp_on_non_cb_assignment(tmp_path):
+    assignment_path = tmp_path / "candidate.json"
+    assignment_path.write_text(json.dumps({
+        "cb_serialized_payload": _production_cb_stamp(),
+        "assignment": {
+            "model.layers.0.self_attn.q_proj": "NVFP4",
+        },
+    }))
+    validation_path = tmp_path / "validation.json"
+    validation_path.write_text(json.dumps({
+        "results": [{
+            "label": "candidate",
+            "path": str(assignment_path),
+            "bpp": 4.5,
+            "last_token_kl": 0.01,
+        }],
+    }))
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "prismaquant.select_validated_frontier",
+            "--validation-json",
+            str(validation_path),
+            "--mode",
+            "best-kl",
+            "--output-layer-config",
+            str(tmp_path / "layer_config.json"),
+            "--output-assignment",
+            str(tmp_path / "selected_assignment.json"),
+            "--output-summary",
+            str(tmp_path / "selection.json"),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert "global serialized-payload context but no per-layer identities" in (
+        result.stderr + result.stdout
+    )
 
 
 def test_select_validated_frontier_diagnostics_include_dominated_rows(tmp_path):

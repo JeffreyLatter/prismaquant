@@ -5,7 +5,7 @@ consumes.** A plugin author needs nothing else: it fully specifies the byte
 layout of the packed weight stream, the safetensors tensor names, the
 `quant_config.json` schema, and the codebook storage. It is pinned bit-for-bit
 by `tests/test_nvfp4_cb_formats.py` (the pack→unpack→reconstruct contract) and
-produced by `prismaquant/export_nvfp4_cb.py`.
+produced by `prismaquant/export_nvfp4_cb.py` and its streaming counterpart.
 
 Producers of these bytes:
 `prismaquant.nvfp4_cb_formats.nvfp4_cb_assemble_bytes`; the inverse the plugin
@@ -20,8 +20,8 @@ selects it. Two grids, three index-encoding modes:
 
 | family | grid | codeword values | act | scale plane | bpw (body) |
 |---|---|---|---|---|---|
-| `NVFP4_CB_K{k}` | fp4 / E2M1 | `{0,±.5,±1,±1.5,±2,±3,±4,±6}` | W4A4 | group-16 E4M3, **in the weight bytes** | `k/8 + 0.5` |
-| `NVFP4_CB_S{k}` | fp4 / E2M1 | positive half-grid + explicit signs | W4A4 | group-16 E4M3, **in the weight bytes** | `k/8 + 0.5` |
+| `NVFP4_CB_K{k}` | fp4 / E2M1 | `{0,±.5,±1,±1.5,±2,±3,±4,±6}` | W4A4 | group-16 E4M3, **in the weight bytes** | production v2: `k/8 + 0.28125` |
+| `NVFP4_CB_S{k}` | fp4 / E2M1 | positive half-grid + explicit signs | W4A4 | group-16 E4M3, **in the weight bytes** | production v2: `k/8 + 0.28125` |
 | `FP8_CB_K{k}`   | fp8 / E4M3 | E4M3 grid (‖·‖ ≤ 448) | W8A8 | **none in weight bytes** — per-output-channel fp32, separate tensor | `k/8` |
 
 `k` rungs (**all-integer ladders**, `prismaquant/format_registry.py:943,947`,
@@ -48,13 +48,14 @@ Per superblock:
 
 ```
 ┌──────────────────────────────┬─────────────────────────┐
-│ INDEX STREAM  (4k bytes)      │ SCALE PLANE (fp4: 16 B)  │   type_size bytes
-│ 32 k-bit codewords, LSB-first │ 16 × E4M3 group scales   │   = 4k + 16 (fp4)
+│ INDEX STREAM  (4k bytes)      │ SCALE PLANE (fp4)         │   type_size bytes
+│ 32 k-bit codewords, LSB-first │ v2: 9 B; legacy v1: 16 B │   = 4k + 9 (fp4 v2)
 │                               │ (fp8: absent)            │   = 4k      (fp8)
 └──────────────────────────────┴─────────────────────────┘
 ```
 
-- `type_size = 4k + 16` (fp4) / `4k` (fp8) bytes — **integer for every k**.
+- Production `type_size = 4k + 9` (fp4 layout-v2) / `4k` (fp8) bytes;
+  explicit legacy-v1 fp4 is `4k + 16`. All are **integer for every k**.
 - 32 codewords = 256 weights / 8 (VEC_DIM); 16 scales = 256 / 16 (FP4_GROUP).
 - **fp8 has no per-superblock scale plane.** Its per-output-channel fp32 scales
   ship as a separate `<name>.weight_scale` tensor (§3).
@@ -113,8 +114,9 @@ under the weighted-L2 objective, so `s_j = sign(x_j)` is jointly optimal.)
 
 ### 1.2 Scale section (fp4 only) — two codings
 
-**Scale coding v1 (e4m3-direct, 16 B — the default; absence of the scheme's
-`scale_coding` key ⇒ v1):** immediately after the 4k index bytes, **16 E4M3
+**Scale coding v1 (e4m3-direct, 16 B — legacy read/write compatibility;
+absence of the scheme's `scale_coding` key still means v1):** immediately
+after the 4k index bytes, **16 E4M3
 bytes**, one group-16 block scale per 16 consecutive weights (group `g` covers
 weights `[16g, 16g+16)` of the superblock). Byte = the `torch.float8_e4m3fn`
 value reinterpreted as uint8 (`scale.to(float8_e4m3fn).view(uint8)`). This is
@@ -122,7 +124,8 @@ value reinterpreted as uint8 (`scale.to(float8_e4m3fn).view(uint8)`). This is
 MMA unchanged. Reconstruction:
 `weight[i] = codeword_value[i] × e4m3_scale[group(i)]`.
 
-**Scale coding v2 (two-tier, 9 B — `layout_version: 2`,
+**Scale coding v2 (two-tier, 9 B — production writer default;
+`layout_version: 2`,
 `docs/lanes/nvfp4-cb/two-tier-scale-spec.md`):** immediately after the 4k index
 bytes:
 
@@ -161,9 +164,10 @@ bytes:
 
 `effective_bits(fp4, v1) = (4k+16)·8/256 = k/8 + 0.5`;
 `effective_bits(fp4, v2) = (4k+9)·8/256 = k/8 + 0.28125` (version-keyed —
-`nvfp4_cb_formats.nvfp4_cb_effective_bits`; the registered FormatSpecs stay on
-v1 accounting until the two-tier serving gates clear, since a v2 artifact may
-only ship served M1-native);
+`nvfp4_cb_formats.nvfp4_cb_effective_bits`). Registered `FormatSpec` values
+remain a legacy nominal description for compatibility and must not price a
+produced artifact; allocator/export/footprint paths use the versioned
+`nvfp4_cb_footprint` payload API with an explicit serialization context.
 `effective_bits(fp8 body) = 4k·8/256 = k/8` (+ the per-channel fp32 plane).
 Two-tier is fp4-only (fp8 has no per-superblock scale plane).
 
@@ -184,9 +188,10 @@ Stream bits `0..11` = LSB-first bits of 197 = `1,0,1,0,0,0,1,1,0,0,...`.
   `c0` and its high 4 bits start `c1`. (Codewords are **not** byte-aligned; only
   the 4k-byte superblock is.)
 
-Index region = `4·12 = 48` bytes (32 codewords × 12 bits = 384 bits). Then 16
-E4M3 scale bytes → `type_size = 64` bytes for the single superblock →
-`cb_qweight` shape `(1, 64)`.
+Index region = `4·12 = 48` bytes (32 codewords × 12 bits = 384 bits). Production
+v2 then appends its 9-byte scale plane → `type_size = 57` bytes for the single
+superblock → `cb_qweight` shape `(1, 57)`. An explicitly requested legacy-v1
+artifact appends 16 bytes instead and has shape `(1, 64)`.
 
 To decode vector 0: read its 12 stream bits → `197`; `sub0 = 197 & 63 = 5`,
 `sub1 = (197 >> 6) & 63 = 3`; codeword = `[sub_cb0[5] (4 coords) | sub_cb1[3] (4
@@ -223,12 +228,55 @@ map experts at the top level additionally need a loader line in
 | `cb_codebook.<ref>.<fmt>` | fp16 `(2^K, 8)` | `full`/`signed` codebook (`K = k` full, `K = k-8` signed) |
 | `cb_codebook.<ref>.<fmt>.sub{i}` | fp16 `(2^b_i, 8/n_sub)` | `product` sub-codebook `i` |
 
-`<ref>` is `lattice` (the deterministic fixed lattice, no per-tensor sidecar) or
+`<ref>` is `lattice` (the deterministic fixed lattice, shipped once per format)
+or
 a role name (a shared per-role learned codebook, e.g. `gate_proj`). `<fmt>` is
 the rung name (`NVFP4_CB_K16`, …). Codebook values are grid-valued and **exact
 in fp16** for both grids; the plugin may re-pack them to 4-bit (fp4) / 8-bit
 (fp8) codes in `process_weights_after_loading` (a load-time transform of a tiny
 table — not a resident weight expansion, so INV-1 is unaffected).
+
+### 3.1 Authoritative serialized-payload accounting
+
+`prismaquant.nvfp4_cb_footprint` is the producer byte contract. Its persisted
+schema is `prismaquant.cb_serialized_payload.v1`; exact calls require a
+`CBSerializationContext` carrying scale coding/layout, codebook sharing source,
+and (when already materialized) physical sidecar refs. Omitting that context on
+producer paths is an error rather than an implicit legacy-v1 estimate.
+
+This contract is exact for **tensor data spans**, not for the byte size of the
+finished export directory. Safetensors' 8-byte prefixes and JSON headers,
+container metadata, `config.json`, `quant_config.json`, tokenizer assets, and
+other copied files are not additive candidate costs. After either exporter has
+written every file it parses the final safetensors headers, re-asserts the CB
+data spans, and persists a second exact scope under
+`provenance.artifact_inventory`: per-file sizes plus the total directory,
+container, tensor-data, container-overhead, and non-container byte counts.
+
+For `rows = product(shape[:-1])` and `n_sb = in_features / 256`:
+
+- fp4-CB tensor payload = `rows · n_sb · (4k + 9)` bytes for production v2,
+  or `rows · n_sb · (4k + 16)` for explicit legacy v1;
+- fp8-CB tensor payload = `rows · n_sb · 4k + rows · 4` bytes (the second term
+  is the separate fp32 output-row scale tensor);
+- CB global-scale bytes are always zero; no such tensor exists;
+- each product-codebook sidecar is the sum of its FP16 subtable payloads,
+  `Σ_i 2^b_i · (8/n_sub) · 2` bytes; signed mode is
+  `2^(k-8) · 8 · 2` bytes.
+
+Assignment accounting deduplicates the sidecar by its full serialized identity:
+format, source/sharing policy, physical refs, dtype, and subtable shapes. Both
+exporters assert their actual/planned tensor bytes and FP16 sidecar tensors
+against this breakdown, then persist a compact copy under
+`provenance.serialized_payload`. The allocator also stamps scale coding,
+layout, and sharing policy into `__prismaquant__.cb_serialized_payload`; an
+export request that disagrees with that recipe fails before writing weights.
+
+The additive allocator candidate cost includes the exact per-tensor payload but
+not a globally shared sidecar fixed charge. Whole tensor-payload/fit-the-card
+pricing adds each sidecar once. Enforcing that non-additive fixed charge
+*inside* the knapsack would require a solver with shared binary activation
+variables; it must not be approximated by charging every candidate a copy.
 
 All **non-target tensors** (norms, embeddings, lm_head, BF16-assigned Linears)
 are copied **verbatim** (bf16 passthrough). Their module names appear in the
@@ -244,7 +292,7 @@ codebooks — this is a distinct `quant_method`). Also mirrored into
 
 ```jsonc
 {
-  "quant_method": "prismaquant",
+  "quant_method": "gridbook",
   "format": "nvfp4_cb",
   "config_groups": {
     "group_0": {
@@ -258,7 +306,7 @@ codebooks — this is a distinct `quant_method`). Also mirrored into
         "group_size": 16,         // fp4 group-16 scale; 0 for fp8
         "vec_dim": 8,
         "n_sub": 2,               // product sub-count; 1 for full/signed
-        "type_size": 80,          // bytes / 256-weight superblock
+        "type_size": 73,          // production-v2 bytes / 256-weight superblock
         "act_bits": 4,            // 4 (fp4, W4A4) | 8 (fp8, W8A8)
         "codebook_source": "learned",   // "lattice" | "learned"
         "codebook_ref": ["cb_codebook.gate_proj.NVFP4_CB_K16.sub0",
@@ -282,6 +330,17 @@ codebooks — this is a distinct `quant_method`). Also mirrored into
     "codebook_source": "learned",
     "scale_sweep": true,
     "cb_targets": 128,
+    "serialized_payload": {
+      "schema": "prismaquant.cb_serialized_payload.v1",
+      "context": {"scale_coding": "two_tier", "layout_version": 2,
+                  "codebook_source": "learned"},
+      "tensor_payload_bytes": 123456,
+      "codebook_sidecar_bytes": 4096,
+      "global_scale_bytes": 0,
+      "total_bytes": 127552,
+      "n_tensors": 128,
+      "sidecars": [/* physical FP16 ref/shape identities */]
+    },
     "tensor_formats": {"model.layers.0.mlp.gate_proj": "NVFP4_CB_K16", ...}
   }
 }
@@ -313,7 +372,8 @@ for each row, each superblock s:
                 cw = mag * (-1 if sgn else +1)            # per coord j
     for coord j in 0..7:
       w_idx  = s*256 + v*8 + j
-      if fp4: scale = e4m3( qweight[row, s*type_size + 4k + (local_group16) ] )
+      if fp4 v1: scale = e4m3(qweight[row, s*type_size + 4k + local_group16])
+      if fp4 v2: scale = T[sub_code(local_group16)] * 2^(super_e-127)
       if fp8: scale = weight_scale[row]
       weight[row, w_idx] = cw[j] * scale
 ```

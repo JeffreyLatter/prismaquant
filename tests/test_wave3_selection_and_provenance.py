@@ -34,7 +34,12 @@ def _rows(tmp_path, spec):
         path = tmp_path / f"{label}.json"
         path.write_text(json.dumps({
             "label": label,
+            "whole_artifact_upper_bound_bytes": int(gb * GB),
             "artifact_bytes": int(gb * GB),
+            "artifact_byte_scope": (
+                "selection_upper_bound_tensor_payload_plus_"
+                "operator_non_tensor_reserve"
+            ),
             "assignment": {"model.layers.0.self_attn.q_proj": "NVFP4"},
         }))
         out.append({"label": label, "path": str(path), "bpp": bpp, "kl": kl})
@@ -108,7 +113,9 @@ def test_allocator_narrows_the_pareto_set_under_a_budget():
     assert "byte-budget Pareto narrowing" in src
     # a computed narrowing, not a hardcoded rung count
     assert "keep_positions" in src
-    assert re.search(r"artifact_bytes.*<=.*budget_bytes_pareto", src)
+    assert re.search(
+        r"whole_artifact_upper_bound_bytes.*<=.*budget_bytes_pareto", src
+    )
 
 
 # --------------------------------------------------------------------- R2

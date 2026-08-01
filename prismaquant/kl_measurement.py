@@ -42,6 +42,13 @@ from prismaquant.perturbed_x_cache import (
     PerturbedActivationCache,
     calibration_data_hash,
 )
+from prismaquant.nvfp4_cb_footprint import (
+    CBSerializationContext,
+    cb_assignment_payload_breakdown,
+    is_cb_format,
+    validate_cb_assignment_serialization_stamps,
+)
+from prismaquant.footprint import nvfp4_global_sidecar_bytes
 
 KLScope = Literal["last_token", "full_sequence"]
 
@@ -179,14 +186,54 @@ def assignment_bit_total(
     stats: Mapping[str, Mapping],
     assignment: Mapping[str, str],
     specs_by_name: Mapping[str, fr.FormatSpec],
+    *,
+    cb_serialization_context: CBSerializationContext | None = None,
+    cb_serialization_stamps: Mapping[str, object] | None = None,
+    where: str = "assignment_bit_total",
 ) -> float:
-    """Return total assigned bits, not average bits."""
+    """Return exact assignment payload bits, including shared CB sidecars.
+
+    Non-CB formats preserve the historical FormatSpec/stat-memory-map path,
+    with NVFP4's emitted global scale tensors added explicitly.
+    CB formats are priced as one assignment so FP8 row scales and each
+    physical codebook sidecar are charged exactly once. Persisted per-layer
+    identities are mandatory: a format label alone cannot establish whether
+    the assignment describes FP4 layout-v1 or v2, nor its sidecar sharing.
+    """
     total = 0.0
+    cb_assignment: dict[str, str] = {}
+    cb_shapes: dict[str, tuple[int, ...]] = {}
     for name, fmt in assignment.items():
         if name not in stats:
             continue
         spec = specs_by_name[fr.canonical_format_name(fmt)]
-        total += 8.0 * _memory_bytes_for_format(stats[name], spec)
+        if is_cb_format(spec.name):
+            cb_assignment[str(name)] = spec.name
+            cb_shapes[str(name)] = _shape_from_stats(dict(stats[name]))
+        else:
+            total += 8.0 * _memory_bytes_for_format(stats[name], spec)
+            if spec.name == "NVFP4":
+                total += 8.0 * nvfp4_global_sidecar_bytes(
+                    str(name), _shape_from_stats(dict(stats[name]))
+                )
+    if cb_assignment:
+        if cb_serialization_context is None:
+            raise ValueError(
+                f"{where}: CB assignment requires a CBSerializationContext"
+            )
+        validate_cb_assignment_serialization_stamps(
+            cb_assignment,
+            cb_shapes,
+            context=cb_serialization_context,
+            stamps=cb_serialization_stamps,
+            where=where,
+        )
+        payload = cb_assignment_payload_breakdown(
+            cb_assignment,
+            cb_shapes,
+            context=cb_serialization_context,
+        )
+        total += 8.0 * int(payload["total_bytes"])
     return total
 
 

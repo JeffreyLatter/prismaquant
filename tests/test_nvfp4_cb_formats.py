@@ -11,10 +11,20 @@ import torch
 from prismaquant import format_registry as fr
 from prismaquant import layer_config as lc
 from prismaquant import nvfp4_cb_formats as cb
+from prismaquant.nvfp4_cb_footprint import (
+    CBSerializationContext,
+    cb_serialization_context_stamp,
+)
 
 _NVFP4_KS = list(range(12, 25))
 _FP8_KS = [28, 32, 36, 40, 44, 48]
 _DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
+
+
+def _production_cb_stamp(formats):
+    return cb_serialization_context_stamp(
+        CBSerializationContext.production(), formats=formats
+    )
 
 
 def _wmse(w, r, cw=None):
@@ -579,7 +589,8 @@ def test_exporter_roundtrip_equals_emulation(export_dir, source):
             if source == "learned" else {"source": "lattice"})
 
     counts = export_nvfp4_cb(mdl, apath, out, cw,
-                             shared_codebook_spec=spec, device="cpu")
+                             shared_codebook_spec=spec, device="cpu",
+                             allow_unstamped_research=True)
     assert counts["NVFP4_CB_K16"] == 1 and counts["FP8_CB_K40"] == 1
 
     qc = json.loads((out / "quant_config.json").read_text())
@@ -589,6 +600,11 @@ def test_exporter_roundtrip_equals_emulation(export_dir, source):
     # config.py override_quantization_method), so the exporter stamps the
     # canonical name and never the legacy one.
     assert qc["quant_method"] == "gridbook"
+    assert qc["provenance"]["render_identity_verified"] is False
+    assert qc["layout_version"] == 2
+    assert qc["provenance"]["serialized_payload"]["context"][
+        "scale_coding"
+    ] == "two_tier"
     # non-target norm copied verbatim; config.json copied + pointer injected.
     ot = load_file(str(out / "model.safetensors"))
     assert "model.norm.weight" in ot
@@ -601,6 +617,8 @@ def test_exporter_roundtrip_equals_emulation(export_dir, source):
     for g in qc["config_groups"].values():
         s = g["scheme"]
         grid, mode, k = s["grid"], s["mode"], s["k"]
+        coding = (cb.SCALE_CODING_TWO_TIER
+                  if "scale_coding" in s else cb.SCALE_CODING_V1)
         ref = s["codebook_ref"]
         codebook = (tuple(cbf[r].float() for r in ref)
                     if isinstance(ref, list) else cbf[ref].float())
@@ -615,13 +633,33 @@ def test_exporter_roundtrip_equals_emulation(export_dir, source):
             else:
                 assert (q + ".weight_scale") not in ot   # fp4: scales in bytes
             up = cb.nvfp4_cb_unpack(packed, k, grid, mode, tuple(w.shape),
-                                    codebook=codebook, scales=scales)
+                                    codebook=codebook, scales=scales,
+                                    scale_coding=coding)
             rec = cb.nvfp4_cb_reconstruct(up, k, grid=grid, mode=mode).float()
             emu_f = cb.nvfp4_cb_fields(w, k, grid=grid, mode=mode,
-                                       col_weights=cw[q], codebook=codebook)
+                                       col_weights=cw[q], codebook=codebook,
+                                       scale_coding=coding)
             emu = cb.nvfp4_cb_reconstruct(emu_f, k, grid=grid,
                                           mode=mode).float()
             assert torch.equal(rec, emu)
+
+
+def test_exporter_rejects_unstamped_cb_recipe_by_default(export_dir):
+    from prismaquant.export_nvfp4_cb import export_nvfp4_cb
+
+    mdl = export_dir / "model"
+    _tiny_model(mdl)
+    qname = "model.layers.0.mlp.gate_proj"
+    apath = export_dir / "assign.json"
+    _write_assignment(apath, {qname: "NVFP4_CB_K16"})
+    with pytest.raises(ValueError, match="value-bearing render identity"):
+        export_nvfp4_cb(
+            mdl,
+            apath,
+            export_dir / "out",
+            {qname: torch.ones(256)},
+            device="cpu",
+        )
 
 
 def test_exporter_rejects_unknown_format(export_dir):
@@ -782,7 +820,8 @@ def test_two_tier_type_size_and_effective_bits():
     packed, _ = cb.nvfp4_cb_pack(w, 14, grid="fp4", mode="product",
                                  scale_coding="two_tier")
     assert packed.shape == (64, (512 // 256) * (4 * 14 + 9))
-    # registered rungs stay on v1 accounting until the serving gates clear.
+    # Registered FormatSpecs retain their legacy nominal rate for API/read
+    # compatibility; producer allocation uses nvfp4_cb_footprint instead.
     assert fr.get_format("NVFP4_CB_K14").effective_bits == pytest.approx(
         2.25, abs=1e-12)
 
@@ -932,7 +971,8 @@ def test_two_tier_exporter_writes_layout_version(export_dir):
     _write_assignment(apath, assign)
     cw = {q: torch.rand(256) + 0.05 for q in assign}
     export_nvfp4_cb(mdl, apath, out, cw, device="cpu",
-                    scale_coding="two_tier")
+                    scale_coding="two_tier",
+                    allow_unstamped_research=True)
     qc = json.loads((out / "quant_config.json").read_text())
     assert qc["layout_version"] == 2
     assert qc["provenance"]["scale_coding"] == "two_tier"
@@ -969,6 +1009,89 @@ def test_two_tier_exporter_writes_layout_version(export_dir):
         else:
             assert "scale_coding" not in s          # fp8: no scale plane
             assert s["type_size"] == 4 * s["k"]
+
+
+def test_exporter_explicit_legacy_v1_remains_readable(export_dir):
+    from safetensors.torch import load_file
+
+    from prismaquant.export_nvfp4_cb import export_nvfp4_cb
+
+    mdl, out = export_dir / "model", export_dir / "out"
+    _tiny_model(mdl)
+    qname = "model.layers.0.mlp.gate_proj"
+    apath = export_dir / "assign.json"
+    _write_assignment(apath, {qname: "NVFP4_CB_K16"})
+    export_nvfp4_cb(
+        mdl,
+        apath,
+        out,
+        {qname: torch.rand(256) + 0.05},
+        device="cpu",
+        scale_coding="v1",
+        allow_unstamped_research=True,
+    )
+    qc = json.loads((out / "quant_config.json").read_text())
+    assert "layout_version" not in qc
+    legacy_stamp = cb_serialization_context_stamp(
+        CBSerializationContext.legacy_v1(),
+        formats=["NVFP4_CB_K16"],
+    )
+    assert qc["provenance"]["serialized_payload"]["context"] == {
+        key: legacy_stamp[key]
+        for key in (
+            "scale_coding",
+            "layout_version",
+            "codebook_source",
+            "scale_sweep",
+            "encode_tier",
+            "renderer_abi",
+        )
+    }
+    group = next(iter(qc["config_groups"].values()))
+    assert "scale_coding" not in group["scheme"]
+    assert group["scheme"]["type_size"] == 4 * 16 + 16
+    tensors = load_file(str(out / "model.safetensors"))
+    packed = tensors[qname + ".cb_qweight"]
+    assert packed.shape == (128, 4 * 16 + 16)
+    sidecar = load_file(str(out / qc["codebook_file"]))
+    refs = group["scheme"]["codebook_ref"]
+    codebook = tuple(sidecar[ref].float() for ref in refs)
+    fields = cb.nvfp4_cb_unpack(
+        packed,
+        16,
+        "fp4",
+        "product",
+        (128, 256),
+        codebook=codebook,
+    )
+    assert "scale_coding" not in fields  # absence is the legacy-v1 read tag
+
+
+def test_exporter_rejects_allocator_serialization_context_drift(export_dir):
+    from prismaquant.export_nvfp4_cb import export_nvfp4_cb
+
+    mdl, out = export_dir / "model", export_dir / "out"
+    _tiny_model(mdl)
+    qname = "model.layers.0.mlp.gate_proj"
+    apath = export_dir / "assign.json"
+    _write_assignment(apath, {
+        qname: "NVFP4_CB_K16",
+        "__prismaquant__": {
+            "schema": "prismaquant.layer_config_meta.v1",
+            "cb_serialized_payload": _production_cb_stamp(
+                ["NVFP4_CB_K16"]
+            ),
+        },
+    })
+    with pytest.raises(ValueError, match="differs from allocator recipe"):
+        export_nvfp4_cb(
+            mdl,
+            apath,
+            out,
+            {qname: torch.rand(256) + 0.05},
+            device="cpu",
+            scale_coding="v1",
+        )
 
 
 # ===========================================================================
@@ -1196,7 +1319,8 @@ def test_exporter_packed_experts_roundtrip(export_dir, source):
     spec = ({"source": "learned", "train": True}
             if source == "learned" else {"source": "lattice"})
     counts = export_nvfp4_cb(mdl, apath, out, cw,
-                             shared_codebook_spec=spec, device="cpu")
+                             shared_codebook_spec=spec, device="cpu",
+                             allow_unstamped_research=True)
     assert counts["FP8_CB_K40"] == 1 and counts["NVFP4_CB_K16"] == 2
 
     ot = load_file(str(out / "model.safetensors"))
@@ -1208,12 +1332,18 @@ def test_exporter_packed_experts_roundtrip(export_dir, source):
     ws = ot["model.layers.0.mlp.experts.gate_up_proj.weight_scale"]
     assert ws.shape == (3, 96)
     dn = ot["model.layers.0.mlp.experts.down_proj.cb_qweight"]
-    assert dn.shape == (3, 48, cb.nvfp4_cb_type_size(16, "fp4"))
+    assert dn.shape == (
+        3,
+        48,
+        cb.nvfp4_cb_type_size(16, "fp4", cb.SCALE_CODING_TWO_TIER),
+    )
     assert ("model.layers.0.mlp.experts.down_proj.weight_scale") not in ot
 
     # per-expert round-trip == whole-stack emulation with per-expert weights
     for g in qc["config_groups"].values():
         s = g["scheme"]
+        coding = (cb.SCALE_CODING_TWO_TIER
+                  if "scale_coding" in s else cb.SCALE_CODING_V1)
         for q in g["targets"]:
             if "experts" not in q:
                 continue
@@ -1228,12 +1358,14 @@ def test_exporter_packed_experts_roundtrip(export_dir, source):
                 packed.reshape(E * w.shape[1], -1), s["k"], s["grid"],
                 s["mode"], (E * w.shape[1], w.shape[2]), codebook=codebook,
                 scales=(scales.reshape(-1, 1) if scales is not None
-                        else None))
+                        else None),
+                scale_coding=coding)
             rec = cb.nvfp4_cb_reconstruct(
                 up, s["k"], grid=s["grid"], mode=s["mode"]).reshape(w.shape)
             emu_f = cb.nvfp4_cb_fields(
                 w, s["k"], grid=s["grid"], mode=s["mode"],
-                col_weights=cw[q], codebook=codebook)
+                col_weights=cw[q], codebook=codebook,
+                scale_coding=coding)
             emu = cb.nvfp4_cb_reconstruct(
                 emu_f, s["k"], grid=s["grid"], mode=s["mode"])
             assert torch.equal(rec, emu.reshape(w.shape))
@@ -1271,7 +1403,12 @@ def test_expert_empirical_merge_replaces_expert_rows():
         "stats": {exp_name: {"h_trace": 1.0}, dense_name: {"h_trace": 2.0}},
         "costs": {exp_name: _mk_cost_row({"NVFP4_CB_K16": 9.9}),
                   dense_name: _mk_cost_row({"NVFP4_CB_K16": 0.5})},
-        "provenance": {"origin": "local"},
+        "provenance": {
+            "origin": "local",
+            "cb_serialized_payload": _production_cb_stamp(
+                ["NVFP4_CB_K16"]
+            ),
+        },
     }
     e_stats = {exp_name: {"h_trace": 0.0, "n_params": 10}}
     e_costs = {exp_name: {"NVFP4_CB_K16": {
@@ -1314,7 +1451,9 @@ def test_expert_empirical_cb_weighted_render_inplace():
     mod = _UnitHolder(w.clone())
     _quantize_unit_inplace(mod, ["gate_up_proj"], "NVFP4_CB_K16",
                            col_weights={full: cw}, unit_qname=qn)
-    direct = cb.make_nvfp4_cb_qdq(16, "fp4", "product")(
+    direct = cb.make_nvfp4_cb_qdq(
+        16, "fp4", "product", scale_coding="two_tier"
+    )(
         w.float(), cw).to(torch.bfloat16)
     assert torch.equal(mod.gate_up_proj.data, direct)
 
@@ -1337,17 +1476,26 @@ def test_expert_empirical_tier_inheritance(monkeypatch):
     w = (torch.randn(2, 16, 256) * 0.02).to(torch.bfloat16)
     cw = torch.rand(256) + 0.05
     qn = "u"
-    outs = {}
+    resolved = []
+    original_resolve = cb._resolve_encode_tier
+
+    def recording_resolve(tier):
+        value = original_resolve(tier)
+        resolved.append(value)
+        return value
+
+    monkeypatch.setattr(cb, "_resolve_encode_tier", recording_resolve)
     for tier in ("max", "fast"):
         monkeypatch.setenv(cb._ENCODE_TIER_ENV, tier)
         mod = _UnitHolder(w.clone())
         _quantize_unit_inplace(mod, ["gate_up_proj"], "NVFP4_CB_K16",
                                col_weights={f"{qn}.gate_up_proj": cw},
                                unit_qname=qn)
-        outs[tier] = mod.gate_up_proj.data.clone()
-    # the registry closure resolves the env per call: tiers render
-    # differently (fast's analytic search vs max's exhaustive sweep).
-    assert not torch.equal(outs["max"], outs["fast"])
+    # The production-context closure resolves the env per call. Layout-v2's
+    # reachable scale set can make these tiers bit-identical on a small input,
+    # so environment inheritance—not a forced output difference—is the
+    # contract this test needs to pin.
+    assert resolved == ["max", "fast"]
 
 
 def test_cb_ladder_split_and_fit():
@@ -1432,7 +1580,11 @@ def _tiny_fp8_source_model(mdl: Path, in_f: int = 256):
     }
     save_file(tens, str(mdl / "model.safetensors"))
     (mdl / "config.json").write_text(
-        json.dumps({"architectures": ["TinyFP8"], "hidden_size": in_f}))
+        json.dumps({
+            "architectures": ["TinyFP8"],
+            "hidden_size": in_f,
+            "quantization_config": {"weight_block_size": [128, 128]},
+        }))
     return tens
 
 
@@ -1451,7 +1603,14 @@ def test_fp8_source_passthrough_verbatim(export_dir):
     apath = export_dir / "assign.json"
     _write_assignment(apath, assign)
     cw = {"model.layers.0.mlp.gate_proj": torch.rand(256) + 0.05}
-    counts = export_nvfp4_cb(mdl, apath, out, cw, device="cpu")
+    counts = export_nvfp4_cb(
+        mdl,
+        apath,
+        out,
+        cw,
+        device="cpu",
+        allow_unstamped_research=True,
+    )
     assert counts["FP8_SOURCE"] == 1 and counts["NVFP4_CB_K16"] == 1
 
     ot = load_file(str(out / "model.safetensors"))

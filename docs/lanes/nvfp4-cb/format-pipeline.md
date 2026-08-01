@@ -1,5 +1,14 @@
 # NVFP4-CB — Format + Pipeline Integration Design (PLAN ONLY)
 
+> **Historical Phase-0 design.** The implemented/shipped byte contract is
+> [LAYOUT.md](LAYOUT.md), not the early estimates below. Production fp4 uses
+> layout-v2 `4k+9`; explicit v1 remains readable at `4k+16`; FP8 adds one fp32
+> scale per output row; and both fixed lattice and learned codebooks are real
+> FP16 sidecar tensors shared once per `(codebook_ref, format)`. There is no CB
+> global-scale scalar. Exact producer accounting lives in
+> `prismaquant.nvfp4_cb_footprint` and requires an explicit serialization
+> context.
+
 Working name: **NVFP4-CB**. Vector-quantized codebook format. Codewords are
 8-dim vectors of FP4 (E2M1) codes `{0,±0.5,±1,±1.5,±2,±3,±4,±6}`; per-group-of-16
 E4M3 scales **identical to NVFP4** (a decoded 16-tile is bit-compatible NVFP4 and
