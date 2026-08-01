@@ -1,108 +1,178 @@
-# Speed-aware format policy: fp8-CB at ~4.5 bpw vs native NVFP4
+# Native-parity and production format-selection policy
 
-> **SUPERSEDED AS PRODUCTION POLICY (2026-07-31).** Keep the dated timing
-> observations below as historical evidence only. The 503/503 screen, blanket
-> decode-neutrality inference, and `quality + lambda*time` objective are not
-> ship rules. Production selection minimizes measured/predicted quality loss
-> subject to exact whole-artifact bytes, separate p95 TTFT and p95 ITL/p05 TPS
-> SLOs, resident+KV+peak-scratch memory, backend/shape/TP legality, and
-> serving-unit coupling. Final decisions require same-session served quality
-> and end-to-end timings under an explicitly recorded execution contract.
+This is the normative policy for balancing Gridbook quality against native
+execution performance. It supersedes the earlier `quality + lambda*time`
+proposal, the blanket decode-neutrality claim, and the retracted 503/503
+screen. Historical experiments remain useful evidence, but they do not
+override these acceptance rules.
 
-2026-07-27, per Robert's directive ("seriously consider where it's truly
-appropriate to take the speed hit for the purposes of accuracy"). Every
-number below is measured; sources cited inline.
+## 1. Optimize quality under hard deployment constraints
 
-## 1. The measured substrate
+For an assignment `a`, production selection is:
 
-**Accuracy at matched 4.5 bpw** (dense-tier A/B, c551e24, cost-model-level
-RTN-vs-RTN fp32): FP8CB_K36 beats vanilla NVFP4 on 503/503 units unweighted
-(geomean −40% error), 87% act-weighted. 42 outlier-row units favor NVFP4 —
-the joint menu already lets the allocator pick NVFP4 there on accuracy
-alone. Part of CB's edge is structural: fp8 rungs run A8 activations where
-native NVFP4 runs A4.
+```text
+minimize    predicted_quality_loss(a)
 
-> **CORRECTION 2026-07-30 — two of the three figures above are artefacts of
-> the screen, not properties of the formats. The conclusion survives and in
-> fact strengthens; the numbers do not.** Evidence:
-> `docs/design/format_choice_4p5_stage0_results.md`.
-> 1. **`h_trace` in the shipped Hy3 CSV is degenerate — literally `1.0` on all
->    503 rows** (verified). `probe.get("h_trace", probe)` never resolved, so no
->    h_trace weighting was ever applied. Fixed in the script.
-> 2. **The codebook was fitted *unweighted* and then scored act-weighted** — an
->    objective mismatch, since production always fits with `col_weights`
->    (`harvest_cb_col_weights` → cache/export). Re-run under the
->    production-faithful fit, K36 wins the act-weighted majority **99.4%
->    (493/496) on the 27B and 100% on the 4B**, versus 62.9% / 89.3% under the
->    mismatched fit — which also inverted Σ h·mse (1.395 and 4.466), each
->    inversion carried by a single high-`h_trace` `down_proj`.
-> 3. **"42 outlier-row units favor NVFP4" is fit-convention-dependent, not
->    structural.** The 27B's equivalent cell gives 184 under the mismatched fit
->    and collapses to **3 of 496** when fitted as production renders — all
->    `linear_attn.in_proj_a` (48 rows, `h_trace` 0.68 vs model median 834,
->    **0.0% aggregate share**); the 4B has **zero**. The Hy3 figure itself is
->    now unverifiable (its source dir is deleted).
-> 4. "87% act-weighted" was the `dense/attn` role alone (86.6%); overall Hy3 is
->    91.7%.
->
-> **What is unchanged:** the no-format-bans policy below, and the direction of
-> the result — at matched 4.5 bpw fp8-CB beats vanilla NVFP4 on the cost model.
-> It remains a cost-model screen, not a served result.
+subject to  exact_whole_artifact_bytes(a) <= B
+            p95_TTFT(a, workload)          <= SLO_prefill
+            p95_ITL(a, workload)           <= SLO_decode_itl
+            p05_TPS(a, workload)           >= SLO_decode_tps
+            resident + KV + peak_scratch   <= device_budget
+            backend, shape, TP, fallback and serving-unit coupling are legal
+```
 
-**Speed at matched bpw** (served, 2026-07-23..27):
-- **Decode: neutral.** CB decode is at per-byte parity (measured twice:
-  27B vs AURA; Laguna vs poolside NVFP4 — tok/s ratio == byte ratio). At
-  MATCHED bpw both formats read the same bytes → no decode tax at all.
-- **Prefill: the entire tax, magnitude regime-dependent.**
-  - Dense, current kernels: ~10% (post CUDA-expander + promoted mid-M
-    fused; 27B lane).
-  - MoE large-expert, current kernels: ~40% vs native grouped CUTLASS
-    (Laguna 2,063 vs 3,603 tok/s under `auto`).
-  - MoE small-expert: near parity (35B `auto` 4,405 vs its own native-path
-    ceiling).
-- Serving-cost raw material now exists per layer: the `auto` tuner logs
-  every candidate's measured ms per layer — a free per-format,
-  per-shape serving-cost table accumulating in every serve.
+Latency is not blended into the objective. There is no `lambda`, no single
+phase-weighted `serve_ms`, and no default workload mix hidden in the allocator.
+Prefill and decode are separate constraints because a format can move them in
+opposite directions. Operators choose explicit SLOs; the allocator minimizes
+quality loss within them.
 
-## 2. The decision structure
+Per-layer or per-operator timing tables may generate candidate assignments.
+They are not final evidence. A selected assignment still requires same-session
+end-to-end timing plus served KL/PPL/tasks, because routing, scheduler batching,
+graphs, scratch pressure, and fallback can change the global rank.
 
-At matched storage, choosing fp8-CB over native NVFP4 buys accuracy
-(−40% cost-model error + A8 activations) and costs **prefill throughput
-only**. So "where is the hit appropriate" reduces to workload shape:
+When reporting a relative speed tax, the reference is the fastest **globally
+feasible assignment under the same whole-artifact byte budget**, memory limits,
+legality rules, and serving-unit coupling. Summing each unit's independently
+fastest format is invalid: that combination can exceed the byte budget,
+especially below 4.5 bpp. Define the fastest feasible reference independently
+for prefill and decode; do not blend the phases.
 
-- **Decode-dominated serving** (chat, long generations, agents that think
-  more than they read): the tax is ~0. CB is strictly better. No policy
-  change needed.
-- **Prefill-heavy serving** (RAG, long-document, batch scoring): the tax
-  is real (10–40% today). Two honest mitigations already exist: the card
-  guidance pattern (the 27B/Laguna cards route prefill-heavy users
-  explicitly), and the allocator's joint menu (NVFP4 already wins
-  placement on the outlier units).
-- The tax is also **shrinking under the kernel campaign** (12×→1.75× on
-  the worst lane in one week); a policy over-fit to today's tax would be
-  stale by the next kernel round.
+The constrained Pareto solver described here is not yet implemented. Until it
+is, timing tables are proposal data and final selection is an external release
+gate, not an allocator capability claim.
 
-## 3. Policy
+## 2. Bytes are a serialized-artifact constraint
 
-1. **Default stays accuracy-first** (status quo). Rationale: decode
-   neutrality means most served tokens see no tax; the accuracy edge is
-   large and measured; the tax is a moving target.
-2. **Implement the opt-in serving-cost axis in the allocator** (the
-   principled lever, no heuristics): a per-(format, shape-regime) cost
-   table measured on the target box — seedable directly from `auto`-tuner
-   logs — and an objective `quality + λ·serving_ms` with λ=0 default.
-   A user who declares a prefill-heavy profile sets λ>0 and the knapsack
-   trades the outlier-adjacent CB units to NVFP4 first (exactly the 42
-   units where the accuracy gap is smallest). This is measurement-driven
-   end to end: costs measured, tradeoff explicit, no format bans.
-3. **Re-run this deliberation after the persistent-schedule build** — if
-   MoE prefill reaches ~1.2× of native, the λ knob becomes nearly moot
-   and CB's accuracy edge decides everything except hard-A4 latency
-   targets.
+Candidate construction, allocation, reports, and exporter assertions use the
+versioned `CBSerializationContext` payload accountant. The final authority is
+the exact exported artifact: model shards and metadata plus every served
+sidecar, with shared sidecars charged once by serialized identity. Target bpp
+and index-body bytes are diagnostics, not the acceptance gate.
 
-## 4. What is NOT proposed
+The relevant serialized contracts are:
 
-No format bans, no bpw-band carve-outs, no "MoE always native" rules —
-the 35B/Laguna divergence under identical formats shows regime, not
-format, drives the tax, and the allocator + auto-tuner pair already
-resolves regime per layer by measurement.
+- production NVFP4-CB K12..K24 uses two-tier layout v2: `4k + 9` bytes per
+  256-weight superblock, about 1.78125..3.28125 bpw before shared sidecars;
+- FP8-CB uses a `4k`-byte index body per superblock **plus** one FP32
+  `weight_scale` per output row; and
+- product-VQ FP16 subtable sidecars are serialized once per codebook
+  reference/format identity. A lattice reference does not imply a free
+  sidecar.
+
+Layout version, scale coding, activation contract, render identity, sidecar
+identity, and serving-unit identity are part of a candidate. A format name
+alone is not a byte or execution identity.
+
+## 3. Benchmark the execution contract
+
+Every result records and pins:
+
+- format and rung;
+- serialized layout version and scale coding;
+- activation quantization (`W4A4`, `W8A8`, or the observed fallback contract);
+- concrete kernel/backend and fallback state;
+- model, tokenizer, Gridbook, vLLM/runtime, GPU/driver, and image commits;
+- tensor-parallel size and scheduler/graph configuration; and
+- exact whole-artifact bytes and budget.
+
+Native NVFP4 is W4A4 while FP8-CB K36 is W8A8. A pure endpoint comparison
+therefore measures the complete format-plus-activation execution contract, not
+weight encoding alone. In delegated NVFP4 MoE, vLLM `auto` can select Marlin,
+drop activation scales, and execute W4A16. Such a run is not a W4A4 baseline;
+the server backend trace must prove the declared contract.
+
+Release evidence covers the workload rather than one convenient shape:
+
+- a prompt-length distribution and concurrency ladder;
+- chunked prefill on and off;
+- plain M=1 decode;
+- batched and speculative decode at the shipped M, with acceptance recorded;
+- MoE routed-token histograms and expert imbalance; and
+- whole grouped-MoE operators, not isolated tensor or summed per-expert times.
+
+Plain low-M decode cannot be extrapolated into tensor-core, batched, or
+speculative regimes. Final timing uses streaming TTFT/ITL/TPS percentiles and
+same-session arm ordering; offline whole-request latency is directional only.
+
+## 4. Same-rate comparisons and production capability
+
+At 4.5 bpp, compare native NVFP4 against FP8-CB K36 only after exact
+whole-artifact accounting. Below native NVFP4's 4.5-bpp floor, “same average
+rate” is an assignment-level comparison: every NVFP4 promotion must be funded
+by lower CB rungs elsewhere. Evaluate the byte-neutral bundle's net quality
+loss and phase-specific latency gain; never compare an isolated promoted layer
+against an unfunded baseline.
+
+NVFP4-CB v2 is the capacity backbone in the approximately
+1.78125..3.28125-bpw band, but it does not yet have teacher-backed same-rate
+quality validation. Keep its fused native-FP4 prefill paths explicit opt-ins
+until served KL/PPL and routing/shape gates pass; the path changes activation
+scales from the fp32-emulated bucket to native ue4m3 factors.
+
+Packed expert stacks currently deny stock NVFP4/FP8 in the Gridbook producer
+profile. The native-versus-CB mixed frontier is therefore feasible only for
+dense and shared units. Packed experts require a lane-level native/CB A/B and
+native expert delegation before the allocator may claim that frontier.
+
+Signed S13..S16 remain registered, exportable, decodable, and shape-compatible
+for legacy and explicitly research-scoped use. They are excluded from the
+production `nvfp4_cb` allow-list after losing 609/776 (78.48%, conventionally
+rounded to 79%) matched weight-MSE comparisons. Every product rung remains in
+the production menu: NVFP4-CB K12..K24 and FP8-CB K28..K48.
+
+## 5. Evidence boundaries
+
+The current record supports only the following statements:
+
+- Strong BF16-teacher-backed wins are FP8-CB at Qwen3.6-27B/5.5 and
+  Ornith-35B/4.75. They do not establish low-bit FP4-CB quality.
+- Exact-4.5 Stage 0 strongly favors production-faithful K36 weight error:
+  493/496 units at 27B and 252/252 at 4B. This is a stop-only surrogate screen,
+  not served KL/PPL and not a promotion.
+- Hy3-295B/2.9 has fit, serve, and TEB evidence but no BF16-teacher quality
+  claim. Zero selected NVFP4 units are circular evidence because that allocator
+  optimized accuracy only.
+- Published “native” reference artifacts are generally mixed NVFP4/FP8, not
+  pure NVFP4. Name their actual assignment and activation/backend contract.
+- The rapid 0.6B endpoint pair is approximate performance evidence only:
+  native is 870,290,032 bytes; FP8-CB model plus sidecar is 871,628,664 bytes,
+  a 1,338,632-byte (+0.154%) excess that misses the <=0.1% formal target. The
+  arms are also W4A4 versus W8A8.
+
+Raw standalone kernel timing is never served evidence. A result advances only
+after the exact production dispatch, quantization, fallback, and end-to-end
+workload contract is measured.
+
+## 6. Approved W4A16 support backlog
+
+W4A16 is an approved Gridbook support addition, not merely an external
+comparison. Gridbook will own exact symmetric packing, serialized scale and
+metadata accounting, serving-profile declaration, loader/delegation, and
+validation. The first execution implementation should reuse upstream vLLM's
+`RDNAHybridW4A16` backend; it must not create a duplicate custom W4A16 kernel.
+
+The initial experiment covers BF16, TP1, symmetric/no-`g_idx` W4A16 at group
+sizes 128/64/32 (nominal 4.125/4.25/4.5 bpw), with exact serialized bytes
+including scales and metadata. Report two explicitly different views:
+
+1. served W4A16-A16 versus production CB-A8; and
+2. weight-isolated W4A16 versus an explicitly named CB-A16 contract.
+
+This work is paused until suitable validation hardware is available. It is
+unimplemented and unvalidated; `INT4_W4A16_g128` therefore remains research
+only and denied by every production Gridbook scope (dense, shared, and packed).
+No production profile, exporter, loader, or performance claim may imply support
+before the full integration and served-quality gates pass.
+
+## 7. Implementation order
+
+1. Use unified serialized byte accounting and candidate execution identity.
+2. Keep fused FP4 opt-in until the served quality/routing gate passes.
+3. Rebuild exact-byte 0.6B/4B/27B endpoints and optimized menus over the full
+   workload matrix.
+4. Check whether per-layer timing tables predict end-to-end ranks.
+5. Implement the constrained Pareto allocator above.
+6. Resume the Gridbook-owned W4A16 packing/delegation feature when validation
+   hardware and the upstream backend are available.
