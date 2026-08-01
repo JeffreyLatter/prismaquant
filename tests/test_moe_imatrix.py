@@ -124,7 +124,16 @@ def test_routed_down_samples_preserve_route_and_token_metadata(ckpt):
             f"model.layers.0.mlp.experts.{expert_id}.up_proj.weight"
         ].float().t()
         expected_values.append(torch.nn.functional.silu(gate) * up)
-    assert torch.allclose(routed.values, torch.stack(expected_values))
+    # Production replays every expert's routed tokens as one batched GEMM;
+    # this independent oracle uses one GEMV per route.  FP32 accumulation
+    # order differs between those kernels (and across CPU BLAS backends), so
+    # compare mathematical equivalence with an explicit FP32 tolerance.
+    torch.testing.assert_close(
+        routed.values,
+        torch.stack(expected_values),
+        rtol=1e-5,
+        atol=1e-5,
+    )
 
 
 def test_synthesizes_gateup_and_down(ckpt):
