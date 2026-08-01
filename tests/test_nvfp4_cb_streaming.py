@@ -8,6 +8,7 @@ stock-CT scope gate. No GPU, no torch.compile (PRISMAQUANT_CB_ENCODE_COMPILE=0).
 from __future__ import annotations
 
 import json
+import importlib
 import os
 import shutil
 import struct
@@ -20,10 +21,13 @@ from safetensors.torch import load_file, save_file
 
 os.environ["PRISMAQUANT_CB_ENCODE_COMPILE"] = "0"
 
-from prismaquant.export_nvfp4_cb import export_nvfp4_cb  # noqa: E402
+from prismaquant.export_nvfp4_cb import (  # noqa: E402
+    export_nvfp4_cb as _export_nvfp4_cb,
+)
 from prismaquant.export_nvfp4_cb_streaming import (  # noqa: E402
     _LazySkeleton,
-    export_nvfp4_cb_streaming,
+    _StreamWriter,
+    export_nvfp4_cb_streaming as _export_nvfp4_cb_streaming,
     main as _cb_stream_main,
 )
 from prismaquant.export_native_compressed import (  # noqa: E402
@@ -32,6 +36,18 @@ from prismaquant.export_native_compressed import (  # noqa: E402
     compute_nvfp4_global_real,
 )
 from prismaquant.model_profiles import detect_profile  # noqa: E402
+
+
+def export_nvfp4_cb(*args, **kwargs):
+    """This module's synthetic direct calls are explicit research renders."""
+    kwargs.setdefault("allow_unstamped_research", True)
+    return _export_nvfp4_cb(*args, **kwargs)
+
+
+def export_nvfp4_cb_streaming(*args, **kwargs):
+    """This module's synthetic direct calls are explicit research renders."""
+    kwargs.setdefault("allow_unstamped_research", True)
+    return _export_nvfp4_cb_streaming(*args, **kwargs)
 
 
 def _st_header(path: Path) -> tuple[dict, int]:
@@ -80,12 +96,182 @@ def _write_model(mdl: Path, tensors: dict, hid: int = 256):
     (mdl / "config.json").write_text(json.dumps({"hidden_size": hid}))
 
 
+def _write_sharded_model(mdl: Path, tensors: dict, hid: int = 256):
+    mdl.mkdir(parents=True, exist_ok=True)
+    items = list(tensors.items())
+    midpoint = max(1, len(items) // 2)
+    shards = [items[:midpoint], items[midpoint:]]
+    shards = [shard for shard in shards if shard]
+    weight_map = {}
+    for index, shard in enumerate(shards, start=1):
+        name = f"model-{index:05d}-of-{len(shards):05d}.safetensors"
+        save_file(dict(shard), str(mdl / name))
+        weight_map.update({tensor_name: name for tensor_name, _ in shard})
+    (mdl / "model.safetensors.index.json").write_text(json.dumps({
+        "metadata": {},
+        "weight_map": weight_map,
+    }))
+    (mdl / "config.json").write_text(json.dumps({"hidden_size": hid}))
+
+
 def _assign(path: Path, mapping: dict):
     path.write_text(json.dumps(mapping))
 
 
 def _tensors_equal(a: dict, b: dict) -> bool:
     return set(a) == set(b) and all(torch.equal(a[k], b[k]) for k in a)
+
+
+def _tree_bytes(root: Path) -> dict[str, bytes]:
+    return {
+        path.relative_to(root).as_posix(): path.read_bytes()
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
+
+
+@pytest.mark.parametrize(
+    "exporter",
+    [export_nvfp4_cb, export_nvfp4_cb_streaming],
+    ids=["batch", "streaming"],
+)
+def test_cb_exporters_reject_in_place_single_source_before_mutation(
+    workdir,
+    exporter,
+):
+    mdl = workdir / "model"
+    _write_model(mdl, {"model.norm.weight": torch.ones(4)})
+    assignment = workdir / "assignment.json"
+    _assign(assignment, {})
+    before = _tree_bytes(mdl)
+
+    with pytest.raises(RuntimeError, match="resolve to the same path"):
+        exporter(mdl, assignment, mdl, {}, device="cpu")
+
+    assert _tree_bytes(mdl) == before
+
+
+@pytest.mark.parametrize(
+    "exporter",
+    [export_nvfp4_cb, export_nvfp4_cb_streaming],
+    ids=["batch", "streaming"],
+)
+def test_cb_exporters_reject_output_nested_under_source(
+    workdir,
+    exporter,
+):
+    mdl = workdir / "model"
+    _write_model(mdl, {"model.norm.weight": torch.ones(4)})
+    assignment = workdir / "assignment.json"
+    _assign(assignment, {})
+    output = mdl / "exported"
+    before = _tree_bytes(mdl)
+
+    with pytest.raises(RuntimeError, match="ancestor/descendant"):
+        exporter(mdl, assignment, output, {}, device="cpu")
+
+    assert not output.exists()
+    assert _tree_bytes(mdl) == before
+
+
+def test_streaming_rejects_in_place_sharded_source_before_mutation(workdir):
+    mdl = workdir / "sharded-model"
+    _write_sharded_model(
+        mdl,
+        {
+            "model.embed_tokens.weight": torch.ones(2, 2),
+            "model.norm.weight": torch.ones(2),
+        },
+        hid=2,
+    )
+    assignment = workdir / "assignment.json"
+    _assign(assignment, {})
+    before = _tree_bytes(mdl)
+
+    with pytest.raises(RuntimeError, match="resolve to the same path"):
+        export_nvfp4_cb_streaming(
+            mdl,
+            assignment,
+            mdl,
+            {},
+            device="cpu",
+        )
+
+    assert _tree_bytes(mdl) == before
+
+
+@pytest.mark.parametrize(
+    "exporter",
+    [export_nvfp4_cb, export_nvfp4_cb_streaming],
+    ids=["batch", "streaming"],
+)
+def test_cb_exporters_reject_symlink_alias_and_stale_aux(
+    workdir,
+    exporter,
+):
+    mdl = workdir / "model"
+    _write_model(mdl, {"model.norm.weight": torch.ones(4)})
+    assignment = workdir / "assignment.json"
+    _assign(assignment, {})
+    before = _tree_bytes(mdl)
+
+    alias = workdir / "source-alias"
+    alias.symlink_to(mdl, target_is_directory=True)
+    with pytest.raises(RuntimeError, match="resolve to the same path"):
+        exporter(mdl, assignment, alias, {}, device="cpu")
+    assert alias.is_symlink()
+    assert _tree_bytes(mdl) == before
+
+    output = workdir / "stale-output"
+    output.mkdir()
+    stale = output / "tokenizer_config.json"
+    stale.write_text('{"old": true}')
+    with pytest.raises(RuntimeError, match="is not empty"):
+        exporter(mdl, assignment, output, {}, device="cpu")
+    assert stale.read_text() == '{"old": true}'
+    assert set(output.iterdir()) == {stale}
+
+
+@pytest.mark.parametrize(
+    ("module_name", "exporter"),
+    [
+        ("prismaquant.export_nvfp4_cb", export_nvfp4_cb),
+        (
+            "prismaquant.export_nvfp4_cb_streaming",
+            export_nvfp4_cb_streaming,
+        ),
+    ],
+    ids=["batch", "streaming"],
+)
+def test_cb_export_transaction_cleans_post_model_budget_failure(
+    workdir,
+    monkeypatch,
+    module_name,
+    exporter,
+):
+    mdl = workdir / "model"
+    _write_model(mdl, {"model.norm.weight": torch.ones(4)})
+    assignment = workdir / "assignment.json"
+    _assign(assignment, {})
+    output = workdir / "artifact"
+    module = importlib.import_module(module_name)
+
+    def fail_final_inventory(out_dir, *_args, **_kwargs):
+        staged = Path(out_dir)
+        assert staged != output
+        assert (staged / "model.safetensors").is_file()
+        raise RuntimeError("hard whole-artifact budget exceeded")
+
+    monkeypatch.setattr(
+        module,
+        "finalize_cb_export_artifact_inventory",
+        fail_final_inventory,
+    )
+    with pytest.raises(RuntimeError, match="hard whole-artifact budget"):
+        exporter(mdl, assignment, output, {}, device="cpu")
+
+    assert not output.exists()
+    assert not list(workdir.glob(f".{output.name}.tmp-*"))
 
 
 # --- byte-identity: dense CB + BF16 + stacked-3D experts + fp8_cb -----------
@@ -141,9 +327,14 @@ def test_streaming_byte_identical_dense_and_stacked(workdir):
         assert _tensors_equal(cb_m, cb_s)
 
 
-def test_streaming_global_cb_stamp_does_not_bypass_missing_layer_identities(
+def test_streaming_global_cb_stamp_does_not_bypass_missing_render_identity(
     workdir,
 ):
+    from prismaquant.nvfp4_cb_footprint import (
+        CBSerializationContext,
+        cb_serialization_context_stamp,
+    )
+
     qname = "model.layers.0.self_attn.o_proj"
     mdl = workdir / "model"
     _write_model(
@@ -154,15 +345,13 @@ def test_streaming_global_cb_stamp_does_not_bypass_missing_layer_identities(
     _assign(ap, {
         qname: {"data_type": "nvfp4_cb", "cb_k": 16},
         "__prismaquant__": {
-            "cb_serialized_payload": {
-                "schema": "prismaquant.cb_serialized_payload.v1",
-                "scale_coding": "two_tier",
-                "layout_version": 2,
-                "codebook_source": "lattice",
-            },
+            "cb_serialized_payload": cb_serialization_context_stamp(
+                CBSerializationContext.production(),
+                formats=["NVFP4_CB_K16"],
+            ),
         },
     })
-    with pytest.raises(ValueError, match="per-layer serialization identity"):
+    with pytest.raises(ValueError, match="missing its value-bearing render identity"):
         export_nvfp4_cb_streaming(
             mdl,
             ap,
@@ -170,6 +359,46 @@ def test_streaming_global_cb_stamp_does_not_bypass_missing_layer_identities(
             {qname: torch.ones(256)},
             device="cpu",
         )
+
+
+def test_streaming_rejects_unstamped_cb_recipe_by_default(workdir):
+    qname = "model.layers.0.self_attn.o_proj"
+    mdl = workdir / "model"
+    _write_model(
+        mdl,
+        {f"{qname}.weight": torch.randn(2, 256).to(torch.bfloat16)},
+    )
+    ap = workdir / "a.json"
+    _assign(ap, {qname: "NVFP4_CB_K16"})
+    with pytest.raises(ValueError, match="value-bearing render identity"):
+        _export_nvfp4_cb_streaming(
+            mdl,
+            ap,
+            workdir / "s",
+            {qname: torch.ones(256)},
+            device="cpu",
+        )
+
+
+@pytest.mark.parametrize("failure_stage", ["producer", "before_publish"])
+def test_stream_writer_removes_owned_temp_before_publish(workdir, failure_stage):
+    output = workdir / "model.safetensors"
+    writer = _StreamWriter()
+
+    def producer():
+        if failure_stage == "producer":
+            raise RuntimeError("producer failed")
+        return torch.ones(4, dtype=torch.float32)
+
+    def before_publish():
+        if failure_stage == "before_publish":
+            raise RuntimeError("coverage failed")
+
+    writer.add("value", torch.float32, (4,), producer)
+    with pytest.raises(RuntimeError, match="failed"):
+        writer.write(output, before_publish=before_publish)
+    assert not output.exists()
+    assert not (workdir / ".model.safetensors.tmp").exists()
 
 
 # --- per-expert -> stacked bridging (Hy3 layout) ---------------------------
@@ -279,6 +508,129 @@ def test_streaming_fp8_source_dequant_on_read(workdir):
     assert torch.equal(got, ref)
 
 
+def test_fp8_cb_resident_and_streaming_exports_are_byte_identical(workdir):
+    torch.manual_seed(31)
+    qname = "model.layers.0.mlp.down_proj"
+    w_fp8 = (torch.randn(256, 256) * 0.3).to(torch.float8_e4m3fn)
+    scale_inv = (torch.rand(2, 2) + 0.1).float()
+    mdl = workdir / "model"
+    _write_model(mdl, {
+        f"{qname}.weight": w_fp8,
+        f"{qname}.weight_scale_inv": scale_inv,
+        "model.norm.weight": torch.ones(256, dtype=torch.bfloat16),
+    })
+    (mdl / "config.json").write_text(json.dumps({
+        "hidden_size": 256,
+        "quantization_config": {"weight_block_size": [128, 128]},
+    }))
+    ap = workdir / "a.json"
+    _assign(ap, {qname: "FP8_CB_K36"})
+    cw = {qname: torch.rand(256) + 0.05}
+
+    export_nvfp4_cb(mdl, ap, workdir / "batch", cw, device="cpu")
+    export_nvfp4_cb_streaming(
+        mdl, ap, workdir / "stream", cw, device="cpu"
+    )
+    batch = load_file(str(workdir / "batch" / "model.safetensors"))
+    stream = load_file(str(workdir / "stream" / "model.safetensors"))
+    assert _tensors_equal(batch, stream)
+
+
+def test_lazy_skeleton_rejects_unscaled_raw_fp8_codes(workdir, monkeypatch):
+    monkeypatch.delenv("PRISMAQUANT_ALLOW_UNSCALED_FP8", raising=False)
+    mdl = workdir / "model"
+    _write_model(mdl, {
+        "model.layers.0.mlp.down_proj.weight":
+            torch.ones(128, 256).to(torch.float8_e4m3fn),
+    })
+    skeleton = _LazySkeleton(mdl)
+    with pytest.raises(RuntimeError, match="has no entry"):
+        skeleton.dequant_weight("model.layers.0.mlp.down_proj.weight")
+
+
+def test_lazy_skeleton_uses_profile_defined_scale_pair(workdir):
+    from prismaquant.layer_streaming import _dequant_fp8_block_weight
+
+    torch.manual_seed(32)
+    weight_key = "layers.0.attn.q_proj.weight"
+    w_fp8 = (torch.randn(256, 256) * 0.3).to(torch.float8_e4m3fn)
+    scale = (torch.rand(2, 2) + 0.1).float()
+    mdl = workdir / "model"
+    _write_model(mdl, {weight_key: w_fp8, "layers.0.attn.q_proj.scale": scale})
+    (mdl / "config.json").write_text(json.dumps({
+        "model_type": "deepseek_v4",
+        "hidden_size": 256,
+        "quantization_config": {"weight_block_size": [128, 128]},
+    }))
+    skeleton = _LazySkeleton(mdl)
+    got = skeleton.dequant_weight(weight_key)
+    ref = _dequant_fp8_block_weight(
+        w_fp8, scale, block=(128, 128), name=weight_key
+    ).to(torch.bfloat16).to(torch.float32)
+    assert torch.equal(got, ref)
+
+
+@pytest.mark.parametrize(
+    "exporter",
+    [export_nvfp4_cb, export_nvfp4_cb_streaming],
+    ids=["batch", "streaming"],
+)
+def test_fp8_source_uses_profile_defined_scale_pair(workdir, exporter):
+    torch.manual_seed(33)
+    checkpoint_base = "layers.0.attn.q_proj"
+    live_base = "model.layers.0.self_attn.q_proj"
+    weight = (torch.randn(256, 256) * 0.3).to(torch.float8_e4m3fn)
+    scale = (torch.rand(2, 2) + 0.1).float()
+    mdl = workdir / "model"
+    _write_model(mdl, {
+        checkpoint_base + ".weight": weight,
+        checkpoint_base + ".scale": scale,
+    })
+    (mdl / "config.json").write_text(json.dumps({
+        "model_type": "deepseek_v4",
+        "hidden_size": 256,
+        "quantization_config": {"weight_block_size": [128, 128]},
+    }))
+    ap = workdir / "a.json"
+    _assign(ap, {live_base: {
+        "data_type": "fp8_e4m3", "bits": 8, "group_size": 128,
+    }})
+    out = workdir / "out"
+    exporter(mdl, ap, out, {}, device="cpu")
+    tensors = load_file(str(out / "model.safetensors"))
+    assert torch.equal(
+        tensors[checkpoint_base + ".weight"].view(torch.uint8),
+        weight.view(torch.uint8),
+    )
+    assert torch.equal(tensors[checkpoint_base + ".weight_scale"], scale)
+    assert checkpoint_base + ".scale" not in tensors
+
+
+def test_resident_export_rejects_profile_scaled_per_expert_source(workdir):
+    weight_key = "layers.0.ffn.experts.0.w1.weight"
+    mdl = workdir / "model"
+    _write_model(mdl, {
+        weight_key: torch.ones(128, 256).to(torch.float8_e4m3fn),
+        "layers.0.ffn.experts.0.w1.scale": torch.ones(1, 2),
+    })
+    (mdl / "config.json").write_text(json.dumps({
+        "model_type": "deepseek_v4",
+        "hidden_size": 256,
+        "quantization_config": {"weight_block_size": [128, 128]},
+    }))
+    qname = "model.layers.0.mlp.experts.gate_up_proj"
+    ap = workdir / "a.json"
+    _assign(ap, {qname: "FP8_CB_K36"})
+    with pytest.raises(ValueError, match="profile-scaled FP8/MXFP4"):
+        export_nvfp4_cb(
+            mdl,
+            ap,
+            workdir / "batch",
+            {qname: torch.ones(256)},
+            device="cpu",
+        )
+
+
 # --- mixed-menu: CB + stock NVFP4 + stock FP8_DYNAMIC + BF16 ----------------
 
 def _mixed_menu_model(mdl: Path):
@@ -375,8 +727,9 @@ def test_streaming_mixed_menu_byte_identical(workdir):
         {"config_groups": bqc["config_groups"]})
 
 
-def test_streaming_stock_resume_across_boundary(workdir):
-    # (d) resume across a stock tensor boundary reproduces the clean-run bytes.
+def test_streaming_resume_fails_closed_without_producer_identity(workdir):
+    # A matching tensor header cannot prove that source/imatrix/codebook bytes
+    # or exporter code are unchanged, even at a valid group boundary.
     mdl = workdir / "model"
     _mixed_menu_model(mdl)
     ap = workdir / "a.json"
@@ -395,8 +748,8 @@ def test_streaming_stock_resume_across_boundary(workdir):
     assert wp[1] <= ws[0] <= (cut - data0) < ws[1]
     (out / "model.safetensors").write_bytes(ref[:cut])   # truncate mid-group
 
-    export_nvfp4_cb_streaming(mdl, ap, out, cw, device="cpu")   # resume
-    assert (out / "model.safetensors").read_bytes() == ref
+    with pytest.raises(RuntimeError, match="output directory .* is not empty"):
+        export_nvfp4_cb_streaming(mdl, ap, out, cw, device="cpu")
 
 
 # --- stock rungs on MoE expert stacks are gated off ------------------------
@@ -573,8 +926,9 @@ def test_reuse_disabled_is_noop(workdir):
     assert not any(str(k).startswith("reuse_") for k in c1)
 
 
-# (2) full reuse: every eligible CB target copied, output == fresh byte-for-byte.
-def test_reuse_full_copy_byte_identical(workdir):
+# (2) reuse is fail-closed until every copied tensor has an immutable producer
+# identity (source bytes + imatrix + codebook + scheme + exporter ABI).
+def test_reuse_prior_is_blocked_before_any_output(workdir):
     mdl = workdir / "model"
     _reuse_model(mdl)
     ap = workdir / "a.json"
@@ -583,20 +937,15 @@ def test_reuse_full_copy_byte_identical(workdir):
     prior = workdir / "prior"
     export_nvfp4_cb_streaming(mdl, ap, prior, cw, device="cpu")   # fresh
     out = workdir / "delta"
-    counts = export_nvfp4_cb_streaming(mdl, ap, out, cw, device="cpu",
-                                       reuse_prior=prior, reuse_verify=2)
-    assert counts["reuse_copied"] == 2
-    assert counts["reuse_encoded"] == 0
-    assert counts["reuse_verified"] == 2
-    assert (out / "model.safetensors").read_bytes() == \
-        (prior / "model.safetensors").read_bytes()
-    assert json.loads((out / "quant_config.json").read_text())[
-        "config_groups"] == json.loads(
-        (prior / "quant_config.json").read_text())["config_groups"]
+    with pytest.raises(RuntimeError, match="DELTA-EXPORT reuse is disabled"):
+        export_nvfp4_cb_streaming(
+            mdl, ap, out, cw, device="cpu", reuse_prior=prior, reuse_verify=2
+        )
+    assert not (out / "model.safetensors").exists()
 
 
 # (3) changed-format target re-encodes; unchanged one still copies.
-def test_reuse_changed_format_reencodes(workdir):
+def test_reuse_changed_format_is_still_blocked_globally(workdir):
     mdl = workdir / "model"
     _reuse_model(mdl)
     cw = _reuse_cw()
@@ -609,18 +958,14 @@ def test_reuse_changed_format_reencodes(workdir):
     fresh_b = workdir / "freshB"
     export_nvfp4_cb_streaming(mdl, apB, fresh_b, cw, device="cpu")   # reference
     out = workdir / "delta"
-    counts = export_nvfp4_cb_streaming(mdl, apB, out, cw, device="cpu",
-                                       reuse_prior=prior, reuse_verify=5)
-    assert counts["reuse_copied"] == 1          # q_proj unchanged
-    assert counts["reuse_encoded"] == 1         # down_proj K16 -> K20
-    assert counts.get("reuse_ineligible_format_changed") == 1
-    # delta reproduces a from-scratch export of allocation B exactly.
-    assert (out / "model.safetensors").read_bytes() == \
-        (fresh_b / "model.safetensors").read_bytes()
+    with pytest.raises(RuntimeError, match="DELTA-EXPORT reuse is disabled"):
+        export_nvfp4_cb_streaming(
+            mdl, apB, out, cw, device="cpu", reuse_prior=prior, reuse_verify=5
+        )
 
 
 # (4) codebook byte-mismatch makes every CB target on that group ineligible.
-def test_reuse_codebook_mismatch_reencodes(workdir):
+def test_reuse_codebook_mismatch_does_not_reenable_copy(workdir):
     mdl = workdir / "model"
     _reuse_model(mdl)
     cw = _reuse_cw()
@@ -634,19 +979,14 @@ def test_reuse_codebook_mismatch_reencodes(workdir):
     cbt = {k: (v + 1.0).to(v.dtype).contiguous() for k, v in cbt.items()}
     save_file(cbt, str(cbf), metadata={"format": "pt"})   # perturb codebook
     out = workdir / "delta"
-    counts = export_nvfp4_cb_streaming(mdl, ap, out, cw, device="cpu",
-                                       reuse_prior=prior)
-    assert counts["reuse_copied"] == 0
-    assert counts["reuse_encoded"] == 2
-    assert counts.get("reuse_ineligible_codebook_mismatch") == 2
-    fresh = workdir / "fresh"
-    export_nvfp4_cb_streaming(mdl, ap, fresh, cw, device="cpu")
-    assert (out / "model.safetensors").read_bytes() == \
-        (fresh / "model.safetensors").read_bytes()
+    with pytest.raises(RuntimeError, match="DELTA-EXPORT reuse is disabled"):
+        export_nvfp4_cb_streaming(
+            mdl, ap, out, cw, device="cpu", reuse_prior=prior
+        )
 
 
-# (5) verification sampling catches a corrupted prior tensor -> loud abort.
-def test_reuse_verification_catches_corruption(workdir):
+# (5) even a positive sample count cannot turn an unbound prior into proof.
+def test_reuse_sampling_cannot_override_missing_identity(workdir):
     torch.manual_seed(13)
     mdl = workdir / "model"
     _write_model(mdl, {
@@ -665,14 +1005,14 @@ def test_reuse_verification_catches_corruption(workdir):
     raw[data0 + off[0]] ^= 0xFF                   # flip one packed-code byte
     (prior / "model.safetensors").write_bytes(bytes(raw))
     out = workdir / "delta"
-    with pytest.raises(RuntimeError, match="VERIFICATION FAILED"):
+    with pytest.raises(RuntimeError, match="DELTA-EXPORT reuse is disabled"):
         export_nvfp4_cb_streaming(mdl, ap, out, cw, device="cpu",
                                   reuse_prior=prior, reuse_verify=1)
     assert not (out / "model.safetensors").exists()   # nothing shipped
 
 
 # (6) sharded prior artifact (index.json + model-XXXXX-of-XXXXX) read path.
-def test_reuse_sharded_prior(workdir):
+def test_reuse_sharded_prior_is_blocked_before_index_read(workdir):
     mdl = workdir / "model"
     _reuse_model(mdl)
     cw = _reuse_cw()
@@ -683,11 +1023,10 @@ def test_reuse_sharded_prior(workdir):
     sharded = workdir / "prior_sharded"
     _reshard(single, sharded)
     out = workdir / "delta"
-    counts = export_nvfp4_cb_streaming(mdl, ap, out, cw, device="cpu",
-                                       reuse_prior=sharded, reuse_verify=2)
-    assert counts["reuse_copied"] == 2 and counts["reuse_encoded"] == 0
-    assert (out / "model.safetensors").read_bytes() == \
-        (single / "model.safetensors").read_bytes()
+    with pytest.raises(RuntimeError, match="DELTA-EXPORT reuse is disabled"):
+        export_nvfp4_cb_streaming(
+            mdl, ap, out, cw, device="cpu", reuse_prior=sharded, reuse_verify=2
+        )
 
 
 # (7) main()/CLI env fallback (PRISMAQUANT_EXPORT_REUSE_PRIOR) — the exact path
@@ -712,21 +1051,21 @@ def test_reuse_main_env_fallback(workdir, monkeypatch):
     ap = workdir / "a.json"
     _assign(ap, _REUSE_ASSIGN_A)
     base = ["--model-dir", str(mdl), "--layer-config", str(ap),
-            "--col-weights", str(cwp), "--device", "cpu"]
+            "--col-weights", str(cwp), "--device", "cpu",
+            "--allow-unstamped-research"]
     prior = workdir / "prior"
     monkeypatch.delenv("PRISMAQUANT_EXPORT_REUSE_PRIOR", raising=False)
     _cb_stream_main(base + ["--out", str(prior)])                  # fresh
     out = workdir / "delta"
     monkeypatch.setenv("PRISMAQUANT_EXPORT_REUSE_PRIOR", str(prior))
     monkeypatch.setenv("PRISMAQUANT_EXPORT_REUSE_VERIFY", "2")
-    _cb_stream_main(base + ["--out", str(out)])                    # reuse via env
-    assert (out / "model.safetensors").read_bytes() == \
-        (prior / "model.safetensors").read_bytes()
+    with pytest.raises(RuntimeError, match="DELTA-EXPORT reuse is disabled"):
+        _cb_stream_main(base + ["--out", str(out)])
 
 
-# (8) RESUME + reuse: a resumed reuse run reproduces the non-resumed bytes
-# (copy-producers are trivially deterministic).
-def test_reuse_resume_matches_nonresumed(workdir):
+# (8) reuse is rejected before an existing output can be mistaken for a bound
+# resume journal.
+def test_reuse_does_not_bypass_resume_gate(workdir):
     mdl = workdir / "model"
     _reuse_model(mdl)
     cw = _reuse_cw()
@@ -735,10 +1074,9 @@ def test_reuse_resume_matches_nonresumed(workdir):
     prior = workdir / "prior"
     export_nvfp4_cb_streaming(mdl, ap, prior, cw, device="cpu")
     out = workdir / "delta"
-    export_nvfp4_cb_streaming(mdl, ap, out, cw, device="cpu",
-                              reuse_prior=prior, reuse_verify=1)
-    ref = (out / "model.safetensors").read_bytes()
-    (out / "model.safetensors").write_bytes(ref[:len(ref) // 2])   # truncate
-    export_nvfp4_cb_streaming(mdl, ap, out, cw, device="cpu",
-                              reuse_prior=prior, reuse_verify=1)    # resume
-    assert (out / "model.safetensors").read_bytes() == ref
+    out.mkdir()
+    (out / "model.safetensors").write_bytes(b"unbound-partial")
+    with pytest.raises(RuntimeError, match="DELTA-EXPORT reuse is disabled"):
+        export_nvfp4_cb_streaming(
+            mdl, ap, out, cw, device="cpu", reuse_prior=prior, reuse_verify=1
+        )

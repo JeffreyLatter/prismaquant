@@ -1522,8 +1522,10 @@ def predict_cb_ladder_costs(w: torch.Tensor, ks: tuple[int, ...], *,
 #
 # Per 256-weight superblock along the input dim:
 #   * 4k index bytes — 32 k-bit codewords (one per 8-dim vector), LSB-first;
-#   * fp4 only: 16 E4M3 group scale bytes (identical to NVFP4's block scales).
-# type_size = 4k + 16 (fp4) / 4k (fp8), integer for every k. The packed tensor
+#   * fp4 v1: 16 E4M3 group-scale bytes;
+#   * production fp4 v2: 9 two-tier bytes (one E8M0 super + eight packed
+#     subscale-nibble bytes).
+# type_size = 4k + 16 (fp4 v1), 4k + 9 (fp4 v2), or 4k (fp8). The packed tensor
 # is 2-D uint8 (rows, bytes_per_row) — NEVER a flat 1-D buffer (the GGUF
 # lesson: a flat store loses the logical row/superblock structure the reader
 # and serving kernel index into). fp8 ships NO scale plane in the weight bytes;
@@ -1552,8 +1554,9 @@ def nvfp4_cb_effective_bits(k: int, grid: str = "fp4",
                             scale_coding: str = SCALE_CODING_V1) -> float:
     """Version-keyed body bpw (spec §2): fp4 v1 ``k/8 + 0.5``, fp4 v2
     two-tier ``k/8 + 0.28125``, fp8 ``k/8`` (per-channel scale separate).
-    The REGISTERED FormatSpecs stay on v1 accounting until the spec's
-    serving gates clear (a v2 artifact may only ship served M1-native)."""
+    Registered FormatSpec rates are nominal compatibility metadata; exact
+    producer pricing is versioned by ``CBSerializationContext`` and asserted
+    against the serialized payload."""
     return _type_size(k, grid, scale_coding) * 8.0 / SUPERBLOCK
 
 

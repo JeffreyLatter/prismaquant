@@ -65,9 +65,12 @@ Usage:
 """
 from __future__ import annotations
 
+import copy
 from collections.abc import Iterable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
+import hashlib
+import json
 import math
 import os
 from pathlib import Path
@@ -85,6 +88,22 @@ from prismaquant.render_score import (
     score_render_error,
 )
 from prismaquant.source_prefetch import prefetch_files_to_page_cache
+
+
+CB_RENDER_IDENTITY_SCHEMA = (
+    "prismaquant.production_weight_cache.cb_render_identity.v2"
+)
+CB_COL_WEIGHTS_HASH_SCHEMA = (
+    "prismaquant.production_weight_cache.cb_col_weights.v1"
+)
+CB_SOURCE_WEIGHTS_HASH_SCHEMA = (
+    "prismaquant.production_weight_cache.cb_source_weights.v1"
+)
+CB_RENDER_CONTRACT_SCHEMA = (
+    "prismaquant.production_weight_cache.cb_render_contract.v1"
+)
+CB_RENDER_MECHANISM_ABI = "prismaquant.production_render_mechanisms.v1"
+CB_RENDER_IDENTITY_METADATA_KEY = "cb_render_identity"
 
 
 def _render_base_format(fmt: str) -> str:
@@ -186,6 +205,31 @@ class ProductionWeightCache:
             self.activation_max_abs = self.activation_scales
         elif self.activation_scales is None and self.activation_max_abs is not None:
             self.activation_scales = self.activation_max_abs
+
+    def validate_cb_render_identity(
+        self,
+        *,
+        expected_context=None,
+        expected_qnames: Sequence[str] | None = None,
+        col_weights: Mapping[str, torch.Tensor] | None = None,
+        require_for_formats: Sequence[str] = (),
+        require_source_complete: bool = True,
+        where: str = "ProductionWeightCache",
+    ):
+        """Validate and return this cache's persisted CB producer context.
+
+        The context is read from the cache metadata, never reconstructed from
+        the current process environment.  Non-CB caches return ``None``.
+        """
+        return validate_production_cache_cb_render_identity(
+            self,
+            expected_context=expected_context,
+            expected_qnames=expected_qnames,
+            col_weights=col_weights,
+            require_for_formats=require_for_formats,
+            require_source_complete=require_source_complete,
+            where=where,
+        )
 
     def enable_lru(self, max_bytes: int) -> None:
         """Bound the in-memory tensor footprint to ``max_bytes`` via LRU
@@ -310,6 +354,23 @@ class ProductionWeightCache:
         responsible for those 3-D entries.
         """
         from prismaquant import format_registry as fr
+
+        cb_formats = [
+            (str(qname), fr.canonical_format_name(str(fmt)))
+            for qname, fmt in assignment.items()
+            if _is_cb_format_name(fr.canonical_format_name(str(fmt)))
+        ]
+        if cb_formats:
+            cb_expected = []
+            for qname, fmt in cb_formats:
+                resolved = self.resolve_key(qname, fmt)
+                if resolved is not None:
+                    cb_expected.append(resolved[0])
+            self.validate_cb_render_identity(
+                expected_qnames=cb_expected,
+                require_for_formats=[fmt for _qname, fmt in cb_formats],
+                where="ProductionWeightCache assignment",
+            )
 
         keys: list[tuple[str, str]] = []
         missing: list[tuple[str, str]] = []
@@ -592,6 +653,12 @@ class ProductionWeightCache:
     def get(self, name: str, fmt: str) -> torch.Tensor | None:
         key = self.resolve_key(name, fmt)
         if key is not None:
+            if _is_cb_format_name(key[1]):
+                self.validate_cb_render_identity(
+                    expected_qnames=[key[0]],
+                    require_for_formats=[key[1]],
+                    where=f"ProductionWeightCache get({key[0]}@{key[1]})",
+                )
             return self._resolve_to_tensor(key)
         return None
 
@@ -1422,6 +1489,1164 @@ def _weighted_render_family(fmt: str) -> str | None:
     return family if family in WEIGHTED_RENDER_FAMILIES else None
 
 
+def _is_cb_format_name(fmt: str) -> bool:
+    """Return whether ``fmt`` is one of the two serialized CB families."""
+    from prismaquant import format_registry as fr
+
+    try:
+        return fr.get_format(
+            fr.canonical_format_name(str(fmt).strip().upper())
+        ).family in {"nvfp4_cb", "fp8_cb"}
+    except Exception:
+        return False
+
+
+def _cb_qnames_in_render_scope(
+    formats_by_qname: Mapping[str, str | Sequence[str]],
+) -> list[str]:
+    return list(_canonical_cb_render_scope(formats_by_qname))
+
+
+def _canonical_cb_render_scope(
+    formats_by_qname: Mapping[str, str | Sequence[str]],
+) -> dict[str, list[str]]:
+    """Canonical qname -> serialized-CB-format render scope."""
+    from prismaquant import format_registry as fr
+
+    scope: dict[str, list[str]] = {}
+    for raw_qname, raw_formats in formats_by_qname.items():
+        formats = (
+            (raw_formats,)
+            if isinstance(raw_formats, str)
+            else tuple(raw_formats)
+        )
+        canonical = sorted({
+            fr.canonical_format_name(str(fmt).strip().upper())
+            for fmt in formats
+            if _is_cb_format_name(fmt)
+        })
+        if canonical:
+            scope[str(raw_qname)] = canonical
+    return dict(sorted(scope.items()))
+
+
+def _canonical_cb_col_weights_identity(
+    col_weights: Mapping[str, torch.Tensor] | None,
+    qnames: Sequence[str],
+) -> tuple[str, dict[str, list[int]], dict[str, str]]:
+    """Hash the exact imatrix values that make a CB render reproducible.
+
+    The byte stream is version-tagged and consists of sorted, length-framed
+    ``qname``, tensor ``shape``, and contiguous little-endian CPU float32
+    values.  Length framing prevents concatenation ambiguity, and the explicit
+    dtype/endian conversion makes insertion order, source dtype, device, and
+    striding irrelevant to the identity.
+    """
+    if not isinstance(col_weights, Mapping):
+        raise ValueError(
+            "production CB render requires an explicit col_weights mapping "
+            "for its persisted render identity"
+        )
+
+    names = sorted(dict.fromkeys(str(name) for name in qnames))
+    missing = [name for name in names if name not in col_weights]
+    if missing:
+        raise ValueError(
+            "production CB render identity is missing col_weights for "
+            f"{len(missing)} qname(s); sample={missing[:8]}"
+        )
+
+    digest = hashlib.sha256()
+    digest.update((CB_COL_WEIGHTS_HASH_SCHEMA + "\0").encode("utf-8"))
+    shapes: dict[str, list[int]] = {}
+    content_digests: dict[str, str] = {}
+
+    def _frame(payload: bytes) -> None:
+        digest.update(len(payload).to_bytes(8, byteorder="little", signed=False))
+        digest.update(payload)
+
+    for qname in names:
+        tensor = torch.as_tensor(col_weights[qname]).detach().to(
+            device="cpu",
+            dtype=torch.float32,
+        ).contiguous()
+        if tensor.layout != torch.strided:
+            raise ValueError(
+                f"production CB col_weights for {qname!r} must be strided"
+            )
+        shape = [int(dim) for dim in tensor.shape]
+        shapes[qname] = shape
+        _frame(qname.encode("utf-8"))
+        _frame(json.dumps(shape, separators=(",", ":")).encode("ascii"))
+        # ``<f4`` fixes little-endian float32 even on a big-endian producer.
+        raw = tensor.numpy().astype("<f4", copy=False).tobytes(order="C")
+        content_digests[qname] = hashlib.sha256(raw).hexdigest()
+        _frame(raw)
+    return digest.hexdigest(), shapes, content_digests
+
+
+def canonical_cb_col_weights_sha256(
+    col_weights: Mapping[str, torch.Tensor] | None,
+    qnames: Sequence[str],
+) -> str:
+    """Public digest helper for producer provenance and focused audits."""
+    digest, _, _ = _canonical_cb_col_weights_identity(col_weights, qnames)
+    return digest
+
+
+def _canonical_json_value(value, *, where: str):
+    try:
+        encoded = json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{where} is not canonical JSON data") from exc
+    return json.loads(encoded)
+
+
+def _cb_render_contract(
+    levers: Mapping[str, object] | None,
+    mechanism_plan,
+    cb_formats: Sequence[str],
+) -> dict[str, object]:
+    if not isinstance(levers, Mapping):
+        raise ValueError(
+            "production CB render identity requires explicit resolved render "
+            "levers"
+        )
+    if not bool(levers.get("weighted_vq", True)):
+        raise ValueError(
+            "production CB render identity requires weighted_vq=True"
+        )
+    ordered = getattr(mechanism_plan, "ordered", mechanism_plan)
+    if ordered is None:
+        raise ValueError(
+            "production CB render identity requires an explicit resolved "
+            "render mechanism plan"
+        )
+    records: list[dict[str, object]] = []
+    calibration_dependent: list[str] = []
+    for raw in ordered:
+        if isinstance(raw, Mapping):
+            record = {
+                str(key): raw[key]
+                for key in (
+                    "name", "operation", "scope", "phase", "gate_metric"
+                )
+                if key in raw
+            }
+            name = str(record.get("name", ""))
+        else:
+            name = str(getattr(raw, "name", raw))
+            record = {
+                "name": name,
+                **({
+                    key: getattr(raw, key)
+                    for key in (
+                        "operation", "scope", "phase", "gate_metric"
+                    )
+                    if hasattr(raw, key)
+                }),
+            }
+        records.append(_canonical_json_value(
+            record,
+            where="CB render mechanism record",
+        ))
+        if any(
+            _format_supports_render_mechanism(fmt, name)
+            and name != "weighted_vq"
+            for fmt in cb_formats
+        ):
+            calibration_dependent.append(name)
+    if calibration_dependent:
+        raise ValueError(
+            "production CB render unexpectedly enables calibration-dependent "
+            f"mechanisms {sorted(set(calibration_dependent))}; bind their "
+            "inputs before admitting them to the CB contract"
+        )
+    return {
+        "schema": CB_RENDER_CONTRACT_SCHEMA,
+        "mechanism_abi": CB_RENDER_MECHANISM_ABI,
+        "resolved_levers": _canonical_json_value(
+            dict(levers),
+            where="CB resolved render levers",
+        ),
+        "mechanism_plan": records,
+        "cb_active_mechanisms": ["weighted_vq"],
+        "calibration_dependent_mechanisms": [],
+    }
+
+
+def _source_weight_value_identity(
+    weight: torch.Tensor,
+) -> tuple[list[int], str]:
+    tensor = torch.as_tensor(weight).detach()
+    shape = [int(dim) for dim in tensor.shape]
+    digest = hashlib.sha256()
+    max_chunk_elements = 4 * 1024 * 1024  # <=16 MiB after fp32 conversion
+
+    def _chunks_c_order(value: torch.Tensor):
+        if value.numel() <= max_chunk_elements or value.ndim == 0:
+            yield value
+            return
+        trailing = math.prod(int(dim) for dim in value.shape[1:])
+        if trailing <= max_chunk_elements:
+            step = max(1, max_chunk_elements // max(trailing, 1))
+            for start in range(0, int(value.shape[0]), step):
+                yield value[start:start + step]
+            return
+        # A single leading slice is still too large. Recurse dimension by
+        # dimension; concatenating these chunks is exactly C-order traversal.
+        for index in range(int(value.shape[0])):
+            yield from _chunks_c_order(value[index])
+
+    for chunk in _chunks_c_order(tensor):
+        cpu = chunk.to(device="cpu", dtype=torch.float32).contiguous()
+        digest.update(
+            cpu.numpy().astype("<f4", copy=False).tobytes(order="C")
+        )
+        del cpu
+    return shape, digest.hexdigest()
+
+
+def _combined_source_weights_sha256(
+    shapes: Mapping[str, Sequence[int]],
+    content_digests: Mapping[str, str],
+) -> str:
+    digest = hashlib.sha256()
+    digest.update((CB_SOURCE_WEIGHTS_HASH_SCHEMA + "\0").encode("utf-8"))
+
+    def _frame(payload: bytes) -> None:
+        digest.update(len(payload).to_bytes(8, "little", signed=False))
+        digest.update(payload)
+
+    for qname in sorted(content_digests):
+        _frame(qname.encode("utf-8"))
+        _frame(json.dumps(
+            [int(dim) for dim in shapes[qname]],
+            separators=(",", ":"),
+        ).encode("ascii"))
+        _frame(bytes.fromhex(str(content_digests[qname])))
+    return digest.hexdigest()
+
+
+def validate_cb_render_source_weight(
+    identity: Mapping[str, object],
+    qname: str,
+    weight: torch.Tensor,
+    *,
+    where: str,
+) -> None:
+    """Incrementally verify one decoded exporter source tensor."""
+    if (
+        not isinstance(identity, Mapping)
+        or identity.get("schema") != CB_RENDER_IDENTITY_SCHEMA
+        or identity.get("source_weights_complete") is not True
+    ):
+        raise ValueError(
+            f"{where}: missing source-complete CB render identity"
+        )
+    name = str(qname)
+    shapes = identity.get("source_weights_shapes")
+    content = identity.get("source_weights_content_sha256")
+    if (
+        not isinstance(shapes, Mapping)
+        or not isinstance(content, Mapping)
+        or name not in shapes
+        or name not in content
+    ):
+        raise ValueError(
+            f"{where}: decoded CB source qname {name!r} is absent from the "
+            "selected render identity"
+        )
+    shape, digest = _source_weight_value_identity(weight)
+    if (
+        shape != [int(dim) for dim in shapes[name]]
+        or digest != str(content[name]).lower()
+    ):
+        raise ValueError(
+            f"{where}: decoded CB source-weight value differs for {name!r}"
+        )
+
+
+def build_production_cache_cb_render_identity(
+    formats_by_qname: Mapping[str, str | Sequence[str]],
+    *,
+    cb_serialization_context,
+    col_weights: Mapping[str, torch.Tensor] | None,
+    render_levers: Mapping[str, object] | None,
+    render_mechanism_plan,
+) -> dict[str, object] | None:
+    """Build the fresh, versioned identity for a CB cache render scope.
+
+    ``None`` is returned only when the scope has no CB formats.  A CB scope
+    requires a caller-supplied ``CBSerializationContext``; this function never
+    consults process environment defaults.
+    """
+    scope = _canonical_cb_render_scope(formats_by_qname)
+    qnames = list(scope)
+    if not scope:
+        return None
+    if cb_serialization_context is None:
+        raise ValueError(
+            "production CB render requires an explicit "
+            "CBSerializationContext; refusing to infer layout/codebook "
+            "identity from the current environment"
+        )
+    from prismaquant.nvfp4_cb_footprint import (
+        CBSerializationContext,
+        cb_serialization_context_stamp,
+    )
+
+    if not isinstance(cb_serialization_context, CBSerializationContext):
+        raise TypeError(
+            "cb_serialization_context must be a CBSerializationContext, got "
+            f"{type(cb_serialization_context).__name__}"
+        )
+    col_digest, shapes, content_digests = _canonical_cb_col_weights_identity(
+        col_weights,
+        qnames,
+    )
+    cb_formats = sorted({fmt for formats in scope.values() for fmt in formats})
+    return {
+        "schema": CB_RENDER_IDENTITY_SCHEMA,
+        "cb_serialized_payload": cb_serialization_context_stamp(
+            cb_serialization_context,
+            formats=cb_formats,
+        ),
+        "render_contract": _cb_render_contract(
+            render_levers,
+            render_mechanism_plan,
+            cb_formats,
+        ),
+        "cb_formats_by_qname": scope,
+        "col_weights_schema": CB_COL_WEIGHTS_HASH_SCHEMA,
+        "col_weights_sha256": col_digest,
+        "col_weights_entries": len(qnames),
+        "col_weights_qnames": qnames,
+        "col_weights_shapes": shapes,
+        "col_weights_content_sha256": content_digests,
+        "source_weights_schema": CB_SOURCE_WEIGHTS_HASH_SCHEMA,
+        "source_weights_complete": False,
+        "source_weights_sha256": None,
+        "source_weights_shapes": {},
+        "source_weights_content_sha256": {},
+    }
+
+
+def validate_cb_render_identity_metadata(
+    identity: Mapping[str, object] | None,
+    *,
+    expected_context=None,
+    expected_qnames: Sequence[str] | None = None,
+    expected_formats_by_qname: Mapping[
+        str, str | Sequence[str]
+    ] | None = None,
+    col_weights: Mapping[str, torch.Tensor] | None = None,
+    source_weights: Mapping[str, torch.Tensor] | None = None,
+    require_source_complete: bool = True,
+    where: str = "CB render identity",
+):
+    """Validate a value-bearing CB render identity independent of a cache.
+
+    This is the shared consumer gate for cache, cost, assignment, and export
+    artifacts.  It validates the serialized layout/codebook bytes, exact
+    qname/format scope, and canonical float32 imatrix content without ever
+    consulting the current process environment.
+    """
+    if not isinstance(identity, Mapping):
+        raise ValueError(f"{where}: missing versioned CB render identity")
+    if identity.get("schema") != CB_RENDER_IDENTITY_SCHEMA:
+        raise ValueError(
+            f"{where}: unsupported CB render identity schema "
+            f"{identity.get('schema')!r}"
+        )
+    if identity.get("col_weights_schema") != CB_COL_WEIGHTS_HASH_SCHEMA:
+        raise ValueError(
+            f"{where}: unsupported CB col_weights identity schema "
+            f"{identity.get('col_weights_schema')!r}"
+        )
+    raw_qnames = identity.get("col_weights_qnames")
+    if not isinstance(raw_qnames, Sequence) or isinstance(raw_qnames, str):
+        raise ValueError(f"{where}: CB render identity has no qname list")
+    identity_qnames = [str(name) for name in raw_qnames]
+    if identity_qnames != sorted(set(identity_qnames)):
+        raise ValueError(
+            f"{where}: CB render identity qnames are not canonical/sorted"
+        )
+    if int(identity.get("col_weights_entries", -1)) != len(identity_qnames):
+        raise ValueError(f"{where}: CB render identity entry count differs")
+
+    raw_scope = identity.get("cb_formats_by_qname")
+    if not isinstance(raw_scope, Mapping):
+        raise ValueError(f"{where}: CB render identity has no format scope")
+    try:
+        scope = _canonical_cb_render_scope(raw_scope)
+    except Exception as exc:
+        raise ValueError(
+            f"{where}: CB render identity format scope is invalid"
+        ) from exc
+    normalized_raw_scope = {
+        str(name): [str(fmt) for fmt in formats]
+        for name, formats in raw_scope.items()
+        if isinstance(formats, Sequence) and not isinstance(formats, str)
+    }
+    if (
+        set(scope) != set(identity_qnames)
+        or normalized_raw_scope != scope
+    ):
+        raise ValueError(
+            f"{where}: CB render identity format scope is not exact, "
+            "canonical, and qname-complete"
+        )
+
+    render_contract = identity.get("render_contract")
+    if not isinstance(render_contract, Mapping):
+        raise ValueError(f"{where}: CB render contract is missing")
+    if render_contract.get("schema") != CB_RENDER_CONTRACT_SCHEMA:
+        raise ValueError(f"{where}: unsupported CB render contract schema")
+    if render_contract.get("mechanism_abi") != CB_RENDER_MECHANISM_ABI:
+        raise ValueError(f"{where}: unsupported CB render mechanism ABI")
+    if not isinstance(render_contract.get("resolved_levers"), Mapping):
+        raise ValueError(f"{where}: CB render contract has no resolved levers")
+    if not isinstance(render_contract.get("mechanism_plan"), Sequence):
+        raise ValueError(f"{where}: CB render contract has no mechanism plan")
+    if render_contract.get("cb_active_mechanisms") != ["weighted_vq"]:
+        raise ValueError(f"{where}: unsupported CB active render mechanisms")
+    if render_contract.get("calibration_dependent_mechanisms") != []:
+        raise ValueError(
+            f"{where}: CB render identity contains unbound "
+            "calibration-dependent mechanisms"
+        )
+
+    raw_shapes = identity.get("col_weights_shapes")
+    if not isinstance(raw_shapes, Mapping) or set(raw_shapes) != set(identity_qnames):
+        raise ValueError(
+            f"{where}: CB render identity shapes do not cover its qnames"
+        )
+    shapes: dict[str, list[int]] = {}
+    for qname in identity_qnames:
+        raw_shape = raw_shapes[qname]
+        if not isinstance(raw_shape, Sequence) or isinstance(raw_shape, str):
+            raise ValueError(
+                f"{where}: CB render identity shape for {qname!r} is invalid"
+            )
+        shape = [int(dim) for dim in raw_shape]
+        if any(dim < 0 for dim in shape):
+            raise ValueError(
+                f"{where}: CB render identity shape for {qname!r} is invalid"
+            )
+        shapes[qname] = shape
+    raw_content_digests = identity.get("col_weights_content_sha256")
+    if (
+        not isinstance(raw_content_digests, Mapping)
+        or set(raw_content_digests) != set(identity_qnames)
+    ):
+        raise ValueError(
+            f"{where}: CB render identity content hashes do not cover its "
+            "qnames"
+        )
+    content_digests = {
+        qname: str(raw_content_digests[qname]).lower()
+        for qname in identity_qnames
+    }
+    if any(
+        re.fullmatch(r"[0-9a-f]{64}", value) is None
+        for value in content_digests.values()
+    ):
+        raise ValueError(f"{where}: CB col_weights content SHA-256 is invalid")
+    observed_digest = str(identity.get("col_weights_sha256", "")).lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", observed_digest):
+        raise ValueError(f"{where}: CB col_weights SHA-256 is invalid")
+
+    if identity.get("source_weights_schema") != CB_SOURCE_WEIGHTS_HASH_SCHEMA:
+        raise ValueError(
+            f"{where}: unsupported CB source-weight identity schema"
+        )
+    source_shapes_raw = identity.get("source_weights_shapes")
+    source_content_raw = identity.get("source_weights_content_sha256")
+    if not isinstance(source_shapes_raw, Mapping) or not isinstance(
+        source_content_raw, Mapping
+    ):
+        raise ValueError(f"{where}: CB source-weight identity is malformed")
+    source_names = set(str(name) for name in source_content_raw)
+    if source_names != set(str(name) for name in source_shapes_raw):
+        raise ValueError(
+            f"{where}: CB source-weight shapes/content scopes differ"
+        )
+    if not source_names.issubset(identity_qnames):
+        raise ValueError(
+            f"{where}: CB source-weight identity contains out-of-scope qnames"
+        )
+    source_shapes: dict[str, list[int]] = {}
+    source_content: dict[str, str] = {}
+    for qname in sorted(source_names):
+        raw_shape = source_shapes_raw[qname]
+        if not isinstance(raw_shape, Sequence) or isinstance(raw_shape, str):
+            raise ValueError(
+                f"{where}: source-weight shape for {qname!r} is invalid"
+            )
+        source_shapes[qname] = [int(dim) for dim in raw_shape]
+        value = str(source_content_raw[qname]).lower()
+        if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+            raise ValueError(
+                f"{where}: source-weight SHA-256 for {qname!r} is invalid"
+            )
+        source_content[qname] = value
+    source_complete = identity.get("source_weights_complete")
+    if not isinstance(source_complete, bool):
+        raise ValueError(
+            f"{where}: CB source-weight completeness marker is invalid"
+        )
+    if source_complete:
+        if source_names != set(identity_qnames):
+            raise ValueError(
+                f"{where}: complete CB source-weight identity does not cover "
+                "its qname scope"
+            )
+        expected_source_digest = _combined_source_weights_sha256(
+            source_shapes,
+            source_content,
+        )
+        if identity.get("source_weights_sha256") != expected_source_digest:
+            raise ValueError(
+                f"{where}: combined CB source-weight SHA-256 differs"
+            )
+    elif require_source_complete:
+        raise ValueError(
+            f"{where}: CB source-weight identity is incomplete; cache render "
+            "did not observe every exact decoded source tensor"
+        )
+    elif identity.get("source_weights_sha256") is not None:
+        raise ValueError(
+            f"{where}: incomplete CB source identity has a final digest"
+        )
+
+    if expected_qnames is not None:
+        missing_expected = sorted(
+            set(str(name) for name in expected_qnames) - set(identity_qnames)
+        )
+        if missing_expected:
+            raise ValueError(
+                f"{where}: requested CB qnames are absent from render "
+                f"identity; sample={missing_expected[:8]}"
+            )
+    if expected_formats_by_qname is not None:
+        expected_scope = _canonical_cb_render_scope(expected_formats_by_qname)
+        missing_or_mismatched = sorted(
+            qname for qname, formats in expected_scope.items()
+            if qname not in scope
+            or not set(formats).issubset(scope[qname])
+        )
+        if missing_or_mismatched:
+            raise ValueError(
+                f"{where}: requested CB qname/format scope differs from the "
+                f"stored render; sample={missing_or_mismatched[:8]}"
+            )
+
+    from prismaquant.nvfp4_cb_footprint import (
+        cb_serialization_context_from_stamp,
+        lattice_codebook_content_sha256,
+        validate_cb_serialization_context_stamp,
+    )
+
+    stamp = identity.get("cb_serialized_payload")
+    context = cb_serialization_context_from_stamp(
+        stamp,
+        where=f"{where} serialized payload",
+    )
+    if expected_context is not None:
+        validate_cb_serialization_context_stamp(
+            stamp,
+            expected_context,
+            where=where,
+        )
+    formats = sorted({fmt for values in scope.values() for fmt in values})
+    if context.codebook_source == "lattice":
+        observed_lattice = stamp.get("lattice_codebook_sha256_by_format")
+        expected_lattice = {
+            fmt: list(lattice_codebook_content_sha256(fmt))
+            for fmt in formats
+        }
+        if not isinstance(observed_lattice, Mapping) or dict(
+            observed_lattice
+        ) != expected_lattice:
+            raise ValueError(
+                f"{where}: CB render identity does not bind the exact "
+                "canonical lattice codebook bytes for its format scope"
+            )
+    else:
+        learned_digests = stamp.get("codebook_content_sha256")
+        if not isinstance(learned_digests, Mapping) or not learned_digests:
+            raise ValueError(
+                f"{where}: learned CB render identity has no value-bearing "
+                "codebook content digests"
+            )
+
+    if col_weights is not None:
+        expected_digest, expected_shapes, expected_content = (
+            _canonical_cb_col_weights_identity(
+                col_weights,
+                identity_qnames,
+            )
+        )
+        if (
+            expected_digest != observed_digest
+            or expected_shapes != shapes
+            or expected_content != content_digests
+        ):
+            raise ValueError(
+                f"{where}: CB col_weights identity differs from the stored "
+                "render"
+            )
+    if source_weights is not None:
+        missing_source_values = sorted(
+            set(identity_qnames) - set(str(name) for name in source_weights)
+        )
+        if missing_source_values:
+            raise ValueError(
+                f"{where}: source-weight validation mapping is missing "
+                f"qnames; sample={missing_source_values[:8]}"
+            )
+        mismatched_source_values: list[str] = []
+        for qname in identity_qnames:
+            shape, digest = _source_weight_value_identity(
+                source_weights[qname]
+            )
+            if (
+                shape != source_shapes.get(qname)
+                or digest != source_content.get(qname)
+            ):
+                mismatched_source_values.append(qname)
+        if mismatched_source_values:
+            raise ValueError(
+                f"{where}: decoded CB source-weight values differ; "
+                f"sample={mismatched_source_values[:8]}"
+            )
+    return context
+
+
+def bind_cb_render_identity_source_weights(
+    identity: Mapping[str, object],
+    source_weights: Mapping[str, torch.Tensor],
+    *,
+    require_complete: bool = True,
+    where: str = "CB render identity source binding",
+) -> dict[str, object]:
+    """Bind exact decoded source tensors into a render identity copy."""
+    validate_cb_render_identity_metadata(
+        identity,
+        require_source_complete=False,
+        where=where,
+    )
+    updated = copy.deepcopy(dict(identity))
+    scope = set(str(name) for name in updated["col_weights_qnames"])
+    shapes = dict(updated["source_weights_shapes"])
+    content = dict(updated["source_weights_content_sha256"])
+    for raw_qname, weight in source_weights.items():
+        qname = str(raw_qname)
+        if qname not in scope:
+            continue
+        shape, digest = _source_weight_value_identity(weight)
+        if qname in content and (
+            list(shapes[qname]) != shape
+            or str(content[qname]).lower() != digest
+        ):
+            raise ValueError(
+                f"{where}: decoded source weight changed for {qname!r}"
+            )
+        shapes[qname] = shape
+        content[qname] = digest
+    observed = set(content)
+    complete = observed == scope
+    if require_complete and not complete:
+        missing = sorted(scope - observed)
+        raise ValueError(
+            f"{where}: missing decoded source weights; sample={missing[:8]}"
+        )
+    updated["source_weights_shapes"] = dict(sorted(shapes.items()))
+    updated["source_weights_content_sha256"] = dict(sorted(content.items()))
+    updated["source_weights_complete"] = bool(complete)
+    updated["source_weights_sha256"] = (
+        _combined_source_weights_sha256(shapes, content)
+        if complete else None
+    )
+    validate_cb_render_identity_metadata(
+        updated,
+        require_source_complete=require_complete,
+        where=where,
+    )
+    return updated
+
+
+def bind_production_cache_cb_source_weights(
+    cache: ProductionWeightCache,
+    source_weights: Mapping[str, torch.Tensor],
+    *,
+    require_complete: bool = False,
+    where: str = "ProductionWeightCache source binding",
+) -> None:
+    """Record decoded source values as streamed CB tensors become resident."""
+    metadata = dict(getattr(cache, "metadata", {}) or {})
+    identity = metadata.get(CB_RENDER_IDENTITY_METADATA_KEY)
+    if identity is None:
+        if source_weights:
+            raise ValueError(f"{where}: cache has no CB render identity")
+        return
+    metadata[CB_RENDER_IDENTITY_METADATA_KEY] = (
+        bind_cb_render_identity_source_weights(
+            identity,
+            source_weights,
+            require_complete=require_complete,
+            where=where,
+        )
+    )
+    cache.metadata = metadata
+
+
+def project_cb_render_identity(
+    identity: Mapping[str, object],
+    formats_by_qname: Mapping[str, str | Sequence[str]],
+    *,
+    col_weights: Mapping[str, torch.Tensor],
+    where: str,
+) -> dict[str, object]:
+    """Project a full-menu identity onto one exact selected CB assignment."""
+    context = validate_cb_render_identity_metadata(identity, where=where)
+    selected_scope = _canonical_cb_render_scope(formats_by_qname)
+    if not selected_scope:
+        raise ValueError(f"{where}: selected scope contains no CB formats")
+    original_scope = identity["cb_formats_by_qname"]
+    missing = sorted(
+        qname for qname, formats in selected_scope.items()
+        if qname not in original_scope
+        or not set(formats).issubset(original_scope[qname])
+    )
+    if missing:
+        raise ValueError(
+            f"{where}: selected CB scope is absent from producer identity; "
+            f"sample={missing[:8]}"
+        )
+    contract = identity["render_contract"]
+    projected = build_production_cache_cb_render_identity(
+        selected_scope,
+        cb_serialization_context=context,
+        col_weights=col_weights,
+        render_levers=contract["resolved_levers"],
+        render_mechanism_plan=contract["mechanism_plan"],
+    )
+    if projected["render_contract"] != contract:
+        raise ValueError(
+            f"{where}: selected projection changed the resolved render "
+            "contract"
+        )
+    projected_shapes = {
+        qname: list(identity["source_weights_shapes"][qname])
+        for qname in selected_scope
+    }
+    projected_content = {
+        qname: str(identity["source_weights_content_sha256"][qname])
+        for qname in selected_scope
+    }
+    projected["source_weights_shapes"] = projected_shapes
+    projected["source_weights_content_sha256"] = projected_content
+    projected["source_weights_complete"] = True
+    projected["source_weights_sha256"] = _combined_source_weights_sha256(
+        projected_shapes,
+        projected_content,
+    )
+    validate_cb_render_identity_metadata(
+        projected,
+        col_weights=col_weights,
+        where=f"{where} projected identity",
+    )
+    return projected
+
+
+def merge_cb_render_identities(
+    identities: Sequence[Mapping[str, object]],
+    *,
+    col_weights: Mapping[str, torch.Tensor],
+    where: str,
+) -> dict[str, object] | None:
+    """Merge disjoint source-complete shard identities into one cost scope."""
+    if not identities:
+        return None
+    contexts = [
+        validate_cb_render_identity_metadata(
+            identity,
+            col_weights=col_weights,
+            where=f"{where} shard {index}",
+        )
+        for index, identity in enumerate(identities)
+    ]
+    first = identities[0]
+    contract = first["render_contract"]
+    scope: dict[str, list[str]] = {}
+    source_shapes: dict[str, list[int]] = {}
+    source_content: dict[str, str] = {}
+    for index, identity in enumerate(identities):
+        if identity["render_contract"] != contract:
+            raise ValueError(
+                f"{where}: CB shard {index} render contract differs"
+            )
+        from prismaquant.nvfp4_cb_footprint import (
+            validate_cb_serialization_context_stamp,
+        )
+
+        validate_cb_serialization_context_stamp(
+            identity["cb_serialized_payload"],
+            contexts[0],
+            where=f"{where} shard {index}",
+        )
+        overlap = set(scope) & set(identity["cb_formats_by_qname"])
+        if overlap:
+            raise ValueError(
+                f"{where}: CB shard render identities overlap; "
+                f"sample={sorted(overlap)[:8]}"
+            )
+        scope.update(copy.deepcopy(identity["cb_formats_by_qname"]))
+        source_shapes.update(copy.deepcopy(identity["source_weights_shapes"]))
+        source_content.update(copy.deepcopy(
+            identity["source_weights_content_sha256"]
+        ))
+    merged = build_production_cache_cb_render_identity(
+        scope,
+        cb_serialization_context=contexts[0],
+        col_weights=col_weights,
+        render_levers=contract["resolved_levers"],
+        render_mechanism_plan=contract["mechanism_plan"],
+    )
+    merged["source_weights_shapes"] = dict(sorted(source_shapes.items()))
+    merged["source_weights_content_sha256"] = dict(
+        sorted(source_content.items())
+    )
+    merged["source_weights_complete"] = True
+    merged["source_weights_sha256"] = _combined_source_weights_sha256(
+        source_shapes,
+        source_content,
+    )
+    validate_cb_render_identity_metadata(
+        merged,
+        col_weights=col_weights,
+        where=f"{where} merged identity",
+    )
+    return merged
+
+
+def validate_production_cache_cb_render_identity(
+    cache: ProductionWeightCache,
+    *,
+    expected_context=None,
+    expected_qnames: Sequence[str] | None = None,
+    col_weights: Mapping[str, torch.Tensor] | None = None,
+    require_for_formats: Sequence[str] = (),
+    require_source_complete: bool = True,
+    where: str = "ProductionWeightCache",
+):
+    """Fail closed on absent, stale, or malformed CB render provenance.
+
+    Consumers rehydrate the stored producer context from this identity.  They
+    may compare it with an assignment context, but they never stamp whatever
+    CB environment happens to be active when the cache is consumed.
+    """
+    stored_cb_scope: dict[str, list[str]] = {}
+    for qname, fmt in (getattr(cache, "weights", {}) or {}):
+        if not _is_cb_format_name(fmt):
+            continue
+        stored_cb_scope.setdefault(str(qname), []).append(str(fmt))
+    required_by_format = any(
+        _is_cb_format_name(fmt) for fmt in require_for_formats
+    )
+    metadata = getattr(cache, "metadata", None)
+    identity = (
+        metadata.get(CB_RENDER_IDENTITY_METADATA_KEY)
+        if isinstance(metadata, Mapping)
+        else None
+    )
+    if not stored_cb_scope and not required_by_format and identity is None:
+        return None
+    if not isinstance(identity, Mapping):
+        raise ValueError(
+            f"{where}: CB cache is missing versioned "
+            f"metadata[{CB_RENDER_IDENTITY_METADATA_KEY!r}]; legacy or "
+            "partially resumed CB caches must be rebuilt"
+        )
+    return validate_cb_render_identity_metadata(
+        identity,
+        expected_context=expected_context,
+        expected_qnames=expected_qnames,
+        expected_formats_by_qname=stored_cb_scope,
+        col_weights=col_weights,
+        require_source_complete=require_source_complete,
+        where=where,
+    )
+
+
+def production_cache_cb_render_identity(
+    cache: ProductionWeightCache,
+    *,
+    expected_context=None,
+    expected_qnames: Sequence[str] | None = None,
+    col_weights: Mapping[str, torch.Tensor] | None = None,
+    require_for_formats: Sequence[str] = (),
+    require_source_complete: bool = True,
+    where: str = "ProductionWeightCache",
+) -> dict[str, object] | None:
+    """Return a validated defensive copy of the cache's stored identity."""
+    context = validate_production_cache_cb_render_identity(
+        cache,
+        expected_context=expected_context,
+        expected_qnames=expected_qnames,
+        col_weights=col_weights,
+        require_for_formats=require_for_formats,
+        require_source_complete=require_source_complete,
+        where=where,
+    )
+    if context is None:
+        return None
+    return copy.deepcopy(
+        dict(cache.metadata[CB_RENDER_IDENTITY_METADATA_KEY])
+    )
+
+
+def production_cache_cb_render_provenance(
+    cache: ProductionWeightCache,
+    *,
+    expected_context=None,
+    expected_qnames: Sequence[str] | None = None,
+    col_weights: Mapping[str, torch.Tensor] | None = None,
+    require_for_formats: Sequence[str] = (),
+    require_source_complete: bool = True,
+    where: str = "ProductionWeightCache",
+) -> dict[str, object]:
+    """Return the exact stored CB provenance fragment for downstream use."""
+    identity = production_cache_cb_render_identity(
+        cache,
+        expected_context=expected_context,
+        expected_qnames=expected_qnames,
+        col_weights=col_weights,
+        require_for_formats=require_for_formats,
+        require_source_complete=require_source_complete,
+        where=where,
+    )
+    if identity is None:
+        return {}
+    return {
+        "cb_serialized_payload": copy.deepcopy(
+            identity["cb_serialized_payload"]
+        ),
+        CB_RENDER_IDENTITY_METADATA_KEY: identity,
+    }
+
+
+def validate_cb_render_provenance(
+    payload: Mapping[str, object],
+    *,
+    expected_context=None,
+    expected_qnames: Sequence[str] | None = None,
+    expected_formats_by_qname: Mapping[
+        str, str | Sequence[str]
+    ] | None = None,
+    col_weights: Mapping[str, torch.Tensor] | None = None,
+    where: str,
+) -> tuple[object, dict[str, object]]:
+    """Validate and return a cost/assignment payload's exact CB identity."""
+    provenance = payload.get("provenance")
+    container = provenance if isinstance(provenance, Mapping) else payload
+    identity = container.get(CB_RENDER_IDENTITY_METADATA_KEY)
+    context = validate_cb_render_identity_metadata(
+        identity if isinstance(identity, Mapping) else None,
+        expected_context=expected_context,
+        expected_qnames=expected_qnames,
+        expected_formats_by_qname=expected_formats_by_qname,
+        col_weights=col_weights,
+        where=where,
+    )
+    top_stamp = container.get("cb_serialized_payload")
+    from prismaquant.nvfp4_cb_footprint import (
+        validate_cb_serialization_context_stamp,
+    )
+
+    validate_cb_serialization_context_stamp(
+        top_stamp if isinstance(top_stamp, Mapping) else None,
+        context,
+        where=f"{where} top-level context",
+    )
+    if top_stamp is None or dict(top_stamp) != dict(
+        identity["cb_serialized_payload"]
+    ):
+        raise ValueError(
+            f"{where}: top-level CB context does not exactly match its "
+            "value-bearing render identity"
+        )
+    return context, copy.deepcopy(dict(identity))
+
+
+def validate_matching_cb_render_identities(
+    reference: Mapping[str, object],
+    candidate: Mapping[str, object],
+    formats_by_qname: Mapping[str, str | Sequence[str]],
+    *,
+    where: str,
+) -> None:
+    """Require equal value-bearing inputs for the requested CB rows."""
+    required_scope = _canonical_cb_render_scope(formats_by_qname)
+    reference_context = validate_cb_render_identity_metadata(
+        reference,
+        expected_formats_by_qname=required_scope,
+        where=f"{where} reference",
+    )
+    validate_cb_render_identity_metadata(
+        candidate,
+        expected_context=reference_context,
+        expected_formats_by_qname=required_scope,
+        where=f"{where} candidate",
+    )
+    if reference["render_contract"] != candidate["render_contract"]:
+        raise ValueError(f"{where}: resolved CB render contracts differ")
+    mismatched: list[str] = []
+    mismatched_source: list[str] = []
+    for qname in required_scope:
+        if (
+            list(reference["col_weights_shapes"][qname])
+            != list(candidate["col_weights_shapes"][qname])
+            or str(reference["col_weights_content_sha256"][qname]).lower()
+            != str(candidate["col_weights_content_sha256"][qname]).lower()
+        ):
+            mismatched.append(qname)
+        if (
+            list(reference["source_weights_shapes"][qname])
+            != list(candidate["source_weights_shapes"][qname])
+            or str(reference["source_weights_content_sha256"][qname]).lower()
+            != str(candidate["source_weights_content_sha256"][qname]).lower()
+        ):
+            mismatched_source.append(qname)
+    if mismatched:
+        raise ValueError(
+            f"{where}: CB imatrix values differ for consumed rows; "
+            f"sample={mismatched[:8]}"
+        )
+    if mismatched_source:
+        raise ValueError(
+            f"{where}: decoded CB source-weight values differ for consumed "
+            f"rows; sample={mismatched_source[:8]}"
+        )
+
+
+def _extend_production_cache_cb_render_identity(
+    cache: ProductionWeightCache,
+    formats_by_qname: Mapping[str, str | Sequence[str]],
+    *,
+    cb_serialization_context,
+    col_weights: Mapping[str, torch.Tensor] | None,
+    render_levers: Mapping[str, object] | None = None,
+    render_mechanism_plan=None,
+) -> None:
+    """Validate the existing identity and extend it for a new CB scope."""
+    new_scope = _canonical_cb_render_scope(formats_by_qname)
+    new_qnames = list(new_scope)
+    if not new_scope:
+        return
+    metadata = dict(getattr(cache, "metadata", {}) or {})
+    old_identity = metadata.get(CB_RENDER_IDENTITY_METADATA_KEY)
+    old_scope: dict[str, list[str]] = {}
+    if old_identity is not None or any(
+        _is_cb_format_name(fmt) for _qname, fmt in cache.weights
+    ):
+        validate_production_cache_cb_render_identity(
+            cache,
+            expected_context=cb_serialization_context,
+            require_for_formats=["NVFP4_CB_K16"],
+            require_source_complete=False,
+            where="ProductionWeightCache extension",
+        )
+        old_scope = {
+            str(name): [str(fmt) for fmt in formats]
+            for name, formats in old_identity["cb_formats_by_qname"].items()
+        }
+        old_qnames = list(old_scope)
+        overlap = sorted(set(old_qnames) & set(new_qnames))
+        if overlap:
+            _, overlap_shapes, overlap_content = (
+                _canonical_cb_col_weights_identity(col_weights, overlap)
+            )
+            stored_shapes = old_identity["col_weights_shapes"]
+            stored_content = old_identity["col_weights_content_sha256"]
+            mismatched = [
+                name for name in overlap
+                if (
+                    list(stored_shapes[name]) != overlap_shapes[name]
+                    or str(stored_content[name]).lower()
+                    != overlap_content[name]
+                )
+            ]
+            if mismatched:
+                raise ValueError(
+                    "ProductionWeightCache extension: CB col_weights differ "
+                    f"for existing render qnames; sample={mismatched[:8]}"
+                )
+        if all(
+            name in old_scope
+            and set(formats).issubset(old_scope[name])
+            for name, formats in new_scope.items()
+        ):
+            return
+    combined: dict[str, list[str]] = copy.deepcopy(old_scope)
+    for name, formats in new_scope.items():
+        combined[name] = sorted(set(combined.get(name, ())) | set(formats))
+    if old_identity is None and (
+        render_levers is None or render_mechanism_plan is None
+    ):
+        raise ValueError(
+            "new ProductionWeightCache CB scope requires explicit resolved "
+            "render levers and mechanism plan"
+        )
+    identity = build_production_cache_cb_render_identity(
+        combined,
+        cb_serialization_context=cb_serialization_context,
+        col_weights=col_weights,
+        render_levers=(
+            render_levers
+            if render_levers is not None
+            else old_identity["render_contract"]["resolved_levers"]
+        ),
+        render_mechanism_plan=(
+            render_mechanism_plan
+            if render_mechanism_plan is not None
+            else old_identity["render_contract"]["mechanism_plan"]
+        ),
+    )
+    if old_identity is not None:
+        if identity["render_contract"] != old_identity["render_contract"]:
+            raise ValueError(
+                "ProductionWeightCache extension: resolved CB render "
+                "contract differs from the existing cache"
+            )
+        identity["source_weights_shapes"] = copy.deepcopy(
+            old_identity["source_weights_shapes"]
+        )
+        identity["source_weights_content_sha256"] = copy.deepcopy(
+            old_identity["source_weights_content_sha256"]
+        )
+        observed = set(identity["source_weights_content_sha256"])
+        expected = set(identity["col_weights_qnames"])
+        identity["source_weights_complete"] = observed == expected
+        identity["source_weights_sha256"] = (
+            _combined_source_weights_sha256(
+                identity["source_weights_shapes"],
+                identity["source_weights_content_sha256"],
+            )
+            if observed == expected else None
+        )
+    metadata[CB_RENDER_IDENTITY_METADATA_KEY] = identity
+    cache.metadata = metadata
+
+
 def _render_nvfp4_progressive_candidate(
     *,
     qname: str,
@@ -1836,6 +3061,7 @@ def render_production_weight(
     act_clip_rescale: str | None = None,
     fisher_row_weights: torch.Tensor | None = None,
     col_weights: torch.Tensor | None = None,
+    cb_serialization_context=None,
     gate_trace: list[dict[str, object]] | None = None,
 ) -> torch.Tensor:
     """Compute the production-faithful dequantized weight for ``(qname, fmt)``.
@@ -1876,6 +3102,12 @@ def render_production_weight(
 
     fmt = fr.canonical_format_name(str(fmt).strip().upper())
     is_cb = fr.get_format(fmt).family in {"nvfp4_cb", "fp8_cb"}
+    if is_cb and cb_serialization_context is None:
+        raise ValueError(
+            f"{qname}={fmt}: production CB render requires an explicit "
+            "CBSerializationContext; refusing to use current environment "
+            "defaults"
+        )
     if is_cb and col_weights is None:
         raise RuntimeError(
             f"{qname}={fmt}: production CB render has no col_weights; "
@@ -1925,14 +3157,26 @@ def render_production_weight(
         # v1/v2 reachable scale set to the same serialization context the
         # cost payload and exporter stamp, while remaining the registry QDQ
         # for every non-CB format.
-        from prismaquant.emu_forward_kl import weighted_quantize_dequantize
+        if is_cb:
+            from prismaquant.nvfp4_cb_footprint import (
+                cb_quantize_dequantize_for_context,
+            )
 
-        baseline = weighted_quantize_dequantize(
-            spec,
-            weight.detach(),
-            None if col_weights is None
-            else col_weights.reshape(-1).to(weight.device),
-        ).to(device=weight.device, dtype=weight.dtype)
+            baseline = cb_quantize_dequantize_for_context(
+                spec,
+                weight.detach(),
+                context=cb_serialization_context,
+                col_weights=col_weights.reshape(-1).to(weight.device),
+            ).to(device=weight.device, dtype=weight.dtype)
+        else:
+            from prismaquant.emu_forward_kl import weighted_quantize_dequantize
+
+            baseline = weighted_quantize_dequantize(
+                spec,
+                weight.detach(),
+                None if col_weights is None
+                else col_weights.reshape(-1).to(weight.device),
+            ).to(device=weight.device, dtype=weight.dtype)
         reference = weight.detach().to(torch.float32)
         acts = activations.get(qname)
         acts_for_render = (
@@ -2311,6 +3555,7 @@ def fill_production_weight_cache(
     recache_microbatch_size: int = 1,
     h_detail_dir: str | Path | None = None,
     col_weights: Mapping[str, torch.Tensor] | None = None,
+    cb_serialization_context=None,
 ) -> ProductionWeightCache:
     """End-to-end fill: collect activations, render production δw per
     (qname, fmt), return a `ProductionWeightCache`.
@@ -2343,6 +3588,9 @@ def fill_production_weight_cache(
         lane's allocator cost, frontier KL and shipped bytes all come from ONE
         ``ProductionWeightCache`` render instead of a separate
         skeleton-requantize path.
+      cb_serialization_context: explicit artifact serialization identity for
+        every CB render. Required when the scope contains a CB format; never
+        inferred from the current environment.
     """
     if recache_pass and not recache_assignment:
         raise ValueError(
@@ -2391,6 +3639,28 @@ def fill_production_weight_cache(
         }
         render_scope = "format-menu"
 
+    cb_render_identity = build_production_cache_cb_render_identity(
+        render_formats_by_qname,
+        cb_serialization_context=cb_serialization_context,
+        col_weights=col_weights,
+        render_levers=levers,
+        render_mechanism_plan=mechanism_plan,
+    )
+    if cb_render_identity is not None:
+        named_modules = dict(model.named_modules())
+        cb_source_weights = {
+            qname: named_modules[qname].weight.detach()
+            for qname in cb_render_identity["col_weights_qnames"]
+            if qname in named_modules
+            and hasattr(named_modules[qname], "weight")
+        }
+        cb_render_identity = bind_cb_render_identity_source_weights(
+            cb_render_identity,
+            cb_source_weights,
+            require_complete=True,
+            where="ProductionWeightCache dense source binding",
+        )
+
     if not qname_set:
         return ProductionWeightCache(
             weights={},
@@ -2399,6 +3669,9 @@ def fill_production_weight_cache(
                 "render_scope": render_scope,
                 "requested_formats": list(requested_formats),
                 "requested_entries": 0,
+                **({
+                    CB_RENDER_IDENTITY_METADATA_KEY: cb_render_identity,
+                } if cb_render_identity is not None else {}),
             },
         )
     model_profile = recache_profile
@@ -2429,6 +3702,20 @@ def fill_production_weight_cache(
     if cache_dir is not None:
         cache_dir_path = Path(cache_dir)
         cache_dir_path.mkdir(parents=True, exist_ok=True)
+        stale_cb_shards = [
+            cache_dir_path / _cache_weight_filename(qname, fmt)
+            for qname, fmts in render_formats_by_qname.items()
+            for fmt in fmts
+            if _is_cb_format_name(fmt)
+            and (cache_dir_path / _cache_weight_filename(qname, fmt)).is_file()
+        ]
+        if stale_cb_shards:
+            raise RuntimeError(
+                "production CB cache resume is disabled because existing "
+                "weight shards are not independently bound to the fresh "
+                "serialization/imatrix identity; move or rebuild the cache "
+                f"directory first. sample={stale_cb_shards[:8]}"
+            )
     render_score_sidecar_path: Path | None = (
         cache_dir_path / "render_scores.json"
         if cache_dir_path is not None else None
@@ -2436,6 +3723,20 @@ def fill_production_weight_cache(
     render_score_records: dict[str, dict[str, object]] = (
         _load_render_score_sidecar(render_score_sidecar_path)
     )
+    # CB weight shards are deliberately never resumed: their rendered values
+    # are only trustworthy under the fresh source/imatrix/context identity
+    # constructed above.  The score sidecar is another derived artifact of
+    # that same render.  Drop any prior score for the fresh CB scope as well,
+    # otherwise a failed re-render could leave an old score looking current
+    # even though no matching CB shard was admitted.
+    fresh_cb_score_keys = {
+        _render_score_record_key(qname, fmt)
+        for qname, fmts in render_formats_by_qname.items()
+        for fmt in fmts
+        if _is_cb_format_name(fmt)
+    }
+    for score_key in fresh_cb_score_keys:
+        render_score_records.pop(score_key, None)
     if progress and render_score_records:
         print(
             f"[prod-cache] resume: loaded {len(render_score_records)} "
@@ -2789,6 +4090,13 @@ def fill_production_weight_cache(
                 fname = _cache_weight_filename(qname, fmt_key)
                 disk_path = cache_dir_path / fname
                 if disk_path.is_file():
+                    if _is_cb_format_name(fmt_key):
+                        raise RuntimeError(
+                            "production CB cache resume is disabled for "
+                            f"{qname}@{fmt_key}: pre-existing shard "
+                            f"{disk_path} has no independently verifiable "
+                            "render identity"
+                        )
                     weights[(qname, fmt_key)] = fname
                     skipped_resumed += 1
                     score_key = _render_score_record_key(qname, fmt_key)
@@ -2832,6 +4140,7 @@ def fill_production_weight_cache(
                         None if col_weights is None
                         else col_weights.get(qname)
                     ),
+                    cb_serialization_context=cb_serialization_context,
                     gate_trace=gate_trace,
                 )
                 render_score_records[_render_score_record_key(qname, fmt_key)] = (
@@ -2974,6 +4283,9 @@ def fill_production_weight_cache(
             "render_scope": render_scope,
             "requested_formats": list(requested_formats),
             "requested_entries": int(n),
+            **({
+                CB_RENDER_IDENTITY_METADATA_KEY: cb_render_identity,
+            } if cb_render_identity is not None else {}),
         },
     )
     if recache_pass:
@@ -3129,6 +4441,7 @@ def fill_packed_expert_cache_entries(
     gate_token_budget: int | None = None,
     module_acts_override: Mapping[str, torch.Tensor] | None = None,
     col_weights: Mapping[str, torch.Tensor] | None = None,
+    cb_serialization_context=None,
 ) -> dict:
     """Render packed-MoE experts into ``ProductionWeightCache`` entries.
 
@@ -3183,6 +4496,9 @@ def fill_packed_expert_cache_entries(
         ``moe_imatrix.synthesize_packed_expert_col_weights`` emits. Applied
         only on the per-expert render path and only for the weighted-render
         families; NVFP4/FP8 expert bytes are unchanged.
+      cb_serialization_context: explicit artifact serialization identity for
+        CB expert renders. Required for CB and never inferred from process
+        environment defaults.
       module_acts_override: streaming build. ``{experts_qname: X}`` module-level
         input snapshots sourced from the probe's activation cache instead of a
         fresh forward pass. When supplied, no calibration forward runs, in-scope
@@ -3283,6 +4599,57 @@ def fill_packed_expert_cache_entries(
             print("[prod-cache/experts] no non-BF16 packed experts in scope",
                   flush=True)
         return coverage
+
+    packed_formats_by_qname = {
+        full: (fmt,)
+        for _experts_qname, _mod, _parent, _pn, full, fmt in in_scope
+    }
+    resolved_packed_levers = _resolve_production_render_levers(levers)
+    packed_mechanism_plan = _resolve_render_mechanism_plan(
+        resolved_packed_levers
+    )
+    _extend_production_cache_cb_render_identity(
+        cache,
+        packed_formats_by_qname,
+        cb_serialization_context=cb_serialization_context,
+        col_weights=col_weights,
+        render_levers=resolved_packed_levers,
+        render_mechanism_plan=packed_mechanism_plan,
+    )
+    packed_cb_source_weights = {
+        full: getattr(mod, pn).detach()
+        for _experts_qname, mod, _parent, pn, full, fmt in in_scope
+        if _is_cb_format_name(fmt)
+    }
+    if packed_cb_source_weights:
+        bind_production_cache_cb_source_weights(
+            cache,
+            packed_cb_source_weights,
+            require_complete=False,
+            where="ProductionWeightCache packed source binding",
+        )
+
+    stale_cb_shards: list[Path] = []
+    for _experts_qname, _mod, _parent, _pn, full, fmt in in_scope:
+        if not _is_cb_format_name(fmt):
+            continue
+        key = (full, fmt)
+        value = cache.weights.get(key)
+        if value is not None and not isinstance(value, torch.Tensor):
+            path = Path(cache._path_for_value(value))
+            if path.is_file():
+                stale_cb_shards.append(path)
+        if cache_dir_path is not None:
+            path = cache_dir_path / _cache_weight_filename(full, fmt)
+            if path.is_file() and path not in stale_cb_shards:
+                stale_cb_shards.append(path)
+    if stale_cb_shards:
+        raise RuntimeError(
+            "production packed-CB cache resume is disabled because existing "
+            "weight shards are not independently bound to the fresh "
+            "serialization/imatrix identity; move or rebuild the cache "
+            f"directory first. sample={stale_cb_shards[:8]}"
+        )
 
     if progress:
         print(
@@ -3706,6 +5073,7 @@ def fill_packed_expert_cache_entries(
                     levers=levers,
                     joint_global_real=per_expert_global[e],
                     col_weights=_expert_col_weights(stack_cw, e, int(E)),
+                    cb_serialization_context=cb_serialization_context,
                 )
                 rendered[e] = w_dq.to(rendered.dtype)
                 del w_dq

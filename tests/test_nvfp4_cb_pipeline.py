@@ -43,7 +43,18 @@ from prismaquant.allocator_candidates import (
     check_format_applicability,
 )
 from prismaquant.allocator_solver import promote_serving_units
-from prismaquant.nvfp4_cb_footprint import CBSerializationContext
+from prismaquant.nvfp4_cb_footprint import (
+    CB_TENSOR_IDENTITY_FIELD,
+    CBSerializationContext,
+    cb_assignment_serialization_stamps,
+    cb_serialization_context_stamp,
+    is_cb_format,
+)
+from prismaquant.production_weight_cache import (
+    bind_cb_render_identity_source_weights,
+    build_production_cache_cb_render_identity,
+    project_cb_render_identity,
+)
 
 # The task's canonical mixed menu: two CB families + their native carriers.
 _MIXED_MENU = [
@@ -56,6 +67,10 @@ _ALL_CB_RUNGS = (
     + [f"FP8_CB_K{k}" for k in (36, 40, 44, 48)]
 )
 _CB_CONTEXT = CBSerializationContext.production()
+
+
+def _cb_stamp(formats):
+    return cb_serialization_context_stamp(_CB_CONTEXT, formats=formats)
 
 
 class _FakeProfile:
@@ -321,28 +336,62 @@ def _write_alloc_fixture(tmp_path, menu):
     specs = _menu_specs(menu)
     stats, costs = _dense_model(specs)
     probe = {"stats": stats, "meta": {"model": None}}
+    cb_formats = sorted(spec.name for spec in specs if is_cb_format(spec.name))
+    col_weights = {
+        qname: torch.linspace(0.1, 1.0, int(entry["in_features"]))
+        for qname, entry in sorted(stats.items())
+    } if cb_formats else {}
+    provenance = {}
+    if cb_formats:
+        formats_by_qname = {
+            qname: cb_formats
+            for qname in sorted(stats)
+        }
+        render_identity = build_production_cache_cb_render_identity(
+            formats_by_qname,
+            cb_serialization_context=_CB_CONTEXT,
+            col_weights=col_weights,
+            render_levers={"weighted_vq": True},
+            render_mechanism_plan=[],
+        )
+        assert render_identity is not None
+        source_weights = {
+            qname: torch.zeros(
+                (
+                    int(entry["out_features"]),
+                    int(entry["in_features"]),
+                ),
+                dtype=torch.bfloat16,
+            )
+            for qname, entry in sorted(stats.items())
+        }
+        render_identity = bind_cb_render_identity_source_weights(
+            render_identity,
+            source_weights,
+        )
+        provenance = {
+            "cb_serialized_payload": render_identity[
+                "cb_serialized_payload"
+            ],
+            "cb_render_identity": render_identity,
+        }
     cost_blob = {
         "costs": costs,
         "formats": list(menu),
         "meta": {"formats": list(menu)},
-        "provenance": {
-            "cb_serialized_payload": {
-                "schema": "prismaquant.cb_serialized_payload.v1",
-                "scale_coding": "two_tier",
-                "layout_version": 2,
-                "codebook_source": "lattice",
-            },
-        },
+        "provenance": provenance,
     }
     p = tmp_path / "probe.pkl"
     c = tmp_path / "cost.pkl"
+    cw = tmp_path / "cb_col_weights.pkl"
     p.write_bytes(pickle.dumps(probe))
     c.write_bytes(pickle.dumps(cost_blob))
-    return p, c
+    cw.write_bytes(pickle.dumps(col_weights))
+    return p, c, cw
 
 
 def _run_main(tmp_path, monkeypatch, menu, *, enforce, target="3.0"):
-    probe_p, cost_p = _write_alloc_fixture(tmp_path, menu)
+    probe_p, cost_p, col_weights_p = _write_alloc_fixture(tmp_path, menu)
     lc = tmp_path / "layer_config.json"
     csv = tmp_path / "pareto.csv"
     argv = [
@@ -358,6 +407,9 @@ def _run_main(tmp_path, monkeypatch, menu, *, enforce, target="3.0"):
         "--allow-default-profile",
         "--cb-scale-coding", "two_tier",
         "--cb-codebook-source", "lattice",
+        "--cb-scale-sweep", "1",
+        "--cb-encode-tier", "balanced",
+        "--cb-col-weights", str(col_weights_p),
     ]
     if enforce:
         argv.append("--enforce-family-coherence")
@@ -392,7 +444,7 @@ def test_auxiliary_cb_format_requires_cost_serialization_provenance(
     tmp_path, monkeypatch, aux_flag, aux_name,
 ):
     """A non-CB body must not hide a CB MTP/visual cost contract."""
-    probe_p, cost_p = _write_alloc_fixture(tmp_path, ["BF16"])
+    probe_p, cost_p, col_weights_p = _write_alloc_fixture(tmp_path, ["BF16"])
     probe = pickle.loads(probe_p.read_bytes())
     costs = pickle.loads(cost_p.read_bytes())
     probe["stats"][aux_name] = {
@@ -407,6 +459,9 @@ def test_auxiliary_cb_format_requires_cost_serialization_provenance(
     # This is the stale pre-contract payload under test: the auxiliary CB row
     # exists, but no v1/v2/codebook identity says which bytes it measured.
     costs["provenance"] = {}
+    col_weights_p.write_bytes(pickle.dumps({
+        aux_name: torch.linspace(0.1, 1.0, 256),
+    }))
     probe_p.write_bytes(pickle.dumps(probe))
     cost_p.write_bytes(pickle.dumps(costs))
     monkeypatch.setattr(sys, "argv", [
@@ -421,8 +476,11 @@ def test_auxiliary_cb_format_requires_cost_serialization_provenance(
         "--pareto-csv", str(tmp_path / "pareto.csv"),
         "--target-profile", "nvfp4_cb",
         "--allow-default-profile",
-        "--cb-scale-coding", "two_tier",
-        "--cb-codebook-source", "lattice",
+            "--cb-scale-coding", "two_tier",
+            "--cb-codebook-source", "lattice",
+            "--cb-scale-sweep", "1",
+            "--cb-encode-tier", "balanced",
+            "--cb-col-weights", str(col_weights_p),
     ])
     with pytest.raises(SystemExit, match="no serialized-payload identity"):
         alloc.main()
@@ -433,7 +491,7 @@ def test_allocator_rejects_incomplete_legal_cb_cost_rows(
     tmp_path, monkeypatch, failure,
 ):
     menu = ["NVFP4_CB_K16", "BF16"]
-    probe_p, cost_p = _write_alloc_fixture(tmp_path, menu)
+    probe_p, cost_p, col_weights_p = _write_alloc_fixture(tmp_path, menu)
     costs = pickle.loads(cost_p.read_bytes())
     first_name = sorted(costs["costs"])[0]
     if failure == "missing":
@@ -454,8 +512,11 @@ def test_allocator_rejects_incomplete_legal_cb_cost_rows(
         "--pareto-csv", str(tmp_path / "pareto.csv"),
         "--target-profile", "nvfp4_cb",
         "--allow-default-profile",
-        "--cb-scale-coding", "two_tier",
-        "--cb-codebook-source", "lattice",
+            "--cb-scale-coding", "two_tier",
+            "--cb-codebook-source", "lattice",
+            "--cb-scale-sweep", "1",
+            "--cb-encode-tier", "balanced",
+            "--cb-col-weights", str(col_weights_p),
     ])
     with pytest.raises(SystemExit, match="CB cost coverage is incomplete"):
         alloc.main()
@@ -490,12 +551,6 @@ def test_task_example_mixed_menu_flows_end_to_end(tmp_path, monkeypatch):
     emitted = json.loads(lc.read_text())
     names = emitted.get("assignment", emitted)
     assert names
-    assert emitted["__prismaquant__"]["cb_serialized_payload"] == {
-        "schema": "prismaquant.cb_serialized_payload.v1",
-        "scale_coding": "two_tier",
-        "layout_version": 2,
-        "codebook_source": "lattice",
-    }
     # Layer-config entries are rich dicts (AutoRound schema); canonicalize each.
     # `__prismaquant__` is the reserved allocator-metadata block (R11), not a
     # tensor entry.
@@ -509,6 +564,25 @@ def test_task_example_mixed_menu_flows_end_to_end(tmp_path, monkeypatch):
         for name, entry in names.items()
         if not lcfg.is_layer_config_meta_key(name)
     }
+    selected_cb_assignment = {
+        name: fmt for name, fmt in assignment.items() if is_cb_format(fmt)
+    }
+    cost_payload = pickle.loads((tmp_path / "cost.pkl").read_bytes())
+    col_weights = pickle.loads(
+        (tmp_path / "cb_col_weights.pkl").read_bytes()
+    )
+    expected_render_identity = project_cb_render_identity(
+        cost_payload["provenance"]["cb_render_identity"],
+        selected_cb_assignment,
+        col_weights=col_weights,
+        where="allocator integration selected render identity",
+    )
+    assert emitted["__prismaquant__"]["cb_render_identity"] == (
+        expected_render_identity
+    )
+    assert emitted["__prismaquant__"]["cb_serialized_payload"] == (
+        expected_render_identity["cb_serialized_payload"]
+    )
     stamps = {
         name: entry["cb_serialized_identity"]
         for name, entry in names.items()
@@ -548,12 +622,20 @@ def test_task_example_mixed_menu_flows_end_to_end(tmp_path, monkeypatch):
 _CB_COST_RUNGS = ["NVFP4_CB_K16", "NVFP4_CB_S16", "FP8_CB_K44"]
 
 
+def _set_explicit_cb_render_env(monkeypatch):
+    monkeypatch.setenv("CB_SCALE_CODING", "two_tier")
+    monkeypatch.setenv("CB_CODEBOOK_SOURCE", "lattice")
+    monkeypatch.setenv("CB_SCALE_SWEEP", "1")
+    monkeypatch.setenv("PRISMAQUANT_CB_ENCODE_TIER", "balanced")
+
+
 @pytest.mark.parametrize("rung", _CB_COST_RUNGS)
-def test_cb_batched_cost_matches_direct_qdq(rung):
+def test_cb_batched_cost_matches_direct_qdq(rung, monkeypatch):
     # The batched cost path must equal the per-slice producer-context QDQ —
     # under a per-item imatrix — or the allocator's cost diverges from the
     # shipped bytes. An absent imatrix is an explicit error because CB export
     # never emits that unweighted render. (in_features=512 % 256 == 0.)
+    _set_explicit_cb_render_env(monkeypatch)
     spec = fr.get_format(rung)
     torch.manual_seed(0)
     stacked = torch.randn(3, 256, 512) * torch.rand(3, 1, 1).exp()
@@ -573,9 +655,10 @@ def test_cb_batched_cost_matches_direct_qdq(rung):
 
 
 @pytest.mark.parametrize("rung", _CB_COST_RUNGS)
-def test_cb_imatrix_changes_cost_and_lowers_weighted_error(rung):
+def test_cb_imatrix_changes_cost_and_lowers_weighted_error(rung, monkeypatch):
     # A non-uniform production imatrix changes the render relative to a
     # supplied uniform vector, and lowers the weighted MSE it optimizes.
+    _set_explicit_cb_render_env(monkeypatch)
     spec = fr.get_format(rung)
     torch.manual_seed(1)
     w = torch.randn(128, 512)
@@ -647,6 +730,61 @@ def _write_layer_config(tmp_path, assignment: dict) -> str:
     return str(p)
 
 
+def _write_production_cb_layer_config(
+    tmp_path,
+    assignment: dict[str, str],
+    source_weights: dict[str, torch.Tensor],
+    col_weights: dict[str, torch.Tensor],
+) -> str:
+    cb_assignment = {
+        qname: fmt
+        for qname, fmt in assignment.items()
+        if is_cb_format(fmt)
+    }
+    assert cb_assignment
+    render_identity = build_production_cache_cb_render_identity(
+        {
+            qname: (fmt,)
+            for qname, fmt in sorted(cb_assignment.items())
+        },
+        cb_serialization_context=_CB_CONTEXT,
+        col_weights=col_weights,
+        render_levers={"weighted_vq": True},
+        render_mechanism_plan=[],
+    )
+    assert render_identity is not None
+    render_identity = bind_cb_render_identity_source_weights(
+        render_identity,
+        {
+            qname: source_weights[qname]
+            for qname in sorted(cb_assignment)
+        },
+    )
+    stamps = cb_assignment_serialization_stamps(
+        cb_assignment,
+        {
+            qname: tuple(source_weights[qname].shape)
+            for qname in sorted(cb_assignment)
+        },
+        context=_CB_CONTEXT,
+    )
+    payload = {
+        qname: {
+            **fr.get_format(fmt).autoround_config(),
+            **({
+                CB_TENSOR_IDENTITY_FIELD: stamps[qname],
+            } if qname in stamps else {}),
+        }
+        for qname, fmt in assignment.items()
+    }
+    payload["__prismaquant__"] = {
+        "schema": "prismaquant.layer_config_meta.v1",
+        "cb_serialized_payload": render_identity["cb_serialized_payload"],
+        "cb_render_identity": render_identity,
+    }
+    return _write_layer_config(tmp_path, payload)
+
+
 def test_stock_nvfp4_export_bitexact_vs_ct_codec(tmp_path):
     # Round-trip: a stock-NVFP4 Linear must ship EXACTLY the CT codec's own
     # output (no re-derivation — the M19 scale-fidelity guarantee).
@@ -654,10 +792,14 @@ def test_stock_nvfp4_export_bitexact_vs_ct_codec(tmp_path):
     from prismaquant import export_native_compressed as enc
     from safetensors.torch import load_file
     q = "model.layers.0.self_attn.o_proj"  # not a fused sibling -> singleton
-    src = _make_synth_model(tmp_path, {q: (256, 512)})
+    model_dir = _Path(tmp_path) / "model"
+    model_dir.mkdir()
+    src = _make_synth_model(model_dir, {q: (256, 512)})
     lc = _write_layer_config(tmp_path, {q: "NVFP4"})
     out = _Path(tmp_path) / "exp"
-    export_nvfp4_cb(str(tmp_path), lc, str(out), col_weights={}, device="cpu")
+    export_nvfp4_cb(
+        str(model_dir), lc, str(out), col_weights={}, device="cpu"
+    )
     st = load_file(str(out / "model.safetensors"))
     ref = enc._quantize_2d(src[q].to("cpu"), "NVFP4")
     assert set(ref) == {"weight_packed", "weight_scale",
@@ -671,10 +813,14 @@ def test_stock_fp8_export_bitexact_vs_ct_codec(tmp_path):
     from prismaquant import export_native_compressed as enc
     from safetensors.torch import load_file
     q = "model.layers.0.mlp.down_proj"
-    src = _make_synth_model(tmp_path, {q: (256, 512)})
+    model_dir = _Path(tmp_path) / "model"
+    model_dir.mkdir()
+    src = _make_synth_model(model_dir, {q: (256, 512)})
     lc = _write_layer_config(tmp_path, {q: "FP8_DYNAMIC"})  # -> FP8_E4M3
     out = _Path(tmp_path) / "exp"
-    export_nvfp4_cb(str(tmp_path), lc, str(out), col_weights={}, device="cpu")
+    export_nvfp4_cb(
+        str(model_dir), lc, str(out), col_weights={}, device="cpu"
+    )
     st = load_file(str(out / "model.safetensors"))
     ref = enc._quantize_2d(src[q].to("cpu"), "FP8_E4M3")
     assert set(ref) == {"weight", "weight_scale"}
@@ -686,21 +832,18 @@ def test_export_global_cb_stamp_does_not_bypass_missing_layer_identities(tmp_pat
     from prismaquant.export_nvfp4_cb import export_nvfp4_cb
 
     qname = "model.layers.0.self_attn.o_proj"
-    _make_synth_model(tmp_path, {qname: (2, 256)})
+    model_dir = _Path(tmp_path) / "model"
+    model_dir.mkdir()
+    _make_synth_model(model_dir, {qname: (2, 256)})
     layer_config = _write_layer_config(tmp_path, {
         qname: "NVFP4_CB_K16",
         "__prismaquant__": {
-            "cb_serialized_payload": {
-                "schema": "prismaquant.cb_serialized_payload.v1",
-                "scale_coding": "two_tier",
-                "layout_version": 2,
-                "codebook_source": "lattice",
-            },
+            "cb_serialized_payload": _cb_stamp(["NVFP4_CB_K16"]),
         },
     })
     with pytest.raises(ValueError, match="per-layer serialization identity"):
         export_nvfp4_cb(
-            str(tmp_path),
+            str(model_dir),
             layer_config,
             str(_Path(tmp_path) / "exp"),
             col_weights={qname: torch.ones(256)},
@@ -715,13 +858,23 @@ def test_mixed_container_config_groups_schema(tmp_path):
     qnv = "model.layers.0.self_attn.o_proj"    # NVFP4
     qfp = "model.layers.0.mlp.up_proj"         # FP8_DYNAMIC
     qbf = "model.layers.0.self_attn.q_proj"    # BF16
-    _make_synth_model(tmp_path, {qcb: (128, 256), qnv: (256, 512),
-                                 qfp: (256, 512), qbf: (256, 512)})
-    lc = _write_layer_config(tmp_path, {
-        qcb: "NVFP4_CB_K16", qnv: "NVFP4", qfp: "FP8_DYNAMIC", qbf: "BF16"})
+    model_dir = _Path(tmp_path) / "model"
+    model_dir.mkdir()
+    source_weights = _make_synth_model(model_dir, {
+        qcb: (128, 256), qnv: (256, 512),
+        qfp: (256, 512), qbf: (256, 512),
+    })
+    assignment = {
+        qcb: "NVFP4_CB_K16", qnv: "NVFP4",
+        qfp: "FP8_DYNAMIC", qbf: "BF16",
+    }
+    col_weights = {qcb: torch.rand(256) + 0.05}
+    lc = _write_production_cb_layer_config(
+        tmp_path, assignment, source_weights, col_weights
+    )
     out = _Path(tmp_path) / "exp"
-    export_nvfp4_cb(str(tmp_path), lc, str(out),
-                    col_weights={qcb: torch.rand(256) + 0.05}, device="cpu")
+    export_nvfp4_cb(str(model_dir), lc, str(out),
+                    col_weights=col_weights, device="cpu")
     qc = _json.loads((out / "quant_config.json").read_text())
     groups = qc["config_groups"]
     # CB groups carry a "scheme" (custom vocab); stock CT groups do NOT (the
@@ -748,8 +901,19 @@ def test_mixed_container_config_groups_schema(tmp_path):
     assert qc["provenance"]["stock_ct_targets"] == 2
     assert qc["provenance"]["cb_targets"] == 1
     payload = qc["provenance"]["serialized_payload"]
-    assert payload["schema"] == "prismaquant.cb_serialized_payload.v1"
-    assert payload["context"]["layout_version"] == 2
+    current_stamp = _cb_stamp(["NVFP4_CB_K16"])
+    assert payload["schema"] == current_stamp["schema"]
+    assert payload["context"] == {
+        key: current_stamp[key]
+        for key in (
+            "scale_coding",
+            "layout_version",
+            "codebook_source",
+            "scale_sweep",
+            "encode_tier",
+            "renderer_abi",
+        )
+    }
     assert payload["tensor_payload_bytes"] == 128 * (4 * 16 + 9)
     assert payload["codebook_sidecar_bytes"] == 2 * 256 * 4 * 2
     assert payload["global_scale_bytes"] == 0
@@ -778,16 +942,29 @@ def test_mixed_container_config_groups_schema(tmp_path):
 def test_stock_rungs_no_longer_rejected_but_junk_still_is(tmp_path):
     from prismaquant.export_nvfp4_cb import export_nvfp4_cb
     q = "model.layers.0.self_attn.o_proj"
-    _make_synth_model(tmp_path, {q: (256, 512)})
-    out = _Path(tmp_path) / "exp"
+    model_dir = _Path(tmp_path) / "model"
+    model_dir.mkdir()
+    _make_synth_model(model_dir, {q: (256, 512)})
     # stock rungs: accepted now.
-    for fmt in ("NVFP4", "FP8_DYNAMIC"):
+    for index, fmt in enumerate(("NVFP4", "FP8_DYNAMIC")):
         lc = _write_layer_config(tmp_path, {q: fmt})
-        export_nvfp4_cb(str(tmp_path), lc, str(out), col_weights={}, device="cpu")
+        export_nvfp4_cb(
+            str(model_dir),
+            lc,
+            str(_Path(tmp_path) / f"exp-{index}"),
+            col_weights={},
+            device="cpu",
+        )
     # a genuinely-unsupported format still hard-fails coverage.
     lc = _write_layer_config(tmp_path, {q: "MXFP4"})
     with pytest.raises(ValueError, match="cannot carry"):
-        export_nvfp4_cb(str(tmp_path), lc, str(out), col_weights={}, device="cpu")
+        export_nvfp4_cb(
+            str(model_dir),
+            lc,
+            str(_Path(tmp_path) / "exp-junk"),
+            col_weights={},
+            device="cpu",
+        )
 
 
 def test_fused_nvfp4_siblings_share_weight_global_scale(tmp_path):
@@ -798,18 +975,22 @@ def test_fused_nvfp4_siblings_share_weight_global_scale(tmp_path):
     from prismaquant.model_profiles import detect_profile
     from safetensors.torch import load_file
     qs = [f"model.layers.0.self_attn.{p}_proj" for p in "qkv"]
-    src = _make_synth_model(tmp_path, {q: (256, 512) for q in qs})
+    model_dir = _Path(tmp_path) / "model"
+    model_dir.mkdir()
+    src = _make_synth_model(model_dir, {q: (256, 512) for q in qs})
     # Only meaningful if the profile actually groups q/k/v; else each is a
     # singleton and the assertion is vacuously the per-Linear scale.
     prof = None
     try:
-        prof = detect_profile(str(tmp_path))
+        prof = detect_profile(str(model_dir))
     except Exception:
         pass
     grouped = prof is not None and prof.fused_sibling_group(qs[0]) is not None
     lc = _write_layer_config(tmp_path, {q: "NVFP4" for q in qs})
     out = _Path(tmp_path) / "exp"
-    export_nvfp4_cb(str(tmp_path), lc, str(out), col_weights={}, device="cpu")
+    export_nvfp4_cb(
+        str(model_dir), lc, str(out), col_weights={}, device="cpu"
+    )
     st = load_file(str(out / "model.safetensors"))
     globals_ = [st[f"{q}.weight_global_scale"] for q in qs]
     if grouped:
@@ -855,20 +1036,28 @@ def test_exporter_resolves_nested_prefix_skeleton(tmp_path, monkeypatch):
     from safetensors.torch import save_file, load_file
     canon = "model.layers.0.mlp.gate_proj"
     nested = "model.language_model.layers.0.mlp.gate_proj"
+    model_dir = _Path(tmp_path) / "model"
+    model_dir.mkdir()
     tens = {
         nested + ".weight": torch.randn(128, 256).bfloat16(),        # CB target
         "model.language_model.norm.weight": torch.randn(64).bfloat16(),   # 1-D verbatim
         "model.visual.patch_embed.weight": torch.randn(32, 64).bfloat16(),  # visual verbatim
     }
-    save_file(tens, str(_Path(tmp_path) / "model.safetensors"))
-    (_Path(tmp_path) / "config.json").write_text(
+    save_file(tens, str(model_dir / "model.safetensors"))
+    (model_dir / "config.json").write_text(
         _json.dumps({"architectures": ["Qwen3_5ForConditionalGeneration"]}))
-    lc = _write_layer_config(tmp_path, {canon: "NVFP4_CB_K16"})
+    col_weights = {canon: torch.rand(256) + 0.05}
+    lc = _write_production_cb_layer_config(
+        tmp_path,
+        {canon: "NVFP4_CB_K16"},
+        {canon: tens[nested + ".weight"]},
+        col_weights,
+    )
     monkeypatch.setattr(model_profiles, "detect_profile",
                         lambda *a, **k: _NestedVLMProfile())
     out = _Path(tmp_path) / "exp"
-    export_nvfp4_cb(str(tmp_path), lc, str(out),
-                    col_weights={canon: torch.rand(256) + 0.05}, device="cpu")
+    export_nvfp4_cb(str(model_dir), lc, str(out),
+                    col_weights=col_weights, device="cpu")
     st = load_file(str(out / "model.safetensors"))
     # Packed tensor carries the NESTED (checkpoint/vLLM) name, not the recipe one.
     assert f"{nested}.cb_qweight" in st, sorted(st)
@@ -896,12 +1085,22 @@ def test_codebook_pqcb_sidecar_contract(tmp_path):
     from safetensors.torch import load_file
     qcb = "model.layers.0.mlp.gate_proj"
     qfp = "model.layers.1.mlp.gate_proj"
-    _make_synth_model(tmp_path, {qcb: (128, 256), qfp: (128, 256)})
-    lc = _write_layer_config(tmp_path, {qcb: "NVFP4_CB_K16", qfp: "FP8_CB_K40"})
+    model_dir = _Path(tmp_path) / "model"
+    model_dir.mkdir()
+    source_weights = _make_synth_model(
+        model_dir, {qcb: (128, 256), qfp: (128, 256)}
+    )
+    assignment = {qcb: "NVFP4_CB_K16", qfp: "FP8_CB_K40"}
+    col_weights = {
+        qcb: torch.rand(256) + 0.05,
+        qfp: torch.rand(256) + 0.05,
+    }
+    lc = _write_production_cb_layer_config(
+        tmp_path, assignment, source_weights, col_weights
+    )
     out = _Path(tmp_path) / "exp"
-    export_nvfp4_cb(str(tmp_path), lc, str(out),
-                    col_weights={qcb: torch.rand(256) + 0.05,
-                                 qfp: torch.rand(256) + 0.05}, device="cpu")
+    export_nvfp4_cb(str(model_dir), lc, str(out),
+                    col_weights=col_weights, device="cpu")
     qc = _json.loads((out / "quant_config.json").read_text())
     cfg = _json.loads((out / "config.json").read_text())
     assert qc["codebook_file"] == "cb_codebooks.pqcb"

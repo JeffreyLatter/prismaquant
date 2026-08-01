@@ -39,7 +39,14 @@ from gguf import GGMLQuantizationType as QT
 
 from prismaquant.gguf_formats import GGUF_BLOCK_BYTES, gguf_pack
 from prismaquant.layer_config import load_assignment
-from prismaquant.nvfp4_cb_footprint import enforce_whole_artifact_budget
+from prismaquant.export_output_safety import (
+    prepare_fresh_export_file,
+    transactional_file_output,
+)
+from prismaquant.nvfp4_cb_footprint import (
+    enforce_whole_artifact_budget,
+    whole_artifact_budget_from_assignment_payload,
+)
 
 # Skeleton tensor types we are willing to treat as a full-precision source.
 _SOURCE_TYPES = {QT.F32, QT.F16, QT.BF16}
@@ -198,6 +205,11 @@ def build_imatrix_from_act_cache(act_dir: str | Path) -> dict[str, torch.Tensor]
     return out
 
 
+@transactional_file_output(
+    source_parameter="skeleton_path",
+    output_parameter="out_path",
+    where="export_gguf",
+)
 def export_gguf(
     skeleton_path: str | Path,
     layer_config_path: str | Path,
@@ -210,10 +222,21 @@ def export_gguf(
     allow_imatrix_gaps: bool = False,
     gptq_act_dir: str | Path | None = None,
 ) -> dict[str, int]:
+    out_path = prepare_fresh_export_file(
+        skeleton_path,
+        out_path,
+        where="export_gguf",
+    )
     if device is None:
         # GPU-first: the weighted scale search is the export hot path.
         device = "cuda" if torch.cuda.is_available() else "cpu"
     assignment = load_assignment(layer_config_path)
+    recipe_payload = json.loads(Path(layer_config_path).read_text())
+    whole_artifact_budget_from_assignment_payload(
+        recipe_payload,
+        where="export_gguf preflight",
+        assignment=assignment,
+    )
     illegal = sorted({
         fmt for fmt in assignment.values()
         if fmt not in GGUF_BLOCK_BYTES and fmt != "BF16"
@@ -449,11 +472,11 @@ def export_gguf(
     writer.write_kv_data_to_file()
     writer.write_tensors_to_file(progress=True)
     writer.close()
-    recipe_payload = json.loads(Path(layer_config_path).read_text())
     budget_attestation = enforce_whole_artifact_budget(
         out_path,
         recipe_payload,
         where="export_gguf",
+        assignment=assignment,
     )
     if budget_attestation is not None:
         print(

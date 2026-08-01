@@ -104,6 +104,29 @@ def _load_col_weights(path, formats) -> dict | None:
     return loaded
 
 
+def _explicit_cb_render_context(formats):
+    """Resolve CB producer settings once, at the CLI boundary.
+
+    Library render/cache code receives the resulting object explicitly and
+    therefore cannot reinterpret a stored cache under a later environment.
+    """
+    from prismaquant.nvfp4_cb_footprint import (
+        cb_serialization_context_from_env,
+        is_cb_format,
+    )
+
+    cb_formats = sorted({str(fmt) for fmt in formats if is_cb_format(str(fmt))})
+    if not cb_formats:
+        return None
+    try:
+        return cb_serialization_context_from_env(
+            require_explicit=True,
+            where="ProductionWeightCache producer",
+        )
+    except ValueError as exc:
+        raise SystemExit(f"[build-prod-cache] ERROR: {exc}") from exc
+
+
 def _model_has_packed_experts(model: nn.Module, profile) -> bool:
     from prismaquant.sensitivity_probe import _is_packed_experts_module
     return any(
@@ -279,6 +302,9 @@ def _run_streaming(args, formats, levers, dtype) -> int:
         f"{non_bf16} non-BF16 entries from {layer_config}",
         flush=True,
     )
+    render_formats = list(formats) + list(render_assignment.values())
+    col_weights = _load_col_weights(args.col_weights, render_formats)
+    cb_serialization_context = _explicit_cb_render_context(render_formats)
 
     skip_tokens = (
         list(args.skip_qnames) if args.skip_qnames is not None else None
@@ -297,6 +323,8 @@ def _run_streaming(args, formats, levers, dtype) -> int:
         expert_render_mode=args.expert_render_mode,
         expert_module_token_budget=args.expert_token_budget,
         h_detail_dir=args.h_detail_dir,
+        col_weights=col_weights,
+        cb_serialization_context=cb_serialization_context,
     )
     elapsed = time.monotonic() - t0
 
@@ -706,7 +734,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"{non_bf16} non-BF16 entries from {layer_config}",
                 flush=True,
             )
-        col_weights = _load_col_weights(args.col_weights, formats)
+        render_formats = list(formats) + list(
+            (render_assignment or {}).values()
+        ) + list(
+            (recache_assignment or {}).values()
+        )
+        col_weights = _load_col_weights(args.col_weights, render_formats)
+        cb_serialization_context = _explicit_cb_render_context(render_formats)
         t0 = time.monotonic()
         cache = fill_production_weight_cache(
             model, calib_ids, qnames,
@@ -722,6 +756,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             recache_microbatch_size=args.recache_microbatch_size,
             h_detail_dir=args.h_detail_dir,
             col_weights=col_weights,
+            cb_serialization_context=cb_serialization_context,
         )
         # R14: stamp the calibration identity onto the cache so every artifact
         # derived from it (production_render_cost's cost table) can be checked
@@ -761,6 +796,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 gate_calib_ids=gate_calib_ids,
                 gate_token_budget=args.expert_gate_token_budget,
                 col_weights=col_weights,
+                cb_serialization_context=cb_serialization_context,
             )
             if expert_coverage:
                 if cache.metadata is None:

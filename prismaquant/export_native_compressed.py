@@ -97,7 +97,15 @@ from .layer_config import (
     layer_config_metadata as _layer_config_metadata,
 )
 from .schemas import validate_layer_config_payload
-from .nvfp4_cb_footprint import enforce_whole_artifact_budget
+from .export_output_safety import (
+    prepare_fresh_export_directory,
+    transactional_export_directory,
+    validate_fresh_export_directory,
+)
+from .nvfp4_cb_footprint import (
+    enforce_whole_artifact_budget,
+    whole_artifact_budget_from_assignment_payload,
+)
 
 # ---------------------------------------------------------------------------
 # NVFP4 packing. The byte layout (two 4-bit indices/byte, element-0 low nibble,
@@ -8012,7 +8020,95 @@ def _refuse_archived_block_output_match() -> None:
     )
 
 
-def main():
+def _replace_cli_option(argv: Sequence[str], option: str, value: str) -> list[str]:
+    """Replace every spelling of one required argparse option."""
+    rewritten = list(argv)
+    found = False
+    index = 0
+    while index < len(rewritten):
+        item = rewritten[index]
+        if item == option:
+            if index + 1 >= len(rewritten):
+                break
+            rewritten[index + 1] = value
+            found = True
+            index += 2
+            continue
+        if item.startswith(option + "="):
+            rewritten[index] = option + "=" + value
+            found = True
+        index += 1
+    if not found:
+        raise RuntimeError(f"required CLI option {option!r} was not found")
+    return rewritten
+
+
+def _cleanup_successful_export_cache(
+    export_cache_dir: str | None,
+    *,
+    keep_export_cache: bool,
+) -> None:
+    """Remove resumable layer state only after final artifact publication."""
+    if (
+        not export_cache_dir
+        or keep_export_cache
+        or not Path(export_cache_dir).exists()
+    ):
+        return
+    try:
+        shutil.rmtree(export_cache_dir)
+        print(
+            f"[export-stream] removed export cache {export_cache_dir}",
+            flush=True,
+        )
+    except Exception as exc:
+        print(
+            f"[export-stream] WARN cache cleanup failed: {exc!r}",
+            flush=True,
+        )
+
+
+def main(argv: Sequence[str] | None = None):
+    """Run one native export inside an artifact-level output transaction."""
+    raw_argv = list(argv) if argv is not None else None
+    parse_argv = raw_argv if raw_argv is not None else os.sys.argv[1:]
+    preflight = argparse.ArgumentParser(add_help=False)
+    preflight.add_argument("--model")
+    preflight.add_argument("--output")
+    preflight.add_argument("--export-cache-dir")
+    preflight.add_argument("--keep-export-cache", action="store_true")
+    known, _unknown = preflight.parse_known_args(parse_argv)
+    if known.model is None or known.output is None:
+        # Preserve the complete parser's native --help/missing-argument errors.
+        return _main_impl(parse_argv)
+
+    requested_output = Path(known.output)
+    with transactional_export_directory(
+        known.model,
+        requested_output,
+        where="export_native_compressed",
+    ) as staged_output:
+        staged_argv = _replace_cli_option(
+            parse_argv,
+            "--output",
+            str(staged_output),
+        )
+        result = _main_impl(staged_argv)
+
+    _cleanup_successful_export_cache(
+        known.export_cache_dir,
+        keep_export_cache=bool(known.keep_export_cache),
+    )
+    print(
+        "[export-stream] done. Serve with:\n"
+        f"  vllm serve {requested_output.resolve()} "
+        "--quantization compressed-tensors",
+        flush=True,
+    )
+    return result
+
+
+def _main_impl(argv: Sequence[str] | None = None):
     global _INPUT_GLOBAL_SCALES, _CACHED_ACTIVATIONS, _ACTIVATION_CACHE_FINGERPRINT
     global _PRODUCTION_WEIGHT_CACHE, _PRODUCTION_CACHE_FINGERPRINT
     global _PRODUCTION_CACHE_PREFETCH_WORKERS, _NVFP4_SCALE_RULE
@@ -8132,7 +8228,17 @@ def main():
                     help="Don't remove --export-cache-dir on success. "
                          "Useful for debugging or comparing two exports "
                          "against the same cache.")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
+
+    out_dir = Path(args.output)
+    # Path safety is the first preflight: an in-place/aliased/stale target must
+    # be rejected before parsing model tensors or allocating any exporter state.
+    # Directory creation remains delayed until the recipe/config gates pass.
+    validate_fresh_export_directory(
+        args.model,
+        out_dir,
+        where="export_native_compressed",
+    )
 
     from .model_profiles import detect_profile, DefaultProfile
     profile = detect_profile(args.model)
@@ -8384,6 +8490,11 @@ def main():
     )
     if runtime_coerced:
         print(_runtime_coercion_report(runtime_coerced), flush=True)
+    whole_artifact_budget_from_assignment_payload(
+        raw_recipe,
+        where="export_native_compressed preflight",
+        assignment=assignment,
+    )
     validate_mtp_assignment_coverage(args.model, assignment, profile)
     fmts = Counter(assignment.values())
     print(f"[export-stream] recipe: {len(assignment)} entries  mix={dict(fmts)}",
@@ -8414,6 +8525,11 @@ def main():
         profile=profile,
     )
     print("[export-stream] quantization-config preflight passed", flush=True)
+    out_dir = prepare_fresh_export_directory(
+        args.model,
+        out_dir,
+        where="export_native_compressed",
+    )
 
     from prismaquant.gpu_guard import require_cuda_hot_path
 
@@ -8422,9 +8538,6 @@ def main():
         "export_native_compressed",
         args.device,
     )
-    out_dir = Path(args.output)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
     if args.offload_folder is None:
         args.offload_folder = str(out_dir / "_streaming_offload")
 
@@ -8580,25 +8693,11 @@ def main():
     except Exception as e:
         print(f"[export-stream] WARN shipcard not written: {e!r}", flush=True)
 
-    # v25: clear the per-layer cache on successful export. --keep-export-cache
-    # leaves it intact (debugging / comparison). On a failed run the cache
-    # stays anyway since this code wouldn't be reached.
-    if (args.export_cache_dir
-            and not args.keep_export_cache
-            and Path(args.export_cache_dir).exists()):
-        import shutil
-        try:
-            shutil.rmtree(args.export_cache_dir)
-            print(f"[export-stream] removed export cache "
-                  f"{args.export_cache_dir}", flush=True)
-        except Exception as e:
-            print(f"[export-stream] WARN cache cleanup failed: {e!r}",
-                  flush=True)
-
     budget_attestation = enforce_whole_artifact_budget(
         out_dir,
         raw_recipe,
         where="export_native_compressed",
+        assignment=assignment,
     )
     if budget_attestation is not None:
         print(
@@ -8607,11 +8706,6 @@ def main():
             f"{budget_attestation['budget_bytes']}B",
             flush=True,
         )
-
-    print(f"[export-stream] done. Serve with:\n"
-          f"  vllm serve {out_dir.resolve()} --quantization compressed-tensors",
-          flush=True)
-
 
 # ---------------------------------------------------------------------------
 # Sharded safetensors writer (mirrors HF transformers' shard layout so
@@ -8658,7 +8752,27 @@ class IncrementalSafetensorsWriter:
         self.tmp_shards: list[tuple[Path, list[str]]] = []
         self.weight_map: dict[str, str] = {}
         self.seen_keys: set[str] = set()
-        self.out_dir.mkdir(parents=True, exist_ok=True)
+        if os.path.lexists(self.out_dir):
+            if self.out_dir.is_symlink() or not self.out_dir.is_dir():
+                raise RuntimeError(
+                    f"{self.out_dir}: native shard output must be a real "
+                    "directory, not a file or symlink"
+                )
+        else:
+            self.out_dir.mkdir(parents=True, exist_ok=False)
+        stale_temps = sorted(
+            path.name
+            for path in self.out_dir.iterdir()
+            if re.fullmatch(
+                r"[.]model-[0-9]+[.]safetensors[.]tmp",
+                path.name,
+            ) is not None
+        )
+        if stale_temps:
+            raise RuntimeError(
+                f"{self.out_dir}: refusing preexisting native temporary "
+                f"shard(s) {stale_temps[:12]}; use a fresh output directory"
+            )
 
     @staticmethod
     def _tensor_size(t: torch.Tensor) -> int:
@@ -8691,6 +8805,11 @@ class IncrementalSafetensorsWriter:
             return
         idx = len(self.tmp_shards) + 1
         tmp_path = self.out_dir / f".model-{idx:05d}.safetensors.tmp"
+        if os.path.lexists(tmp_path):
+            raise RuntimeError(
+                f"{tmp_path}: native temporary shard appeared during "
+                "export; refusing to overwrite a concurrent/stale writer"
+            )
         save_file(
             {k: v.contiguous() for k, v in
              _clone_shared_storage_for_safetensors(self.current).items()},

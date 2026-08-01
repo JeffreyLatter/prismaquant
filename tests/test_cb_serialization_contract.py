@@ -30,10 +30,12 @@ from prismaquant.nvfp4_cb_footprint import (
     cb_tensor_serialization_stamp,
     codebook_subtable_shapes,
     cb_export_artifact_inventory,
+    cb_serialization_context_from_stamp,
     cb_serialization_context_stamp,
     enforce_whole_artifact_budget,
     finalize_cb_export_artifact_inventory,
     load_cb_codebook_digest_manifest,
+    lattice_codebook_content_sha256,
     whole_artifact_budget_stamp,
     validate_cb_cost_provenance,
 )
@@ -49,6 +51,7 @@ def test_cost_qdq_matches_serialized_pack_unpack(
     """Cost reconstruction is exactly what the selected writer serializes."""
     monkeypatch.setenv("CB_SCALE_CODING", scale_coding)
     monkeypatch.setenv("CB_CODEBOOK_SOURCE", "lattice")
+    monkeypatch.setenv("CB_SCALE_SWEEP", "1")
     monkeypatch.setenv("PRISMAQUANT_CB_ENCODE_TIER", "fast")
     torch.manual_seed(1000 + k)
     weight = torch.randn(*shape) * 0.2
@@ -93,6 +96,7 @@ def test_cost_qdq_matches_serialized_pack_unpack(
 def test_fp8_cost_qdq_matches_serialized_pack_unpack(monkeypatch, shape):
     monkeypatch.setenv("CB_SCALE_CODING", "two_tier")
     monkeypatch.setenv("CB_CODEBOOK_SOURCE", "lattice")
+    monkeypatch.setenv("CB_SCALE_SWEEP", "1")
     monkeypatch.setenv("PRISMAQUANT_CB_ENCODE_TIER", "fast")
     torch.manual_seed(1044)
     weight = torch.randn(*shape) * 0.2
@@ -160,6 +164,53 @@ def test_cost_cache_identity_missing_or_mismatched_fails_closed():
         )
 
 
+def test_lattice_identity_persists_canonical_content_and_roundtrips_refs():
+    fmt = "NVFP4_CB_K16"
+    qname = "layer.q_proj"
+    refs = (
+        f"cb_codebook.lattice.{fmt}.sub0",
+        f"cb_codebook.lattice.{fmt}.sub1",
+    )
+    context = CBSerializationContext.production(
+        codebook_refs={qname: refs},
+    )
+    stamp = cb_serialization_context_stamp(context, formats=[fmt])
+    assert stamp["lattice_codebook_sha256_by_format"] == {
+        fmt: list(lattice_codebook_content_sha256(fmt)),
+    }
+    assert stamp["codebook_refs"][qname] == list(refs)
+    restored = cb_serialization_context_from_stamp(stamp, where="unit")
+    assert restored.codebook_refs == {qname: refs}
+
+    payload = cb_assignment_payload_breakdown(
+        {qname: fmt},
+        {qname: (2, 256)},
+        context=restored,
+    )
+    assert payload["sidecars"][0]["content_sha256"] == list(
+        lattice_codebook_content_sha256(fmt)
+    )
+
+
+def test_lattice_identity_rejects_noncanonical_materialized_bytes():
+    fmt = "NVFP4_CB_K16"
+    qname = "layer.q_proj"
+    refs = (
+        f"cb_codebook.lattice.{fmt}.sub0",
+        f"cb_codebook.lattice.{fmt}.sub1",
+    )
+    context = CBSerializationContext.production(
+        codebook_refs={qname: refs},
+        codebook_content_digests={ref: "f" * 64 for ref in refs},
+    )
+    with pytest.raises(ValueError, match="canonical lattice identity"):
+        cb_assignment_payload_breakdown(
+            {qname: fmt},
+            {qname: (2, 256)},
+            context=context,
+        )
+
+
 def test_learned_context_validation_allows_unused_menu_digest_superset():
     selected = CBSerializationContext.production(
         codebook_source="learned",
@@ -189,26 +240,63 @@ def test_learned_context_validation_allows_unused_menu_digest_superset():
 def test_incremental_merge_rejects_a_stale_cb_shard(tmp_path, monkeypatch):
     monkeypatch.setenv("CB_SCALE_CODING", "two_tier")
     monkeypatch.setenv("CB_CODEBOOK_SOURCE", "lattice")
+    monkeypatch.setenv("CB_SCALE_SWEEP", "1")
+    monkeypatch.setenv("PRISMAQUANT_CB_ENCODE_TIER", "balanced")
     fresh = tmp_path / "fresh.pkl"
     stale = tmp_path / "stale.pkl"
     output = tmp_path / "merged.pkl"
     common = {"formats": ["NVFP4_CB_K16"], "meta": {}}
+    col_weights = {
+        "layer.0": torch.ones(256),
+        "layer.1": torch.ones(256),
+    }
+    col_path = tmp_path / "col.pkl"
+    col_path.write_bytes(pickle.dumps(col_weights))
+    monkeypatch.setenv("PRISMAQUANT_CB_COL_WEIGHTS", str(col_path))
+    import prismaquant.measure_quant_cost as measure_cost
+    monkeypatch.setattr(measure_cost, "_CB_CW_CACHE", None)
+    from prismaquant.production_weight_cache import (
+        bind_cb_render_identity_source_weights,
+        build_production_cache_cb_render_identity,
+    )
+
+    def identity(name, context):
+        value = build_production_cache_cb_render_identity(
+            {name: common["formats"]},
+            cb_serialization_context=context,
+            col_weights=col_weights,
+            render_levers={"weighted_vq": True},
+            render_mechanism_plan=[],
+        )
+        return bind_cb_render_identity_source_weights(
+            value,
+            {name: torch.ones(2, 256)},
+        )
+
+    fresh_identity = identity(
+        "layer.0", CBSerializationContext.production()
+    )
+    stale_identity = identity(
+        "layer.1", CBSerializationContext.legacy_v1()
+    )
     fresh.write_bytes(pickle.dumps({
         **common,
-        "costs": {"layer.0": {}},
+        "costs": {"layer.0": {"NVFP4_CB_K16": {"output_mse": 1.0}}},
         "provenance": {
-            "cb_serialized_payload": cb_serialization_context_stamp(
-                CBSerializationContext.production()
-            ),
+            "cb_serialized_payload": fresh_identity[
+                "cb_serialized_payload"
+            ],
+            "cb_render_identity": fresh_identity,
         },
     }))
     stale.write_bytes(pickle.dumps({
         **common,
-        "costs": {"layer.1": {}},
+        "costs": {"layer.1": {"NVFP4_CB_K16": {"output_mse": 1.0}}},
         "provenance": {
-            "cb_serialized_payload": cb_serialization_context_stamp(
-                CBSerializationContext.legacy_v1()
-            ),
+            "cb_serialized_payload": stale_identity[
+                "cb_serialized_payload"
+            ],
+            "cb_render_identity": stale_identity,
         },
     }))
     with pytest.raises(ValueError, match="differs from allocator recipe"):
@@ -264,6 +352,64 @@ def test_assignment_bits_prices_fp4_layout_and_shared_role_once(scale_coding):
     assert bits == 8 * breakdown["total_bytes"]
     bytes_per_superblock = 4 * 16 + (16 if scale_coding == "v1" else 9)
     assert breakdown["tensor_payload_bytes"] == 2 * 4 * 2 * bytes_per_superblock
+
+
+def test_explicit_codebook_refs_reject_partial_subtable_sharing():
+    fmt = "NVFP4_CB_K16"
+    assignment = {"layer.a": fmt, "layer.b": fmt}
+    refs = {
+        "layer.a": ("shared", "a-only"),
+        "layer.b": ("shared", "b-only"),
+    }
+    context = CBSerializationContext.production(
+        codebook_source="learned",
+        codebook_refs=refs,
+        codebook_content_digests={
+            "shared": "1" * 64,
+            "a-only": "2" * 64,
+            "b-only": "3" * 64,
+        },
+    )
+    with pytest.raises(ValueError, match="partially shared or reused"):
+        cb_assignment_payload_breakdown(
+            assignment,
+            {name: (2, 256) for name in assignment},
+            context=context,
+        )
+
+
+def test_explicit_codebook_refs_reject_duplicate_ref_within_table_set():
+    fmt = "NVFP4_CB_K16"
+    context = CBSerializationContext.production(
+        codebook_source="learned",
+        codebook_refs={"layer.a": ("duplicate", "duplicate")},
+        codebook_content_digests={"duplicate": "1" * 64},
+    )
+    with pytest.raises(ValueError, match="repeats a physical codebook ref"):
+        cb_assignment_payload_breakdown(
+            {"layer.a": fmt},
+            {"layer.a": (2, 256)},
+            context=context,
+        )
+
+
+def test_explicit_codebook_refs_reject_conflicting_physical_identity():
+    refs = ("same-sub0", "same-sub1")
+    assignment = {
+        "layer.a": "NVFP4_CB_K16",
+        "layer.b": "NVFP4_CB_K17",
+    }
+    context = CBSerializationContext.production(
+        codebook_source="learned",
+        codebook_refs={name: refs for name in assignment},
+        codebook_content_digests={ref: "4" * 64 for ref in refs},
+    )
+    with pytest.raises(ValueError, match="partially shared or reused"):
+        cb_assignment_payload_breakdown(
+            assignment,
+            {name: (2, 256) for name in assignment},
+            context=context,
+        )
 
 
 @pytest.mark.parametrize("in_features", [512, 5120])
@@ -467,6 +613,30 @@ def _write_safetensors(path, entries, *, data_bytes=None):
     )
 
 
+def _write_canonical_lattice_sidecar(path, payload):
+    from safetensors.torch import save_file
+
+    tensors = {}
+    for sidecar in payload["sidecars"]:
+        fmt = sidecar["format"]
+        family, rung = fmt.split("_CB_", 1)
+        grid = "fp4" if family == "NVFP4" else "fp8"
+        mode = "signed" if rung.startswith("S") else "product"
+        k = int(rung[1:])
+        codebook = cb._resolve_codebook(
+            k, grid, mode, None, torch.device("cpu")
+        )
+        tables = codebook if isinstance(codebook, tuple) else (codebook,)
+        assert len(tables) == len(sidecar["codebook_ref"])
+        tensors.update({
+            ref: table.to(torch.float16).cpu().contiguous()
+            for ref, table in zip(
+                sidecar["codebook_ref"], tables, strict=True
+            )
+        })
+    save_file(tensors, str(path))
+
+
 def _write_raw_safetensors(path, raw_header: str, data: bytes = b""):
     raw = raw_header.encode("utf-8")
     path.write_bytes(struct.pack("<Q", len(raw)) + raw + data)
@@ -541,19 +711,8 @@ def test_recursive_inventory_reaches_a_stable_quant_config_fixed_point(tmp_path)
         tmp_path / "nested" / "model.safetensors",
         {"layer.q_proj.cb_qweight": ("U8", (tensor_bytes,), (0, tensor_bytes))},
     )
-    _write_safetensors(
-        tmp_path / "cb_codebooks.pqcb",
-        {
-            ref: ("F16", tuple(shape), (offset, offset + math.prod(shape) * 2))
-            for sidecar in payload["sidecars"]
-            for ref, shape, offset in zip(
-                sidecar["codebook_ref"],
-                sidecar["subtable_shapes"],
-                itertools.accumulate(
-                    [0] + [math.prod(s) * 2 for s in sidecar["subtable_shapes"][:-1]]
-                ),
-            )
-        },
+    _write_canonical_lattice_sidecar(
+        tmp_path / "cb_codebooks.pqcb", payload
     )
     (tmp_path / "tokenizer").mkdir()
     (tmp_path / "tokenizer" / "extra.txt").write_text("abc")
@@ -599,7 +758,12 @@ def _materialize_minimal_cb_export(tmp_path, *, context=None):
             nbytes = math.prod(shape) * 2
             sidecar_entries[ref] = ("F16", tuple(shape), (offset, offset + nbytes))
             offset += nbytes
-    _write_safetensors(tmp_path / "cb_codebooks.pqcb", sidecar_entries)
+    if context.codebook_source == "lattice":
+        _write_canonical_lattice_sidecar(
+            tmp_path / "cb_codebooks.pqcb", payload
+        )
+    else:
+        _write_safetensors(tmp_path / "cb_codebooks.pqcb", sidecar_entries)
     return payload
 
 
@@ -664,6 +828,22 @@ def test_inventory_rejects_stale_model_shards(tmp_path):
         )
 
 
+def test_inventory_rejects_stale_model_index_beside_single_file(tmp_path):
+    payload = _materialize_minimal_cb_export(tmp_path)
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps({
+        "metadata": {"total_size": 1},
+        "weight_map": {"old.weight": "missing-old-shard.safetensors"},
+    }))
+    with pytest.raises(AssertionError, match="stale model.safetensors.index"):
+        cb_export_artifact_inventory(
+            tmp_path,
+            serialized_payload=payload,
+            cb_tensor_names=["layer.q_proj.cb_qweight"],
+            codebook_file="cb_codebooks.pqcb",
+            expected_model_files=["model.safetensors"],
+        )
+
+
 def test_inventory_rejects_stale_codebook_sidecars(tmp_path):
     payload = _materialize_minimal_cb_export(tmp_path)
     _write_safetensors(tmp_path / "stale-codebooks.pqcb", {})
@@ -716,20 +896,64 @@ def test_final_inventory_hard_fails_actual_recursive_size_over_budget(tmp_path):
         )
 
 
+@pytest.mark.parametrize("expected_headroom", [9, 99])
+def test_final_inventory_budget_digit_boundaries_converge(
+    tmp_path, expected_headroom
+):
+    probe = tmp_path / "probe"
+    probe.mkdir()
+    probe_payload = _materialize_minimal_cb_export(probe)
+    probe_inventory = finalize_cb_export_artifact_inventory(
+        probe,
+        {"provenance": {}},
+        serialized_payload=probe_payload,
+        cb_tensor_names=["layer.q_proj.cb_qweight"],
+        codebook_file="cb_codebooks.pqcb",
+        expected_model_files=["model.safetensors"],
+        whole_artifact_budget_bytes=9000,
+    )
+    target_budget = (
+        int(probe_inventory["export_directory_bytes"]) + expected_headroom
+    )
+    # Both budgets have the same decimal width, so the embedded budget field
+    # occupies exactly the same number of bytes in the fresh target export.
+    assert 1000 <= target_budget <= 9999
+
+    target = tmp_path / "target"
+    target.mkdir()
+    target_payload = _materialize_minimal_cb_export(target)
+    inventory = finalize_cb_export_artifact_inventory(
+        target,
+        {"provenance": {}},
+        serialized_payload=target_payload,
+        cb_tensor_names=["layer.q_proj.cb_qweight"],
+        codebook_file="cb_codebooks.pqcb",
+        expected_model_files=["model.safetensors"],
+        whole_artifact_budget_bytes=target_budget,
+    )
+    assert target_budget - inventory["export_directory_bytes"] == expected_headroom
+    assert "within_whole_artifact_budget" not in inventory
+    assert "whole_artifact_budget_headroom_bytes" not in inventory
+    on_disk = json.loads((target / "quant_config.json").read_text())
+    assert on_disk["provenance"]["artifact_inventory"] == inventory
+
+
 def test_generic_export_budget_gate_measures_files_recursively(tmp_path):
     artifact = tmp_path / "artifact"
     (artifact / "nested").mkdir(parents=True)
     (artifact / "a.bin").write_bytes(b"a" * 7)
     (artifact / "nested" / "b.bin").write_bytes(b"b" * 5)
+    assignment = {"layer.q_proj": "BF16"}
     payload = {
         "whole_artifact_budget": whole_artifact_budget_stamp(
             budget_bytes=12,
             selection_tensor_payload_bytes=8,
             selection_non_tensor_reserve_bytes=4,
+            selection_assignment=assignment,
         ),
     }
     attestation = enforce_whole_artifact_budget(
-        artifact, payload, where="unit export"
+        artifact, payload, where="unit export", assignment=assignment
     )
     assert attestation["actual_bytes"] == 12
     assert attestation["within_budget"]
@@ -738,9 +962,32 @@ def test_generic_export_budget_gate_measures_files_recursively(tmp_path):
         budget_bytes=11,
         selection_tensor_payload_bytes=8,
         selection_non_tensor_reserve_bytes=3,
+        selection_assignment=assignment,
     )
     with pytest.raises(RuntimeError, match="exact completed artifact size"):
-        enforce_whole_artifact_budget(artifact, payload, where="unit export")
+        enforce_whole_artifact_budget(
+            artifact, payload, where="unit export", assignment=assignment
+        )
+
+
+def test_whole_artifact_budget_rejects_assignment_drift(tmp_path):
+    assignment = {"layer.q_proj": "BF16"}
+    payload = {
+        "whole_artifact_budget": whole_artifact_budget_stamp(
+            budget_bytes=1,
+            selection_tensor_payload_bytes=1,
+            selection_non_tensor_reserve_bytes=0,
+            selection_assignment=assignment,
+        ),
+    }
+    (tmp_path / "artifact.bin").write_bytes(b"x")
+    with pytest.raises(ValueError, match="assignment being consumed"):
+        enforce_whole_artifact_budget(
+            tmp_path,
+            payload,
+            where="unit export",
+            assignment={"layer.q_proj": "NVFP4"},
+        )
 
 
 def test_fp8_rate_helper_reflects_in_features_row_scale_amortization():

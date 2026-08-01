@@ -93,6 +93,8 @@ if [[ "$EXPORT_CONTAINER" == "nvfp4_cb" ]]; then
   # final export must describe the same layout and shared sidecars.
   : "${CB_CODEBOOK_SOURCE:=lattice}"
   : "${CB_SCALE_CODING:=two_tier}"
+  : "${CB_SCALE_SWEEP:=1}"
+  : "${PRISMAQUANT_CB_ENCODE_TIER:=balanced}"
   if [[ "$CB_CODEBOOK_SOURCE" == "learned" ]]; then
     echo "[pipeline] ERROR: learned CB is research-only until one immutable value-bearing codebook bundle is loaded verbatim by cost/cache/KL/export. Digests alone do not supply those values, and export-time retraining depends on the selected assignment. Use CB_CODEBOOK_SOURCE=lattice." >&2
     exit 2
@@ -100,7 +102,27 @@ if [[ "$EXPORT_CONTAINER" == "nvfp4_cb" ]]; then
   # Cost renderers resolve CBSerializationContext from the environment. These
   # must be exported (not merely shell locals) or a legacy-v1/default split can
   # recur between the Python cost process and the exporter CLI.
-  export CB_CODEBOOK_SOURCE CB_SCALE_CODING
+  case "$CB_SCALE_SWEEP" in
+    1|true|True|TRUE|yes|Yes|YES|on|On|ON) CB_SCALE_SWEEP=1 ;;
+    0|false|False|FALSE|no|No|NO|off|Off|OFF) CB_SCALE_SWEEP=0 ;;
+    *)
+      echo "[pipeline] ERROR: CB_SCALE_SWEEP must be 0 or 1" >&2
+      exit 2
+      ;;
+  esac
+  case "$PRISMAQUANT_CB_ENCODE_TIER" in
+    fast|balanced|max) ;;
+    *)
+      echo "[pipeline] ERROR: PRISMAQUANT_CB_ENCODE_TIER must be fast, balanced, or max" >&2
+      exit 2
+      ;;
+  esac
+  if [[ "$CB_SCALE_CODING" == "two_tier" && "$CB_SCALE_SWEEP" != "1" ]]; then
+    echo "[pipeline] ERROR: CB layout-v2/two_tier requires CB_SCALE_SWEEP=1; its scale encoder has no defined one-shot render" >&2
+    exit 2
+  fi
+  export CB_CODEBOOK_SOURCE CB_SCALE_CODING CB_SCALE_SWEEP
+  export PRISMAQUANT_CB_ENCODE_TIER
 fi
 if [[ "$EXPORT_CONTAINER" == "gguf" || "$EXPORT_CONTAINER" == "nvfp4_cb" ]]; then
   : "${ACTIVATION_ROWS_LIMIT:=1024}"
@@ -753,6 +775,8 @@ STAGE_SETTINGS_ENV=(
   "CB_LADDER_INTERP=$CB_LADDER_INTERP"
   "CB_SCALE_CODING=${CB_SCALE_CODING:-}"
   "CB_CODEBOOK_SOURCE=${CB_CODEBOOK_SOURCE:-}"
+  "CB_SCALE_SWEEP=${CB_SCALE_SWEEP:-}"
+  "PRISMAQUANT_CB_ENCODE_TIER=${PRISMAQUANT_CB_ENCODE_TIER:-}"
   "VALIDATED_FRONTIER_DATASET=$VALIDATED_FRONTIER_DATASET"
   "VALIDATED_FRONTIER_NSAMPLES=$VALIDATED_FRONTIER_NSAMPLES"
   "VALIDATED_FRONTIER_SEQLEN=$VALIDATED_FRONTIER_SEQLEN"
@@ -866,6 +890,17 @@ os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
 with open(out, "wb") as fh:
     pickle.dump(cw, fh)
 print(f"[pipeline] {stage} wrote {out}: {len(cw)} entries")
+PY
+}
+
+formats_contain_cb() {
+  python3 - "$1" <<'PY'
+import sys
+from prismaquant import format_registry as fr
+from prismaquant.nvfp4_cb_footprint import is_cb_format
+
+formats = [item.strip() for item in sys.argv[1].split(",") if item.strip()]
+raise SystemExit(0 if any(is_cb_format(fr.get_format(item).name) for item in formats) else 1)
 PY
 }
 
@@ -1292,9 +1327,13 @@ if [[ -n "$TARGET_DISK_GB" ]]; then
 fi
 ALLOCATOR_CB_ARGS=()
 if [[ "$EXPORT_CONTAINER" == "nvfp4_cb" ]]; then
+  harvest_cb_col_weights "[3/4] allocator identity"
   ALLOCATOR_CB_ARGS=(
     --cb-scale-coding "$CB_SCALE_CODING"
     --cb-codebook-source "$CB_CODEBOOK_SOURCE"
+    --cb-scale-sweep "$CB_SCALE_SWEEP"
+    --cb-encode-tier "$PRISMAQUANT_CB_ENCODE_TIER"
+    --cb-col-weights "$CB_COL_WEIGHTS"
   )
 fi
 python3 -m prismaquant.allocator \
@@ -1327,6 +1366,8 @@ if [[ "$PRODUCTION_CACHE" != "0" && "$PRODUCTION_CACHE" != "false" && "$PRODUCTI
   PROD_CACHE_RAW="${WORK_DIR}/artifacts/production_weight_cache_raw.pkl"
   PROD_CACHE_RECACHED="${WORK_DIR}/artifacts/production_weight_cache_recached.pkl"
   CACHE_FORMATS="$PRODUCTION_CACHE_FORMATS"
+  PRODUCTION_CACHE_CB_ARGS=()
+  PRODUCTION_CACHE_CB_SETTINGS=()
   if [[ "$SELECTION_MODE" == "validated-surrogate" ]]; then
     if [[ -z "$ALLOCATOR_PARETO_DIR" || ! -f "$ALLOCATOR_PARETO_DIR/manifest.json" ]]; then
       echo "[pipeline] ERROR: validated-surrogate selection requires allocator pareto assignments at $ALLOCATOR_PARETO_DIR" >&2
@@ -1354,10 +1395,19 @@ PY
       echo "[pipeline] ERROR: validated-surrogate selection has no non-BF16 cache formats" >&2
       exit 2
     fi
+    if formats_contain_cb "$CACHE_FORMATS"; then
+      harvest_cb_col_weights "[4/4] validated-frontier cache"
+      CB_COL_WEIGHTS_SHA256=$(sha256sum "$CB_COL_WEIGHTS" | cut -d' ' -f1)
+      PRODUCTION_CACHE_CB_ARGS=(--col-weights "$CB_COL_WEIGHTS")
+      PRODUCTION_CACHE_CB_SETTINGS=(
+        "CB_COL_WEIGHTS_SHA256=$CB_COL_WEIGHTS_SHA256"
+      )
+    fi
     PROD_CACHE_DIR="${PROD_CACHE_DIR}_frontier"
     PROD_CACHE_RAW="${WORK_DIR}/artifacts/production_weight_cache_frontier_raw.pkl"
     require_stage_settings "$PROD_CACHE_RAW" frontier-cache \
-      "CACHE_FORMATS=$CACHE_FORMATS"
+      "CACHE_FORMATS=$CACHE_FORMATS" \
+      "${PRODUCTION_CACHE_CB_SETTINGS[@]+"${PRODUCTION_CACHE_CB_SETTINGS[@]}"}"
     if [[ ! -f "$PROD_CACHE_RAW" ]]; then
       echo "[pipeline] [4/4] building format-menu production cache for validated frontier ..."
       python3 -m prismaquant.build_production_cache \
@@ -1374,6 +1424,7 @@ PY
         --cache-dir "$PROD_CACHE_DIR" \
         --render-scope format-menu \
         --render-packed-experts \
+        "${PRODUCTION_CACHE_CB_ARGS[@]+"${PRODUCTION_CACHE_CB_ARGS[@]}"}" \
         2>&1 | tee "${WORK_DIR}/logs/production_cache_frontier.log"
     else
       echo "[pipeline] [4/4] frontier production cache exists, skipping"
@@ -1424,6 +1475,9 @@ PY
       --production-cache-lru-gb "$PRODUCTION_CACHE_LRU_GB"
       --production-cache-prefetch "$PRODUCTION_CACHE_PREFETCH"
       --production-cache-prefetch-workers "$PRODUCTION_CACHE_PREFETCH_WORKERS"
+    )
+    VAK_COMMON_ARGS+=(
+      "${PRODUCTION_CACHE_CB_ARGS[@]+"${PRODUCTION_CACHE_CB_ARGS[@]}"}"
     )
     if [[ "$VALIDATED_DISABLE_FROZEN_WEIGHT_CACHE" != "0" && "$VALIDATED_DISABLE_FROZEN_WEIGHT_CACHE" != "false" && "$VALIDATED_DISABLE_FROZEN_WEIGHT_CACHE" != "False" ]]; then
       VAK_COMMON_ARGS+=(--disable-frozen-weight-cache)
@@ -1548,6 +1602,16 @@ PY
 )"
     echo "[pipeline] production cache formats selected from assignment: ${CACHE_FORMATS:-none}"
   fi
+  if [[ "$SELECTION_MODE" != "validated-surrogate" \
+     && -n "$CACHE_FORMATS" ]] \
+     && formats_contain_cb "$CACHE_FORMATS"; then
+    harvest_cb_col_weights "[4/4] production cache"
+    CB_COL_WEIGHTS_SHA256=$(sha256sum "$CB_COL_WEIGHTS" | cut -d' ' -f1)
+    PRODUCTION_CACHE_CB_ARGS=(--col-weights "$CB_COL_WEIGHTS")
+    PRODUCTION_CACHE_CB_SETTINGS=(
+      "CB_COL_WEIGHTS_SHA256=$CB_COL_WEIGHTS_SHA256"
+    )
+  fi
   if [[ "$SELECTION_MODE" == "validated-surrogate" ]]; then
     :
   elif [[ -z "$CACHE_FORMATS" ]]; then
@@ -1555,7 +1619,8 @@ PY
   elif [[ "$PRODUCTION_RECACHE" != "0" && "$PRODUCTION_RECACHE" != "false" && "$PRODUCTION_RECACHE" != "False" ]]; then
     LC_DIGEST=$(sha256sum "${WORK_DIR}/artifacts/layer_config.json" | cut -c1-16)
     require_stage_settings "$PROD_CACHE_RECACHED" production-cache-recached \
-      "ASSIGNMENT_DIGEST=$LC_DIGEST"
+      "ASSIGNMENT_DIGEST=$LC_DIGEST" \
+      "${PRODUCTION_CACHE_CB_SETTINGS[@]+"${PRODUCTION_CACHE_CB_SETTINGS[@]}"}"
     if [[ ! -f "$PROD_CACHE_RECACHED" ]]; then
       if [[ ! -f "$PROD_CACHE_RAW" ]]; then
         echo "[pipeline] [4/4] building production cache + re-fitting activation scales ..."
@@ -1575,6 +1640,7 @@ PY
           --render-layer-config "${WORK_DIR}/artifacts/layer_config.json" \
           --recache-layer-config "${WORK_DIR}/artifacts/layer_config.json" \
           --recache-microbatch-size "$PRODUCTION_RECACHE_MICROBATCH" \
+          "${PRODUCTION_CACHE_CB_ARGS[@]+"${PRODUCTION_CACHE_CB_ARGS[@]}"}" \
           ${EXPERT_GATE_DATASET:+--expert-gate-dataset "$EXPERT_GATE_DATASET"} \
           2>&1 | tee "${WORK_DIR}/logs/production_cache.log"
       else
@@ -1603,7 +1669,8 @@ PY
   else
     RAW_LC_DIGEST=$(sha256sum "${WORK_DIR}/artifacts/layer_config.json" | cut -c1-16)
     require_stage_settings "$PROD_CACHE_RAW" production-cache-raw \
-      "CACHE_FORMATS=$CACHE_FORMATS" "ASSIGNMENT_DIGEST=$RAW_LC_DIGEST"
+      "CACHE_FORMATS=$CACHE_FORMATS" "ASSIGNMENT_DIGEST=$RAW_LC_DIGEST" \
+      "${PRODUCTION_CACHE_CB_SETTINGS[@]+"${PRODUCTION_CACHE_CB_SETTINGS[@]}"}"
     if [[ ! -f "$PROD_CACHE_RAW" ]]; then
       echo "[pipeline] [4/4] building production cache ..."
       python3 -m prismaquant.build_production_cache \
@@ -1620,6 +1687,7 @@ PY
         --cache-dir "$PROD_CACHE_DIR" \
         --render-scope "$PRODUCTION_CACHE_RENDER_SCOPE" \
         --render-layer-config "${WORK_DIR}/artifacts/layer_config.json" \
+        "${PRODUCTION_CACHE_CB_ARGS[@]+"${PRODUCTION_CACHE_CB_ARGS[@]}"}" \
         ${EXPERT_GATE_DATASET:+--expert-gate-dataset "$EXPERT_GATE_DATASET"} \
         2>&1 | tee "${WORK_DIR}/logs/production_cache.log"
     else
@@ -1979,17 +2047,12 @@ if [[ "$EXPORT_CONTAINER" == "nvfp4_cb" ]]; then
       exit 2
       ;;
   esac
-  # Opt-in DELTA-EXPORT (default OFF): byte-copy CB/stock targets whose
-  # (format, scheme, codebook) are unchanged from a PRIOR artifact instead of
-  # re-encoding — a re-allocation of the same source reproduces byte-identical
-  # tensors for kept targets (the deterministic RESUME contract). Unset ->
-  # every target encodes fresh (byte-identical to before). EXPORT_REUSE_VERIFY
-  # (default 3) freshly re-encodes N random copies and aborts on any mismatch.
+  # Quarantined 2026-07-31: the old delta path did not bind reuse to the exact
+  # source/imatrix/codebook/exporter ABI and sampled only a few copied tensors.
+  # The exporter now requires a fresh output and rejects unbound reuse/resume.
   if [[ -n "${EXPORT_REUSE_PRIOR:-}" ]]; then
-    CB_EXPORT_ARGS+=(--reuse-prior "$EXPORT_REUSE_PRIOR")
-    [[ -n "${EXPORT_REUSE_VERIFY:-}" ]] && \
-      CB_EXPORT_ARGS+=(--reuse-verify "$EXPORT_REUSE_VERIFY")
-    echo "[pipeline] [4/4] DELTA-EXPORT reuse enabled: prior=${EXPORT_REUSE_PRIOR} verify=${EXPORT_REUSE_VERIFY:-3}"
+    echo "[pipeline] ERROR: EXPORT_REUSE_PRIOR is quarantined; CB export requires a fresh output until reuse has a complete source/imatrix/codebook/exporter-ABI manifest" >&2
+    exit 2
   fi
   "${CB_EXPORT_ARGS[@]}" 2>&1 | tee "${WORK_DIR}/logs/export.log"
 

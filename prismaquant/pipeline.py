@@ -70,6 +70,8 @@ _RENDER_SETTINGS: tuple[str, ...] = (
 _CB_SERIALIZATION_SETTINGS: tuple[str, ...] = (
     "CB_SCALE_CODING",
     "CB_CODEBOOK_SOURCE",
+    "CB_SCALE_SWEEP",
+    "PRISMAQUANT_CB_ENCODE_TIER",
 )
 
 

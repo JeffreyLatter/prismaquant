@@ -215,7 +215,6 @@ def synthesize_production_render_cost_payload(
     require_render_scores: bool = False,
     require_output_metric: bool = False,
 ) -> dict:
-    records = _cache_render_score_records(production_cache)
     baseline_costs = dict(baseline_cost_payload["costs"])
     output_formats = [
         fr.canonical_format_name(str(fmt))
@@ -227,11 +226,68 @@ def synthesize_production_render_cost_payload(
     ]
     output_formats = list(dict.fromkeys(output_formats))
 
+    cb_context = None
+    cb_render_provenance: dict[str, object] = {}
+    valid_cb_render_records: set[tuple[str, str]] = set()
+    if any(
+        fr.get_format(fmt).family in {"nvfp4_cb", "fp8_cb"}
+        for fmt in output_formats
+    ):
+        from prismaquant.nvfp4_cb_footprint import validate_cb_cost_provenance
+        from prismaquant.production_weight_cache import (
+            production_cache_cb_render_provenance,
+        )
+
+        cb_render_provenance = production_cache_cb_render_provenance(
+            production_cache,
+            require_for_formats=output_formats,
+            where="production render cost cache",
+        )
+        from prismaquant.nvfp4_cb_footprint import (
+            cb_serialization_context_from_stamp,
+        )
+
+        cb_context = cb_serialization_context_from_stamp(
+            cb_render_provenance["cb_serialized_payload"],
+            where="production render cost cache",
+        )
+        # Fallback rows still come from the baseline table.  Both sources must
+        # describe the same serialized CB artifact before their rows can be
+        # combined under one provenance stamp.
+        validate_cb_cost_provenance(
+            baseline_cost_payload,
+            output_formats,
+            context=cb_context,
+            where="production render baseline cost",
+        )
+        identity_scope = cb_render_provenance[
+            "cb_render_identity"
+        ]["cb_formats_by_qname"]
+        identity_pairs = {
+            (canonical_cost_name(qname), fr.canonical_format_name(fmt))
+            for qname, formats_for_qname in identity_scope.items()
+            for fmt in formats_for_qname
+        }
+        cache_pairs = {
+            (canonical_cost_name(qname), fr.canonical_format_name(fmt))
+            for qname, fmt in (getattr(production_cache, "weights", {}) or {})
+            if fr.get_format(fr.canonical_format_name(fmt)).family
+            in {"nvfp4_cb", "fp8_cb"}
+        }
+        # A score is usable only when both the value-bearing identity and an
+        # actual admitted cache tensor cover the row.  This prevents an old
+        # render_scores.json entry (including one left after a failed fresh
+        # render) from being relabeled under today's identity.
+        valid_cb_render_records = identity_pairs & cache_pairs
+
+    records = _cache_render_score_records(production_cache)
+
     output_costs: dict[str, dict[str, dict]] = {}
     render_entries = 0
     fallback_entries = 0
     missing: list[dict[str, str]] = []
     non_output_metric: list[dict[str, str]] = []
+    cb_fallback_scope: dict[str, list[str]] = {}
 
     for qname, per_name_raw in baseline_costs.items():
         cname = canonical_cost_name(str(qname))
@@ -251,6 +307,11 @@ def synthesize_production_render_cost_payload(
                 continue
 
             record = _lookup_record(records, qname, fmt_c)
+            if (
+                fr.get_format(fmt_c).family in {"nvfp4_cb", "fp8_cb"}
+                and (cname, fmt_c) not in valid_cb_render_records
+            ):
+                record = None
             if record is not None:
                 metric = str(record.get("metric", ""))
                 if require_output_metric and metric not in {
@@ -283,6 +344,8 @@ def synthesize_production_render_cost_payload(
             if fallback is None:
                 fallback = {"error": "missing production render score"}
             else:
+                if fr.get_format(fmt_c).family in {"nvfp4_cb", "fp8_cb"}:
+                    cb_fallback_scope.setdefault(str(qname), []).append(fmt_c)
                 fallback["cost_source"] = fallback.get(
                     "cost_source",
                     "fallback_baseline",
@@ -290,6 +353,29 @@ def synthesize_production_render_cost_payload(
             synthesized[fmt_c] = fallback
             fallback_entries += 1
         output_costs[str(qname)] = synthesized
+
+    if cb_fallback_scope:
+        # A context-only match is insufficient: a baseline measured with
+        # imatrix A cannot be relabeled as cache/imatrix B merely because both
+        # used layout v2.  Require value-bearing provenance and compare every
+        # CB row actually consumed as a fallback.
+        from prismaquant.production_weight_cache import (
+            validate_cb_render_provenance,
+            validate_matching_cb_render_identities,
+        )
+
+        _baseline_context, baseline_identity = validate_cb_render_provenance(
+            baseline_cost_payload,
+            expected_context=cb_context,
+            expected_formats_by_qname=cb_fallback_scope,
+            where="production render baseline CB fallback",
+        )
+        validate_matching_cb_render_identities(
+            cb_render_provenance["cb_render_identity"],
+            baseline_identity,
+            cb_fallback_scope,
+            where="production render baseline CB fallback",
+        )
 
     if require_render_scores and missing:
         sample = ", ".join(
@@ -319,6 +405,11 @@ def synthesize_production_render_cost_payload(
         if isinstance(baseline_provenance, Mapping)
         else {}
     )
+    if cb_context is not None:
+        # The rendered rows came from the cache. Carry the complete persisted
+        # value-bearing identity; reconstructing a fresh stamp here would lose
+        # the exact imatrix qname scope/content binding.
+        inherited_provenance.update(cb_render_provenance)
     return {
         "schema": SCHEMA,
         "costs": output_costs,

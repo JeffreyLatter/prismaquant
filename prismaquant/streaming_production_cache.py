@@ -52,6 +52,10 @@ from prismaquant.production_weight_cache import (
     _resolve_production_render_levers,
     _resolve_render_mechanism_plan,
     _store_rendered_weight_entry,
+    _cache_weight_filename,
+    _extend_production_cache_cb_render_identity,
+    _is_cb_format_name,
+    bind_production_cache_cb_source_weights,
     fill_packed_expert_cache_entries,
     render_production_weight,
 )
@@ -113,6 +117,8 @@ def _render_dense_layer(
     device: torch.device,
     fisher_rows: _FisherRowWeightCache | None,
     render_score_records: dict[str, dict[str, object]],
+    col_weights: Mapping[str, torch.Tensor] | None,
+    cb_serialization_context,
     progress: bool,
 ) -> int:
     """Render this layer's assigned non-BF16 dense Linears from the act cache.
@@ -136,6 +142,40 @@ def _render_dense_layer(
     }
     if not qname_to_module:
         return 0
+
+    _extend_production_cache_cb_render_identity(
+        cache,
+        {qname: (fmt,) for qname, fmt in render_formats_by_qname.items()},
+        cb_serialization_context=cb_serialization_context,
+        col_weights=col_weights,
+    )
+    dense_cb_source_weights = {
+        qname: qname_to_module[qname].weight.detach()
+        for qname, fmt in render_formats_by_qname.items()
+        if _is_cb_format_name(fmt)
+    }
+    if dense_cb_source_weights:
+        bind_production_cache_cb_source_weights(
+            cache,
+            dense_cb_source_weights,
+            require_complete=False,
+            where="streaming ProductionWeightCache dense source binding",
+        )
+    if cache_dir_path is not None:
+        stale = [
+            cache_dir_path / _cache_weight_filename(qname, fmt)
+            for qname, fmt in render_formats_by_qname.items()
+            if _is_cb_format_name(fmt)
+            and (
+                cache_dir_path / _cache_weight_filename(qname, fmt)
+            ).is_file()
+        ]
+        if stale:
+            raise RuntimeError(
+                "streaming production CB cache resume is disabled; "
+                "pre-existing dense shards are not independently bound to "
+                f"the fresh render identity. sample={stale[:8]}"
+            )
 
     render_base_fmts = {
         _render_base_format(f) for f in render_formats_by_qname.values()
@@ -223,6 +263,10 @@ def _render_dense_layer(
             joint_global_real=joint,
             input_global_scale=export_scale,
             fisher_row_weights=row_weights,
+            col_weights=(
+                None if col_weights is None else col_weights.get(qname)
+            ),
+            cb_serialization_context=cb_serialization_context,
             gate_trace=gate_trace,
         )
         render_score_records[_render_score_record_key(qname, fmt)] = (
@@ -266,6 +310,8 @@ def _render_packed_layer(
     module_token_budget: int,
     max_rows_per_expert: int,
     render_mode: str,
+    col_weights: Mapping[str, torch.Tensor] | None,
+    cb_serialization_context,
     progress: bool,
 ) -> dict:
     """Render this layer's packed experts via the shared packed-expert path,
@@ -287,6 +333,8 @@ def _render_packed_layer(
         cache_dir=cache_dir_path,
         render_mode=render_mode,
         module_acts_override=module_acts,
+        col_weights=col_weights,
+        cb_serialization_context=cb_serialization_context,
         progress=progress,
     )
 
@@ -306,6 +354,46 @@ def _experts_qnames_by_layer(
     return out
 
 
+def _streaming_cb_render_scope(
+    model: nn.Module,
+    *,
+    dense_modules: Mapping[str, nn.Module],
+    experts_by_layer: Mapping[int | None, Sequence[str]],
+    render_assignment: Mapping[str, str],
+    assignment_nonbf16: Mapping[str, str],
+    profile,
+) -> dict[str, tuple[str, ...]]:
+    """Resolve the exact live-qname CB scope before the first shard write."""
+    from prismaquant.sensitivity_probe import _packed_experts_param_names
+
+    scope: dict[str, tuple[str, ...]] = {}
+    for qname in dense_modules:
+        fmt = assignment_nonbf16.get(qname)
+        if fmt is not None and _is_cb_format_name(fmt):
+            scope[qname] = (fmt,)
+
+    modules = dict(model.named_modules())
+    for experts_qname in sorted({
+        name for names in experts_by_layer.values() for name in names
+    }):
+        mod = modules[experts_qname]
+        for pn in _packed_experts_param_names(mod, profile):
+            full = f"{experts_qname}.{pn}" if experts_qname else pn
+            try:
+                recipe_key = profile.live_to_recipe_name(full)
+            except Exception:
+                recipe_key = full
+            fmt = render_assignment.get(recipe_key)
+            if fmt is None and recipe_key != full:
+                fmt = render_assignment.get(full)
+            if fmt is None:
+                continue
+            canonical = _canon_fmt(fmt)
+            if _is_cb_format_name(canonical):
+                scope[full] = (canonical,)
+    return dict(sorted(scope.items()))
+
+
 def run_streaming_render(
     model: nn.Module,
     *,
@@ -323,6 +411,8 @@ def run_streaming_render(
     expert_module_token_budget: int = 32768,
     max_rows_per_expert: int = 2048,
     h_detail_dir: str | Path | None = None,
+    col_weights: Mapping[str, torch.Tensor] | None = None,
+    cb_serialization_context=None,
     install=None,
     unload=None,
     set_priority=None,
@@ -366,6 +456,39 @@ def run_streaming_render(
         model, profile, layers_prefix, num_layers,
     )
 
+    cb_scope = _streaming_cb_render_scope(
+        model,
+        dense_modules=dense_modules,
+        experts_by_layer=per_layer_experts,
+        render_assignment=render_assignment,
+        assignment_nonbf16=assignment_nonbf16,
+        profile=profile,
+    )
+    _extend_production_cache_cb_render_identity(
+        cache,
+        cb_scope,
+        cb_serialization_context=cb_serialization_context,
+        col_weights=col_weights,
+        render_levers=levers,
+        render_mechanism_plan=mechanism_plan,
+    )
+    if cache_dir_path is not None and cb_scope:
+        stale_cb_shards = sorted(
+            cache_dir_path / _cache_weight_filename(qname, fmt)
+            for qname, formats_for_qname in cb_scope.items()
+            for fmt in formats_for_qname
+            if (
+                cache_dir_path / _cache_weight_filename(qname, fmt)
+            ).is_file()
+        )
+        if stale_cb_shards:
+            raise RuntimeError(
+                "streaming production CB cache resume is disabled; "
+                "pre-existing shards are not independently bound to the "
+                "fresh render identity. "
+                f"sample={stale_cb_shards[:8]}"
+            )
+
     render_score_records: dict[str, dict[str, object]] = {}
     coverage: dict[str, dict[str, object]] = {}
 
@@ -392,6 +515,8 @@ def run_streaming_render(
                 device=device,
                 fisher_rows=fisher_rows,
                 render_score_records=render_score_records,
+                col_weights=col_weights,
+                cb_serialization_context=cb_serialization_context,
                 progress=progress,
             )
             if experts:
@@ -406,6 +531,8 @@ def run_streaming_render(
                     module_token_budget=expert_module_token_budget,
                     max_rows_per_expert=max_rows_per_expert,
                     render_mode=expert_render_mode,
+                    col_weights=col_weights,
+                    cb_serialization_context=cb_serialization_context,
                     progress=progress,
                 )
                 coverage.update(cov)
@@ -422,6 +549,14 @@ def run_streaming_render(
     # Head / root-level Linears (rare — lm_head is normally pinned-skipped) are
     # resident throughout; render them last with no install.
     _process_layer(None)
+
+    if cb_scope:
+        bind_production_cache_cb_source_weights(
+            cache,
+            {},
+            require_complete=True,
+            where="streaming ProductionWeightCache final source binding",
+        )
 
     if coverage:
         cache.metadata["packed_expert_coverage"] = coverage
@@ -481,6 +616,8 @@ def fill_production_weight_cache_streaming(
     expert_module_token_budget: int = 32768,
     max_rows_per_expert: int = 2048,
     h_detail_dir: str | Path | None = None,
+    col_weights: Mapping[str, torch.Tensor] | None = None,
+    cb_serialization_context=None,
     offload_folder: str | Path | None = None,
     progress: bool = True,
 ) -> ProductionWeightCache:
@@ -535,6 +672,8 @@ def fill_production_weight_cache_streaming(
             expert_module_token_budget=expert_module_token_budget,
             max_rows_per_expert=max_rows_per_expert,
             h_detail_dir=h_detail_dir,
+            col_weights=col_weights,
+            cb_serialization_context=cb_serialization_context,
             install=ctx.install,
             unload=ctx.unload,
             set_priority=_priority_setter(ctx),

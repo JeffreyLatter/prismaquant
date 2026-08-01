@@ -134,6 +134,10 @@ from .nvfp4_cb_footprint import (
     validate_cb_cost_provenance,
     whole_artifact_budget_stamp,
 )
+from .production_weight_cache import (
+    project_cb_render_identity,
+    validate_cb_render_provenance,
+)
 from .footprint import nvfp4_global_sidecar_bytes
 from .serving_profiles import (
     check_serving_format,
@@ -1018,14 +1022,17 @@ def _write_bit_attribution_reports(
               flush=True)
 
 
-def discover_visual_linears_from_source(model_path: str) -> list[str]:
-    """Scan the source safetensors index for `model.visual.blocks.*.weight`
-    entries with rank-2 shapes — these are the Linear modules the visual
-    encoder exposes.
+def discover_visual_linear_stats_from_source(
+    model_path: str,
+    *,
+    strict: bool = False,
+) -> dict[str, dict[str, object]]:
+    """Scan source safetensors for visual-Linear names and exact shapes.
 
-    Returned names are the basename (`.weight` stripped) so they slot
-    directly into the allocator's assignment dictionary and the exporter's
-    quantize-by-recipe dispatch.
+    Returned keys are the basename (``.weight`` stripped); values carry the
+    same ``n_params``/``in_features``/``out_features`` fields as probe stats.
+    Keeping shapes is required for exact Pareto byte pricing when the text-only
+    probe did not instantiate the visual tower.
 
     The probe's text-only staging strips the visual tower, so visual
     Linears never appear in the probe or cost pickles. This helper lets
@@ -1037,10 +1044,13 @@ def discover_visual_linears_from_source(model_path: str) -> list[str]:
     """
     src = Path(model_path)
     idx_path = src / "model.safetensors.index.json"
-    candidates: list[tuple[str, tuple[int, ...]]] = []
+    candidates: list[tuple[str, tuple[int, ...], str]] = []
+    source_tensor_names: set[str] = set()
+    scan_errors: list[str] = []
     if idx_path.exists():
         with open(idx_path) as f:
             wm = json.load(f).get("weight_map", {})
+        source_tensor_names.update(str(name) for name in wm)
         # Index file carries only names, not shapes. We need to open each
         # referenced shard once to read rank.
         from collections import defaultdict as _dd
@@ -1053,43 +1063,71 @@ def discover_visual_linears_from_source(model_path: str) -> list[str]:
             by_shard[shard].append(key)
         try:
             from safetensors import safe_open
-        except ImportError:
-            return []
+        except ImportError as exc:
+            if strict:
+                raise RuntimeError(
+                    "exact visual source discovery requires safetensors"
+                ) from exc
+            return {}
         for shard, keys in by_shard.items():
             shard_path = src / shard
             if not shard_path.exists():
+                scan_errors.append(
+                    f"missing indexed shard {shard!r} for {keys[:4]}"
+                )
                 continue
             with safe_open(str(shard_path), framework="pt") as sf:
                 for k in keys:
                     try:
-                        shape = tuple(sf.get_slice(k).get_shape())
-                    except Exception:
+                        tensor_slice = sf.get_slice(k)
+                        shape = tuple(tensor_slice.get_shape())
+                        dtype = str(tensor_slice.get_dtype()).upper()
+                    except Exception as exc:
+                        scan_errors.append(f"{shard}:{k}: {exc}")
                         continue
-                    candidates.append((k, shape))
+                    candidates.append((k, shape, dtype))
     else:
         # No index file — scan every safetensors shard directly. Used for
         # small, single-file checkpoints.
         try:
             from safetensors import safe_open
-        except ImportError:
-            return []
+        except ImportError as exc:
+            if strict:
+                raise RuntimeError(
+                    "exact visual source discovery requires safetensors"
+                ) from exc
+            return {}
         import os as _os
         if not src.exists():
-            return []
+            if strict:
+                raise FileNotFoundError(
+                    f"visual source checkpoint does not exist: {src}"
+                )
+            return {}
         for f in sorted(_os.listdir(src)):
             if not f.endswith(".safetensors"):
                 continue
             with safe_open(str(src / f), framework="pt") as sf:
+                source_tensor_names.update(str(key) for key in sf.keys())
                 for k in sf.keys():
                     if not k.endswith(".weight"):
                         continue
                     if not _VISUAL_PREFIX_RE.match(k):
                         continue
                     try:
-                        shape = tuple(sf.get_slice(k).get_shape())
-                    except Exception:
+                        tensor_slice = sf.get_slice(k)
+                        shape = tuple(tensor_slice.get_shape())
+                        dtype = str(tensor_slice.get_dtype()).upper()
+                    except Exception as exc:
+                        scan_errors.append(f"{f}:{k}: {exc}")
                         continue
-                    candidates.append((k, shape))
+                    candidates.append((k, shape, dtype))
+
+    if strict and scan_errors:
+        raise RuntimeError(
+            "exact visual source discovery was incomplete: "
+            + "; ".join(scan_errors[:8])
+        )
 
     # Only rank-2 weights are Linear-like; conv1d / norms / biases are
     # kept at BF16 passthrough regardless of --visual-format.
@@ -1108,14 +1146,84 @@ def discover_visual_linears_from_source(model_path: str) -> list[str]:
         r"|rotary_emb"          # rotary pos embed cache
         r")(?:\.|$)"
     )
-    out: list[str] = []
-    for name, shape in candidates:
+    out: dict[str, dict[str, object]] = {}
+    for name, shape, dtype in candidates:
         if len(shape) != 2:
             continue
         if _NON_LINEAR_RE.search(name):
             continue
-        out.append(name[:-len(".weight")] if name.endswith(".weight") else name)
-    return sorted(set(out))
+        qname = name[:-len(".weight")] if name.endswith(".weight") else name
+        out_features, in_features = (int(shape[0]), int(shape[1]))
+        entry = {
+            "n_params": out_features * in_features,
+            "out_features": out_features,
+            "in_features": in_features,
+            "source_dtype": (
+                "bf16" if dtype == "BF16"
+                else "fp8" if dtype.startswith("F8_")
+                else "fp16" if dtype == "F16"
+                else "fp32" if dtype == "F32"
+                else dtype.lower()
+            ),
+            "has_fp8_scale": any(
+                f"{qname}.{suffix}" in source_tensor_names
+                for suffix in ("weight_scale_inv", "weight_scale")
+            ),
+        }
+        previous = out.setdefault(qname, entry)
+        if previous != entry:
+            raise RuntimeError(
+                f"visual Linear {qname!r} appears with conflicting source "
+                f"shapes: {previous} versus {entry}"
+            )
+    return dict(sorted(out.items()))
+
+
+def discover_visual_linears_from_source(model_path: str) -> list[str]:
+    """Backwards-compatible name-only view of source visual Linears."""
+    return list(discover_visual_linear_stats_from_source(model_path))
+
+
+def validate_source_visual_passthrough_contract(
+    source_visual_stats: Mapping[str, Mapping[str, object]],
+    visual_format: str,
+) -> None:
+    """Reject a source-only visual passthrough whose dtype does not match."""
+    canonical = fr.get_format(visual_format).name
+    if canonical not in PASSTHROUGH_SOURCE_REQUIREMENTS:
+        return
+    mismatched = sorted(
+        name
+        for name, entry in source_visual_stats.items()
+        if (
+            not _passthrough_source_ok(
+                canonical,
+                str(entry.get("source_dtype", "unknown")),
+            )
+            or (
+                canonical == "FP8_SOURCE"
+                and not bool(entry.get("has_fp8_scale", False))
+            )
+        )
+    )
+    if not mismatched:
+        return
+    sample = [
+        (
+            name,
+            source_visual_stats[name].get("source_dtype", "unknown"),
+            bool(source_visual_stats[name].get("has_fp8_scale", False)),
+        )
+        for name in mismatched[:8]
+    ]
+    raise ValueError(
+        f"--visual-format={canonical} is a passthrough contract, but "
+        "source-only visual Linears have incompatible source dtype/scale "
+        "contracts "
+        f"(sample={sample}). The exporter copies these tensors verbatim, so "
+        "pricing them as a re-encode would make the assignment budget false. "
+        "Choose an explicit re-encoding format or use a matching source."
+    )
 
 
 
@@ -1544,6 +1652,27 @@ def main():
             "values; direct research accounting APIs still accept digests."
         ),
     )
+    ap.add_argument(
+        "--cb-scale-sweep",
+        choices=("0", "1"),
+        default=None,
+        help="Exact CB scale-search contract; required with CB formats.",
+    )
+    ap.add_argument(
+        "--cb-encode-tier",
+        choices=("fast", "balanced", "max"),
+        default=None,
+        help="Resolved CB encoder tier; required with CB formats.",
+    )
+    ap.add_argument(
+        "--cb-col-weights",
+        default=None,
+        help=(
+            "Exact imatrix pickle used by CB cost/cache/export. Required "
+            "when any allocated or fixed auxiliary format is CB; allocator "
+            "validates its value-bearing render identity before solving."
+        ),
+    )
     ap.add_argument("--formats", default="",
                     help="Comma-separated format names to consider; empty=all")
     ap.add_argument("--allow-pinned", default="",
@@ -1863,19 +1992,26 @@ def main():
         fmt_names = cost_data["formats"]
     specs = [fr.get_format(n) for n in fmt_names]
     cb_serialization_context = None
+    cb_col_weights = None
+    cb_cost_render_identity = None
     cb_requested_names = [spec.name for spec in specs]
     cb_requested_names.extend((
         fr.get_format(args.mtp_format).name,
         fr.get_format(args.visual_format).name,
     ))
     if any(is_cb_format(name) for name in cb_requested_names):
-        if args.cb_scale_coding is None or args.cb_codebook_source is None:
+        if (
+            args.cb_scale_coding is None
+            or args.cb_codebook_source is None
+            or args.cb_scale_sweep is None
+            or args.cb_encode_tier is None
+        ):
             raise SystemExit(
                 "[alloc] ERROR: a CB format is present in the body or fixed "
                 "auxiliary assignment but exact serialized "
-                "context is missing. Pass --cb-scale-coding {two_tier,v1} and "
-                "--cb-codebook-source lattice; refusing to silently "
-                "price the registry's legacy-v1 approximation."
+                "and renderer context is missing. Pass --cb-scale-coding, "
+                "--cb-codebook-source, --cb-scale-sweep, and "
+                "--cb-encode-tier; refusing implicit render defaults."
             )
         codebook_digests = None
         if args.cb_codebook_digests is not None:
@@ -1884,10 +2020,31 @@ def main():
                 "the production allocator until learned CB has immutable "
                 "value-bearing codebook input"
             )
+        if args.cb_col_weights is None:
+            raise SystemExit(
+                "[alloc] ERROR: CB allocation requires --cb-col-weights so "
+                "the cost table can be checked against the exact imatrix "
+                "that cache/KL/export consume"
+            )
+        try:
+            with open(args.cb_col_weights, "rb") as fh:
+                cb_col_weights = pickle.load(fh)
+        except Exception as exc:
+            raise SystemExit(
+                f"[alloc] ERROR: cannot load CB col-weights "
+                f"{args.cb_col_weights}: {exc}"
+            ) from None
+        if not isinstance(cb_col_weights, Mapping):
+            raise SystemExit(
+                "[alloc] ERROR: --cb-col-weights must contain a qname -> "
+                "tensor mapping"
+            )
         try:
             cb_serialization_context = CBSerializationContext(
                 scale_coding=args.cb_scale_coding,
                 codebook_source=args.cb_codebook_source,
+                scale_sweep=args.cb_scale_sweep == "1",
+                encode_tier=args.cb_encode_tier,
                 codebook_content_digests=codebook_digests,
             )
         except ValueError as exc:
@@ -1896,7 +2053,10 @@ def main():
             "[alloc] CB serialized payload: "
             f"scale_coding={cb_serialization_context.scale_coding} "
             f"layout_version={cb_serialization_context.layout_version} "
-            f"codebook_source={cb_serialization_context.codebook_source}",
+            f"codebook_source={cb_serialization_context.codebook_source} "
+            f"scale_sweep={cb_serialization_context.scale_sweep} "
+            f"encode_tier={cb_serialization_context.encode_tier} "
+            f"renderer_abi={cb_serialization_context.renderer_abi}",
             flush=True,
         )
         try:
@@ -1905,6 +2065,14 @@ def main():
                 cb_requested_names,
                 context=cb_serialization_context,
                 where=f"allocator cost cache {args.costs}",
+            )
+            _stored_context, cb_cost_render_identity = (
+                validate_cb_render_provenance(
+                    cost_data,
+                    expected_context=cb_serialization_context,
+                    col_weights=cb_col_weights,
+                    where=f"allocator cost cache {args.costs}",
+                )
             )
         except ValueError as exc:
             raise SystemExit(f"[alloc] ERROR: {exc}") from None
@@ -2092,8 +2260,8 @@ def main():
             reason = None
             if not isinstance(row, Mapping):
                 reason = "missing"
-            elif row.get("error") is not None:
-                reason = f"error={row.get('error')}"
+            elif "error" in row:
+                reason = f"error={row.get('error')!r}"
             if reason is not None:
                 incomplete_cb_costs.append((str(name), spec.name, reason))
     if incomplete_cb_costs:
@@ -2262,6 +2430,55 @@ def main():
                 f" ({len(visual_aux_candidates)} measured cost rows tracked)"
                 if visual_aux_candidates else ""
             ),
+            flush=True,
+        )
+
+    # Text-only probes can omit the complete visual tower. Discover those
+    # source-only Linears *before* Pareto records are built so every candidate
+    # JSON, CB identity, payload price, and budget stamp covers the exact full
+    # assignment later emitted by the selector/exporter. The historical late
+    # insertion made Pareto files deltas over the final layer_config and could
+    # stamp a different (occasionally smaller) artifact than the one shipped.
+    source_visual_stats = (
+        discover_visual_linear_stats_from_source(
+            probe_model_path,
+            strict=bool(
+                args.target_disk_gb is not None
+                or visual_format_canonical != "BF16"
+            ),
+        )
+        if probe_model_path
+        else {}
+    )
+    source_only_visual_stats = {
+        name: entry
+        for name, entry in source_visual_stats.items()
+        if name not in fixed_format_assignment
+    }
+    if source_only_visual_stats and is_cb_format(visual_format_canonical):
+        sample = sorted(source_only_visual_stats)[:8]
+        raise SystemExit(
+            "[alloc] ERROR: source-only visual Linears cannot be assigned a "
+            f"CB format without measured imatrix/cost rows (sample={sample}). "
+            "Run multimodal probing so these Linears have production "
+            "col_weights, or choose a non-CB --visual-format."
+        )
+    try:
+        validate_source_visual_passthrough_contract(
+            source_visual_stats,
+            visual_format_canonical,
+        )
+    except ValueError as exc:
+        raise SystemExit(f"[alloc] ERROR: {exc}") from None
+    if source_only_visual_stats:
+        fixed_format_assignment.update({
+            name: visual_format_canonical for name in source_only_visual_stats
+        })
+        fixed_stats.update(source_only_visual_stats)
+        print(
+            f"[alloc] --visual-format={visual_format_canonical}: added "
+            f"{len(source_only_visual_stats)} source-only visual Linears "
+            "to every full Pareto assignment before byte pricing",
             flush=True,
         )
 
@@ -2710,6 +2927,28 @@ def main():
                     )
         return stamps
 
+    def _cb_render_identity_for_assignment(
+        expanded_assignment: Mapping[str, str],
+    ) -> dict | None:
+        selected_scope = {
+            str(name): (str(fmt),)
+            for name, fmt in expanded_assignment.items()
+            if is_cb_format(fmt)
+        }
+        if not selected_scope:
+            return None
+        if cb_cost_render_identity is None or cb_col_weights is None:
+            raise RuntimeError(
+                "CB assignment has no validated value-bearing cost render "
+                "identity"
+            )
+        return project_cb_render_identity(
+            cb_cost_render_identity,
+            selected_scope,
+            col_weights=cb_col_weights,
+            where="allocator selected CB assignment",
+        )
+
     pareto_seed_records: list[dict] = []
 
     # Pareto sweep.
@@ -2751,6 +2990,9 @@ def main():
             expanded_counts = defaultdict(int)
             for fmt in expanded.values():
                 expanded_counts[fmt] += 1
+            pareto_cb_render_identity = _cb_render_identity_for_assignment(
+                expanded
+            )
             pareto_seed_records.append({
                 "target_bits": float(t),
                 "achieved_bits": float(achieved),
@@ -2766,6 +3008,9 @@ def main():
                 CB_ASSIGNMENT_IDENTITIES_FIELD: _cb_stamps_for_assignment(
                     expanded
                 ),
+                **({
+                    "cb_render_identity": pareto_cb_render_identity,
+                } if pareto_cb_render_identity is not None else {}),
             })
 
     # Coarse Kneedle, then golden-section refinement inside the knee bracket so
@@ -2799,6 +3044,9 @@ def main():
                     r_counts = defaultdict(int)
                     for fmt in r_exp.values():
                         r_counts[fmt] += 1
+                    refined_cb_render_identity = (
+                        _cb_render_identity_for_assignment(r_exp)
+                    )
                     pareto_seed_records.append({
                         "target_bits": float(refined["target_bits"]),
                         "achieved_bits": float(r_ach),
@@ -2814,6 +3062,9 @@ def main():
                         CB_ASSIGNMENT_IDENTITIES_FIELD: _cb_stamps_for_assignment(
                             r_exp
                         ),
+                        **({
+                            "cb_render_identity": refined_cb_render_identity,
+                        } if refined_cb_render_identity is not None else {}),
                         "knee_refined": True,
                     })
 
@@ -2882,6 +3133,13 @@ def main():
                 context="pareto candidate footprint",
                 cb_serialization_context=cb_serialization_context,
             )
+            if info["n_missing_stats"]:
+                sample = ", ".join(info["missing_stats_names"][:10])
+                raise ValueError(
+                    f"{info['n_missing_stats']} assigned Linear(s) have no "
+                    f"shape stats and cannot receive an exact artifact price: "
+                    f"{sample}"
+                )
             tensor_payload_bytes = int(info["artifact_payload_bytes"])
             reserve_bytes = int(args.artifact_overhead_reserve_bytes or 0)
             return {
@@ -2899,6 +3157,11 @@ def main():
                 } if args.target_disk_gb is not None else {}),
             }
         except Exception as exc:
+            if args.target_disk_gb is not None:
+                raise SystemExit(
+                    "[alloc] ERROR: exact Pareto artifact pricing failed "
+                    f"under --target-disk-gb: {exc}"
+                ) from None
             print(f"[alloc] WARNING: could not price a Pareto candidate: {exc}",
                   flush=True)
             return None
@@ -2988,6 +3251,7 @@ def main():
                         selection_non_tensor_reserve_bytes=int(
                             args.artifact_overhead_reserve_bytes
                         ),
+                        selection_assignment=assignment,
                     )
             payload = {
                 "schema": "prismaquant.allocator.pareto_assignment.v2",
@@ -3016,12 +3280,13 @@ def main():
                 "target_profile": target_profile,
                 "assignment": dict(sorted(assignment.items())),
                 **({
-                    "cb_serialized_payload": cb_serialization_context_stamp(
-                        cb_serialization_context
-                    ),
+                    "cb_serialized_payload": record[
+                        "cb_render_identity"
+                    ]["cb_serialized_payload"],
                     CB_ASSIGNMENT_IDENTITIES_FIELD: dict(sorted(
                         record.get(CB_ASSIGNMENT_IDENTITIES_FIELD, {}).items()
                     )),
+                    "cb_render_identity": record["cb_render_identity"],
                 } if record.get(CB_ASSIGNMENT_IDENTITIES_FIELD) else {}),
                 **({
                     "whole_artifact_budget": record_budget_stamp,
@@ -3220,6 +3485,7 @@ def main():
             return {
                 "target_bits": float(t), "achieved_bits": float(ach_t),
                 "bpp": float(ach_t), "dloss": float(tot_t),
+                "assignment": expanded_t,
                 "tensor_payload_bytes": int(info["artifact_payload_bytes"]),
                 "whole_artifact_upper_bound_bytes": int(
                     info["artifact_payload_bytes"]
@@ -3438,6 +3704,7 @@ def main():
                 chosen_info["tensor_payload_bytes"]
             ),
             selection_non_tensor_reserve_bytes=overhead_reserve_bytes,
+            selection_assignment=chosen_info["assignment"],
         )
         selection.update({
             "has_slack": bool(has_slack),
@@ -3603,10 +3870,7 @@ def main():
               f"to --visual-format={visual_format} (Phase 1 uniform).",
               flush=True)
 
-    if probe_model_path:
-        visual_names_src = discover_visual_linears_from_source(probe_model_path)
-    else:
-        visual_names_src = []
+    visual_names_src = sorted(source_visual_stats)
 
     if visual_names_src:
         for vname in visual_names_src:
@@ -3715,6 +3979,9 @@ def main():
     final_cb_serialization_stamps = _cb_stamps_for_assignment(
         assignment_expanded
     )
+    final_cb_render_identity = _cb_render_identity_for_assignment(
+        assignment_expanded
+    )
     layer_cfg = {}
     for name, fmt in assignment_expanded.items():
         if fmt in format_specs:
@@ -3772,10 +4039,11 @@ def main():
             "missing_stats_names"
         ],
         **({
-            "cb_serialized_payload": cb_serialization_context_stamp(
-                cb_serialization_context
-            ),
-        } if cb_serialization_context is not None else {}),
+            "cb_serialized_payload": final_cb_render_identity[
+                "cb_serialized_payload"
+            ],
+            "cb_render_identity": final_cb_render_identity,
+        } if final_cb_render_identity is not None else {}),
         **({
             "whole_artifact_budget": selected_whole_artifact_budget_stamp,
         } if selected_whole_artifact_budget_stamp is not None else {}),

@@ -47,12 +47,16 @@ from prismaquant.layer_config import (
 )
 from prismaquant.model_profiles import detect_profile_with_warning
 from prismaquant.nvfp4_cb_footprint import (
+    CB_ASSIGNMENT_IDENTITIES_FIELD,
     CBSerializationContext,
+    assignment_serialization_sha256,
+    cb_serialization_context_stamp,
     cb_serialization_metadata_from_assignment_payload,
     cb_serialization_context_from_stamp,
     is_cb_format,
     validate_cb_cost_provenance,
     validate_cb_serialization_context_stamp,
+    whole_artifact_budget_from_assignment_payload,
 )
 from prismaquant.kl_measurement import (
     assignment_bit_total,
@@ -1135,6 +1139,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         "measured on the same production-rendered W_tilde path used by export.",
     )
     parser.add_argument(
+        "--col-weights",
+        default=None,
+        help=(
+            "Exact CB imatrix pickle. Required when any assignment contains "
+            "CB; validated against value-bearing cache/cost provenance before "
+            "the tokenizer or model is loaded."
+        ),
+    )
+    parser.add_argument(
         "--production-cache-dir-override",
         default=None,
         help="Relocate disk-backed production cache entries to this directory.",
@@ -1202,13 +1215,45 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.base_assignment
     )
     labeled_paths = [_parse_labeled_path(value) for value in args.assignment]
+    candidate_payloads = {
+        (label, str(path)): _load_json(path)
+        for label, path in labeled_paths
+    }
     assignments = [
         (label, load_assignment_json(path, base=base_assignment), str(path))
         for label, path in labeled_paths
     ]
+    any_cb_assignment = any(
+        is_cb_format(fmt)
+        for _label, assignment, _path in assignments
+        for fmt in assignment.values()
+    )
+    cb_col_weights: dict[str, torch.Tensor] | None = None
+    if any_cb_assignment:
+        if not args.col_weights:
+            raise ValueError(
+                "validate-kl CB assignments require --col-weights so the "
+                "cost/cache/assignment imatrix identity can be checked "
+                "before model load"
+            )
+        with Path(args.col_weights).open("rb") as fh:
+            raw_col_weights = pickle.load(fh)
+        if not isinstance(raw_col_weights, Mapping):
+            raise ValueError(
+                "validate-kl --col-weights pickle must contain a qname "
+                "mapping"
+            )
+        cb_col_weights = {
+            str(name): torch.as_tensor(value)
+            for name, value in raw_col_weights.items()
+        }
     assignment_cb_metadata: dict[
         tuple[str, str], tuple[CBSerializationContext | None, dict[str, str]]
     ] = {}
+    assignment_cb_render_identities: dict[
+        tuple[str, str], dict[str, object] | None
+    ] = {}
+    assignment_budget_metadata: dict[tuple[str, str], Mapping | None] = {}
     for (label, assignment, path), (_path_label, raw_path) in zip(
         assignments, labeled_paths
     ):
@@ -1236,6 +1281,28 @@ def main(argv: Sequence[str] | None = None) -> int:
             candidate_identities,
         )
         assignment_cb_metadata[(label, path)] = (context, identities)
+        cb_render_identity = None
+        if has_cb:
+            from prismaquant.production_weight_cache import (
+                validate_cb_render_provenance,
+            )
+
+            _stored_context, cb_render_identity = (
+                validate_cb_render_provenance(
+                    candidate_payloads[(label, path)],
+                    expected_context=context,
+                    col_weights=cb_col_weights,
+                    where=f"assignment {label!r} ({path})",
+                )
+            )
+        assignment_cb_render_identities[(label, path)] = cb_render_identity
+        assignment_budget_metadata[(label, path)] = (
+            whole_artifact_budget_from_assignment_payload(
+                candidate_payloads[(label, path)],
+                where=f"assignment {label!r} ({path})",
+                assignment=assignment,
+            )
+        )
         # Validate context, every per-layer identity, and once-only sidecars
         # before loading a multi-billion-parameter model.
         assignment_bit_total(
@@ -1252,6 +1319,77 @@ def main(argv: Sequence[str] | None = None) -> int:
                 list(assignment.values()),
                 context=context,
                 where=f"validate-kl cost cache {args.costs}",
+            )
+            from prismaquant.production_weight_cache import (
+                validate_cb_render_provenance,
+            )
+
+            validate_cb_render_provenance(
+                cost_payload_for_identity,
+                expected_context=context,
+                col_weights=cb_col_weights,
+                where=f"validate-kl cost cache {args.costs}",
+            )
+
+    # Load and validate the render cache before tokenizer/model construction.
+    # A v1 cache under a v2 assignment (or any legacy CB cache with no stored
+    # identity) is a provenance failure, not a reason to allocate a multi-GiB
+    # model and discover the mismatch hours later.
+    production_cache = None
+    pristine_cache_dir: object = "__unset__"
+    if args.production_weight_cache:
+        with Path(args.production_weight_cache).open("rb") as fh:
+            production_cache = pickle.load(fh)
+        if args.production_cache_dir_override:
+            # Remember the as-pickled cache_dir: if the M4 lazy gap-fill
+            # re-pickles this cache, the session's dir override must not be
+            # baked into the shared build artifact.
+            pristine_cache_dir = getattr(production_cache, "cache_dir", None)
+            production_cache.relocate(args.production_cache_dir_override)
+        for _label, _assignment, _path in assignments:
+            _context, _identities = assignment_cb_metadata[(_label, _path)]
+            if _context is None:
+                continue
+            production_cache.validate_cb_render_identity(
+                expected_context=_context,
+                col_weights=cb_col_weights,
+                require_for_formats=list(_assignment.values()),
+                where=(
+                    "validate-kl production cache for assignment "
+                    f"{_label!r}"
+                ),
+            )
+            from prismaquant.production_weight_cache import (
+                production_cache_cb_render_identity,
+                validate_matching_cb_render_identities,
+            )
+
+            cache_render_identity = production_cache_cb_render_identity(
+                production_cache,
+                expected_context=_context,
+                col_weights=cb_col_weights,
+                require_for_formats=list(_assignment.values()),
+                where=(
+                    "validate-kl production cache for assignment "
+                    f"{_label!r}"
+                ),
+            )
+            validate_matching_cb_render_identities(
+                cache_render_identity,
+                assignment_cb_render_identities[(_label, _path)],
+                _assignment,
+                where=(
+                    "validate-kl cache/assignment provenance for "
+                    f"{_label!r}"
+                ),
+            )
+        if (
+            args.production_cache_lru_gb
+            and float(args.production_cache_lru_gb) > 0
+            and hasattr(production_cache, "enable_lru")
+        ):
+            production_cache.enable_lru(
+                int(float(args.production_cache_lru_gb) * 1024**3)
             )
 
     device_str = _device_arg(args.device)
@@ -1337,27 +1475,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             model.to(device)
         model.eval()
         model_device = next(model.parameters()).device
-        production_cache = None
-        pristine_cache_dir: object = "__unset__"
-        if args.production_weight_cache:
-            import pickle
-
-            with Path(args.production_weight_cache).open("rb") as fh:
-                production_cache = pickle.load(fh)
-            if args.production_cache_dir_override:
-                # Remember the as-pickled cache_dir: if the M4 lazy gap-fill
-                # re-pickles this cache, the session's dir override must not
-                # be baked into the shared build artifact.
-                pristine_cache_dir = getattr(production_cache, "cache_dir", None)
-                production_cache.relocate(args.production_cache_dir_override)
-            if (
-                args.production_cache_lru_gb
-                and float(args.production_cache_lru_gb) > 0
-                and hasattr(production_cache, "enable_lru")
-            ):
-                production_cache.enable_lru(
-                    int(float(args.production_cache_lru_gb) * 1024**3)
-                )
         materialization_mode = args.assignment_materialization
         if materialization_mode == "auto":
             if production_cache is not None and len(assignments) == 1:
@@ -1446,6 +1563,40 @@ def main(argv: Sequence[str] | None = None) -> int:
                 }
                 if not _expert_ra:
                     continue
+                _cb_context, _cb_identities = assignment_cb_metadata[
+                    (_label, _path)
+                ]
+                _cb_col_weights = None
+                if any(is_cb_format(fmt) for fmt in _expert_ra.values()):
+                    cache_identity = production_cache.metadata[
+                        "cb_render_identity"
+                    ]
+                    identity_qnames = cache_identity["col_weights_qnames"]
+                    _cb_col_weights = {
+                        str(name): (
+                            cb_col_weights.get(str(name))
+                            if cb_col_weights is not None else None
+                        )
+                        for name in identity_qnames
+                    }
+                    _cb_col_weights.update({
+                        str(name): (
+                            cb_col_weights.get(str(name))
+                            if cb_col_weights is not None else None
+                        )
+                        for name, fmt in _expert_ra.items()
+                        if is_cb_format(fmt)
+                    })
+                    missing_cw = sorted(
+                        name for name, value in _cb_col_weights.items()
+                        if value is None
+                    )
+                    if missing_cw:
+                        raise RuntimeError(
+                            "validate-kl lazy CB expert render is missing "
+                            "--col-weights entries; "
+                            f"sample={missing_cw[:8]}"
+                        )
                 print(
                     f"[validate-kl/M4] '{_label}': lazy-rendering "
                     f"{len(_expert_ra)} packed-expert tensor(s) at "
@@ -1461,6 +1612,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     levers=production_cache.levers, profile=profile,
                     cache_dir=getattr(production_cache, "cache_dir", None),
                     render_mode="batched",
+                    col_weights=_cb_col_weights,
+                    cb_serialization_context=_cb_context,
                 )
                 _lazy_filled_total += len(_cov)
                 if len(_cov) < len(_expert_ra):
@@ -1682,10 +1835,56 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "changed_vs_base": int(changed),
                 "assignment_entries": len(assignment),
                 "assignment_hash": assignment_hash(assignment),
+                "assignment_sha256": assignment_serialization_sha256(
+                    assignment
+                ),
                 "kl_scope": args.kl_scope,
                 "assignment_materialization": materialization_mode,
                 "replay": replay_stats,
             }
+            cb_context, cb_identities = assignment_cb_metadata[(label, path)]
+            cb_render_identity = assignment_cb_render_identities[(label, path)]
+            candidate_budget = assignment_budget_metadata[(label, path)]
+            resolved_assignment_payload = {
+                "schema": "prismaquant.validated_resolved_assignment.v1",
+                "source_path": path,
+                "assignment": dict(sorted(assignment.items())),
+                "assignment_sha256": assignment_serialization_sha256(
+                    assignment
+                ),
+                **({
+                    "cb_serialized_payload": dict(
+                        cb_render_identity["cb_serialized_payload"]
+                    ),
+                    "cb_render_identity": cb_render_identity,
+                    CB_ASSIGNMENT_IDENTITIES_FIELD: dict(sorted(
+                        cb_identities.items()
+                    )),
+                } if cb_context is not None else {}),
+                **({
+                    "whole_artifact_budget": dict(candidate_budget),
+                } if candidate_budget is not None else {}),
+            }
+            result["resolved_assignment_payload"] = resolved_assignment_payload
+            result["resolved_assignment_payload_sha256"] = hashlib.sha256(
+                json.dumps(
+                    resolved_assignment_payload,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                ).encode("utf-8")
+            ).hexdigest()
+            if candidate_budget is not None:
+                result["whole_artifact_upper_bound_bytes"] = int(
+                    candidate_budget[
+                        "selection_whole_artifact_upper_bound_bytes"
+                    ]
+                )
+                result["artifact_byte_scope"] = (
+                    "selection_upper_bound_tensor_payload_plus_"
+                    "operator_non_tensor_reserve"
+                )
             if costs is not None:
                 result["mse"] = _assignment_cost_summary(costs, assignment)
             if cache_diagnostics is not None:

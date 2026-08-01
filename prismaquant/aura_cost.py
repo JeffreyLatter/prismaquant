@@ -416,6 +416,22 @@ def compute_aura_cost(
     names = list(linears.keys())
     fmts = [fr.canonical_format_name(f) for f in formats]
     nonzero_fmts = [f for f in fmts if f not in _ZERO_COST_FORMATS]
+    cb_provenance: dict[str, object] = {}
+    if any(is_cb_format(fmt) for fmt in fmts):
+        if production_cache is None:
+            raise RuntimeError(
+                "AURA CB cost requires a ProductionWeightCache with a "
+                "persisted CB render identity"
+            )
+        from prismaquant.production_weight_cache import (
+            production_cache_cb_render_provenance,
+        )
+
+        cb_provenance = production_cache_cb_render_provenance(
+            production_cache,
+            require_for_formats=fmts,
+            where="AURA production cache",
+        )
     # Passthrough-rule guard (opt-in; default off keeps the output byte-for-byte
     # identical). BF16 zero-cost is only valid when the source weight is already
     # bf16/fp16 -- on an fp32-source model loaded as fp32, casting W to BF16 is a
@@ -766,7 +782,11 @@ def compute_aura_cost(
             "dw_rendered_rows": n_rendered,
             "dw_rtn_fallback_rows": n_rtn,
             "git_commit": _git_commit(),
-            **cb_cost_provenance(fmts),
+            **(
+                cb_provenance
+                if cb_provenance
+                else cb_cost_provenance(fmts)
+            ),
         },
     }
 

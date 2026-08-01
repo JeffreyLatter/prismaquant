@@ -29,20 +29,25 @@ import re
 import struct
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 
 from . import format_registry as fr
 
-CB_SERIALIZED_PAYLOAD_SCHEMA = "prismaquant.cb_serialized_payload.v1"
+CB_SERIALIZED_PAYLOAD_SCHEMA = "prismaquant.cb_serialized_payload.v2"
+LEGACY_CB_SERIALIZED_PAYLOAD_SCHEMA = "prismaquant.cb_serialized_payload.v1"
 CB_EXPORT_ARTIFACT_INVENTORY_SCHEMA = (
     "prismaquant.cb_export_artifact_inventory.v1"
 )
-WHOLE_ARTIFACT_BUDGET_SCHEMA = "prismaquant.whole_artifact_budget.v1"
+WHOLE_ARTIFACT_BUDGET_SCHEMA = "prismaquant.whole_artifact_budget.v2"
 WHOLE_ARTIFACT_BUDGET_FIELD = "whole_artifact_budget"
 CB_TENSOR_IDENTITY_FIELD = "cb_serialized_identity"
 CB_ASSIGNMENT_IDENTITIES_FIELD = "cb_serialized_identities"
 PRODUCTION_FP4_SCALE_CODING = "two_tier"
 LEGACY_FP4_SCALE_CODING = "v1"
+CB_RENDERER_ABI = "prismaquant.nvfp4_cb_renderer.v1"
+CB_ENCODE_TIER_DEFAULT = "balanced"
+CB_ENCODE_TIERS = frozenset({"fast", "balanced", "max"})
 _SCALE_CODINGS = {PRODUCTION_FP4_SCALE_CODING, LEGACY_FP4_SCALE_CODING}
 _LAYOUT_FOR_SCALE_CODING = {
     LEGACY_FP4_SCALE_CODING: 1,
@@ -97,6 +102,9 @@ class CBSerializationContext:
     scale_coding: str
     codebook_source: str
     layout_version: int | None = None
+    scale_sweep: bool = True
+    encode_tier: str = CB_ENCODE_TIER_DEFAULT
+    renderer_abi: str = CB_RENDERER_ABI
     codebook_refs: Mapping[str, str | Sequence[str]] | None = None
     codebook_content_digests: Mapping[str, str] | None = None
 
@@ -125,6 +133,30 @@ class CBSerializationContext:
         object.__setattr__(self, "scale_coding", coding)
         object.__setattr__(self, "codebook_source", source)
         object.__setattr__(self, "layout_version", layout)
+        if not isinstance(self.scale_sweep, bool):
+            raise TypeError(
+                "CB scale_sweep identity must be an explicit bool, got "
+                f"{self.scale_sweep!r}"
+            )
+        if coding == PRODUCTION_FP4_SCALE_CODING and not self.scale_sweep:
+            raise ValueError(
+                "CB layout-v2/two_tier requires scale_sweep=True; the "
+                "two-tier scale encoder has no defined one-shot render"
+            )
+        tier = str(self.encode_tier).strip().lower()
+        if tier not in CB_ENCODE_TIERS:
+            raise ValueError(
+                f"unknown CB encode_tier {self.encode_tier!r}; expected "
+                f"{sorted(CB_ENCODE_TIERS)}"
+            )
+        renderer_abi = str(self.renderer_abi).strip()
+        if renderer_abi != CB_RENDERER_ABI:
+            raise ValueError(
+                f"unsupported CB renderer_abi {renderer_abi!r}; rebuild "
+                f"with {CB_RENDERER_ABI!r}"
+            )
+        object.__setattr__(self, "encode_tier", tier)
+        object.__setattr__(self, "renderer_abi", renderer_abi)
         if self.codebook_refs is not None:
             normalized_refs: dict[str, str | tuple[str, ...]] = {}
             for qname, raw_refs in self.codebook_refs.items():
@@ -153,6 +185,8 @@ class CBSerializationContext:
     def production(
         cls,
         *,
+        scale_sweep: bool = True,
+        encode_tier: str = CB_ENCODE_TIER_DEFAULT,
         codebook_source: str = "lattice",
         codebook_refs: Mapping[str, str | Sequence[str]] | None = None,
         codebook_content_digests: Mapping[str, str] | None = None,
@@ -160,6 +194,8 @@ class CBSerializationContext:
         return cls(
             scale_coding=PRODUCTION_FP4_SCALE_CODING,
             layout_version=2,
+            scale_sweep=scale_sweep,
+            encode_tier=encode_tier,
             codebook_source=codebook_source,
             codebook_refs=codebook_refs,
             codebook_content_digests=codebook_content_digests,
@@ -169,6 +205,8 @@ class CBSerializationContext:
     def legacy_v1(
         cls,
         *,
+        scale_sweep: bool = True,
+        encode_tier: str = CB_ENCODE_TIER_DEFAULT,
         codebook_source: str = "lattice",
         codebook_refs: Mapping[str, str | Sequence[str]] | None = None,
         codebook_content_digests: Mapping[str, str] | None = None,
@@ -177,13 +215,19 @@ class CBSerializationContext:
         return cls(
             scale_coding=LEGACY_FP4_SCALE_CODING,
             layout_version=1,
+            scale_sweep=scale_sweep,
+            encode_tier=encode_tier,
             codebook_source=codebook_source,
             codebook_refs=codebook_refs,
             codebook_content_digests=codebook_content_digests,
         )
 
 
-def cb_serialization_context_stamp(context: CBSerializationContext) -> dict:
+def cb_serialization_context_stamp(
+    context: CBSerializationContext,
+    *,
+    formats: Sequence[str | fr.FormatSpec] | None = None,
+) -> dict:
     """Small identity stamp suitable for an allocator recipe's metadata."""
     if context is None:
         raise ValueError("CB serialization context stamp requires a context")
@@ -201,11 +245,40 @@ def cb_serialization_context_stamp(context: CBSerializationContext) -> dict:
         "scale_coding": context.scale_coding,
         "layout_version": context.layout_version,
         "codebook_source": context.codebook_source,
+        "scale_sweep": context.scale_sweep,
+        "encode_tier": context.encode_tier,
+        "renderer_abi": context.renderer_abi,
+        **({
+            "lattice_codebook_sha256_by_format": {
+                name: list(lattice_codebook_content_sha256(name))
+                for name in sorted({
+                    (
+                        item.name
+                        if isinstance(item, fr.FormatSpec)
+                        else fr.get_format(str(item)).name
+                    )
+                    for item in formats
+                    if is_cb_format(
+                        item.name if isinstance(item, fr.FormatSpec) else str(item)
+                    )
+                })
+            },
+        } if context.codebook_source == "lattice" and formats is not None else {}),
+        **({
+            "codebook_refs": {
+                str(name): (
+                    str(refs)
+                    if isinstance(refs, str)
+                    else list(refs)
+                )
+                for name, refs in sorted(context.codebook_refs.items())
+            },
+        } if context.codebook_refs is not None else {}),
         **({
             "codebook_content_sha256": dict(sorted(
                 context.codebook_content_digests.items()
             )),
-        } if context.codebook_source == "learned" else {}),
+        } if context.codebook_content_digests else {}),
     }
 
 
@@ -226,13 +299,26 @@ def cb_serialization_context_from_stamp(
             f"{where}: CB assignment is missing its serialized-payload "
             "context stamp"
         )
+    if stamp.get("schema") == LEGACY_CB_SERIALIZED_PAYLOAD_SCHEMA:
+        raise ValueError(
+            f"{where}: legacy CB serialized-payload v1 stamp has no exact "
+            "codebook-content identity; rebuild the cost/cache/assignment "
+            "with the v2 producer contract"
+        )
     if stamp.get("schema") != CB_SERIALIZED_PAYLOAD_SCHEMA:
         raise ValueError(
             f"{where}: unsupported CB serialized-payload schema "
             f"{stamp.get('schema')!r}"
         )
     missing = [
-        key for key in ("scale_coding", "layout_version", "codebook_source")
+        key for key in (
+            "scale_coding",
+            "layout_version",
+            "codebook_source",
+            "scale_sweep",
+            "encode_tier",
+            "renderer_abi",
+        )
         if stamp.get(key) is None
     ]
     if missing:
@@ -247,10 +333,45 @@ def cb_serialization_context_from_stamp(
             f"{where}: learned CB serialized-payload context is missing "
             "codebook_content_sha256"
         )
+    raw_lattice_digests = stamp.get("lattice_codebook_sha256_by_format")
+    if raw_lattice_digests is not None and not isinstance(
+        raw_lattice_digests, Mapping
+    ):
+        raise ValueError(
+            f"{where}: lattice codebook digest stamp is not an object"
+        )
+    if isinstance(raw_lattice_digests, Mapping):
+        for raw_format, raw_values in raw_lattice_digests.items():
+            canonical = fr.get_format(str(raw_format)).name
+            if not is_cb_format(canonical) or not isinstance(
+                raw_values, Sequence
+            ) or isinstance(raw_values, (str, bytes)):
+                raise ValueError(
+                    f"{where}: invalid lattice codebook digest entry for "
+                    f"{raw_format!r}"
+                )
+            observed_values = tuple(str(value) for value in raw_values)
+            expected_values = lattice_codebook_content_sha256(canonical)
+            if observed_values != expected_values:
+                raise ValueError(
+                    f"{where}: lattice codebook digest entry for {canonical} "
+                    "does not match canonical serialized bytes"
+                )
+    raw_refs = stamp.get("codebook_refs")
+    if raw_refs is not None and not isinstance(raw_refs, Mapping):
+        raise ValueError(f"{where}: CB codebook_refs stamp is not an object")
     return CBSerializationContext(
         scale_coding=str(stamp["scale_coding"]),
         layout_version=int(stamp["layout_version"]),
         codebook_source=str(stamp["codebook_source"]),
+        scale_sweep=stamp["scale_sweep"],
+        encode_tier=str(stamp["encode_tier"]),
+        renderer_abi=str(stamp["renderer_abi"]),
+        codebook_refs=(
+            {str(name): value for name, value in raw_refs.items()}
+            if isinstance(raw_refs, Mapping)
+            else None
+        ),
         codebook_content_digests=(
             {str(name): str(value) for name, value in raw_digests.items()}
             if isinstance(raw_digests, Mapping)
@@ -279,11 +400,15 @@ def cb_serialization_context_from_env(
         environ = os.environ
     scale = environ.get("CB_SCALE_CODING")
     source = environ.get("CB_CODEBOOK_SOURCE")
-    if require_explicit and (not scale or not source):
+    raw_sweep = environ.get("CB_SCALE_SWEEP")
+    raw_tier = environ.get("PRISMAQUANT_CB_ENCODE_TIER")
+    if require_explicit and (not scale or not source or raw_sweep is None or not raw_tier):
         missing = [
             name for name, value in (
                 ("CB_SCALE_CODING", scale),
                 ("CB_CODEBOOK_SOURCE", source),
+                ("CB_SCALE_SWEEP", raw_sweep),
+                ("PRISMAQUANT_CB_ENCODE_TIER", raw_tier),
             ) if not value
         ]
         raise ValueError(
@@ -295,11 +420,59 @@ def cb_serialization_context_from_env(
         if digest_source
         else None
     )
+    scale_sweep = _parse_bool_setting(
+        raw_sweep,
+        default=True,
+        name="CB_SCALE_SWEEP",
+        where=where,
+    )
     return CBSerializationContext(
         scale_coding=scale or PRODUCTION_FP4_SCALE_CODING,
         codebook_source=source or "lattice",
+        scale_sweep=scale_sweep,
+        encode_tier=resolve_cb_encode_tier(raw_tier, environ=environ),
         codebook_content_digests=digests,
     )
+
+
+def _parse_bool_setting(
+    raw: object,
+    *,
+    default: bool,
+    name: str,
+    where: str,
+) -> bool:
+    if raw is None:
+        return bool(default)
+    value = str(raw).strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(
+        f"{where}: {name} must be a boolean 0/1 setting, got {raw!r}"
+    )
+
+
+def resolve_cb_encode_tier(
+    raw: object | None = None,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> str:
+    """Resolve the encoder tier once so every render receives it explicitly."""
+    if raw is None:
+        if environ is None:
+            import os
+
+            environ = os.environ
+        raw = environ.get("PRISMAQUANT_CB_ENCODE_TIER")
+    tier = str(raw or CB_ENCODE_TIER_DEFAULT).strip().lower()
+    if tier not in CB_ENCODE_TIERS:
+        raise ValueError(
+            f"unknown CB encode tier {tier!r}; expected "
+            f"{sorted(CB_ENCODE_TIERS)}"
+        )
+    return tier
 
 
 def load_cb_codebook_digest_manifest(
@@ -340,8 +513,17 @@ def validate_cb_serialization_context_stamp(
         return
     if not isinstance(stamp, Mapping):
         raise TypeError(f"{where}: CB serialized-payload stamp is not an object")
+    cb_serialization_context_from_stamp(stamp, where=where)
     expected = cb_serialization_context_stamp(context)
-    base_keys = ("schema", "scale_coding", "layout_version", "codebook_source")
+    base_keys = (
+        "schema",
+        "scale_coding",
+        "layout_version",
+        "codebook_source",
+        "scale_sweep",
+        "encode_tier",
+        "renderer_abi",
+    )
     observed = {key: stamp.get(key) for key in base_keys}
     expected_base = {key: expected.get(key) for key in base_keys}
     if observed != expected_base:
@@ -349,6 +531,32 @@ def validate_cb_serialization_context_stamp(
             f"{where}: CB serialization context differs from allocator "
             f"recipe: recipe={observed}, exporter={expected_base}"
         )
+    observed_refs = stamp.get("codebook_refs")
+    if context.codebook_refs is not None and isinstance(
+        observed_refs, Mapping
+    ):
+        missing_refs = sorted(set(context.codebook_refs) - set(observed_refs))
+        mismatched_refs = sorted(
+            name
+            for name, refs in context.codebook_refs.items()
+            if name in observed_refs
+            and (
+                (str(observed_refs[name]),)
+                if isinstance(observed_refs[name], str)
+                else tuple(str(item) for item in observed_refs[name])
+            )
+            != (
+                (str(refs),)
+                if isinstance(refs, str)
+                else tuple(str(item) for item in refs)
+            )
+        )
+        if missing_refs or mismatched_refs:
+            raise ValueError(
+                f"{where}: CB physical codebook refs differ from allocator "
+                f"recipe: missing={missing_refs[:8]}, "
+                f"mismatched={mismatched_refs[:8]}"
+            )
     if context.codebook_source == "learned":
         observed_digests = stamp.get("codebook_content_sha256")
         if not isinstance(observed_digests, Mapping):
@@ -382,7 +590,12 @@ def cb_cost_provenance(
     if not any(is_cb_format(name) for name in names):
         return {}
     ctx = context or cb_serialization_context_from_env()
-    return {"cb_serialized_payload": cb_serialization_context_stamp(ctx)}
+    return {
+        "cb_serialized_payload": cb_serialization_context_stamp(
+            ctx,
+            formats=names,
+        ),
+    }
 
 
 def validate_cb_cost_provenance(
@@ -409,6 +622,23 @@ def validate_cb_cost_provenance(
             "refusing a cache whose scale layout/codebook source is unknown"
         )
     validate_cb_serialization_context_stamp(stamp, context, where=where)
+    if context.codebook_source == "lattice":
+        expected_lattice = {
+            fr.get_format(name).name: list(
+                lattice_codebook_content_sha256(fr.get_format(name).name)
+            )
+            for name in names
+            if is_cb_format(name)
+        }
+        observed_lattice = stamp.get("lattice_codebook_sha256_by_format")
+        if not isinstance(observed_lattice, Mapping) or any(
+            observed_lattice.get(name) != digests
+            for name, digests in expected_lattice.items()
+        ):
+            raise ValueError(
+                f"{where}: CB cost payload does not identify the exact "
+                "canonical lattice bytes for its measured format menu"
+            )
 
 
 def _cb_info(format_name: str) -> tuple[str, str, int] | None:
@@ -433,6 +663,39 @@ def _cb_info(format_name: str) -> tuple[str, str, int] | None:
 
 def is_cb_format(format_name: str) -> bool:
     return _cb_info(format_name) is not None
+
+
+@lru_cache(maxsize=None)
+def lattice_codebook_content_sha256(format_name: str) -> tuple[str, ...]:
+    """Exact FP16 payload digests for the canonical lattice sidecar tables."""
+    canonical = str(format_name).strip().upper()
+    info = _cb_info(canonical)
+    if info is None:
+        raise ValueError(f"{format_name!r} is not a CB format")
+    grid, mode, k = info
+    import torch
+
+    from . import nvfp4_cb_formats as cb
+
+    if mode == "product":
+        n_sub = 2 if grid == "fp4" else 4
+        sub_dim = _VEC_DIM // n_sub
+        tables = tuple(
+            cb.fixed_lattice(bits, grid, sub_dim)
+            for bits in _bit_split(k, n_sub)
+        )
+    elif mode == "signed":
+        tables = (
+            cb.fixed_lattice(k - _VEC_DIM, grid, _VEC_DIM, positive=True),
+        )
+    else:
+        tables = (cb.fixed_lattice(k, grid, _VEC_DIM),)
+    return tuple(
+        hashlib.sha256(
+            tensor.to(torch.float16).cpu().contiguous().numpy().tobytes()
+        ).hexdigest()
+        for tensor in tables
+    )
 
 
 def cb_quantize_dequantize_for_context(
@@ -474,7 +737,9 @@ def cb_quantize_dequantize_for_context(
         mode=mode,
         col_weights=col_weights,
         codebook=codebook,
+        scale_sweep=context.scale_sweep,
         scale_coding=coding,
+        encode_tier=context.encode_tier,
     )
     return nvfp4_cb_reconstruct(
         fields,
@@ -590,11 +855,29 @@ def cb_serialization_metadata_from_assignment_payload(
     )
 
 
+def assignment_serialization_sha256(
+    assignment: Mapping[str, str],
+) -> str:
+    """Canonical SHA-256 binding a byte budget to one exact assignment."""
+    normalized = {
+        str(name): fr.canonical_format_name(str(fmt).strip().upper())
+        for name, fmt in assignment.items()
+    }
+    encoded = json.dumps(
+        normalized,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def whole_artifact_budget_stamp(
     *,
     budget_bytes: int,
     selection_tensor_payload_bytes: int,
     selection_non_tensor_reserve_bytes: int,
+    selection_assignment: Mapping[str, str],
 ) -> dict:
     """Persist the conservative selection contract consumed by exporters."""
     values = {
@@ -620,6 +903,9 @@ def whole_artifact_budget_stamp(
         "selection_tensor_payload_bytes": selection_tensor_payload_bytes,
         "selection_non_tensor_reserve_bytes": selection_non_tensor_reserve_bytes,
         "selection_whole_artifact_upper_bound_bytes": upper_bound,
+        "selection_assignment_sha256": assignment_serialization_sha256(
+            selection_assignment
+        ),
         "selection_contract": (
             "tensor_payload_plus_operator_supplied_non_tensor_reserve"
         ),
@@ -631,6 +917,7 @@ def whole_artifact_budget_from_assignment_payload(
     payload: Mapping[str, object],
     *,
     where: str,
+    assignment: Mapping[str, str] | None = None,
 ) -> Mapping[str, object] | None:
     """Read and validate an optional hard export-directory budget stamp."""
     meta = payload.get("__prismaquant__")
@@ -680,6 +967,22 @@ def whole_artifact_budget_from_assignment_payload(
             f"{where}: selected whole-artifact upper bound {expected_upper}B "
             f"exceeds budget {parsed['budget_bytes']}B"
         )
+    assignment_digest = raw.get("selection_assignment_sha256")
+    if not isinstance(assignment_digest, str) or not re.fullmatch(
+        r"[0-9a-f]{64}", assignment_digest
+    ):
+        raise ValueError(
+            f"{where}: whole-artifact budget stamp has no valid exact "
+            "selection_assignment_sha256"
+        )
+    if assignment is not None:
+        actual_digest = assignment_serialization_sha256(assignment)
+        if actual_digest != assignment_digest:
+            raise ValueError(
+                f"{where}: whole-artifact budget was priced for assignment "
+                f"{assignment_digest}, but the assignment being consumed "
+                f"hashes to {actual_digest}"
+            )
     return dict(raw)
 
 
@@ -702,11 +1005,13 @@ def enforce_whole_artifact_budget(
     assignment_payload: Mapping[str, object],
     *,
     where: str,
+    assignment: Mapping[str, str] | None = None,
 ) -> dict | None:
     """Hard-fail a completed file/directory against its persisted budget."""
     stamp = whole_artifact_budget_from_assignment_payload(
         assignment_payload,
         where=where,
+        assignment=assignment,
     )
     if stamp is None:
         return None
@@ -777,6 +1082,11 @@ def _physical_codebook_refs(
                 f"{qname}: {format_name} needs {expected_count} codebook "
                 f"subtable ref(s), got {len(refs)}"
             )
+        if len(set(refs)) != len(refs):
+            raise ValueError(
+                f"{qname}: {format_name} repeats a physical codebook ref "
+                f"within one table set: {list(refs)}"
+            )
         return tuple(str(item) for item in refs)
 
     logical = _default_logical_ref(qname, context.codebook_source)
@@ -805,6 +1115,20 @@ def _sidecar_identity(
                 "alone cannot prove render/export byte identity"
             )
         content_sha256 = [digests[ref] for ref in refs]
+    else:
+        content_sha256 = list(lattice_codebook_content_sha256(canonical))
+        supplied_digests = context.codebook_content_digests or {}
+        mismatched = [
+            ref
+            for ref, digest in zip(refs, content_sha256, strict=True)
+            if ref in supplied_digests and supplied_digests[ref] != digest
+        ]
+        if mismatched:
+            raise ValueError(
+                f"{qname}: lattice {canonical} materialized codebook bytes "
+                f"do not match the canonical lattice identity for "
+                f"{mismatched}"
+            )
     return {
         "format": canonical,
         "codebook_source": context.codebook_source,
@@ -812,8 +1136,7 @@ def _sidecar_identity(
         "dtype": "float16",
         "subtable_shapes": [list(shape) for shape in shapes],
         "payload_bytes": codebook_sidecar_payload_bytes(canonical),
-        **({"content_sha256": content_sha256}
-           if content_sha256 is not None else {}),
+        "content_sha256": content_sha256,
     }
 
 
@@ -876,6 +1199,9 @@ def cb_tensor_payload_breakdown(
         "k": k,
         "artifact_scale_coding": context.scale_coding,
         "layout_version": context.layout_version,
+        "scale_sweep": context.scale_sweep,
+        "encode_tier": context.encode_tier,
+        "renderer_abi": context.renderer_abi,
         "tensor_scale_coding": context.scale_coding if grid == "fp4" else "none",
         "type_size": (4 * k + (9 if context.scale_coding ==
                                PRODUCTION_FP4_SCALE_CODING else 16))
@@ -929,6 +1255,7 @@ def cb_assignment_payload_breakdown(
         )
     per_tensor: dict[str, dict] = {}
     sidecars: dict[str, dict] = {}
+    sidecar_key_by_ref: dict[str, str] = {}
     totals = {
         "index_bytes": 0,
         "fp4_scale_bytes": 0,
@@ -948,13 +1275,39 @@ def cb_assignment_payload_breakdown(
         for key in totals:
             totals[key] += int(item[key])
         sidecar_key = item["sidecar_identity_key"]
+        sidecar_identity = item["sidecar_identity"]
+        refs = tuple(str(ref) for ref in sidecar_identity["codebook_ref"])
+        overlapping_keys = {
+            sidecar_key_by_ref[ref]
+            for ref in refs
+            if ref in sidecar_key_by_ref
+        }
+        if overlapping_keys and overlapping_keys != {sidecar_key}:
+            raise ValueError(
+                f"{qname}: physical CB codebook refs are partially shared or "
+                "reused with conflicting shape/content identity. Explicit "
+                "ref sets must be disjoint or completely identical; "
+                f"refs={list(refs)}, prior_identity_keys="
+                f"{sorted(overlapping_keys)}"
+            )
         previous = sidecars.get(sidecar_key)
         if previous is None:
-            sidecars[sidecar_key] = item["sidecar_identity"]
-        elif previous != item["sidecar_identity"]:
+            if overlapping_keys:
+                raise ValueError(
+                    f"{qname}: physical CB codebook refs overlap a prior "
+                    "sidecar without an identical complete identity"
+                )
+            sidecars[sidecar_key] = sidecar_identity
+            sidecar_key_by_ref.update({ref: sidecar_key for ref in refs})
+        elif previous != sidecar_identity:
             raise ValueError(
                 f"conflicting CB sidecar identity for {qname}: {previous} vs "
-                f"{item['sidecar_identity']}"
+                f"{sidecar_identity}"
+            )
+        elif any(sidecar_key_by_ref.get(ref) != sidecar_key for ref in refs):
+            raise ValueError(
+                f"{qname}: identical CB sidecar identity did not resolve to "
+                "the same complete physical ref set"
             )
     sidecar_bytes = sum(int(item["payload_bytes"]) for item in sidecars.values())
     total_bytes = totals["tensor_payload_bytes"] + sidecar_bytes
@@ -964,6 +1317,9 @@ def cb_assignment_payload_breakdown(
             "scale_coding": context.scale_coding,
             "layout_version": context.layout_version,
             "codebook_source": context.codebook_source,
+            "scale_sweep": context.scale_sweep,
+            "encode_tier": context.encode_tier,
+            "renderer_abi": context.renderer_abi,
         },
         **{key: int(value) for key, value in totals.items()},
         "codebook_sidecar_bytes": int(sidecar_bytes),
@@ -1180,6 +1536,15 @@ def cb_export_artifact_inventory(
     if not files:
         raise AssertionError(f"{root}: CB export produced no files")
 
+    if (
+        expected_model_files is not None
+        and "model.safetensors.index.json" in files
+    ):
+        raise AssertionError(
+            f"{root}: unexpected/stale model.safetensors.index.json is "
+            "present beside the fresh CB export plan"
+        )
+
     stale_codebook_files = sorted(
         name
         for name in files
@@ -1292,7 +1657,7 @@ def cb_export_artifact_inventory(
             len(refs) != len(digests)
         ):
             raise AssertionError(
-                f"{root}: invalid learned-codebook digest identity"
+                f"{root}: invalid codebook digest identity"
             )
         for ref, digest in zip(refs, digests):
             ref_name = str(ref)
@@ -1302,14 +1667,14 @@ def cb_export_artifact_inventory(
             )
             if previous != digest_value:
                 raise AssertionError(
-                    f"{root}: conflicting learned-codebook digests for "
+                    f"{root}: conflicting codebook digests for "
                     f"{ref_name!r}"
                 )
     actual_codebook_digests: dict[str, str] = {}
     if expected_codebook_digests:
         if codebook_file is None:
             raise AssertionError(
-                f"{root}: learned-codebook identity has no sidecar file"
+                f"{root}: codebook identity has no sidecar file"
             )
         actual_codebook_digests = _safetensors_tensor_payload_sha256(
             root / codebook_file,
@@ -1322,7 +1687,7 @@ def cb_export_artifact_inventory(
         )
         if mismatched:
             raise AssertionError(
-                f"{root}: final learned-codebook bytes differ from their "
+                f"{root}: final codebook bytes differ from their "
                 f"content identity: {mismatched[:12]}"
             )
     cb_codebook_bytes = sum(codebook_spans.values())
@@ -1380,12 +1745,6 @@ def cb_export_artifact_inventory(
         } if actual_codebook_digests else {}),
         **({
             "whole_artifact_budget_bytes": whole_artifact_budget_bytes,
-            "within_whole_artifact_budget": bool(
-                directory_bytes <= whole_artifact_budget_bytes
-            ),
-            "whole_artifact_budget_headroom_bytes": int(
-                whole_artifact_budget_bytes - directory_bytes
-            ),
         } if whole_artifact_budget_bytes is not None else {}),
     }
 
@@ -1407,6 +1766,12 @@ def finalize_cb_export_artifact_inventory(
     continue until the embedded inventory equals the bytes on disk.  The
     representation contains sizes rather than a self-hash and converges in a
     handful of iterations; failure to converge is a hard exporter error.
+
+    Derived budget state (headroom and within-budget) is deliberately not
+    persisted in the self-sized JSON.  Embedding decimal headroom can create a
+    two-cycle at digit boundaries: changing 10 to 9 shrinks the JSON by one
+    byte, which changes the headroom back to 10.  The final hard check derives
+    those values from the stable directory size instead.
     """
     root = Path(out_dir)
     provenance = quant_config.setdefault("provenance", {})
@@ -1431,16 +1796,20 @@ def finalize_cb_export_artifact_inventory(
             whole_artifact_budget_bytes=whole_artifact_budget_bytes,
         )
         if provenance.get("artifact_inventory") == inventory:
-            if (
-                whole_artifact_budget_bytes is not None
-                and not inventory["within_whole_artifact_budget"]
+            if whole_artifact_budget_bytes is not None and (
+                inventory["export_directory_bytes"]
+                > whole_artifact_budget_bytes
             ):
+                overage_bytes = int(
+                    inventory["export_directory_bytes"]
+                    - whole_artifact_budget_bytes
+                )
                 raise RuntimeError(
                     f"{root}: exact recursive export size is "
                     f"{inventory['export_directory_bytes']}B, exceeding the "
                     f"hard whole-artifact budget of "
                     f"{whole_artifact_budget_bytes}B by "
-                    f"{-inventory['whole_artifact_budget_headroom_bytes']}B"
+                    f"{overage_bytes}B"
                 )
             return inventory
         provenance["artifact_inventory"] = inventory

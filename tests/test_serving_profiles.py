@@ -450,6 +450,7 @@ def test_gguf_lane_declaration_matches_the_exporters_own_gate():
     """Both GGUF exporters gate emission on `fmt in GGUF_BLOCK_BYTES`; the
     lane derives its menu from that same object, and every entry has a
     field codec behind it."""
+    pytest.importorskip("gguf")
     import prismaquant.export_gguf as export_gguf
     import prismaquant.export_gguf_direct as export_gguf_direct
     from prismaquant import gguf_formats

@@ -22,6 +22,12 @@ NON_WEIGHTED_FORMATS = ["NVFP4", "FP8_E4M3", "MXFP4", "MXFP8_E4M3", "BF16"]
 WEIGHTED_FORMATS = ["NVFP4_CB_K16", "FP8_CB_K32", "Q4_K"]
 
 
+def _cb_context():
+    from prismaquant.nvfp4_cb_footprint import CBSerializationContext
+
+    return CBSerializationContext.production()
+
+
 def _render(fmt, weight, acts, col_weights, levers=None):
     import prismaquant.production_weight_cache as pwc
 
@@ -32,6 +38,9 @@ def _render(fmt, weight, acts, col_weights, levers=None):
         activations={"lin": acts},
         levers={"gptq": True} if levers is None else levers,
         col_weights=col_weights,
+        cb_serialization_context=(
+            _cb_context() if "_CB_" in str(fmt).upper() else None
+        ),
     )
 
 
@@ -135,6 +144,21 @@ def test_production_cb_render_requires_col_weights(fmt):
         _render(fmt, torch.randn(8, 256), torch.randn(32, 256), None)
 
 
+@pytest.mark.parametrize("fmt", ["NVFP4_CB_K16", "FP8_CB_K32"])
+def test_production_cb_render_requires_explicit_serialization_context(fmt):
+    import prismaquant.production_weight_cache as pwc
+
+    with pytest.raises(ValueError, match="explicit CBSerializationContext"):
+        pwc.render_production_weight(
+            torch.randn(8, 256),
+            fmt,
+            qname="lin",
+            activations={"lin": torch.randn(32, 256)},
+            levers={"gptq": True},
+            col_weights=torch.ones(256),
+        )
+
+
 def test_packed_expert_col_weight_slicing_matches_the_cost_convention():
     """`_expert_col_weights` and `measure_quant_cost._item_col_weights` are the
     same convention; a divergence would weight cost and cache differently."""
@@ -160,6 +184,25 @@ def test_build_cache_col_weights_refuses_the_confounding_combinations():
         _load_col_weights(None, ["NVFP4_CB_K16", "BF16"])
     with pytest.raises(SystemExit, match="no weighted-render family"):
         _load_col_weights("unused.pkl", ["NVFP4", "BF16"])
+
+
+def test_build_cache_cb_context_requires_explicit_producer_settings(monkeypatch):
+    from prismaquant.build_production_cache import _explicit_cb_render_context
+
+    monkeypatch.delenv("CB_SCALE_CODING", raising=False)
+    monkeypatch.delenv("CB_CODEBOOK_SOURCE", raising=False)
+    monkeypatch.delenv("CB_SCALE_SWEEP", raising=False)
+    monkeypatch.delenv("PRISMAQUANT_CB_ENCODE_TIER", raising=False)
+    with pytest.raises(SystemExit, match="missing explicit CB producer"):
+        _explicit_cb_render_context(["NVFP4_CB_K16"])
+
+    monkeypatch.setenv("CB_SCALE_CODING", "v1")
+    monkeypatch.setenv("CB_CODEBOOK_SOURCE", "lattice")
+    monkeypatch.setenv("CB_SCALE_SWEEP", "1")
+    monkeypatch.setenv("PRISMAQUANT_CB_ENCODE_TIER", "balanced")
+    context = _explicit_cb_render_context(["NVFP4_CB_K16"])
+    assert context.scale_coding == "v1"
+    assert context.layout_version == 1
 
 
 def test_direct_cb_kl_swapper_requires_production_col_weights():
