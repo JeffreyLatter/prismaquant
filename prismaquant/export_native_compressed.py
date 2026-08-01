@@ -901,8 +901,15 @@ def _nvfp4_input_gscale_fp8_range_enabled() -> bool:
     only behind a per-artifact served A/B (the scale is a free
     post-export knob: patch input_global_scale in place, re-measure).
     """
-    return os.environ.get(
-        "PRISMAQUANT_NVFP4_INPUT_GSCALE_FP8_RANGE", "0") == "1"
+    from prismaquant.nvfp4_activation_contract import (
+        FULL_E4M3_INPUT_GLOBAL_SCALE_POLICY,
+        resolve_input_global_scale_policy,
+    )
+
+    return (
+        resolve_input_global_scale_policy()
+        == FULL_E4M3_INPUT_GLOBAL_SCALE_POLICY
+    )
 
 
 def _nvfp4_input_global_scale_from_max_abs(max_abs: float) -> float:
@@ -918,9 +925,15 @@ def _nvfp4_input_global_scale_from_max_abs(max_abs: float) -> float:
     max_abs = float(max_abs)
     if max_abs <= 0.0:
         return float(DEFAULT_INPUT_GLOBAL_SCALE)
-    if _nvfp4_input_gscale_fp8_range_enabled():
-        return float(_FP8_E4M3_MAX * _FP4_E2M1_MAX / max_abs)
-    return float(_FP4_E2M1_MAX / max_abs)
+    from prismaquant.nvfp4_activation_contract import (
+        input_global_scale_from_max_abs,
+        resolve_input_global_scale_policy,
+    )
+
+    return input_global_scale_from_max_abs(
+        max_abs,
+        policy=resolve_input_global_scale_policy(),
+    )
 
 
 def compute_nvfp4_input_global_scale(activations: torch.Tensor) -> float:

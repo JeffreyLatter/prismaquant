@@ -5,12 +5,16 @@ exporter (no silent RTN) and the local packed-expert cost (lockstep)."""
 from __future__ import annotations
 
 import json
+import hashlib
 
 import pytest
 import torch
-from safetensors.torch import save_file
+from safetensors.torch import load_file, save_file
 
-from prismaquant.moe_imatrix import synthesize_packed_expert_col_weights
+from prismaquant.moe_imatrix import (
+    RoutedActivationSamples,
+    synthesize_packed_expert_col_weights,
+)
 
 HID, INTER, E = 16, 8, 2
 
@@ -46,6 +50,81 @@ def ckpt(tmp_path):
                 "name": "model.layers.0.self_attn.q_proj"},
                act_dir / "model__layers__0__self_attn__q_proj.pt")
     return model_dir, act_dir
+
+
+def test_routed_down_samples_preserve_route_and_token_metadata(ckpt):
+    model_dir, act_dir = ckpt
+    entry = act_dir / "model__layers__0__mlp__experts.pt"
+    blob = torch.load(entry, map_location="cpu", weights_only=False)
+    blob["row_indices"] = torch.arange(1000, 1064)
+    torch.save(blob, entry)
+    config_path = model_dir / "config.json"
+    config = json.loads(config_path.read_text())
+    config["num_experts_per_tok"] = 2
+    config["model_type"] = "laguna"
+    config["moe_router_logit_softcapping"] = 1.5
+    config["moe_routed_scaling_factor"] = 2.5
+    config_path.write_text(json.dumps(config))
+    weights_with_bias = load_file(str(model_dir / "model.safetensors"))
+    weights_with_bias[
+        "model.layers.0.mlp.experts.e_score_correction_bias"
+    ] = torch.tensor([0.35, -0.2])
+    save_file(weights_with_bias, str(model_dir / "model.safetensors"))
+
+    samples: dict = {}
+    down_name = "model.layers.0.mlp.experts.down_proj"
+    synthesize_packed_expert_col_weights(
+        model_dir,
+        act_dir,
+        {},
+        profile=_IdentityProfile(),
+        device="cpu",
+        max_rows=64,
+        activation_samples=samples,
+        target_names={down_name},
+    )
+    routed = samples[down_name]
+    assert isinstance(routed, RoutedActivationSamples)
+    routed.validate()
+    assert routed.values.shape == (64, INTER)
+
+    weights = load_file(str(model_dir / "model.safetensors"))
+    x = blob["inputs"].float()
+    logits = x @ weights["model.layers.0.mlp.gate.weight"].float().t()
+    logits = torch.tanh(logits / 1.5) * 1.5
+    scores = torch.sigmoid(logits)
+    selection_scores = scores + weights[
+        "model.layers.0.mlp.experts.e_score_correction_bias"
+    ]
+    _, topi = torch.topk(selection_scores, 2, dim=-1)
+    topv = torch.gather(scores, -1, topi)
+    topv = topv / topv.sum(dim=-1, keepdim=True) * 2.5
+    seed = int.from_bytes(
+        hashlib.sha256("model.layers.0.mlp.experts".encode()).digest()[:8],
+        "little",
+    ) & ((1 << 63) - 1)
+    generator = torch.Generator().manual_seed(seed)
+    sampled_flat = torch.randperm(128, generator=generator)[:64].sort().values
+    sampled_rows = torch.div(sampled_flat, 2, rounding_mode="floor")
+    sampled_slots = sampled_flat.remainder(2)
+    expected_experts = topi[sampled_rows, sampled_slots]
+    assert torch.equal(routed.cache_row_indices, sampled_rows)
+    assert torch.equal(routed.source_row_indices, sampled_rows + 1000)
+    assert torch.equal(routed.route_slots, sampled_slots)
+    assert torch.equal(routed.expert_indices, expected_experts)
+    assert torch.equal(routed.route_weights, topv[sampled_rows, sampled_slots])
+
+    expected_values = []
+    for row, expert in zip(sampled_rows, routed.expert_indices, strict=True):
+        expert_id = int(expert.item())
+        gate = x[row] @ weights[
+            f"model.layers.0.mlp.experts.{expert_id}.gate_proj.weight"
+        ].float().t()
+        up = x[row] @ weights[
+            f"model.layers.0.mlp.experts.{expert_id}.up_proj.weight"
+        ].float().t()
+        expected_values.append(torch.nn.functional.silu(gate) * up)
+    assert torch.allclose(routed.values, torch.stack(expected_values))
 
 
 def test_synthesizes_gateup_and_down(ckpt):

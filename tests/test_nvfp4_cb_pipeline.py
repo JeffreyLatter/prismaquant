@@ -248,8 +248,9 @@ def test_cb_candidate_bytes_use_v2_payload_and_require_context():
         cb_serialization_context=_CB_CONTEXT,
     )[name]
     by_fmt = {candidate.fmt: candidate for candidate in candidates}
-    # FP4 v2: one 256-weight superblock per row, 4k+9 = 73 bytes.
-    assert by_fmt["NVFP4_CB_K16"].memory_bytes == 64 * 73
+    # FP4 production-static: one 256-weight superblock per row (4k+9 =
+    # 73 bytes) plus one exact F32 input_global_scale for the target.
+    assert by_fmt["NVFP4_CB_K16"].memory_bytes == 64 * 73 + 4
     # FP8: 4k index bytes per row plus one fp32 row scale.
     assert by_fmt["FP8_CB_K44"].memory_bytes == 64 * (4 * 44 + 4)
     assert "two_tier" in by_fmt["NVFP4_CB_K16"].serialized_identity
@@ -766,6 +767,25 @@ def _write_layer_config(tmp_path, assignment: dict) -> str:
     return str(p)
 
 
+def _write_activation_cache(
+    tmp_path,
+    target_widths: dict[str, int],
+) -> str:
+    act_dir = _Path(tmp_path) / "act"
+    act_dir.mkdir(exist_ok=True)
+    generator = torch.Generator().manual_seed(321)
+    for qname, width in target_widths.items():
+        torch.save(
+            {
+                "name": qname,
+                "inputs": torch.randn(7, width, generator=generator),
+                "row_indices": torch.arange(7),
+            },
+            act_dir / (qname.replace(".", "__") + ".pt"),
+        )
+    return str(act_dir)
+
+
 def _write_production_cb_layer_config(
     tmp_path,
     assignment: dict[str, str],
@@ -909,8 +929,13 @@ def test_mixed_container_config_groups_schema(tmp_path):
         tmp_path, assignment, source_weights, col_weights
     )
     out = _Path(tmp_path) / "exp"
+    activation_cache = _write_activation_cache(
+        tmp_path,
+        {qcb: 256, qnv: 512},
+    )
     export_nvfp4_cb(str(model_dir), lc, str(out),
-                    col_weights=col_weights, device="cpu")
+                    col_weights=col_weights, device="cpu",
+                    activation_cache_dir=activation_cache)
     qc = _json.loads((out / "quant_config.json").read_text())
     groups = qc["config_groups"]
     # CB groups carry a "scheme" (custom vocab); stock CT groups do NOT (the
@@ -948,9 +973,12 @@ def test_mixed_container_config_groups_schema(tmp_path):
             "scale_sweep",
             "encode_tier",
             "renderer_abi",
+            "activation_contract",
+            "activation_execution",
         )
     }
-    assert payload["tensor_payload_bytes"] == 128 * (4 * 16 + 9)
+    assert payload["tensor_payload_bytes"] == 128 * (4 * 16 + 9) + 4
+    assert payload["input_global_scale_bytes"] == 4
     assert payload["codebook_sidecar_bytes"] == 2 * 256 * 4 * 2
     assert payload["global_scale_bytes"] == 0
     inventory = qc["provenance"]["artifact_inventory"]
@@ -1092,19 +1120,23 @@ def test_exporter_resolves_nested_prefix_skeleton(tmp_path, monkeypatch):
     monkeypatch.setattr(model_profiles, "detect_profile",
                         lambda *a, **k: _NestedVLMProfile())
     out = _Path(tmp_path) / "exp"
+    activation_cache = _write_activation_cache(tmp_path, {canon: 256})
     export_nvfp4_cb(str(model_dir), lc, str(out),
-                    col_weights=col_weights, device="cpu")
+                    col_weights=col_weights, device="cpu",
+                    activation_cache_dir=activation_cache)
     st = load_file(str(out / "model.safetensors"))
     # Packed tensor carries the NESTED (checkpoint/vLLM) name, not the recipe one.
     assert f"{nested}.cb_qweight" in st, sorted(st)
     assert f"{canon}.cb_qweight" not in st
-    # config_groups target is the CANONICAL name so the plugin matches the
-    # modules vLLM actually instantiates. (Artifacts exported before 3be09e4
-    # carry checkpoint-namespace targets; the plugin canonicalizes those at
-    # parse time — e765301 — so back-compat lives there, not here.)
+    # Contracted config_groups targets use the exact physical tensor prefix.
+    # Gridbook preserves that pre-canonicalization spelling for activation
+    # attestation while its module matcher performs the serving-name rewrite.
     qc = _json.loads((out / "quant_config.json").read_text())
     cb_g = next(g for g in qc["config_groups"].values() if "scheme" in g)
-    assert canon in cb_g["targets"] and nested not in cb_g["targets"]
+    assert nested in cb_g["targets"] and canon not in cb_g["targets"]
+    activation_record = qc["execution_contracts"]["nvfp4_w4a4"]
+    assert activation_record["target_names"] == [nested]
+    assert f"{nested}.input_global_scale" in st
     # Non-target tensors copied verbatim under their checkpoint names.
     assert "model.language_model.norm.weight" in st
     assert "model.visual.patch_embed.weight" in st
@@ -1135,8 +1167,10 @@ def test_codebook_pqcb_sidecar_contract(tmp_path):
         tmp_path, assignment, source_weights, col_weights
     )
     out = _Path(tmp_path) / "exp"
+    activation_cache = _write_activation_cache(tmp_path, {qcb: 256})
     export_nvfp4_cb(str(model_dir), lc, str(out),
-                    col_weights=col_weights, device="cpu")
+                    col_weights=col_weights, device="cpu",
+                    activation_cache_dir=activation_cache)
     qc = _json.loads((out / "quant_config.json").read_text())
     cfg = _json.loads((out / "config.json").read_text())
     assert qc["codebook_file"] == "cb_codebooks.pqcb"

@@ -166,7 +166,9 @@ def test_assignment_artifact_bytes_cb_uses_exact_tensor_and_shared_sidecar():
         source_manifest=None,
         cb_serialization_context=CBSerializationContext.production(),
     )
-    tensor_bytes = 2 * 64 * (4 * 16 + 9)
+    # Static fused-W4A4 contract adds one canonical F32
+    # input_global_scale scalar per FP4-CB target.
+    tensor_bytes = 2 * 64 * (4 * 16 + 9) + 2 * 4
     sidecar_bytes = 2 * 256 * 4 * 2
     assert result["floor_bytes"] == 1234
     assert result["cb_tensor_payload_bytes"] == tensor_bytes
@@ -177,6 +179,9 @@ def test_assignment_artifact_bytes_cb_uses_exact_tensor_and_shared_sidecar():
     assert result["artifact_byte_scope"] == "safetensors_tensor_data_spans"
     assert result["export_directory_bytes"] is None
     assert result["cb_serialized_payload"]["global_scale_bytes"] == 0
+    assert result["cb_serialized_payload"][
+        "input_global_scale_bytes"
+    ] == 8
 
 
 def test_assignment_artifact_bytes_missing_stats_stay_in_floor():

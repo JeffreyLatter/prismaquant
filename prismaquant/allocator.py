@@ -2040,11 +2040,18 @@ def main():
                 "tensor mapping"
             )
         try:
+            from prismaquant.nvfp4_activation_contract import (
+                NVFP4_ACTIVATION_CONTRACT_SCHEMA,
+                NVFP4_ACTIVATION_EXECUTION,
+            )
+
             cb_serialization_context = CBSerializationContext(
                 scale_coding=args.cb_scale_coding,
                 codebook_source=args.cb_codebook_source,
                 scale_sweep=args.cb_scale_sweep == "1",
                 encode_tier=args.cb_encode_tier,
+                activation_contract=NVFP4_ACTIVATION_CONTRACT_SCHEMA,
+                activation_execution=NVFP4_ACTIVATION_EXECUTION,
                 codebook_content_digests=codebook_digests,
             )
         except ValueError as exc:

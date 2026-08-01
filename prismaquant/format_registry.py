@@ -1028,50 +1028,10 @@ def nvfp4_activation_qdq_served(
     x: torch.Tensor,
     input_global_scale: float,
 ) -> torch.Tensor:
-    """Serve-faithful NVFP4 activation quantize-dequantize.
+    """Compatibility import for the single-owner served W4A4 oracle."""
 
-    Emulates vLLM's runtime activation path for W4A4 NVFP4 with a static
-    per-tensor ``input_global_scale`` G (the on-disk value): per 16-group
-    along the last dim, the FP8-STORED block scale is
-    ``sf = fp8_e4m3(amax/6 * G)`` and elements quantize on the E2M1 grid
-    at effective scale ``sf / G``. This models the two effects the plain
-    dynamic emulation misses (2026-07-02 audit, M18 residual + C1):
-    subnormal/zeroed FP8 block scales when a block's amax is far below
-    the calibration amax baked into G, and CLIPPING when a block's amax
-    exceeds it. Requires ``x.shape[-1] % 16 == 0``; callers fall back to
-    the dynamic path otherwise.
-    """
-    if x.shape[-1] % 16 != 0:
-        raise ValueError(
-            f"nvfp4_activation_qdq_served needs last dim % 16 == 0, "
-            f"got {tuple(x.shape)}")
-    g = float(input_global_scale)
-    orig_shape = x.shape
-    orig_dtype = x.dtype
-    x2 = x.reshape(-1, x.shape[-1] // 16, 16).float()
-    amax = x2.abs().amax(dim=-1, keepdim=True)
-    s_real = amax / 6.0
-    # FP8 snap of the stored scale in LOADED units (clamp before the
-    # cast: torch's float8_e4m3fn cast is NOT saturating and mints NaN
-    # above ~464).
-    sf = (s_real * g).clamp(max=448.0)
-    sf = sf.to(torch.float8_e4m3fn).float()
-    s_used = sf / g
-    # sf == 0 (block scale underflowed FP8): vLLM dequantizes the whole
-    # block to exactly 0.
-    safe = s_used.clamp_min(torch.finfo(torch.float32).tiny)
-    q = (x2 / safe).clamp(-6.0, 6.0)
-    cb = _codebook_on_device(
-        _CODEBOOKS["fp4_e2m1"], device=q.device, dtype=torch.float32)
-    idx = torch.bucketize(q.contiguous().abs(), cb[cb >= 0])
-    pos = cb[cb >= 0]
-    idx_lo = (idx - 1).clamp_min(0)
-    idx_hi = idx.clamp_max(pos.numel() - 1)
-    lo, hi = pos[idx_lo], pos[idx_hi]
-    qa = q.abs()
-    # ties toward zero, matching the export codec's _round_to_codebook
-    choose_hi = (hi - qa).abs() < (qa - lo).abs()
-    rounded = torch.where(choose_hi, hi, lo) * torch.sign(q)
-    out = rounded * s_used
-    out = torch.where(sf > 0, out, torch.zeros_like(out))
-    return out.reshape(orig_shape).to(orig_dtype)
+    from prismaquant.nvfp4_activation_contract import (
+        nvfp4_activation_qdq_served as _owned_nvfp4_activation_qdq_served,
+    )
+
+    return _owned_nvfp4_activation_qdq_served(x, input_global_scale)

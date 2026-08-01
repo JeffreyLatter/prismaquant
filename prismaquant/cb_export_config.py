@@ -158,6 +158,7 @@ def build_cb_scheme(
     k: int,
     codebook: object,
     scale_coding: str,
+    activation_contract: str | None = None,
 ) -> dict[str, Any]:
     """Build the canonical scheme for one CB target/group.
 
@@ -196,6 +197,8 @@ def build_cb_scheme(
     }
     if coding == SCALE_CODING_TWO_TIER:
         scheme["scale_coding"] = _two_tier_scale_coding()
+    if grid == "fp4" and activation_contract is not None:
+        scheme["activation_contract"] = str(activation_contract)
     return scheme
 
 
@@ -209,7 +212,7 @@ def cb_scheme_reuse_signature(scheme: Mapping[str, Any]) -> dict[str, Any]:
         and scale_coding.get("kind") == "two_tier"
         else SCALE_CODING_V1
     )
-    return {
+    signature: dict[str, Any] = {
         "grid": scheme.get("grid"),
         "mode": scheme.get("mode"),
         "k": scheme.get("k"),
@@ -218,6 +221,9 @@ def cb_scheme_reuse_signature(scheme: Mapping[str, Any]) -> dict[str, Any]:
         "codebook_ref": scheme.get("codebook_ref"),
         "scale_coding": coding,
     }
+    if scheme.get("activation_contract") is not None:
+        signature["activation_contract"] = scheme["activation_contract"]
+    return signature
 
 
 def _identity_target(qname: str) -> str:
@@ -241,6 +247,7 @@ def build_quant_config(
     serialized_payload_summary: Mapping[str, Any],
     serialization_context: object,
     cb_render_identity: Mapping[str, Any] | None,
+    activation_execution_contract: Mapping[str, Any] | None = None,
     git_commit: str,
     cb_target_name: TargetName = _identity_target,
     delegated_target_name: TargetName = _identity_target,
@@ -273,6 +280,13 @@ def build_quant_config(
     }
 
     config_groups: dict[str, dict[str, Any]] = {}
+    activation_contract_ref = None
+    if activation_execution_contract is not None:
+        from prismaquant.nvfp4_activation_contract import (
+            NVFP4_ACTIVATION_CONTRACT_KEY,
+        )
+
+        activation_contract_ref = NVFP4_ACTIVATION_CONTRACT_KEY
     for group_index, ((ref, fmt), qnames) in enumerate(
         sorted(by_group.items())
     ):
@@ -285,6 +299,7 @@ def build_quant_config(
             k=k,
             codebook=codebooks[(ref, fmt)],
             scale_coding=scale_coding,
+            activation_contract=activation_contract_ref,
         )
         config_groups[f"group_{group_index}"] = {
             "targets": sorted(cb_target_name(qname) for qname in qnames),
@@ -350,6 +365,10 @@ def build_quant_config(
         **({"codebook_file": codebook_file} if codebook_file else {}),
         "provenance": provenance,
     }
+    if activation_execution_contract is not None:
+        quant_config["execution_contracts"] = {
+            activation_contract_ref: dict(activation_execution_contract),
+        }
     if scale_coding == SCALE_CODING_TWO_TIER:
         # Missing layout_version remains the permanent v1 compatibility rule.
         quant_config["layout_version"] = 2

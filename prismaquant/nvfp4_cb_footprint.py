@@ -2,14 +2,18 @@
 
 The producer writes two kinds of payload:
 
-* one per-Linear packed tensor (plus an FP32 row-scale tensor for FP8-CB); and
+* one per-Linear packed tensor (plus an FP32 row-scale tensor for FP8-CB, or
+  one FP32 static activation scalar for contracted FP4-CB); and
 * FP16 codebook subtables shared once per ``(codebook_ref, format)``.
 
 This module describes those tensors, not an abstract nominal rate.  In
 particular, production FP4-CB uses layout-v2 ``4k + 9`` byte superblocks,
 FP8-CB carries ``4 * output_rows`` scale bytes, and neither CB family has an
-NVFP4-style global-scale scalar.  Product and signed codebook sizes are derived
-from the exact subtable shapes emitted by :mod:`prismaquant.export_nvfp4_cb`.
+NVFP4-style *weight* global-scale scalar.  The versioned static W4A4 execution
+variant adds exactly one four-byte ``input_global_scale`` to each FP4-CB target;
+historical/research v2 artifacts do not. Product and signed codebook sizes are
+derived from the exact subtable shapes emitted by
+:mod:`prismaquant.export_nvfp4_cb`.
 
 ``cb_footprint`` is retained as the backwards-compatible Phase-0 entry point.
 New producer code should use :func:`cb_tensor_payload_breakdown` and
@@ -48,7 +52,8 @@ from .cb_layout import (
     type_size as cb_type_size,
 )
 
-CB_SERIALIZED_PAYLOAD_SCHEMA = "prismaquant.cb_serialized_payload.v2"
+CB_SERIALIZED_PAYLOAD_SCHEMA = "prismaquant.cb_serialized_payload.v3"
+PREVIOUS_CB_SERIALIZED_PAYLOAD_SCHEMA = "prismaquant.cb_serialized_payload.v2"
 LEGACY_CB_SERIALIZED_PAYLOAD_SCHEMA = "prismaquant.cb_serialized_payload.v1"
 CB_EXPORT_ARTIFACT_INVENTORY_SCHEMA = (
     "prismaquant.cb_export_artifact_inventory.v1"
@@ -68,6 +73,14 @@ _FP16_BYTES = 2
 _FP32_BYTES = 4
 _SUPERBLOCK = SUPERBLOCK
 _VEC_DIM = VEC_DIM
+
+
+def _serialized_payload_schema(context: "CBSerializationContext") -> str:
+    return (
+        CB_SERIALIZED_PAYLOAD_SCHEMA
+        if context.activation_contract is not None
+        else PREVIOUS_CB_SERIALIZED_PAYLOAD_SCHEMA
+    )
 
 _SAFETENSORS_DTYPE_BITS = {
     "BOOL": 8,
@@ -113,6 +126,8 @@ class CBSerializationContext:
     scale_sweep: bool = True
     encode_tier: str = CB_ENCODE_TIER_DEFAULT
     renderer_abi: str = CB_RENDERER_ABI
+    activation_contract: str | None = None
+    activation_execution: str | None = None
     codebook_refs: Mapping[str, str | Sequence[str]] | None = None
     codebook_content_digests: Mapping[str, str] | None = None
 
@@ -165,6 +180,39 @@ class CBSerializationContext:
             )
         object.__setattr__(self, "encode_tier", tier)
         object.__setattr__(self, "renderer_abi", renderer_abi)
+        if self.activation_contract is not None:
+            from .nvfp4_activation_contract import (
+                NVFP4_ACTIVATION_CONTRACT_SCHEMA,
+                NVFP4_ACTIVATION_EXECUTION,
+            )
+
+            activation_contract = str(self.activation_contract).strip()
+            if activation_contract != NVFP4_ACTIVATION_CONTRACT_SCHEMA:
+                raise ValueError(
+                    "unsupported CB activation contract "
+                    f"{activation_contract!r}; expected "
+                    f"{NVFP4_ACTIVATION_CONTRACT_SCHEMA!r}"
+                )
+            object.__setattr__(
+                self, "activation_contract", activation_contract
+            )
+            activation_execution = str(
+                self.activation_execution or ""
+            ).strip()
+            if activation_execution != NVFP4_ACTIVATION_EXECUTION:
+                raise ValueError(
+                    "static CB activation contract requires "
+                    f"activation_execution={NVFP4_ACTIVATION_EXECUTION!r}, "
+                    f"got {self.activation_execution!r}"
+                )
+            object.__setattr__(
+                self, "activation_execution", activation_execution
+            )
+        elif self.activation_execution is not None:
+            raise ValueError(
+                "CB activation_execution cannot be set without an "
+                "activation_contract"
+            )
         if self.codebook_refs is not None:
             normalized_refs: dict[str, str | tuple[str, ...]] = {}
             for qname, raw_refs in self.codebook_refs.items():
@@ -199,12 +247,19 @@ class CBSerializationContext:
         codebook_refs: Mapping[str, str | Sequence[str]] | None = None,
         codebook_content_digests: Mapping[str, str] | None = None,
     ) -> CBSerializationContext:
+        from .nvfp4_activation_contract import (
+            NVFP4_ACTIVATION_CONTRACT_SCHEMA,
+            NVFP4_ACTIVATION_EXECUTION,
+        )
+
         return cls(
             scale_coding=PRODUCTION_FP4_SCALE_CODING,
             layout_version=2,
             scale_sweep=scale_sweep,
             encode_tier=encode_tier,
             codebook_source=codebook_source,
+            activation_contract=NVFP4_ACTIVATION_CONTRACT_SCHEMA,
+            activation_execution=NVFP4_ACTIVATION_EXECUTION,
             codebook_refs=codebook_refs,
             codebook_content_digests=codebook_content_digests,
         )
@@ -226,6 +281,8 @@ class CBSerializationContext:
             scale_sweep=scale_sweep,
             encode_tier=encode_tier,
             codebook_source=codebook_source,
+            activation_contract=None,
+            activation_execution=None,
             codebook_refs=codebook_refs,
             codebook_content_digests=codebook_content_digests,
         )
@@ -249,13 +306,17 @@ def cb_serialization_context_stamp(
             "the bytes that cost, KL, and export must share"
         )
     return {
-        "schema": CB_SERIALIZED_PAYLOAD_SCHEMA,
+        "schema": _serialized_payload_schema(context),
         "scale_coding": context.scale_coding,
         "layout_version": context.layout_version,
         "codebook_source": context.codebook_source,
         "scale_sweep": context.scale_sweep,
         "encode_tier": context.encode_tier,
         "renderer_abi": context.renderer_abi,
+        **({
+            "activation_contract": context.activation_contract,
+            "activation_execution": context.activation_execution,
+        } if context.activation_contract is not None else {}),
         **({
             "lattice_codebook_sha256_by_format": {
                 name: list(lattice_codebook_content_sha256(name))
@@ -307,13 +368,17 @@ def cb_serialization_context_from_stamp(
             f"{where}: CB assignment is missing its serialized-payload "
             "context stamp"
         )
-    if stamp.get("schema") == LEGACY_CB_SERIALIZED_PAYLOAD_SCHEMA:
+    schema = stamp.get("schema")
+    if schema == LEGACY_CB_SERIALIZED_PAYLOAD_SCHEMA:
         raise ValueError(
             f"{where}: legacy CB serialized-payload v1 stamp has no exact "
             "codebook-content identity; rebuild the cost/cache/assignment "
-            "with the v2 producer contract"
+            "with the current producer contract"
         )
-    if stamp.get("schema") != CB_SERIALIZED_PAYLOAD_SCHEMA:
+    if schema not in {
+        PREVIOUS_CB_SERIALIZED_PAYLOAD_SCHEMA,
+        CB_SERIALIZED_PAYLOAD_SCHEMA,
+    }:
         raise ValueError(
             f"{where}: unsupported CB serialized-payload schema "
             f"{stamp.get('schema')!r}"
@@ -332,6 +397,26 @@ def cb_serialization_context_from_stamp(
     if missing:
         raise ValueError(
             f"{where}: CB serialized-payload context is missing {missing}"
+        )
+    activation_contract = stamp.get("activation_contract")
+    activation_execution = stamp.get("activation_execution")
+    if schema == CB_SERIALIZED_PAYLOAD_SCHEMA and activation_contract is None:
+        raise ValueError(
+            f"{where}: CB serialized-payload v3 stamp is missing its "
+            "activation_contract"
+        )
+    if schema == CB_SERIALIZED_PAYLOAD_SCHEMA and activation_execution is None:
+        raise ValueError(
+            f"{where}: CB serialized-payload v3 stamp is missing its "
+            "activation_execution"
+        )
+    if (
+        schema == PREVIOUS_CB_SERIALIZED_PAYLOAD_SCHEMA
+        and (activation_contract is not None or activation_execution is not None)
+    ):
+        raise ValueError(
+            f"{where}: CB serialized-payload v2 stamp cannot claim an "
+            "activation_contract"
         )
     raw_digests = stamp.get("codebook_content_sha256")
     if str(stamp["codebook_source"]).strip().lower() == "learned" and not isinstance(
@@ -375,6 +460,16 @@ def cb_serialization_context_from_stamp(
         scale_sweep=stamp["scale_sweep"],
         encode_tier=str(stamp["encode_tier"]),
         renderer_abi=str(stamp["renderer_abi"]),
+        activation_contract=(
+            str(activation_contract)
+            if activation_contract is not None
+            else None
+        ),
+        activation_execution=(
+            str(activation_execution)
+            if activation_execution is not None
+            else None
+        ),
         codebook_refs=(
             {str(name): value for name, value in raw_refs.items()}
             if isinstance(raw_refs, Mapping)
@@ -396,9 +491,10 @@ def cb_serialization_context_from_env(
 ) -> CBSerializationContext:
     """Resolve the producer identity used by a CB render.
 
-    Production defaults are v2/lattice.  Pipeline stages pass both variables
+    Production defaults are the v3 static-activation contract over the
+    layout-v2/lattice weight payload. Pipeline stages pass the choices
     explicitly and stamp them into their cache provenance; the defaults keep
-    direct library calls aligned with the production writer.  Callers that
+    direct library calls aligned with the production writer. Callers that
     consume an existing artifact use ``require_explicit=True`` so absence is
     never mistaken for proof that a cache used today's defaults.
     """
@@ -434,11 +530,18 @@ def cb_serialization_context_from_env(
         name="CB_SCALE_SWEEP",
         where=where,
     )
+    from .nvfp4_activation_contract import (
+        NVFP4_ACTIVATION_CONTRACT_SCHEMA,
+        NVFP4_ACTIVATION_EXECUTION,
+    )
+
     return CBSerializationContext(
         scale_coding=scale or PRODUCTION_FP4_SCALE_CODING,
         codebook_source=source or "lattice",
         scale_sweep=scale_sweep,
         encode_tier=resolve_cb_encode_tier(raw_tier, environ=environ),
+        activation_contract=NVFP4_ACTIVATION_CONTRACT_SCHEMA,
+        activation_execution=NVFP4_ACTIVATION_EXECUTION,
         codebook_content_digests=digests,
     )
 
@@ -531,6 +634,8 @@ def validate_cb_serialization_context_stamp(
         "scale_sweep",
         "encode_tier",
         "renderer_abi",
+        "activation_contract",
+        "activation_execution",
     )
     observed = {key: stamp.get(key) for key in base_keys}
     expected_base = {key: expected.get(key) for key in base_keys}
@@ -1184,11 +1289,21 @@ def cb_tensor_payload_breakdown(
         scale_bytes_per_superblock = packed_type_size - (INDEX_BYTES_PER_K * k)
         fp4_scale_bytes = output_rows * n_superblocks * scale_bytes_per_superblock
     fp8_row_scale_bytes = _FP32_BYTES * output_rows if grid == "fp8" else 0
+    input_global_scale_bytes = (
+        _FP32_BYTES
+        if grid == "fp4" and context.activation_execution is not None
+        else 0
+    )
     packed_weight_bytes = index_bytes + fp4_scale_bytes
-    tensor_payload_bytes = packed_weight_bytes + fp8_row_scale_bytes
+    tensor_payload_bytes = (
+        packed_weight_bytes
+        + fp8_row_scale_bytes
+        + input_global_scale_bytes
+    )
     sidecar = _sidecar_identity(qname, canonical, context)
+    payload_schema = _serialized_payload_schema(context)
     identity = {
-        "schema": CB_SERIALIZED_PAYLOAD_SCHEMA,
+        "schema": payload_schema,
         "format": canonical,
         "grid": grid,
         "mode": mode,
@@ -1198,6 +1313,8 @@ def cb_tensor_payload_breakdown(
         "scale_sweep": context.scale_sweep,
         "encode_tier": context.encode_tier,
         "renderer_abi": context.renderer_abi,
+        "activation_contract": context.activation_contract,
+        "activation_execution": context.activation_execution,
         "tensor_scale_coding": context.scale_coding if grid == "fp4" else "none",
         "type_size": packed_type_size,
         "shape": list(dims),
@@ -1208,13 +1325,14 @@ def cb_tensor_payload_breakdown(
         "index_bytes": int(index_bytes),
         "fp4_scale_bytes": int(fp4_scale_bytes),
         "fp8_row_scale_bytes": int(fp8_row_scale_bytes),
+        "input_global_scale_bytes": int(input_global_scale_bytes),
         "global_scale_bytes": 0,
         "packed_weight_bytes": int(packed_weight_bytes),
         "tensor_payload_bytes": int(tensor_payload_bytes),
         "sidecar": sidecar,
     }
     return {
-        "schema": CB_SERIALIZED_PAYLOAD_SCHEMA,
+        "schema": payload_schema,
         "identity": identity,
         "identity_key": _identity_key(identity),
         "qname": str(qname),
@@ -1226,6 +1344,7 @@ def cb_tensor_payload_breakdown(
         "index_bytes": int(index_bytes),
         "fp4_scale_bytes": int(fp4_scale_bytes),
         "fp8_row_scale_bytes": int(fp8_row_scale_bytes),
+        "input_global_scale_bytes": int(input_global_scale_bytes),
         "global_scale_bytes": 0,
         "packed_weight_bytes": int(packed_weight_bytes),
         "tensor_payload_bytes": int(tensor_payload_bytes),
@@ -1254,6 +1373,7 @@ def cb_assignment_payload_breakdown(
         "index_bytes": 0,
         "fp4_scale_bytes": 0,
         "fp8_row_scale_bytes": 0,
+        "input_global_scale_bytes": 0,
         "global_scale_bytes": 0,
         "tensor_payload_bytes": 0,
     }
@@ -1306,7 +1426,7 @@ def cb_assignment_payload_breakdown(
     sidecar_bytes = sum(int(item["payload_bytes"]) for item in sidecars.values())
     total_bytes = totals["tensor_payload_bytes"] + sidecar_bytes
     return {
-        "schema": CB_SERIALIZED_PAYLOAD_SCHEMA,
+        "schema": _serialized_payload_schema(context),
         "context": {
             "scale_coding": context.scale_coding,
             "layout_version": context.layout_version,
@@ -1314,6 +1434,10 @@ def cb_assignment_payload_breakdown(
             "scale_sweep": context.scale_sweep,
             "encode_tier": context.encode_tier,
             "renderer_abi": context.renderer_abi,
+            **({
+                "activation_contract": context.activation_contract,
+                "activation_execution": context.activation_execution,
+            } if context.activation_contract is not None else {}),
         },
         **{key: int(value) for key, value in totals.items()},
         "codebook_sidecar_bytes": int(sidecar_bytes),
@@ -1335,6 +1459,7 @@ def cb_payload_summary(breakdown: Mapping[str, object]) -> dict:
         "index_bytes",
         "fp4_scale_bytes",
         "fp8_row_scale_bytes",
+        "input_global_scale_bytes",
         "global_scale_bytes",
         "tensor_payload_bytes",
         "codebook_sidecar_bytes",
@@ -1921,9 +2046,16 @@ def _legacy_context_from_sources(
             "cb_assignment_payload_breakdown with exact codebook refs"
         )
     source = next(iter(kinds), "lattice")
+    from .nvfp4_activation_contract import (
+        NVFP4_ACTIVATION_CONTRACT_SCHEMA,
+        NVFP4_ACTIVATION_EXECUTION,
+    )
+
     return CBSerializationContext(
         scale_coding=scale_coding,
         codebook_source=source,
+        activation_contract=NVFP4_ACTIVATION_CONTRACT_SCHEMA,
+        activation_execution=NVFP4_ACTIVATION_EXECUTION,
         codebook_refs=refs or None,
     )
 
@@ -1939,9 +2071,10 @@ def cb_footprint(
     """Backwards-compatible mixed-assignment footprint wrapper.
 
     Unlike the obsolete Phase-0 formula, lattice tables are real FP16
-    sidecars and are charged, FP4 has no global scalar, and production defaults
-    to layout-v2.  Pass ``context=CBSerializationContext.legacy_v1(...)`` to
-    reproduce an older artifact explicitly.
+    sidecars and are charged, FP4 has no weight-global scalar, and the static
+    production variant charges one activation scalar per FP4 target on top of
+    layout-v2. Pass ``context=CBSerializationContext.legacy_v1(...)`` to
+    reproduce a legacy layout-v1 artifact explicitly.
     """
     ctx = context or _legacy_context_from_sources(
         assignment, codebook_sources, scale_coding=scale_coding
@@ -1977,6 +2110,9 @@ def cb_footprint(
                 "params": params,
                 "body_bytes": int(item["packed_weight_bytes"]),
                 "global_scale_bytes": 0,
+                "input_global_scale_bytes": int(
+                    item["input_global_scale_bytes"]
+                ),
                 "channel_scale_bytes": int(item["fp8_row_scale_bytes"]),
                 "sidecar_bytes": charged,
                 "codebook_source": ctx.codebook_source,
@@ -2002,16 +2138,25 @@ def cb_footprint(
     body_bytes = int(cb_breakdown["index_bytes"] +
                      cb_breakdown["fp4_scale_bytes"] + non_cb_bytes)
     channel_scale_bytes = int(cb_breakdown["fp8_row_scale_bytes"])
+    input_global_scale_bytes = int(
+        cb_breakdown["input_global_scale_bytes"]
+    )
     sidecar_bytes = int(cb_breakdown["codebook_sidecar_bytes"])
-    total_bytes = body_bytes + channel_scale_bytes + sidecar_bytes
+    total_bytes = (
+        body_bytes
+        + channel_scale_bytes
+        + input_global_scale_bytes
+        + sidecar_bytes
+    )
     return {
-        "schema": CB_SERIALIZED_PAYLOAD_SCHEMA,
+        "schema": _serialized_payload_schema(ctx),
         "serialization_context": cb_breakdown["context"],
         "total_bytes": total_bytes,
         "body_bytes": body_bytes,
         "sidecar_bytes": sidecar_bytes,
         "codebook_sidecar_bytes": sidecar_bytes,
         "global_scale_bytes": 0,
+        "input_global_scale_bytes": input_global_scale_bytes,
         "channel_scale_bytes": channel_scale_bytes,
         "fp8_row_scale_bytes": channel_scale_bytes,
         "index_bytes": int(cb_breakdown["index_bytes"]),
