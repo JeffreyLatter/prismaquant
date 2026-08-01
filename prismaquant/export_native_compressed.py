@@ -7952,7 +7952,7 @@ def _write_shipcard(
     build venv, and embedding a docker serve here would make the exporter own
     the serving stack. What it can do is state, on the artifact, exactly which
     serve-lane verdicts are still missing, so "we never ran the ship gate"
-    becomes a refusal (`tools/shipcard.py verify`) instead of an omission.
+    becomes a refusal (`python -m prismaquant.shipcard_cli verify`) instead of an omission.
     """
     import hashlib
 
@@ -7987,7 +7987,7 @@ def _write_shipcard(
     print(f"[export-stream] shipcard opened: {path}", flush=True)
     print(f"[export-stream]   serve-lane slots still UNFILLED: "
           f"{', '.join(_shipcard.unfilled_slots(card))}", flush=True)
-    print(f"[export-stream]   close them, then: python3 tools/shipcard.py "
+    print(f"[export-stream]   close them, then: python3 -m prismaquant.shipcard_cli "
           f"verify {path}", flush=True)
 
 

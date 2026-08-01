@@ -12,7 +12,8 @@ import pytest
 
 
 REPO = Path(__file__).resolve().parents[1]
-PIN = REPO / "scripts" / "lib" / "gridbook_runtime_pin.json"
+PIN = (REPO / "prismaquant" / "gridbook_runtime" /
+       "gridbook_runtime_pin.json")
 REQUIRE_CONTRACT = os.environ.get(
     "PRISMAQUANT_REQUIRE_GRIDBOOK_CONTRACT") == "1"
 

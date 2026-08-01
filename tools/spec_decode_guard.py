@@ -17,7 +17,7 @@ Returned/recorded `spec_decode_detected`:
   on a `gold.*` record)
 * `True`  — refuse: vLLM routes echo/prompt logprobs through the DRAFT model, so
   the NLL/KL would be the 1-layer MTP head's, not the artifact's
-* `None`  — could not inspect. Not treated as "off": `tools/shipcard.py verify`
+* `None`  — could not inspect. Not treated as "off": `python -m prismaquant.shipcard_cli verify`
   refuses an unknown, because an unverified negative is what the original trap
   looked like.
 """

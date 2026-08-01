@@ -212,7 +212,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  - {problem}", file=sys.stderr)
         if not args.force_unverified:
             print("[publish] nothing was uploaded and no upload command was "
-                  "printed. Close the slots (tools/shipcard.py show|fill) or "
+                  "printed. Close the slots (python -m prismaquant.shipcard_cli show|fill) or "
                   "re-run with --force-unverified.", file=sys.stderr)
             return 1
         if not _confirm_forced(artifact_dir, args.confirm_name):

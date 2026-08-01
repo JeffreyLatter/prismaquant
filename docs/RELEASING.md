@@ -5,10 +5,10 @@ only, so merging it — or any later commit to `main` — can never trigger an
 upload. A release is:
 
 ```bash
-# 1. bump the version in pyproject.toml, commit it
+# 1. bump the version in pyproject.toml and CHANGELOG.md, merge it to main
 # 2. tag and push the tag
-git tag -a v0.2.0 -m "prismaquant 0.2.0"
-git push origin v0.2.0
+git tag -a v0.5.0 -m "prismaquant 0.5.0"
+git push origin v0.5.0
 ```
 
 The workflow then builds, gates, publishes to PyPI via OIDC, and creates the
@@ -29,10 +29,10 @@ irreversible step failed.
 So: **if trusted publishing is intended, the first upload must come from the
 workflow. Never token-upload a rehearsal first.**
 
-As of 2026-07-29, `https://pypi.org/pypi/prismaquant/json` returns 404 — the
-project does not exist yet, so **case 1 below applies and the first upload must
-come from the workflow.** Do not token-upload anything first, not even a
-rehearsal: that is precisely what orphaned gridbook's publisher.
+As of 2026-08-01, the `prismaquant` project exists and releases 0.2.0 through
+0.4.1 were published successfully by this workflow through trusted OIDC. The
+active configuration is therefore **case 2** below. Case 1 is retained only for
+maintainers creating a new sibling project.
 
 1. **If the `prismaquant` project does NOT yet exist on PyPI** — use the
    *account-level* "pending publisher" form
@@ -47,7 +47,8 @@ rehearsal: that is precisely what orphaned gridbook's publisher.
    | Workflow name | `release.yml` |
    | Environment name | `pypi` |
 
-2. **If the project already exists** (e.g. it was created by any other upload) —
+2. **For PrismaQuant today: the project already exists.** If the publisher must
+   be recreated,
    the account-level pending form will NOT work. Use the *project-scoped*
    publisher form at `https://pypi.org/manage/project/prismaquant/settings/publishing/`
    with the same four values. That is the form that works once a project exists;
@@ -71,21 +72,22 @@ nothing in this pipeline needs one.
 - `twine check --strict` on both artifacts.
 - **Runtime data files are packaged** (`.github/scripts/check_dist.py`).
   prismaquant is pure Python, so the packaging risk is not compiled sources: it
-  is the JSON the code reads at runtime — `model_profiles/specs/*.json`
-  (model structure) and `serving_profile_specs/*.json` (serving constraints) —
-  plus `run-pipeline.sh`. A `package-data` regression still imports cleanly and
-  only fails when a user asks for a profile, so it is checked against both the
-  wheel and the sdist, and the check refuses to pass vacuously if it finds no
-  expected files in the source tree.
+  is the model/serving/lane JSON, canonical IQ and CB tensor tables, immutable
+  Gridbook pin and resolver, and `run-pipeline.sh`. A package-data regression
+  still imports cleanly and only fails on a user's first real run, so every
+  asset is checked against both wheel and sdist.
 - **The tag matches the built version.** A mismatch means the wrong artifact is
   about to be published under the wrong name.
 - **The wheel works non-editably** (`.github/scripts/check_installed.py`): run
   from a temp directory with no `PYTHONPATH`, so `import prismaquant` cannot
   fall back to the checkout. The install must resolve from site-packages, all
   four serving profiles must load out of the installed JSON, the
-  model-structure spec directory must be present inside the package,
-  `run-pipeline.sh` must be there, and `python -m prismaquant.allocator --help`
-  must exit 0.
+  model-structure spec directory must be present inside the package, IQ and CB
+  tables must load, the Gridbook helper must parse its adjacent pin from an
+  arbitrary working directory, `run-pipeline.sh` must be there, and the
+  allocator and shipcard CLIs must run.
+- **The tag commit is on `main`.** The workflow fetches full history and refuses
+  a tag cut from an unmerged release branch.
 
 The release job deliberately does **not** re-run the whole test suite against
 the install. A substantial part of the suite asserts *repository* invariants

@@ -29,7 +29,7 @@ Before implementing new functionality, read this file,
    additionally on bit-exactness against `gguf-py`; codebook (NVFP4-CB /
    FP8-CB) on the separately released
    [`gridbook`](https://github.com/RobTand/gridbook) plugin, pinned by
-   `scripts/lib/gridbook_runtime_pin.json`. It ships its own CUDA kernels and
+   `prismaquant/gridbook_runtime/gridbook_runtime_pin.json`. It ships its own CUDA kernels and
    is gated on an unforked vLLM (no core patches), a producer profile declared
    in Gridbook's packaged `runtime_contract.json`, fail-closed expert loading,
    and served speed at least at parity

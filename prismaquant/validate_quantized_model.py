@@ -594,7 +594,7 @@ def main() -> int:
     ap.add_argument("--shipcard", default=None,
                     help="Path to the artifact's shipcard.json; this run's "
                          "verdict is appended to the ship_gate slot "
-                         "(see tools/shipcard.py).")
+                         "(see python -m prismaquant.shipcard_cli).")
     ap.add_argument("--artifact-dir", default=None,
                     help="Local directory of the artifact being served, used "
                          "to stamp model_sha on the shipcard record. Defaults "

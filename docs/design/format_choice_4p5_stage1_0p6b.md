@@ -10,7 +10,7 @@ under an exact whole-artifact byte constraint.
 **Historical execution note (2026-08-01):** this run predated removal of the
 vendored Gridbook tree. Its old copy/editable-install commands are intentionally
 not reusable. Current reproduction must resolve the exact external runtime via
-`scripts/lib/gridbook_runtime_pin.json` and `gridbook_runtime.sh`; a result that
+`prismaquant/gridbook_runtime/gridbook_runtime_pin.json` and `gridbook_runtime.sh`; a result that
 cannot attest that commit is invalid.
 
 Executes the endpoint half of `docs/design/format_choice_4p5.md` §5 Stage 1 /

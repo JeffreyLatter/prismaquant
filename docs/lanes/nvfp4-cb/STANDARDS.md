@@ -52,7 +52,7 @@ repository does not duplicate those tables.
 Runtime dispatch, kernel defaults, environment switches, supported shapes, and
 operator evidence live only in the Gridbook repository and its packaged
 contract. Consult `docs/PLUGIN.md`, `docs/KERNELS.md`, and the dated audits from
-the exact commit in `scripts/lib/gridbook_runtime_pin.json`; this producer
+the exact commit in `prismaquant/gridbook_runtime/gridbook_runtime_pin.json`; this producer
 document intentionally carries no parallel dispatch table.
 
 The producer-side decision needed here is fixed: both fused NVFP4 activation

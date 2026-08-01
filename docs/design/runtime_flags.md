@@ -238,7 +238,7 @@ Gridbook owns these flags, their defaults, validation, dispatch semantics, and
 operator documentation. Keeping a second table here already caused factual
 drift (for example the dense CUDA GEMV crossover and fused-FP4 promotion
 status), so it has been removed. Consult the `docs/PLUGIN.md` shipped by the
-exact Gridbook commit in `scripts/lib/gridbook_runtime_pin.json`. A serve record
+exact Gridbook commit in `prismaquant/gridbook_runtime/gridbook_runtime_pin.json`. A serve record
 must fingerprint that commit and its actual environment; a PrismaQuant document
 is never authority for a runtime default.
 
@@ -281,7 +281,7 @@ rg -o 'PRISMAQUANT_[A-Z0-9_]+' prismaquant scripts tools \
 That inventory is diagnostic rather than a stability promise: a token may be a
 compatibility check, refusal, or research switch rather than a supported knob.
 Gridbook runtime flags are defined and documented only by the exact commit in
-`scripts/lib/gridbook_runtime_pin.json`. `PQ_EXPORT_VECTOR_CHUNK` remains the
+`prismaquant/gridbook_runtime/gridbook_runtime_pin.json`. `PQ_EXPORT_VECTOR_CHUNK` remains the
 one live producer flag outside the `PRISMAQUANT_` namespace.
 
 ## 11. Disabling for debugging

@@ -194,7 +194,7 @@ def lane_gate_report(spec: LaneSpec, shipcard: Mapping[str, Any] | None = None
     """Advisory status of every declared gate against a shipcard payload.
 
     Returns one row per gate: `{gate, runner, shipcard_slot, filled,
-    advisory}`. Nothing here refuses — `tools/shipcard.py verify` is the
+    advisory}`. Nothing here refuses — `python -m prismaquant.shipcard_cli verify` is the
     refusal, and this is the lane-uniform view of what it will refuse on.
     """
     slots: Mapping[str, Any] = {}

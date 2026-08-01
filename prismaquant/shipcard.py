@@ -4,7 +4,7 @@ R13 (`docs/audits/architecture_re-vet_2026-07-30.md`). The build lane and the
 serve lane are separated by a physical boundary: `vllm` is not importable in the
 build venv, so `run-pipeline.sh` cannot run a ship gate and never should. What it
 *can* do is **open a record with required, empty slots** that only the serve lane
-can close. `tools/shipcard.py verify` then exits non-zero until every slot holds a
+can close. `python -m prismaquant.shipcard_cli verify` then exits non-zero until every slot holds a
 record whose `model_sha` matches the artifact on disk — which turns "we never ran
 the gate" from a silent omission into an explicit refusal.
 
@@ -15,8 +15,8 @@ Slots (all required):
 | `native_export.eager` | `validate_native_export.py --shipcard` (eager arm) |
 | `native_export.graph` | `validate_native_export.py --shipcard --no-enforce-eager` |
 | `ship_gate` | `validate_quantized_model.py --shipcard` |
-| `gold.kl` | `tools/shipcard.py fill --slot gold.kl --record <full_kl json>` |
-| `gold.ppl` | `tools/shipcard.py fill --slot gold.ppl --record <ppl json>` |
+| `gold.kl` | `python -m prismaquant.shipcard_cli fill --slot gold.kl --record <full_kl json>` |
+| `gold.ppl` | `python -m prismaquant.shipcard_cli fill --slot gold.ppl --record <ppl json>` |
 
 The two `gold.*` slots additionally require `spec_decode_detected: false` on the
 record that produced the number — vLLM routes echo+logprobs through the draft

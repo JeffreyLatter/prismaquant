@@ -29,7 +29,7 @@ from prismaquant.shipcard import (
     verify,
     write_shipcard,
 )
-from tools.shipcard import main as shipcard_cli
+from prismaquant.shipcard_cli import main as shipcard_cli
 
 
 def _artifact(tmp_path, *, name="exported", weight_bytes=b"weights"):

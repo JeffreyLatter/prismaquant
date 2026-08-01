@@ -2,10 +2,10 @@
 # Resolve Gridbook from one immutable external-source pin.
 #
 # Host use (source this file):
-#   . scripts/lib/gridbook_runtime.sh
+#   . prismaquant/gridbook_runtime/gridbook_runtime.sh
 #   gridbook_runtime_prepare
 #   docker run "${GRIDBOOK_RUNTIME_DOCKER_ARGS[@]}" ... \
-#     bash -c 'bash /repo/scripts/lib/gridbook_runtime.sh install-container; ...'
+#     bash -c 'bash "${PQ_GRIDBOOK_RUNTIME_HELPER:?}" install-container; ...'
 #
 # The only override is deliberately narrow:
 #   GRIDBOOK_RUNTIME_CHECKOUT=/clean/checkout
@@ -16,10 +16,10 @@
 # artifacts are rejected. Gridbook remains a separate project and is never
 # copied back into the PrismaQuant source tree.
 
-_GRIDBOOK_RUNTIME_LIB_DIR="$({
+_GRIDBOOK_RUNTIME_ASSET_DIR="$({
     cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P
 })"
-_GRIDBOOK_RUNTIME_PIN_FILE="${_GRIDBOOK_RUNTIME_LIB_DIR}/gridbook_runtime_pin.json"
+_GRIDBOOK_RUNTIME_PIN_FILE="${_GRIDBOOK_RUNTIME_ASSET_DIR}/gridbook_runtime_pin.json"
 
 _gridbook_runtime_error() {
     printf 'gridbook-runtime: ERROR: %s\n' "$*" >&2
@@ -235,7 +235,7 @@ _gridbook_runtime_fetch_pinned_checkout() (
 
 gridbook_runtime_prepare() {
     local checkout_override=${GRIDBOOK_RUNTIME_CHECKOUT:-}
-    local source container_source
+    local source container_source contract_source container_contract
 
     gridbook_runtime_load_pin || return
     if [[ -n "$checkout_override" ]]; then
@@ -245,25 +245,37 @@ gridbook_runtime_prepare() {
         source="$(_gridbook_runtime_fetch_pinned_checkout)" || return
     fi
     container_source=/opt/prismaquant-gridbook-source
+    contract_source=$_GRIDBOOK_RUNTIME_ASSET_DIR
+    container_contract=/opt/prismaquant-gridbook-runtime-contract
 
-    if [[ "$source" == *:* || "$source" == *$'\n'* ]]; then
-        _gridbook_runtime_error \
-            "runtime source path contains a character Docker -v cannot encode: $source"
-        return
-    fi
+    local path
+    for path in "$source" "$contract_source"; do
+        if [[ "$path" == *:* || "$path" == *$'\n'* ]]; then
+            _gridbook_runtime_error \
+                "bind source path contains a character Docker -v cannot encode: $path"
+            return
+        fi
+    done
 
     GRIDBOOK_RUNTIME_SOURCE=$source
     GRIDBOOK_RUNTIME_CONTAINER_SOURCE=$container_source
-    export GRIDBOOK_RUNTIME_SOURCE GRIDBOOK_RUNTIME_CONTAINER_SOURCE
+    GRIDBOOK_RUNTIME_CONTRACT_SOURCE=$contract_source
+    GRIDBOOK_RUNTIME_CONTAINER_CONTRACT=$container_contract
+    GRIDBOOK_RUNTIME_CONTAINER_HELPER="${container_contract}/gridbook_runtime.sh"
+    export GRIDBOOK_RUNTIME_SOURCE GRIDBOOK_RUNTIME_CONTAINER_SOURCE \
+        GRIDBOOK_RUNTIME_CONTRACT_SOURCE GRIDBOOK_RUNTIME_CONTAINER_CONTRACT \
+        GRIDBOOK_RUNTIME_CONTAINER_HELPER
 
     GRIDBOOK_RUNTIME_DOCKER_ARGS=(
         --volume "${source}:${container_source}:ro"
+        --volume "${contract_source}:${container_contract}:ro"
         --env "PQ_GRIDBOOK_RUNTIME_SOURCE=${container_source}"
         --env "PQ_GRIDBOOK_RUNTIME_COMMIT=${GRIDBOOK_RUNTIME_COMMIT}"
         --env "PQ_GRIDBOOK_RUNTIME_VERSION=${GRIDBOOK_RUNTIME_VERSION}"
+        --env "PQ_GRIDBOOK_RUNTIME_HELPER=${GRIDBOOK_RUNTIME_CONTAINER_HELPER}"
     )
-    printf 'gridbook-runtime: checkout %s (%s)\n' \
-        "$source" "$GRIDBOOK_RUNTIME_COMMIT" >&2
+    printf 'gridbook-runtime: checkout %s (%s); contract %s\n' \
+        "$source" "$GRIDBOOK_RUNTIME_COMMIT" "$contract_source" >&2
 }
 
 gridbook_runtime_container_install_target() {
@@ -292,7 +304,7 @@ gridbook_runtime_install_container() {
         return
     fi
 
-    # Re-read the pin from the independently mounted PrismaQuant checkout.
+    # Re-read the pin from the independently mounted PrismaQuant contract.
     # Docker environment values are transport only: they cannot authorize a
     # different runtime commit or same-version payload.
     gridbook_runtime_load_pin || return

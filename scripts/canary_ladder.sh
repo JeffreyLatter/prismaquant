@@ -19,7 +19,7 @@ set -euo pipefail
 STEP="${1:-1}"
 SOAK_MIN="${2:-10}"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-. "$REPO/scripts/lib/gridbook_runtime.sh"
+. "$REPO/prismaquant/gridbook_runtime/gridbook_runtime.sh"
 gridbook_runtime_prepare || exit $?
 LOG=/home/rob/dq-runs/laguna-s21/logs/canary_ladder.log
 mkdir -p "$(dirname "$LOG")"
@@ -53,7 +53,7 @@ if [ "$STEP" -le 2 ]; then
     "${GRIDBOOK_RUNTIME_DOCKER_ARGS[@]}" --entrypoint bash \
     vllm-node:latest -c '
       set -euo pipefail
-      . /repo/scripts/lib/gridbook_runtime.sh
+      . "${PQ_GRIDBOOK_RUNTIME_HELPER:?}"
       gridbook_runtime_install_container
       pip install pytest -q 2>/dev/null
       cd "$(gridbook_runtime_container_install_target)"
@@ -109,7 +109,7 @@ if [ "$STEP" -le 4 ]; then
     "${GRIDBOOK_RUNTIME_DOCKER_ARGS[@]}" \
     -e PRISMAQUANT_ENABLE_PTC=1 --entrypoint bash vllm-node:latest -c '
       set -euo pipefail
-      . /repo/scripts/lib/gridbook_runtime.sh
+      . "${PQ_GRIDBOOK_RUNTIME_HELPER:?}"
       gridbook_runtime_install_container
       pip install pytest -q 2>/dev/null
       cd "$(gridbook_runtime_container_install_target)"

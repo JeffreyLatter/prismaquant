@@ -40,9 +40,6 @@
 
 set -euo pipefail
 
-# Repo root, for the out-of-package tools/ (shipcard show at the end).
-PIPELINE_REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-
 : "${MODEL_PATH:?Set MODEL_PATH to the source HF model directory}"
 : "${WORK_DIR:?Set WORK_DIR to a writable directory for artifacts}"
 : "${FORMATS:=NVFP4,FP8_DYNAMIC,BF16}"
@@ -2076,7 +2073,7 @@ if [[ "$EXPORT_CONTAINER" == "nvfp4_cb" ]]; then
   echo "[pipeline] done."
   echo "  Artifact: ${CB_OUT}  (custom quant_method=gridbook; LAYOUT.md contract)"
   echo "  Serve:    vLLM with the pinned external gridbook package installed"
-  echo "            (scripts/lib/gridbook_runtime_pin.json); NOT stock compressed-tensors."
+  echo "            (prismaquant/gridbook_runtime/gridbook_runtime_pin.json); NOT stock compressed-tensors."
   echo "  Gate:     served KL-vs-BF16 + WikiText PPL in the plugin serving env."
   exit 0
 fi
@@ -2133,9 +2130,8 @@ echo "  Artifact: ${WORK_DIR}/exported"
 # run ends by naming what has NOT been measured yet, instead of echoing a
 # command and implying the artifact is done.
 SHIPCARD_JSON="${WORK_DIR}/exported/shipcard.json"
-SHIPCARD_TOOL="${PIPELINE_REPO_ROOT}/tools/shipcard.py"
-if [[ -f "$SHIPCARD_JSON" && -f "$SHIPCARD_TOOL" ]]; then
-  python3 "$SHIPCARD_TOOL" show "$SHIPCARD_JSON" || true
+if [[ -f "$SHIPCARD_JSON" ]]; then
+  python3 -m prismaquant.shipcard_cli show "$SHIPCARD_JSON" || true
 else
   echo "  WARNING: no shipcard at ${SHIPCARD_JSON} — the export did not open a ship record."
 fi

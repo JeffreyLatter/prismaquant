@@ -13,7 +13,7 @@ def _read(path: str) -> str:
 def test_runtime_flags_doc_owns_policy_without_mirroring_gridbook_flags():
     doc = _read("docs/design/runtime_flags.md")
     assert "There is deliberately no hand-maintained exhaustive flag list" in doc
-    assert "scripts/lib/gridbook_runtime_pin.json" in doc
+    assert "prismaquant/gridbook_runtime/gridbook_runtime_pin.json" in doc
     assert "rg -o 'PRISMAQUANT_[A-Z0-9_]+' prismaquant scripts tools" in doc
     for external_runtime_flag in (
         "PRISMAQUANT_CB_DECODE",

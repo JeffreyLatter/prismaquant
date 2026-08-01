@@ -2,7 +2,7 @@
 
 > **Historical evidence.** Gridbook now solely owns the runtime and kernel
 > implementation. PrismaQuant consumes its immutable external pin from
-> `scripts/lib/gridbook_runtime_pin.json`; there is no in-repo runtime copy.
+> `prismaquant/gridbook_runtime/gridbook_runtime_pin.json`; there is no in-repo runtime copy.
 
 > **Prototype (ii+) of `docs/lanes/nvfp4-cb/serving-kernel.md`.** Builds on the
 > prototype-(i) correctness serve (`serve_prototype_0p6b.md`): adds a **tuned

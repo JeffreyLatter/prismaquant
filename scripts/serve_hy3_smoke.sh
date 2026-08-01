@@ -16,7 +16,7 @@ set -u
 PQ_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [ -f "$PQ_SCRIPT_DIR/lib/serve_manifest.sh" ] && . "$PQ_SCRIPT_DIR/lib/serve_manifest.sh"
 PQ_REPO_ROOT="$(cd "$PQ_SCRIPT_DIR/.." && pwd)"
-. "$PQ_SCRIPT_DIR/lib/gridbook_runtime.sh"
+. "$PQ_REPO_ROOT/prismaquant/gridbook_runtime/gridbook_runtime.sh"
 gridbook_runtime_prepare || exit $?
 NAME=pq_hy3_cb
 MODEL=/dqruns/prod-hy3-nvfp4cb-2p9/exported_nvfp4_cb
@@ -35,7 +35,7 @@ docker run -d --rm --gpus all -p 8000:8000 --name "$NAME" \
   -e PQ_MODEL="$MODEL" -e PQ_MAXLEN="$MAXLEN" -e PQ_UTIL="$UTIL" \
   --entrypoint bash vllm-node:latest -c '
     set -euo pipefail
-    bash /repo/scripts/lib/gridbook_runtime.sh install-container
+    bash "${PQ_GRIDBOOK_RUNTIME_HELPER:?}" install-container
     exec vllm serve "$PQ_MODEL" --host 0.0.0.0 --port 8000 --enforce-eager \
       --max-model-len "$PQ_MAXLEN" --served-model-name m \
       --gpu-memory-utilization "$PQ_UTIL"' > "$LOG" 2>&1
