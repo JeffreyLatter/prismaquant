@@ -1,15 +1,18 @@
 # PrismaQuant Architecture
 
-As of: 2026-08-01 · branch `fix/remove-vendored-gridbook` · verified against implementation
-commit `3d6d54c`, with the external Gridbook runtime pinned to
-`59cebf9f2c7fd43fcaa33c101eca31cbfd59fd99` (v0.4.1).
+As of: 2026-08-01 · branch `release/prismaquant-0.5.2` · verified against implementation
+baseline commit `48c069d`, with the external Gridbook runtime pinned to
+`593f524e0a5d73b18e56d290a7b1355e66b2f9ce` (v0.5.0).
 
 This revision retains the four 2026-07-30 architecture re-vet waves documented in
 `docs/audits/architecture_re-vet_2026-07-30.md` and closes the runtime-ownership debt: the
 vendored Gridbook tree and sync path are gone, producer ABI/menu/config facts have one owner,
-and required CI checks the independent producer and consumer at one immutable commit. The two
-behavioural facts a returning reader must know are that **`COST_MODE` defaults to `aura`**
-(§3.3) and fused native-NVFP4 remains default-off after its teacher-backed quality gate (§9.2).
+and required CI checks the independent producer and consumer at one immutable commit. The 0.5.2
+release advances only that boundary to Gridbook 0.5.0: the producer ABI, format menu, allocation
+and export defaults, and quality-promotion status are unchanged, and DSv4 remains gated. The
+three behavioural facts a returning reader must know are that **`COST_MODE` defaults to `aura`**
+(§3.3), Gridbook serving is native CUDA/CUTLASS-only and fails closed (§9.2), and fused
+native-NVFP4 remains default-off after its teacher-backed quality gate (§9.2).
 
 **Prime directive:** the code is the authority. Where this document and the tree disagree, the
 document is wrong — fix it, or record the divergence in §12; never propagate it.
@@ -67,7 +70,7 @@ by measurement, not by the cost model (§2).
 | Lane | Container | Runtime | Formats | Status |
 |---|---|---|---|---|
 | Native | `compressed-tensors` | vanilla vLLM, Blackwell CUTLASS | NVFP4, FP8_DYNAMIC/E4M3, FP8_SOURCE, BF16 | production default |
-| CB ("gridbook") | `nvfp4_cb` codebook checkpoint | vLLM + the separately versioned `gridbook` package (custom CUDA/CUTLASS), installed from the exact commit in `prismaquant/gridbook_runtime/gridbook_runtime_pin.json` | FP4-CB / FP8-CB rungs plus the native menu | production only for architectures declared by Gridbook's packaged runtime contract; DSv4 remains gated |
+| CB ("gridbook") | `nvfp4_cb` codebook checkpoint | vLLM + the separately versioned `gridbook` package (native CUDA/CUTLASS-only, fail-closed), installed from the exact commit in `prismaquant/gridbook_runtime/gridbook_runtime_pin.json` | FP4-CB / FP8-CB rungs plus the native menu | production only for architectures declared by Gridbook's packaged runtime contract; DSv4 remains gated |
 | GGUF | single `.gguf` | llama.cpp; vLLM via `vllm-gguf-plugin` | Q2_K…Q8_0 k-quants + IQ family + BF16 | enabled end-to-end; the only 2–3 bpw path |
 
 Lane detail, defaults and proven results: §9. Export codecs: §6. Pipeline defaults: §3.3.
@@ -369,7 +372,7 @@ VALIDATED_SOURCE_PREFETCH=require   VALIDATED_FRONTIER_PICK=kneedle,
                                     or `budget` under a TARGET_DISK_GB card
 VALIDATED_FRONTIER_SKIP_CALIB=$NSAMPLES (held-out disjointness, ON)
 CB_EXPERT_EMPIRICAL=0  CB_SCALE_CODING=two_tier  (D15: shipped values)
-AURA_ADDITIVITY_GATE=auto
+AURA_ADDITIVITY_GATE=measure
 PRISMAQUANT_GGUF_IMATRIX=1  DEVICE=cuda  EXPORT_DEVICE=cuda
 ```
 
@@ -1489,7 +1492,7 @@ flowchart TD
     GBPLUG["packaged runtime_contract.json<br/>consumer aliases, format ABI, supported producer profiles"]
     GBSCAN["Gridbook-owned architecture loader registry<br/>version-robust, inert for non-CB checkpoints"]
     GBINST["Gridbook-owned top-level expert loader + fill guard<br/>missing coverage fails closed before execution"]
-    GBCFG["Gridbook-owned quantization config<br/>CB / ignore / delegated stock CT / embedding / routed experts"]
+    GBCFG["Gridbook-owned quantization config<br/>native CUDA/CUTLASS-only, fail-closed<br/>CB / ignore / delegated stock CT / embedding / routed experts"]
   end
 
   GBPLUG --> GBSCAN
@@ -1847,13 +1850,18 @@ not import Gridbook while exporting and carries no parallel runtime alias or loa
 producer codec remains an intentionally independent implementation of the artifact ABI; CI
 compares every packing/layout field and every rung so incompatibility fails at the boundary.
 
-At runtime `register()` may preload the fused extension for residency-matched A/B, registers
-`"gridbook"` plus the legacy artifact alias `"prismaquant"`, and installs the per-architecture
-loader hooks. It does not patch vLLM core. The container may mix CB groups, ignored BF16
-prefixes, and native NVFP4/FP8 groups delegated to vLLM. Fused dense and grouped NVFP4 paths
-remain explicit opt-ins: the 2026-08-01 teacher-backed LFM gate rejected default enablement even
-though operator arithmetic passed. The canceled gfx1151/ROCm prototype was removed rather than
-maintained as an unqualified second backend.
+At runtime `register()` registers `"gridbook"` plus the legacy artifact alias `"prismaquant"`
+and installs the per-architecture loader hooks. It does not patch vLLM core. Gridbook 0.5.0
+resolves and attests every serving-reachable extension, optional-kernel mode, ABI, device, and
+shape contract during model load. Decode, expansion, activation QDQ, and routing support are
+native CUDA; GEMM and grouped GEMM are native CUTLASS. A missing or ineligible required native
+operation raises instead of selecting Triton, a fallback-capable vLLM helper, or another serving
+implementation. The container may mix CB groups, ignored BF16 prefixes, and stock NVFP4/FP8
+groups delegated to vLLM. Gridbook's own FP8 transient paths call vLLM's registered native
+CUDA quantizer and CUTLASS scaled-matmul operators directly after attestation. Fused dense and
+grouped native-NVFP4 paths remain explicit opt-ins: the 2026-08-01 teacher-backed LFM gate
+rejected default enablement even though operator arithmetic passed. The canceled gfx1151/ROCm
+prototype was removed rather than maintained as an unqualified second backend.
 
 **Storage format.** Product vector quantization onto a codebook whose every entry lies exactly
 on a hardware grid, so a decoded tile *is* a bit-standard NVFP4/FP8 tensor and dequantization
@@ -1882,8 +1890,9 @@ from `config.json` (external Gridbook `gridbook/config.py`,
 keeps vLLM's weight loader off it.
 
 **Runtime defaults and kernel provenance live only in Gridbook.** The old table
-here was removed after it drifted from the runtime it described. Resolve the
-commit in `prismaquant/gridbook_runtime/gridbook_runtime_pin.json`, then consult that source's
+here was removed after it drifted from the runtime it described. The current pin is Gridbook
+0.5.0 at `593f524e0a5d73b18e56d290a7b1355e66b2f9ce`; resolve it from
+`prismaquant/gridbook_runtime/gridbook_runtime_pin.json`, then consult that source's
 `docs/PLUGIN.md`, `docs/KERNELS.md`, and dated audits. The cross-project policy
 is only this: a numerics-changing path cannot be promoted by kernel arithmetic
 or speed alone. The latest teacher-backed LFM gate rejected both fused-NVFP4
@@ -1892,7 +1901,9 @@ defaults, so dense and grouped paths remain explicit opt-ins.
 **Per-arch wiring — the no-longer-silent no-load trap** (R10, 2026-07-30). Archs whose vLLM
 loader maps experts at the top level never call the per-layer `FusedMoE.load_weights`, so
 Gridbook installs its top-level wrapper from the packaged runtime contract. The authoritative
-module list is deliberately not repeated here. DSv4 remains absent and gated.
+module list is deliberately not repeated here. DSv4 remains absent and gated; Gridbook 0.5.0's
+warm synthetic DSV4-shape grouped-bridge timing is a kernel microbenchmark, not artifact
+qualification or a production promotion.
 Over-installing is harmless and a missing module is a no-op.
 An unwired arch used to load no stacked-CB expert tensors at all while the FusedMoE served
 uninitialised memory — garbage generation, not a crash (confirmed, `9a79963`: Laguna, 93% of
@@ -1930,7 +1941,8 @@ objectives are reachable here but **opt-in and non-default**, because the accura
 AURA is native-lane evidence and no served CB objective A/B exists. Lane defaults now match
 shipping practice (§12 D15 closed).
 
-**Proven results.**
+**Proven results.** These measurements remain tied to their recorded runtime commits; they are
+not relabelled as Gridbook 0.5.0 native-only measurements.
 
 | artifact | result |
 |---|---|
@@ -2170,8 +2182,9 @@ polish, full rejected-methods catalog) is at
 
 ## 12. Known gaps and debt register
 
-Honest register, code-cited, as of 2026-08-01 (`fix/remove-vendored-gridbook`, implementation
-commit `3d6d54c`; external Gridbook pin `59cebf9f2c7fd43fcaa33c101eca31cbfd59fd99`, v0.4.1).
+Honest register, code-cited, as of 2026-08-01 (`release/prismaquant-0.5.2`, implementation
+baseline commit `48c069d`; external Gridbook pin
+`593f524e0a5d73b18e56d290a7b1355e66b2f9ce`, v0.5.0).
 Severity is operational risk, not effort. Plugin-contract leaks are stated in §8.5 and only
 referenced here. Entries closed on 2026-07-30 are kept, marked, for one cycle so a reader
 returning with a stale copy sees the resolution rather than silence.
@@ -2224,11 +2237,12 @@ New with the 2026-07-30 merge:
 | D28 | **Serve-time fast-kernel enforcement has no caller.** `require_fast_kernels(model)` — which reads the model profile's kernel requirements and hard-fails at startup when a required fast kernel (`causal-conv1d`, `flash-linear-attention`, …) is not importable — lost its only caller when `polish_from_assignment` was archived on **2026-05-15**, and was itself walled 2026-07-30 (R19) as an orphan. It is the only mechanized piece of **core principle 9's** "routed to a *performant* kernel (not a slow fallback)" gate, so that gate is **manual today**: nothing in the build or serve path refuses a checkpoint whose arch would silently fall back to the slow PyTorch implementation. The mechanism is written and tested — only the call site is missing. | `archive/orphans_2026-07-30/prismaquant/_fast_kernel_guard.py` + `tests/test_fast_kernel_guard.py`; sole historical caller `archive/polish_2026-05-15/prismaquant/polish_from_assignment.py:202` | LOW | Move the guard back and call it from `validate_native_export` / the serve launcher, keyed on the resolved profile — or, if serve-time enforcement belongs to the lane scripts, say so in §7 and delete the row. |
 
 **Open items carried from session handovers.** Of the 41 items the handover census could not
-map to a verified closure, five were re-verified as still-open and are folded in above:
-tail-veto (D1), `TARGET_DISK_GB` (D12), the DSv4 CB lane (D3), the fp4-CB fast expander
-refusing `is_fp4` so NVFP4-CB stays on the Triton decode path (external Gridbook
-`gridbook/expand.py`), and the
-shipped Mistral-Medium-3.5-128B artifact with no profile or spec (§8.4). Two are standing
+map to a verified closure, the prior FP4-CB fast-expander/Triton item is now closed by the
+exact pinned Gridbook 0.5.0 runtime: FP4-v2 prepares its native expander at model load, decode
+uses native CUDA GEMV, M>8 uses native BF16 expansion plus Gridbook's owned CUTLASS grouped
+bridge, and a missing operation fails closed. The remaining re-verified items are folded in
+above: tail-veto (D1), `TARGET_DISK_GB` (D12), the DSv4 CB lane (D3), and the shipped
+Mistral-Medium-3.5-128B artifact with no profile or spec (§8.4). Two are standing
 research questions rather than debt: deriving the GPTQ damp constant from the weights, and the
 XLAYER Q4 LFM2.5 routing-channel measurement. The remaining ~34 — mostly PrismaSCOUT-era items
 that died with their subsystem — are enumerated with verdicts in

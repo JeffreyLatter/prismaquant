@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.5.2 — 2026-08-01
+
+This patch release advances the immutable runtime boundary to Gridbook 0.5.0
+at exact commit `593f524e0a5d73b18e56d290a7b1355e66b2f9ce`.
+
+Gridbook serving is now native CUDA/CUTLASS-only. Required native kernels are
+attested at model load and missing or ineligible kernels fail closed instead of
+falling back to Triton or another serving implementation.
+
+The PrismaQuant producer ABI, format menu, allocation and export defaults, and
+quality-promotion status are unchanged. This release makes no DeepSeek-V4
+(DSV4) qualification or support claim; that work remains paused.
+
 ## 0.5.1 — 2026-08-01
 
 This patch release makes fused NVFP4 W4A4 artifact eligibility explicit and
