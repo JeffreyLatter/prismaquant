@@ -344,7 +344,7 @@ additivity check (Σ per-layer ms vs measured end-to-end prefill on both arms).
    since Milestone C, but it is opt-in, non-default, and "the A/B that would justify
    a CB default has not been run" (ARCHITECTURE §4.7). Arm C uses the lane default;
    comparing cost objectives is a different experiment.
-3. **No NVFP4-CB claims at 4.5**
+3. **No Strix Halo numbers** — nothing measured there. **No NVFP4-CB claims at 4.5**
    — the fp4 ladder tops out at 3.28125 bpw. **No GGUF comparison** — separate lane,
    separate serving stack.
 4. **No heuristic format bans or bpw carve-outs.** Capability/evidence policy is

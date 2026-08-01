@@ -7,7 +7,10 @@ It is a local quantization-error screen, not served KL/PPL evidence.
 ## Reproduction identity
 
 - Command: `scripts/run_0p8b_s_rung_headtohead.sh`
-- PrismaQuant commit recorded by the cost artifact: `9d2a88646d7c6ff33924d91ba0804b225c66b8cf`
+- Required PrismaQuant checkout, also recorded by the cost artifact:
+  `9d2a88646d7c6ff33924d91ba0804b225c66b8cf`. Reproduction must run from that
+  commit because the current production profile intentionally masks signed
+  rungs from new allocations.
 - Source: `Qwen/Qwen3.5-0.8B`; the local source weight shard used by the run has
   SHA-256 `04b1c301231dd422b8860db31311ab2721511346a32cb1e079c4c4e5f1fe4696`
   and `config.json` has SHA-256

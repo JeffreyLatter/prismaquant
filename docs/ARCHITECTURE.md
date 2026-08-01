@@ -958,10 +958,12 @@ remain selectable.
 
 ### 5.1 The menu
 
-`format_registry.py`. `FormatSpec` byte accounting is shape-exact, not a nominal scalar:
+`format_registry.py`. For non-CB formats, `FormatSpec` byte accounting is
+shape-exact rather than a nominal scalar:
 `scale_count_for_shape` (`:123-155`) handles `scale_block_shape`, per-channel `group_size==0`,
 and 3-D packed-expert stacks; `memory_bytes_for_shape` / `effective_bits_for_shape`
-(`:157-168`) are what the DP, `footprint.py`, and the Pareto table consume. Aliases:
+(`:157-168`) are what the DP, `footprint.py`, and the Pareto table consume for
+those formats. Aliases:
 `FP8`/`FP8_DYNAMIC` → `FP8_E4M3`, `MXFP8` → `MXFP8_E4M3` (`:170-188`).
 `act_quant_changes_input` (`:75-106`) is the **single** predicate for "does the serving kernel
 consume quantized activations" (`act_bits` absent or ≥ 16 ⇒ no): the allocator's bit-exact
@@ -989,8 +991,11 @@ both, the allocator never picks it.
 `FP8_SOURCE`'s `quantize_dequantize` is identity (`:835`): the bf16 view *is* the lossless
 dequant of the source E4M3, so cost is exactly zero. Legal on dense Linears under
 `vllm_packed_moe`, **illegal on packed experts** (absent from the expert allow-list — §6.4).
-`FP8_CB` has no group-16 scale plane; its per-output-channel fp32 scales are accounted by
-`nvfp4_cb_footprint.py`, since one `FormatSpec` cannot model both (`:954-961`).
+CB candidates deliberately use a different byte authority: the versioned
+`CBSerializationContext` in `nvfp4_cb_footprint.py` prices the exact FP4 layout,
+FP8 per-row FP32 scales, and deduplicated sidecar identity. Candidate
+construction, assignment accounting, reports, and exporter assertions share
+that context; exact post-export inventory remains the final artifact check.
 
 NVFP4 *weight* RTN routes through the export codec (`_nvfp4_export_aligned_rtn` `:636-663`) so
 emulation and shipped bytes share one rendering; *activations* do not — per-group dynamic RTN,

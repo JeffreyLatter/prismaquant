@@ -61,9 +61,13 @@ The relevant serialized contracts are:
   reference/format identity. A lattice reference does not imply a free
   sidecar.
 
-Layout version, scale coding, activation contract, render identity, sidecar
-identity, and serving-unit identity are part of a candidate. A format name
-alone is not a byte or execution identity.
+The full execution contract must be selection and benchmark identity. The
+current `Candidate` encodes format, predicted loss, payload bytes, serialized
+layout, and sidecar identity through `CBSerializationContext`; it does **not**
+yet encode activation contract, concrete backend/fallback, or serving-unit
+identity. Until those fields land, they remain explicit feasibility inputs and
+benchmark provenance rather than properties enforced by the candidate object.
+A format name alone is not a byte or execution identity.
 
 ## 3. Benchmark the execution contract
 
