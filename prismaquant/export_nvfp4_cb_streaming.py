@@ -72,6 +72,7 @@ from prismaquant.export_nvfp4_cb import (
     _parse_cb_format,
     _role_of,
     _to_device,
+    _try_resolve_direct_packed_expert,
     _try_resolve_skeleton,
 )
 from prismaquant.layer_config import load_assignment
@@ -104,8 +105,15 @@ _ST_DTYPE = {
 # Inverse (safetensors dtype string -> torch dtype), used by the DELTA-EXPORT
 # reuse path to read a prior artifact's per-tensor dtype from its header.
 _ST_DTYPE_INV = {v: k for k, v in _ST_DTYPE.items()}
-_EXPERT_RE = re.compile(
+_LEGACY_EXPERT_RE = re.compile(
     r"^(.*\.experts)\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$")
+
+_LEGACY_PACKED_PROJECTIONS = {
+    "gate_up_proj": ("gate_proj", "up_proj"),
+    "down_proj": ("down_proj",),
+    "gate_proj": ("gate_proj",),
+    "up_proj": ("up_proj",),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -361,49 +369,131 @@ class _StreamWriter:
 # Per-expert -> stacked plan
 # ---------------------------------------------------------------------------
 
-def _plan_expert_stacks(skeleton: _LazySkeleton) -> dict[str, dict]:
+def _packed_expert_param_names(profile) -> frozenset[str]:
+    if profile is not None:
+        try:
+            names = frozenset(profile.packed_expert_param_names())
+            if names:
+                return names
+        except Exception:
+            pass
+    return frozenset(_LEGACY_PACKED_PROJECTIONS)
+
+
+def _packed_expert_projection_names(profile, packed_proj: str) -> tuple[str, ...]:
+    if profile is not None:
+        try:
+            names = tuple(profile.packed_expert_projection_names(packed_proj))
+            if names:
+                return names
+        except Exception:
+            pass
+    return _LEGACY_PACKED_PROJECTIONS.get(packed_proj, (packed_proj,))
+
+
+def _plan_expert_stacks(skeleton: _LazySkeleton, profile=None) -> dict[str, dict]:
     """Group per-expert on-disk tensors into stacked-output plans keyed by the
     LIVE packed qname (``…experts.gate_up_proj`` = fused gate+up, or
-    ``…experts.down_proj``). Returns {live_packed_base: {proj: {i: base}}}."""
+    ``…experts.down_proj``). Projection names and fusion order come from the
+    model profile (for example LFM uses ``w1/w3`` + ``w2`` rather than
+    ``gate_proj/up_proj`` + ``down_proj``). The legacy projection names remain
+    as a fallback for profile-less synthetic checkpoints.
+
+    Returns ``{checkpoint_experts_prefix: {projection: {expert_id: base}}}``.
+    """
     experts: dict[str, dict[str, dict[int, str]]] = {}
+    regex = None
+    if profile is not None:
+        try:
+            regex = profile.per_expert_moe_regex()
+        except Exception:
+            regex = None
+    pat = None
+    if regex:
+        pat = re.compile(regex[len("re:"):] if regex.startswith("re:")
+                         else regex)
+
+    def _profile_match(base: str) -> bool:
+        if pat is None:
+            return False
+        if pat.match(base):
+            return True
+        try:
+            return bool(pat.match(profile.to_vllm_internal_name(base)))
+        except Exception:
+            return False
+
     for name in skeleton.keys():
-        m = _EXPERT_RE.match(name)
-        if not m:
+        if not name.endswith(".weight"):
             continue
-        prefix, idx, proj = m.group(1), int(m.group(2)), m.group(3)
         base = name[:-len(".weight")]
+        if pat is not None:
+            if not _profile_match(base):
+                continue
+            try:
+                head, proj = base.rsplit(".", 1)
+                prefix, idx_s = head.rsplit(".", 1)
+            except ValueError:
+                continue
+            if not idx_s.isdigit():
+                continue
+            try:
+                parent = profile.packed_expert_parent_for_projection(proj)
+            except Exception:
+                parent = None
+            if parent is None:
+                continue
+            idx = int(idx_s)
+        else:
+            m = _LEGACY_EXPERT_RE.match(name)
+            if not m:
+                continue
+            prefix, idx, proj = m.group(1), int(m.group(2)), m.group(3)
         experts.setdefault(prefix, {}).setdefault(proj, {})[idx] = base
     return experts
 
 
-def _stacked_source_weight(skeleton, prefix, packed_proj, members) -> \
+def _stacked_source_weight(skeleton, profile, prefix, packed_proj, members) -> \
         torch.Tensor:
     """Materialise the full stacked source weight (E, out, in) for a packed
     expert group — used only where a stack must be resident (codebook
     training sampling); the packer streams per expert."""
-    return torch.stack([_expert_weight(skeleton, prefix, packed_proj,
+    projections = _packed_expert_projection_names(profile, packed_proj)
+    return torch.stack([_expert_weight(skeleton, profile, prefix, packed_proj,
                                        members, e)
-                        for e in range(_n_experts(members))])
+                        for e in range(_n_experts(members, projections))])
 
 
-def _n_experts(members: dict[str, dict[int, str]]) -> int:
-    proj = next(iter(members))
-    ids = members[proj]
-    n = len(ids)
-    if sorted(ids) != list(range(n)):
-        raise ValueError(f"non-contiguous expert ids for {proj}: {sorted(ids)}")
-    return n
+def _n_experts(members: dict[str, dict[int, str]],
+               projections: tuple[str, ...] | None = None) -> int:
+    projections = tuple(projections or members)
+    if not projections:
+        raise ValueError("expert group has no projections")
+    expected_ids = None
+    for proj in projections:
+        ids = members.get(proj)
+        if ids is None:
+            raise ValueError(f"expert group is missing projection {proj!r}")
+        got = sorted(ids)
+        if got != list(range(len(got))):
+            raise ValueError(f"non-contiguous expert ids for {proj}: {got}")
+        if expected_ids is None:
+            expected_ids = got
+        elif got != expected_ids:
+            raise ValueError(
+                f"expert ids differ across projections: {proj} has {got}, "
+                f"expected {expected_ids}")
+    return len(expected_ids)
 
 
-def _expert_weight(skeleton, prefix, packed_proj, members, e) -> torch.Tensor:
-    """One expert's fp32 weight for the packed projection: gate_up_proj fuses
-    cat([gate_e, up_e], dim=0); down_proj is the single down_e."""
-    if packed_proj == "gate_up_proj":
-        g = skeleton.dequant_weight(members["gate_proj"][e] + ".weight")
-        u = skeleton.dequant_weight(members["up_proj"][e] + ".weight")
-        return torch.cat([g, u], dim=0)
-    proj = packed_proj if packed_proj in members else "down_proj"
-    return skeleton.dequant_weight(members[proj][e] + ".weight")
+def _expert_weight(skeleton, profile, prefix, packed_proj, members,
+                   e) -> torch.Tensor:
+    """Materialize one expert's packed projection using profile-declared
+    projection names and order (for example LFM gate_up = ``w1`` then ``w3``)."""
+    projections = _packed_expert_projection_names(profile, packed_proj)
+    tensors = [skeleton.dequant_weight(members[p][e] + ".weight")
+               for p in projections]
+    return tensors[0] if len(tensors) == 1 else torch.cat(tensors, dim=0)
 
 
 # ---------------------------------------------------------------------------
@@ -731,7 +821,7 @@ def export_nvfp4_cb_streaming(
         profile = detect_profile(str(model_dir))
     except Exception:
         profile = None
-    expert_groups = _plan_expert_stacks(skeleton)
+    expert_groups = _plan_expert_stacks(skeleton, profile)
 
     # --- Stock-CT codecs (mixed container: the plugin delegates non-"scheme"
     # groups to vLLM's CompressedTensors path). REUSE the authoritative
@@ -794,23 +884,25 @@ def export_nvfp4_cb_streaming(
         key = _try_resolve_skeleton(qname, skeleton, profile, suffix)
         if key is not None:
             return "tensor", key
-        # packed-expert group keyed by the live packed name.
-        m = re.match(r"^(.*\.experts)\.(gate_up_proj|down_proj|gate_proj|"
-                     r"up_proj)$", qname)
-        if m:
-            prefix, packed_proj = m.group(1), m.group(2)
+        # Packed-expert groups are keyed by CHECKPOINT prefixes. Resolve the
+        # recipe qname directly and through the profile's source mapping, and
+        # accept only packed parents declared by that profile.
+        candidates = [qname]
+        if profile is not None:
+            try:
+                mapped = profile.source_tensor_name(qname)
+                if mapped not in candidates:
+                    candidates.append(mapped)
+            except Exception:
+                pass
+        packed_names = _packed_expert_param_names(profile)
+        for candidate in candidates:
+            if "." not in candidate:
+                continue
+            prefix, packed_proj = candidate.rsplit(".", 1)
+            if not prefix.endswith(".experts") or packed_proj not in packed_names:
+                continue
             grp = expert_groups.get(prefix)
-            if grp is None and profile is not None:
-                # Nested-prefix checkpoints (Qwen3.5-VLM: recipe
-                # `model.layers.*` vs on-disk `model.language_model.layers.*`)
-                # — the groups are keyed by CHECKPOINT prefixes; map the
-                # recipe prefix through the profile (same resolution the
-                # dense `_try_resolve_skeleton` path uses).
-                try:
-                    grp = expert_groups.get(
-                        profile.source_tensor_name(prefix))
-                except Exception:
-                    grp = None
             if grp is not None:
                 return "experts", (prefix, packed_proj, grp)
         return None, None
@@ -821,14 +913,15 @@ def export_nvfp4_cb_streaming(
             return tuple(skeleton.get_shape(h))
         if kind == "experts":
             prefix, packed_proj, grp = h
-            n = _n_experts(grp)
-            if packed_proj == "gate_up_proj":
-                g = skeleton.get_shape(grp["gate_proj"][0] + ".weight")
-                u = skeleton.get_shape(grp["up_proj"][0] + ".weight")
-                return (n, int(g[0]) + int(u[0]), int(g[1]))
-            proj = packed_proj if packed_proj in grp else "down_proj"
-            s = skeleton.get_shape(grp[proj][0] + ".weight")
-            return (n, int(s[0]), int(s[1]))
+            projections = _packed_expert_projection_names(profile, packed_proj)
+            n = _n_experts(grp, projections)
+            shapes = [skeleton.get_shape(grp[p][0] + ".weight")
+                      for p in projections]
+            in_f = int(shapes[0][1])
+            if any(len(s) != 2 or int(s[1]) != in_f for s in shapes):
+                raise ValueError(
+                    f"{qname}: incompatible expert projection shapes {shapes}")
+            return (n, sum(int(s[0]) for s in shapes), in_f)
         raise KeyError(f"{qname}: no streaming source (tensor or expert group)")
 
     # --- Coverage gate (lazy: shapes only). ---
@@ -1245,14 +1338,19 @@ def export_nvfp4_cb_streaming(
     # artifact at a 4.75 bpp target).
     consumed_expert_bases = set()
     for prefix, projs in expert_groups.items():
-        canon_prefix = _canonical_qname(prefix, profile) or prefix
-        packed_names = set()
-        for p in {prefix, canon_prefix}:
-            packed_names |= {f"{p}.gate_up_proj", f"{p}.down_proj",
-                             f"{p}.gate_proj", f"{p}.up_proj"}
-        if packed_names & cb_targets_set:
-            for proj, ids in projs.items():
-                for e, base in ids.items():
+        # Consume only the source projections belonging to an actually-CB
+        # packed parent. A partial layer (for example gate_up=CB, down=BF16)
+        # must retain the untouched per-expert tensors for its BF16 parent.
+        for packed_proj in _packed_expert_param_names(profile):
+            checkpoint_qname = f"{prefix}.{packed_proj}"
+            canon_qname = _canonical_qname(checkpoint_qname, profile)
+            variants = {checkpoint_qname}
+            if canon_qname is not None:
+                variants.add(canon_qname)
+            if not variants & cb_targets_set:
+                continue
+            for proj in _packed_expert_projection_names(profile, packed_proj):
+                for base in projs.get(proj, {}).values():
                     consumed_expert_bases.add(base + ".weight")
     resolved_source_scale_keys = {
         entry[1] for entry in skeleton._fp8_scale_inv_map.values()
@@ -1267,8 +1365,13 @@ def export_nvfp4_cb_streaming(
             ".weight_scale_inv"
         ):
             continue   # consumed with its fp8 weight, or an unused sidecar
-        ckpt_qname = (name[:-len(".weight")] if name.endswith(".weight")
-                      else None)
+        if name.endswith(".weight"):
+            ckpt_qname = name[:-len(".weight")]
+        elif _try_resolve_direct_packed_expert(
+                name, skeleton, profile) == name:
+            ckpt_qname = name
+        else:
+            ckpt_qname = None
         canon = _canonical_qname(ckpt_qname, profile) if ckpt_qname else None
         if canon in cb_targets_set or canon in source_set \
                 or canon in stock_set:
@@ -1424,8 +1527,10 @@ def _stream_pack_target(skeleton, profile, resolved, qname, grid, mode, k,
     # in-memory exporter packs a pre-stacked 3-D tensor. Peak = one MoE layer's
     # experts, not the model.
     prefix, packed_proj, grp = h
-    n = _n_experts(grp)
-    w = torch.stack([_expert_weight(skeleton, prefix, packed_proj, grp, e)
+    projections = _packed_expert_projection_names(profile, packed_proj)
+    n = _n_experts(grp, projections)
+    w = torch.stack([_expert_weight(skeleton, profile, prefix, packed_proj,
+                                    grp, e)
                      for e in range(n)]).to(device)
     if cb_render_identity is not None:
         from prismaquant.production_weight_cache import (
@@ -1465,7 +1570,7 @@ def _train_shared_codebook_streaming(skeleton, profile, expert_groups,
         else:
             prefix, packed_proj, grp = h
             weights.append(_stacked_source_weight(
-                skeleton, prefix, packed_proj, grp).to(device))
+                skeleton, profile, prefix, packed_proj, grp).to(device))
         cws.append(col_weights[q].to(device))
     return _train_shared_codebook(
         weights, cws, grid=grid, mode=mode, k=k, seed=seed, iters=iters,

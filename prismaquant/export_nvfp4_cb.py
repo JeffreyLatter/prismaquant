@@ -145,11 +145,17 @@ def _pack_skeleton_experts(
     skeleton: dict,
     profile,
     fp8_scale_inv_map=None,
+    target_qnames: set[str] | None = None,
 ) -> int:
     """Per-expert-on-disk MoE checkpoints (Qwen3.5-MoE / Ornith): assemble
     the packed ``<experts>.gate_up_proj/.down_proj`` skeleton tensors the CB
     targets name, via layer_streaming's tested bridge. No-op for dense or
     already-packed checkpoints.
+
+    When ``target_qnames`` is supplied, only those packed parents are
+    assembled. This is required for partial mixed assignments: an omitted or
+    BF16 expert bank must stay in its original per-expert checkpoint layout,
+    which is the layout architecture-specific vLLM loaders consume.
 
     Memory discipline: the bridge is invoked once PER packed group (the
     ``live_param_shape`` gate restricts each call), so the transient is one
@@ -181,6 +187,34 @@ def _pack_skeleton_experts(
         except Exception:
             return False
 
+    requested = None if target_qnames is None else set(target_qnames)
+
+    def is_requested(packed_full: str) -> bool:
+        if requested is None:
+            return True
+        variants = {packed_full}
+        canon = _canonical_qname(packed_full, profile)
+        if canon is not None:
+            variants.add(canon)
+        return bool(variants & requested)
+
+    def packed_source_parts(source_name: str):
+        """Return ``(packed_parent, expert_id, projection)`` for either a
+        checkpoint or profile-mapped live per-expert source name."""
+        name = (source_name[:-len(".weight")]
+                if source_name.endswith(".weight") else source_name)
+        try:
+            head, proj = name.rsplit(".", 1)
+            experts_path, idx = head.rsplit(".", 1)
+        except ValueError:
+            return None
+        if not idx.isdigit():
+            return None
+        parent = profile.packed_expert_parent_for_projection(proj)
+        if parent is None:
+            return None
+        return f"{experts_path}.{parent}", int(idx), proj
+
     # Pre-derive each packed group's expected shape from its per-expert
     # members (E, sum of fused projection out-dims, in).
     members: dict[str, dict[int, dict[str, tuple]]] = defaultdict(
@@ -194,6 +228,15 @@ def _pack_skeleton_experts(
         except Exception:
             live_weight_name = None
         live_weight_name = live_weight_name or key
+        raw_parts = packed_source_parts(key)
+        live_parts = packed_source_parts(live_weight_name)
+        candidate_parents = {
+            parts[0] for parts in (raw_parts, live_parts)
+            if parts is not None
+        }
+        if requested is not None and not any(
+                is_requested(parent) for parent in candidate_parents):
+            continue
         if key.endswith(".weight") and (
             t.dtype == torch.float8_e4m3fn
             or live_weight_name in (fp8_scale_inv_map or {})
@@ -203,14 +246,10 @@ def _pack_skeleton_experts(
                 "FP8/MXFP4 per-expert tensors before dequantization; use "
                 "export_nvfp4_cb_streaming for this source"
             )
-        head, proj = name.rsplit(".", 1)
-        experts_path, idx = head.rsplit(".", 1)
-        if not idx.isdigit():
+        if raw_parts is None:
             continue
-        parent = profile.packed_expert_parent_for_projection(proj)
-        if parent is None:
-            continue
-        members[f"{experts_path}.{parent}"][int(idx)][proj] = tuple(t.shape)
+        packed_full, idx, proj = raw_parts
+        members[packed_full][idx][proj] = tuple(t.shape)
     expected: dict[str, tuple] = {}
     for packed_full, by_e in members.items():
         parent = packed_full.rsplit(".", 1)[1]
@@ -242,9 +281,54 @@ def _pack_skeleton_experts(
     return produced
 
 
+def _try_resolve_direct_packed_expert(qname, skeleton, profile):
+    """Resolve a direct packed expert parameter key (no ``.weight`` suffix).
+
+    Packed expert containers expose 3-D ``nn.Parameter`` objects directly on
+    some HF models. A checkpoint saved from that live representation therefore
+    legitimately contains ``...experts.gate_up_proj`` rather than
+    ``...experts.gate_up_proj.weight``. Accept only profile-declared packed
+    parents under an ``experts`` container, and require rank 3 so an unrelated
+    suffix-less tensor can never be mistaken for a quantization target.
+    """
+    if profile is None:
+        return None
+    try:
+        packed_names = frozenset(profile.packed_expert_param_names())
+    except Exception:
+        return None
+    if not packed_names:
+        return None
+    candidates = [qname]
+    try:
+        mapped = profile.source_tensor_name(qname)
+        if mapped not in candidates:
+            candidates.append(mapped)
+    except Exception:
+        pass
+    for key in candidates:
+        if key not in skeleton or "." not in key:
+            continue
+        parent, leaf = key.rsplit(".", 1)
+        if not parent.endswith(".experts") or leaf not in packed_names:
+            continue
+        if hasattr(skeleton, "get_shape"):
+            shape = tuple(skeleton.get_shape(key))
+        else:
+            shape = tuple(skeleton[key].shape)
+        if len(shape) != 3:
+            raise ValueError(
+                f"{qname}: direct packed expert source {key!r} must be rank-3 "
+                f"[experts, out_features, in_features], got {shape}")
+        return key
+    return None
+
+
 def _try_resolve_skeleton(qname, skeleton, profile, suffix=".weight"):
     """Recipe qname -> actual skeleton key, or None if neither the direct name
-    nor the profile-mapped (checkpoint-convention) name is present."""
+    nor the profile-mapped (checkpoint-convention) name is present. For the
+    default weight lookup, also accepts a validated direct 3-D packed-expert
+    parameter key (the native LFM live/save representation)."""
     direct = qname + suffix
     if direct in skeleton:
         return direct
@@ -252,6 +336,9 @@ def _try_resolve_skeleton(qname, skeleton, profile, suffix=".weight"):
         mapped = profile.source_tensor_name(qname) + suffix
         if mapped in skeleton:
             return mapped
+    if suffix == ".weight":
+        return _try_resolve_direct_packed_expert(
+            qname, skeleton, profile)
     return None
 
 
@@ -263,6 +350,8 @@ def _resolve_skeleton(qname, skeleton, profile, suffix=".weight"):
     tried = [qname + suffix]
     if profile is not None:
         tried.append(profile.source_tensor_name(qname) + suffix)
+        if suffix == ".weight":
+            tried.extend([qname, profile.source_tensor_name(qname)])
     raise KeyError(
         f"{qname}: no skeleton tensor for {suffix!r} (tried {tried})")
 
@@ -474,14 +563,6 @@ def export_nvfp4_cb(
     # also carries the checkpoint-declared block shape and declared MXFP4 set;
     # missing scales fail closed in cb_source_weight_bf16_value.
     _source_fp8_scale_map = build_cb_source_fp8_scale_map(model_dir)
-    # Per-expert-on-disk MoE checkpoints: assemble the packed expert stacks
-    # the CB targets name BEFORE any skeleton resolution below.
-    _pack_skeleton_experts(
-        skeleton,
-        _profile,
-        _source_fp8_scale_map,
-    )
-
     # --- Coverage gate: classify every assigned format into CB / stock-CT /
     # BF16-passthrough (the mixed container, LAYOUT.md §4; "FP8 in every
     # recipe"). ---
@@ -510,6 +591,22 @@ def export_nvfp4_cb(
             f"{sorted({f for _, f in illegal})} — it carries the CB families "
             f"+ stock NVFP4/FP8_DYNAMIC (CT-delegated) + FP8_SOURCE "
             f"(verbatim fp8 passthrough) + BF16 passthrough only")
+
+    # Per-expert-on-disk MoE checkpoints: assemble only packed parents that
+    # are actually quantized. Packing every detected bank mutates omitted/BF16
+    # LFM layers from their loadable ``experts.E.w1/w2/w3.weight`` layout into
+    # aggregate ``gate_up_proj/down_proj.weight`` passthrough tensors that
+    # vLLM's architecture loader cannot consume.
+    _pack_skeleton_experts(
+        skeleton,
+        _profile,
+        fp8_scale_inv_map=_source_fp8_scale_map,
+        target_qnames=set(cb_targets) | set(stock_targets),
+    )
+    # FP8_SOURCE is deliberately excluded above: it is a byte-verbatim
+    # passthrough contract and must already resolve to a source weight plus its
+    # scale_inv sibling. Synthesizing a packed stack would change that payload
+    # and still would not produce the required packed scale tensor.
 
     # Sidecar stock targets (visual/audio — modules the profile's LM mapping
     # drops): ship WEIGHT-ONLY (W4A16). Text-only calibration has no visual
@@ -760,7 +857,12 @@ def export_nvfp4_cb(
         # EXPORTED tensor names — vLLM's convention, incl. the language_model
         # infix); `canon` is the canonical recipe qname that assignment /
         # col_weights / cb_targets are keyed by (nested -> canonical).
-        ckpt_qname = name[:-len(".weight")] if name.endswith(".weight") else None
+        if name.endswith(".weight"):
+            ckpt_qname = name[:-len(".weight")]
+        elif _try_resolve_direct_packed_expert(name, skeleton, _profile) == name:
+            ckpt_qname = name
+        else:
+            ckpt_qname = None
         canon = _canonical_qname(ckpt_qname, _profile) if ckpt_qname else None
         if canon is None and ckpt_qname is not None and (
                 ckpt_qname in stock_targets or ckpt_qname in cb_targets):
