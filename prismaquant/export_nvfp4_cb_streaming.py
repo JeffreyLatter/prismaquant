@@ -898,7 +898,7 @@ def export_nvfp4_cb_streaming(
         outside = sorted(
             q for q in list(cb_targets) + list(source_targets)
             + list(stock_targets)
-            if not any(_export_base_name(q, profile).startswith(p)
+            if not any(_export_base_name(q, profile, skeleton).startswith(p)
                        for p in subset_prefixes))
         if outside:
             raise ValueError(
@@ -1186,7 +1186,9 @@ def export_nvfp4_cb_streaming(
         ) = build_execution_contract(
             logical_scales,
             policy=activation_scale_policy_id,
-            target_name=lambda qname: _export_base_name(qname, profile),
+            target_name=lambda qname: _export_base_name(
+                qname, profile, skeleton
+            ),
         )
     verified_cb_source_qnames: set[str] = set()
 
@@ -1220,7 +1222,7 @@ def export_nvfp4_cb_streaming(
 
     # CB + FP8_SOURCE targets (keyed by canonical/recipe qname).
     for qname in list(cb_targets) + list(source_targets):
-        export_base = _export_base_name(qname, profile)
+        export_base = _export_base_name(qname, profile, skeleton)
         kind, h = _resolve_target(qname)
         if qname in source_set:
             wkey = _try_resolve_skeleton(qname, skeleton, profile)
@@ -1415,7 +1417,7 @@ def export_nvfp4_cb_streaming(
     # group from its base boundary and rewrites identical bytes.
     for qname in sorted(stock_targets):
         canon_fmt = stock_targets[qname]
-        export_base = _export_base_name(qname, profile)
+        export_base = _export_base_name(qname, profile, skeleton)
         kind, h = _resolve_target(qname)              # dense: kind == "tensor"
         shape = _target_shape(qname)
         override = (_nvfp4_shared_global.get(qname)
@@ -1585,7 +1587,7 @@ def export_nvfp4_cb_streaming(
     serialized_payload_summary = cb_payload_summary(serialized_payload)
 
     def _cb_target_name(qname: str) -> str:
-        return _export_base_name(qname, profile)
+        return _export_base_name(qname, profile, skeleton)
 
     def _delegated_target_name(qname: str) -> str:
         return (

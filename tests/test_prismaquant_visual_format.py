@@ -137,8 +137,36 @@ class TestDiscoverVisualLinearsFromSource(unittest.TestCase):
             "in_features": 16,
             "source_dtype": "bf16",
             "has_fp8_scale": False,
+            "_nvfp4_weight_only": True,
         })
         validate_source_visual_passthrough_contract(stats, "BF16")
+
+    def test_profile_mapping_marks_all_text_excluded_stock_targets_weight_only(self):
+        from prismaquant.allocator import _mark_weight_only_nvfp4_stats
+
+        class _Profile:
+            @staticmethod
+            def checkpoint_to_live_name(name, *, multimodal=False):
+                if name.startswith(("model.audio_tower.", "mtp.")):
+                    return None
+                return name
+
+        stats = {
+            "model.layers.0.mlp.down_proj": {"n_params": 1},
+            "model.audio_tower.proj": {"n_params": 1},
+            "mtp.layers.0.mlp.down_proj": {"n_params": 1},
+        }
+        marked = _mark_weight_only_nvfp4_stats(stats, _Profile())
+        self.assertNotIn(
+            "_nvfp4_weight_only",
+            marked["model.layers.0.mlp.down_proj"],
+        )
+        self.assertTrue(
+            marked["model.audio_tower.proj"]["_nvfp4_weight_only"]
+        )
+        self.assertTrue(
+            marked["mtp.layers.0.mlp.down_proj"]["_nvfp4_weight_only"]
+        )
 
     def test_non_bf16_source_cannot_receive_bf16_passthrough_budget(self):
         import tempfile

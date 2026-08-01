@@ -1142,6 +1142,106 @@ def test_exporter_resolves_nested_prefix_skeleton(tmp_path, monkeypatch):
     assert "model.visual.patch_embed.weight" in st
 
 
+def test_streaming_keeps_direct_namespace_under_multimodal_wrapper(
+        tmp_path, monkeypatch):
+    """Resident and streaming export must derive names from the same source.
+
+    Some text-only snapshots retain a multimodal wrapper config while their
+    tensors already use the flat ``model.layers.*`` namespace.  A profile-only
+    rewrite would invent ``model.language_model.layers.*`` output names.  The
+    streaming subset gate, execution contract, tensor writer, and config group
+    must all use the direct physical prefix that actually resolved.
+    """
+    import importlib
+
+    from prismaquant import model_profiles
+    from prismaquant.export_nvfp4_cb import export_nvfp4_cb
+    from safetensors.torch import load_file
+
+    streaming_module = importlib.import_module(
+        "prismaquant.export_nvfp4_cb_streaming"
+    )
+    canon = "model.layers.0.mlp.gate_proj"
+    nested = "model.language_model.layers.0.mlp.gate_proj"
+    model_dir = _Path(tmp_path) / "model"
+    model_dir.mkdir()
+    source_weights = _make_synth_model(model_dir, {canon: (128, 256)})
+    (model_dir / "config.json").write_text(_json.dumps({
+        "architectures": ["Qwen3_5ForConditionalGeneration"],
+        "text_config": {"model_type": "qwen3_5"},
+    }))
+    col_weights = {canon: torch.rand(256) + 0.05}
+    layer_config = _write_production_cb_layer_config(
+        tmp_path,
+        {canon: "NVFP4_CB_K16"},
+        source_weights,
+        col_weights,
+    )
+    activation_cache = _write_activation_cache(tmp_path, {canon: 256})
+    profile = _NestedVLMProfile()
+    monkeypatch.setattr(
+        model_profiles, "detect_profile", lambda *args, **kwargs: profile
+    )
+    monkeypatch.setattr(
+        streaming_module, "detect_profile", lambda *args, **kwargs: profile
+    )
+
+    resident = _Path(tmp_path) / "resident"
+    streaming = _Path(tmp_path) / "streaming"
+    common = {
+        "col_weights": col_weights,
+        "device": "cpu",
+        "activation_cache_dir": activation_cache,
+        "activation_scale_policy": "full_e4m3",
+    }
+    export_nvfp4_cb(
+        model_dir,
+        layer_config,
+        resident,
+        **common,
+    )
+    streaming_module.export_nvfp4_cb_streaming(
+        model_dir,
+        layer_config,
+        streaming,
+        # This is also the regression for subset validation: before the fix,
+        # the profile-only mapped name was rejected as outside this prefix.
+        subset_prefixes=["model.layers."],
+        **common,
+    )
+
+    resident_tensors = load_file(str(resident / "model.safetensors"))
+    streaming_tensors = load_file(str(streaming / "model.safetensors"))
+    for tensors in (resident_tensors, streaming_tensors):
+        assert f"{canon}.cb_qweight" in tensors
+        assert f"{canon}.input_global_scale" in tensors
+        assert f"{nested}.cb_qweight" not in tensors
+        assert f"{nested}.input_global_scale" not in tensors
+    assert torch.equal(
+        resident_tensors[f"{canon}.input_global_scale"],
+        streaming_tensors[f"{canon}.input_global_scale"],
+    )
+
+    resident_config = _json.loads(
+        (resident / "quant_config.json").read_text()
+    )
+    streaming_config = _json.loads(
+        (streaming / "quant_config.json").read_text()
+    )
+    for config in (resident_config, streaming_config):
+        cb_group = next(
+            group for group in config["config_groups"].values()
+            if "scheme" in group
+        )
+        assert cb_group["targets"] == [canon]
+        assert config["execution_contracts"]["nvfp4_w4a4"][
+            "target_names"
+        ] == [canon]
+    assert resident_config["execution_contracts"] == (
+        streaming_config["execution_contracts"]
+    )
+
+
 def test_codebook_pqcb_sidecar_contract(tmp_path):
     # Codebooks ship in cb_codebooks.pqcb (safetensors under a non-globbed
     # extension), named by each scheme's codebook_ref, and are NOT in
