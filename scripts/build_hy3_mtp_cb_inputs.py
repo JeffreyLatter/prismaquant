@@ -17,7 +17,9 @@ Two rung-selection policies (``--rung-select``):
     per-role CB menu, fit served acceptance to ``a(b)=a_inf−β·sqrt(E(b))``,
     and pick the throughput-optimal rung with ``mtp_rung_selection.select_rung``.
     Emits ``mtp_rung_selection.json`` (the full selection provenance) next to
-    the layer_config. Default stays ``modal`` so the shipped artifact is stable.
+    the layer_config. Exact menu bytes are derived from the body assignment's
+    persisted CB serialization context; an unstamped body assignment is rejected.
+    Default stays ``modal`` so the shipped artifact is stable.
 
 Everything the MTP layer_config does NOT name (``enorm``/``hnorm``/``eh_proj``/
 ``final_layernorm``, the block's norms, ``q_norm``/``k_norm``, the router gate,
@@ -53,6 +55,15 @@ from prismaquant.mtp_rung_selection import (
     RungPoint,
     ServeConstants,
     select_rung,
+)
+from prismaquant.nvfp4_cb_footprint import (
+    CBSerializationContext,
+    cb_assignment_payload_breakdown,
+    cb_payload_summary,
+    cb_quantize_dequantize_for_context,
+    cb_serialization_context_from_stamp,
+    cb_serialization_context_stamp,
+    cb_serialization_metadata_from_assignment_payload,
 )
 
 # Recipe-qname roles under model.layers.{L}. and their target CB family.
@@ -162,6 +173,34 @@ def _modal_expert_fp4_k(body_lc: dict) -> tuple[int, Counter]:
     return dist.most_common(1)[0][0], dist
 
 
+def _load_body_cb_serialization_context(
+    body_layer_config: str | Path,
+) -> CBSerializationContext:
+    """Load the exact CB producer identity carried by the body assignment.
+
+    Auto selection makes resident-byte and render-error claims, so it may not
+    infer layout-v1/v2, scale sweep, encoder tier, or codebook sharing from the
+    current process defaults. Historical unstamped assignments remain usable by
+    the modal builder, which makes no exact byte claim; auto mode fails closed.
+    """
+    path = Path(body_layer_config)
+    payload = json.loads(path.read_text())
+    stamp, _identities = cb_serialization_metadata_from_assignment_payload(
+        payload
+    )
+    if stamp is None:
+        raise ValueError(
+            f"{path}: auto MTP selection requires the body assignment's "
+            "explicit cb_serialized_payload context (layout/scale coding, "
+            "scale sweep, encoder tier, and codebook identity); refusing to "
+            "price a legacy unstamped CB menu"
+        )
+    return cb_serialization_context_from_stamp(
+        stamp,
+        where=f"Hy3 MTP body assignment {path}",
+    )
+
+
 # --------------------------------------------------------------------------- #
 # The build (shared by modal + auto). expert_key / shared_key are
 # (data_type, cb_k) tuples; when None they default to the modal policy.
@@ -246,25 +285,12 @@ def build(source_dir: Path, body_layer_config: Path, out_dir: Path,
 # --------------------------------------------------------------------------- #
 # Auto mode: menu construction, E resolution, selection
 # --------------------------------------------------------------------------- #
-def _rung_bpw(key: tuple[str, int]) -> float:
-    """Body bits/weight for a CB rung: nvfp4_cb = k/8 + 0.5, fp8_cb = k/8."""
-    dt, k = key
-    return k / 8.0 + (0.5 if dt == "nvfp4_cb" else 0.0)
-
-
 def _expert_family_for_k(k: int) -> str:
     if 12 <= k <= 24:
         return "nvfp4_cb"
     if 28 <= k <= 48:
         return "fp8_cb"
     raise ValueError(f"cb_k={k} maps to no known CB family (fp4 12-24, fp8 28-48)")
-
-
-def _pair_dense_k(expert_bpw: float) -> int:
-    """Pick the fp8 dense/shared rung whose bpw is closest to the expert tier
-    (the doc's 'per-role rung families map to a common bits level'; ties → the
-    higher-fidelity k). Dense/shared floor at the smallest fp8 rung (3.5 bpw)."""
-    return min(_DENSE_FP8_KS, key=lambda k: (abs(k / 8.0 - expert_bpw), -k))
 
 
 def _expert_shape_bytes(source_dir: Path, shard_map: dict, base: str):
@@ -278,65 +304,209 @@ def _expert_shape_bytes(source_dir: Path, shard_map: dict, base: str):
     return len(ids), shapes
 
 
+def _num_params(shape) -> int:
+    out = 1
+    for dim in shape:
+        out *= int(dim)
+    return out
+
+
+def _auto_target_shapes(source_dir: Path, shard_map: dict, profile, base: str):
+    """Return the concrete packed-expert and dense MTP serialization shapes."""
+    num_experts, (g0, u0, d0) = _expert_shape_bytes(
+        source_dir, shard_map, base
+    )
+    dense_shapes: dict[str, tuple[int, ...]] = {}
+    for leaf in _ATTN_LEAVES:
+        qname = f"{base}.self_attn.{leaf}"
+        dense_shapes[qname] = _shape(
+            source_dir,
+            shard_map,
+            profile.source_tensor_name(qname) + ".weight",
+        )
+    for leaf in _SHARED_LEAVES:
+        qname = f"{base}.mlp.shared_experts.{leaf}"
+        dense_shapes[qname] = _shape(
+            source_dir,
+            shard_map,
+            profile.source_tensor_name(qname) + ".weight",
+        )
+    if int(g0[1]) != int(u0[1]):
+        raise ValueError(
+            f"{base}: gate/up expert input widths differ: {g0[1]} != {u0[1]}"
+        )
+    expert_shapes = {
+        f"{base}.mlp.experts.gate_up_proj": (
+            num_experts,
+            int(g0[0]) + int(u0[0]),
+            int(g0[1]),
+        ),
+        f"{base}.mlp.experts.down_proj": (
+            num_experts,
+            int(d0[0]),
+            int(d0[1]),
+        ),
+    }
+    return num_experts, dense_shapes, expert_shapes
+
+
+def _exact_scope_rate(
+    shapes: dict[str, tuple[int, ...]],
+    format_name: str,
+    context: CBSerializationContext,
+) -> tuple[dict, float]:
+    assignment = {qname: format_name for qname in shapes}
+    payload = cb_assignment_payload_breakdown(
+        assignment,
+        shapes,
+        context=context,
+    )
+    params = sum(_num_params(shape) for shape in shapes.values())
+    return payload, 8.0 * int(payload["total_bytes"]) / max(params, 1)
+
+
+def _pair_dense_key_exact(
+    expert_key: tuple[str, int],
+    dense_shapes: dict[str, tuple[int, ...]],
+    expert_shapes: dict[str, tuple[int, ...]],
+    context: CBSerializationContext,
+) -> tuple[str, int]:
+    """Match dense/shared FP8 to the expert tier using exact scope rates.
+
+    The comparison includes layout-v1/v2, FP8 row scales, and one deduplicated
+    sidecar set within each role scope. The final full-draft payload is priced
+    again below so a sidecar shared by expert and dense scopes is charged once.
+    """
+    expert_format = _cb_format_name(expert_key)
+    _payload, expert_bpp = _exact_scope_rate(
+        expert_shapes,
+        expert_format,
+        context,
+    )
+    candidates: list[tuple[float, int]] = []
+    for dense_k in _DENSE_FP8_KS:
+        _dense_payload, dense_bpp = _exact_scope_rate(
+            dense_shapes,
+            _cb_format_name(("fp8_cb", dense_k)),
+            context,
+        )
+        candidates.append((abs(dense_bpp - expert_bpp), dense_k))
+    # Equal distance prefers the higher-fidelity dense rung.
+    dense_k = min(candidates, key=lambda item: (item[0], -item[1]))[1]
+    return "fp8_cb", dense_k
+
+
+def _build_auto_menu_from_shapes(
+    *,
+    num_experts: int,
+    dense_shapes: dict[str, tuple[int, ...]],
+    expert_shapes: dict[str, tuple[int, ...]],
+    e_table: dict[str, float],
+    cb_context: CBSerializationContext,
+) -> tuple[list[RungPoint], dict]:
+    """Build an exact serialized-payload menu from concrete target shapes."""
+    if not isinstance(cb_context, CBSerializationContext):
+        raise ValueError(
+            "Hy3 MTP auto menu requires an explicit CBSerializationContext; "
+            "refusing FormatSpec/default byte estimates"
+        )
+    expert_ladder = [("nvfp4_cb", k) for k in _EXPERT_FP4_KS] + [
+        ("fp8_cb", k) for k in _EXPERT_FP8_KS
+    ]
+    all_shapes = {**dense_shapes, **expert_shapes}
+    total_params = sum(_num_params(shape) for shape in all_shapes.values())
+
+    menu: list[RungPoint] = []
+    pairing: dict[str, dict] = {}
+    used_formats: set[str] = set()
+    for expert_key in expert_ladder:
+        _expert_dt, expert_k = expert_key
+        name = f"K{expert_k}"
+        dense_key = _pair_dense_key_exact(
+            expert_key,
+            dense_shapes,
+            expert_shapes,
+            cb_context,
+        )
+        expert_format = _cb_format_name(expert_key)
+        dense_format = _cb_format_name(dense_key)
+        assignment = {
+            **{qname: expert_format for qname in expert_shapes},
+            **{qname: dense_format for qname in dense_shapes},
+        }
+        payload = cb_assignment_payload_breakdown(
+            assignment,
+            all_shapes,
+            context=cb_context,
+        )
+        total_bytes = int(payload["total_bytes"])
+        bits = 8.0 * total_bytes / max(total_params, 1)
+        if name not in e_table:
+            raise KeyError(
+                f"auto menu rung {name} ({expert_format}) has no E in the "
+                "e-table — measure it (--measure-e) or add it to --e-table "
+                "(never fabricate E)"
+            )
+        menu.append(
+            RungPoint(
+                name=name,
+                bits=bits,
+                resident_bytes=total_bytes,
+                E=float(e_table[name]),
+            )
+        )
+        used_formats.update((expert_format, dense_format))
+        pairing[name] = {
+            "expert_key": list(expert_key),
+            "dense_key": list(dense_key),
+            "expert_format": expert_format,
+            "dense_format": dense_format,
+            "bits": bits,
+            "resident_bytes": total_bytes,
+            "byte_scope": (
+                "cb_tensor_data_plus_deduplicated_fp16_codebook_sidecars"
+            ),
+            "serialized_payload": cb_payload_summary(payload),
+        }
+    return menu, {
+        "num_experts": int(num_experts),
+        "total_params": total_params,
+        "byte_scope": (
+            "cb_tensor_data_plus_deduplicated_fp16_codebook_sidecars"
+        ),
+        "cb_serialized_payload": cb_serialization_context_stamp(
+            cb_context,
+            formats=sorted(used_formats),
+        ),
+        "pairing": pairing,
+    }
+
+
 def _build_auto_menu(source_dir: Path, shard_map: dict, profile, base: str,
-                     e_table: dict[str, float]) -> tuple[list[RungPoint], dict]:
+                     e_table: dict[str, float], *,
+                     cb_context: CBSerializationContext
+                     ) -> tuple[list[RungPoint], dict]:
     """Build the per-rung menu (bits, resident bytes, E) for the draft.
 
     Each menu rung is a full-draft encoding named by its EXPERT rung short name
     (``K14``..``K20`` fp4, ``K28``..``K44`` fp8); dense/shared ride along at the
-    nearest fp8 tier. bits + resident bytes are exact from source shapes and the
-    registry byte model; E comes from ``e_table`` (measured or precomputed).
+    nearest exact-rate fp8 tier. Bits and resident bytes come from the
+    authoritative serialized-payload API over the real packed target shapes;
+    E comes from ``e_table`` (measured or precomputed).
     """
-    num_experts, (g0, u0, d0) = _expert_shape_bytes(source_dir, shard_map, base)
-    dense_shapes = []
-    for leaf in _ATTN_LEAVES:
-        q = f"{base}.self_attn.{leaf}"
-        dense_shapes.append(_shape(source_dir, shard_map,
-                                   profile.source_tensor_name(q) + ".weight"))
-    for leaf in _SHARED_LEAVES:
-        q = f"{base}.mlp.shared_experts.{leaf}"
-        dense_shapes.append(_shape(source_dir, shard_map,
-                                   profile.source_tensor_name(q) + ".weight"))
-
-    def _mem(name: str, shape) -> int:
-        return int(fr.get_format(name).memory_bytes_for_shape(tuple(shape)))
-
-    def _params(shape) -> int:
-        n = 1
-        for d in shape:
-            n *= int(d)
-        return n
-
-    expert_ladder = [("nvfp4_cb", k) for k in _EXPERT_FP4_KS] + \
-                    [("fp8_cb", k) for k in _EXPERT_FP8_KS]
-    dense_params = sum(_params(s) for s in dense_shapes)
-    expert_params = num_experts * (_params(g0) + _params(u0) + _params(d0))
-    total_params = dense_params + expert_params
-
-    menu: list[RungPoint] = []
-    pairing: dict[str, dict] = {}
-    for ekey in expert_ladder:
-        edt, ek = ekey
-        name = f"K{ek}"
-        dense_k = _pair_dense_k(_rung_bpw(ekey))
-        dkey = ("fp8_cb", dense_k)
-        efmt, dfmt = _cb_format_name(ekey), _cb_format_name(dkey)
-        expert_bytes = num_experts * (_mem(efmt, g0) + _mem(efmt, u0)
-                                      + _mem(efmt, d0))
-        dense_bytes = sum(_mem(dfmt, s) for s in dense_shapes)
-        total_bytes = expert_bytes + dense_bytes
-        bits = 8.0 * total_bytes / total_params
-        if name not in e_table:
-            raise KeyError(
-                f"auto menu rung {name} ({efmt}) has no E in the e-table — "
-                "measure it (--measure-e) or add it to --e-table (never fabricate E)")
-        menu.append(RungPoint(name=name, bits=bits,
-                              resident_bytes=total_bytes, E=float(e_table[name])))
-        pairing[name] = {"expert_key": list(ekey), "dense_key": list(dkey),
-                         "expert_format": efmt, "dense_format": dfmt,
-                         "bits": bits, "resident_bytes": total_bytes}
-    return menu, {"num_experts": num_experts, "total_params": total_params,
-                  "pairing": pairing}
+    num_experts, dense_shapes, expert_shapes = _auto_target_shapes(
+        source_dir,
+        shard_map,
+        profile,
+        base,
+    )
+    return _build_auto_menu_from_shapes(
+        num_experts=num_experts,
+        dense_shapes=dense_shapes,
+        expert_shapes=expert_shapes,
+        e_table=e_table,
+        cb_context=cb_context,
+    )
 
 
 def _normalize_rung_name(s: str) -> str:
@@ -348,7 +518,8 @@ def _normalize_rung_name(s: str) -> str:
     return f"K{int(m.group(1))}"
 
 
-def _measure_e_table(source_dir: Path, shard_map: dict, profile, base: str
+def _measure_e_table(source_dir: Path, shard_map: dict, profile, base: str, *,
+                     cb_context: CBSerializationContext
                      ) -> dict[str, float]:
     """Uniform-h Σ per-Linear RTN weight-MSE per menu rung, on the real MTP
     weights (doc §2/§3). GPU-only: loads and CB-quantises every draft Linear at
@@ -358,6 +529,18 @@ def _measure_e_table(source_dir: Path, shard_map: dict, profile, base: str
                            "MTP weights); provide --e-table instead on CPU")
     dev = torch.device("cuda")
     ids = _expert_ids(shard_map, base)
+    if cb_context.codebook_source != "lattice":
+        raise ValueError(
+            "--measure-e cannot render a learned CB context without the exact "
+            "materialized codebook values; provide a value-bearing renderer or "
+            "use a precomputed --e-table bound to that context"
+        )
+    _num_experts, dense_shapes, expert_shapes = _auto_target_shapes(
+        source_dir,
+        shard_map,
+        profile,
+        base,
+    )
 
     def _load(name: str) -> torch.Tensor:
         with safe_open(source_dir / shard_map[name], framework="pt",
@@ -366,7 +549,20 @@ def _measure_e_table(source_dir: Path, shard_map: dict, profile, base: str
 
     def _mse(w: torch.Tensor, fmt_name: str) -> float:
         spec = fr.get_format(fmt_name)
-        wq = spec.quantize_dequantize(w.clone())  # uniform-h ⇒ no col_weights
+        # The MTP policy deliberately uses uniform column importance, but the
+        # production CB renderer is still weighted VQ. Bind the all-ones values
+        # explicitly along with layout, scale sweep and encoder tier.
+        col_weights = torch.ones(
+            int(w.shape[-1]),
+            dtype=torch.float32,
+            device=w.device,
+        )
+        wq = cb_quantize_dequantize_for_context(
+            spec,
+            w.clone(),
+            context=cb_context,
+            col_weights=col_weights,
+        )
         return float(((w - wq.to(w.dtype)) ** 2).mean().item())
 
     dense_names = (
@@ -382,7 +578,13 @@ def _measure_e_table(source_dir: Path, shard_map: dict, profile, base: str
     for ekey in expert_ladder:
         name = f"K{ekey[1]}"
         efmt = _cb_format_name(ekey)
-        dfmt = _cb_format_name(("fp8_cb", _pair_dense_k(_rung_bpw(ekey))))
+        dkey = _pair_dense_key_exact(
+            ekey,
+            dense_shapes,
+            expert_shapes,
+            cb_context,
+        )
+        dfmt = _cb_format_name(dkey)
         E = sum(_mse(w, dfmt) for w in dense_ws)
         for e in ids:
             for leaf in ("gate_proj", "up_proj", "down_proj"):
@@ -399,12 +601,21 @@ def run_auto(args) -> dict:
         raise RuntimeError(f"no model profile detected for {source_dir}")
     shard_map = _shard_map(source_dir)
     base = f"model.layers.{args.mtp_layer}"
+    cb_context = _load_body_cb_serialization_context(
+        args.body_layer_config
+    )
 
     # E(b): measured on GPU or a precomputed table — never fabricated.
     if args.measure_e and args.e_table:
         raise ValueError("pass only one of --measure-e / --e-table")
     if args.measure_e:
-        e_table = _measure_e_table(source_dir, shard_map, profile, base)
+        e_table = _measure_e_table(
+            source_dir,
+            shard_map,
+            profile,
+            base,
+            cb_context=cb_context,
+        )
         e_source = "measured_rtn_weight_mse"
     elif args.e_table:
         raw = json.loads(Path(args.e_table).read_text())
@@ -414,8 +625,14 @@ def run_auto(args) -> dict:
         raise ValueError("auto mode needs an error curve: --measure-e (GPU) or "
                          "--e-table JSON (never fabricate E)")
 
-    menu, menu_meta = _build_auto_menu(source_dir, shard_map, profile, base,
-                                       e_table)
+    menu, menu_meta = _build_auto_menu(
+        source_dir,
+        shard_map,
+        profile,
+        base,
+        e_table,
+        cb_context=cb_context,
+    )
 
     accept_points = []
     for spec in args.accept_point or []:
@@ -448,6 +665,8 @@ def run_auto(args) -> dict:
         "source_dir": str(source_dir), "mtp_layer": args.mtp_layer,
         "e_source": e_source, "num_experts": menu_meta["num_experts"],
         "total_quant_params": menu_meta["total_params"],
+        "byte_scope": menu_meta["byte_scope"],
+        "cb_serialized_payload": menu_meta["cb_serialized_payload"],
         "pairing": menu_meta["pairing"],
         "selected_expert_format": chosen["expert_format"],
         "selected_dense_format": chosen["dense_format"],
