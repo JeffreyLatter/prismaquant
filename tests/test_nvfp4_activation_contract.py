@@ -15,12 +15,20 @@ from prismaquant.nvfp4_activation_contract import (
     NVFP4_ACTIVATION_CONTRACT_KEY,
     NVFP4_ACTIVATION_CONTRACT_SCHEMA,
     NVFP4_ACTIVATION_EXECUTION,
+    NVFP4_INPUT_GLOBAL_SCALE_SUFFIX,
+    UNCALIBRATED_INPUT_GLOBAL_SCALE,
     build_execution_contract,
     calibrated_input_global_scales,
+    fused_dense_group,
+    fused_sibling_group_key,
+    group_fused_sibling_targets,
     input_global_scale_from_max_abs,
     nvfp4_activation_qdq_served,
+    resolve_input_global_scale_value,
     select_mse_grid_input_global_scale,
     target_values_sha256,
+    unify_fused_sibling_input_global_scales,
+    unify_fused_sibling_max_abs,
 )
 from prismaquant.nvfp4_cb_footprint import (
     CBSerializationContext,
@@ -68,6 +76,92 @@ def test_formula_policies_are_explicit_and_f32_rounded():
             0.0,
             policy=LEGACY_INPUT_GLOBAL_SCALE_POLICY,
         )
+
+
+def test_uncalibrated_fallback_is_explicit_and_legacy_only():
+    assert input_global_scale_from_max_abs(
+        0.0,
+        policy=LEGACY_INPUT_GLOBAL_SCALE_POLICY,
+        nonpositive_fallback=UNCALIBRATED_INPUT_GLOBAL_SCALE,
+    ) == 1.0
+    with pytest.raises(ValueError, match="finite and > 0"):
+        input_global_scale_from_max_abs(
+            float("nan"),
+            policy=LEGACY_INPUT_GLOBAL_SCALE_POLICY,
+            nonpositive_fallback=UNCALIBRATED_INPUT_GLOBAL_SCALE,
+        )
+
+    with pytest.raises(ValueError, match="no calibrated"):
+        resolve_input_global_scale_value(target="layer.q_proj")
+    assert resolve_input_global_scale_value(
+        target="layer.q_proj",
+        allow_uncalibrated_fallback=True,
+    ) == UNCALIBRATED_INPUT_GLOBAL_SCALE
+    assert resolve_input_global_scale_value(
+        3.0,
+        target="layer.q_proj",
+        calibrated_scales={"layer.q_proj": 2.0},
+        allow_uncalibrated_fallback=True,
+    ) == 3.0
+    assert resolve_input_global_scale_value(
+        target="layer.q_proj",
+        calibrated_scales={"layer.q_proj": 2.0},
+        allow_uncalibrated_fallback=True,
+    ) == 2.0
+
+
+def test_one_grouping_primitive_drives_max_and_reciprocal_joins():
+    q = "model.layers.2.self_attn.q_proj"
+    k = "model.layers.2.self_attn.k_proj"
+    down = "model.layers.2.mlp.down_proj"
+
+    fallback = fused_dense_group(q)
+    assert fallback == (
+        "model.layers.2",
+        ("q_proj", "k_proj", "v_proj"),
+    )
+    assert fused_sibling_group_key(q) == fused_sibling_group_key(k)
+    groups = group_fused_sibling_targets([q, k, down])
+    assert sorted(map(tuple, groups.values())) == sorted([(q, k), (down,)])
+
+    max_abs = unify_fused_sibling_max_abs({q: 1.0, k: 4.0, down: 3.0})
+    scales = unify_fused_sibling_input_global_scales(
+        {q: 0.5, k: 0.25, down: 0.75}
+    )
+    assert max_abs == {q: 4.0, k: 4.0, down: 3.0}
+    assert scales == {q: 0.25, k: 0.25, down: 0.75}
+
+
+def test_grouping_profile_errors_are_strict_unless_legacy_opts_in():
+    class BrokenProfile:
+        @staticmethod
+        def fused_sibling_group(_name):
+            raise RuntimeError("profile unavailable")
+
+    name = "model.layers.0.self_attn.q_proj"
+    with pytest.raises(RuntimeError, match="profile unavailable"):
+        fused_sibling_group_key(name, profile=BrokenProfile())
+    assert fused_sibling_group_key(
+        name,
+        profile=BrokenProfile(),
+        tolerate_profile_errors=True,
+    ) == "model.layers.0::__fused__:q_proj,k_proj,v_proj"
+
+
+def test_profile_leaf_mapping_and_direct_group_share_key_api():
+    class LeafProfile:
+        @staticmethod
+        def fused_sibling_group(_name):
+            return None
+
+        @staticmethod
+        def fused_sibling_leaf_mapping():
+            return {"ab_proj": ("a_proj", "b_proj")}
+
+    profile = LeafProfile()
+    assert fused_sibling_group_key(
+        "layer.a_proj", profile=profile
+    ) == fused_sibling_group_key("layer.b_proj", profile=profile)
 
 
 def test_e2m1_midpoints_use_encoded_index_even_rne():
@@ -179,6 +273,14 @@ def test_contract_digest_framing_has_pinned_vector():
         {"a": 1.0, "b": 2.0},
         policy=LEGACY_INPUT_GLOBAL_SCALE_POLICY,
     ) == "5207c30737409ae6d16586f1f169efc8f56948bee51031e1610683f0fee08d0f"
+
+
+def test_contract_uses_the_canonical_tensor_suffix_api():
+    record, _ = build_execution_contract(
+        {"layer.q_proj": 2.0},
+        policy=LEGACY_INPUT_GLOBAL_SCALE_POLICY,
+    )
+    assert record["tensor_suffix"] == NVFP4_INPUT_GLOBAL_SCALE_SUFFIX
 
 
 def test_accounting_is_keyed_to_static_contract_variant():
