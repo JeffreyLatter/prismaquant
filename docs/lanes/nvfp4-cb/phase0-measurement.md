@@ -1,5 +1,12 @@
 # NVFP4-CB — Phase 0 Measurement Plan (PLAN ONLY)
 
+> Historical pre-production plan. Its nominal-rate formulas predate the
+> versioned serialized-payload accountant: production FP4-CB v2 writes
+> `4k+9` bytes per 256-weight superblock, FP8-CB also writes one FP32 scale per
+> output row, and every emitted FP16 codebook sidecar is charged once by exact
+> physical/content identity. Do not use the formulas below for allocation or
+> same-rate claims; final exported whole-artifact bytes are authoritative.
+
 Working name **NVFP4-CB**: a vector-quantized codebook format. Codewords are
 8-dim vectors of FP4 (E2M1) codes `{0,±0.5,±1,±1.5,±2,±3,±4,±6}`; group-of-16
 E4M3 scales exactly as NVFP4, so a decoded tile is bit-compatible NVFP4 and

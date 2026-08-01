@@ -1,13 +1,17 @@
 # Stage 1 (0.6B): pure NVFP4 vs pure FP8-CB_K36 at 4.5 bpw
 
-**Status: RESULTS PENDING — builds in flight.** This file is written as the
-runs execute; every number lands with the command that produced it. Setup,
-tooling and the two economics verifications are final.
+**Status: approximate endpoint evidence only; not the formal same-rate
+decider.** The completed native artifact is **870,290,032 B**. The FP8-CB model
+plus `cb_codebooks.pqcb` is **871,628,664 B**, or **1,338,632 B (+0.154%)**
+larger. That misses the protocol's <=0.1% exact-byte tolerance. The pair is
+useful for performance iteration, but any native-parity decision must be rerun
+under an exact whole-artifact byte constraint.
 
 Executes the endpoint half of `docs/design/format_choice_4p5.md` §5 Stage 1 /
 §5 Stage 2 ("Endpoints first"): two *pure* single-format builds of the same
-model at the same 4.5 rung, so the total format effect is measured with **zero
-allocation confound**. Neither endpoint is shippable — a single-rung menu is
+model at the same nominal 4.5 rung, so there is no assignment-choice confound;
+the measured artifacts are not exact-byte matched. Neither endpoint is
+shippable — a single-rung menu is
 the sanctioned isolation pattern only (`[MEMORY: FP8 in every recipe]`).
 
 Run commit `550710b` (branch `claude/docs-consolidation`; the criteria doc's
@@ -87,6 +91,7 @@ drive a uniform endpoint through the stock orchestrator.)
 | format (every unit) | `NVFP4` | `FP8_CB_K36` |
 | nominal rate | 4.5 bpw (4b + fp8/16 scale) | 4.5 bpw index stream |
 | serving profile | `vllm_packed_moe` | `nvfp4_cb` |
+| activation contract | native NVFP4 W4A4 | FP8-CB W8A8 (A8) |
 | render | production cache: `gptq,static_act_order,joint_scale_opt` | imatrix-weighted VQ, `lattice` codebooks, scale sweep on, `two_tier` scale coding (inert on an fp8-only menu) |
 | work dir | `/home/rob/dq-runs/fc45-0p6b-nvfp4` | `/home/rob/dq-runs/fc45-0p6b-fp8cb` |
 
@@ -101,8 +106,10 @@ no choice — so `local` was used on both arms purely to keep the cost stage
 cheap. **The renders are deliberately NOT matched**: each arm gets its own
 lane's production render, which is the comparison the criteria doc describes
 ("pure-CB pays the known ~5.4 h `balanced` encode wall, pure-NVFP4 is a fast
-native-path export"). This is a format+render endpoint comparison, not a
-format-only one.
+native-path export"). This is a full execution-contract endpoint comparison,
+not a weight-encoding comparison: format, render, container/backend, and
+activation quantization all change together. In particular native is W4A4
+while FP8-CB is A8.
 
 ## 3. Builds — exact commands
 
@@ -150,7 +157,14 @@ CB_LADDER_INTERP=0 DEVICE=cuda EXPORT_DEVICE=cuda \
 
 ## 4. Bytes
 
-RESULTS PENDING.
+| arm | measured payload | bytes |
+|---|---|---:|
+| native NVFP4 | model artifact | 870,290,032 |
+| FP8-CB K36 | model artifact + `cb_codebooks.pqcb` | 871,628,664 |
+
+FP8-CB is 1,338,632 B (+0.154%) larger. Since the preregistered exact-rate
+tolerance is <=0.1%, neither timing nor quality result from this pair may be
+reported as the formal same-rate winner.
 
 ## 5. KL-vs-BF16 and PPL
 
@@ -158,11 +172,19 @@ RESULTS PENDING.
 
 ## 6. Verdict
 
-RESULTS PENDING.
+No formal winner can be declared from this pair: it misses exact-byte matching
+and compares W4A4 with A8. Preserve any measured timing as approximate
+full-contract evidence and rerun exact-byte endpoints before promotion.
 
 ## 7. Ladder economics — two claims verified in code
 
 ### (a) `PRISMAQUANT_EXPORT_REUSE_PRIOR` — does a changed `layer_config` re-encode only the changed units?
+
+> Historical audit, quarantined 2026-07-31. Current HEAD rejects both unbound
+> delta reuse and streaming resume and requires a fresh output directory. The
+> mechanism below describes the superseded implementation; none of its timing
+> or safety claims are release evidence until reuse binds the exact source,
+> imatrix, codebook content, exporter ABI, and every copied tensor.
 
 **Yes — with four caveats that materially narrow the ladder's "partial
 re-export" economics.** All line numbers in

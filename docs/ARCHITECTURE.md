@@ -1978,13 +1978,15 @@ renamed rather than deleted, so both **307-redirect** to the canonical id (verif
 Hub 2026-07-30). The two historical citations are annotated in place rather than rewritten —
 they are the ship ledger, and the ledger records what was posted on the day.
 
-**Standing format-speed policy** (`docs/lanes/nvfp4-cb/format-speed-policy.md`, `dec4891`): at
-matched bpw fp8-CB beats native NVFP4 on 503/503 dense units (geomean −40% cost-model error),
-decode is per-byte-neutral, and the entire tax is prefill (dense ~10%; MoE 0–40%, regime- not
-format-dependent). Default stays accuracy-first, **no format bans**. The principled lever — an
-opt-in per-(format, shape-regime) serving-cost term with λ=0 default, seedable from the `auto`
-tuner's own per-layer timings — is specified, not implemented (no λ term in
-`allocator_solver.py`).
+**Format-speed policy correction (2026-07-31).** The earlier 503/503 screen, blanket
+decode-neutrality inference, and proposed `quality + lambda*time` objective are historical,
+not production policy; `docs/lanes/nvfp4-cb/format-speed-policy.md` is retained only as a
+dated measurement record. Production optimizes quality subject to hard, phase-specific
+constraints: exact whole-artifact bytes, separate p95 TTFT and p95 ITL/p05 TPS SLOs,
+resident+KV+peak-scratch memory, backend/shape/TP legality, and serving-unit coupling.
+Per-layer timings may propose an assignment, but same-session served quality plus end-to-end
+timing decide it. The execution contract (format/rung, layout, activation quantization,
+backend, runtime/GPU commits, TP, and fallback state) is part of every comparison.
 
 ### 9.3 GGUF
 

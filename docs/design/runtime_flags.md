@@ -190,8 +190,8 @@ imatrix-weighted render the exporter ships (CB Milestone C). Lane record:
 | `PRISMAQUANT_CB_LADDER_TOL` | `0.10` | `measure_quant_cost.py:1563` | Holdout-gate relative-error tolerance for the dense ladder; matches the expert stage's `--ladder-holdout-tol` default. **This is the FALLBACK value, not the rule** (R20): per `encode_tiers.md` §B the gate must trust a fit only where the holdout error clears the *between-seed cost noise*, so `_cb_ladder_holdout_tol` (`expert_empirical_cost.py:559`) derives the tolerance from the paired per-calibration-window spread of the measured rungs — free on the expert path, which already measures every unit KL window by window. The constant stands only where that datum is absent or degenerate: the **dense** path measures each `(tensor, format)` exactly once (accumulator `_count == 1`), so it has no between-draw spread and always uses this value. |
 | `PRISMAQUANT_CB_COL_WEIGHTS` | unset | `measure_quant_cost.py:1350` | Path to the shared CB col-weights (imatrix) pickle; exported by the pipeline at `run-pipeline.sh:642`. This is the lockstep contract: measured CB cost and the exporter's weighted-VQ render must use the same weights, including the synthesized per-expert down_proj replay entries the inline module-input pool cannot provide. |
 | `PRISMAQUANT_EXPERT_CALIB_BATCH` | `1` | `expert_empirical_cost.py:92` (`_CALIB_BATCH_ENV`), used in `_calib_batch()` | Calibration sequences per forward in the empirical expert unit-KL stage — the dominant-wall knob of `[2d]` / `[2d-CB]`. `1` preserves the historical per-sequence numerics exactly; `>1` batches independent windows (both arms always use the same batching, so the KL comparison stays internally consistent). |
-| `PRISMAQUANT_EXPORT_REUSE_PRIOR` | unset | `export_nvfp4_cb_streaming.py:1360` | Env alias for `--reuse-prior`: delta-export byte-copies CB/stock targets whose `(format, scheme, codebook)` are unchanged from a prior artifact instead of re-encoding. Surfaced in the shell as `EXPORT_REUSE_PRIOR` (`run-pipeline.sh:1635`). Default off — every target encodes fresh. |
-| `PRISMAQUANT_EXPORT_REUSE_VERIFY` | `3` | `export_nvfp4_cb_streaming.py:1363` | Number of reused tensors re-encoded fresh and byte-checked; any mismatch aborts. |
+| `PRISMAQUANT_EXPORT_REUSE_PRIOR` | **quarantined** | `export_nvfp4_cb_streaming.py` | Reserved legacy alias. Current HEAD fails closed: prior artifacts are not bound to an exact source/imatrix/codebook/exporter ABI, so no tensor may be reused. `EXPORT_REUSE_PRIOR` is rejected by `run-pipeline.sh`. |
+| `PRISMAQUANT_EXPORT_REUSE_VERIFY` | inactive | `export_nvfp4_cb_streaming.py` | Reserved with the quarantined reuse interface; sampling is not proof of whole-artifact identity. |
 
 Shell-side CB knobs (`run-pipeline.sh`): `CB_LADDER_INTERP` (`0`),
 **`CB_EXPERT_EMPIRICAL` (`0` since 2026-07-30 — D15: the default is now the
@@ -207,7 +207,8 @@ unit-KL replacement)**, `CB_EXPERT_NSAMPLES` / `CB_EXPERT_SEQLEN` (`16` /
 Laguna-S-2.1 artifacts and `STANDARDS.md` calls it the production fp4 scale
 coding, with v1 legacy read-compat only; the flag is inert on fp8-CB-only
 menus, which have no group-16 scale plane)**,
-`EXPORT_REUSE_PRIOR` / `EXPORT_REUSE_VERIFY`.
+`EXPORT_REUSE_PRIOR` / `EXPORT_REUSE_VERIFY` are reserved and rejected as of
+2026-07-31; every CB export uses a fresh output.
 
 ## 6. Non-`PRISMAQUANT_` shell vars read directly by Python
 
