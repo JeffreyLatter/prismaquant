@@ -1,7 +1,7 @@
 # PrismaQuant Architecture
 
-As of: 2026-08-01 · branch `fix/remove-vendored-gridbook` · based on
-`claude/docs-consolidation` commit `d5d8343`, with the external Gridbook runtime pinned to
+As of: 2026-08-01 · branch `fix/remove-vendored-gridbook` · verified against implementation
+commit `3d6d54c`, with the external Gridbook runtime pinned to
 `59cebf9f2c7fd43fcaa33c101eca31cbfd59fd99` (v0.4.1).
 
 This revision retains the four 2026-07-30 architecture re-vet waves documented in
@@ -2170,8 +2170,8 @@ polish, full rejected-methods catalog) is at
 
 ## 12. Known gaps and debt register
 
-Honest register, code-cited, as of 2026-08-01 (`fix/remove-vendored-gridbook`, based on
-`d5d8343`; external Gridbook pin `59cebf9f2c7fd43fcaa33c101eca31cbfd59fd99`, v0.4.1).
+Honest register, code-cited, as of 2026-08-01 (`fix/remove-vendored-gridbook`, implementation
+commit `3d6d54c`; external Gridbook pin `59cebf9f2c7fd43fcaa33c101eca31cbfd59fd99`, v0.4.1).
 Severity is operational risk, not effort. Plugin-contract leaks are stated in §8.5 and only
 referenced here. Entries closed on 2026-07-30 are kept, marked, for one cycle so a reader
 returning with a stale copy sees the resolution rather than silence.
