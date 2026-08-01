@@ -28,6 +28,16 @@ from typing import Callable
 import torch
 from compressed_tensors.quantization.utils.mxfp_utils import generate_mx_scales
 
+from prismaquant.cb_layout import (
+    CODEWORDS_PER_SUPERBLOCK,
+    FP4_GROUP,
+    FP8_PRODUCT_RUNGS,
+    NVFP4_PRODUCT_RUNGS,
+    NVFP4_SIGNED_RUNGS,
+    SCALE_CODING_V1,
+    SCALE_PLANE_BYTES,
+    SUPERBLOCK,
+)
 from prismaquant.fp8_dynamic import (
     fp8_dynamic_activation_qdq_vllm,
     fp8_dynamic_weight_qdq,
@@ -919,22 +929,24 @@ register_format(_make_gguf_spec("IQ4_NL", 4, 32, 16))     # 18 B / 32 = 4.5
 def _make_nvfp4_cb_spec(k: int) -> FormatSpec:
     return FormatSpec(
         name=f"NVFP4_CB_K{k}",
-        weight_bits=0, group_size=256, scale_bits=32 * k + 128,
+        weight_bits=0, group_size=SUPERBLOCK,
+        scale_bits=(CODEWORDS_PER_SUPERBLOCK * k
+                    + 8 * SCALE_PLANE_BYTES[("fp4", SCALE_CODING_V1)]),
         scale_dtype_name="nvfp4_cb_vq",
         weight_element_dtype=f"nvfp4_cb_k{k}",
-        act_bits=4, act_dtype_name="fp4_e2m1", act_group_size=16,
+        act_bits=4, act_dtype_name="fp4_e2m1", act_group_size=FP4_GROUP,
         family="nvfp4_cb", min_capability_sm=100,
         autoround_config=(
-            lambda k=k: dict(bits=0, group_size=256, data_type="nvfp4_cb",
+            lambda k=k: dict(bits=0, group_size=SUPERBLOCK, data_type="nvfp4_cb",
                              cb_k=k, sym=True, act_bits=4,
                              act_data_type="nv_fp4_with_static_gs",
-                             act_group_size=16, act_dynamic=True)
+                             act_group_size=FP4_GROUP, act_dynamic=True)
         ),
         # Kept at v1 for direct legacy/research callers. Producer-cost paths
         # bind CBSerializationContext explicitly; a FormatSpec alone cannot
         # establish the artifact layout/codebook identity.
         quantize_dequantize=make_nvfp4_cb_qdq(k, "fp4", "product"),
-        activation_quantize_dequantize=_make_rtn("fp4_e2m1", 16),
+        activation_quantize_dequantize=_make_rtn("fp4_e2m1", FP4_GROUP),
     )
 
 
@@ -944,19 +956,21 @@ def _make_nvfp4_cb_signed_spec(k: int) -> FormatSpec:
     # accounting is identical to the flat rungs (32k + 128 bits / 256).
     return FormatSpec(
         name=f"NVFP4_CB_S{k}",
-        weight_bits=0, group_size=256, scale_bits=32 * k + 128,
+        weight_bits=0, group_size=SUPERBLOCK,
+        scale_bits=(CODEWORDS_PER_SUPERBLOCK * k
+                    + 8 * SCALE_PLANE_BYTES[("fp4", SCALE_CODING_V1)]),
         scale_dtype_name="nvfp4_cb_vq",
         weight_element_dtype=f"nvfp4_cb_s{k}",
-        act_bits=4, act_dtype_name="fp4_e2m1", act_group_size=16,
+        act_bits=4, act_dtype_name="fp4_e2m1", act_group_size=FP4_GROUP,
         family="nvfp4_cb", min_capability_sm=100,
         autoround_config=(
-            lambda k=k: dict(bits=0, group_size=256, data_type="nvfp4_cb",
+            lambda k=k: dict(bits=0, group_size=SUPERBLOCK, data_type="nvfp4_cb",
                              cb_k=k, cb_mode="signed", sym=True, act_bits=4,
                              act_data_type="nv_fp4_with_static_gs",
-                             act_group_size=16, act_dynamic=True)
+                             act_group_size=FP4_GROUP, act_dynamic=True)
         ),
         quantize_dequantize=make_nvfp4_cb_qdq(k, "fp4", "signed"),
-        activation_quantize_dequantize=_make_rtn("fp4_e2m1", 16),
+        activation_quantize_dequantize=_make_rtn("fp4_e2m1", FP4_GROUP),
     )
 
 
@@ -969,7 +983,8 @@ def _make_fp8_cb_spec(k: int) -> FormatSpec:
     # single-scale FormatSpec cannot model on top of the superblock stream.
     return FormatSpec(
         name=f"FP8_CB_K{k}",
-        weight_bits=0, group_size=256, scale_bits=32 * k,
+        weight_bits=0, group_size=SUPERBLOCK,
+        scale_bits=CODEWORDS_PER_SUPERBLOCK * k,
         scale_dtype_name="fp8_cb_vq",
         weight_element_dtype=f"fp8_cb_k{k}",
         act_bits=8, act_dtype_name="fp8_e4m3", act_group_size=0,
@@ -986,11 +1001,11 @@ def _make_fp8_cb_spec(k: int) -> FormatSpec:
     )
 
 
-for _k in range(12, 25):                    # 2.000 .. 3.500 bpw in 0.125 steps
+for _k in NVFP4_PRODUCT_RUNGS:               # 2.000 .. 3.500 bpw in 0.125 steps
     register_format(_make_nvfp4_cb_spec(_k))
-for _k in (13, 14, 15, 16):                 # signed: 2.125 .. 2.5 bpw
+for _k in NVFP4_SIGNED_RUNGS:                # signed: 2.125 .. 2.5 bpw
     register_format(_make_nvfp4_cb_signed_spec(_k))
-for _k in range(28, 49):                    # 3.5 .. 6.0 bpw in 0.125 steps
+for _k in FP8_PRODUCT_RUNGS:                 # 3.5 .. 6.0 bpw in 0.125 steps
     register_format(_make_fp8_cb_spec(_k))
 
 

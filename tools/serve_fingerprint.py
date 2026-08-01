@@ -154,6 +154,20 @@ def package_versions(names: Sequence[str] = TRACKED_PACKAGES) -> dict[str, str]:
     return out
 
 
+def gridbook_runtime_pin() -> dict[str, str] | None:
+    """Immutable external Gridbook identity injected by the serve helper."""
+    mapping = {
+        "commit": "PQ_GRIDBOOK_RUNTIME_COMMIT",
+        "version": "PQ_GRIDBOOK_RUNTIME_VERSION",
+    }
+    value = {
+        field: os.environ[name]
+        for field, name in mapping.items()
+        if os.environ.get(name)
+    }
+    return value or None
+
+
 def git_commit(repo: str | os.PathLike | None = None) -> str | None:
     """HEAD of the tree this tool was run from (`None` if unavailable).
 
@@ -277,6 +291,7 @@ def collect_manifest(
         "kv_cache_dtype": _flag_value(launch_argv, "--kv-cache-dtype"),
         "speculative_config": _flag_value(launch_argv, "--speculative-config"),
         "package_versions": package_versions(),
+        "gridbook_runtime_pin": gridbook_runtime_pin(),
         "resident_extensions": extensions,
         # False whenever any inspected process's address space could not be
         # read (the host-side-of-a-container case): an unverified scan must not

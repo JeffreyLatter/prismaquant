@@ -27,13 +27,16 @@ Before implementing new functionality, read this file,
    Three containers, three gates: `compressed-tensors` on vanilla vLLM (no
    PrismaQuant kernels); GGUF on llama.cpp and the vLLM GGUF plugin, gated
    additionally on bit-exactness against `gguf-py`; codebook (NVFP4-CB /
-   FP8-CB) on the out-of-tree `gridbook` plugin (`plugins/gridbook`), which
-   ships its own CUDA kernels and is gated on an unforked vLLM (no core
-   patches), a wired per-arch expert loader for MoE
-   (`plugins/gridbook/gridbook/plugin.py:133-139` — a missing loader line makes
-   CB expert tensors silently not load), and served speed at least at parity
+   FP8-CB) on the separately released
+   [`gridbook`](https://github.com/RobTand/gridbook) plugin, pinned by
+   `scripts/lib/gridbook_runtime_pin.json`. It ships its own CUDA kernels and
+   is gated on an unforked vLLM (no core patches), a producer profile declared
+   in Gridbook's packaged `runtime_contract.json`, fail-closed expert loading,
+   and served speed at least at parity
    with the container it displaces. The non-vLLM-native lanes are sanctioned,
    not exceptions; what is forbidden is a forked runtime.
+   PrismaQuant must never vendor or import the Gridbook runtime; compatibility
+   crosses the repository boundary only through the immutable pin and contract.
 5. **Measure on the same calibration contract.** New levers need apples-to-
    apples KL, bpp, and runtime measurements. Compare against the relevant
    shipped or current baseline using the same calibration set, sequence

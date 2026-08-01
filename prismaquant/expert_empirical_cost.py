@@ -45,6 +45,11 @@ import torch
 import torch.nn.functional as F
 
 from prismaquant import format_registry as fr
+from prismaquant.cb_layout import (
+    VEC_DIM,
+    parse_format_name,
+    subtable_bit_widths,
+)
 from prismaquant.emu_forward_kl import _qdq_accepts_col_weights
 from prismaquant.nvfp4_cb_footprint import (
     cb_cost_provenance,
@@ -64,7 +69,6 @@ _CB_FAMILIES = {"nvfp4_cb", "fp8_cb"}
 # different grids/codings and never share one log-linear fit. The RD-law fit
 # is holdout-gated per unit, so admitting a family costs nothing when the law
 # fails there (falls back to full measurement).
-_CB_K_RE = re.compile(r"^((?:NVFP4|FP8)_CB_[KS])(\d+)$")
 # RD-law ladder interpolation (moe_cb_design.md §3.4): D(k) = C * 2^(-k/4),
 # validated +-3% on weighted-recon at 0.6B but UNPROVEN on unit-KL — so it is
 # opt-in and holdout-gated PER UNIT (a failed holdout falls back to full
@@ -402,9 +406,10 @@ def _cb_ladder_split(measured_fmts: Sequence[str]):
     ladders, or None when no family pays."""
     fams: dict[str, dict[str, int]] = {}
     for f in measured_fmts:
-        m = _CB_K_RE.match(f)
-        if m:
-            fams.setdefault(m.group(1), {})[f] = int(m.group(2))
+        parsed = parse_format_name(f)
+        if parsed is not None:
+            family, k = parsed
+            fams.setdefault(family.prefix, {})[f] = k
     ladders = []
     for _fam, kmap in sorted(fams.items()):
         if len(kmap) < 4:
@@ -478,14 +483,17 @@ def _cb_ladder_rate_factor(fmt_name: str, k: int) -> float:
     DIFFERENT phases, which is exactly where the 8-12% holdout rejections
     came from (2026-07-21 27B cost run). R is exact per phase and reduces to
     the old law at even splits (R(4m) = 4*2^(-m) for fp8)."""
-    n_sub = 4 if fmt_name.startswith("FP8_CB") else 2
-    sub_dim = 8 // n_sub
-    base, extra = divmod(int(k), n_sub)
-    r = 0.0
-    for i in range(n_sub):
-        b = base + (1 if i < extra else 0)
-        r += 2.0 ** (-2.0 * b / sub_dim)
-    return r
+    parsed = parse_format_name(fmt_name)
+    if parsed is None:
+        raise ValueError(f"not a producer CB format: {fmt_name!r}")
+    family, parsed_k = parsed
+    if int(k) != parsed_k:
+        raise ValueError(
+            f"CB rung mismatch: {fmt_name!r} encodes k={parsed_k}, got {k}"
+        )
+    widths = subtable_bit_widths(parsed_k, family.mode, family.n_sub)
+    sub_dim = VEC_DIM // family.n_sub
+    return sum(2.0 ** (-2.0 * width / sub_dim) for width in widths)
 
 
 class _LadderLaw(NamedTuple):

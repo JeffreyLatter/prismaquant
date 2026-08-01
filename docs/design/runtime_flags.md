@@ -3,7 +3,8 @@
 *Reconciled against code 2026-07-30 (branch `claude/docs-consolidation`).*
 Method: AST + literal sweep of `os.environ` / `os.getenv` / `_env_flag` /
 `_env_int` / `_env_flag_enabled` / registry `*_env=` parameters / `pq_env_*`
-across `prismaquant/`, `plugins/gridbook/`, `tools/`, `scripts/`, `pipeline.py`
+across `prismaquant/`, `tools/`, `scripts/`, `pipeline.py`, and the separately
+versioned Gridbook source at the commit current on the reconciliation date
 (excluding `archive/`, `fp8/`, `scratch/`, `tests/`, worktrees). Every row cites
 its reading `file:line`; when a flag has several readers the row cites the one
 that decides behaviour and notes the others.
@@ -233,59 +234,13 @@ the corresponding CLI flag is absent.
 
 ## 7. gridbook serving-plugin flags
 
-These are read **inside the vLLM process** by `plugins/gridbook/gridbook/`
-(PyPI `gridbook`), not by the build pipeline. They select kernels and schedules;
-several change numerics, and those are marked. Registry key is `gridbook` with
-legacy alias `prismaquant` (`plugin.py:133-139`).
-
-### 7a. Dispatch and dense Linear (`linear.py`, `ops.py`, `cuda_ext.py`)
-
-| env var | default | read at | what it does |
-|---|---|---|---|
-| `PRISMAQUANT_CB_DECODE` | `cuda` | `linear.py:299`; `moe.py:1927` | Selects the CUDA GEMV decode path; any other value falls back to Triton. |
-| `PRISMAQUANT_CB_CUDA_M_MAX` | `8` | `linear.py:53` | Within the decode regime, the CUDA GEMV handles `M ≤ this`; above it Triton's `tl.dot` wins (measured 0.66× at M=16, 3.2× loss going the other way at M=1-2). |
-| `PRISMAQUANT_PREFILL_M_THRESHOLD` | `16` | `linear.py:46` | Decode/prefill regime boundary. Set huge to force the Triton decode path at prefill (isolates the transient-expansion lever). |
-| `PRISMAQUANT_CB_FUSED_MIDM` | `1` | `linear.py:439` | Fused mid-M kernel for `16 < M ≤ 128` at `k ∈ {28,32,36,40,44,48}` (1.04-1.45× on GB10). The `_scaled` entry applies both scales inside its fp32 EVT epilogue and rounds once to bf16, matching `cutlass_scaled_mm`'s rounding order. |
-| `PRISMAQUANT_CB_PREFILL_DENSE` | unset | `linear.py:455` | `persistent` enables the transient-free persistent-tile dense prefill kernel for `M > 128`. **Any constraint miss falls through silently** to the shipping expand+cutlass path. Rounds to bf16 before scaling — a rounding-ORDER difference vs the shipping path. |
-| `PRISMAQUANT_PTC_VARIANT` | `1` | `linear.py:462` | Persistent-tile-compute kernel variant selector. |
-| `PRISMAQUANT_ENABLE_PTC` | unset | `cuda_ext.py:165` | The PTC extension builds only on explicit `=1` — **quarantined** after the 2026-07-23 wedge crisis. |
-| `PRISMAQUANT_CB_EXT_DIR` | `~/.cache/prismaquant-cb-ext` | `cuda_ext.py:100` / `:173` / `:226` | Override for the CUDA-extension build directory (base ext, `ptc/`, `fused/`). |
-| `PRISMAQUANT_CB_DISPATCH` | `op` | `ops.py:271` | `inline` bypasses the custom-op dispatch wrapper. |
-| `PRISMAQUANT_OPS_CUDAGRAPH_UNSAFE` | unset | `ops.py:36` | `1` tags the CB ops `cudagraph_unsafe`, restoring the old partition boundary. Reproduces the compile+piecewise corruption for an A/B; do not ship. |
-| `PRISMAQUANT_PRELOAD_FUSED` | unset | `plugin.py:126` | `1` force-builds and loads the fused ext even when its dispatch env is off, so both arms of a served logprob comparison carry identical CUDA-extension residency. Required whenever an A/B could otherwise be confounded by the session-arithmetic-drift mechanism. |
-| `PRISMAQUANT_DEBUG_PREFIXES` | unset | `config.py:340` (weight-prefix → scheme resolution); `linear.py:334` (persistent-TC ineligibility) | `1` logs prefix/eligibility resolution to stderr. First thing to set when CB tensors appear not to load. |
-
-### 7b. MoE paths (`moe.py`)
-
-| env var | default | read at | what it does |
-|---|---|---|---|
-| `PRISMAQUANT_CB_PREFILL` | `auto` (fp8) / `loop` (fp4) | `moe.py:404` | MoE prefill strategy override. `auto` is the measured per-layer selection promoted in `3062fbf`. `l2_pipeline` selects the diagnostic path directly. |
-| `PRISMAQUANT_CB_AUTOTUNE_MIN_M` | `1024` | `moe.py:1395` | Minimum M before prefill autotuning engages. |
-| `PRISMAQUANT_CB_AUTOTUNE_LOG` | unset | `moe_autotune.py:autotune_sink_path` | Durable JSONL sink for the prefill auto-tuner's per-candidate timings (re-vet R21): one row per tuned layer carrying `(format, shape regime, box)` + `{candidate: ms}`. Unset falls back to `<PRISMAQUANT_CB_ARTIFACT_DIR>/cb_autotune_timings.jsonl` when that is set, else the timings stay on stderr only. `off`/`0` disables. Append-only; an unwritable path degrades to a stderr warning and never fails a serve. **This is measurement, not policy** — nothing reads it back into an allocator; the λ time term stays specified-not-implemented until two boxes' tables disagree in ranking. |
-| `PRISMAQUANT_CB_ARTIFACT_DIR` | unset | `moe.py:_log_prefill_choice` | Directory the auto-tuner's default sink is written beside (normally the served artifact's directory). |
-| `PRISMAQUANT_CB_PREFILL_AUTO_FORCE` | unset | `moe.py:1397` | Pins the autotuner to one named candidate. |
-| `PRISMAQUANT_CB_L2_AUTOTUNE` | unset | `moe.py:1375` | `1` adds the L2-pipeline variant to the autotune candidates. **DIAGNOSTIC-ONLY** (`afc64ec`): gated off by default after three live-serve wedges; its parity / ragged / buffer-rotation race tests have never executed on hardware. |
-| `PRISMAQUANT_CB_L2_WINDOW_MB` / `_GROUP` / `_MIN_M` / `_OVERLAP` | unset / unset / `128` (`moe_l2.py:138`) / unset | `moe.py:920` / `:923` / `:1115` / `:1171` | L2-pipeline per-half window cap (can only lower the device-derived cap), forced expert group size, tiny-M floor, and cross-stream overlap. `_OVERLAP=1` refuses to run inside a graph capture rather than risk the driver hang. |
-| `PRISMAQUANT_CB_PREFILL_GROUPED_MM` | `0` | `moe.py:1471` | Opt-in grouped-MM prefill. **Reassociation-class numerics change** (GEMM accumulation and cross-expert combine only; the per-expert QDQ rows are reproduced exactly). |
-| `PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK` | `64` (loop path) / `256` (fp8 chunked) | `moe.py:1474` / `:1687` | Expert-chunk size. Note the two paths carry different defaults. |
-| `PRISMAQUANT_CB_PREFILL_OVERLAP` | off (`=1` enables) | `moe.py:1757` | FP8 prefill side-stream overlap. Measured NULL on 35B-A3B (17 ms/layer, both arms identical, 2026-07-26); stays opt-in until a positive exists at any scale. |
-| `PRISMAQUANT_CB_PREFILL_TIMING` | unset | `moe.py:1717` | Per-stage prefill timing instrumentation (qdq/align/expand/gemm/act/combine). |
-| `PRISMAQUANT_CB_GROUPED_TRIM` | `1` | `moe.py:773` | Trims `expert_ids` to the live block count — costs the one device sync. |
-| `PRISMAQUANT_CB_EXPAND` | unset | `moe.py:1874` | `triton` restores the pre-optimization expand path (bisection lever; the old path cost ~26 ms/layer of pure memcpy on Laguna-256E prefill). |
-
-### 7c. CUDA-kernel schedule switches (`csrc/cb_gemv.cu`)
-
-All read host-side in the launcher, so they are CUDA-graph-capture-safe (no
-device reads, no new syncs).
-
-| env var | default | read at | what it does |
-|---|---|---|---|
-| `PRISMAQUANT_CB_FP8_SCHED` | double-buffer | `cb_gemv.cu:470` | `legacy` selects the single-buffer dense fp8 decode schedule. The default software-pipelined double buffer is **bit-identical** and +3-6%. |
-| `PRISMAQUANT_CB_FP4V2_SCHED` | single-buffer | `cb_gemv.cu:759` | `db` opts the fp4-v2 dense kernel into double-buffering, which **regressed** (its two-tier decode is compute-bound). Kept as the switch that measured the loss. |
-| `PRISMAQUANT_CB_DECODE_CONTRACT` | `v1` | `cb_gemv.cu:471` / `:760` / `:1357` / `:1437` | `v2` selects the per-weight decode contract v2. |
-| `PRISMAQUANT_CB_W2_SCHED` | round-2 warp schedule | `cb_gemv.cu:1436` / `:1438` | fp4-v2 grouped down-projection (w2) schedule. Default drops the idle-warp 8-warp launch to 2 warps at `n_sb=6` (+50% on the Hy3 w2 shape); it **reassociates** the fp32 partial sum vs `legacy` and is served-KL-validated. `w13` (`n_sb=16`) stays 8-warp and bit-identical. `legacy` = the numerics-preserving 8/4-warp baseline. `rowpack` = round-3 experiment (further reassociated, **pending its own served check**). |
-| `PRISMAQUANT_CB_W2_ROWS` | `8` | `cb_gemv.cu:1442` | `rowpack` rows-per-block, `RPB ∈ {4,8,16}`. |
-| `PRISMAQUANT_CB_W2_WARPS` | `0` (derive) | `cb_gemv.cu:1486` | Overrides the derived warp count for the default w2 schedule. |
+Gridbook owns these flags, their defaults, validation, dispatch semantics, and
+operator documentation. Keeping a second table here already caused factual
+drift (for example the dense CUDA GEMV crossover and fused-FP4 promotion
+status), so it has been removed. Consult the `docs/PLUGIN.md` shipped by the
+exact Gridbook commit in `scripts/lib/gridbook_runtime_pin.json`. A serve record
+must fingerprint that commit and its actual environment; a PrismaQuant document
+is never authority for a runtime default.
 
 ## 8. GGUF lane (`docs/lanes/gguf.md`)
 
@@ -310,176 +265,24 @@ not re-added by a future scrape.
 | `PRISMAQUANT_GRAPH_POOL` | **Not an env var.** Module global `_PRISMAQUANT_GRAPH_POOL` (`kl_measurement.py:407`). |
 | `PRISMAQUANT_COORD_LANE_BATCH` | **Set but never read** — written by `tools/smoke_graph_memory.py:72`, consumed by nothing. |
 
-## 10. Live flag index
+## 10. Discovering live flags
 
-The complete live `PRISMAQUANT_*` vocabulary (157 flags), including low-level
-debug, cache, validation, serving and archived-research switches. Anything not
-on this list is not read by current code. `PQ_EXPORT_VECTOR_CHUNK` is the one
-live flag outside the namespace.
+There is deliberately no hand-maintained exhaustive flag list. The previous
+snapshot mixed producer, archived, and externally owned Gridbook selectors and
+drifted as soon as the runtime moved repositories. Sections 1–9 document the
+supported PrismaQuant policy knobs by subsystem. For a mechanical source audit,
+search live producer code directly, for example:
 
-```text
-PRISMAQUANT_ACT_CACHE_ASYNC
-PRISMAQUANT_ACT_CACHE_FP32
-PRISMAQUANT_ACT_CACHE_WORKERS
-PRISMAQUANT_ACT_CLIP_QUANTILE
-PRISMAQUANT_ALLOW_KV_SHARED_FISHER
-PRISMAQUANT_ALLOW_PACKED_EXPERT_RTN
-PRISMAQUANT_ALLOW_PYTORCH_FALLBACK
-PRISMAQUANT_ALLOW_SUMSQ_PACKED_FISHER
-PRISMAQUANT_ALLOW_UNSCALED_FP8
-PRISMAQUANT_ASSIGNMENT_KL_FROZEN_WEIGHT_CACHE
-PRISMAQUANT_BATCHED_NVFP4_EXPORT
-PRISMAQUANT_BLOCK_OUTPUT_MATCH
-PRISMAQUANT_CB_AUTOTUNE_MIN_M
-PRISMAQUANT_CB_COL_WEIGHTS
-PRISMAQUANT_CB_CUDA_M_MAX
-PRISMAQUANT_CB_DECODE
-PRISMAQUANT_CB_DECODE_CONTRACT
-PRISMAQUANT_CB_DISPATCH
-PRISMAQUANT_CB_ENCODE_COMPILE
-PRISMAQUANT_CB_ENCODE_TIER
-PRISMAQUANT_CB_EXPAND
-PRISMAQUANT_CB_EXT_DIR
-PRISMAQUANT_CB_FP4V2_SCHED
-PRISMAQUANT_CB_FP8_SCHED
-PRISMAQUANT_CB_FUSED_MIDM
-PRISMAQUANT_CB_GROUPED_TRIM
-PRISMAQUANT_CB_L2_AUTOTUNE
-PRISMAQUANT_CB_L2_GROUP
-PRISMAQUANT_CB_L2_MIN_M
-PRISMAQUANT_CB_L2_OVERLAP
-PRISMAQUANT_CB_L2_WINDOW_MB
-PRISMAQUANT_CB_LADDER_INTERP
-PRISMAQUANT_CB_LADDER_TOL
-PRISMAQUANT_CB_PREFILL
-PRISMAQUANT_CB_PREFILL_AUTO_FORCE
-PRISMAQUANT_CB_PREFILL_DENSE
-PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK
-PRISMAQUANT_CB_PREFILL_GROUPED_MM
-PRISMAQUANT_CB_PREFILL_OVERLAP
-PRISMAQUANT_CB_PREFILL_TIMING
-PRISMAQUANT_CB_W2_ROWS
-PRISMAQUANT_CB_W2_SCHED
-PRISMAQUANT_CB_W2_WARPS
-PRISMAQUANT_COORD_LANE_CUDA_GRAPHS
-PRISMAQUANT_COORD_LANE_CUDA_GRAPHS_MIN_CALLS
-PRISMAQUANT_COORD_LANE_CUDA_GRAPH_CACHE_SIZE
-PRISMAQUANT_COORD_REPLAY_CACHE
-PRISMAQUANT_COST_PREFETCH_ACT
-PRISMAQUANT_COST_UCB_Z
-PRISMAQUANT_CUDA_GRAPH_MAX_ENTRIES_PER_PATH
-PRISMAQUANT_DAMP_ANALYTICAL
-PRISMAQUANT_DAMP_ANALYTICAL_C
-PRISMAQUANT_DAMP_SWEEP_LOG
-PRISMAQUANT_DEBUG_PREFIXES
-PRISMAQUANT_DEFERRED_FISHER_COMPUTE
-PRISMAQUANT_DEFERRED_FISHER_SYNC
-PRISMAQUANT_DETERMINISTIC
-PRISMAQUANT_DIRECT_CUDA_LOAD
-PRISMAQUANT_DISABLE_RTN_COMPILE
-PRISMAQUANT_DO_NO_HARM
-PRISMAQUANT_DO_NO_HARM_VERBOSE
-PRISMAQUANT_EMPTY_CACHE_EACH_REPLAY_BATCH
-PRISMAQUANT_ENABLE_PTC
-PRISMAQUANT_EXPERT_CALIB_BATCH
-PRISMAQUANT_EXPERT_COST_SAMPLE
-PRISMAQUANT_EXPERT_LAZY_FILL
-PRISMAQUANT_EXPORT_INLINE_EXPERT_GPTQ
-PRISMAQUANT_EXPORT_REUSE_PRIOR
-PRISMAQUANT_EXPORT_REUSE_VERIFY
-PRISMAQUANT_EXTERNAL_WEIGHT_MANAGEMENT
-PRISMAQUANT_FISHER_CAP_MULTIPLIER
-PRISMAQUANT_FISHER_COL_WEIGHTS
-PRISMAQUANT_FISHER_GPTQ_ROW_WEIGHT_CLIP
-PRISMAQUANT_FISHER_OUTPUT_MSE_ALLOCATOR
-PRISMAQUANT_FISHER_OUTPUT_MSE_ROW_WEIGHT_CLIP
-PRISMAQUANT_FISHER_WEIGHTED_GPTQ
-PRISMAQUANT_FP8_GPTQ_BLOCK_SIZE
-PRISMAQUANT_FP8_SCALE_SWEEP_FACTORS
-PRISMAQUANT_FROZEN_WEIGHT_CACHE_MAX_ENTRIES
-PRISMAQUANT_FROZEN_WEIGHT_CACHE_MIN_FREE_FRACTION
-PRISMAQUANT_FROZEN_WEIGHT_CACHE_MIN_FREE_GB
-PRISMAQUANT_FULL_SEQUENCE_KL
-PRISMAQUANT_FUSED_KERNEL_NVFP4
-PRISMAQUANT_FUSED_KERNEL_OVER_PROD_CACHE
-PRISMAQUANT_GGUF_EXPERT_COST_SAMPLE
-PRISMAQUANT_GGUF_IMATRIX
-PRISMAQUANT_GPTQ_BLOCK_SIZE
-PRISMAQUANT_GPTQ_DAMP
-PRISMAQUANT_GPTQ_DAMP_ROLES
-PRISMAQUANT_GPTQ_DAMP_SWEEP
-PRISMAQUANT_GPTQ_STATIC_ACT_ORDER
-PRISMAQUANT_GPU_MEM_RESERVE_FRACTION
-PRISMAQUANT_GPU_MEM_RESERVE_GB
-PRISMAQUANT_GRAPH_AUDIT
-PRISMAQUANT_GRAPH_OUTPUT_CLONE
-PRISMAQUANT_GRAPH_SHARED_POOL
-PRISMAQUANT_HOST_MEM_RESERVE_FRACTION
-PRISMAQUANT_HOST_MEM_RESERVE_GB
-PRISMAQUANT_IQ_COMPILE_SWEEP
-PRISMAQUANT_KL_CUDA_GRAPHS
-PRISMAQUANT_KL_CUDA_GRAPHS_MIN_CALLS
-PRISMAQUANT_KL_CUDA_GRAPHS_VERBOSE
-PRISMAQUANT_KL_CUDA_GRAPH_CACHE_SIZE
-PRISMAQUANT_KV_COTANGENT
-PRISMAQUANT_L3_CUDA_GRAPHS
-PRISMAQUANT_L3_CUDA_GRAPHS_MIN_CALLS
-PRISMAQUANT_L3_FROZEN_PERTURBED_CACHE
-PRISMAQUANT_L3_MAX_LANES_MEM_HEADROOM_FRACTION
-PRISMAQUANT_L3_MAX_LANES_MEM_HEADROOM_GB
-PRISMAQUANT_L3_MIN_HOST_MEM_GB
-PRISMAQUANT_L3_PREQUANT_CACHE
-PRISMAQUANT_L3_PREQUANT_CACHE_PEAK_MULTIPLIER
-PRISMAQUANT_L3_PREQUANT_CACHE_RESERVE_FRACTION
-PRISMAQUANT_L3_PREQUANT_CACHE_RESERVE_GB
-PRISMAQUANT_MASK_CUDA_DURING_META_INIT
-PRISMAQUANT_MAX_GPU_MEM_GB
-PRISMAQUANT_MXFP8_JOINT_SCALE_SHIFTS
-PRISMAQUANT_MXFP8_SCALE_SWEEP_SHIFTS
-PRISMAQUANT_NVFP4_ACT_EMULATE_SERVED_SCALES
-PRISMAQUANT_NVFP4_EXPORT_MATCH_RENDER_SCALE
-PRISMAQUANT_NVFP4_FUSED_JIT_WARMUP
-PRISMAQUANT_NVFP4_INPUT_GSCALE_FP8_RANGE
-PRISMAQUANT_NVFP4_JOINT_SCALE_GLOBAL_GRID
-PRISMAQUANT_NVFP4_JOINT_SCALE_GLOBAL_SPAN_HI
-PRISMAQUANT_NVFP4_JOINT_SCALE_GLOBAL_SPAN_LO
-PRISMAQUANT_NVFP4_JOINT_SCALE_LEVELS
-PRISMAQUANT_NVFP4_JOINT_SCALE_OPT
-PRISMAQUANT_NVFP4_SCALE_RULE
-PRISMAQUANT_NVFP4_SNAPPED_SCALE_SCORING
-PRISMAQUANT_OPS_CUDAGRAPH_UNSAFE
-PRISMAQUANT_PREFILL_M_THRESHOLD
-PRISMAQUANT_PRELOAD_FUSED
-PRISMAQUANT_PROBE_BATCHED_ACT_TRANSFER
-PRISMAQUANT_PROBE_CTX_CACHE
-PRISMAQUANT_PROBE_DOMAIN
-PRISMAQUANT_PROBE_RETAIN_CROSS_CHUNK
-PRISMAQUANT_PROD_ACT_SCALES
-PRISMAQUANT_PTC_VARIANT
-PRISMAQUANT_RENDER_GATE_MIN_GAIN
-PRISMAQUANT_RENDER_PROGRESSIVE_GATES
-PRISMAQUANT_SHARED_WEIGHT_FORMAT_CACHE
-PRISMAQUANT_SKIP_PACKED_EXPERT_COST
-PRISMAQUANT_SMOKE_DETERMINISM
-PRISMAQUANT_SMOKE_MODEL
-PRISMAQUANT_SMOKE_SAMPLES
-PRISMAQUANT_SMOKE_SEED
-PRISMAQUANT_SMOKE_SEQLEN
-PRISMAQUANT_SOLVER_TRACE
-PRISMAQUANT_STRICT_ASSIGNMENT_COVERAGE
-PRISMAQUANT_STRICT_PRODUCTION_CACHE
-PRISMAQUANT_TARGET_PROFILE
-PRISMAQUANT_TMPDIR
-PRISMAQUANT_UMA_MEMORY_INFO
-PRISMAQUANT_VALIDATION_CUDA_GRAPHS
-PRISMAQUANT_VALIDATION_CUDA_GRAPH_CACHE_SIZE
-PRISMAQUANT_VALIDATION_FAKE_METRICS
-PRISMAQUANT_VALIDATION_PROD_CACHE
-PRISMAQUANT_VALIDATION_PROD_CACHE_DIR
-PRISMAQUANT_VALIDATION_PROD_CACHE_LRU_GB
-PRISMAQUANT_VALIDATION_SKIP_END_KL
-PRISMAQUANT_VALIDATION_WIKITEXT_STRIDE
+```bash
+rg -o 'PRISMAQUANT_[A-Z0-9_]+' prismaquant scripts tools \
+  | cut -d: -f2 | sort -u
 ```
+
+That inventory is diagnostic rather than a stability promise: a token may be a
+compatibility check, refusal, or research switch rather than a supported knob.
+Gridbook runtime flags are defined and documented only by the exact commit in
+`scripts/lib/gridbook_runtime_pin.json`. `PQ_EXPORT_VECTOR_CHUNK` remains the
+one live producer flag outside the `PRISMAQUANT_` namespace.
 
 ## 11. Disabling for debugging
 
@@ -506,5 +309,7 @@ Two traps when doing this:
   is walled (§2). There is now one reader and one default (`0`), but pinning it
   explicitly in an A/B is still the cheap habit.
 - Extension residency shifts allocator addresses and moves confident-KL by up
-  to ±17% between arms. Set `PRISMAQUANT_PRELOAD_FUSED=1` on both arms of any
-  served comparison where one arm would otherwise not load the fused ext.
+  to ±17% between arms. For a served Gridbook comparison, use the same-process
+  A/B harness and residency controls documented by the exact pinned Gridbook
+  commit; runtime selector names and defaults are intentionally not repeated
+  here.

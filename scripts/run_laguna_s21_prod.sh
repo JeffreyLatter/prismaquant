@@ -40,12 +40,8 @@ export EXPORT_STREAMING=auto
 export CB_EXPERT_EMPIRICAL=0
 export PRISMAQUANT_EXPERT_COST_SAMPLE=16
 
-export FORMATS="$(python3 - <<'PYF'
-fp4 = ",".join(f"NVFP4_CB_K{k}" for k in range(12, 25))
-fp8 = ",".join(f"FP8_CB_K{k}" for k in range(28, 49))
-print(f"{fp4},{fp8},NVFP4,FP8_DYNAMIC,BF16")
-PYF
-)"
+export FORMATS="$(PYTHONPATH="$REPO" python3 \
+  "$REPO/scripts/print_cb_format_menu.py" NVFP4 FP8_DYNAMIC BF16)"
 export CB_SCALE_CODING=two_tier
 export TARGET_BITS="${TARGET_BITS:-6.0}"
 export PARETO_TARGETS="${PARETO_TARGETS:-3.0,3.25,3.5,3.75,4.0,4.25,4.5,4.75,5.0,5.25,5.5,5.75,6.0,6.25}"

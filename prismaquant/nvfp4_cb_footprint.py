@@ -33,6 +33,20 @@ from functools import lru_cache
 from pathlib import Path
 
 from . import format_registry as fr
+from .cb_layout import (
+    INDEX_BYTES_PER_K,
+    LAYOUT_FOR_SCALE_CODING,
+    SCALE_CODINGS,
+    SCALE_CODING_TWO_TIER,
+    SCALE_CODING_V1,
+    SUPERBLOCK,
+    VEC_DIM,
+    codebook_subtable_shapes as _layout_codebook_subtable_shapes,
+    family_for,
+    parse_format_name,
+    subtable_bit_widths,
+    type_size as cb_type_size,
+)
 
 CB_SERIALIZED_PAYLOAD_SCHEMA = "prismaquant.cb_serialized_payload.v2"
 LEGACY_CB_SERIALIZED_PAYLOAD_SCHEMA = "prismaquant.cb_serialized_payload.v1"
@@ -43,20 +57,17 @@ WHOLE_ARTIFACT_BUDGET_SCHEMA = "prismaquant.whole_artifact_budget.v2"
 WHOLE_ARTIFACT_BUDGET_FIELD = "whole_artifact_budget"
 CB_TENSOR_IDENTITY_FIELD = "cb_serialized_identity"
 CB_ASSIGNMENT_IDENTITIES_FIELD = "cb_serialized_identities"
-PRODUCTION_FP4_SCALE_CODING = "two_tier"
-LEGACY_FP4_SCALE_CODING = "v1"
+PRODUCTION_FP4_SCALE_CODING = SCALE_CODING_TWO_TIER
+LEGACY_FP4_SCALE_CODING = SCALE_CODING_V1
 CB_RENDERER_ABI = "prismaquant.nvfp4_cb_renderer.v1"
 CB_ENCODE_TIER_DEFAULT = "balanced"
 CB_ENCODE_TIERS = frozenset({"fast", "balanced", "max"})
-_SCALE_CODINGS = {PRODUCTION_FP4_SCALE_CODING, LEGACY_FP4_SCALE_CODING}
-_LAYOUT_FOR_SCALE_CODING = {
-    LEGACY_FP4_SCALE_CODING: 1,
-    PRODUCTION_FP4_SCALE_CODING: 2,
-}
+_SCALE_CODINGS = SCALE_CODINGS
+_LAYOUT_FOR_SCALE_CODING = LAYOUT_FOR_SCALE_CODING
 _FP16_BYTES = 2
 _FP32_BYTES = 4
-_SUPERBLOCK = 256
-_VEC_DIM = 8
+_SUPERBLOCK = SUPERBLOCK
+_VEC_DIM = VEC_DIM
 
 _SAFETENSORS_DTYPE_BITS = {
     "BOOL": 8,
@@ -83,9 +94,6 @@ _SAFETENSORS_DTYPE_BITS = {
     "I64": 64,
     "F64": 64,
 }
-
-_CB_NAME_RE = re.compile(r"^(NVFP4|FP8)_CB_([KS])(\d+)$")
-
 
 @dataclass(frozen=True)
 class CBSerializationContext:
@@ -644,8 +652,8 @@ def validate_cb_cost_provenance(
 def _cb_info(format_name: str) -> tuple[str, str, int] | None:
     """Return ``(grid, mode, k)`` for a registered CB format."""
     canonical = str(format_name).strip().upper()
-    match = _CB_NAME_RE.match(canonical)
-    if match is None:
+    parsed = parse_format_name(canonical)
+    if parsed is None:
         return None
     try:
         registered = fr.get_format(canonical)
@@ -653,12 +661,8 @@ def _cb_info(format_name: str) -> tuple[str, str, int] | None:
         return None
     if str(registered.name).strip().upper() != canonical:
         return None
-    family, rung, raw_k = match.groups()
-    if family == "FP8" and rung != "K":
-        return None
-    grid = "fp4" if family == "NVFP4" else "fp8"
-    mode = "signed" if rung == "S" else "product"
-    return grid, mode, int(raw_k)
+    family, k = parsed
+    return family.grid, family.mode, k
 
 
 def is_cb_format(format_name: str) -> bool:
@@ -678,15 +682,19 @@ def lattice_codebook_content_sha256(format_name: str) -> tuple[str, ...]:
     from . import nvfp4_cb_formats as cb
 
     if mode == "product":
-        n_sub = 2 if grid == "fp4" else 4
+        n_sub = family_for(grid, mode).n_sub
         sub_dim = _VEC_DIM // n_sub
         tables = tuple(
             cb.fixed_lattice(bits, grid, sub_dim)
-            for bits in _bit_split(k, n_sub)
+            for bits in subtable_bit_widths(k, mode, n_sub)
         )
     elif mode == "signed":
+        n_sub = family_for(grid, mode).n_sub
+        (magnitude_bits,) = subtable_bit_widths(k, mode, n_sub)
         tables = (
-            cb.fixed_lattice(k - _VEC_DIM, grid, _VEC_DIM, positive=True),
+            cb.fixed_lattice(
+                magnitude_bits, grid, _VEC_DIM, positive=True
+            ),
         )
     else:
         tables = (cb.fixed_lattice(k, grid, _VEC_DIM),)
@@ -1033,25 +1041,14 @@ def enforce_whole_artifact_budget(
     return attestation
 
 
-def _bit_split(k: int, n_sub: int) -> tuple[int, ...]:
-    base, extra = divmod(int(k), int(n_sub))
-    return tuple(base + (1 if index < extra else 0) for index in range(n_sub))
-
-
 def codebook_subtable_shapes(format_name: str) -> tuple[tuple[int, int], ...]:
     """Exact FP16 subtable shapes emitted for one CB format."""
     info = _cb_info(format_name)
     if info is None:
         raise ValueError(f"{format_name!r} is not a CB format")
     grid, mode, k = info
-    if mode == "signed":
-        magnitude_bits = k - _VEC_DIM
-        if magnitude_bits < 1:
-            raise ValueError(f"signed CB format requires k > {_VEC_DIM}, got {k}")
-        return ((1 << magnitude_bits, _VEC_DIM),)
-    n_sub = 2 if grid == "fp4" else 4
-    sub_dim = _VEC_DIM // n_sub
-    return tuple((1 << bits, sub_dim) for bits in _bit_split(k, n_sub))
+    n_sub = family_for(grid, mode).n_sub
+    return _layout_codebook_subtable_shapes(k, mode, n_sub)
 
 
 def codebook_sidecar_payload_bytes(format_name: str) -> int:
@@ -1180,12 +1177,11 @@ def cb_tensor_payload_breakdown(
     output_rows = int(math.prod(dims[:-1]))
     n_superblocks = in_features // _SUPERBLOCK
     grid, mode, k = info
-    index_bytes = output_rows * n_superblocks * (4 * k)
+    packed_type_size = cb_type_size(k, grid, context.scale_coding)
+    index_bytes = output_rows * n_superblocks * (INDEX_BYTES_PER_K * k)
     fp4_scale_bytes = 0
     if grid == "fp4":
-        scale_bytes_per_superblock = (
-            9 if context.scale_coding == PRODUCTION_FP4_SCALE_CODING else 16
-        )
+        scale_bytes_per_superblock = packed_type_size - (INDEX_BYTES_PER_K * k)
         fp4_scale_bytes = output_rows * n_superblocks * scale_bytes_per_superblock
     fp8_row_scale_bytes = _FP32_BYTES * output_rows if grid == "fp8" else 0
     packed_weight_bytes = index_bytes + fp4_scale_bytes
@@ -1203,9 +1199,7 @@ def cb_tensor_payload_breakdown(
         "encode_tier": context.encode_tier,
         "renderer_abi": context.renderer_abi,
         "tensor_scale_coding": context.scale_coding if grid == "fp4" else "none",
-        "type_size": (4 * k + (9 if context.scale_coding ==
-                               PRODUCTION_FP4_SCALE_CODING else 16))
-        if grid == "fp4" else 4 * k,
+        "type_size": packed_type_size,
         "shape": list(dims),
         "params": int(math.prod(dims)),
         "output_rows": output_rows,

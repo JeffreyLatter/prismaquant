@@ -45,7 +45,7 @@ serve_dump_speed () {
 
 # BF16 reference (needs high gpu-mem-util for 27B; last --gpu-memory-utilization wins).
 serve_dump_speed pq27b_bf16 "$BF16_CT" bf16 --gpu-memory-utilization 0.90
-# OURS — plugin engages (quant_method=prismaquant; CB + stock-CT delegation).
+# OURS — Gridbook engages (quant_method=gridbook; CB + stock-CT delegation).
 serve_dump_speed pq27b_ours "$OURS_CT" ours --gpu-memory-utilization 0.85
 # PrismaAURA-5.5 — stock compressed-tensors (vLLM native; plugin idle).
 serve_dump_speed pq27b_aura "$AURA_CT" aura --gpu-memory-utilization 0.85

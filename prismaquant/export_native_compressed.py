@@ -1560,9 +1560,9 @@ def _coerce_runtime_legal_assignment(
             continue
         if fmt_canonical not in EXPORTABLE_FORMATS:
             from prismaquant.gguf_formats import GGUF_BLOCK_BYTES
-            from prismaquant.layer_config import _NVFP4_CB_FORMAT_NAMES
+            from prismaquant.cb_layout import CB_FORMAT_NAMES
 
-            if fmt_canonical in _NVFP4_CB_FORMAT_NAMES:
+            if fmt_canonical in CB_FORMAT_NAMES:
                 # Wrong container: an NVFP4-CB / FP8-CB assignment reaching the
                 # compressed-tensors exporter means the pipeline was launched
                 # without EXPORT_CONTAINER=nvfp4_cb. Stock compressed-tensors

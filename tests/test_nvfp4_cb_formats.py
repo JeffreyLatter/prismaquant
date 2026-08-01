@@ -11,6 +11,7 @@ import torch
 from prismaquant import format_registry as fr
 from prismaquant import layer_config as lc
 from prismaquant import nvfp4_cb_formats as cb
+from prismaquant.cb_layout import bit_split
 from prismaquant.nvfp4_cb_footprint import (
     CBSerializationContext,
     cb_serialization_context_stamp,
@@ -302,7 +303,7 @@ def test_signed_learned_magnitude_roundtrip():
 
 
 def test_signed_needs_more_than_sign_bits():
-    with pytest.raises(ValueError, match="signed mode needs k"):
+    with pytest.raises(ValueError, match="signed CB requires"):
         cb.nvfp4_cb_fields(torch.randn(8, 256), 8, grid="fp4", mode="signed")
 
 
@@ -340,10 +341,10 @@ def test_product_n_sub4_determinism_pin():
 
 
 def test_bit_split_even_and_ceil_first():
-    assert cb._bit_split(13, 2) == (7, 6)
-    assert cb._bit_split(12, 2) == (6, 6)
-    assert cb._bit_split(36, 4) == (9, 9, 9, 9)
-    assert cb._bit_split(48, 4) == (12, 12, 12, 12)
+    assert bit_split(13, 2) == (7, 6)
+    assert bit_split(12, 2) == (6, 6)
+    assert bit_split(36, 4) == (9, 9, 9, 9)
+    assert bit_split(48, 4) == (12, 12, 12, 12)
 
 
 # Lloyd at scale: the old dense one-hot path materialized (m, K) fp32 —
@@ -596,7 +597,7 @@ def test_exporter_roundtrip_equals_emulation(export_dir, source):
     qc = json.loads((out / "quant_config.json").read_text())
     # "gridbook" is the registry key the plugin registers under (32a02e7);
     # "prismaquant" survives only as a READ alias for artifacts exported
-    # before the rename (plugins/gridbook/gridbook/plugin.py:133-139 and
+    # before the rename (the external Gridbook runtime's legacy alias and
     # config.py override_quantization_method), so the exporter stamps the
     # canonical name and never the legacy one.
     assert qc["quant_method"] == "gridbook"
@@ -1660,12 +1661,10 @@ def test_fp8_source_rejects_non_fp8_source(export_dir):
 
 
 def test_fp8_source_in_serving_allowlist():
-    import json as _json
-    from pathlib import Path as _P
+    from prismaquant.serving_profiles import load_serving_profile
 
-    spec = _json.loads((_P("prismaquant/serving_profile_specs/nvfp4_cb.json")
-                        ).read_text())
-    allow = spec["format_rules"][0]["allow_formats"]
+    profile = load_serving_profile("nvfp4_cb")
+    allow = profile.format_rules[0].allow_formats
     assert "FP8_SOURCE" in allow
     # FP8_SOURCE is passthrough (no 256-superblock shape rule).
-    assert "FP8_SOURCE" not in spec["shape_rules"][0]["formats"]
+    assert "FP8_SOURCE" not in profile.shape_rules[0].formats

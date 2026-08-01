@@ -84,8 +84,16 @@ class ServingFormatRule:
         return cls(
             id=str(payload["id"]),
             when=NameCondition.from_dict(payload.get("when") or {}),
-            allow_formats=tuple(str(v) for v in payload.get("allow_formats", ())),
-            deny_formats=tuple(str(v) for v in payload.get("deny_formats", ())),
+            allow_formats=_declared_formats(
+                payload.get("allow_formats", ()),
+                payload.get("allow_formats_from", ()),
+                owner=f"format rule {payload['id']!r} allow-list",
+            ),
+            deny_formats=_declared_formats(
+                payload.get("deny_formats", ()),
+                payload.get("deny_formats_from", ()),
+                owner=f"format rule {payload['id']!r} deny-list",
+            ),
             reason=str(payload.get("reason", "profile_mismatch")),
             detail=str(payload.get("detail", "")),
             scope=scope,
@@ -132,7 +140,11 @@ class ShapeRule:
     def from_dict(cls, payload: Mapping[str, Any]) -> "ShapeRule":
         return cls(
             id=str(payload["id"]),
-            formats=tuple(str(v) for v in payload.get("formats", ())),
+            formats=_declared_formats(
+                payload.get("formats", ()),
+                payload.get("formats_from", ()),
+                owner=f"shape rule {payload['id']!r}",
+            ),
             when=NameCondition.from_dict(payload.get("when") or {}),
             min_in_features=_optional_int(payload.get("min_in_features")),
             min_out_features=_optional_int(payload.get("min_out_features")),
@@ -500,13 +512,9 @@ _CACHE: dict[str, ServingProfile] = {}
 _EMITTABLE_CACHE: dict["ExportLaneSpec", frozenset[str]] = {}
 
 
-def _declared_exporter_formats(path: str, lane_id: str) -> set[str]:
-    """Read an exporter's own format declaration at ``module:ATTR``.
+def _declared_format_source(path: str, owner: str) -> tuple[str, ...]:
+    """Read one canonical format-name iterable at ``module:ATTR``."""
 
-    Imported lazily and cached by the caller: the compressed-tensors
-    exporter imports this module, so a module-scope import would be
-    circular, and the GGUF codec tables pull torch.
-    """
     if ":" in path:
         module_name, attr_name = path.split(":", 1)
     else:
@@ -515,31 +523,55 @@ def _declared_exporter_formats(path: str, lane_id: str) -> set[str]:
         module = import_module(module_name)
     except ImportError as exc:  # pragma: no cover - environment breakage
         raise RuntimeError(
-            f"serving profile export lane {lane_id!r} declares "
+            f"{owner} declares "
             f"{path!r} but {module_name!r} could not be imported "
-            f"({exc!r}); the lane's format menu cannot be bounded by its "
-            f"exporter."
+            f"({exc!r}); its format set cannot be resolved."
         ) from exc
     try:
         declared = getattr(module, attr_name)
     except AttributeError as exc:
         raise RuntimeError(
-            f"serving profile export lane {lane_id!r} declares "
+            f"{owner} declares "
             f"{path!r} but {module_name!r} has no attribute "
-            f"{attr_name!r}. The lane's emittable-format menu is derived "
-            f"from the exporter's own declaration — update the profile "
-            f"spec to the declaration's new name rather than hand-listing "
-            f"formats here."
+            f"{attr_name!r}; update the source declaration rather than "
+            f"hand-listing its formats."
         ) from exc
     try:
         names = [str(name) for name in declared]
     except TypeError as exc:
         raise RuntimeError(
-            f"serving profile export lane {lane_id!r}: {path!r} is not "
+            f"{owner}: {path!r} is not "
             f"iterable ({type(declared).__name__}); expected a container of "
             f"format names (a dict keyed by format name counts)."
         ) from exc
-    return {fr.canonical_format_name(name) for name in names}
+    return tuple(fr.canonical_format_name(name) for name in names)
+
+
+def _declared_formats(
+    literal: Collection[object],
+    sources: Collection[object],
+    *,
+    owner: str,
+) -> tuple[str, ...]:
+    """Combine explicit policy entries with named canonical format sets."""
+
+    names = [fr.canonical_format_name(str(value)) for value in literal]
+    for source in sources:
+        names.extend(_declared_format_source(str(source), owner))
+    return tuple(dict.fromkeys(names))
+
+
+def _declared_exporter_formats(path: str, lane_id: str) -> set[str]:
+    """Read an exporter's own format declaration at ``module:ATTR``.
+
+    Imported lazily and cached by the caller: the compressed-tensors
+    exporter imports this module, so a module-scope import would be
+    circular, and the GGUF codec tables pull torch.
+    """
+
+    return set(_declared_format_source(
+        path, f"serving profile export lane {lane_id!r}"
+    ))
 
 
 def serving_profile_names() -> tuple[str, ...]:

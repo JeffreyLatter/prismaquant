@@ -1,5 +1,11 @@
 # Architecture re-vet — 2026-07-30
 
+> **Frozen audit snapshot.** This document records the repository as it existed
+> on 2026-07-30. On 2026-07-31/08-01 the gfx1151 work was canceled and removed,
+> and the two-tree Gridbook design was retired: Gridbook now has one external
+> canonical repository consumed through one immutable pin and packaged runtime
+> contract. Paths under `plugins/gridbook/` below are historical and do not exist.
+
 **Date** 2026-07-30 · **HEAD** `ef50495` (`claude/docs-consolidation`; docs consolidation complete, tests 1563/0) · **Input** `docs/ARCHITECTURE.md` + six lens reviews in `scratch/doc-consolidation-2026-07-30/revet/`.
 
 **What this is.** The re-vet Robert asked for after the docs consolidation: *"re-vet the architecture and see if there are any fundamental changes we want to make; make sure we're using our plugin architecture right and using configurations for supporting individual models."* Six lenses (cost/allocation, pipeline, plugins, lanes, validation, de-scope) verified every claim in code at `ef50495` and wrote proposals, not patches. **No code and no docs were changed.**

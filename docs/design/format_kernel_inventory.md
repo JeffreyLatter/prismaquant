@@ -1,5 +1,11 @@
 # Format / kernel inventory — what the hardware actually does, and what to build
 
+> **Frozen inventory snapshot.** Access to the sole gfx1151 machine was lost on
+> 2026-07-31 and all Strix/ROCm implementation work was canceled. Gridbook's
+> unqualified HIP prototype was removed. Strix rankings and build directions
+> below are historical evidence only, not an active backlog; the Blackwell
+> measurements remain useful context.
+
 2026-07-30. Commissioned by Robert: *"take an inventory of the available formats
 and build kernels to support them. We can allow the allocator to decide what
 formats to use where."* This document is the **inventory and the ranked kernel-gap
@@ -324,7 +330,7 @@ deliverable is a kernel list.
 
 ### 3.1 CUDA / GB10 — the gridbook surface
 
-Dispatch thresholds, all `plugins/gridbook/gridbook/linear.py`: `PREFILL_M_THRESHOLD
+Dispatch thresholds, all in external Gridbook `gridbook/linear.py`: `PREFILL_M_THRESHOLD
 = 16` (:46), `CUDA_GEMV_M_MAX = 8` (:53), mid-M fused window `16 < M ≤ 128` (:437),
 persistent-TC `M > 128` (:456).
 
@@ -360,13 +366,11 @@ MXFP8, BF16. This is why the native lane ships on stock vLLM.
 | fp8 / fp4 / fp6 | ❌ absent in silicon | ❌ absent in silicon |
 | **any CB grid** | ❌ | ❌ |
 
-A ROCm CB lane is **being wired as this inventory was written**, by the agent that
-owns HIP kernel authoring: `plugins/gridbook/gridbook/csrc_hip/` (4 files,
-`cb_gemv_hip.hip`, `cb_gemm_hip.hip`, `cb_decode_hip.h`, `wmma_probe.hip`) plus
-`hip_ext.py` and `linear_hip.py`, now reachable via a `torch.version.hip`-gated
-import and a `_HIP.maybe_apply` hook in `linear.py:55-60, 369-375`. This document
-neither audits nor touches that work. Two things are worth recording for it, both
-of which fall out of the measurements above rather than from reading its code:
+A ROCm CB prototype was being wired when this inventory was written. That work
+was canceled on 2026-07-31 after access to the sole gfx1151 machine was lost,
+before serving and packaging gates could be completed. Its sources and dispatch
+hook were removed from canonical Gridbook; there is no supported ROCm CB lane.
+The following two observations are retained only as historical experiment notes:
 
 - **It is landing on the fp8 grid, and §2.2 argues the grid should be bf16 on this
   chip.** That is gap #2, and it is a format decision, not a kernel decision — worth
@@ -422,7 +426,7 @@ justifies it · effort · the accuracy question it opens · portability.
 
 ---
 
-**#2 — gfx1151 `BF16_CB` grid + decode GEMV and bf16-MMA prefill**
+**HISTORICAL #2 — CANCELED: gfx1151 `BF16_CB` grid + decode GEMV and bf16-MMA prefill**
 *(ROCm / gfx1151 · effort **M** · quality strictly ≥ `FP8_CB`)*
 
 - **Enables:** CB artifacts to serve on Strix Halo **at all** (today: zero paths,
@@ -443,7 +447,7 @@ justifies it · effort · the accuracy question it opens · portability.
 
 ---
 
-**#3 — gfx1151 int4-WMMA GEMM (W4A4), fed by an int4-grid CB or native INT4**
+**HISTORICAL #3 — CANCELED: gfx1151 int4-WMMA GEMM (W4A4), fed by an int4-grid CB or native INT4**
 *(ROCm / gfx1151 · effort **L** · **opens a serious accuracy question**)*
 
 - **Enables:** the only path to GB10-class prefill throughput on Strix. Strix has

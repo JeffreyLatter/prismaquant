@@ -1113,7 +1113,7 @@ def test_exporter_resolves_nested_prefix_skeleton(tmp_path, monkeypatch):
 def test_codebook_pqcb_sidecar_contract(tmp_path):
     # Codebooks ship in cb_codebooks.pqcb (safetensors under a non-globbed
     # extension), named by each scheme's codebook_ref, and are NOT in
-    # model.safetensors — the exact contract plugins/gridbook config.py
+    # model.safetensors — the exact external Gridbook config contract
     # get_codebooks() -> load_file(model_dir/cb_codebooks.pqcb) consumes, and
     # linear.py looks up as codebooks[n] for n in codebook_ref. (Format-level
     # fixture: the plugin's own reader is not importable without vLLM.)

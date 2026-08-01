@@ -298,7 +298,7 @@ def main() -> int:
                             "data_offsets": [off, off + sz]}
             off += sz
             weight_map[name] = fname
-        sh_hdr["__metadata__"] = {"format": "pt", "quant_method": "prismaquant"}
+        sh_hdr["__metadata__"] = {"format": "pt", "quant_method": "gridbook"}
         hb = json.dumps(sh_hdr, separators=(",", ":")).encode()
         hb += b" " * (-len(hb) % 8)
         with open(out_dir / fname, "wb") as out:

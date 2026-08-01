@@ -11,6 +11,7 @@ import json
 from collections.abc import Mapping
 from pathlib import Path
 
+from prismaquant.cb_layout import CB_FORMAT_NAMES
 from prismaquant.schemas import validate_layer_config_payload
 
 
@@ -53,16 +54,9 @@ _GGUF_FORMAT_NAMES = frozenset(
      "IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ3_XXS", "IQ3_S", "IQ4_XS", "IQ4_NL"}
 )
 
-# NVFP4-CB / FP8-CB vector-quantization codebook lane (custom vLLM plugin;
-# pinned to format_registry by test_nvfp4_cb_formats). ALL integer rungs per
-# STANDARDS.md: NVFP4_CB_K12..K24, NVFP4_CB_S13..S16 (sign-magnitude),
-# FP8_CB_K28..K48 (the 2026-07-21 all-integer ladder — a stale step-4 set
-# here crashed the first full-ladder 27B export on cb_k=47).
-_NVFP4_CB_FORMAT_NAMES = frozenset(
-    {f"NVFP4_CB_K{k}" for k in range(12, 25)}
-    | {f"NVFP4_CB_S{k}" for k in (13, 14, 15, 16)}
-    | {f"FP8_CB_K{k}" for k in range(28, 49)}
-)
+# Backwards-compatible private name used by exporters. The canonical producer
+# ladder is torch-free ``cb_layout.CB_FORMAT_NAMES``; do not rebuild it here.
+_NVFP4_CB_FORMAT_NAMES = CB_FORMAT_NAMES
 
 
 def canonicalize_format(entry: dict | str | int) -> str:

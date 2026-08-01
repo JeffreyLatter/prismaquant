@@ -4,9 +4,12 @@ Dated 2026-07-21 (Robert: "make a definitive determination about final kernel
 and format standards"). This page is the contract production runs build
 against. Changes to it require a served A/B, not a preference.
 
-The vendored Gridbook runtime follows this contract: dense and MoE fused-FP4
-prefill are disabled unless their respective opt-in environment variables are
-set. Kernel-only speedups do not promote a path across activation buckets.
+The separately versioned, exact-commit-pinned Gridbook runtime follows this
+contract. Dense and MoE fused-FP4 prefill are disabled unless their respective
+opt-in environment variables are set. Kernel-only speedups do not promote a
+path across activation buckets. Runtime aliases, rungs, layouts, and supported
+producer profiles come from Gridbook's packaged `runtime_contract.json`; this
+repository does not duplicate those tables.
 
 ## Format standard (what an artifact may contain)
 
@@ -44,47 +47,20 @@ set. Kernel-only speedups do not promote a path across activation buckets.
   allocate zero vanilla-NVFP4 units remain Ada-servable as a bonus, never a
   constraint.
 
-## Kernel standard (the serving surface)
+## Runtime/kernel standard (owned by Gridbook)
 
-| Regime | Standard path | Status |
-|---|---|---|
-| Decode M≤16, dense | CUDA GEMV: fp8 double-buffer; fp4-v2 round-2 schedule | DEFAULT |
-| Decode M≤16, MoE | grouped CUDA GEMVs + deterministic combine | DEFAULT |
-| Prefill dense fp8-CB | `cb_expand_fp8` (direct e4m3 bytes) → stock cutlass W8A8 | DEFAULT |
-| Prefill dense fp4-CB | Triton v2 expand (bf16, composed scales) → cuBLAS | DEFAULT |
-| Prefill MoE fp8-CB | 'auto': measured per-layer selection over stock + grouped_fused × rung-feasible TileM (first-prefill cuda-event timing, cached; deterministic tuning-call output) | DEFAULT (2026-07-26 two-model gate: 35B 4,405 vs best-fixed 4,285; Laguna-class 2,063 vs best-fixed 1,821 — auto ≥ best fixed on both; composed paths individually KL-gated) |
-| Prefill MoE fp8-CB alt | 'grouped_fused': tile-indexed grouped decode-in-prologue (no weight expansion) | OPT-IN — wins small-expert MoE (35B-class); loses large-expert (Laguna-class). End state: measured per-layer auto-select |
-| Prefill MoE fp4-CB | per-expert loop (one host sync) | DEFAULT until stock's bf16-expand variant is measured |
-| Prefill dense fp4-CB alt | fused fp4-MMA decode-in-prologue (block-scaled NVF4, `OMMA.SF.16864` k=64, gmem-direct consumer decode) | OPT-IN (`PRISMAQUANT_CB_FUSED_FP4`), DEFAULT OFF — bit-exact vs the stock NVF4 collective across the rung ladder; MEASURED (2026-07-31, warm 2.2–2.5 GHz): beats the shipping transient at EVERY (rung, M): 5.2–6.1× at M≤128, 2.5–2.9× at M=512, 1.3–1.5× at M=2048; 2.5–12.4× vs Triton decode; native ratio 1.65–3.6 (the gap IS the decode prologue). Served A/B REQUIRED before promotion (activation bucket changes: native ue4m3 group scales vs the emulation's fp32). `docs/lanes/nvfp4-cb/fp4-fused-prefill.md` |
-| Prefill MoE fp4-CB alt | fused fp4-MMA tile-indexed grouped (TileM 128/256) | OPT-IN (`PRISMAQUANT_CB_FUSED_FP4_MOE`), DEFAULT OFF — bit-exact vs per-expert dense fused; MEASURED: kernel-side 5.2–5.6× the shipping per-expert loop at tile_m=128 (E=128/hidden=4096/inter=1536), native-ceiling ratio 1.5–2.1; same served-A/B requirement and activation-bucket caveat as the dense arm |
-| Dispatch | M-branch-hoist opaque custom ops (layer registry) | DEFAULT |
-| Mid-M 17–128 fp8-CB | CUTLASS fused decode-in-prologue, fp32 EVT scale epilogue | DEFAULT (promoted 2026-07-26: 1.40× in-niche; conf-KL-vs-teacher gate 0.00305/99.83% ON vs 0.00324/99.88% OFF at forced-96 microbatching — preserved; 4-ulp cutlass_scaled_mm agreement) |
-| Large-M fused dense | persistent-N self-contained TC kernel | MEASURED NEGATIVE (2026-07-26): parity-green but 2–5.7× slower than expand+fork at 27B shapes; the CUDA expander shrank the dense expand tax to ~10%, killing the original opportunity. Kernel kept quarantined (PRISMAQUANT_ENABLE_PTC=1) as the schedule reference. |
-| Large-M fused MoE | persistent/grouped decode-in-mainloop | ROADMAP — the fat target (expand ≈ 35% of Laguna MoE layer time; f ≈ 50%) |
-| MoE prefill alts | stock-kernel (capture-safe) / batched | OPT-IN |
-| l2_pipeline (per-expert L2-pinned scratch) | wedged live serving 3× (stream/capture context + device-wide sync on hot path; serial variant still wedges) | DIAGNOSTIC-ONLY — L2-residency hypothesis unmeasured; excluded from auto candidates |
-| w2 rowpack, damp sweep, … | measured negative | ARCHIVED behind env switches |
+Runtime dispatch, kernel defaults, environment switches, supported shapes, and
+operator evidence live only in the Gridbook repository and its packaged
+contract. Consult `docs/PLUGIN.md`, `docs/KERNELS.md`, and the dated audits from
+the exact commit in `scripts/lib/gridbook_runtime_pin.json`; this producer
+document intentionally carries no parallel dispatch table.
 
-- Decode contract v2 (scale-epilogue hoist): MEASURED NULL on one served 27B
-  plain low-M decode arm (10.10 vs 10.13 tok/s, quality-neutral). That supports
-  a bandwidth-bound reading for that arm only; it does not establish batched or
-  speculative decode neutrality. Default stays v1; v2 remains supported via
-  `PRISMAQUANT_CB_DECODE_CONTRACT=v2`.
-- R6 smem-resident codebook LUT (2026-07-26, commit `1ede688`): k48's 32 KB LUT
-  thrashed the ~50 KB post-carve-out L1 (decode ALU ran 7.5× k44's for 9% more
-  bits). Staging the table into smem per (TileM, KBits) cut the **ALU term 9.1×**
-  in the R2 term decomposition, **bit-exact 38/38**; kernel-level −61.5% on k48
-  fused, and served Laguna auto went 2,063 → 2,186 tok/s. Mechanism +
-  `AssertSmemFits` gating: `plugins/gridbook/README.md:136`.
-- Serving graph standard for ship configs: **mode-0 + FULL_DECODE_ONLY**.
-  The compile lane (mode-3, any cudagraph flavor) is correctness-clean since
-  the M-branch hoist and measured at decode parity (13.5–14.0 band on Hy3,
-  all four configs) — supported, not default. Revisit only with a lever that
-  moves the measured number.
-- All kernels are k-parameterized over the full integer ladder (ceil-first
-  splits); odd-k fp8 rows stage byte-granular until an odd rung is measured
-  hot on a served artifact.
-- Capability floor 8.0; JIT builds target the local arch.
+The producer-side decision needed here is fixed: both fused NVFP4 activation
+contracts remain explicit opt-ins and default OFF. The 2026-08-01 LFM
+teacher-backed gate rejected promotion despite green CUDA arithmetic/routing
+tests. No PrismaQuant menu, launcher, or artifact metadata may imply those paths
+are defaults. Reconsideration requires Gridbook's served quality and workload
+gates to pass, followed by advancing the immutable external pin.
 
 ## Cost standard
 

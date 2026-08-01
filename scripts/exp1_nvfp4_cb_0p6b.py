@@ -35,12 +35,17 @@ import torch
 import torch.nn as nn
 
 from prismaquant import format_registry as fr
+from prismaquant.cb_layout import (
+    codebook_subtable_shapes,
+    family_for,
+    subtable_bit_widths,
+)
 from prismaquant.emu_forward_kl import measure_emulated_kl, _git_commit
 from prismaquant.measure_quant_cost import canonical_linear_name
 from prismaquant.nvfp4_cb_formats import (
     make_nvfp4_cb_qdq, learn_codebook, _scale_and_vectorize,
     _col_weight_vectors, nvfp4_cb_fields, nvfp4_cb_reconstruct,
-    fixed_lattice, _build_lattice, VEC_DIM, _bit_split,
+    fixed_lattice, _build_lattice, VEC_DIM,
 )
 from prismaquant.nvfp4_cb_footprint import cb_footprint
 from prismaquant.index_entropy import index_entropy
@@ -58,6 +63,8 @@ IMATRIX_SEQS = 32
 IMATRIX_SEQLEN = 1024
 SUPERBLOCK = 256
 EPS = 1e-8
+FP4_PRODUCT_N_SUB = family_for("fp4", "product").n_sub
+FP4_SIGNED_N_SUB = family_for("fp4", "signed").n_sub
 
 # ---------------------------------------------------------------------------
 # Arm table. `fmt` is the emulation format name (a dynamically-registered
@@ -782,20 +789,27 @@ def train_shared_codebooks(model, targets, imatrix, *, mode, k, seed,
             idx = torch.randperm(vec.shape[0], generator=g)[:train_cap].to(vec.device)
             vec, wq = vec[idx], wq[idx]
         if mode == "signed":
-            cb = learn_codebook(vec.abs(), k - VEC_DIM, grid="fp4",
+            (magnitude_bits,) = subtable_bit_widths(
+                k, mode, FP4_SIGNED_N_SUB
+            )
+            cb = learn_codebook(vec.abs(), magnitude_bits, grid="fp4",
                                 col_weights=wq, iters=iters, seed=seed,
                                 positive=True).cpu()
         elif mode == "product":
-            # Two 4-dim sub-codebooks (fp4 n_sub=2), learned per half.
-            bits = _bit_split(k, 2)
+            bits = subtable_bit_widths(k, "product", FP4_PRODUCT_N_SUB)
+            shapes = codebook_subtable_shapes(
+                k, "product", FP4_PRODUCT_N_SUB
+            )
             subs = []
-            for i, b in enumerate(bits):
-                xs = vec[:, i * 4:(i + 1) * 4]
-                ws = wq[:, i * 4:(i + 1) * 4]
-                init_i = fixed_lattice(b, "fp4", 4).to(vec.device)
+            offset = 0
+            for b, (_, sub_dim) in zip(bits, shapes):
+                xs = vec[:, offset:offset + sub_dim]
+                ws = wq[:, offset:offset + sub_dim]
+                init_i = fixed_lattice(b, "fp4", sub_dim).to(vec.device)
                 subs.append(learn_codebook(xs, b, grid="fp4", col_weights=ws,
                                            init=init_i, iters=iters,
                                            seed=seed).cpu())
+                offset += sub_dim
             cb = tuple(subs)
         else:  # full
             cb = learn_codebook(vec, k, grid="fp4", col_weights=wq,
@@ -927,12 +941,20 @@ def footprint_1b(arm: Arm1b, targets: dict) -> dict:
     channel_scale = foot["channel_scale_bytes"]
     n_roles = len({role_of(q) for q in targets})
     if arm.kind == "signed_shared":
-        entries = 1 << (arm.k - VEC_DIM)               # magnitude table
+        entries = sum(
+            rows for rows, _ in codebook_subtable_shapes(
+                arm.k, "signed", FP4_SIGNED_N_SUB
+            )
+        )
         sidecar = n_roles * entries * CB_ENTRY_BYTES
     elif arm.kind == "full_shared":
         sidecar = n_roles * (1 << arm.k) * CB_ENTRY_BYTES
     elif arm.kind == "product_shared":
-        entries = sum(1 << b for b in _bit_split(arm.k, 2))  # 2 sub-tables
+        entries = sum(
+            1 << b for b in subtable_bit_widths(
+                arm.k, "product", FP4_PRODUCT_N_SUB
+            )
+        )
         sidecar = n_roles * entries * CB_ENTRY_BYTES
     elif arm.kind == "pertensor":
         sidecar = len(targets) * (1 << arm.k) * CB_ENTRY_BYTES
@@ -1454,7 +1476,11 @@ def footprint_1c(arm: Arm1c, targets: dict) -> dict:
         bpw = nvfp4_cb_effective_bits(arm.k, "fp4", arm.scale_coding)
         body = int(round(bpw * n_params / 8.0))
         # shared product sub-tables: 2 × 2^(k/2) 4-dim entries × 2 B, per role
-        entries = sum(1 << b for b in _bit_split(arm.k, 2))
+        entries = sum(
+            1 << b for b in subtable_bit_widths(
+                arm.k, "product", FP4_PRODUCT_N_SUB
+            )
+        )
         sidecar = len({role_of(q) for q in targets}) * entries * _SUB4_ENTRY_BYTES
         byte_scope = (
             "research_analytic_cb_body_plus_packed_fp4_role_codebooks"

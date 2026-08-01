@@ -1,15 +1,15 @@
 # PrismaQuant Architecture
 
-As of: 2026-07-30 · branch `claude/docs-consolidation` · verified against merge `8f14400`
-(= NVFP4-CB lane + `origin/main`'s 54-commit allocator/release stack) plus the same-day
-cleanup/fix batch and **all four** architecture re-vet waves committed with this document
-(`docs/audits/architecture_re-vet_2026-07-30.md` carries an Outcome line for every R1–R28):
-wave 1 the plugin/registry debt, wave 2 the archive walls (R4/R17/R18/R19/R25),
-wave 3 the orchestrator (R1/R2(i)/R5/R6/R11/R24 — §3.4, §3.6, §4.6, §8.5 L1; D4/D6/D8/D9/D10/D12
-closed), **wave 4 the cost axes and the lanes** (R3/R2-final/R16/R21 + the R7/R23 rulings —
-§3.3, §4.2, §4.3, **§4.7**, the stage table's `[2b/4 cw]` and `[3c]` rows; D14/D15 closed and
-D26's measurement half closed). The one change of *behaviour* a returning reader must know:
-**`COST_MODE` now defaults to `aura`** (§3.3).
+As of: 2026-08-01 · branch `fix/remove-vendored-gridbook` · verified against implementation
+commit `3d6d54c`, with the external Gridbook runtime pinned to
+`59cebf9f2c7fd43fcaa33c101eca31cbfd59fd99` (v0.4.1).
+
+This revision retains the four 2026-07-30 architecture re-vet waves documented in
+`docs/audits/architecture_re-vet_2026-07-30.md` and closes the runtime-ownership debt: the
+vendored Gridbook tree and sync path are gone, producer ABI/menu/config facts have one owner,
+and required CI checks the independent producer and consumer at one immutable commit. The two
+behavioural facts a returning reader must know are that **`COST_MODE` defaults to `aura`**
+(§3.3) and fused native-NVFP4 remains default-off after its teacher-backed quality gate (§9.2).
 
 **Prime directive:** the code is the authority. Where this document and the tree disagree, the
 document is wrong — fix it, or record the divergence in §12; never propagate it.
@@ -67,7 +67,7 @@ by measurement, not by the cost model (§2).
 | Lane | Container | Runtime | Formats | Status |
 |---|---|---|---|---|
 | Native | `compressed-tensors` | vanilla vLLM, Blackwell CUTLASS | NVFP4, FP8_DYNAMIC/E4M3, FP8_SOURCE, BF16 | production default |
-| CB ("gridbook") | `nvfp4_cb` codebook checkpoint | vLLM + `gridbook` plugin (`plugins/gridbook`, PyPI `gridbook`, custom CUDA/CUTLASS) | FP4-CB / FP8-CB rungs plus the native menu | production for 4 wired archs; DSv4 a commented candidate path (`plugins/gridbook/gridbook/plugin.py:114-117`) |
+| CB ("gridbook") | `nvfp4_cb` codebook checkpoint | vLLM + the separately versioned `gridbook` package (custom CUDA/CUTLASS), installed from the exact commit in `scripts/lib/gridbook_runtime_pin.json` | FP4-CB / FP8-CB rungs plus the native menu | production only for architectures declared by Gridbook's packaged runtime contract; DSv4 remains gated |
 | GGUF | single `.gguf` | llama.cpp; vLLM via `vllm-gguf-plugin` | Q2_K…Q8_0 k-quants + IQ family + BF16 | enabled end-to-end; the only 2–3 bpw path |
 
 Lane detail, defaults and proven results: §9. Export codecs: §6. Pipeline defaults: §3.3.
@@ -1440,9 +1440,10 @@ anywhere under `prismaquant/` outside `model_profiles/` and `vendored/` numbered
 **three** — the MiniMax hardcodes of §8.5 L4 — and are now **zero**: R27 routed both through
 profile accessors (`bypass_hf_fp8_module_rewrite()`,
 `packed_expert_module_class_names()`), declared in `specs/minimax_m2.json`.
-`plugins/gridbook/` has **none**; its per-arch binding is guarded
-module-path strings in a data registry (`plugin.py:91-118`), which the scan does not and should
-not count. An earlier, laxer count ("5 and 2") could not be reproduced and is withdrawn; the
+Gridbook is a separate repository and therefore outside this AST scan. Its supported producer
+profiles and serving aliases are imported as data from the installed package's
+`runtime_contract.json`; PrismaQuant carries no copy of those tables. An earlier, laxer count
+("5 and 2") could not be reproduced and is withdrawn; the
 remaining arch-named literals in the core stack are argparse help, log/error text, and
 `vendored/`'s registration machinery, which is arch-specific by design — the cosmetic list at
 the end of §8.5 is the audited set.
@@ -1484,11 +1485,11 @@ flowchart TD
   end
   CONSUMERS --> PIPE
 
-  subgraph GB["gridbook per-arch loader chain -- serving side, cannot import prismaquant"]
-    GBPLUG["plugin.py:91-118 -- _CB_TOPLEVEL_MODULE_PATHS, data<br/>hy_v3, hy_v3_mtp, laguna, qwen3_5, qwen3_5_mtp: module paths<br/>each fed to _install_on_module_classes (class-name agnostic)<br/>DSv4: commented candidate path at :114-117<br/>a missing entry now RAISES at serve (cb_fill_guard)"]
-    GBSCAN["_install_on_module_classes -- plugin.py:38-63<br/>version-robust, inert for non-CB checkpoints"]
-    GBINST["install_toplevel_cb_expert_loader<br/>moe_toplevel_loader.py:497-516, idempotent sentinel"]
-    GBCFG["PrismaQuantConfig.get_quant_method -- config.py:326-375<br/>CB group / ignore / stock CT / embedding / RoutedExperts"]
+  subgraph GB["external Gridbook repository -- sole serving/runtime owner"]
+    GBPLUG["packaged runtime_contract.json<br/>consumer aliases, format ABI, supported producer profiles"]
+    GBSCAN["Gridbook-owned architecture loader registry<br/>version-robust, inert for non-CB checkpoints"]
+    GBINST["Gridbook-owned top-level expert loader + fill guard<br/>missing coverage fails closed before execution"]
+    GBCFG["Gridbook-owned quantization config<br/>CB / ignore / delegated stock CT / embedding / routed experts"]
   end
 
   GBPLUG --> GBSCAN
@@ -1498,7 +1499,7 @@ flowchart TD
 
   L1["LEAK 1 -- run-pipeline.sh:91<br/>TARGET_PROFILE hardcoded to vllm_packed_moe and passed<br/>unconditionally (:471, :1081); spec.default_serving_profile<br/>can never win. hy_v3 declares gguf, laguna declares nvfp4_cb.<br/>MEASURED 2026-07-11: 226 dense FP8 Linears silently -> BF16<br/>on the Hy3 CT export. PRISMAQUANT_TARGET_PROFILE is the audit<br/>escape hatch and run-pipeline.sh does not set it."]
   L2["LEAK 2 -- FIXED 2026-07-30 (R12)<br/>MTP now routed through profile.build_mtp_module /<br/>read_mtp_source_state_dict / load_mtp_state_dict at all three sites.<br/>mtp_module.py deleted; DSv4 takes the hy_v3 passthrough route."]
-  L3["LEAK 3 -- gridbook opt-in is code, not data<br/>a missing line means stacked CB expert tensors never load and the<br/>FusedMoE serves init memory. Symptom is garbage generation, not a<br/>crash (commit 9a79963). No automated detection, no test."]
+  L3["LEAK 3 -- FIXED + OWNERSHIP MOVED 2026-08-01<br/>Gridbook alone owns loader wiring and the fill guard; missing coverage<br/>raises before execution. PrismaQuant carries no loader table and CI compares<br/>its eligible producer profiles with the exact pinned consumer contract."]
   L4["LEAK 4 -- FIXED 2026-07-30 (R27)<br/>streaming_model FP8-rewrite bypass -> profile.bypass_hf_fp8_module_rewrite()<br/>(spec staging.bypass_hf_fp8_module_rewrite); incremental_probe expert<br/>container -> profile.packed_expert_module_class_names().<br/>Zero arch literals in core-stack control flow."]
 
   L1 -.->|"leak"| RESOLVE
@@ -1644,42 +1645,40 @@ modeling. Then run the conformance validator (§8.6), which nothing else does.
 plus `"nvfp4_cb"` in the spec's `supported_lanes` — the lane declaration is what
 `require_lane_supported` (`serving_profiles.py`) checks, and it must be added *with* the loader
 wiring of (7), never ahead of it.
-(7) **Read the arch's vLLM `load_weights`** and decide whether experts are mapped at the top
-level or delegated to per-layer `FusedMoE.load_weights`. Top-level archs need **one line** — the
-vLLM module path in `_CB_TOPLEVEL_MODULE_PATHS` (`plugins/gridbook/gridbook/plugin.py:91-118`),
-which `_install_on_module_classes` (`:38-63`) consumes; version- and name-robust, inert for
-non-CB checkpoints (`:44-46`). Per-layer archs need nothing (`plugin.py:7-21`). Get it wrong and
-the serve now *raises* instead of generating garbage (`cb_fill_guard.py`, §8.5 L3). (8) A
-CB-quantized MTP/drafter needs its own module-path entry (`hy_v3_mtp` is one; Laguna's DFlash
-drafter is still missing, `plugin.py:100-104`).
+(7) **Read the architecture's vLLM `load_weights`** and implement any required
+top-level expert-loader hook in the external Gridbook repository. Gridbook owns
+that registry and its fail-closed fill guard; its packaged consumer contract is
+the only architecture-capability list PrismaQuant checks. Do not copy module
+paths here. (8) A CB-quantized MTP/drafter needs corresponding Gridbook loader
+coverage and a contract update before the PrismaQuant lane declaration lands.
 
-Serving-side registry keys: `"gridbook"` with legacy alias `"prismaquant"` (`plugin.py:141`,
-`:147`) for artifacts exported before the rename.
+Serving-side registry keys are owned by the pinned Gridbook consumer contract:
+canonical `"gridbook"`, with `"prismaquant"` retained only as a read alias for
+artifacts exported before the rename.
 
 ### 8.4 Conformance matrix
 
 | Arch | profile | prio | structure spec | `default_serving_profile` | `supported_lanes` (preferred) | gridbook opt-in | MTP |
 |---|---|---|---|---|---|---|---|
-| qwen3 (dense) | `qwen3.py` | 130 | ✅ | `vllm_packed_moe` | CT | n/a | none |
+| qwen3 (dense) | `qwen3.py` | 130 | ✅ | `vllm_packed_moe` | CT, **nvfp4_cb** (CT) | no special loader hook | none |
 | qwen3_moe | `qwen3_moe.py` | 120 | ✅ | `vllm_packed_moe` | CT | ⚠ none | none |
-| qwen3_5 / 3.6 MoE | `qwen3_5.py` | 110 | ✅ | `vllm_packed_moe` | CT, **nvfp4_cb** (CT) | ✅ module paths `plugin.py:112-113` | `build_mtp_module` → `MtpModule` (live; R12) |
-| qwen3_5_dense | `qwen3_5_dense.py` | 100 | ✅ | `vllm_packed_moe` | CT, **nvfp4_cb** (CT) | ✅ same paths | inherits `Qwen3_5Profile.build_mtp_module` (dead copy removed, R12) |
+| qwen3_5 / 3.6 MoE | `qwen3_5.py` | 110 | ✅ | `vllm_packed_moe` | CT, **nvfp4_cb** (CT) | declared by pinned Gridbook contract | `build_mtp_module` → `MtpModule` (live; R12) |
+| qwen3_5_dense | `qwen3_5_dense.py` | 100 | ✅ | `vllm_packed_moe` | CT, **nvfp4_cb** (CT) | no expert-loader hook | inherits `Qwen3_5Profile.build_mtp_module` (dead copy removed, R12) |
 | gemma4 | `gemma4.py` | 140 | ✅ | `vllm_packed_moe` | CT | ⚠ none | none |
 | lfm2_moe (LFM2.5) | `lfm2_moe.py` | 150 | ✅ | `vllm_packed_moe` | CT | ⚠ none | `has_mtp → False` |
 | minimax_m2 | `minimax_m2.py` | 160 | ✅ **added R22** — all 8 overrides declared | `vllm_packed_moe` **(added R22)** | CT | ⚠ none | `has_mtp → False` |
-| deepseek_v4 | `deepseek_v4.py` | 170 | ✅ | `vllm_packed_moe` **(added R22)** | CT | ❌ commented candidate `plugin.py:114-117` | `has_mtp → False` + `mtp.` passthrough (hy_v3 route, R12) |
-| hy_v3 | `hy_v3.py` | 180 | ✅ | `gguf` (overridden, L1) | CT, nvfp4_cb, **gguf** (gguf) | ✅ `:93`, MTP `:99` | `has_mtp → False`; MTP passthrough + out-of-band CB scripts |
-| laguna (poolside S/XS 2.x) | `laguna.py` | 190 | ✅ | `nvfp4_cb` (overridden, L1) | CT, **nvfp4_cb** (nvfp4_cb) | ✅ `:104`; drafter missing `:100-104` | `has_mtp → False` |
+| deepseek_v4 | `deepseek_v4.py` | 170 | ✅ | `vllm_packed_moe` **(added R22)** | CT | ❌ absent from the pinned Gridbook contract; loader/delegation unimplemented and lane gated | `has_mtp → False` + `mtp.` passthrough (hy_v3 route, R12) |
+| hy_v3 | `hy_v3.py` | 180 | ✅ | `gguf` (overridden, L1) | CT, nvfp4_cb, **gguf** (gguf) | declared by pinned Gridbook contract | `has_mtp → False`; MTP passthrough + out-of-band CB scripts |
+| laguna (poolside S/XS 2.x) | `laguna.py` | 190 | ✅ | `nvfp4_cb` (overridden, L1) | CT, **nvfp4_cb** (nvfp4_cb) | declared by pinned Gridbook contract; drafter still separate | `has_mtp → False` |
 | default | `default.py` | — (terminal) | n/a by design | — | CT (default) | n/a | none |
 
 `prio` = detection priority, lower first (§8.1); the same number is declared on the Python class
 and in the spec, and a test asserts they agree. **CT** = `compressed-tensors`. The lane column is
-the *declared* set (R6, spec `supported_lanes`/`preferred_lane`), and it is deliberately equal to
-the gridbook loader list — four architectures for CB, one for GGUF. Over-declaring is the exact
+the *declared* set (R6, spec `supported_lanes`/`preferred_lane`), and required CI compares the
+five CB producer profiles with Gridbook's packaged contract; GGUF has one. Over-declaring is the exact
 failure the field exists to prevent: an undeclared lane does not fail loudly, it serves
 uninitialised expert memory. `require_lane_supported(profile, EXPORT_CONTAINER)`
-(`serving_profiles.py`) is the preflight; **the `run-pipeline.sh` call site is wave 3 and is not
-wired yet**, so today the declaration is read only by tests and by callers that opt in.
+(`serving_profiles.py`) runs in `run-pipeline.sh` before profile resolution and export.
 
 Gaps beyond the four leaks. **minimax_m2's missing spec is closed** (R22, 2026-07-30): all
 eight overrides (`:69,:86,:91,:101,:104,:110,:133,:137`) are now declared in
@@ -1721,7 +1720,7 @@ These four are the canonical statement; §12 references them rather than restati
 |---|---|---|
 | L1 | **FIXED 2026-07-30 (R11).** Was: `run-pipeline.sh` hardcoded `TARGET_PROFILE:=vllm_packed_moe` and passed it unconditionally, and `resolve_target_profile` gives an explicit request precedence (`serving_profiles.py`), so `spec.default_serving_profile` was **never consulted through the production orchestrator** — `hy_v3.json` (`gguf`) and `laguna.json` (`nvfp4_cb`) silently overridden. **The leak had a measured cost:** because export re-resolved the profile it judges legality under, on 2026-07-11 **226 dense FP8 Linears were silently demoted to BF16** on the Hy3 compressed-tensors export. **Mechanism of the fix:** (i) the shell default is now empty and `--target-profile` is passed to the allocator **only when non-empty**, with a new `--target-profile-default vllm_packed_moe` supplying the fallback for architectures that declare nothing — never `research`, whose menu is unbounded. (ii) The allocator stamps its **resolved** profile into `layer_config.json`'s reserved `__prismaquant__` metadata block (`layer_config.LAYER_CONFIG_META_KEY`, skipped by every assignment parser and by the schema), and `export_native_compressed._allocator_target_profile_for_audit` reads it, with `PRISMAQUANT_TARGET_PROFILE` kept as the operator override for direct exporter invocations. `select_validated_frontier` carries the block forward when it overwrites the layer config, so the validated path keeps it too. Allocator and export can no longer disagree, and the channel travels **with** the artifact. **Non-regression:** re-solving the shipped 27B and 35B from their stored probe/cost artifacts changed **0 of 614** and **0 of 500** assignments vs the same code without the change (the 35B differs from its *shipped* config by 32/500 for an unrelated, pre-existing reason — the Fisher renormalization fix that landed after that artifact shipped). Every in-tree launch script sets `TARGET_PROFILE` explicitly, so all eight are bit-identical. | ~~high~~ FIXED |
 | L2 | **FIXED 2026-07-30 (R12).** MTP construction bypassed the profile: `prismaquant/mtp_module.py` was Qwen3.5-specific yet imported **directly** by `incremental_probe.py`, `incremental_measure_quant_cost.py` and `export_native_compressed.py`, gated only on the arch-agnostic `profile.has_mtp()`, so `deepseek_v4` (`has_mtp → True`, `build_mtp_module → None`) would have been handed a Qwen3.5 decoder layer. **Mechanism of the fix:** a fourth accessor `ModelProfile.mtp_source_prefix()` (`base.py:255-272`, spec-expressible as `shard_regexes.mtp_source_prefix`, default `"mtp."`) plus a generic `read_mtp_source_state_dict()` (`:290-326`) and a packed-expert-aware `load_mtp_state_dict()` (`:329-396`, absorbed from the deleted `_load_into_mtp`); `build_mtp_module`'s docstring now states the naming contract (names under an `mtp` parent must equal the recipe names). The Qwen body moved verbatim into `model_profiles/qwen3_5.py:124` (`MtpModule`) and the dead near-copies in `qwen3_5.py` and `qwen3_5_dense.py` were reconciled into it; all three call sites now go through the profile and hard-fail with a named error if `has_mtp()` and `build_mtp_module()` disagree. `prismaquant/mtp_module.py` is **deleted**. DSv4 takes the hy_v3 route (`has_mtp → False` + `"mtp."` in `passthrough_prefixes`) until its nextn block is actually quantized. Gates: `tests/test_mtp_module_arch.py` pins parameter-name-set equality against the pre-move layout for both the dense and MoE profile; `tests/test_model_profile_conformance.py::test_has_mtp_implies_a_buildable_mtp_module` is the standing ratchet. | ~~high~~ FIXED |
-| L3 | **FIXED 2026-07-30 (R10).** Was: a hand-maintained `try/except ImportError` opt-in chain (three hardcoded class imports plus one module scan), whose missing-line failure mode is **coherent-looking garbage generation** at serve time, with no test. Now: (i) the opt-in is data — a module-path tuple `_CB_TOPLEVEL_MODULE_PATHS` (`plugins/gridbook/gridbook/plugin.py:91-118`) fed to the version- and name-robust `_install_on_module_classes` (`:38-63`); a new arch is one line, and DSv4 is a commented candidate naming the vLLM module path to check (`:114-117`) rather than a bare TODO. A JSON sidecar remains the upgrade if third parties need to extend it. (ii) The silence is gone: `create_weights` stamps `_pq_cb_filled = False` on `w13/w2_cb_qweight`, both fill paths stamp `True` (the instance hook `moe.py:199`, `moe_toplevel_loader.py:583`), and `process_weights_after_loading` (`moe.py:213-217`) raises via `cb_fill_guard.assert_cb_experts_filled` (`:114`), naming the model class and the module path to add. **No env bypass**; scoped to the params the local rank registered, so EP/PP-absent and zero-expert shards are skipped (`cb_fill_guard.py:57-77`). Tests: `plugins/gridbook/tests/test_cb_fill_guard.py` (7). | ~~high~~ closed |
+| L3 | **FIXED 2026-07-30 (R10), ownership boundary hardened 2026-08-01.** Was: a hand-maintained `try/except ImportError` opt-in chain whose missing-line failure mode was **coherent-looking garbage generation**. Gridbook now owns the module-path registry, fill guard, and tests in its sole canonical repository. PrismaQuant owns no loader or runtime copy; its required CI job installs the exact pinned Gridbook commit, validates PEP 610 provenance, and compares the producer profile set with Gridbook's packaged `runtime_contract.json`. The runtime stamps CB expert parameters unfilled, stamps them after either loader path, and fails closed before execution if any local registered expert remains unfilled. **No env bypass.** | ~~high~~ closed |
 | L4 | **FIXED 2026-07-30 (R27).** Both MiniMax hardcodes now go through profile accessors. `streaming_model.py`'s FP8-rewrite bypass was already half config-derived (`quant_method == "fp8"` and `weight_block_size`); the architecture half is a static property, so it became `staging.bypass_hf_fp8_module_rewrite` in the spec behind `profile.bypass_hf_fp8_module_rewrite()` (`base.py`), leaving the per-checkpoint half a config read where it belongs. `incremental_probe.py`'s `type(module).__name__ == "MiniMaxM2Experts"` became `profile.packed_expert_module_class_names()` (`base.py:182-192`) — the accessor that already existed for exactly this lookup — plus the structural shape test; the declared class stays **required**, because the replacement forward implements one specific expert-loop signature and applying it to a lookalike container would silently change a forward pass. `specs/minimax_m2.json` declares both, and `unpacked_expert_projection_names` with them. | closed |
 
 Cosmetic, listed so they are not re-discovered as leaks:
@@ -1776,20 +1775,20 @@ the one box any of it has been proven on.
 flowchart LR
   subgraph CONT["artifact containers"]
     A1["compressed-tensors<br/>NVFP4 / FP8_DYNAMIC / FP8_SOURCE / BF16<br/>export_native_compressed.py"]
-    A2["codebook (CB)<br/>production: NVFP4_CB_K12-K24 + FP8_CB_K28-K48<br/>legacy/research decoder: signed S13-S16<br/>plus stock rungs -- deliberately a mixed container<br/>export_nvfp4_cb.py, layer_config.py:35-38"]
+    A2["codebook (CB)<br/>production: NVFP4_CB_K12-K24 + FP8_CB_K28-K48<br/>legacy/research decoder: signed S13-S16<br/>plus stock rungs -- deliberately a mixed container<br/>export_nvfp4_cb.py, cb_layout.py"]
     A3["GGUF<br/>Q2_K..Q8_0 + IQ family<br/>export_gguf.py"]
   end
 
   subgraph RT["runtimes"]
     R1["vanilla vLLM<br/>no plugin, no forked runtime, no custom kernels<br/>CUTLASS NVFP4 path on Blackwell"]
-    R2["vLLM + gridbook plugin<br/>PyPI gridbook; entry point vllm.general_plugins<br/>3 JIT CUDA exts + sm_121 CUTLASS fork (csrc/)"]
+    R2["vLLM + Gridbook plugin<br/>exact commit from gridbook_runtime_pin.json<br/>entry point vllm.general_plugins; runtime details owned by Gridbook"]
     R3["llama.cpp"]
     R4["vLLM GGUF path<br/>in-tree up to vLLM 0.19; official vllm-gguf-plugin after"]
   end
 
   subgraph HW["hardware"]
     H1["NVIDIA GB10 DGX Spark<br/>Blackwell sm_121, 128 GB unified memory<br/>~121 GB usable serving budget"]
-    H2["Strix Halo<br/>PLANNED -- nothing built, no code in tree<br/>gridbook csrc is CUDA/sm_121-only, so the CB lane<br/>has no port path today"]
+    H2["Strix Halo<br/>CANCELED / UNSUPPORTED<br/>prototype removed after hardware access was lost;<br/>no qualified Gridbook backend"]
   end
 
   A1 -->|"serving profile vllm_packed_moe"| R1
@@ -1802,16 +1801,17 @@ flowchart LR
   R3 -->|"Spark-proven -- 295B-class at 2.8 bpp; the KL harness for this lane"| H1
   R4 -->|"smoke-verified on the 0.19.2 venv only, never KL-measured"| H1
 
-  R3 -.->|"planned, unbuilt"| H2
-  R4 -.->|"planned, unbuilt"| H2
+  R3 -.->|"no qualified deployment"| H2
+  R4 -.->|"no qualified deployment"| H2
 
   classDef proven stroke:#2d7a2d,stroke-width:2px
-  classDef planned stroke:#c07800,stroke-width:2px,stroke-dasharray:4
+  classDef unsupported stroke:#c0392b,stroke-width:2px,stroke-dasharray:4
   class H1 proven
-  class H2 planned
+  class H2 unsupported
 ```
 
-Paths below are repo-root-relative; `gb/` abbreviates `plugins/gridbook/gridbook/`.
+PrismaQuant paths below are repo-root-relative. Gridbook source paths refer to the separately
+versioned repository at the exact commit recorded in `scripts/lib/gridbook_runtime_pin.json`.
 
 ### 9.1 Native compressed-tensors — the default lane
 
@@ -1822,67 +1822,47 @@ it; §7 owns its gates. Validation runs in-process (`validate_native_export.py:1
 
 ### 9.2 gridbook — codebook (CB) serving
 
-**Package and registration.** `plugins/gridbook/` is an independently installable package
-(`gridbook`, `pyproject.toml:8`), registered through vLLM's general-plugin entry point
-(`pyproject.toml:69-70`). In-tree version is **`0.2.0.dev0`** (`gb/__init__.py:19`, which
-`pyproject.toml:73` declares as the single source of truth) — a *development head*, not a
-release: releases are cut from the standalone `/home/rob/gridbook` repo, which published PyPI
-0.1.1. The dev suffix is the honest label for a tree that is ahead of the release in kernel work
-(R6 smem LUT, single-storage dense weights) and must never be read as published — §12 D27,
-resolved 2026-07-30. (Unlike the `prismaquant` package, whose 0.4.1 release commit is now
-merged — §12 D7.) `register()` (`gb/plugin.py:129-151`) does three things: optional force-preload of the fused
-extension under `PRISMAQUANT_PRELOAD_FUSED` (residency-matched A/B, §7.4),
-`register_quantization_config("gridbook")` plus the legacy alias `"prismaquant"` for pre-rename
-artifacts (`:141-147`), and the per-arch loader installs below. **No vLLM-core monkeypatches**
-— only the model classes' own `load_weights` (`:16-21`) and one instance-level wrap on FusedMoE
-(`gb/moe.py:177-207`). It is a *mixed* container: CB targets get CB methods, ignored prefixes
-BF16, and plain NVFP4/FP8_DYNAMIC groups are re-keyed into a real `CompressedTensorsConfig` and
-delegated (`gb/config.py:326-375`). Single-GPU only — no TP handling in `gb/*.py`.
+**Package, registration, and ownership.** Gridbook is one independent package with one source
+repository, one test suite, and one release history. It registers through vLLM's general-plugin
+entry point and owns all serving code: configuration parsing, architecture loader hooks, CUDA
+sources, kernel dispatch, telemetry, and runtime tests. PrismaQuant owns the inverse boundary:
+model analysis, allocation, artifact encoding, and exporter metadata. There is no runtime source
+under this repository and no sync operation between repositories.
 
-**Two trees, one package, one direction (2026-07-30).** The same package lives in two places:
-`plugins/gridbook/` here is the **development tree** — where the kernel campaign lands, next to
-the encoder that produces the artifacts those kernels serve — and `RobTand/gridbook` (locally
-`/home/rob/gridbook`) is the **release project**, which owns the distribution scaffolding this
-tree deliberately does not have (`LICENSE`, `MANIFEST.in`, `Dockerfile`, `docs/`, `.github/`,
-`CITATION.cff`) and is the only place a tag or a PyPI upload happens. They drifted 37 files
-apart with nothing watching, so the path is now mechanical: `scripts/sync_gridbook.py` mirrors
-`plugins/gridbook/gridbook/` → `<release>/gridbook/` and `plugins/gridbook/tests/` →
-`<release>/tests/`, one way, deletions included, reading **committed** content only (a
-`--rev`, default `HEAD`) so in-flight kernel authoring is excluded by construction rather than
-by a denylist — Robert's rule is "when they're ready", and a commit is the only mechanical
-definition of ready this repo has. It never writes outside those two subtrees.
-`tests/test_gridbook_sync.py` runs `--check` as a drift gate and skips (never passes) when the
-clone is absent; its location is `GRIDBOOK_REPO`. Nothing in the path commits, tags or
-publishes — releasing stays a human action.
+The complete integration is one immutable record, `scripts/lib/gridbook_runtime_pin.json`.
+Every serving script resolves that record through `scripts/lib/gridbook_runtime.sh`, accepts only
+an exact clean commit checkout, mounts it read-only, and independently re-reads the tracked pin
+inside the container before re-attesting and installing the checkout. Branch names, moving tags,
+dirty trees, wheels, and editable installs are rejected. Serve fingerprints include the resolved
+Gridbook commit, so an A/B cannot silently compare different runtime code.
 
-**What flows, and what is held: two tiers (Robert, 2026-07-30).** *"nvfp4 kernels are to be
-made part of gridbook immediately once completed. we can hold back amd specific kernels until
-later once they are validated."* **Tier 1, NVFP4/CUDA: ships on completion** — and there is no
-step for it, which is the design. Committing the kernel under `plugins/gridbook/` *is* the
-release action, because the sync reads committed content; the sequence afterwards is "commit
-here, run the script, commit in the release repo", with nothing to edit. **Tier 2, AMD/HIP:
-held until a serving metric exists.** The lane compiled and passed a 1-bf16-ULP parity gate on
-gfx1151, but has never run inside a serve (no vLLM-ROCm on that box) — correct in a
-microbenchmark is not shipped, and §7's promotion ladder does not know a rung for it. The hold
-is policy in the tool, not a step to remember: `sync_gridbook.HELD_PATHS` (`gridbook/csrc_hip`,
-`gridbook/hip_ext.py`, `gridbook/linear_hip.py`, each carrying its reason and its release
-condition) is filtered out of the source listing and *deleted* if found in the release repo,
-and the drift gate reads the same list — so "present here, absent there" is the intended steady
-state. The hold is on **paths, never on content**: `gb/linear.py:57-77` keeps its one guarded
-`from . import linear_hip` and syncs verbatim, since with the module held the import raises and
-`_HIP = None` — the state every CUDA box was always in. Forking the dispatch core instead would
-put a content exception in the gate, which is not checkable the way a path exception is.
-Packaging is the one place the hold cannot be enforced by mirroring (the release repo owns
-`pyproject.toml`/`MANIFEST.in`), so `packaging_leaks()` reports a held lane's package-data
-globs as drift rather than silently allowing a half-released lane.
+**One machine-readable contract, not parallel tables.** Gridbook packages
+`gridbook/runtime_contract.json`; it is authoritative for the runtime's quantization aliases,
+CB rung ranges, serialized packing/type-size rules, and supported producer-profile ids.
+PrismaQuant's required `gridbook-contract` CI job VCS-installs the exact pinned commit, verifies
+its PEP 610 provenance and package version, and compares the producer's declarations against
+that contract. Adding an architecture or changing a runtime ABI therefore starts in Gridbook,
+then advances this repository's single pin only after the contract test passes. PrismaQuant does
+not import Gridbook while exporting and carries no parallel runtime alias or loader table. Its
+producer codec remains an intentionally independent implementation of the artifact ABI; CI
+compares every packing/layout field and every rung so incompatibility fails at the boundary.
+
+At runtime `register()` may preload the fused extension for residency-matched A/B, registers
+`"gridbook"` plus the legacy artifact alias `"prismaquant"`, and installs the per-architecture
+loader hooks. It does not patch vLLM core. The container may mix CB groups, ignored BF16
+prefixes, and native NVFP4/FP8 groups delegated to vLLM. Fused dense and grouped NVFP4 paths
+remain explicit opt-ins: the 2026-08-01 teacher-backed LFM gate rejected default enablement even
+though operator arithmetic passed. The canceled gfx1151/ROCm prototype was removed rather than
+maintained as an unqualified second backend.
 
 **Storage format.** Product vector quantization onto a codebook whose every entry lies exactly
 on a hardware grid, so a decoded tile *is* a bit-standard NVFP4/FP8 tensor and dequantization
 is a gather rather than arithmetic. A weight vector is d=8 wide; a k-bit index selects a
-codeword; 32 codewords plus scales form a 256-weight superblock (`gb/codec.py:16-18`). Two
+codeword; 32 codewords plus scales form a 256-weight superblock (external Gridbook
+`gridbook/codec.py`). Two
 ladders, every integer rung: `NVFP4_CB_K12–K24` (E2M1 grid, 1.78125–3.28125
 serialized body bpw under production layout v2) and `FP8_CB_K28–K48`
-(E4M3 grid, 3.5–6.0 bpw) — `prismaquant/layer_config.py:35-38`, allow-listed in
+(E4M3 grid, 3.5–6.0 bpw) — `prismaquant/cb_layout.py`, sourced into
 `serving_profile_specs/nvfp4_cb.json`. A third, signed-codebook ladder
 `NVFP4_CB_S13–S16` remains codec/export/decoder compatible for legacy and
 explicit research use, but is **excluded from new production allocations**.
@@ -1897,39 +1877,23 @@ to production solves (`format_registry.py:932-983`,
 precision are independent dials: `FP8_CB_K32` *stores*
 4.0 bpw and *computes* in fp8 — why CB beats native NVFP4 at matched bpw (fp8 rungs run A8
 activations where NVFP4 runs A4). Codebooks live in a `.pqcb` safetensors sidecar pointed at
-from `config.json` (`gb/config.py:4-10`, `export_nvfp4_cb.py:630-639`); the non-globbed extension
+from `config.json` (external Gridbook `gridbook/config.py`,
+`export_nvfp4_cb.py:630-639`); the non-globbed extension
 keeps vLLM's weight loader off it.
 
-**Kernel defaults and their provenance.** Changes to this table require a served A/B
-(`docs/lanes/nvfp4-cb/STANDARDS.md`).
-
-| lever | status | commit | code |
-|---|---|---|---|
-| dense decode: M≤8 CUDA GEMV (`CUDA_GEMV_M_MAX=8` — it LOSES 0.66× at M=16), M 9–16 Triton, M>16 prefill path `cb_expand_fp8` → stock `cutlass_scaled_mm` | DEFAULT | — | `gb/linear.py:46,48-53,359-360` |
-| mid-M 17–128 fused decode-in-prologue (fp32 EVT epilogue) | PROMOTED-DEFAULT (`!= "0"`) | `ac3e584` | `gb/linear.py:437-441`; gate: conf-KL 0.00305/99.83% ON vs 0.00324/99.88% OFF, 1.40× in-niche |
-| MoE fp8-CB prefill `auto` (per-layer cuda-event selection over stock + `grouped_fused` × feasible TileM) | PROMOTED-DEFAULT, two-model gate | `3062fbf` | `gb/moe.py:404-405`, policy `gb/moe_autotune.py`; 35B 4,405 vs best-fixed 4,285; Laguna 2,063 vs 1,821 |
-| `grouped_fused` as the MoE default | PROMOTED then **REVERTED** | `4b81f61` → `2d37398` | now opt-in; re-decodes each expert's B per M-tile and pads to tile multiples, so both taxes scale with expert *size* (`gb/moe.py:365-372`) |
-| R6 smem-resident decode LUT | PROMOTED-DEFAULT (compile-time, no env gate) | `1ede688` | `gb/csrc/cutlass_fork/sm120_cb_fused_mma.hpp:167-193`; k48 L1 cliff removed, 9.1× ALU term, bit-exact 38/38 |
-| single-storage dense weights (issue #1) | PROMOTED-DEFAULT, unconditional | `bf1ada0` | `gb/linear.py:266-289`; 27B weights 36.5 → 21.4 GiB (`:270-273`), KV 1.40M → 1.76M tokens |
-| `l2_pipeline` MoE prefill | **DIAGNOSTIC-ONLY** — wedged the live serve three times | `afc64ec` | `gb/moe.py:399-403`; excluded from `auto` unless `PRISMAQUANT_CB_L2_AUTOTUNE=1` |
-| §4b persistent-N TC dense prefill | **QUARANTINED** + measured negative (2–5.7× slower) | wired `708d4ff`, verdict `d924d76` | ext builds only under `PRISMAQUANT_ENABLE_PTC=1` (`gb/cuda_ext.py:163-168`, quarantined 2026-07-23 after a boot wedge) |
-| decode contract v2 | measured NULL, opt-in | `d924d76` | — |
-| w2 side-stream overlap; w2 rowpack | **UNMEASURED** — wired but not benched ("not for public sync until benched"); rowpack pending its own served-KL check | `08263af` | — |
-| fp4-CB dense fused prefill: block-scaled decode-in-prologue on the native NVF4 MMA (SASS-gated `OMMA.SF.16864` k=64, zero QMMA — the `f8f6f4` k=32 trap), gmem-direct consumer decode | **OPT-IN, default OFF** (`PRISMAQUANT_CB_FUSED_FP4`) — bit-exact vs the stock NVF4 collective across K12–K24/S13–S16/v1+v2; MEASURED 2026-07-31 (warm, 2.2–2.5 GHz): wins EVERY (rung, M) vs both shipping fp4 paths — 5.2–6.1× vs the transient at M≤128, 1.3–1.5× at M=2048, 2.5–12.4× vs Triton; native ratio 1.65–3.6. Served A/B pending (activation bucket changes) | — | `gb/csrc/cb_fused_fp4_gemm.cu`, `gb/csrc/cutlass_fork/sm120_cb_fused_fp4_mma.hpp`, `gb/linear.py`; record: `docs/lanes/nvfp4-cb/fp4-fused-prefill.md` |
-| fp4-CB MoE grouped fused prefill (tile-indexed, TileM ∈ {128, 256}) | **OPT-IN, default OFF** (`PRISMAQUANT_CB_FUSED_FP4_MOE`) — bit-exact vs per-expert dense fused at both tiles; MEASURED: 5.2–5.6× the shipping loop kernel-side (tile 128), native-ceiling ratio 1.5–2.1; served A/B pending | — | `gb/csrc/cb_fused_fp4_gemm.cu`, `gb/moe.py` |
-
-fp4-CB MoE prefill DEFAULTS to the per-expert loop (`gb/moe.py:404-405`); the grouped
-decode-in-mainloop fp4 kernel above now exists but stays opt-in until the served A/B —
-persistent/grouped large-M remains the roadmap's fat target on the fp8 side too.
+**Runtime defaults and kernel provenance live only in Gridbook.** The old table
+here was removed after it drifted from the runtime it described. Resolve the
+commit in `scripts/lib/gridbook_runtime_pin.json`, then consult that source's
+`docs/PLUGIN.md`, `docs/KERNELS.md`, and dated audits. The cross-project policy
+is only this: a numerics-changing path cannot be promoted by kernel arithmetic
+or speed alone. The latest teacher-backed LFM gate rejected both fused-NVFP4
+defaults, so dense and grouped paths remain explicit opt-ins.
 
 **Per-arch wiring — the no-longer-silent no-load trap** (R10, 2026-07-30). Archs whose vLLM
 loader maps experts at the top level never call the per-layer `FusedMoE.load_weights`, so
-`_install_toplevel_cb_expert_loaders()` wraps them — now by iterating a **data** registry,
-`_CB_TOPLEVEL_MODULE_PATHS` (`gb/plugin.py:91-118`): `hy_v3`, `hy_v3_mtp`, `laguna`, `qwen3_5`,
-`qwen3_5_mtp`, each fed to `_install_on_module_classes` (`:38-63`), which discovers the
-entrypoint classes a module *defines* and is therefore immune to the class renames that made the
-old hardcoded imports fragile. DSv4-class is a commented candidate module path (`:114-117`),
-one uncomment away. Over-installing is harmless (`:44-46`), and a missing module is a no-op.
+Gridbook installs its top-level wrapper from the packaged runtime contract. The authoritative
+module list is deliberately not repeated here. DSv4 remains absent and gated.
+Over-installing is harmless and a missing module is a no-op.
 An unwired arch used to load no stacked-CB expert tensors at all while the FusedMoE served
 uninitialised memory — garbage generation, not a crash (confirmed, `9a79963`: Laguna, 93% of
 params). That is now a hard serve-time failure: `create_weights` stamps `_pq_cb_filled = False`,
@@ -1938,11 +1902,10 @@ both fill paths stamp `True`, and `process_weights_after_loading` raises through
 no env bypass, scoped to the params the local rank registered (EP/PP-absent and zero-expert
 shards skipped). New-arch checklist: §8.3 Tier D; leak record: §8.5 L3 (closed).
 
-**Serving.** Four scripts under `scripts/`, all `vllm-node:latest`, all binding `-p 8000:8000`;
-three carry `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`: `serve_qwen27b_smoke.sh` (util 0.80),
-`serve_laguna_smoke.sh` (0.90, 256k mandate), `serve_hy3_teb.sh` (ToolEvalBench protocol), and
-`serve_hy3_smoke.sh` — the outlier at util 0.95 with **no slack gate, no watchdog, no env
-passthroughs**. The OOM discipline lives in the script code (`serve_laguna_smoke.sh:64-90`):
+**Serving.** Every live CB launcher resolves the same exact external Gridbook pin through
+`scripts/lib/gridbook_runtime.sh`, mounts the exact checkout read-only, re-verifies the tracked
+pin inside the container, and records the resolved runtime in the serve fingerprint. The OOM discipline lives in the launcher
+code (`serve_laguna_smoke.sh:64-90`):
 poll `/v1/models`, sleep 10 s for the allocator to settle, fail the serve and `exit 3` if
 `MemAvailable < MIN_FREE_GIB` (8), then arm a detached watchdog that kills the container below
 `WATCHDOG_GIB` (4). Rationale inline at `serve_hy3_teb.sh:76-84`; see §10.
@@ -2063,7 +2026,7 @@ safe — one killed the box ~1.75 h after going quiet.
 | `/home/rob/dq-runs/venvs/prismaquant-hy3` | Hy3 (`hy_v3`) chain | transformers 5.13; the cu130 venv lacks `hy_v3` |
 | `/home/rob/dq-runs/venvs/prismaquant-vllm-kl-20260521` | vLLM 0.19.2 in-tree GGUF | the working local GGUF-serving venv |
 | `vllm-node:latest` | all four CB serve scripts; the Hy3 GGUF stack | native HYV3; the only serving image the current scripts reference |
-| `~/.cache/prismaquant-cb-ext` (or `PRISMAQUANT_CB_EXT_DIR`) | gridbook JIT build cache | never `/tmp` (`gb/cuda_ext.py:15-17`) |
+| `~/.cache/prismaquant-cb-ext` (or `PRISMAQUANT_CB_EXT_DIR`) | Gridbook JIT build cache | never `/tmp` (external Gridbook `gridbook/cuda_ext.py`) |
 
 `transformers` pins are model-specific and have cost hours: MiniMax requires 4.57.5,
 Qwen3.5/3.6 need ≥5.5 (4.57.5 raises `KeyError` on the model type). Older launchers and
@@ -2076,7 +2039,18 @@ launching, build → measure → delete before the next arm. **Never write to `/
 cleared it in 2026-04 and took the MiniMax artifacts with it. Set `TMPDIR` explicitly for any
 tool reaching for `mkdtemp()`.
 
-**Strix Halo — a second box, and a CB kernel lane that now exists in HIP.** Robert funded kernel
+**Strix Halo / ROCm — CANCELED 2026-07-31; no supported backend.** Access to the only gfx1151
+machine was lost before build ABI, dispatch, fallback, graph, wheel-install, vLLM, or served
+quality gates could be completed. The prototype sources and dispatch hook were deleted from the
+canonical Gridbook tree; PrismaQuant contains no copy. ROCm is therefore unsupported and must
+fail through the ordinary absence of a qualified backend. Reintroduction requires new hardware,
+hard architecture attestation, installed-wheel tests, and the full served promotion ladder.
+
+The remainder of this subsection is a **frozen historical measurement record**, not an active
+implementation description, support claim, or build plan. Paths named below belonged to the
+now-deleted prototype.
+
+**Historical Strix snapshot.** Robert funded kernel
 authoring on 2026-07-30 ("build fp8 vllm kernels that target strix halo and support codebook
 formats"), which **supersedes re-vet R7's serving-only framing** (R7 accepted GGUF-first with
 "no ROCm build stack in scope" and left option B — a HIP port of the CB kernels — unfunded; the
@@ -2085,7 +2059,7 @@ arrived the same day: AMD Ryzen AI MAX+ 395 / Radeon 8060S, **gfx1151**, RDNA 3.
 ROCm 7.1.1, torch 2.9.1 with HIP, **58 GB** unified memory (not 128 — size test shapes
 accordingly), 919 GB free.
 
-`plugins/gridbook/gridbook/csrc_hip/` holds the result: a wave32 decode GEMV (fp8-CB **and**
+The deleted prototype's `csrc_hip/` held the result: a wave32 decode GEMV (fp8-CB **and**
 NVFP4_CB two-tier v2), a bf16 **WMMA** decode-in-prologue prefill GEMM, the transient expander,
 and the fused fp8 activation QDQ, sharing one format header with the CUDA lane. It **compiles,
 runs, and passes parity at a 1-bf16-ULP gate against an fp64 torch reference** across the odd
@@ -2139,7 +2113,8 @@ path is compiled but untested. Quantization stays on the Spark either way — R7
 half is unchanged, since probe/cost/render/export are CUDA and need zero ROCm work. GGUF remains
 the zero-code serving lane (§9.3). Full status, the LDS budget table per rung, the measured
 LDS-vs-global LUT policy and its shape-dependence, seven Fedora/ROCm bring-up landmines and the
-deferred-work list: `plugins/gridbook/gridbook/csrc_hip/README.md`.
+deferred-work list was kept in the deleted prototype's `csrc_hip/README.md`; the dated audit is
+the surviving record.
 
 ## 11. History — what was tried and rejected
 
@@ -2185,7 +2160,7 @@ walls live under `docs/archive/`; code walls under repo-root `archive/`.
 | MXFP4-grid codebooks | Shares NVFP4's element grid exactly and differs only in the scale plane — but E8M0's pow2-only scale costs **~25× at the 4-bit grid what it costs at 8-bit**, and the 8-bit figure (+13.8%) is what de-menued MXFP8. The cross-platform premise is also false as stated: gfx1151 has no fp4 matrix path at all, so an MXFP4 grid buys nothing on the only non-Blackwell box we own. Revisit only with hardware that runs MXFP4 natively (RDNA4/CDNA4/Intel). | `docs/design/mxfp4_cb_feasibility.md` |
 | MXFP6-grid codebooks | **In a codebook the grid is not a storage dial.** The stored stream is the k-bit index stream, so an MXFP6-grid rung stores byte-for-byte what FP8-CB stores at the same k; both MXFP6 grids are *exact subsets* of e4m3 (63/63 values round-trip, verified), so the codebook is an FP8-CB codebook handicapped to a subset, decoding to the same e4m3 tile and the same GEMM. Strict dominance, not a tradeoff — no measurement warranted. Would change only on a part with a genuine 6-bit matrix rate (CDNA4/MI355X runs MXFP6 at 2× fp8). | `docs/design/mxfp6_cb_feasibility.md` |
 | CB persistent-N dense prefill; decode contract v2; w2 `rowpack`; chunked expand/GEMM overlap | Parity-green, 0.74–5.7× slower. Quarantined behind flags, kept as measured negatives. | `docs/lanes/nvfp4-cb/STANDARDS.md` |
-| CB `l2_pipeline` MoE prefill | Wedged live serving three times; DIAGNOSTIC-ONLY, excluded from `auto` (`gb/moe.py:399-403,1360-1372`, `afc64ec`). | same |
+| CB `l2_pipeline` MoE prefill | Wedged live serving three times; DIAGNOSTIC-ONLY, excluded from `auto` in external Gridbook (`gridbook/moe.py`; evidence commit `afc64ec`). | same |
 
 Derivations and the additivity/cancellation analysis behind the CLADO/QUBO rejections belong to
 `paper/main.tex` §`sec:additivity`; the retired PrismaSCOUT paper (cascade spine, monotone
@@ -2195,8 +2170,8 @@ polish, full rejected-methods catalog) is at
 
 ## 12. Known gaps and debt register
 
-Honest register, code-cited, as of 2026-07-30 (`claude/docs-consolidation`, HEAD `8f14400` =
-the merge of `origin/main`'s 54-commit allocator/release stack into the NVFP4-CB lane).
+Honest register, code-cited, as of 2026-08-01 (`fix/remove-vendored-gridbook`, implementation
+commit `3d6d54c`; external Gridbook pin `59cebf9f2c7fd43fcaa33c101eca31cbfd59fd99`, v0.4.1).
 Severity is operational risk, not effort. Plugin-contract leaks are stated in §8.5 and only
 referenced here. Entries closed on 2026-07-30 are kept, marked, for one cycle so a reader
 returning with a stale copy sees the resolution rather than silence.
@@ -2205,8 +2180,8 @@ returning with a stale copy sees the resolution rather than silence.
 D13, **D14**, **D15**, D16, D19, D20, D21, D27 — and D1 is implemented but shipped default-off,
 so its *default* remains a decision for Robert rather than debt.
 Still open, unchanged by the waves: **D11** (no profile-validator preflight for the actual
-`MODEL_PATH`), **D17** (registry vs export-scheme metadata unreconciled), **D18** (dead flag
-entries not yet deleted; ~25 gridbook serving flags now partly documented), **D23** (no
+`MODEL_PATH`), **D17** (registry vs export-scheme metadata unreconciled), **D18** (two dead
+PrismaQuant flag tokens not yet deleted), **D23** (no
 accounting-era stamp), **D24** (KV-cotangent path never run on a real KV-sharing checkpoint),
 **D25** (Gemma4 tied-embeddings result is enablement, not quality), **D28** (fast-kernel guard
 has no caller) — and **D26**, whose measurement half closed (a GGUF KL evaluator exists) while
@@ -2217,7 +2192,7 @@ unplumbed).
 |---|---|---|---|---|
 | D1 | **FIXED 2026-07-30 (R9).** Tail-veto was unimplemented since 2026-06-05 — and it had stalled on an assumed cost (a second eval pass) that does not exist. **Mechanism:** every KL site already accumulated per-sequence values and discarded them at the return; both selection paths now return `(mean, per_seq, stats)`, so `kl_p95/kl_p99/kl_max` and the rung-2 `nll_mean/nll_p99` (one `gather` + `logsumexp` on logits already in hand) cost **zero extra forwards**. `_frontier_from_rows` gained a second admission condition — `row[tail] <= incumbent[tail] * (1 + tail_eta)` — behind `--tail-veto {none,kl_p99,kl_max,nll_p99}` / `--tail-eta`, with vetoed rows retained under `vetoed_rows` + `veto_reason` so a refusal is visible. **DEFAULT-ON since 2026-07-30** with `kl_max` (the worst sequence) as the contract statistic — Robert's ruling; `--tail-veto none` still reproduces the pre-R9 envelope byte-for-byte (pinned by a frontier-identity regression test). The slack is **derived, not chosen**: `--tail-eta auto` (default) is the incumbent's between-repeat relative stderr of the tail statistic, degrading to a strict 0 **with a printed warning** on a single repeat. A pre-R9 validation JSON (no tail column on any row) makes the veto go inert with a warning rather than empty the frontier. §4.6, §7.1. | `select_validated_frontier.py` `_frontier_from_rows`, `measured_rows`, `tail_eta_auto`, `tail_veto_inert_reason`, `TAIL_VETO_COLUMNS`/`TAIL_REPEAT_COLUMNS`; `validate_assignments_kl._kl_repeat_summary` (per-repeat tails); `kl_measurement.sequence_token_nll` / `summarize_per_sequence_kl`; `tests/test_select_validated_frontier.py`, `tests/test_kl_per_sequence_tail.py` | — | CLOSED — default-on, `kl_max`, repeat-derived eta (ruled 2026-07-30). |
 | D2 | **FIXED 2026-07-30 (R12).** MTP construction bypassed the profile — §8.5 L2. All three import sites now call `profile.build_mtp_module()` / `read_mtp_source_state_dict()` / `load_mtp_state_dict()`, keyed on the new `mtp_source_prefix()` accessor; `prismaquant/mtp_module.py` is deleted and DSv4 declares `has_mtp → False` + `"mtp."` passthrough. | §8.5 L2 | ~~HIGH~~ CLOSED | — |
-| D3 | **FIXED 2026-07-30 (R10)** — was: gridbook per-arch CB expert opt-in as a hand-maintained code list, a missing line failing silently as coherent garbage generation. Now a module-path tuple (`plugin.py:91-118`) plus an unbypassable serve-time fill assertion (`cb_fill_guard.py`, raised from `process_weights_after_loading`). §8.5 L3 has the mechanism. | §8.5 L3 | ~~HIGH~~ closed | — |
+| D3 | **CLOSED 2026-08-01 (R10 ownership follow-through)** — was: Gridbook per-arch CB expert opt-in as a hand-maintained list inside PrismaQuant, with a missing line failing silently as coherent garbage generation. Gridbook now solely owns its loader registry and unbypassable fill guard; PrismaQuant carries no runtime copy and required CI checks its one exact pin, PEP 610 provenance, producer-profile set, and emitted artifacts against Gridbook's packaged contract. | §8.5 L3; `scripts/lib/gridbook_runtime_pin.json`; `tests/test_gridbook_runtime_contract.py` | ~~HIGH~~ closed | — |
 | ~~D4~~ | **CLOSED 2026-07-30 (re-vet R11).** `TARGET_PROFILE` has no shell default; `--target-profile` reaches the allocator only when requested, with `--target-profile-default vllm_packed_moe` as the fallback; the allocator stamps its resolved profile into `layer_config.json`'s reserved `__prismaquant__` block and the exporter reads it (env override kept). Non-regression 0/614 and 0/500 on the shipped 27B/35B. See §8.5 L1. | §8.5 L1 | ~~HIGH~~ | closed |
 | D5 | **RESOLVED 2026-07-30.** `PRISMAQUANT_GPTQ_DAMP_SWEEP` had two readers with opposite defaults — `"0"` in the exporter, `"1"` in a forked lever-defaulting copy inside the KL sensitivity probe (stale from `9c91d62`, missed by the sweep-OFF policy in `f2363e2`), so any A/B touching both compared different renders. `_normalized_production_cache_levers` now delegates to `production_weight_cache._resolve_production_render_levers` — one contract, and the probe's stamped provenance can no longer disagree with the render that produced it. | `archive/l3_propagated_2026-07-30/prismaquant/kl_sensitivity_probe.py:272-285`; `tests/test_production_weight_cache.py` | — | Done, and fully closed later the same day: R4 walled the probe itself, so the forked reader no longer exists in the live tree. The follow-up landed too — the delegation contract is pinned by `tests/test_production_weight_cache.py`, which carries it as a local shim and keeps every assertion (sweep OFF by default; sweep-off renders must record their fixed damp). |
 | ~~D6~~ | **CLOSED 2026-07-30 (re-vet R5).** Closed by *mechanism*, not enumeration: `pipeline.STAGE_SETTINGS_KEYS` declares each artifact's key set, `run-pipeline.sh` supplies values once, and the guard now covers every skip-if-exists artifact (16 call sites / 15 artifacts). `cost.pkl` additionally carries a `provenance["cost_mode"]` stamp so a mode change cannot silently reuse the other estimator's table (R2 precondition (i)). See §3.4. | §3.4; `pipeline.py` `STAGE_SETTINGS_KEYS` | ~~HIGH~~ | closed |
@@ -2228,11 +2203,11 @@ unplumbed).
 | D11 | **MOSTLY FIXED 2026-07-30.** `model_profiles/validate.py`'s 8 conformance checks had zero callers and there were no workflow files in the tree. Both halves closed: `.github/workflows/ci.yml` (#18, `1cc7b90`) runs the suite on every push and PR (py3.11/3.12, CPU torch), and `tests/test_model_profile_conformance.py` drives the CPU-safe checks (1, 6, 8 + four structural invariants) over every registered profile, with 2/3/4 behind `integration` and 6/7 behind `slow`, and known gaps encoded as ratchets rather than bare xfails. **Residual (2026-07-30, R12): the check-5 half is now covered** — `test_has_mtp_implies_a_buildable_mtp_module` asserts `build_mtp_module` is a real override (and `mtp_source_prefix()` non-empty) whenever `has_mtp()`, which is the declarative part of the check that would catch L2/D2; check 5 proper still materialises a decoder layer and stays out of CI. Remaining: nothing invokes the validator as a `run-pipeline.sh` preflight for the actual `MODEL_PATH`. | `.github/workflows/ci.yml`; `tests/test_model_profile_conformance.py:9-31,223-249` | LOW (was MED) | Add a preflight invocation for `MODEL_PATH`. |
 | ~~D12~~ | **CLOSED 2026-07-30 (re-vet R1).** `TARGET_DISK_GB` is plumbed through `run-pipeline.sh`: it overrides `TARGET_BITS`, narrows the Pareto sweep to the byte-feasible bracket, flips `SELECTION_MODE` to `validated-surrogate` and the frontier pick to `budget` = min measured KL among the rows that fit. Kneedle stays the default without a card and stays a diagnostic. See §4.6. | §4.6; `select_validated_frontier --mode budget` | ~~MED~~ | closed |
 | D13 | **FIXED 2026-07-30 (R22 + R27).** The two hardcoded MiniMax arch tests now route through `profile.bypass_hf_fp8_module_rewrite()` and `profile.packed_expert_module_class_names()`; `specs/minimax_m2.json` exists and declares all eight of that profile's overrides; `deepseek_v4.json` declares `default_serving_profile: vllm_packed_moe`. Core-stack arch literals in control flow: **0**. Residual (not debt, sequencing): the MiniMax Python overrides stay until the equivalence gate `tests/test_minimax_m2_spec.py` has held for a release. | §8.4, §8.5 L4 | closed | — |
-| ~~D14~~ | **CLOSED 2026-07-30.** The rewrite landed: `plugins/gridbook/README.md` now documents the delegation dispatch table (per-target CB vs stock-CT, `plugin.py`), carries a **MoE serving** section that opens with "supported and the main use — 3 of the 4 proven artifacts are MoE" including the top-level-loader trap, points at `docs/lanes/nvfp4-cb/STANDARDS.md` as authoritative rather than restating status, and states the version story (PyPI 0.1.1 from the standalone release repo; in-tree is `0.2.0.dev0`, the development head). No `NotImplementedError`/uniform-CB-only/`--enforce-eager`-required claim survives. | `plugins/gridbook/README.md` | ~~MED~~ | closed |
+| ~~D14~~ | **CLOSED 2026-08-01.** Runtime documentation now lives with the sole canonical Gridbook package. PrismaQuant documents only its producer/export contract and points to the pinned package's machine-readable runtime contract; the former in-tree README was deleted with the vendored runtime. | external Gridbook `README.md`; `scripts/lib/gridbook_runtime_pin.json` | ~~MED~~ | closed |
 | ~~D15~~ | **CLOSED 2026-07-30 (wave 4, R28/R3).** The approved option was taken — **flip the defaults to the shipped values**, not defend the conservative one: `CB_SCALE_CODING=two_tier` (layout-v2 shipped in the Hy3 295B and Laguna-S-2.1 artifacts, and `STANDARDS.md` calls it the production fp4 scale coding with v1 legacy read-compat only — the old "serve gates pending, do NOT ship" comment predated its own ship; the knob is inert on fp8-CB-only menus, which is why two 27B/35B drivers set `v1` without contradicting it) and `CB_EXPERT_EMPIRICAL=0` (every shipped MoE CB driver sets it). Both are pinned by `tests/test_architecture_doc.py::test_cb_defaults_match_the_shipped_drivers`, which asserts the shell default against the drivers themselves so the two cannot drift apart again. No shipped run changes: every driver sets both explicitly. | `run-pipeline.sh`; `tests/test_architecture_doc.py` | ~~MED~~ | closed |
 | D16 | **RESOLVED 2026-07-30 (R25) — as *unreachable*, not unmeasured, and the A/B was never needed.** The register asked for a gold-lane A/B on a 27B-class artifact; reading the emit-loop dispatch order answered it for free: the production-cache pack fires first and `continue`s, so with `PRODUCTION_CACHE=1` (the shipping default) **no dense NVFP4 Linear ever reached the branch** — confirmed by `grep -c "block-output-match"` → 0 on two real production export logs. Two further findings made keeping it indefensible: had it run, `_finalize_compute_only` would have re-derived per-group scales **outside** `_export_match_render_scale_rule`, discarding the render's `joint_mse` scales (the −6.6% KL defect M19 fixed everywhere else); and its `{0.95, 1.0, 1.05}` per-tensor gain re-search is subsumed by JSO, wrapped in `except Exception → WARN` so failure was invisible. Walled with `_finalize_compute_only` and the three export branches; `main()` now hard-`SystemExit`s if the flag is set truthy (§3.5). **Lesson: before funding a measurement, check the code under test executes on the recipe you ship.** | `archive/block_output_match_2026-07-30/README.md`; `export_native_compressed.py::_refuse_archived_block_output_match` | ~~MED~~ closed | — |
 | D17 | **Registry and export metadata are unreconciled sources of truth** for bits/group per format — `FormatSpec` vs the `*_SCHEME` constants, with no test comparing them (§6.4, last row). | `format_registry.py:44-168`; `export_native_compressed.py:7247-7336` | MED | Add a parametrized test asserting scheme ↔ spec agreement per production format. |
-| D18 | **PARTIALLY FIXED 2026-07-30.** `PRISMAQUANT_L2_CUDA_GRAPHS` and `PRISMAQUANT_DO_NO_HARM_MIN_GAIN` are no longer *documented as live* — `runtime_flags.md:285-286` now labels both **DEAD** with the evidence (sole occurrence a comment at `perturbed_x_cache.py:1225`; no occurrence at all, respectively) and points at the live analogue `PRISMAQUANT_RENDER_GATE_MIN_GAIN`. The entries themselves are still present rather than deleted, and the ~25 undocumented gridbook serving flags are still undocumented. | `docs/design/runtime_flags.md:285-286` | LOW | Delete the dead entries once no reader is chasing them; add the gridbook serving flags. |
+| D18 | **PARTIALLY FIXED 2026-08-01.** The Gridbook-documentation half is closed: Gridbook owns and publishes its runtime flags, and PrismaQuant no longer mirrors that external catalog. The only remaining debt is producer-local cleanup: the dead `PRISMAQUANT_L2_CUDA_GRAPHS` and `PRISMAQUANT_DO_NO_HARM_MIN_GAIN` tokens remain in the historical/dead section even though the former's sole code occurrence is a comment at `perturbed_x_cache.py:1225` and the latter has no code occurrence. The live producer analogue remains `PRISMAQUANT_RENDER_GATE_MIN_GAIN`. | `docs/design/runtime_flags.md`; external pinned Gridbook runtime contract | LOW | Delete the two dead PrismaQuant entries once no reader is chasing them. |
 | D19 | **FIXED 2026-07-30.** The count was low: **14** launchers under `examples/launchers/`, not 8, invoke `python -m prismaquant.<module>` for a module that no longer exists (`iterate_block_clado`, `measure_block_clado`, `block_clado`, `validate_block_clado`, `measure_output_fisher`, `dense_cone`, `polish_from_assignment`, `coord_descent_polish`, `measure_adjoint_l3`, `adjoint_l3_frontier`). Walled at `archive/launchers_2026-07-30/` with a banner README enumerating each file and its dead invocation, per the dated-wall convention of §11. | `archive/launchers_2026-07-30/README.md`; `examples/launchers/README.md` | — | Done. |
 | D20 | **RESOLVED 2026-07-30.** Two archive walls had no banner README (`archive/prismaclip_2026-05-14/`, `archive/reap_2026-05-15/`) — the latter walls off live-adjacent code (`expert_prune.py`, `allocator_prune.py`, `observers/`, 5 tests) and encodes a policy the code still enforces. Two more walls violated the dated-directory convention. Banners written; `archive/entmoot/` → `archive/entmoot_2026-05-03/` (date from `193f313`) and `archive/minimax_m2p7/` → `archive/minimax_m2p7_2026-04-24/` (date from its own banner). Neither renamed wall is cited by a `run-pipeline.sh` `exit 2` message. | `ls archive/*/README.md` | — | Done. Follow-up: a test asserting every `archive/*/` carries a `README.md`. |
 | D21 | **RESOLVED 2026-07-30 (R28).** Three ids appeared across the docs for one Hy3 artifact; the premise "at most one is live" was wrong — they are *renames*, not rivals, so the older ids **307-redirect** rather than 404. Canonical id (verified against the Hub 2026-07-30): **`rdtand/Hy3-295B-A21B-prismaquant-gridbook-2.9bit-vllm`** — the one to cite in all new material. The two `prod_hy3_results.md` citations are the dated ship ledger and were **annotated in place** ("now redirects to …"), not rewritten: a ledger records what was posted on the day. §9.2's unresolved paragraph now carries the resolution. | `docs/lanes/nvfp4-cb/prod_hy3_results.md:248-251,313-320`; §9.2 | ~~LOW~~ closed | Done. Follow-up: `scratch/gridbook-launch-post.md:24,179` still carries a third variant (`…-prismaquant-codebook-2.9bit-vllm`) — `scratch/` is out of the doc contract's scope, so it is left as-is; do not cite from it. |
@@ -2245,13 +2220,14 @@ New with the 2026-07-30 merge:
 | D24 | **The KV-cotangent path has never touched a real KV-sharing checkpoint.** Its correctness is established by exact fp64 equivalence on a synthetic model (rel err 0.00e+00 vs one end-to-end autograd backward; the pre-fix protocol under-counts `k_proj` 85.1% / `v_proj` 38.5%) — a demonstration, not a measurement. No `num_kv_shared_layers > 0` model has been probed, so the magnitude of the correction on a shipping architecture is unknown, and the guard it replaced (`PRISMAQUANT_ALLOW_KV_SHARED_FISHER`) was the only thing previously stopping such a probe. | §7.5; `tests/test_kv_cotangent_path.py`; commit `b6ec9cb` | MED | Probe one real KV-sharing checkpoint (Gemma4-class) with the path on and off, and record the h_trace delta before any allocation claim rides on it. |
 | D25 | **Gemma4-31B tied-embeddings result is enablement, not quality.** The first end-to-end probe → cost → allocate → export on a tied model (244 NVFP4 / 119 FP8 / 27 BF16 at achieved 6.000 bpp, 27.18 GB, `tie_word_embeddings` preserved and no duplicated `lm_head` bytes) ran at **2 samples × seqlen 512** to reach failures fast. The artifact has not been served and no KL/PPL exists for it. Nothing in §1.2 should cite it. | §7.5; commit `d058267` | MED | Re-run at production calibration and take it through the §7 gates before the family table gains a row. |
 | D26 | **MEASUREMENT HALF CLOSED 2026-07-30 (wave 4, R16); the plumbing half is open.** The lane now has a KL evaluator: `prismaquant/gguf_kl_evaluator.py:measure_assignment_kl` wraps `llama-perplexity --kl-divergence-base` behind the `validate_assignments_kl` interface and returns `(mean, per_sequence, stats)` under the gold lane's key names — with the honest caveat that `per_sequence` is empty and `kl_tail_domain="aggregate"` (llama.cpp reports token-domain quantiles). Parsing is pinned against canned output in both shipped spellings; the live path is integration and unrun. **Still open:** `run-pipeline.sh`'s frontier loop is not wired to it (GGUF selection is still `surrogate`), and there is still no `PACKED_ROLE_SPLIT` plumbing, so every use of the split is a manual `allocator.py` invocation. | `prismaquant/gguf_kl_evaluator.py`; `prismaquant/lane_specs/gguf.json`; `grep -c PACKED_ROLE_SPLIT prismaquant/run-pipeline.sh` → 0 | LOW | Wire the frontier loop to the adapter, and plumb `PACKED_ROLE_SPLIT`. |
-| D27 | **RESOLVED 2026-07-30 (R10).** The skew was real but benign: releases are cut from the standalone `/home/rob/gridbook` repo (PyPI 0.1.1), never from this tree, and the in-tree copy is *ahead* of the release in kernel work while its label was *behind*. Fixed by labelling it as what it is — `__version__ = "0.2.0.dev0"` (`plugins/gridbook/gridbook/__init__.py:16`, still `pyproject.toml:73`'s single source of truth), a dev suffix reading "unreleased, post-0.1.1"; `plugins/gridbook/README.md` now states the release source and that the in-tree copy is the development head. | `plugins/gridbook/gridbook/__init__.py:16`; `plugins/gridbook/README.md` | ~~LOW~~ closed | — |
+| D27 | **CLOSED 2026-08-01.** The version skew was not benign enough to preserve: the entire vendored Gridbook package, mirror script, and sync test were deleted. Gridbook now has one source tree and one version. PrismaQuant consumes one full-commit pin, verifies installed PEP 610 provenance and package version in CI, and fingerprints the resolved runtime for every serve. | `scripts/lib/gridbook_runtime_pin.json`; `scripts/lib/gridbook_runtime.sh`; `tests/test_gridbook_runtime_boundary.py`; `tests/test_gridbook_runtime_contract.py` | ~~LOW~~ closed | — |
 | D28 | **Serve-time fast-kernel enforcement has no caller.** `require_fast_kernels(model)` — which reads the model profile's kernel requirements and hard-fails at startup when a required fast kernel (`causal-conv1d`, `flash-linear-attention`, …) is not importable — lost its only caller when `polish_from_assignment` was archived on **2026-05-15**, and was itself walled 2026-07-30 (R19) as an orphan. It is the only mechanized piece of **core principle 9's** "routed to a *performant* kernel (not a slow fallback)" gate, so that gate is **manual today**: nothing in the build or serve path refuses a checkpoint whose arch would silently fall back to the slow PyTorch implementation. The mechanism is written and tested — only the call site is missing. | `archive/orphans_2026-07-30/prismaquant/_fast_kernel_guard.py` + `tests/test_fast_kernel_guard.py`; sole historical caller `archive/polish_2026-05-15/prismaquant/polish_from_assignment.py:202` | LOW | Move the guard back and call it from `validate_native_export` / the serve launcher, keyed on the resolved profile — or, if serve-time enforcement belongs to the lane scripts, say so in §7 and delete the row. |
 
 **Open items carried from session handovers.** Of the 41 items the handover census could not
 map to a verified closure, five were re-verified as still-open and are folded in above:
 tail-veto (D1), `TARGET_DISK_GB` (D12), the DSv4 CB lane (D3), the fp4-CB fast expander
-refusing `is_fp4` so NVFP4-CB stays on the Triton decode path (`gb/expand.py:28-31`), and the
+refusing `is_fp4` so NVFP4-CB stays on the Triton decode path (external Gridbook
+`gridbook/expand.py`), and the
 shipped Mistral-Medium-3.5-128B artifact with no profile or spec (§8.4). Two are standing
 research questions rather than debt: deriving the GPTQ damp constant from the weights, and the
 XLAYER Q4 LFM2.5 routing-channel measurement. The remaining ~34 — mostly PrismaSCOUT-era items

@@ -6,7 +6,7 @@
 > `TWO_TIER_SUB_TABLE`, `TWO_TIER_SUPER_BIAS`, `_two_tier_tables`). Export:
 > `prismaquant/export_nvfp4_cb.py:670-676,755` (`layout_version: 2`, scheme
 > carries `scale_coding.kind = "two_tier"` + the table). Serving: composition
-> table `plugins/gridbook/gridbook/codec.py:46-56`, in-kernel compose in the
+> table in [Gridbook's `codec.py`](https://github.com/RobTand/gridbook/blob/master/gridbook/codec.py), in-kernel compose in the
 > fp4-v2 dense/grouped GEMVs and `expand_fp4_v2_to_weight`. Shipped in the Hy3
 > 295B and Laguna-S-2.1 artifacts (`CB_SCALE_CODING=two_tier`,
 > `scripts/run_hy3_prod_nvfp4cb.sh:53`, `scripts/run_hy3_prod_joint.sh:56`,

@@ -1,6 +1,11 @@
 # Strix Halo: which native formats, which CB formats
 
-**Status: plan, proposed 2026-07-30.** Implements nothing. Every hardware claim
+> **CANCELED / historical plan.** Access to the sole gfx1151 machine was lost
+> on 2026-07-31. No Strix runtime support is being built or shipped, and the
+> unqualified Gridbook HIP prototype was removed. The measurements below are
+> retained as a dated research record, not an active plan or support promise.
+
+**Original status: plan, proposed 2026-07-30; canceled 2026-07-31.** Implements nothing. Every hardware claim
 below was measured on the actual gfx1151 box this session (compile-probe or
 on-device run); anything unmeasured is labelled. Commissioned by Robert: *"come
 up with a plan about what native formats to support on Strix Halo and what CB

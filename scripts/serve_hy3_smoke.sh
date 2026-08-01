@@ -15,6 +15,9 @@ set -u
 # R15 serve fingerprint (docs/ARCHITECTURE.md §7.4): write_serve_manifest.
 PQ_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [ -f "$PQ_SCRIPT_DIR/lib/serve_manifest.sh" ] && . "$PQ_SCRIPT_DIR/lib/serve_manifest.sh"
+PQ_REPO_ROOT="$(cd "$PQ_SCRIPT_DIR/.." && pwd)"
+. "$PQ_SCRIPT_DIR/lib/gridbook_runtime.sh"
+gridbook_runtime_prepare || exit $?
 NAME=pq_hy3_cb
 MODEL=/dqruns/prod-hy3-nvfp4cb-2p9/exported_nvfp4_cb
 MAXLEN="${MAXLEN:-8192}"
@@ -24,15 +27,18 @@ LOG=/home/rob/dq-runs/prod-hy3-nvfp4cb-2p9/logs/serve_smoke.log
 docker rm -f "$NAME" >/dev/null 2>&1
 echo "[serve] launching $NAME (max-model-len $MAXLEN, util $UTIL) $(date '+%H:%M:%S')"
 docker run -d --rm --gpus all -p 8000:8000 --name "$NAME" \
-  -v /home/rob/prismaquant:/repo \
+  -v "$PQ_REPO_ROOT":/repo:ro \
   -v /home/rob/dq-runs:/dqruns \
   -v /home/rob/.cache/huggingface:/hf \
+  "${GRIDBOOK_RUNTIME_DOCKER_ARGS[@]}" \
   -e VLLM_LOGGING_LEVEL=INFO \
-  --entrypoint bash vllm-node:latest -c "
-    pip install -e /repo/plugins/gridbook --no-deps -q 2>/dev/null
-    exec vllm serve $MODEL --host 0.0.0.0 --port 8000 --enforce-eager \
-      --max-model-len $MAXLEN --served-model-name m \
-      --gpu-memory-utilization $UTIL" > "$LOG" 2>&1
+  -e PQ_MODEL="$MODEL" -e PQ_MAXLEN="$MAXLEN" -e PQ_UTIL="$UTIL" \
+  --entrypoint bash vllm-node:latest -c '
+    set -euo pipefail
+    bash /repo/scripts/lib/gridbook_runtime.sh install-container
+    exec vllm serve "$PQ_MODEL" --host 0.0.0.0 --port 8000 --enforce-eager \
+      --max-model-len "$PQ_MAXLEN" --served-model-name m \
+      --gpu-memory-utilization "$PQ_UTIL"' > "$LOG" 2>&1
 
 # Long load window: 110 GB weight read + plugin JIT build + KV profile.
 for i in $(seq 1 240); do   # up to 20 min

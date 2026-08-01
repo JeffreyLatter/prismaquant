@@ -17,7 +17,7 @@ declarative contract layer, not the executor.
 | Allocate | `allocator` |
 | Cache | `build_production_cache`, `production_recache` |
 | Select | `validate_assignments_kl`, `select_validated_frontier` |
-| Export | `export_native_compressed` (compressed-tensors), `export_gguf` / `export_gguf_direct` (GGUF), `export_nvfp4_cb` / `export_nvfp4_cb_streaming` (codebook, served by `plugins/gridbook`) |
+| Export | `export_native_compressed` (compressed-tensors), `export_gguf` / `export_gguf_direct` (GGUF), `export_nvfp4_cb` / `export_nvfp4_cb_streaming` (codebook, served by the separately released [Gridbook](https://github.com/RobTand/gridbook) package) |
 | Validate | `validation_harness`, `validate_native_export`, `validate_quantized_model` |
 
 ## Library modules with no CLI (imported by the stages above)

@@ -35,7 +35,7 @@ better. Nothing is left to measure: this is a subset relation, not a tradeoff.
   ([Colfax sub-byte GEMM tutorial](https://research.colfax-intl.com/cutlass-tutorial-sub-byte-gemm-on-nvidia-blackwell-gpus/)).
   Our own in-tree CUTLASS fork carries the same fact as code:
   `float_e2m3_unpacksmem_t` / `float_e3m2_unpacksmem_t` in
-  `plugins/gridbook/gridbook/csrc/cutlass_fork/sm120_cb_mma_tma.hpp:195-207`, and
+  external Gridbook `gridbook/csrc/cutlass_fork/sm120_cb_mma_tma.hpp`, and
   the fused mainloop's `IsF8F6F4` static-assert (`sm120_cb_fused_mma.hpp:214-216`).
 - B200 datasheets group FP8/FP6 at one PFLOPS number. One microbench claims FP6 >
   FP8 on B200 (`tcgen05.mma` m64n8k16, 2567 vs 1925 TFLOPS,
@@ -58,7 +58,7 @@ better. Nothing is left to measure: this is a subset relation, not a tradeoff.
 ## Q2 — What would an MXFP6-CB rung compute on in gridbook?
 
 The grid sets the GEMM dtype through decode/expand, and every fp8-ladder path is
-e4m3 end to end (`plugins/gridbook/gridbook/linear.py:355-460`): decode-regime
+e4m3 end to end (external Gridbook `gridbook/linear.py`): decode-regime
 CUDA GEMV gathers the **E4M3-byte** codebook (`csrc/cb_gemv.cu:266-296`); prefill
 expands to a `[N,K]` `float8_e4m3fn` transient and calls stock `cutlass_scaled_mm`
 W8A8 (`expand.py:312-352`, "an expanded FP8_CB weight IS a plain fp8 checkpoint");

@@ -25,6 +25,7 @@ from tools.serve_fingerprint import (
     collect_manifest,
     elide_argv_paths,
     fingerprint,
+    gridbook_runtime_pin,
     manifest_differences,
     resident_extensions,
     self_manifest,
@@ -82,6 +83,9 @@ def test_argv_paths_are_elided_so_an_ab_shares_a_fingerprint():
     ("package_versions", {"vllm": "0.22.0", "torch": "2.11.0"}),
     ("launch_flags", ["vllm", "serve", "<path>"]),
     ("gpu_name", "NVIDIA H100"),
+    ("gridbook_runtime_pin", {
+        "commit": "f" * 40, "version": "0.4.1",
+    }),
 ])
 def test_stack_changes_move_the_fingerprint(key, value):
     changed = dict(BASE_MANIFEST, **{key: value})
@@ -99,6 +103,18 @@ def test_extension_pattern_matches_the_tracked_sos():
     ):
         assert EXTENSION_PATTERN.search(path), path
     assert not EXTENSION_PATTERN.search("/usr/lib/libcudart.so.13")
+
+
+def test_external_gridbook_pin_is_recorded_in_the_stack(monkeypatch):
+    monkeypatch.setenv("PQ_GRIDBOOK_RUNTIME_COMMIT", "a" * 40)
+    monkeypatch.setenv("PQ_GRIDBOOK_RUNTIME_VERSION", "0.4.1")
+    assert gridbook_runtime_pin() == {
+        "commit": "a" * 40,
+        "version": "0.4.1",
+    }
+    manifest = collect_manifest(
+        pids=[__import__("os").getpid()], launch_argv=["vllm", "serve", "/m"])
+    assert manifest["gridbook_runtime_pin"] == gridbook_runtime_pin()
 
 
 def test_self_manifest_reads_this_process(tmp_path):

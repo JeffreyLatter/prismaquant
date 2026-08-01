@@ -5,12 +5,12 @@ architecture is wired for that lane. Nothing stops `EXPORT_CONTAINER=nvfp4_cb`
 on an arch whose gridbook CB expert loader is a TODO: the run completes, the
 artifact serves, and the FusedMoE reads uninitialised memory — coherent-looking
 garbage, not a crash (commit `9a79963`, Laguna, 93% of parameters). The honest
-CB-eligible set is four architectures and until now nothing in the tree said
+CB-eligible set is five producer profiles and until now nothing in the tree said
 so.
 
-This file pins the reader half: the spec fields, the profile accessors, and the
-preflight helper. The `run-pipeline.sh` wiring is a later wave — the helper is
-written and tested first so the wiring is a one-line call, not a redesign.
+This file pins the spec fields, profile accessors, and the preflight helper now
+wired by `run-pipeline.sh`. Cross-repository CI separately compares the exact
+producer set with Gridbook's packaged contract.
 """
 from __future__ import annotations
 
@@ -28,18 +28,10 @@ from prismaquant.model_profiles.structure import (
 )
 from prismaquant.serving_profiles import require_lane_supported
 
-# The architectures with a gridbook CB loader
-# (`plugins/gridbook/gridbook/plugin.py`), and nothing else.
-#
-# `qwen3` (dense Qwen3ForCausalLM) added 2026-07-30 for the format_choice_4p5
-# Stage 1 endpoint screen. It needs NO per-arch wiring: `_CB_TOPLEVEL_MODULE_PATHS`
-# exists only for top-level *packed MoE expert* loaders (hy_v3, laguna,
-# qwen3_5), and a dense model's CB Linears dispatch through `config.py`'s
-# name-based `_scheme_for_prefix` + vLLM's own `packed_modules_mapping` — the
-# same situation as `qwen3_5_dense`, which is already declared. Qwen3-0.6B has
-# also been served through the CB lane before, uniform, 196 CB Linears
-# (docs/lanes/nvfp4-cb/serve_prototype_0p6b.md).
-CB_WIRED = {"qwen3", "qwen3_5", "qwen3_5_dense", "hy_v3", "laguna"}
+# Gridbook support is intentionally not duplicated here. The separately pinned
+# runtime publishes its supported producer IDs in runtime_contract.json, and
+# tests/test_gridbook_runtime_contract.py compares declarations to that one
+# machine-readable table in the dedicated integration job.
 GGUF_WIRED = {"hy_v3"}
 
 PROFILE_CLASSES = list(_registry._REGISTERED)
@@ -77,16 +69,12 @@ def test_preferred_lane_must_be_supported():
 
 
 @pytest.mark.parametrize("cls", PROFILE_CLASSES, ids=PROFILE_IDS)
-def test_declared_lanes_match_the_wired_reality(cls):
-    """The declared set must equal the wiring that exists, not the wiring we
-    would like to exist. Over-declaring is the failure this exists to stop."""
+def test_declared_lanes_include_native_and_match_local_gguf_wiring(cls):
+    """Locally owned lanes are checked here; Gridbook is checked externally."""
     profile = _profile(cls)
     lanes = set(profile.supported_export_lanes())
     assert DEFAULT_EXPORT_LANE in lanes, (
         f"{profile.name}: every architecture ships through the native lane")
-    assert ("nvfp4_cb" in lanes) == (profile.name in CB_WIRED), (
-        f"{profile.name}: nvfp4_cb declaration disagrees with the gridbook "
-        f"loader list {sorted(CB_WIRED)}")
     assert ("gguf" in lanes) == (profile.name in GGUF_WIRED), (
         f"{profile.name}: gguf declaration disagrees with {sorted(GGUF_WIRED)}")
 

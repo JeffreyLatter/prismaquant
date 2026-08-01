@@ -15,10 +15,12 @@
 #
 # Usage: bash scripts/canary_ladder.sh [start_step] [SOAK_MIN]
 # ============================================================================
-set -u
+set -euo pipefail
 STEP="${1:-1}"
 SOAK_MIN="${2:-10}"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$REPO/scripts/lib/gridbook_runtime.sh"
+gridbook_runtime_prepare || exit $?
 LOG=/home/rob/dq-runs/laguna-s21/logs/canary_ladder.log
 mkdir -p "$(dirname "$LOG")"
 
@@ -47,11 +49,14 @@ fi
 
 if [ "$STEP" -le 2 ]; then
   say "step 2: proven gridbook kernels"
-  docker run --rm --gpus all --ipc=host -v "$REPO":/repo --entrypoint bash \
+  docker run --rm --gpus all --ipc=host -v "$REPO":/repo:ro \
+    "${GRIDBOOK_RUNTIME_DOCKER_ARGS[@]}" --entrypoint bash \
     vllm-node:latest -c '
-      pip install -e /repo/plugins/gridbook --no-deps -q 2>/dev/null
+      set -euo pipefail
+      . /repo/scripts/lib/gridbook_runtime.sh
+      gridbook_runtime_install_container
       pip install pytest -q 2>/dev/null
-      cd /repo/plugins/gridbook
+      cd "$(gridbook_runtime_container_install_target)"
       python3 -m pytest tests/test_cuda_gemv.py -x -q 2>&1 | tail -1' \
     2>&1 | tail -1 | tee -a "$LOG"
   soak
@@ -100,11 +105,14 @@ fi
 
 if [ "$STEP" -le 4 ]; then
   say "step 4: hardened persistent-TC battery (quarantine opt-in)"
-  docker run --rm --gpus all --ipc=host -v "$REPO":/repo \
+  docker run --rm --gpus all --ipc=host -v "$REPO":/repo:ro \
+    "${GRIDBOOK_RUNTIME_DOCKER_ARGS[@]}" \
     -e PRISMAQUANT_ENABLE_PTC=1 --entrypoint bash vllm-node:latest -c '
-      pip install -e /repo/plugins/gridbook --no-deps -q 2>/dev/null
+      set -euo pipefail
+      . /repo/scripts/lib/gridbook_runtime.sh
+      gridbook_runtime_install_container
       pip install pytest -q 2>/dev/null
-      cd /repo/plugins/gridbook
+      cd "$(gridbook_runtime_container_install_target)"
       python3 -m pytest tests/test_persistent_tc.py -q 2>&1 | tail -1
       python3 tests/test_persistent_tc.py bench 2>&1 | tail -12' \
     2>&1 | tail -13 | tee -a "$LOG"
