@@ -1,7 +1,13 @@
 # Choosing between native NVFP4 and FP8-CB at a 4.5-bit budget
 
-**Status: proposed criteria + measurement plan. Changes no default, bans no
-format, implements nothing.** Drafted 2026-07-30 against HEAD `601639d`.
+> **Historical design record.** The experiment plan and Stage-0 results remain
+> useful, but `docs/lanes/nvfp4-cb/format-speed-policy.md` now owns the
+> production decision. In particular, ignore this draft's 503/503 screen,
+> blended `serve_ms`/independent-minimum floor, and any blanket decode-neutrality
+> reading; the normative policy uses exact serialized bytes and separate hard
+> TTFT/ITL/TPS constraints.
+
+**Status: superseded policy draft; retained for experiment provenance.** Drafted 2026-07-30 against HEAD `601639d`.
 Every claim is cited to code/measurement, or labelled `[EXTRAPOLATION]` /
 `[MEMORY]` (auto-memory, not re-verified this session).
 
@@ -20,13 +26,13 @@ K36 is the exact-4.5 rung, no interpolation needed on the CB side. **Verified: a
 2.0–3.5 bpw (v1) and **1.78–3.28125 bpw under the shipped two-tier v2**
 (`format_registry.py:980`; `two-tier-scale-spec.md` §2.1), so it cannot reach 4.5.
 
-**Byte asymmetry, so a "matched 4.5" A/B is honest.** NVFP4's 4.5 *includes* its
-scale plane; FP8_CB_K36's 4.5 is index stream only, plus per-output-channel fp32
-scales at `32/in_features` bpw (`nvfp4_cb_footprint.py:18-19,43`; +0.00625 at
-`in=5120`) and a codebook sidecar if codebooks are learned rather than lattice
-(`:41`; zero for the lattice codebooks the 27B/35B runs shipped). Match on
-**`footprint`/`nvfp4_cb_footprint` bytes, not labels** — as the 27B A/B did
-(16.713 vs 16.707 GB body, Δ 0.04%, `prod_27b_results.md:32-37`).
+**The 4.5 labels do not make the artifacts byte-identical.** NVFP4's 4.5
+includes its group-scale plane; FP8_CB_K36's 4.5 is the index stream, plus
+`32/in_features` scale bpw and a serialized product-codebook sidecar even for a
+deterministic lattice reference. Match on one versioned whole-artifact byte
+accountant and retain exact exported bytes as the final assertion. The
+versioned `CBSerializationContext` serialized-payload API is authoritative;
+exact exported inventory is the final whole-artifact assertion.
 
 ### The gap, named first — **nothing has ever been served at 4.5 on the CB side**
 
@@ -46,36 +52,21 @@ why the question is open rather than settled by the shipped evidence.
 
 ### 2.1 Measured at exactly 4.5
 
-**The 503/503 sweep is a genuine K36-vs-native-4.5 pairing** — not an
-interpolation between rungs; that was the first thing checked.
-`scripts/ab_nvfp4_vs_k36_dense.py` (commit `c551e24`) prices both formats through
-one code path at their exact 4.5 rungs:
-
-> FP8CB_K36 beats vanilla NVFP4 on **503/503 units unweighted (geomean −40%
-> error), 87% act-weighted. 42 outlier-row units favor NVFP4**
-> — `format-speed-policy.md:9-14`
-
-Three structural limits, stated before it is leaned on:
-(1) **Weight-error only** — `cost()` quantizes `W` and nothing else
-(`ab_nvfp4_vs_k36_dense.py:91-103`), so the A8-vs-A4 activation difference (the
-mechanism the policy itself names as part of CB's edge) **is not inside the −40%**;
-it is an additional, separately-unmeasured advantage at 4.5.
-(2) **One model, one tier** — Hy3-295B dense/attention/shared targets, experts and
-`layers.80` excluded (`:70-73`); no 27B, no 4B, no MoE expert unit at 4.5.
-(3) **Cost-model, not KL, not served** — a screen under the metric authority
-(ARCHITECTURE §2.3); the commit says so itself.
+The original 503/503 Hy3 screen is retracted: its `h_trace` column was constant
+and it fit unweighted codebooks before act-weighted scoring. The corrected
+production-faithful Stage 0 favors K36 on **493/496** 27B units and **252/252**
+4B units. This remains weight-error-only, excludes the W8A8-vs-W4A4 activation
+effect, and can only stop the program; it is not served KL/PPL or a promotion.
+See `format_choice_4p5_stage0_results.md`.
 
 Measured at *other* budgets:
 
 - **Served, matched bytes:** 27B @5.5 — conf-KL −45…−53%, ALL-KL −56/−58%, PPL gap
   to BF16 3× smaller (`prod_27b_results.md:41-55,124-134`); 35B MoE @4.75 — conf-KL
   −53%, ALL-KL −43%, PPL gap −30% (`prod_35b_results.md:26-40`).
-- **Revealed allocator preference — three joint solves, zero vanilla NVFP4
-  chosen:** 27B @5.5, 386/386 body Linears on CB (`prod_27b_results.md:13-24`);
-  35B @4.75, all-CB body (`prod_35b_results.md:20-22`); Hy3 @2.9 on an 11-format
-  joint menu → "36 dense/shared Linears → vanilla FP8_DYNAMIC; **0 → vanilla
-  NVFP4** (offered and never chosen)" (`prod_hy3_results.md:277-282`). **None at
-  4.5.**
+- **Zero vanilla-NVFP4 selections are not speed evidence.** The 27B/35B/Hy3
+  allocators optimized accuracy only, so preferring the more accurate format is
+  circular with respect to a quality-versus-latency decision.
 - **Speed at matched bpw:** decode **per-byte neutral at plain low-M decode**
   (measured twice — but never with a draft active; §4(d) scopes this claim: in
   the shipped spec-decode/batched regime the fp8:fp4 tensor-core ratio predicts
@@ -146,19 +137,16 @@ Measured at *other* budgets:
 ### (a) Quality at 4.5 is per-Linear, and belongs to the allocator
 
 Inside the CB container both families are already in **one menu**: the serving
-profile allow-lists `NVFP4`, `FP8_DYNAMIC`, `FP8_SOURCE`, `BF16` next to 38 CB
+profile allow-lists `NVFP4`, `FP8_DYNAMIC`, `FP8_SOURCE`, `BF16` next to the
+product CB
 rungs (`prismaquant/serving_profile_specs/nvfp4_cb.json`), whose own description
 calls it "**deliberately a MIXED container (PLAN.md decision #1, 'FP8 in every
 recipe')**". Measured cost decides per Linear; under
 `SELECTION_MODE=validated-surrogate`, real held-out KL decides the frontier point.
 
-**So this document names no layers.** "Attention `o_proj` gets NVFP4 at 4.5" is a
-hardcoded format ban with better manners — vetoed by core principle 1 and by the
-standing policy (*"No format bans, no bpw-band carve-outs, no 'MoE always native'
-rules"*, `format-speed-policy.md:66-72`). The 42 outlier-row units favouring NVFP4
-are **the argument for the joint menu, not for a hand-picked list**: the allocator
-picks NVFP4 there on accuracy alone (`:12-14`). The criteria's job is to say
-**which menu to offer**.
+**So this document names no layers.** A promotion below 4.5 bpw is an
+assignment-level byte-neutral bundle: lower CB rungs elsewhere must fund the
+NVFP4 unit, and the bundle's net quality and phase-specific latency decide it.
 
 ### (b) The artifact-level rule, keyed on what the allocator cannot see
 
@@ -170,26 +158,13 @@ picks NVFP4 there on accuracy alone (`:12-14`). The criteria's job is to say
   vanilla-NVFP4 rungs offered** — NVFP4 has no kernel there, gridbook's floor is
   8.0. A constraint, never a quality claim.
 
-**K2 — Prefill weight of the deployment** (reached only when K1 leaves both open).
-- **Decode-dominated** (chat, agents, long generations): decode is per-byte neutral
-  at matched bytes, tax ≈ 0 ⇒ **CB menu**, accuracy-first, status quo.
-- **Prefill-heavy** (RAG, long-document, batch scoring): tax is real and
-  regime-dependent (dense ~10%, MoE 0–40%) ⇒ **native menu, or CB with the
-  deployment declared on the card** — today's honest mitigations are card routing
-  guidance plus the joint menu (`format-speed-policy.md:36-47`).
-- K2 is an **operator declaration about the deployment**, expressed as *which menu
-  is offered* — the same class of input as `TARGET_DISK_GB`, not a heuristic inside
-  the objective, and it must never become one. **Interim rule:** §4(d)'s
-  prefill-tax budget supersedes K2 once implemented — the declaration collapses
-  into choosing `T` on a measured frontier.
+**K2 — Phase-specific deployment SLOs.** Declare p95 TTFT and p95 ITL / p05 TPS
+limits over a representative workload. Plain M=1 decode and prefill are separate
+constraints; neither substitutes for batched/speculative decode at shipped M.
 
-**K3 — The R21 sink graduates K2 from judgment to a table.** The λ term
-(`quality + λ·serving_ms`, λ=0 default) is **specified, not implemented** — no λ in
-`allocator_solver.py` (ARCHITECTURE §9.2) — and R21 defers it until two boxes'
-tables disagree in ranking. The raw material already accrues: the `auto` tuner logs
-measured ms per candidate per layer, "a free per-format, per-shape serving-cost
-table accumulating in every serve" (`format-speed-policy.md:26-29`). Until that
-table exists and disagrees, K2 stays an operator key.
+**K3 — Timing tables propose, end-to-end evidence decides.** The `auto` tuner
+logs candidate timings, but no `lambda` time objective is permitted. Validate a
+candidate's same-session whole-serve ranks and served quality before selection.
 
 **K4 — tie-breaker, a cost not a quality signal.** CB costs encode wall (uniform-FP8
 27B ≈ 5.4 h at `balanced`, `encode_tiers.md:31,66-75`) and its lane gates are
@@ -205,89 +180,24 @@ containing FP8:
 | decision | menu offered |
 |---|---|
 | native | `NVFP4, FP8_DYNAMIC, BF16` (+ `FP8_SOURCE` where the source is fp8) |
-| CB | `FP8_CB_K28..K48, NVFP4_CB_K12..K24/S13..S16, NVFP4, FP8_DYNAMIC, BF16` (STANDARDS "standard production menu") |
+| CB | `FP8_CB_K28..K48, NVFP4_CB_K12..K24, NVFP4, FP8_DYNAMIC, BF16` (signed S-rungs remain research/legacy compatible) |
 
 A "pure NVFP4 at 4.5" artifact is not a candidate in either branch; a CB artifact
 that allocates zero NVFP4 units is an *outcome of measurement*, not a container
 property.
 
-### (d) The systematic balance — a serving-time budget, not a λ blend, not a menu
+### (d) The systematic balance — constrained quality optimization
 
-*Added 2026-07-30 after Robert's framing: "systematically, I'm looking for how we
-balance performance of NVFP4 vs accuracy of codebook fp8 at the same bit rate —
-and even lower bit rates use fp8 when NVFP4 could be used." Widened same day per
-his correction: "it's more than just prefill; it's a decode tax as well — FP8 CB
-is going to be 50% the speed of NVFP4."*
+The normative form is the hard-constraint system in
+`format-speed-policy.md`: exact serialized bytes; separate p95 TTFT and p95 ITL
+/ p05 TPS SLOs; resident+KV+peak-scratch fit; and execution/shape/TP/coupling
+legality. The objective is predicted quality loss only.
 
-**The decode tax, reconciled with the measured record.** "Decode per-byte-neutral
-at matched bytes (measured twice)" and "FP8-CB at ~50% of NVFP4 decode" are both
-true — in different regimes. The neutral measurements are low-M decode:
-bandwidth-bound, matched bytes ⇒ matched time. The 50% is the compute regime:
-whenever decode is not M≈1 — **spec-decode drafts (the shipped configuration:
-MTP acceptance is a §7.2 ship gate), batched serving, wide drafts** — the GEMM
-enters the tensor-core-rate regime where Blackwell fp8 throughput is half of fp4.
-`[PREDICTION — the 2:1 architectural ratio; not yet measured on this box at
-matched bytes with a draft active]`. The existing record contains **no**
-decode-with-draft NVFP4-vs-CB pairing, so the per-byte-neutral claim is scoped to
-plain low-M decode and must not be cited beyond it (this supersedes the narrower
-phrasing in §2.1 and `format-speed-policy.md` — like prefill, decode is
-**regime-dependent**, and the shipped regime is not M=1).
-
-**The revealed preference in §2.1 is circular, and Robert's second sentence is the
-proof.** The allocator's objective is accuracy-only, so at matched bytes fp8-CB
-wins every unit *by construction* wherever it is more accurate — at 4.5 and at 2.9
-alike. Zero-vanilla-NVFP4 solves are not evidence that NVFP4 has no value; they are
-the objective being structurally blind to the one thing NVFP4 is good at (prefill:
-no expand, W4A4 tensor-core rate). K2's operator-declared menu is an honest patch,
-not a balance.
-
-**The systematic form.** Speed does not enter the objective (a `λ·serving_ms` blend
-has no natural units — the class of tuned constant core principle 2 forbids). It
-enters as a **second explicit budget**, exactly parallel to fit-the-card (R1:
-budget = constraint, measured KL = objective):
-
-```
-minimize   quality cost (per-unit, measured)
-subject to bytes(assignment)      ≤ TARGET_DISK_GB              (landed)
-           serve_ms(assignment)   ≤ (1 + T) · serve_floor        (proposed)
-
-serve_ms(assignment) = Σ_phases w_phase · Σ_units ms(format_u, shape_u, phase)
-                       phases = {prefill, decode@shipped-M}      (decode at the
-                       draft/batch M the artifact actually serves, not M=1)
-serve_floor          = same double sum over each unit's menu-minimum
-w_phase              = the deployment's phase mix — with T, the operator's
-                       ONE deployment input (TARGET_SERVE_TAX + a phase weight)
-```
-
-Per-phase time is additive across sequential layers the way bytes are additive
-across tensors — an assumption to *check per phase*, not assume: sum the
-per-layer table for an existing artifact pair and compare against its measured
-end-to-end prefill *and* decode (§2.1's 27B/35B numbers are the check pairs; the
-decode check needs the draft active). If Robert's 2:1 decode prediction holds,
-the decode term — not prefill — dominates the frontier for chat/agent
-deployments, and the balance tips materially toward NVFP4 units on
-decode-critical paths at every bit rate, which is exactly his low-bit
-observation made quantitative.
-
-**Sweep T; do not pick it.** Solve the same byte budget at
-`T ∈ {∞, 0.20, 0.10, 0}` and measure real KL at each point: the deliverable is a
-**measured KL-vs-prefill-tax frontier**, and the operator picks a point on a
-curve the platform measured. `T=∞` reproduces today's behaviour exactly
-(bit-identical, provably non-regressive); `T=0` is the all-fastest solve. The
-low-bit observation becomes a row in the same table: re-solve a Hy3-class 2.9
-budget under `T` and read what accuracy the prefill discipline costs there.
-
-**Data and machinery required, honestly.** (i) The per-(format, shape-regime) ms
-table: the R21 sink accrues it on every serve, and one microbench pass needs both
-kernels in one process — vLLM's `cutlass_scaled_mm` and the gridbook ext — i.e.
-the serving container, i.e. a box window (same window as Stage 1's served arms).
-(ii) The solver: an ε-constraint second axis on the memoized DP
-(`solve_with_promotion`'s feasible-only contract extends; cost **M**). (iii)
-Status: **PROPOSED, not implemented.** K1 remains hard and binding; K2/K3 remain
-the *interim* operating rule until the table exists, the DP lands, and the
-frontier is measured — at which point K2's deployment declaration collapses into
-choosing `T`, and K3's "graduates to a table" clause is discharged by
-construction. The R21 ruling (no λ) is unchanged — this is not λ.
+For a relative tax, compare against the fastest globally feasible assignment
+under the same byte budget. The old sum of independently fastest unit formats
+can be byte-infeasible and is retired. Per-layer timing additivity must first
+predict end-to-end ranks; the final frontier is remeasured with served
+KL/PPL/tasks and end-to-end streaming timing.
 
 ## 5. MEASUREMENT PLAN — validating 4.5 (acceptance fixed before each stage runs)
 
@@ -339,11 +249,10 @@ form: take the CB artifact and replace specific Linears with NVFP4, measuring
 the impact of the substitution directly.*
 
 **Endpoints first (Robert, same day: "or better yet, a pure nvfp4 build vs a
-pure fp8 cb build").** The pure builds ARE the ladder's endpoints — pure
-`FP8_CB_K36` is the base at 0% substitution, pure `NVFP4` is the 100% rung —
-and they run FIRST: total format effect on quality and both-phase serving time
-with **zero allocation confound**, and the cleanest test of the 2:1 decode
-prediction. Pure single-format menus are the sanctioned isolation pattern
+pure fp8 cb build").** Pure `FP8_CB_K36` and pure `NVFP4` isolate the complete
+W8A8-versus-W4A4 execution contracts with zero allocation confound, but they are
+formal same-rate endpoints only after exact whole-artifact accounting places
+both under the same byte budget. Pure single-format menus are the sanctioned isolation pattern
 (`[MEMORY: FP8 in every recipe]` — "2-rung menus only for cost-model A/B
 isolation, never shippable"; neither endpoint ships). Neither endpoint needs
 the allocator: a uniform assignment over the profile's quantizable set
@@ -353,12 +262,11 @@ work dir's act cache reuses for the imatrix harvest; pure-CB pays the known
 native-path export.
 
 **Interior rungs (Robert's substitution design) only if the endpoint gap
-justifies mapping the exchange curve.** Base = the pure-CB endpoint. Rank units
-by **predicted accuracy cost of the CB→NVFP4 flip per decode-ms saved** (the
-joint solve already priced both formats for every unit; the 42 outlier units
-that favour NVFP4 on accuracy substitute first — they are free). Substitute the
-top ~{25, 50, 75}% by that ratio; per-substitution bytes stay matched to
-~0.006 bpw (report bytes per rung regardless). Serve every rung — endpoints
+justifies mapping the exchange curve.** Per-unit timing may rank proposals, but
+each rung is a globally byte-feasible bundle: lower CB rungs must fund any
+NVFP4 promotion and the final solve minimizes quality loss under the phase
+SLOs. Substitute the top ~{25, 50, 75}% feasible bundles and report exact
+whole-artifact bytes. Serve every rung — endpoints
 included — through the SAME gridbook container (mixed-container delegation
 routes stock-NVFP4 units onto the native CUTLASS path; verified in-container
 before the ladder runs) against the same BF16 teacher, residency-matched.
@@ -384,8 +292,11 @@ an allocation-level comparison answers "which MENU at 4.5", the ladder answers
   (default), `TARGET_BITS=4.5`.
 - **Arm C** — CB container (`EXPORT_CONTAINER=nvfp4_cb`), STANDARDS production menu,
   lane-default cost mode (`local`), `TARGET_BITS=4.5`.
-- **Matched on measured body bytes ≤0.1%** via `footprint`/`nvfp4_cb_footprint`
-  (27B precedent: 0.04%). Nominal bpw labels are not a match (§1).
+- **Matched under the declared serialized-payload budget** using the versioned
+  serialization context, then checked against the exporter's exact shipped-file
+  inventory. Nominal bpw labels alone are not a match (§1). Report both payload
+  and whole-directory totals so container
+  metadata cannot disappear into rounding.
 - **Model:** Qwen3.6-27B — the only model with both a served CB datum (5.5) and a
   shipped native twin on the same harness, so 4.5 is readable against 5.5. If dense
   and MoE answers diverge (expected: the prefill tax is regime-driven), the 35B MoE
@@ -416,11 +327,9 @@ additivity check (Σ per-layer ms vs measured end-to-end prefill on both arms).
 
 ### Box constraints, stated honestly
 
-- **One Spark.** 121 GiB unified; at drafting time 69 used / 51 available with the
-  **idle serve on :8000 holding roughly half the pool**. A 27B arm needs the pool
-  (artifact + serve at util 0.80–0.85 + BF16 dump): stop the idle serve and get
-  **Robert's box clearance first**
-  `[MEMORY: no over-parallel during production — a production run gets the box]`.
+- **One Spark.** A 27B arm needs exclusive access to the unified-memory pool
+  (artifact + serve at util 0.80–0.85 + BF16 dump). No existing service is
+  required to remain online; get box clearance before a production run.
 - **Disk:** 224 GB free of 1.8 TB = 12.4% — above the ≥10% floor, but two 27B caches
   (~90 GB each) do not fit concurrently: build → measure → delete → build, `df -h
   /home/rob` before each launch.
@@ -429,8 +338,8 @@ additivity check (Σ per-layer ms vs measured end-to-end prefill on both arms).
 
 ## 6. Explicit non-goals
 
-1. **No λ in the objective.** The serving-cost term stays specified-not-implemented;
-   ruling **R21** stands. Stage 3 only *reads* the timing data R21 named.
+1. **No λ in the objective.** Timing enters only through separate hard
+   TTFT/ITL/TPS constraints; Stage 3 may use the R21 table to propose candidates.
 2. **No AURA-on-CB conclusions.** The CB lane can reach `COST_OBJECTIVE=aura-adjoint`
    since Milestone C, but it is opt-in, non-default, and "the A/B that would justify
    a CB default has not been run" (ARCHITECTURE §4.7). Arm C uses the lane default;
@@ -438,6 +347,6 @@ additivity check (Σ per-layer ms vs measured end-to-end prefill on both arms).
 3. **No Strix Halo numbers** — nothing measured there. **No NVFP4-CB claims at 4.5**
    — the fp4 ladder tops out at 3.28125 bpw. **No GGUF comparison** — separate lane,
    separate serving stack.
-4. **No format bans, no bpw-band carve-outs**, including no "below X bpp use native"
-   rule. If the allocator picks something that serves badly, the measurement is
-   wrong, not the optimizer.
+4. **No heuristic format bans or bpw carve-outs.** Capability/evidence policy is
+   still binding: packed experts cannot select unimplemented native delegation,
+   and signed S-rungs remain research-only.

@@ -958,10 +958,12 @@ remain selectable.
 
 ### 5.1 The menu
 
-`format_registry.py`. `FormatSpec` byte accounting is shape-exact, not a nominal scalar:
+`format_registry.py`. For non-CB formats, `FormatSpec` byte accounting is
+shape-exact rather than a nominal scalar:
 `scale_count_for_shape` (`:123-155`) handles `scale_block_shape`, per-channel `group_size==0`,
 and 3-D packed-expert stacks; `memory_bytes_for_shape` / `effective_bits_for_shape`
-(`:157-168`) are what the DP, `footprint.py`, and the Pareto table consume. Aliases:
+(`:157-168`) are what the DP, `footprint.py`, and the Pareto table consume for
+those formats. Aliases:
 `FP8`/`FP8_DYNAMIC` → `FP8_E4M3`, `MXFP8` → `MXFP8_E4M3` (`:170-188`).
 `act_quant_changes_input` (`:75-106`) is the **single** predicate for "does the serving kernel
 consume quantized activations" (`act_bits` absent or ≥ 16 ⇒ no): the allocator's bit-exact
@@ -979,7 +981,8 @@ pricing and emulation. Registry-vs-callable consistency is pinned by
 | `MXFP8_E4M3` | `:720-728` | 8 / 32 / e8m0 | 8.25 | Registered, profile-allowed, **de-menued** |
 | `NVFP4A16`, `MXFP4`, `MXFP6_E3M2/E2M3`, `MXFP8A16`, `MXFP8_E5M2`, `FP8_E5M2`, `INT8_W8A16`, `INT4_W4A16_g128` | `:678-795` | — | — | Research / registry-only |
 | GGUF k-quants + IQ | `:884-902` | `_make_gguf_spec :864` | 2.0625–8.5 | GGUF lane (§9.3) |
-| `NVFP4_CB_K12..K24` / `_S13..S16` / `FP8_CB_K28..K48` | `:913`, `:932`, `:954` | VQ codebook, g256 | 2.000–3.500 / 2.125–2.500 / 3.5–6.0 | gridbook CB lane (§9.2) |
+| `NVFP4_CB_K12..K24` / `FP8_CB_K28..K48` | `:913`, `:954` | product-VQ codebook, g256 | 1.78125–3.28125 serialized body / 3.5–6.0 index stream plus row scales | production gridbook CB menu (§9.2) |
+| `NVFP4_CB_S13..S16` | `:932` | signed codebook, g256 | legacy/research layout | decoder/export compatible, production-menu denied (§9.2) |
 
 MXFP8 is de-menued rather than denied — `vllm_packed_moe` still allows `MXFP8_E4M3` — because
 its E8M0 pow2 scale wastes ~√2 of a binade and exact-scale FP8 Pareto-dominates it; offered
@@ -988,8 +991,11 @@ both, the allocator never picks it.
 `FP8_SOURCE`'s `quantize_dequantize` is identity (`:835`): the bf16 view *is* the lossless
 dequant of the source E4M3, so cost is exactly zero. Legal on dense Linears under
 `vllm_packed_moe`, **illegal on packed experts** (absent from the expert allow-list — §6.4).
-`FP8_CB` has no group-16 scale plane; its per-output-channel fp32 scales are accounted by
-`nvfp4_cb_footprint.py`, since one `FormatSpec` cannot model both (`:954-961`).
+CB candidates deliberately use a different byte authority: the versioned
+`CBSerializationContext` in `nvfp4_cb_footprint.py` prices the exact FP4 layout,
+FP8 per-row FP32 scales, and deduplicated sidecar identity. Candidate
+construction, assignment accounting, reports, and exporter assertions share
+that context; exact post-export inventory remains the final artifact check.
 
 NVFP4 *weight* RTN routes through the export codec (`_nvfp4_export_aligned_rtn` `:636-663`) so
 emulation and shipped bytes share one rendering; *activations* do not — per-group dynamic RTN,
@@ -1770,7 +1776,7 @@ the one box any of it has been proven on.
 flowchart LR
   subgraph CONT["artifact containers"]
     A1["compressed-tensors<br/>NVFP4 / FP8_DYNAMIC / FP8_SOURCE / BF16<br/>export_native_compressed.py"]
-    A2["codebook (CB)<br/>NVFP4_CB_K12-K24, NVFP4_CB_S13-S16, FP8_CB_K28-K48<br/>plus stock rungs -- deliberately a mixed container<br/>export_nvfp4_cb.py, layer_config.py:35-38"]
+    A2["codebook (CB)<br/>production: NVFP4_CB_K12-K24 + FP8_CB_K28-K48<br/>legacy/research decoder: signed S13-S16<br/>plus stock rungs -- deliberately a mixed container<br/>export_nvfp4_cb.py, layer_config.py:35-38"]
     A3["GGUF<br/>Q2_K..Q8_0 + IQ family<br/>export_gguf.py"]
   end
 
@@ -1874,19 +1880,20 @@ globs as drift rather than silently allowing a half-released lane.
 on a hardware grid, so a decoded tile *is* a bit-standard NVFP4/FP8 tensor and dequantization
 is a gather rather than arithmetic. A weight vector is d=8 wide; a k-bit index selects a
 codeword; 32 codewords plus scales form a 256-weight superblock (`gb/codec.py:16-18`). Two
-ladders, every integer rung: `NVFP4_CB_K12–K24` (E2M1 grid, 2.0–3.28 bpw) and `FP8_CB_K28–K48`
+ladders, every integer rung: `NVFP4_CB_K12–K24` (E2M1 grid, 1.78125–3.28125
+serialized body bpw under production layout v2) and `FP8_CB_K28–K48`
 (E4M3 grid, 3.5–6.0 bpw) — `prismaquant/layer_config.py:35-38`, allow-listed in
-`serving_profile_specs/nvfp4_cb.json`. A third, signed-codebook ladder `NVFP4_CB_S13–S16`
-(2.125–2.5 bpw) is **production, not research** — earlier revisions of this section called it
-"research-only", which was an inverted label, not a description of the code: the rungs are
-allow-listed in the *served* profile (`serving_profile_specs/nvfp4_cb.json:30-33,93-96`, both
-the format allow-list and the per-role menu), emitted by the exporter
-(`export_nvfp4_cb.py:77,278`) and CUDA-served as the `n_sub == 1` decode path
-(`plugins/gridbook/gridbook/linear.py:295-305`). The allocator can pick them today, so
-"research-only" and the served allow-list cannot both be true; the R28 ruling (2026-07-30) is
-**keep the rungs, fix the label** — they are the lane's sign-magnitude fp4 family in the
-2.125–2.5 bpw band, learned on `|v|` with an explicit sign
-(`format_registry.py:932-983`, `export_nvfp4_cb.py:277-281`). Storage rate and compute
+`serving_profile_specs/nvfp4_cb.json`. A third, signed-codebook ladder
+`NVFP4_CB_S13–S16` remains codec/export/decoder compatible for legacy and
+explicit research use, but is **excluded from new production allocations**.
+The 2026-07-22 Qwen3.5-0.8B matched-rung screen found product K lower in
+609/776 weight-MSE comparisons (78.48%); only six signed units survived the
+2.6-bpp allocation. The reproducible command, comparison definition, source
+identity, and artifact checksums are in
+`docs/results/qwen35_0p8b_s_rung_headtohead_2026-07-22.md`. Keeping decoder
+support preserves already exported artifacts without advertising a losing rung
+to production solves (`format_registry.py:932-983`,
+`export_nvfp4_cb.py:277-281`). Storage rate and compute
 precision are independent dials: `FP8_CB_K32` *stores*
 4.0 bpw and *computes* in fp8 — why CB beats native NVFP4 at matched bpw (fp8 rungs run A8
 activations where NVFP4 runs A4). Codebooks live in a `.pqcb` safetensors sidecar pointed at
@@ -1978,15 +1985,22 @@ renamed rather than deleted, so both **307-redirect** to the canonical id (verif
 Hub 2026-07-30). The two historical citations are annotated in place rather than rewritten —
 they are the ship ledger, and the ledger records what was posted on the day.
 
-**Format-speed policy correction (2026-07-31).** The earlier 503/503 screen, blanket
-decode-neutrality inference, and proposed `quality + lambda*time` objective are historical,
-not production policy; `docs/lanes/nvfp4-cb/format-speed-policy.md` is retained only as a
-dated measurement record. Production optimizes quality subject to hard, phase-specific
-constraints: exact whole-artifact bytes, separate p95 TTFT and p95 ITL/p05 TPS SLOs,
-resident+KV+peak-scratch memory, backend/shape/TP legality, and serving-unit coupling.
-Per-layer timings may propose an assignment, but same-session served quality plus end-to-end
-timing decide it. The execution contract (format/rung, layout, activation quantization,
-backend, runtime/GPU commits, TP, and fallback state) is part of every comparison.
+**Standing native-parity policy** (`docs/lanes/nvfp4-cb/format-speed-policy.md`): minimize
+predicted quality loss subject to exact whole-artifact bytes, separate p95 TTFT and p95 ITL /
+p05 TPS SLOs, device-residency limits, and backend/shape/TP/serving-unit legality. There is no
+`quality + lambda*time` objective and no blended `serve_ms`. Per-layer timings may propose an
+assignment, but same-session served KL/PPL/tasks plus end-to-end timing decide it. Exact-4.5
+Stage 0 favors production-faithful K36 weight error (493/496 units at 27B, 252/252 at 4B), but
+that is a stop-only surrogate, not a served promotion. Plain M=1 decode evidence does not imply
+batched/speculative parity, and the Hy3 zero-NVFP4 allocation is circular under its
+accuracy-only objective.
+
+**Implementation status:** this constrained Pareto formulation is normative
+future work, not current allocator behavior. Today the profile legality masks
+(including signed-rung exclusion) are enforced, tensor-payload costs feed the
+quality-only allocator, and final SLO/quality selection is an external release
+gate. A format allow-list does not prove a backend, activation contract, or
+promotion state; those live in the structured native-parity benchmark record.
 
 ### 9.3 GGUF
 

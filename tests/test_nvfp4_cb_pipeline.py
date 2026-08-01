@@ -6,9 +6,10 @@ that the CB rungs flow through the STANDARD allocator machinery as first-class
 menu rungs alongside plain NVFP4/FP8_DYNAMIC/BF16 (the mixed container,
 PLAN.md decision #1 / format-pipeline.md §5), namely:
 
-  - serving_profile_specs/nvfp4_cb.json loads, is discoverable, allows both CB
-    families + NVFP4/FP8_DYNAMIC/BF16, and enforces the in_features%256 shape
-    rule (mirrors gguf.json);
+  - serving_profile_specs/nvfp4_cb.json loads, is discoverable, allows both
+    product-VQ ladders + NVFP4/FP8_DYNAMIC/BF16, excludes signed S-rungs from
+    production allocation while retaining research/codec compatibility, and
+    enforces the in_features%256 shape rule (mirrors gguf.json);
   - a mixed menu (NVFP4_CB_K14,NVFP4_CB_K16,FP8_CB_K44,NVFP4,FP8_DYNAMIC,BF16)
     flows through build_candidates legality + the knapsack + fused-sibling
     promotion without error;
@@ -61,11 +62,12 @@ _MIXED_MENU = [
     "NVFP4_CB_K14", "NVFP4_CB_K16", "FP8_CB_K44",
     "NVFP4", "FP8_DYNAMIC", "BF16",
 ]
-_ALL_CB_RUNGS = (
+_PRODUCT_CB_RUNGS = (
     [f"NVFP4_CB_K{k}" for k in range(12, 25)]
-    + [f"NVFP4_CB_S{k}" for k in (13, 14, 15, 16)]
-    + [f"FP8_CB_K{k}" for k in (36, 40, 44, 48)]
+    + [f"FP8_CB_K{k}" for k in range(28, 49)]
 )
+_SIGNED_CB_RUNGS = [f"NVFP4_CB_S{k}" for k in (13, 14, 15, 16)]
+_ALL_CB_RUNGS = _PRODUCT_CB_RUNGS + _SIGNED_CB_RUNGS
 _CB_CONTEXT = CBSerializationContext.production()
 
 
@@ -144,11 +146,45 @@ def test_nvfp4_cb_profile_discoverable_and_metadata():
     assert prof.runtime == "gridbook_plugin"
 
 
-def test_nvfp4_cb_profile_allows_all_cb_rungs_and_carriers():
+def test_nvfp4_cb_profile_allows_all_product_rungs_and_carriers_only():
     prof = sp.load_serving_profile("nvfp4_cb")
-    for name in _ALL_CB_RUNGS + ["NVFP4", "FP8_DYNAMIC", "BF16"]:
+    for name in _PRODUCT_CB_RUNGS + ["NVFP4", "FP8_DYNAMIC", "BF16"]:
         d = prof.check_format(None, name)
         assert d.legal, f"nvfp4_cb profile must allow {name}: {d.reason} {d.detail}"
+    for name in _SIGNED_CB_RUNGS:
+        d = prof.check_format(None, name)
+        assert not d.legal
+        assert d.rule == "nvfp4_cb_container_formats"
+
+
+def test_allocator_masks_signed_rungs_from_production_but_not_research():
+    name = "model.layers.0.self_attn.o_proj"
+    specs = [fr.get_format(rung) for rung in _SIGNED_CB_RUNGS] + [
+        fr.get_format("BF16")
+    ]
+    stats = {name: {"h_trace": 0.8, "n_params": 512 * 512,
+                    "in_features": 512, "out_features": 512}}
+    costs = {name: _costs_for(specs, 0.8)}
+
+    research = build_candidates(
+        stats,
+        costs,
+        specs,
+        target_profile="research",
+        cb_serialization_context=_CB_CONTEXT,
+    )
+    production = build_candidates(
+        stats,
+        costs,
+        specs,
+        target_profile="nvfp4_cb",
+        cb_serialization_context=_CB_CONTEXT,
+    )
+
+    assert {candidate.fmt for candidate in research[name]} == {
+        *_SIGNED_CB_RUNGS, "BF16"
+    }
+    assert [candidate.fmt for candidate in production[name]] == ["BF16"]
 
 
 def test_nvfp4_cb_profile_denies_out_of_family_format():

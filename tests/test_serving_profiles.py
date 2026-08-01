@@ -18,10 +18,17 @@ from prismaquant.serving_profiles import (
 
 VLLM_PROFILE = "vllm_packed_moe"
 
-# Representative qnames for the two format-rule scopes every packed-MoE
-# profile keys on.
+# Representative qnames for dense, unpacked shared-expert, and packed-expert
+# targets. Shared experts are rank-2 tensors and therefore use dense scope.
 DENSE_QNAME = "model.layers.0.self_attn.q_proj"
+SHARED_QNAME = "model.layers.0.mlp.shared_expert.gate_proj"
 EXPERT_QNAME = "model.layers.0.mlp.experts.gate_up_proj"
+
+NVFP4_CB_SCOPE_CASES = (
+    pytest.param(DENSE_QNAME, False, id="dense"),
+    pytest.param(SHARED_QNAME, False, id="shared"),
+    pytest.param(EXPERT_QNAME, True, id="packed"),
+)
 
 ALL_FORMAT_NAMES = tuple(sorted(set(fr.REGISTRY) | set(fr.FORMAT_ALIASES)))
 
@@ -334,15 +341,22 @@ def test_research_profile_is_the_declared_emulation_only_exemption():
         assert check_serving_format("research", DENSE_QNAME, fmt).legal, fmt
 
 
-@pytest.mark.parametrize("profile_id", ["vllm_packed_moe", "gguf"])
+@pytest.mark.parametrize("profile_id", ["vllm_packed_moe", "nvfp4_cb", "gguf"])
 def test_production_profile_never_admits_an_unexportable_format(profile_id):
     """The invariant: effective-legal ⊆ exporter-emittable, for every
     registered format and both rule scopes."""
     emittable = lane_emittable_formats(profile_id)
     assert emittable
-    for qname in (DENSE_QNAME, EXPERT_QNAME, "model.layers.0.mlp.down_proj"):
+    scopes = (
+        (DENSE_QNAME, False),
+        (SHARED_QNAME, False),
+        (EXPERT_QNAME, True),
+    )
+    for qname, packed_expert in scopes:
         for fmt in ALL_FORMAT_NAMES:
-            if not check_serving_format(profile_id, qname, fmt).legal:
+            if not check_serving_format(
+                profile_id, qname, fmt, packed_expert=packed_expert
+            ).legal:
                 continue
             assert fr.canonical_format_name(fmt) in emittable, (
                 f"{profile_id} admits {fmt} at {qname} but its exporter "
@@ -379,6 +393,84 @@ def test_vllm_lane_denies_the_a16_rungs_with_a_structural_reason():
         decision = check_serving_format(VLLM_PROFILE, DENSE_QNAME, fmt)
         assert not decision.legal, fmt
         assert decision.reason == "exporter_cannot_emit", fmt
+
+
+@pytest.mark.parametrize("qname,packed_expert", NVFP4_CB_SCOPE_CASES)
+@pytest.mark.parametrize(
+    "fmt", ["NVFP4_CB_S13", "NVFP4_CB_S14", "NVFP4_CB_S15", "NVFP4_CB_S16"]
+)
+def test_nvfp4_cb_signed_rungs_are_research_only_in_every_scope(
+    fmt, qname, packed_expert
+):
+    """Codec compatibility must not make a signed rung production-selectable."""
+    emittable = lane_emittable_formats("nvfp4_cb")
+    assert emittable is not None and fmt in emittable
+    assert fmt in fr.REGISTRY
+    assert check_serving_format(
+        "research", qname, fmt, packed_expert=packed_expert
+    ).legal
+
+    decision = check_serving_format(
+        "nvfp4_cb", qname, fmt, packed_expert=packed_expert
+    )
+    assert not decision.legal
+    assert decision.reason == "profile_mismatch"
+    assert decision.rule == "nvfp4_cb_container_formats"
+
+
+def test_nvfp4_cb_signed_rungs_retain_legacy_shape_compatibility():
+    for fmt in ("NVFP4_CB_S13", "NVFP4_CB_S14", "NVFP4_CB_S15", "NVFP4_CB_S16"):
+        assert check_serving_shape(
+            "nvfp4_cb", fmt, in_features=2048, out_features=512
+        ).legal
+        decision = check_serving_shape(
+            "nvfp4_cb", fmt, in_features=2064, out_features=512
+        )
+        assert not decision.legal
+        assert decision.reason == "kernel_shape"
+
+
+def test_nvfp4_cb_all_product_rungs_remain_in_every_production_scope():
+    product_rungs = (
+        *(f"NVFP4_CB_K{k}" for k in range(12, 25)),
+        *(f"FP8_CB_K{k}" for k in range(28, 49)),
+    )
+    for qname, packed_expert in (
+        (DENSE_QNAME, False),
+        (SHARED_QNAME, False),
+        (EXPERT_QNAME, True),
+    ):
+        for fmt in product_rungs:
+            decision = check_serving_format(
+                "nvfp4_cb", qname, fmt, packed_expert=packed_expert
+            )
+            assert decision.legal, (qname, fmt, decision)
+
+
+@pytest.mark.parametrize("qname,packed_expert", NVFP4_CB_SCOPE_CASES)
+def test_nvfp4_cb_w4a16_stays_denied_until_gridbook_support_lands(
+    qname, packed_expert
+):
+    """Approved backlog status is not an exporter/runtime capability claim."""
+    fmt = "INT4_W4A16_g128"
+    assert fmt in fr.REGISTRY
+    assert check_serving_format(
+        "research", qname, fmt, packed_expert=packed_expert
+    ).legal
+
+    decision = check_serving_format(
+        "nvfp4_cb", qname, fmt, packed_expert=packed_expert
+    )
+    assert not decision.legal
+    assert decision.rule == "nvfp4_cb_container_formats"
+
+    profile = load_serving_profile("nvfp4_cb")
+    unpoliced = dataclasses.replace(profile, format_rules=())
+    structural = unpoliced.check_format(
+        qname, fmt, packed_expert=packed_expert
+    )
+    assert not structural.legal
+    assert structural.reason == "exporter_cannot_emit"
 
 
 def test_vllm_lane_still_admits_the_whole_production_menu():

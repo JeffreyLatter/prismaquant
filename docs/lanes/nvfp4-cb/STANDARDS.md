@@ -14,8 +14,8 @@ set. Kernel-only speedups do not promote a path across activation buckets.
 
 | Family | Rungs | Rate | Scale coding | Mode |
 |---|---|---|---|---|
-| NVFP4_CB (fp4 grid) | K12–K24, EVERY integer | 2.0–3.28 bpw (2.28–3.53 eff.) | two-tier v2 (E8M0 super + 4-bit sub codes, 0.28125 bpw) | product, ceil-first uneven splits |
-| FP8_CB (e4m3 grid) | K28–K48, EVERY integer | 3.5–6.0 bpw | per-output-channel fp32 (~free) | product, ceil-first uneven splits |
+| NVFP4_CB (fp4 grid) | K12–K24, EVERY integer | 1.78125–3.28125 bpw serialized body | two-tier v2 (E8M0 super + 4-bit sub codes, 0.28125 bpw) | product, ceil-first uneven splits |
+| FP8_CB (e4m3 grid) | K28–K48, EVERY integer | 3.5–6.0 index bpw + `32/in_features` scale bpw | per-output-row fp32 tensor | product, ceil-first uneven splits |
 | NVFP4 (vanilla) | — | 4.5 bpw | group-16 E4M3 | menu member; Blackwell-only serving |
 | FP8_DYNAMIC | — | 8 bpw | per-channel | menu member |
 | BF16 / FP8_SOURCE | — | 16 / ~8 | — | passthrough-only (source dtype) |
@@ -27,17 +27,18 @@ set. Kernel-only speedups do not promote a path across activation buckets.
   never produced by new exports.
 - **Signed S-rungs (S13–S16): CLOSED as research-only (measured,
   2026-07-22).** The K-vs-S head-to-head on Qwen3.5-0.8B (matched-rate menu,
-  776 per-(Linear,k) direct cost comparisons): K wins 79%, median S penalty
+  776 per-(Linear,k) direct cost comparisons): K wins 609/776 (78.48%), median S penalty
   +0.5–2.2%, allocator placed 6 S-units vs 147 K-units (only linear-attn
   in_proj_a/b/qkv/z ever preferred S). Serving propriety PROVEN: the signed
   chain (encoder → export → vLLM load → decode) is bit-exact on the real
   artifact (max |serve − reconstruct| = 0) plus the 18-test GPU battery.
   S-rungs stay OFF production menus — correct but not worth menu space; the
-  spec keeps them for exotic weight geometries. Full mode: spec-reserved,
-  unimplemented.
+  spec keeps them for exotic weight geometries. Reproduction and immutable
+  artifact identities: `../../results/qwen35_0p8b_s_rung_headtohead_2026-07-22.md`.
+  Full mode: spec-reserved, unimplemented.
 - MTP sidecars: CB-quantized, rung by the canon throughput selector
   (`mtp_rung_selection.py`). Vision towers (VLMs): vanilla NVFP4.
-- Standard production menu = both CB ladders (all integers) + NVFP4 +
+- Standard production menu = both product K-ladders (all integers) + NVFP4 +
   FP8_DYNAMIC + BF16 (+FP8_SOURCE where the source is fp8). Target hardware:
   Blackwell (GB10 sm_121 / RTX 5090 sm_120). Artifacts that happen to
   allocate zero vanilla-NVFP4 units remain Ada-servable as a bonus, never a
@@ -64,10 +65,11 @@ set. Kernel-only speedups do not promote a path across activation buckets.
 | l2_pipeline (per-expert L2-pinned scratch) | wedged live serving 3× (stream/capture context + device-wide sync on hot path; serial variant still wedges) | DIAGNOSTIC-ONLY — L2-residency hypothesis unmeasured; excluded from auto candidates |
 | w2 rowpack, damp sweep, … | measured negative | ARCHIVED behind env switches |
 
-- Decode contract v2 (scale-epilogue hoist): MEASURED NULL on served 27B
-  (10.10 vs 10.13 tok/s, quality-neutral) — decode is bandwidth-bound at
-  per-byte parity, nothing for the hoist to recover. Default stays v1;
-  v2 remains supported via PRISMAQUANT_CB_DECODE_CONTRACT=v2.
+- Decode contract v2 (scale-epilogue hoist): MEASURED NULL on one served 27B
+  plain low-M decode arm (10.10 vs 10.13 tok/s, quality-neutral). That supports
+  a bandwidth-bound reading for that arm only; it does not establish batched or
+  speculative decode neutrality. Default stays v1; v2 remains supported via
+  `PRISMAQUANT_CB_DECODE_CONTRACT=v2`.
 - R6 smem-resident codebook LUT (2026-07-26, commit `1ede688`): k48's 32 KB LUT
   thrashed the ~50 KB post-carve-out L1 (decode ALU ran 7.5× k44's for 9% more
   bits). Staging the table into smem per (TileM, KBits) cut the **ALU term 9.1×**
