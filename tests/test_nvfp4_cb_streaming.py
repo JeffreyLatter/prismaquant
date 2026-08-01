@@ -452,6 +452,180 @@ def test_streaming_per_expert_bridging(workdir):
         assert torch.equal(tm[key], ts[key]), key
 
 
+def _lfm_per_expert_model(mdl: Path, layers=(2,), E=2, inter=256, hid=256,
+                          seed=17):
+    """Tiny LFM checkpoint layout: per-expert w1/w3 fuse to gate_up and w2
+    maps to down. Dimensions stay superblock-legal for real CB packing."""
+    torch.manual_seed(seed)
+    tensors = {"model.embedding_norm.weight":
+               torch.ones(hid, dtype=torch.bfloat16)}
+    for layer in layers:
+        prefix = f"model.layers.{layer}.feed_forward.experts"
+        for e in range(E):
+            tensors[f"{prefix}.{e}.w1.weight"] = (
+                torch.randn(inter, hid) * 0.3).to(torch.bfloat16)
+            tensors[f"{prefix}.{e}.w3.weight"] = (
+                torch.randn(inter, hid) * 0.3).to(torch.bfloat16)
+            tensors[f"{prefix}.{e}.w2.weight"] = (
+                torch.randn(hid, inter) * 0.3).to(torch.bfloat16)
+    mdl.mkdir(parents=True, exist_ok=True)
+    save_file(tensors, str(mdl / "model.safetensors"))
+    (mdl / "config.json").write_text(json.dumps({
+        "model_type": "lfm2_moe",
+        "architectures": ["Lfm2MoeForCausalLM"],
+        "hidden_size": hid,
+        "intermediate_size": inter,
+        "num_local_experts": E,
+    }))
+    return tensors
+
+
+def _lfm_cb_assignment(layer: int) -> dict:
+    prefix = f"model.layers.{layer}.feed_forward.experts"
+    return {
+        f"{prefix}.gate_up_proj": {"data_type": "nvfp4_cb", "cb_k": 16},
+        f"{prefix}.down_proj": {"data_type": "nvfp4_cb", "cb_k": 16},
+    }
+
+
+def _lfm_col_weights(layer: int, E=2, inter=256, hid=256) -> dict:
+    prefix = f"model.layers.{layer}.feed_forward.experts"
+    return {
+        f"{prefix}.gate_up_proj": torch.rand(E, 1, hid) + 0.05,
+        f"{prefix}.down_proj": torch.rand(E, 1, inter) + 0.05,
+    }
+
+
+def test_streaming_lfm_profile_declared_expert_projections(workdir):
+    """Regression: streaming must discover LFM's w1/w2/w3 source tensors via
+    the profile rather than a gate_proj/up_proj/down_proj-only regex."""
+    mdl = workdir / "lfm"
+    _lfm_per_expert_model(mdl)
+    ap = workdir / "a.json"
+    _assign(ap, _lfm_cb_assignment(2))
+    cw = _lfm_col_weights(2)
+
+    cm = export_nvfp4_cb(mdl, ap, workdir / "m", cw, device="cpu")
+    cs = export_nvfp4_cb_streaming(mdl, ap, workdir / "s", cw, device="cpu")
+    assert cm == cs
+    tm = load_file(str(workdir / "m" / "model.safetensors"))
+    ts = load_file(str(workdir / "s" / "model.safetensors"))
+    assert _tensors_equal(tm, ts)
+    prefix = "model.layers.2.feed_forward.experts"
+    assert f"{prefix}.gate_up_proj.cb_qweight" in ts
+    assert f"{prefix}.down_proj.cb_qweight" in ts
+    assert not any(k.startswith(prefix + ".0.") for k in ts)
+
+
+def _lfm_direct_packed_model(mdl: Path, layers=(2,), E=2, inter=256,
+                             hid=256, seed=19):
+    """LFM's live ``nn.Parameter`` save layout has no ``.weight`` suffix."""
+    torch.manual_seed(seed)
+    tensors = {"model.embedding_norm.weight":
+               torch.ones(hid, dtype=torch.bfloat16)}
+    for layer in layers:
+        prefix = f"model.layers.{layer}.feed_forward.experts"
+        tensors[f"{prefix}.gate_up_proj"] = (
+            torch.randn(E, 2 * inter, hid) * 0.3).to(torch.bfloat16)
+        tensors[f"{prefix}.down_proj"] = (
+            torch.randn(E, hid, inter) * 0.3).to(torch.bfloat16)
+    mdl.mkdir(parents=True, exist_ok=True)
+    save_file(tensors, str(mdl / "model.safetensors"))
+    (mdl / "config.json").write_text(json.dumps({
+        "model_type": "lfm2_moe",
+        "architectures": ["Lfm2MoeForCausalLM"],
+        "hidden_size": hid,
+        "intermediate_size": inter,
+        "num_local_experts": E,
+    }))
+    return tensors
+
+
+def test_streaming_lfm_direct_packed_source_is_validated_and_exported(workdir):
+    """Regression for packed LFM saves whose expert parameter keys are the
+    direct qnames. Both exporters must quantize selected rank-3 tensors while
+    preserving direct BF16 banks and marking them ignored."""
+    mdl = workdir / "lfm-packed"
+    original = _lfm_direct_packed_model(mdl, layers=(2, 3))
+    ap = workdir / "a.json"
+    assignment = _lfm_cb_assignment(2)
+    bf16_prefix = "model.layers.3.feed_forward.experts"
+    assignment.update({
+        f"{bf16_prefix}.gate_up_proj": "BF16",
+        f"{bf16_prefix}.down_proj": "BF16",
+    })
+    _assign(ap, assignment)
+    cw = _lfm_col_weights(2)
+
+    cm = export_nvfp4_cb(mdl, ap, workdir / "m", cw, device="cpu")
+    cs = export_nvfp4_cb_streaming(mdl, ap, workdir / "s", cw, device="cpu")
+    assert cm == cs
+    tm = load_file(str(workdir / "m" / "model.safetensors"))
+    ts = load_file(str(workdir / "s" / "model.safetensors"))
+    assert _tensors_equal(tm, ts)
+    cb_prefix = "model.layers.2.feed_forward.experts"
+    assert f"{cb_prefix}.gate_up_proj.cb_qweight" in ts
+    assert f"{cb_prefix}.down_proj.cb_qweight" in ts
+    for projection in ("gate_up_proj", "down_proj"):
+        key = f"{bf16_prefix}.{projection}"
+        assert torch.equal(ts[key], original[key])
+    quant_config = json.loads((workdir / "s" / "quant_config.json").read_text())
+    assert {f"{bf16_prefix}.gate_up_proj", f"{bf16_prefix}.down_proj"} \
+        <= set(quant_config["ignore"])
+
+
+def test_streaming_lfm_direct_packed_source_rejects_non_3d(workdir):
+    mdl = workdir / "lfm-packed-bad"
+    tensors = _lfm_direct_packed_model(mdl)
+    key = "model.layers.2.feed_forward.experts.gate_up_proj"
+    tensors[key] = torch.randn(512, 256).to(torch.bfloat16)
+    save_file(tensors, str(mdl / "model.safetensors"))
+    ap = workdir / "a.json"
+    _assign(ap, _lfm_cb_assignment(2))
+    with pytest.raises(ValueError, match="direct packed expert source.*rank-3"):
+        export_nvfp4_cb_streaming(
+            mdl, ap, workdir / "s", _lfm_col_weights(2), device="cpu")
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_partial_lfm_mixed_export_preserves_bf16_per_expert(
+        workdir, streaming):
+    """A CB layer may coexist with an explicitly BF16 LFM layer. Only the CB
+    parents are stacked; BF16 stays as the original per-expert checkpoint
+    tensors expected by LFM's vLLM loader."""
+    mdl = workdir / "lfm"
+    original = _lfm_per_expert_model(mdl, layers=(2, 3))
+    ap = workdir / "a.json"
+    assignment = _lfm_cb_assignment(2)
+    bf16_prefix = "model.layers.3.feed_forward.experts"
+    assignment.update({
+        f"{bf16_prefix}.gate_up_proj": {
+            "data_type": "bfloat16", "bits": 16},
+        f"{bf16_prefix}.down_proj": {
+            "data_type": "bfloat16", "bits": 16},
+    })
+    _assign(ap, assignment)
+    out = workdir / ("streaming" if streaming else "memory")
+    exporter = export_nvfp4_cb_streaming if streaming else export_nvfp4_cb
+    exporter(mdl, ap, out, _lfm_col_weights(2), device="cpu")
+
+    exported = load_file(str(out / "model.safetensors"))
+    cb_prefix = "model.layers.2.feed_forward.experts"
+    assert f"{cb_prefix}.gate_up_proj.cb_qweight" in exported
+    assert f"{cb_prefix}.down_proj.cb_qweight" in exported
+    assert not any(k.startswith(cb_prefix + ".0.") for k in exported)
+    assert f"{bf16_prefix}.gate_up_proj.weight" not in exported
+    assert f"{bf16_prefix}.down_proj.weight" not in exported
+    expected_ignore = set()
+    for e in range(2):
+        for proj in ("w1", "w2", "w3"):
+            key = f"{bf16_prefix}.{e}.{proj}.weight"
+            assert torch.equal(exported[key], original[key])
+            expected_ignore.add(key[:-len(".weight")])
+    quant_config = json.loads((out / "quant_config.json").read_text())
+    assert expected_ignore <= set(quant_config["ignore"])
+
+
 # --- bounded peak residency ------------------------------------------------
 
 def test_streaming_peak_residency(workdir, monkeypatch):
