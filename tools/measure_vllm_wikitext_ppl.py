@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import sys
 import time
 from pathlib import Path
 
@@ -12,6 +13,35 @@ import torch
 from datasets import load_dataset
 from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+try:  # package mode (`python -m tools.measure_vllm_wikitext_ppl`)
+    from .serve_fingerprint import git_commit, self_manifest
+    from .spec_decode_guard import refuse_if_spec_decode
+except ImportError:  # script mode (`python /repo/tools/measure_vllm_wikitext_ppl.py`)
+    from serve_fingerprint import git_commit, self_manifest  # type: ignore
+    from spec_decode_guard import refuse_if_spec_decode  # type: ignore
+
+#: Set by `_load_llm`; `None` (could not inspect) is refused by the shipcard.
+_SPEC_DECODE_DETECTED: bool | None = None
+
+
+def _provenance() -> dict:
+    """Serving-stack + code provenance for the result dict (R15).
+
+    The tool builds its own in-process `LLM`, so `/proc/self/maps` is the
+    authoritative extension-residency read for the numbers below; a PPL from a
+    different `serve_fingerprint` is not a comparable delta (tools/kl_ab.py).
+    """
+    manifest = self_manifest(
+        extra={"measurement_tool": "measure_vllm_wikitext_ppl"})
+    return {
+        "git_commit": git_commit(),
+        "serve_fingerprint": manifest["serve_fingerprint"],
+        "serve_manifest": manifest,
+        "spec_decode_detected": _SPEC_DECODE_DETECTED,
+    }
 
 
 def _load_ids(tokenizer, *, cache_dir: str, split: str, n_tokens: int) -> list[int]:
@@ -46,7 +76,18 @@ def _load_llm(args) -> LLM:
         # Mamba/DeltaNet hybrids need max_num_batched_tokens >= their
         # chunk-alignment floor (~2096); seqlen+1 alone can undershoot it.
         kwargs["max_num_batched_tokens"] = args.max_num_batched_tokens
-    return LLM(**kwargs)
+    llm = LLM(**kwargs)
+    # Spec-decode routes /v1/completions echo+logprobs (and prompt_logprobs)
+    # through the DRAFT model: the NLL below would be the 1-layer MTP head's.
+    # `validate_quantized_model` has refused this since the draft-logprobs
+    # postmortem; the gold lane had no such guard until R13.
+    global _SPEC_DECODE_DETECTED
+    _SPEC_DECODE_DETECTED = refuse_if_spec_decode(
+        llm=llm,
+        allow=getattr(args, "allow_spec_decode", False),
+        context="ppl",
+    )
+    return llm
 
 
 def _logprob_value(entry, token_id: int) -> float:
@@ -81,6 +122,11 @@ def main() -> int:
     parser.add_argument("--quantization")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.84)
     parser.add_argument("--enforce-eager", action="store_true")
+    parser.add_argument(
+        "--allow-spec-decode", action="store_true",
+        help="proceed even when the engine has a speculative config. The NLL "
+        "is then the DRAFT model's, not the artifact's; the shipcard refuses "
+        "such a record (see tools/spec_decode_guard.py).")
     parser.add_argument("--max-num-batched-tokens", type=int, default=None)
     args = parser.parse_args()
 
@@ -145,6 +191,7 @@ def main() -> int:
         "per_chunk_mean_nll": [float(v) for v in chunk_nlls],
         "max_chunk_mean_nll": float(max(chunk_nlls)) if chunk_nlls else None,
         "elapsed_s": float(time.monotonic() - started),
+        **_provenance(),
     }
     output.write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result, indent=2), flush=True)

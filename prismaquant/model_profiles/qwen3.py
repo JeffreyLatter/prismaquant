@@ -24,6 +24,9 @@ from .base import ModelProfile
 
 class Qwen3Profile(ModelProfile):
 
+    # Detection priority (lower = consulted first): original dense Qwen3; after the 3.5/3.6 and MoE siblings.
+    priority = 130
+
     @classmethod
     def matches(cls, model_type: str, architectures: list[str]) -> bool:
         # Must distinguish from Qwen3.5/3.6 (which use Qwen3_5For... or

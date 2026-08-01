@@ -24,6 +24,9 @@ from .base import ModelProfile
 
 class Gemma4Profile(ModelProfile):
 
+    # Detection priority (lower = consulted first): disjoint from the Qwen family.
+    priority = 140
+
     @classmethod
     def matches(cls, model_type: str, architectures: list[str]) -> bool:
         if model_type in {"gemma4", "gemma4_text"}:

@@ -563,6 +563,15 @@ class PerturbedActivationCache:
                     dtype=param.dtype,
                 ).contiguous()
             else:
+                from .nvfp4_cb_footprint import is_cb_format
+
+                if is_cb_format(fmt):
+                    raise RuntimeError(
+                        f"production_weight_cache is required for CB fallback "
+                        f"({param_plan.name!r}, {fmt!r}); the registry path is "
+                        "unweighted legacy rendering and cannot represent the "
+                        "stamped production serialization contract"
+                    )
                 if (
                     self._production_weight_cache is not None
                     and fmt != "BF16"
@@ -843,6 +852,15 @@ class PerturbedActivationCache:
                         f"RTN fallback."
                     )
             if q is None:
+                from .nvfp4_cb_footprint import is_cb_format
+
+                fmt_canon = fr.canonical_format_name(param_plan.spec.name)
+                if is_cb_format(fmt_canon):
+                    raise RuntimeError(
+                        f"production_weight_cache is required for CB fallback "
+                        f"({param_plan.name!r}, {fmt_canon!r}); refusing an "
+                        "unweighted legacy registry render"
+                    )
                 q = param_plan.spec.quantize_dequantize(original)
             if q is None:
                 continue

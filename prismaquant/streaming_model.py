@@ -80,28 +80,37 @@ from .layer_streaming import (
 from .tied_embeddings import resolve_tied_output_embedding
 
 
-def _minimax_native_fp8_checkpoint(model_path: str) -> bool:
-    """True for MiniMax native-FP8 checkpoints with block scales.
+def _bypass_hf_fp8_module_rewrite(model_path: str) -> bool:
+    """True when HF's FP8 pre-load module rewrite must be skipped here.
 
-    MiniMax-M2/M2.7 exposes 256 experts as a ModuleList. Transformers
-    5.x's FP8 pre-load rewrite currently replaces that ModuleList with
-    FP8Experts, then tries to set `experts.0.w1`, which fails because
-    FP8Experts is not integer-indexable. The streaming path does not
-    need HF's module rewrite: `_read_layer_to_device` reads the source
-    fp8 bytes and applies `.weight_scale_inv` inline.
+    Two independent conditions, and they belong in different places:
+
+      - the **checkpoint** is native FP8 with block scales — a per-checkpoint
+        fact, read from `quantization_config` right here;
+      - the **architecture**'s expert container breaks under that rewrite — a
+        static architecture property, so it is declared in the model profile
+        (`staging.bypass_hf_fp8_module_rewrite`) rather than pattern-matched
+        on the model name. MiniMax-M2/M2.7 exposes 256 experts as a
+        `ModuleList`; transformers 5.x replaces it with `FP8Experts` and then
+        tries to set `experts.0.w1`, which that container does not support.
+
+    The streaming path never needs the rewrite anyway: `_read_layer_to_device`
+    reads the source fp8 bytes and applies `.weight_scale_inv` inline.
     """
     try:
         with open(os.path.join(model_path, "config.json")) as f:
             cfg = json.load(f)
     except Exception:
         return False
-    model_type = str(cfg.get("model_type", "")).replace("-", "_").lower()
-    archs = [str(a) for a in cfg.get("architectures", [])]
     qc = cfg.get("quantization_config") or {}
-    return (
-        model_type.startswith("minimax_m2")
-        or any(a.startswith("MiniMaxM2") for a in archs)
-    ) and qc.get("quant_method") == "fp8" and "weight_block_size" in qc
+    if qc.get("quant_method") != "fp8" or "weight_block_size" not in qc:
+        return False
+    try:
+        from .model_profiles import profile_from_config
+
+        return bool(profile_from_config(cfg).bypass_hf_fp8_module_rewrite())
+    except Exception:
+        return False
 
 
 @contextmanager
@@ -461,7 +470,7 @@ class StreamingContext:
         # exceeds effective budget, the put returns False and the
         # tensors fall out of scope here — ensure_loaded will re-load
         # synchronously when actually needed.
-        self.layer_cache.put(L, tensors, force=False)
+        self.layer_cache.put(L, tensors, force=False, pinned_until_read=True)
         with self._inflight_lock:
             self._inflight.pop(L, None)
         return tensors
@@ -916,7 +925,7 @@ def _build_streaming_context(model_path: str, *,
     if multimodal:
         staged = stage_multimodal(model_path)
     else:
-        bypass_hf_fp8_rewrite = _minimax_native_fp8_checkpoint(model_path)
+        bypass_hf_fp8_rewrite = _bypass_hf_fp8_module_rewrite(model_path)
         staged = stage_text_only(model_path)
         if bypass_hf_fp8_rewrite:
             print(f"{log_prefix} manual meta streaming load avoids HF fp8 "

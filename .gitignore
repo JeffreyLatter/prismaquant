@@ -9,6 +9,7 @@ dist/
 .env
 *.pkl
 *.log
+.coverage
 
 # Local reference materials (third-party papers / code; copyrighted, not to publish)
 references/
@@ -16,6 +17,14 @@ scratch/
 
 # Personal / local-only state — entire .claude dir kept out of the repo
 .claude/
+
+# Session handovers are centralized here but stay local-only (session history,
+# not for the public repo); only the explanatory README is tracked
+docs/handovers/*
+!docs/handovers/README.md
+
+# Local model checkpoints downloaded into the repo root (e.g. Laguna FP8 source)
+fp8/
 
 # Local sqlite + worktrees + scratch artifacts
 data/
@@ -26,3 +35,6 @@ propagated-cost
 paper/scripts/gemini_review_stderr.txt
 tmp/
 .tmp/
+
+# Editor swapfiles
+.*.swp

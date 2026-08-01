@@ -1,12 +1,18 @@
+from types import SimpleNamespace
+
+import pytest
 import torch
 import torch.nn as nn
 
 from prismaquant.production_weight_cache import ProductionWeightCache
 from prismaquant.validate_assignments_kl import (
+    _assert_calibration_disjoint,
     _assignment_cost_summary,
     _calibration_provenance,
+    _load_calibration_repeats,
     _materialize_assignment_inplace,
     _production_cache_assignment_diagnostics,
+    _upstream_calibration_hashes,
 )
 
 
@@ -141,3 +147,68 @@ def test_diagnostics_counts_packed_expert_misses_m4():
         "diagnostics must pass include_packed_experts=True (M4)"
     assert diag["cache_miss_count"] == 1
     assert diag["missing_sample"][0][0].endswith("gate_up_proj")
+
+
+# --------------------------------------------------------------------------
+# R14 — held-out disjointness mechanized by hash
+# --------------------------------------------------------------------------
+
+def test_upstream_calibration_hashes_reads_meta_and_provenance():
+    assert _upstream_calibration_hashes(
+        {"meta": {"calib_hash": "aa"}}) == {"aa"}
+    assert _upstream_calibration_hashes(
+        {"provenance": {"calib_hashes": ["bb", "cc"]}}) == {"bb", "cc"}
+    # Pre-R14 artifacts stamp nothing -> the check stays inert rather than guess.
+    assert _upstream_calibration_hashes({"meta": {"nsamples": 8}}) == set()
+    assert _upstream_calibration_hashes(None) == set()
+
+
+def test_assert_calibration_disjoint_passes_on_disjoint_draws():
+    checked = _assert_calibration_disjoint(
+        ["sel1", "sel2"], {"probe": {"cost1"}, "cost": {"cost1", "cost2"}})
+    assert checked["probe"]["overlap"] == []
+    assert checked["cost"]["upstream_hashes"] == 2
+
+
+def test_assert_calibration_disjoint_hard_errors_on_intersection():
+    with pytest.raises(ValueError, match="held-out violation"):
+        _assert_calibration_disjoint(["sel1", "shared"], {"cost": {"shared"}})
+
+
+def test_calib_skip_first_on_wikitext_raises_instead_of_silently_skipping():
+    """R14(iii): the wikitext branch computed `skip` and never applied it."""
+    args = SimpleNamespace(
+        calib_repeats=1, n_calib_samples=4, calib_skip_first=32,
+        dataset="", calib_split="train", calib_seed=42, calib_seqlen=128,
+        calib_repeat_seed_stride=1,
+    )
+    with pytest.raises(ValueError, match="only implemented for --dataset"):
+        _load_calibration_repeats(object(), args)
+
+    # No skip requested -> the wikitext branch is untouched.
+    args.calib_skip_first = 0
+    calls = {}
+
+    def _fake_loader(tokenizer, n, seqlen, *, split, seed):
+        calls["seed"] = seed
+        return torch.zeros(n, seqlen, dtype=torch.long)
+
+    import prismaquant.validate_assignments_kl as mod
+    original = mod.load_wikitext_calibration_windowed
+    mod.load_wikitext_calibration_windowed = _fake_loader
+    try:
+        repeats = _load_calibration_repeats(object(), args)
+    finally:
+        mod.load_wikitext_calibration_windowed = original
+    assert len(repeats) == 1 and repeats[0].shape == (4, 128)
+    assert calls["seed"] == 42
+
+
+def test_calibration_provenance_hashes_are_per_repeat():
+    repeats = [torch.arange(8).reshape(2, 4), torch.arange(8, 16).reshape(2, 4)]
+    prov = _calibration_provenance(repeats)
+    assert len(prov["calib_repeat_hashes"]) == 2
+    assert len(set(prov["calib_repeat_hashes"])) == 2
+    # The combined digest is a different construction from the element hashes,
+    # which is why the disjointness check intersects the ELEMENTS.
+    assert prov["calib_hash"] not in prov["calib_repeat_hashes"]

@@ -15,6 +15,9 @@ from .qwen3 import Qwen3Profile
 
 class Qwen3MoeProfile(Qwen3Profile):
 
+    # Detection priority (lower = consulted first): must precede Qwen3Profile — `qwen3_moe` archs start with the qwen3 prefix.
+    priority = 120
+
     @classmethod
     def matches(cls, model_type: str, architectures: list[str]) -> bool:
         if model_type == "qwen3_moe":

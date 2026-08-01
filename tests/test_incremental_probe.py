@@ -95,7 +95,16 @@ class TestIncrementalProbe(unittest.TestCase):
         ref = MiniMaxM2Experts()
         fast = MiniMaxM2Experts()
         fast.load_state_dict(ref.state_dict())
-        self.assertEqual(_set_minimax_fast_moe(fast, True, chunk_size=2), 1)
+        # `class_names` now comes from the model profile
+        # (`packed_expert_module_class_names()` -> the spec's
+        # `packed_experts.module_class_names`), replacing the literal
+        # "MiniMaxM2Experts" that used to live in incremental_probe.py.
+        self.assertEqual(
+            _set_minimax_fast_moe(
+                fast, True, chunk_size=2,
+                class_names=("MiniMaxM2Experts",)),
+            1,
+        )
 
         hidden_ref = torch.randn(11, 5, requires_grad=True)
         hidden_fast = hidden_ref.detach().clone().requires_grad_(True)

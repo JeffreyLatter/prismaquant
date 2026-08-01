@@ -11,13 +11,14 @@ Exports:
   - register_profile(cls): register a custom profile at runtime
   - ModelGraph / ModelStructureSpec: typed model decomposition artifacts
 
-MiniMaxM2Profile was archived 2026-04-24; see archive/minimax_m2p7/README.md.
+MiniMaxM2Profile was archived 2026-04-24; see archive/minimax_m2p7_2026-04-24/README.md.
 """
 from .base import ModelProfile
 from .default import DefaultProfile
 from .deepseek_v4 import DeepseekV4Profile
 from .gemma4 import Gemma4Profile
 from .hy_v3 import HyV3Profile
+from .laguna import LagunaProfile
 from .lfm2_moe import Lfm2MoeProfile
 from .qwen3 import Qwen3Profile
 from .qwen3_5 import Qwen3_5Profile
@@ -49,6 +50,7 @@ __all__ = [
     "Qwen3_5DenseProfile",
     "Gemma4Profile",
     "HyV3Profile",
+    "LagunaProfile",
     "Lfm2MoeProfile",
     "detect_profile",
     "detect_profile_with_warning",

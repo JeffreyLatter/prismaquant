@@ -43,7 +43,13 @@ def test_packed_expert_param_names(profile):
 
 
 def test_source_passthrough_prefixes_are_spec_backed(profile):
+    # `mtp.` covers the nextn block. DSv4 takes the hy_v3 route until its
+    # MTP is actually quantized: `has_mtp() -> False` (so probe/cost/
+    # allocator never see it, and `checkpoint_to_live_name` drops the
+    # keys) + verbatim passthrough here so vLLM's nextn spec decode still
+    # loads. Audit R12, 2026-07-30.
     assert profile.source_passthrough_prefixes() == (
+        "mtp.",
         "attn_sink",
         "hc_",
         "compressor.ape",

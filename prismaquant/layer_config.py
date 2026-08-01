@@ -11,12 +11,39 @@ import json
 from collections.abc import Mapping
 from pathlib import Path
 
+from prismaquant.cb_layout import CB_FORMAT_NAMES
 from prismaquant.schemas import validate_layer_config_payload
 
 
 def strip_weight(name: str) -> str:
     """Normalize tensor names to module qnames."""
     return name[:-len(".weight")] if name.endswith(".weight") else name
+
+
+# Reserved non-tensor key in layer_config.json. No module qname can collide
+# with it (dunder-wrapped, no dots), so allocator metadata can travel WITH the
+# assignment instead of in a side report the exporter never reads (re-vet R11 /
+# debt D4: the allocator resolved `vllm_packed_moe` while export re-resolved
+# `gguf` from the spec, silently coercing 226 Hy3 FP8 Linears to BF16).
+LAYER_CONFIG_META_KEY = "__prismaquant__"
+
+
+def is_layer_config_meta_key(name: str) -> bool:
+    return str(name) == LAYER_CONFIG_META_KEY
+
+
+def layer_config_metadata(payload: Mapping) -> dict:
+    """Return the reserved metadata block of a layer_config payload."""
+    meta = payload.get(LAYER_CONFIG_META_KEY) if isinstance(payload, Mapping) else None
+    return dict(meta) if isinstance(meta, Mapping) else {}
+
+
+def read_layer_config_metadata(path: str | Path) -> dict:
+    try:
+        payload = json.loads(Path(path).read_text())
+    except Exception:
+        return {}
+    return layer_config_metadata(payload) if isinstance(payload, Mapping) else {}
 
 
 # GGUF k-quant + IQ lane (llama.cpp / vLLM-GGUF serving). Kept as an explicit
@@ -26,6 +53,10 @@ _GGUF_FORMAT_NAMES = frozenset(
     {"Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "Q8_0",
      "IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ3_XXS", "IQ3_S", "IQ4_XS", "IQ4_NL"}
 )
+
+# Backwards-compatible private name used by exporters. The canonical producer
+# ladder is torch-free ``cb_layout.CB_FORMAT_NAMES``; do not rebuild it here.
+_NVFP4_CB_FORMAT_NAMES = CB_FORMAT_NAMES
 
 
 def canonicalize_format(entry: dict | str | int) -> str:
@@ -43,6 +74,17 @@ def canonicalize_format(entry: dict | str | int) -> str:
             if gguf_type not in _GGUF_FORMAT_NAMES:
                 raise ValueError(f"unsupported gguf scheme: {entry!r}")
             return gguf_type
+        if dt == "nvfp4_cb":
+            rung = "S" if str(entry.get("cb_mode", "")) == "signed" else "K"
+            name = f"NVFP4_CB_{rung}{int(entry['cb_k'])}"
+            if name not in _NVFP4_CB_FORMAT_NAMES:
+                raise ValueError(f"unsupported nvfp4_cb scheme: {entry!r}")
+            return name
+        if dt == "fp8_cb":
+            name = f"FP8_CB_K{int(entry['cb_k'])}"
+            if name not in _NVFP4_CB_FORMAT_NAMES:
+                raise ValueError(f"unsupported fp8_cb scheme: {entry!r}")
+            return name
         if dt == "nv_fp" and bits == 4:
             return "NVFP4"
         if dt == "mx_fp" and bits == 4:
@@ -79,6 +121,8 @@ def canonicalize_format(entry: dict | str | int) -> str:
         value = entry.lower()
         if value.upper() in _GGUF_FORMAT_NAMES:
             return value.upper()
+        if value.upper() in _NVFP4_CB_FORMAT_NAMES:
+            return value.upper()
         if value in ("nvfp4", "fp4", "4"):
             return "NVFP4"
         if value in ("mxfp4", "mx_fp4"):
@@ -107,6 +151,7 @@ def canonicalize_assignment(raw: Mapping) -> dict[str, str]:
     return {
         strip_weight(str(name)): canonicalize_format(entry)
         for name, entry in raw.items()
+        if not is_layer_config_meta_key(name)
     }
 
 

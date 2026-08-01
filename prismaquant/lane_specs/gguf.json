@@ -1,0 +1,59 @@
+{
+  "schema": "prismaquant.lane_spec.v1",
+  "id": "gguf",
+  "export_container": "gguf",
+  "runtime": "llama.cpp",
+  "description": "One GGUF artifact serves llama.cpp natively (and vLLM via the GGUF path). The lane's own harness is llama-perplexity, which is why its KL evaluator is an adapter rather than the resident one — the artifact cannot be materialised into a torch model without leaving the format under test.",
+  "serving_profiles": ["gguf"],
+  "endpoint": {
+    "kind": "llama_server",
+    "base_url": "http://127.0.0.1:8000",
+    "health_path": "/health",
+    "metrics_path": "/metrics"
+  },
+  "serve": {
+    "scripts": [],
+    "command": [
+      "${LLAMA_CPP_DIR}/build/bin/llama-server",
+      "-m", "${MODEL}",
+      "--host", "0.0.0.0", "--port", "8000",
+      "-ngl", "99"
+    ]
+  },
+  "gates": [
+    {
+      "id": "load_generate",
+      "runner": "${LLAMA_CPP_DIR}/build/bin/llama-completion",
+      "shipcard_slot": "native_export.eager",
+      "description": "Load + greedy generate, run inline by run-pipeline.sh's GGUF branch — the one lane whose load smoke is already in the pipeline, because its runtime is a binary and not an importable package."
+    },
+    {
+      "id": "ship_gate.ppl_p99nll",
+      "runner": "prismaquant.validate_quantized_model --base-url http://127.0.0.1:8000/v1 --shipcard",
+      "shipcard_slot": "ship_gate",
+      "description": "llama-server exposes an OpenAI-compatible endpoint, so the same endpoint-agnostic ship gate applies unchanged."
+    },
+    {
+      "id": "gold.kl",
+      "runner": "llama-perplexity --kl-divergence-base <base_logits.bin> --kl-divergence",
+      "shipcard_slot": "gold.kl",
+      "description": "The lane's native KL harness: base logits saved once from the bf16 skeleton, then per artifact."
+    },
+    {
+      "id": "gold.ppl",
+      "runner": "llama-perplexity -f wiki.test.raw",
+      "shipcard_slot": "gold.ppl",
+      "description": "PPL from the same harness; Mean PPL(Q) is parsed from the same output as the KL."
+    }
+  ],
+  "kl_evaluator": {
+    "kind": "llama_perplexity",
+    "entrypoint": "prismaquant.gguf_kl_evaluator:measure_assignment_kl",
+    "note": "Wraps `llama-perplexity --kl-divergence-base` behind the validate_assignments_kl interface: (mean, per_sequence, stats) with the gold lane's key names. per_sequence is EMPTY — llama-perplexity reports aggregate quantiles, not per-sequence values — so stats carries kl_tail_domain='aggregate' and the tail keys come from its own quantiles rather than being recomputed."
+  },
+  "advisory_gates": true,
+  "notes": [
+    "This evaluator is what makes --packed-role-split measurable: the role split hard-gates on supports_per_role_expert_schemes, which only gguf declares, and the lane previously had no validated-frontier evaluator at all (D26).",
+    "GGUF cost/render lockstep is keyed on PRISMAQUANT_GGUF_IMATRIX: the cost render applies the imatrix exactly when the export does (§4.7)."
+  ]
+}

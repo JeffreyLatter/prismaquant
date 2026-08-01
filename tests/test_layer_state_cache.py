@@ -207,6 +207,21 @@ def test_layer_state_cache_strict_miss_escape_allows_rtn(monkeypatch):
     assert len(cache.layer_inputs) == 2
 
 
+def test_layer_state_cache_never_uses_unweighted_cb_rtn_fallback(monkeypatch):
+    monkeypatch.setenv("PRISMAQUANT_STRICT_PRODUCTION_CACHE", "0")
+    model = _TinyCausalLM(layers=2, use_lm_head=False).eval()
+    cache = LayerHiddenStateCache(model)
+
+    with pytest.raises(RuntimeError, match="required for CB fallback"):
+        cache.populate(
+            {"model.layers.0.proj": "NVFP4_CB_K16"},
+            _calib_ids(batch=1, seq=3),
+            device="cpu",
+            dtype=torch.float32,
+            production_weight_cache=ProductionWeightCache({}, levers={}),
+        )
+
+
 def test_layer_state_cache_invalidate_clears_state():
     torch.manual_seed(3)
     model = _TinyCausalLM().eval()

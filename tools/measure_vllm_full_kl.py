@@ -7,14 +7,46 @@ import argparse
 import json
 import math
 import random
+import sys
 import time
 from pathlib import Path
 
 import torch
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+try:  # package mode (`python -m tools.measure_vllm_full_kl`)
+    from .serve_fingerprint import git_commit, self_manifest
+    from .spec_decode_guard import refuse_if_spec_decode
+except ImportError:  # script mode (`python /repo/tools/measure_vllm_full_kl.py`)
+    from serve_fingerprint import git_commit, self_manifest  # type: ignore
+    from spec_decode_guard import refuse_if_spec_decode  # type: ignore
+
 # vLLM / datasets / transformers are imported lazily inside the functions
 # that need them so the position-KL math stays unit-testable in environments
 # without a serving stack.
+
+#: Set by `_load_llm` once the engine exists; stamped on every result dict.
+#: `None` means "could not inspect", which the shipcard refuses — an unverified
+#: negative is exactly what the draft-logprobs trap looked like.
+_SPEC_DECODE_DETECTED: bool | None = None
+
+
+def _provenance(args) -> dict:
+    """Serving-stack + code provenance for a result dict (R15).
+
+    This tool builds its own in-process `LLM`, so the measuring process *is*
+    the server and `/proc/self/maps` is the authoritative residency read. Two
+    result JSONs whose `serve_fingerprint` differs are not comparable as a
+    delta (`tools/kl_ab.py` refuses them).
+    """
+    manifest = self_manifest(extra={"measurement_tool": "measure_vllm_full_kl"})
+    return {
+        "git_commit": git_commit(),
+        "serve_fingerprint": manifest["serve_fingerprint"],
+        "serve_manifest": manifest,
+        "spec_decode_detected": _SPEC_DECODE_DETECTED,
+    }
 
 
 def _load_wikitext_calibration(
@@ -76,7 +108,14 @@ def _load_llm(args, *, max_model_len: int) -> "LLM":
         # max_num_batched_tokens >= their chunk-alignment floor (~2096);
         # the seqlen+16 max_model_len alone can drive it below that.
         kwargs["max_num_batched_tokens"] = args.max_num_batched_tokens
-    return LLM(**kwargs)
+    llm = LLM(**kwargs)
+    global _SPEC_DECODE_DETECTED
+    _SPEC_DECODE_DETECTED = refuse_if_spec_decode(
+        llm=llm,
+        allow=getattr(args, "allow_spec_decode", False),
+        context="kl",
+    )
+    return llm
 
 
 def _resolve_vocab_size(llm: LLM, tokenizer) -> int:
@@ -284,6 +323,7 @@ def _teacher(args) -> int:
             "topk_coverage_mean": float(cov.mean()),
             "topk_coverage_min": float(cov.min()),
             "elapsed_s": time.monotonic() - started,
+            **_provenance(args),
         }
         Path(args.meta_output).write_text(json.dumps(meta, indent=2))
         print(json.dumps(meta, indent=2), flush=True)
@@ -310,6 +350,7 @@ def _teacher(args) -> int:
         "vocab_size": int(vocab_size),
         "teacher_shape": list(logprobs.shape),
         "elapsed_s": time.monotonic() - started,
+        **_provenance(args),
     }
     Path(args.meta_output).write_text(json.dumps(meta, indent=2))
     print(json.dumps(meta, indent=2), flush=True)
@@ -405,6 +446,7 @@ def _student_all_positions(args, payload) -> int:
         "n_confident": int(confident.sum()),
         "kl_per_sample": [float(x) for x in kl_pos.mean(dim=1).tolist()],
         "elapsed_s": time.monotonic() - started,
+        **_provenance(args),
     }
     Path(args.output).write_text(json.dumps(result, indent=2))
     print(json.dumps(result, indent=2), flush=True)
@@ -444,6 +486,7 @@ def _student(args) -> int:
         "kl_max": float(per_sample.max().item()),
         "kl_per_sample": [float(x) for x in per_sample.tolist()],
         "elapsed_s": time.monotonic() - started,
+        **_provenance(args),
     }
     Path(args.output).write_text(json.dumps(result, indent=2))
     print(json.dumps(result, indent=2), flush=True)
@@ -471,6 +514,11 @@ def main() -> int:
         "position (n_positions = n_samples*(seqlen-1)).")
     parser.add_argument("--prompt-top-k", type=int, default=1024)
     parser.add_argument("--enforce-eager", action="store_true")
+    parser.add_argument(
+        "--allow-spec-decode", action="store_true",
+        help="proceed even when the engine has a speculative config. The "
+        "numbers are then the DRAFT model's, not the artifact's; the shipcard "
+        "refuses such a record (see tools/spec_decode_guard.py).")
     parser.add_argument("--max-num-batched-tokens", type=int, default=None)
     parser.add_argument(
         "--window-seed", type=int, default=42,

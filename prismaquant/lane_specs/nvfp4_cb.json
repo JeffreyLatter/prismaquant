@@ -1,0 +1,67 @@
+{
+  "schema": "prismaquant.lane_spec.v1",
+  "id": "nvfp4_cb",
+  "export_container": "nvfp4_cb",
+  "runtime": "vllm+gridbook_plugin",
+  "description": "NVFP4-CB / FP8-CB codebook container, served by the separately released Gridbook plugin pinned in scripts/lib/gridbook_runtime_pin.json. PrismaQuant does not vendor the runtime. Same OpenAI endpoint as the native lane — which is exactly why the CB half of R16 is wiring, not capability: validate_quantized_model is already endpoint-agnostic and knows nothing about the container.",
+  "serving_profiles": ["nvfp4_cb"],
+  "endpoint": {
+    "kind": "openai",
+    "base_url": "http://127.0.0.1:8000/v1",
+    "health_path": "/health",
+    "metrics_path": "/metrics"
+  },
+  "serve": {
+    "scripts": [
+      "scripts/serve_qwen27b_smoke.sh",
+      "scripts/serve_hy3_smoke.sh",
+      "scripts/serve_hy3_teb.sh",
+      "scripts/serve_laguna_smoke.sh"
+    ],
+    "command": [
+      "bash", "${SERVE_SCRIPT}"
+    ]
+  },
+  "gates": [
+    {
+      "id": "load_generate",
+      "runner": "scripts/serve_*.sh (plugin serving env) + greedy generate",
+      "shipcard_slot": "native_export.eager",
+      "description": "CB artifacts load ONLY through the gridbook plugin, so the load+generate smoke runs in the plugin's serving env, not in the build venv. The gridbook cb_fill_guard raises from process_weights_after_loading if any CB expert tensor went unconsumed (D3) — the failure mode this gate exists for is coherent-looking garbage, not a crash."
+    },
+    {
+      "id": "ship_gate.ppl_p99nll",
+      "runner": "prismaquant.validate_quantized_model --base-url ... --shipcard",
+      "shipcard_slot": "ship_gate",
+      "description": "Unchanged from the native lane: same script, same endpoint, same thresholds."
+    },
+    {
+      "id": "gold.kl",
+      "runner": "tools/measure_vllm_full_kl.py",
+      "shipcard_slot": "gold.kl",
+      "description": "Served KL-vs-BF16 in the plugin serving env. Match extension residency across A/B arms: loading a CUDA extension shifts allocator addresses and moves confident-KL by up to 17%."
+    },
+    {
+      "id": "gold.ppl",
+      "runner": "tools/measure_wikitext_ppl.py",
+      "shipcard_slot": "gold.ppl",
+      "description": "Direct WikiText PPL on the served CB artifact."
+    },
+    {
+      "id": "perf.prefill",
+      "runner": "scripts/serve_hy3_teb.sh + TTFT/decode read",
+      "shipcard_slot": null,
+      "description": "INV-2: no rung is production-eligible until it clears the prefill perf gate as well as the quality gate — a Triton-masquerade fallback that serves correct tokens slowly is a failed lane, not a passed one."
+    }
+  ],
+  "kl_evaluator": {
+    "kind": "validate_assignments_kl",
+    "entrypoint": "prismaquant.validate_assignments_kl:main",
+    "note": "Reachable on this lane since CB Milestone C (R3): the production cache renders CB rungs imatrix-weighted via --col-weights, so a frontier KL measures the bytes the exporter ships. Selection on this lane is still SURROGATE by default — validated-frontier CB selection is enabled, not promoted."
+  },
+  "advisory_gates": true,
+  "notes": [
+    "Required CI compares the producer profiles declared CB-eligible with the pinned Gridbook consumer contract; the preflight refuses any mismatch (R6).",
+    "Single-GPU only: the pinned Gridbook contract has no qualified TP path."
+  ]
+}

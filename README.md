@@ -1,11 +1,12 @@
 # PrismaQuant
 
-**Mixed-precision LLM quantization that chooses the right format for every weight matrix, selected on real end-to-end KL — shipped as artifacts that stock inference engines serve with no forked runtime and no custom kernels.**
+**Mixed-precision LLM quantization that chooses the right format for every weight matrix, selected on real end-to-end KL — shipped as artifacts that stock inference engines serve on an unforked runtime.**
 
-PrismaQuant's allocator is **AURA** (*Production-Faithful KL–Fisher Allocation*): a per-Linear cost model built from KL-Fisher probes of the full model multiplied against the *production-rendered* weight error — the exact bytes that ship — solved as a multi-choice knapsack, and gated by real KL measured on a held-out split before anything is published. Two output containers:
+PrismaQuant's allocator is **AURA** (*Production-Faithful KL–Fisher Allocation*): a per-Linear cost model built from KL-Fisher probes of the full model multiplied against the *production-rendered* weight error — the exact bytes that ship — solved as a multi-choice knapsack, and gated by real KL measured on a held-out split before anything is published. Three output containers:
 
-- **`compressed-tensors`** — vanilla vLLM serves it natively (`vllm serve $WORK_DIR/exported`). NVFP4 / FP8 / BF16 per Linear, CUTLASS kernels on Blackwell.
-- **GGUF** — llama.cpp *and* vLLM (via the GGUF plugin) serve the same file. Full k-quant + IQ menu, per-tensor mixed, imatrix-weighted. This is how a 295B MoE fits on one 128 GB box.
+- **`compressed-tensors`** — vanilla vLLM serves it natively (`vllm serve $WORK_DIR/exported`), no custom kernels. NVFP4 / FP8 / BF16 per Linear, CUTLASS kernels on Blackwell.
+- **GGUF** — llama.cpp *and* vLLM (via the GGUF plugin) serve the same file, again with no PrismaQuant kernels. Full k-quant + IQ menu, per-tensor mixed, imatrix-weighted. This is how a 295B MoE fits on one 128 GB box.
+- **Codebook (`NVFP4-CB` / `FP8-CB`)** — served by **gridbook**, our out-of-tree vLLM quantization plugin, which *does* ship its own Blackwell CUDA kernels. Still an unforked vLLM: install the exact commit in `scripts/lib/gridbook_runtime_pin.json`, no core patches. See below.
 
 ---
 
@@ -48,7 +49,8 @@ export MODEL_PATH=/path/to/model
 export WORK_DIR=./dq-runs/mymodel
 export FORMATS=NVFP4,FP8_DYNAMIC,BF16   # the production menu — FP8 belongs in every recipe
 export TARGET_BITS=4.75
-export COST_MODE=aura                    # AURA cost (default: production-render-score)
+# COST_MODE=aura is the DEFAULT since 2026-07-30 (KL-Fisher x production-rendered dW);
+# set COST_MODE=production-render-score to reproduce pre-flip artifacts.
 export SELECTION_MODE=validated-surrogate  # real-KL frontier selection (default: surrogate)
 
 ./prismaquant/run-pipeline.sh
@@ -151,6 +153,16 @@ GGUF quantizers are PrismaQuant's own GPU implementations (imatrix-weighted grid
 
 ---
 
+## Codebook lane (gridbook)
+
+Below NVFP4's 4.5 bpw floor the vLLM-native menu runs out of rungs, and the GGUF IQ formats that fill the gap carry a large prefill tax on this hardware. The **NVFP4-CB / FP8-CB** product-codebook formats open measured 2–6 bpw rungs with a served kernel behind them: the resident weight is a packed k-bit index stream plus a tiny shared codebook, expanded inside the kernel — the dense `[N,K]` matrix is never materialized in HBM.
+
+Serving is the separately released [`gridbook`](https://github.com/RobTand/gridbook) package: an out-of-tree vLLM quantization plugin (registry key `gridbook`, legacy read alias `prismaquant`) with zero vLLM-core patches. It carries its own JIT-built CUDA kernels for Blackwell — `csrc/cb_gemv.cu` for decode and CUTLASS prefill kernels — with a correct Triton fallback when `nvcc` is unavailable on a supported NVIDIA deployment. Export is `EXPORT_CONTAINER=nvfp4_cb` (`prismaquant/export_nvfp4_cb.py`). PrismaQuant contains no copy of the runtime: its only supported integration source is the immutable commit in `scripts/lib/gridbook_runtime_pin.json`, and CI compares producer profiles/rungs/layouts to that install's packaged `runtime_contract.json`. Gridbook may publish the same source as a release, but PrismaQuant serving and validation never replace the commit pin with a moving or merely version-matched package request.
+
+Public artifact: [`rdtand/Hy3-295B-A21B-gridbook-2.9bit-vllm`](https://huggingface.co/rdtand/Hy3-295B-A21B-gridbook-2.9bit-vllm) — 295B/21B-active at 2.9 bpw on **one** DGX Spark, prefill 89 tok/s against the same model's GGUF IQ artifact at 42 tok/s. No directional quality claim at this scale, same as the GGUF lane. Lane record: [`docs/lanes/nvfp4-cb/`](docs/lanes/nvfp4-cb/).
+
+---
+
 ## Architectures
 
 First-class profiles in-tree:
@@ -161,6 +173,7 @@ First-class profiles in-tree:
 - **MiniMax M2 / M2.7** — nested per-expert MoE, native-FP8 source
 - **Gemma4** — multi-layer-type rope, KV sharing, visual/text profiles
 - **LFM2.5** — per-expert MoE + short-conv layers
+- **poolside Laguna** (`laguna`) — 117B/256-expert sparse MoE, separate DFlash drafter as the MTP-analog
 
 A new architecture is a `model_profiles/` registration (structure spec JSON + a small profile class); most of the fused-group and naming plumbing is auto-derived from the vLLM model class, so ports land in ~30–200 LoC.
 
@@ -191,6 +204,13 @@ The rules this project holds itself to, because low-bit quantization results are
 - **Held-out means held-out.** Selection KL uses text the cost stage never saw.
 - **No hand-tuned bans.** If the allocator picks something that breaks, the cost model is wrong — fix the measurement, don't constrain the optimizer. The only constants allowed are ones derived from a dtype's numerical precision.
 - **No quality claims we can't back.** The 295B artifact ships with an explicit "no quality claims" section because its teacher can't be measured on the target hardware. Provenance (git commit, calibration hash, assignment hash) is baked into every artifact's metadata.
+
+---
+
+## Documentation
+
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — the system map: stages, contracts, containers, where each decision is actually made.
+- [`docs/README.md`](docs/README.md) — index of the rest: normative design rules and runtime flags (`docs/design/`), per-container lane records (`docs/lanes/`), dated results and audits, and the archive.
 
 ---
 

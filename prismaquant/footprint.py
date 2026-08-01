@@ -1,12 +1,15 @@
-"""Exact on-disk artifact footprint for a quantization assignment.
+"""Exact serialized tensor-data footprint for a quantization assignment.
 
 The fit-the-card bit-rate selector (see ``saturation_select.select_under_byte
 _budget``) needs to map an allocation -> the GB the exported compressed-tensors
-checkpoint will occupy on disk, *before* paying for an export. This module is
-that map, and it is exact (not the handover's hand-fit ``fixed_floor + 3.04*bpp``
-linear approximation): it reproduces the real exported
-``model.safetensors.index.json`` ``metadata.total_size`` to 0.00% on the
-Qwen3.6-27B aura / baseline / aura_525 artifacts.
+checkpoint will put in safetensors data spans, *before* paying for an export.
+This module is that payload map, and it is exact (not the handover's hand-fit
+``fixed_floor + 3.04*bpp`` linear approximation): it reproduces the exported
+``model.safetensors.index.json`` ``metadata.total_size``.  That metadata is a
+tensor-payload total, not a filesystem-size total: safetensors headers,
+container metadata, JSON configs, tokenizer assets, and other non-weight files
+are intentionally outside this pre-export budget.  CB exporters persist a
+separate measured ``provenance.artifact_inventory`` after writing every file.
 
 The accounting is the same identity the streaming exporter ships:
 
@@ -58,6 +61,11 @@ from typing import Iterable, Mapping
 
 from . import format_registry as fr
 from .allocator_solver import _shape_from_stats
+from .nvfp4_cb_footprint import (
+    CBSerializationContext,
+    cb_assignment_payload_breakdown,
+    is_cb_format,
+)
 
 # safetensors header dtype -> bytes per element (header carries the source
 # dtype string; we only need it to derive source-bytes-per-param when the
@@ -538,8 +546,15 @@ def assignment_artifact_bytes(
     regime: str = "bf16",
     canonicalize: bool = True,
     context: str = "assignment_artifact_bytes",
+    cb_serialization_context: CBSerializationContext | None = None,
 ) -> dict:
-    """Exact on-disk bytes of the exported artifact for ``assignment``.
+    """Exact serialized tensor-data bytes for ``assignment``.
+
+    The historical ``artifact_bytes`` result key is retained for API and
+    recipe compatibility, but its scope is explicitly tensor data spans.  It
+    does *not* include safetensors headers/container metadata or non-weight
+    files.  A completed CB export records those measured filesystem bytes
+    separately under ``provenance.artifact_inventory``.
 
     ``assignment`` maps Linear qname -> format name (the allocator's *expanded*,
     post-promotion per-Linear assignment, so fused-sibling / packed-MoE coupling
@@ -585,11 +600,19 @@ def assignment_artifact_bytes(
     (``resolve_reencoded_source_bytes`` / ``check_floor_non_negative``) so a
     sweeping caller can name the rung it was pricing.
 
-    Returns a dict: ``artifact_bytes``, ``floor_bytes``, ``body_quant_bytes``,
-    ``reencoded_source_bytes``, ``n_reencoded``, ``n_missing_stats``,
-    ``missing_stats_names``, ``regime``, ``source_accounting``.
+    Returns a dict: compatibility alias ``artifact_bytes``, explicit
+    ``artifact_payload_bytes`` / ``artifact_byte_scope``, ``floor_bytes``,
+    ``body_quant_bytes``,
+    ``cb_tensor_payload_bytes``, ``cb_codebook_sidecar_bytes``,
+    ``cb_serialized_payload``, ``reencoded_source_bytes``, ``n_reencoded``,
+    ``n_missing_stats``, ``missing_stats_names``, ``regime``,
+    ``source_accounting``. CB assignments require
+    ``cb_serialization_context`` so a v1/v2 layout or sidecar sharing policy is
+    never inferred silently.
     """
     body_quant = 0
+    cb_assignment: dict[str, str] = {}
+    cb_shapes: dict[str, tuple[int, ...]] = {}
     reenc_by_name: dict[str, int] = {}
     priced: list[str] = []
     missing_stats: list[str] = []
@@ -602,13 +625,34 @@ def assignment_artifact_bytes(
             continue
         shape = _shape_from_stats(entry)
         name = fr.canonical_format_name(fmt) if canonicalize else fmt
-        body_quant += fr.get_format(name).memory_bytes_for_shape(shape)
+        if is_cb_format(name):
+            if cb_serialization_context is None:
+                raise ValueError(
+                    f"[footprint] {context}: assignment contains {name} but "
+                    "no CBSerializationContext was supplied. Exact CB bytes "
+                    "need scale coding/layout and codebook identity; refusing "
+                    "to silently price legacy-v1 FormatSpec bytes."
+                )
+            cb_assignment[qname] = name
+            cb_shapes[qname] = shape
+        else:
+            body_quant += fr.get_format(name).memory_bytes_for_shape(shape)
         if name == "NVFP4":
             body_quant += nvfp4_global_sidecar_bytes(qname, shape)
         if source_manifest is None:
             reenc_by_name[qname] = reencoded_source_bytes_for_shape(
                 shape, regime)
         priced.append(qname)
+    cb_payload = None
+    if cb_assignment:
+        cb_payload = cb_assignment_payload_breakdown(
+            cb_assignment,
+            cb_shapes,
+            context=cb_serialization_context,
+        )
+        # Includes each packed/row-scale tensor plus each FP16 codebook table
+        # set once per (codebook_ref, format).
+        body_quant += int(cb_payload["total_bytes"])
     if source_manifest is not None:
         reenc_by_name = resolve_reencoded_source_bytes(
             source_manifest, priced, context=context)
@@ -616,10 +660,24 @@ def assignment_artifact_bytes(
     floor = int(source_total_bytes) - reenc_src
     check_floor_non_negative(
         floor, int(source_total_bytes), reenc_by_name, context=context)
+    artifact_payload_bytes = floor + body_quant
     return {
-        "artifact_bytes": floor + body_quant,
+        # Compatibility name consumed by the allocator/selection records.
+        # Scope is pinned immediately below so it cannot be confused with a
+        # post-export stat(2) inventory.
+        "artifact_bytes": artifact_payload_bytes,
+        "artifact_payload_bytes": artifact_payload_bytes,
+        "artifact_byte_scope": "safetensors_tensor_data_spans",
+        "export_directory_bytes": None,
         "floor_bytes": floor,
         "body_quant_bytes": body_quant,
+        "cb_tensor_payload_bytes": (
+            int(cb_payload["tensor_payload_bytes"]) if cb_payload else 0
+        ),
+        "cb_codebook_sidecar_bytes": (
+            int(cb_payload["codebook_sidecar_bytes"]) if cb_payload else 0
+        ),
+        "cb_serialized_payload": cb_payload,
         "reencoded_source_bytes": reenc_src,
         "n_reencoded": len(priced),
         "n_missing_stats": len(missing_stats),
@@ -637,8 +695,9 @@ def assignment_artifact_gb(
     source_total_bytes: int,
     source_manifest: Mapping[str, int] | None,
     regime: str = "bf16",
+    cb_serialization_context: CBSerializationContext | None = None,
 ) -> float:
-    """Convenience: just the artifact size in GB (decimal, matches index.json).
+    """Convenience: tensor-data payload GB (decimal, matches index.json).
 
     ``source_manifest`` is required for the same reason as in
     :func:`assignment_artifact_bytes`; pass ``None`` to opt into the
@@ -649,6 +708,7 @@ def assignment_artifact_gb(
         source_total_bytes=source_total_bytes,
         regime=regime,
         source_manifest=source_manifest,
+        cb_serialization_context=cb_serialization_context,
     )["artifact_bytes"] / GB
 
 

@@ -50,6 +50,11 @@ from prismaquant.kl_fisher import (
     select_token_scope,
     token_count_for_logits,
 )
+from prismaquant.perturbed_x_cache import calibration_data_hash
+from prismaquant.nvfp4_cb_footprint import (
+    cb_cost_provenance,
+    is_cb_format,
+)
 
 SCHEMA = "prismaquant.aura_cost.v1"
 
@@ -225,11 +230,18 @@ def _delta_w(
                 f"for ({name!r}, {fmt!r}); refusing silent RTN fallback. Build the "
                 f"cache for this (Linear, format) or drop --require-production-cache.")
     spec = fr.get_format(fmt)
+    if is_cb_format(spec.name):
+        raise RuntimeError(
+            f"{name}={spec.name}: AURA CB delta requires a production-cache "
+            "render with the production col_weights/codebook contract; "
+            "refusing the unweighted direct fallback"
+        )
     qdq = getattr(spec, "quantize_dequantize", None)
     if qdq is None:
         return None
     try:
-        return qdq(weight.float()) - weight.float(), "rtn"
+        rendered = qdq(weight.float())
+        return rendered - weight.float(), "rtn"
     except Exception:
         return None
 
@@ -357,6 +369,7 @@ def compute_aura_cost(
     hook_harvest: bool = False,
     allow_packed_expert_omission: bool = False,
     probe_microbatch: int = 0,
+    collect_col_energy: bool = False,
 ) -> dict:
     """Return a cost.pkl payload dict (stats + costs) for the allocator.
 
@@ -403,6 +416,22 @@ def compute_aura_cost(
     names = list(linears.keys())
     fmts = [fr.canonical_format_name(f) for f in formats]
     nonzero_fmts = [f for f in fmts if f not in _ZERO_COST_FORMATS]
+    cb_provenance: dict[str, object] = {}
+    if any(is_cb_format(fmt) for fmt in fmts):
+        if production_cache is None:
+            raise RuntimeError(
+                "AURA CB cost requires a ProductionWeightCache with a "
+                "persisted CB render identity"
+            )
+        from prismaquant.production_weight_cache import (
+            production_cache_cb_render_provenance,
+        )
+
+        cb_provenance = production_cache_cb_render_provenance(
+            production_cache,
+            require_for_formats=fmts,
+            where="AURA production cache",
+        )
     # Passthrough-rule guard (opt-in; default off keeps the output byte-for-byte
     # identical). BF16 zero-cost is only valid when the source weight is already
     # bf16/fp16 -- on an fp32-source model loaded as fp32, casting W to BF16 is a
@@ -450,6 +479,13 @@ def compute_aura_cost(
     x2_probe: dict[tuple[str, str], list[float]] = {}
     dw_src: dict[tuple[str, str], str] = {}  # "rendered" | "rtn" per row
     g_trace: dict[str, float] = {}  # KL-Fisher weight-grad energy
+    # Opt-in per-column KL-Fisher energy: the SAME grad energy g_trace sums to a
+    # scalar, reduced over output rows to a length-in_features vector instead
+    # (col_energy[n][j] = Σ_probes Σ_out (∂probe/∂W)[:,j]²). Default OFF keeps
+    # the harvest arithmetic and payload bit-identical to today; when ON, its
+    # per-row sum equals g_trace by construction (same summand, coarser
+    # reduction). Feeds fisher_col_weights (exp 4: Fisher vs imatrix weighting).
+    col_energy: dict[str, torch.Tensor] = {}
     inv = 1.0 / float(n_probes)
 
     for ci, chunk in enumerate(chunks):
@@ -516,6 +552,14 @@ def compute_aura_cost(
             with torch.no_grad():
                 gf = g.float()
                 g_trace[name] += float((gf * gf).sum().item())
+                if collect_col_energy:
+                    # Reduce over output rows (dim 0) -> length-in_features
+                    # vector; kept resident (GPU-first) and summed across
+                    # probes/chunks. Targets are 2D nn.Linear ([out, in]);
+                    # packed 3D experts are guarded out of this harvest.
+                    ce = (gf * gf).sum(dim=0)
+                    prev = col_energy.get(name)
+                    col_energy[name] = ce if prev is None else prev + ce
                 for f in nonzero_fmts:
                     key = (name, f)
                     if key in dW:
@@ -653,6 +697,13 @@ def compute_aura_cost(
             "out_features": int(getattr(mod, "out_features", mod.weight.shape[0])),
             "n_probes": int(n_probes),
         }
+        if collect_col_energy and n in col_energy:
+            # Per-column KL-Fisher energy, mean over probes (× inv) so its sum
+            # matches h_trace (= g_trace × inv). fp32 CPU vector, length
+            # in_features. Key present ONLY when collection is enabled, so the
+            # default payload is byte-identical to today's.
+            stats[n]["fisher_col"] = (
+                col_energy[n].float() * inv).detach().cpu()
         costs[n] = {}
         for f in fmts:
             if f in _ZERO_COST_FORMATS:
@@ -719,10 +770,23 @@ def compute_aura_cost(
             "calib_sha256": hashlib.sha256(
                 calib_ids.detach().cpu().contiguous().numpy().tobytes()
             ).hexdigest(),
+            # R14: the canonical cross-stage calibration identity
+            # (perturbed_x_cache.calibration_data_hash). validate_assignments_kl
+            # intersects its own calib_repeat_hashes against these and refuses
+            # to select on text the cost stage already saw. calib_sha256 above
+            # is a different construction and is kept for continuity with
+            # existing artifacts.
+            "calib_hash": calibration_data_hash(calib_ids),
+            "calib_hashes": [calibration_data_hash(calib_ids)],
             "omitted_packed_experts": omitted_packed_experts,
             "dw_rendered_rows": n_rendered,
             "dw_rtn_fallback_rows": n_rtn,
             "git_commit": _git_commit(),
+            **(
+                cb_provenance
+                if cb_provenance
+                else cb_cost_provenance(fmts)
+            ),
         },
     }
 
@@ -826,8 +890,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "packed-MoE expert tensors from the cost payload. "
                         "Default is fail-fast because packed experts need an "
                         "empirical/hybrid expert-cost path, not silent omission.")
+    p.add_argument("--collect-col-energy", action="store_true",
+                   default=os.environ.get("PRISMAQUANT_FISHER_COL_WEIGHTS") == "1",
+                   help="Also emit a per-Linear per-column KL-Fisher energy "
+                        "vector (stats[name]['fisher_col'], length in_features) "
+                        "for Fisher-weighted codeword/scale search (nvfp4-cb "
+                        "exp 4). Additive: the rest of the payload is unchanged. "
+                        "Env: PRISMAQUANT_FISHER_COL_WEIGHTS=1.")
     p.add_argument("--device", default="cuda")
+    p.add_argument("--cost-mode", default="",
+                   help="Pipeline COST_MODE stamped into "
+                        "provenance['cost_mode'] (re-vet R2).")
     args = p.parse_args(argv)
+    from prismaquant.gpu_guard import require_cuda_hot_path
+    require_cuda_hot_path("aura_cost", args.device)
 
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -916,6 +992,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         hook_harvest=args.hook_harvest,
         allow_packed_expert_omission=args.allow_packed_expert_omission,
         probe_microbatch=args.probe_microbatch,
+        collect_col_energy=args.collect_col_energy,
     )
     payload["provenance"].update({
         "model": str(args.model),
@@ -927,6 +1004,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "calib_seqlen": int(args.calib_seqlen),
         "calib_seed": int(args.calib_seed),
         "production_cache": str(args.production_cache or ""),
+        # re-vet R2 precondition (i): which pipeline COST_MODE produced this.
+        "cost_mode": str(args.cost_mode or ""),
     })
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     with open(args.output, "wb") as fh:

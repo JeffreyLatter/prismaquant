@@ -13,14 +13,13 @@ and export pipeline treat every MLP as a regular dense Linear.
 """
 from __future__ import annotations
 
-import copy
-
-import torch.nn as nn
-
 from .qwen3_5 import Qwen3_5Profile
 
 
 class Qwen3_5DenseProfile(Qwen3_5Profile):
+
+    # Detection priority (lower = consulted first): must precede Qwen3_5Profile — the dense arch is a subset of the 3.5/3.6 family.
+    priority = 100
 
     @classmethod
     def matches(cls, model_type: str, architectures: list[str]) -> bool:
@@ -50,57 +49,12 @@ class Qwen3_5DenseProfile(Qwen3_5Profile):
         return "Qwen3_5ForConditionalGeneration"
 
     # ------------------------------------------------------------
-    # MTP — dense decoder layer (Qwen3_5 / Qwen3_6 share the class)
+    # MTP — inherited from Qwen3_5Profile.
+    #
+    # This profile used to carry a third near-copy of the MTP module
+    # (dead: production imported `mtp_module.MtpModule` directly, so
+    # nothing but the offline validator ever reached it). `MtpModule`
+    # picks `Qwen3_5DecoderLayer` / `Qwen3_5RMSNorm` from the config —
+    # exactly what this override built — so inheriting it is what the
+    # shipped path already did. Removed 2026-07-30 (audit R12).
     # ------------------------------------------------------------
-    def build_mtp_module(self, text_config) -> nn.Module:
-        """Mirror vLLM's `Qwen3_5MultiTokenPredictor.forward` but using
-        the dense `Qwen3_5DecoderLayer` / `Qwen3_5RMSNorm`."""
-        import torch
-        try:
-            from transformers.models.qwen3_5.modeling_qwen3_5 import (
-                Qwen3_5DecoderLayer, Qwen3_5RMSNorm,
-            )
-        except ImportError:
-            # Fallback for transformers builds where the dense module
-            # isn't split out yet — reuse the MoE decoder class; with
-            # num_experts=0 it degenerates to dense MLP.
-            from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
-                Qwen3_5MoeDecoderLayer as Qwen3_5DecoderLayer,
-                Qwen3_5MoeRMSNorm as Qwen3_5RMSNorm,
-            )
-
-        mtp_cfg = copy.deepcopy(text_config)
-        mtp_cfg.layer_types = ["full_attention"]
-        mtp_cfg.num_hidden_layers = 1
-        hidden = mtp_cfg.hidden_size
-        eps = mtp_cfg.rms_norm_eps
-
-        class _DenseMtpModule(nn.Module):
-            def __init__(self, cfg):
-                super().__init__()
-                self.fc = nn.Linear(hidden * 2, hidden, bias=False)
-                self.layers = nn.ModuleList([Qwen3_5DecoderLayer(cfg, layer_idx=0)])
-                self.norm = Qwen3_5RMSNorm(hidden, eps=eps)
-                self.pre_fc_norm_hidden = Qwen3_5RMSNorm(hidden, eps=eps)
-                self.pre_fc_norm_embedding = Qwen3_5RMSNorm(hidden, eps=eps)
-
-            def forward(self, inputs_embeds, body_hidden_states,
-                        position_embeddings, causal_mask, position_ids):
-                e = self.pre_fc_norm_embedding(inputs_embeds)
-                h = self.pre_fc_norm_hidden(body_hidden_states)
-                h = torch.cat([e, h], dim=-1)
-                h = self.fc(h)
-                h = self.layers[0](
-                    hidden_states=h,
-                    position_embeddings=position_embeddings,
-                    attention_mask=causal_mask,
-                    position_ids=position_ids,
-                    past_key_values=None,
-                    use_cache=False,
-                )
-                if isinstance(h, tuple):
-                    h = h[0]
-                h = self.norm(h)
-                return h
-
-        return _DenseMtpModule(mtp_cfg)

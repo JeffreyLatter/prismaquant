@@ -87,14 +87,14 @@ Source material to consult
    (especially iterate_perturbed_allocation.py, propagated_cost.py,
    perturbed_x_cache.py, allocator_solver.py, measure_quant_cost.py,
    kernels/nvfp4_fused.py)
-5. Documentation: /home/rob/prismaquant/docs/prismascout_overview.md,
-   /home/rob/prismaquant/docs/propagated_cost.md
+5. Documentation: /home/rob/prismaquant/docs/archive/prismascout_overview.md,
+   /home/rob/prismaquant/docs/archive/propagated_cost.md
 6. Handover record:
    /home/rob/prismaquant/.claude/prismaquant-handover-2026-04-29.md,
    /home/rob/prismaquant/.claude/codex-handover-2026-04-29-pm.md,
    /home/rob/prismaquant/.claude/prismaquant-handover-2026-05-01.md,
    /home/rob/prismaquant/.claude/prismaquant-handover-2026-05-02.md,
-   /home/rob/prismaquant/docs/prismascout_handover_2026-05-03.md
+   /home/rob/prismaquant/docs/archive/prismascout_handover_2026-05-03.md
 7. Prior deliberation (use as background, not as load-bearing source):
    /home/rob/prismaquant/scratch/deliberation/*.md
 8. Git history:

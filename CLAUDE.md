@@ -94,53 +94,88 @@ is the part he thinks *"could radically change all quantization if done right."*
 > end-to-end on a held-out split."* Cross-layer interactions stop being
 > quantities you must **model** and become quantities you **observe**.
 
-Everything downstream follows from this. Cheap, biased surrogates *propose*
+Everything downstream follows from this. A cheap, biased surrogate *proposes*
 candidates; expensive, faithful end-to-end KL on a held-out split *decides* what
-ships. The current paper's additive production-faithful allocator is **AURA**;
+ships.
+
+**There is one cost level, not three.** The surrogate is a *single faithful
+unary cost* over `(Linear, format)`, solved by a multi-choice knapsack DP:
+
+- **The cost.** **`COST_MODE=aura` by default since 2026-07-30** (re-vet R2):
+  `predicted_dloss` from a **KL-adjoint** probe × the production-rendered `dW`
+  (`aura_cost.py`), worth **−38%/−39.5% KL @4B** across two calibrations and
+  **−17.9% @27B** against the `h_trace × output_mse` baseline, and the recipe
+  behind both flagships. `production-render-score` is the explicit/legacy
+  spelling that reproduces every pre-flip artifact — per-Linear error measured
+  on the **production-rendered** weights the export will actually ship (score
+  field `weight_mse` since audit M6), so the surrogate, the KL validation and
+  the exported bytes are the same rendering (principle 8). Either way the
+  rendering identity is the point; what the flip changed is the *objective*
+  applied to it. `COST_MODE` is a spelling over `COST_RENDER × COST_OBJECTIVE`
+  (re-vet R3). On MoE the smooth
+  cost is route-flip-blind for routed experts, so packed experts get **measured**
+  empirical unit-KL instead (`expert_empirical_cost.py`), merged into one hybrid
+  payload. Fisher normalization detail: every `h_trace` row — dense or MoE
+  expert — is normalized by the same **global** calib token count, since tokens
+  never routed to an expert contribute zero gradient to the mean-Δloss
+  objective. Two superseded conventions were reversed on purpose: an explicit
+  ÷route_prob (removed in audit M4) and the per-routed-token division M4 kept as
+  "the implicit ÷token-fraction" (removed in PR #14 — it inflated rarely-routed
+  unpacked-expert rows by global/routed, i.e. inverted importance weighting; see
+  `finalize_fisher_stats`).
+- **The selection.** Render the allocator's Pareto candidates, **measure real
+  KL** on a **held-out** split, take the empirical Pareto frontier under
+  η-dominance, and pick the shipping point. The bit-rate target is a **byte
+  budget** ("fit the card", `footprint.py` exact) plus the saturation point B*;
+  **kneedle is demoted to a diagnostic** — it is axis-dependent and
+  LOO-unstable (fp32 4B: elbow at 5.00 in only 454/1000 bootstraps).
+- **The guarantee.** Coordinate-descent polish accepts only single-unit flips
+  that *strictly* reduce measured real KL — *provably no worse* than the chosen
+  frontier point (a contractual guarantee under the fixed polish-time evaluator,
+  explicitly **not** an optimality claim, and re-validated end-to-end after
+  export).
+
+### History: the retired cascade
+
+PrismaQuant was described for most of its life as a three-level cost cascade —
+**L1** additive Fisher → **L2** perturbed-X fixed point (re-measure each
+Linear's output MSE under the activation distribution the current assignment
+induces, re-solve, iterate) → **L3** propagated end-KL for a bounded
+neighborhood, paired against a frozen L2 baseline. **That framing was retired on
+2026-07-30** and the code walled at `archive/l3_propagated_2026-07-30/`
+(re-vet R4). Read the banner there before proposing any cross-layer revival.
+
+Neither L2 nor L3 was ever executed by the shipping pipeline, and three
+measurements closed the question:
+
+- **L2 beat additive L1 by −1.5%. AURA beat L1 by −38.5%** on the same baseline
+  (`aura_cascade_headtohead`). A better *single* cost was worth 25× more than a
+  second level.
+- **The pairwise residual is +5–12% and diffuse, 3 of 1180 pairs significant**
+  (`xlayer_sensitivity_2026_06_09`), and the apparent non-additivity was a
+  **bf16 differencing artifact** — per-Linear KLs *do* add in fp32
+  (`cross_layer_additivity_fp32`). Measure cost in fp32.
+- **L3-polish-of-many does not compose:** per-Linear L3 costs measured under an
+  L2 context don't sum to true end-KL when many flip at once (§9). Measured
+  one-at-a-time coordinate descent is the safe form, and it is what survives.
+
+The real-KL gate is what makes all of this safe rather than lucky: on the
+Qwen3.6-4B 4.5-bpp microbenchmark L3-polish-DP *regressed* (0.371→0.461) and was
+rolled back **by the gate**; coord-descent then recovered and surpassed
+(→0.245, 6 of 101 flips accepted) — and none of those flips would have been
+chosen by the additive surrogate.
+
+**Naming:** the current paper's production-faithful allocator is **AURA**.
 **PrismaSCOUT** is the retired prior cascade (Surrogate-Cascaded Optimization
-Under Tradeoff; an earlier internal name for the L3-polish piece was
-*PrismaClade*).
-
-### The cost cascade (cheap→faithful, each level gates the next)
-- **L1 — additive Fisher.** `predicted_dloss = ½·H_trace·MSE` per `(Linear,
-  format)`, from the diagonal-Fisher 2nd-order loss expansion. `H_trace` is the
-  empirical Fisher diagonal trace (one calibration backward pass; **every row —
-  dense or MoE expert — is normalized by the same global calib token count**,
-  since tokens never routed to an expert contribute zero gradient to the
-  mean-Δloss objective). Superseded conventions, both reversed on purpose: an
-  explicit ÷route_prob (removed in audit M4) and the per-routed-token division
-  that M4 kept as "the implicit ÷token-fraction" (removed in PR #14 — it
-  inflated rarely-routed unpacked-expert rows by global/routed, i.e. inverted
-  importance weighting; see `finalize_fisher_stats`). Solve the multi-choice
-  knapsack DP. Seconds.
-- **L2 — perturbed-X fixed point.** Re-measure each Linear's *output* MSE under
-  the activation distribution induced by the current assignment (upstream quant
-  noise shifts downstream inputs), re-solve, iterate to weighted-Hamming
-  convergence (~2–3 passes). Minutes. This is what folds inter-layer coupling
-  into the cost without modeling it.
-- **L3 — propagated end-KL** *(opt-in final pass).* For a bounded neighborhood of
-  uncertain Linears, measure paired BF16-vs-candidate **end-to-end** KL, with the
-  baseline frozen at the converged L2 assignment (not global BF16 — that
-  subtraction is what makes it a defensible *local* unary cost). Tens of minutes.
-
-### Selection: validated-frontier kneedle + non-regressive polish
-- Render the allocator's Pareto candidates, **measure real KL** on a **held-out**
-  split, take the empirical Pareto frontier under η-dominance, pick the **kneedle**
-  on measured `(bpp, KL)`, and report a **leave-one-out** stability check.
-- **Coordinate-descent polish** then accepts only single-unit flips that *strictly*
-  reduce measured real KL — *provably no worse* than the chosen frontier point
-  (a contractual guarantee under the fixed polish-time evaluator, explicitly
-  **not** an optimality claim, and re-validated end-to-end after export).
-- This is real: on the Qwen3.6-4B 4.5-bpp microbenchmark, L3-polish-DP *regresses*
-  (0.371→0.461, rolled back by the real-KL gate); coord-descent recovers and
-  surpasses (→0.245, 6 of 101 flips accepted) — and none of those flips would
-  have been chosen by the additive surrogate.
+Under Tradeoff); an earlier internal name for the L3-polish piece was
+*PrismaClade*.
 
 **Why CLADO/QUBO/HAWQ aren't the answer here:** the literature *models* the
 cross-layer bias (pairwise IQP, 2nd-order ILP, Shapley games). Robert *observes*
-it by gating every shippable candidate on real KL. The full integer-quadratic
-program was rejected — O(N²) per-pair measurement, and the O(N) cascade recovered
-the optimum to within 1–2%. The decision-unit *framing* from CLADO is kept
+it by gating every shippable candidate on real KL — and the measurements above
+say there is nothing there to model. The full integer-quadratic program was
+rejected: O(N²) per-pair measurement, for an optimum the O(N) path recovers to
+within 1–2%. The decision-unit *framing* from CLADO is kept
 (`decision_units.py`); the solver is archived.
 
 ---
@@ -213,6 +248,14 @@ the optimum to within 1–2%. The decision-unit *framing* from CLADO is kept
     uniform NVFP4 must use the same convention. (Beware: bpp labels are *not*
     comparable across accounting eras — the public "5.31" artifact's body bpp is
     ~4.76 under current accounting.)
+13. **`docs/ARCHITECTURE.md` stays current — same commit, not later.** Any
+    change to pipeline defaults, the stage graph, the format menu, the plugin
+    contract, serving-lane defaults, or ship gates updates `docs/ARCHITECTURE.md`
+    (and its diagrams if topology changed) in the same commit, and re-stamps its
+    provenance block. Handovers and results docs are append-only history and
+    never substitute for this. `tests/test_docs_staleness.py` +
+    `tests/test_architecture_doc.py` enforce the mechanical half; the
+    judgment half is on you.
 
 ---
 
@@ -245,6 +288,10 @@ the optimum to within 1–2%. The decision-unit *framing* from CLADO is kept
 - **Pre-ship gate** (`validate_quantized_model.py`): vLLM actually serves;
   generation is coherent; PPL < threshold **and p99 per-prompt NLL** < threshold
   (p99 added after a broken 27B passed on mean while 80% of prompts were broken).
+- **No HF upload without `tools/publish_artifact.py`** — it refuses on an
+  unverified shipcard (pipeline gates stay advisory; **publication** is the
+  blocking point). `--force-unverified` needs the artifact dir's basename
+  re-typed and stamps `forced_unverified` onto the card.
 - **Promotion ladder:** Research (opt-in, documented, excluded from defaults) →
   Candidate (small-model GPU+vLLM smokes + a 27B measurement plan) → Production
   recipe (wins/preserves KL/bpp/runtime on the target stack + serving suite +
@@ -259,7 +306,8 @@ the optimum to within 1–2%. The decision-unit *framing* from CLADO is kept
 
 ## 6. Architecture & code map (validated against the tree)
 
-**`run-pipeline.sh` is the real orchestrator.** `pipeline.py` is a *declarative
+**`run-pipeline.sh` (at `prismaquant/run-pipeline.sh`, not the repo root) is
+the real orchestrator.** `pipeline.py` is a *declarative
 contract* layer (typed stages/gates/`APPROVED_RESOURCE_OWNERS`), **not** the
 executor. Stages are file-artifact-coupled and skip-if-exists. `WORK_DIR/`:
 `artifacts/` (probe.pkl, cost*.pkl, layer_config.json, pareto*, production cache),
@@ -288,12 +336,27 @@ validate_quantized_model (PPL / p99-NLL / MMLU / MTP-acceptance ship gate)
 `FORMATS=NVFP4,FP8_DYNAMIC,BF16` (note: **MXFP8 is de-menued for inference** —
 exact-scale FP8 Pareto-dominates it), `NSAMPLES=32 SEQLEN=1024`,
 `PRODUCTION_CACHE_LEVERS=gptq,static_act_order,joint_scale_opt`,
-`COST_MODE=production-render-score`, **`SELECTION_MODE=surrogate`** (set
+**`COST_MODE=aura`** (flipped from `production-render-score` on 2026-07-30,
+re-vet R2 — both flagships were produced with it; `production-render-score` is
+the explicit/legacy spelling that reproduces every pre-flip artifact, and a
+stale `WORK_DIR` now **rebuilds loudly** on the mode change instead of silently
+allocating on the other estimator), **`SELECTION_MODE=surrogate`** (set
 `validated-surrogate` to opt into the real-KL frontier selection that produced
 the shipped 27B), `TARGET_PROFILE=vllm_packed_moe`, `PRODUCTION_CACHE=1`,
-`PRODUCTION_RECACHE=1`, `VALIDATED_SOURCE_PREFETCH=require`. The archived cost
-modes / levers (`grouped-kl`, fisher, hdq, multi-shot) **fail fast with `exit 2`**
-pointing at their archive.
+`PRODUCTION_RECACHE=1`, `VALIDATED_SOURCE_PREFETCH=require`,
+`AURA_ADDITIVITY_GATE=auto`, `CB_EXPERT_EMPIRICAL=0`, `CB_SCALE_CODING=two_tier`
+(the last two are D15: the default is now the value every shipped driver sets).
+The archived cost modes / levers (`grouped-kl`, fisher, hdq, multi-shot,
+production-render-staged) **fail fast with `exit 2`** pointing at their archive.
+
+`COST_MODE` is a **spelling** over two axes since 2026-07-30 (re-vet R3):
+`COST_RENDER ∈ {inline, cached-menu}` × `COST_OBJECTIVE ∈ {weight-recon,
+render-score, aura-adjoint}`. The CB/GGUF lanes are no longer pinned to
+`COST_MODE=local` — that gate named a *render* property to block an *objective*;
+it is now a render-faithfulness assertion, and `col_weights` on the production
+render path (CB Milestone C) lets a cached-menu render be the exporter's
+imatrix-weighted render. Non-`local` objectives on CB are reachable but
+**opt-in and not recommended** until a served CB A/B exists.
 
 **Subsystem owners (the files that matter):**
 
@@ -301,14 +364,14 @@ pointing at their archive.
 |---|---|
 | Orchestrate / contract | `run-pipeline.sh` (exec) · `pipeline.py` (declarative spec + owner validation, not executor) · `__init__.py` (transformers-5.x polyfills) |
 | Allocate | `allocator.py` (CLI, Pareto sweep, log-error kneedle, `--bit-attribution-json/csv`) · `allocator_solver.py` (numpy multi-choice knapsack DP, union-find serving-unit promotion, `predicted_dloss`) · `allocator_candidates.py` (legality gate + cost-source precedence + passthrough integrity) · `decision_units.py` |
-| Probe / cost | `incremental_probe.py` + `sensitivity_probe.py` + `kl_fisher.py` (L1 Fisher) · `incremental_measure_quant_cost.py` + `measure_quant_cost.py` · `perturbed_x_cache.py` (L2) · `kl_measurement.py` + `propagated_sensitivity_costs.py` (L3) · `production_render_cost.py` |
+| Probe / cost | `incremental_probe.py` + `sensitivity_probe.py` + `kl_fisher.py` (Fisher probe) · `incremental_measure_quant_cost.py` + `measure_quant_cost.py` · `production_render_cost.py` (default cost) · `aura_cost.py` + `expert_empirical_cost.py` (`COST_MODE=aura`, MoE hybrid) · `kl_measurement.py` (whole-assignment KL + per-sequence tail) · `perturbed_x_cache.py` (activation cache / model loading — **not** a cost stage). The L3 propagated stack is walled at `archive/l3_propagated_2026-07-30/` |
 | Formats | `format_registry.py` (FormatSpec + RTN `quantize_dequantize`/`activation_quantize_dequantize`, codebook bucketize, E8M0 snap, `torch.compile` hot path) · `mx_formats.py` · `fp8_dynamic.py` |
 | The one cache + render | `production_weight_cache.py` (`ProductionWeightCache` + `render_production_weight`) · `build_production_cache.py` · `production_recache.py` · `render_score.py` (output-MSE render scorer + gate + mechanism registry/topo-order) · `layer_state_cache.py` |
 | Streaming (huge models) | `layer_streaming.py` (LRU + pressure shrink + FP8 block dequant + per-expert→packed bridge) · `streaming_model.py` · `weight_session.py` (stage/revert/commit live-model format flips) · `source_prefetch.py` (fail-fast residency gate) · `autoscale.py` |
-| Export | `export_native_compressed.py` (~7300 lines: NVFP4/MX/FP8 packing, unified codecs, `build_quantization_config` config_groups+ignore, packed-MoE split, FP8_SOURCE verbatim copy, BF16-upgrade audit) · `export_batched_gptq.py` · `block_output_match.py` |
-| Validate / select | `validate_assignments_kl.py` · `select_validated_frontier.py` (kneedle + surrogate-vs-KL Spearman + worst-rank-inversion) · `validation_harness.py` · `validate_native_export.py` · `validate_quantized_model.py` |
+| Export | `export_native_compressed.py` (~7300 lines: NVFP4/MX/FP8 packing, unified codecs, `build_quantization_config` config_groups+ignore, packed-MoE split, FP8_SOURCE verbatim copy, BF16-upgrade audit) · `export_batched_gptq.py`. (`block_output_match.py` walled 2026-07-30 — `archive/block_output_match_2026-07-30/`; it was unreachable on the shipping recipe.) |
+| Validate / select | `validate_assignments_kl.py` · `select_validated_frontier.py` (kneedle + surrogate-vs-KL Spearman + worst-rank-inversion) · `validation_harness.py` · `validate_native_export.py` · `validate_quantized_model.py` · `shipcard.py` (the refusal contract) · `lane_spec.py` + `lane_specs/*.json` (per-lane serve command / endpoint / gate set / KL evaluator — gates ADVISORY) · `gguf_kl_evaluator.py` (llama-perplexity behind the `validate_assignments_kl` interface) |
 | Profiles (plug-in) | `model_profiles/`: `base.py` (auto-derives fused/packed/naming from the vLLM class), `structure.py` (declarative `ModelStructureSpec` JSON + `build_model_graph`), `registry.py` (`detect_profile`/`register_profile`), `vllm_registry.py`, + per-arch (`qwen3*`, `gemma4`, `lfm2_moe`, `minimax_m2`, `deepseek_v4`). Serving constraints live in the top-level `serving_profiles.py` + `serving_profile_specs/*.json` |
-| Misc | `mtp_module.py` (synthesize MTP since transformers v5 drops it) · `mse_promotion.py` · `layer_config.py` (single canonical recipe parser) · `schemas.py` |
+| Misc | MTP synthesis (transformers v5 drops it) now lives on the profile: `model_profiles/base.py` `mtp_source_prefix`/`read_mtp_source_state_dict`/`load_mtp_state_dict` + `model_profiles/qwen3_5.py::MtpModule` (top-level `mtp_module.py` deleted 2026-07-30) · `layer_config.py` (single canonical recipe parser) · `schemas.py` |
 
 **Plug-in a new architecture = three registries, ~30–200 LoC:** model structure
 (`model_profiles/specs/*.json` + a `ModelProfile`), serving constraints
@@ -360,7 +423,7 @@ across two calibration draws at ~4.4× less render time, and the old
 "+137.5% if disabled" claim was a tier-5 hook screen that inverted on the
 gold lane. `PRISMAQUANT_GPTQ_DAMP_SWEEP=1` reproduces historical artifacts;
 `PRISMAQUANT_GPTQ_DAMP` overrides the constant. Open research: derive the
-per-Linear optimum from weights alone (docs/unified_render_theory.md).
+per-Linear optimum from weights alone (docs/design/unified_render_theory.md).
 
 **Hardware:** NVIDIA **GB10 / DGX Spark** ("sparky"), Blackwell sm_121, **128 GB
 unified memory** (~121 GB usable serving budget — GPU and host share one physical
@@ -380,9 +443,12 @@ broken) + `causal-conv1d`, installed `--no-deps` so torch is never touched.
 
 ## 8. Current state (snapshot — verify against `git`/memory before relying)
 
-Branch at last edit: **`claude/fix-issues-4-6`** (Gemma4 multi-layer-type rope +
-KV-sharing, LFM2.5 enablement, incomplete-fused-group BF16 forcing, Gemma BOS PPL
-fix). `main` is the integration branch.
+Branch at last edit: **`claude/docs-consolidation`** (2026-07-30: docs
+centralization + `docs/ARCHITECTURE.md` + cleanup; = NVFP4-CB lane +
+origin/main merged, i.e. the allocator PR stack #13–#21, closures #27–#29, and
+the v0.4.1 release stack). **`origin/main` is the integration branch — the
+local `main` checkout had drifted 54 commits behind it; check
+`git fetch && git log main..origin/main` before trusting local `main`.**
 
 **Shipped public artifacts (`rdtand/`):**
 - **Qwen3.6-27B PrismaSCOUT** — 5.31 bpp / held-out KL 0.0151, 20.17 GB; 11%
@@ -397,9 +463,12 @@ fix). `main` is the integration branch.
 - **Gemma4-31B-IT 6bit** (2026-06-01; beats the shipped 5.5 by −24% *confident-position*
   KL-vs-BF16, +5.9pp top-1 agreement; the 5.5 repo is left untouched).
 
-**Live recipe:** `gptq`(+damp_sweep) + `static_act_order` + **JSO** + the
-PrismaQuant solver; `production-render-score` cost; surrogate selection by default,
-validated-surrogate for real-KL frontier selection.
+**Live recipe:** `gptq` (fixed damp 1.0, sweep OFF) + `static_act_order` +
+**JSO** + the PrismaQuant solver; **AURA cost** (`COST_MODE=aura`, the default
+since 2026-07-30) with the empirical packed-expert unit-KL hybrid on MoE and the
+`[3c]` additivity report stamped into `cost.pkl` provenance; surrogate selection
+by default, validated-surrogate for real-KL frontier selection (automatic under
+a `TARGET_DISK_GB` card).
 
 **In flight / open (and the stale claims to ignore):**
 - **DSv4-Flash-Base** (284B FP8 source): vendored transformers (`PR #45643`) + 3
@@ -407,8 +476,10 @@ validated-surrogate for real-KL frontier selection.
   misrouting cost). ~88 GB at 2.5 bpp. v2 SVD expert-factorization design deferred
   (prefer no new vLLM kernel).
 - **Robust Fisher clip** (K×median per-role h_trace clip): a research **WIN**
-  (~5% better at 6.0 on 4B) pending promotion to an opt-in lever
-  (`PRISMAQUANT_FISHER_CAP_MULTIPLIER`); tool at `/home/rob/dq-runs/robust_fisher_clip.py`.
+  (~5% better at 6.0 on 4B). **Wired as an opt-in lever 2026-07-30 (R28)**:
+  `PRISMAQUANT_FISHER_CAP_MULTIPLIER=K` → `allocator.clip_probe_fisher_outliers`,
+  unset = byte-identical no-op. Still **research** — no served A/B; do not
+  default it on. Reference tool: `/home/rob/dq-runs/robust_fisher_clip.py`.
 - **Production-faithful polish** (5.39 bpp / polish-time KL 0.0054): **provisional**
   — that number is a polish-time signal on a 2×128 calibration, **not** a held-out
   8×512 claim. Do not cite −2.8× as a result until the 8×512 re-measurement lands.
@@ -450,6 +521,11 @@ lever ones (grouped-KL, Fisher, HDQ, multi-shot) **fail-fast with `exit 2`** fro
 
 | Method | Why it lost (the lesson) |
 |---|---|
+| **The three-level cost cascade (L1→L2→L3)** | Retired from the spine 2026-07-30 (`archive/l3_propagated_2026-07-30/`). L2 beat additive L1 by −1.5%; AURA beat L1 by −38.5%. Cross-layer residuals +5–12% diffuse, 3/1180 pairs significant, and the non-additivity was a bf16 artifact. *One faithful cost beats another level.* |
+| **`COST_MODE=production-render-staged`** | Rendered NVFP4 first and promoted only the top-30% error tail, so the DP could not consider anything outside it. 27B: last-token-KL screen improved 0.0232 vs 0.0280, direct PPL **regressed 10.83 vs 8.33** — "Do not ship". The canonical screen-vs-gold inversion. `archive/production_render_staged_2026-07-30/`. |
+| **`MSE_PROMOTION`** (post-frontier rewrite) | Re-ranked the already-KL-selected point by local `output_mse_per_bit`. On 35B: beat the strategic baseline, lost to both the shipped 4.75 and the 5.16 kneedle. *A post-allocator rewrite cannot beat a better cost inside the DP.* `archive/mse_promotion_2026-07-30/`. |
+| **`PRODUCTION_CACHE_UNION`** (smart-union cache) | Offered an FP8 rung only above a percentile of the NVFP4 `output_mse` surrogate — a render-budget heuristic deciding the allocator's candidate set (principle 1). `archive/union_cache_2026-07-30/`. |
+| **Block-output match** (lever #12) | **Unreachable**, not unmeasured: the production-cache pack `continue`s first, so it never ran on the shipping recipe (0 hits in two real export logs); had it run it would have discarded the render's `joint_mse` scales (M19). Subsumed by JSO. *Check the code executes before funding an A/B.* `archive/block_output_match_2026-07-30/`. |
 | **grouped-KL** cost surrogate | "−3.52% PPL" was a local/HF screen; **lost the vLLM A/B**. *Promote on the serving metric.* |
 | **CLADO** full IQP solver | O(N²) per-pair; the O(N) cascade matched it to 1–2%. Keep the decision-unit framing, drop the solver. |
 | **L3-polish-of-many DP** | Non-additive: per-Linear L3 costs measured under L2 context don't sum to true end-KL when many flip at once. Coord-descent (one-at-a-time, measured) is the safe alternative. |
@@ -503,26 +579,34 @@ lever ones (grouped-KL, Fisher, HDQ, multi-shot) **fail-fast with `exit 2`** fro
 
 Read these for *depth*; the prime directive applies.
 
-- **`docs/prismaquant_design.md`** — the master design doc (57 KB): the *why*
-  behind the cascade, the knapsack DP + log-error kneedle, the render pipeline,
-  the export codecs, the validation chain, the plugin architecture, and §11
-  "Alternatives Considered and Rejected". **Most authoritative narrative**, and
-  its archive banners are kept current. Still: a doc, not the code.
-- **`AGENTS.md`** + **`docs/design_guidelines.md`** — the terse normative rules
+- **`docs/ARCHITECTURE.md`** — **the master document. Start here.** Single
+  current system map: pipeline stages + defaults, cost models, formats, export,
+  validation, plugin architecture, the three serving lanes, hardware, history,
+  and an honest debt register — every normative claim code-cited, three mermaid
+  diagrams, provenance-stamped. Carries the maintenance contract (§0): any
+  change to defaults, stages, formats, plugin contract, lanes, or ship gates
+  updates it in the same commit. `docs/README.md` is the index of everything
+  else, with per-doc status labels.
+- **`docs/archive/prismaquant_design.md`** — the retired 2026-06 master design
+  doc; superseded by `docs/ARCHITECTURE.md` (banner on the file). Historical
+  depth on the cascade era only; several claims known-stale.
+- **`AGENTS.md`** + **`docs/design/design_guidelines.md`** — the terse normative rules
   (the 9 core principles, promotion gates, progressive render-gate contract,
   rotation-transform rule, exception rule). Mandatory pre-read for new work.
-- **`docs/runtime_flags.md`** — the env-flag vocabulary (`PRISMAQUANT_*`,
+- **`docs/design/runtime_flags.md`** — the env-flag vocabulary (`PRISMAQUANT_*`,
   `COST_MODE`, `SELECTION_MODE`, `PRODUCTION_CACHE_LEVERS`, CUDA-graph autos).
-- **`docs/progressive_render_pipeline.md`** + **`docs/pluggable_refactor.md`** +
-  **`docs/propagated_cost.md`** — render-gate ordering, the plugin contract, the
-  L3 propagated-cost spec.
+- **`docs/design/progressive_render_pipeline.md`** + **`docs/design/pluggable_refactor.md`**
+  — render-gate ordering and the plugin contract. (`docs/archive/propagated_cost.md` is the
+  L3 propagated-cost spec: **archived**, matching the code wall at
+  `archive/l3_propagated_2026-07-30/`.)
 - **`paper/main.tex`** — the current AURA spine: production-faithful KL--Fisher
   allocation, additivity/cancellation analysis, served KL/PPL evidence, and
   limitations. `paper/figures/fig_aura_rd_geometry.tex` is the key geometry
   figure. The retired PrismaSCOUT paper, including monotone-polish and the
   rejected-methods catalog, is archived at
   `paper/archive/prismascout_paper_2026-06-05.tex`.
-- **`.claude/prismaquant-handover-*.md`** — session history, newest first. Useful
+- **`docs/handovers/prismaquant-handover-*.md`** (moved from `.claude/`
+  2026-07-30; gitignored, local-only) — session history, newest first. Useful
   for narrative arc; **assume the "open items" are stale** (the 2026-05-28 one
   lists the cancelled JSO A/B). Codex/Gemini deliberations: `.claude/codex-*`,
   `scratch/deliberation/`.

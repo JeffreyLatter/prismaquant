@@ -28,11 +28,22 @@ from typing import Callable
 import torch
 from compressed_tensors.quantization.utils.mxfp_utils import generate_mx_scales
 
+from prismaquant.cb_layout import (
+    CODEWORDS_PER_SUPERBLOCK,
+    FP4_GROUP,
+    FP8_PRODUCT_RUNGS,
+    NVFP4_PRODUCT_RUNGS,
+    NVFP4_SIGNED_RUNGS,
+    SCALE_CODING_V1,
+    SCALE_PLANE_BYTES,
+    SUPERBLOCK,
+)
 from prismaquant.fp8_dynamic import (
     fp8_dynamic_activation_qdq_vllm,
     fp8_dynamic_weight_qdq,
 )
 from prismaquant.gguf_formats import make_gguf_qdq
+from prismaquant.nvfp4_cb_formats import make_nvfp4_cb_qdq
 from prismaquant.mx_formats import (
     e8m0_to_scale,
     mxfp8_e4m3_activation_qdq_vllm,
@@ -899,6 +910,103 @@ register_format(_make_gguf_spec("IQ3_XXS", 3, 256, 16))   # 98 B / 256 = 3.0625
 register_format(_make_gguf_spec("IQ3_S", 3, 256, 112))    # 110 B / 256 = 3.4375
 register_format(_make_gguf_spec("IQ4_XS", 4, 256, 64))    # 136 B / 256 = 4.25
 register_format(_make_gguf_spec("IQ4_NL", 4, 32, 16))     # 18 B / 32 = 4.5
+
+
+# NVFP4-CB / FP8-CB vector-quantization codebook family (custom out-of-tree
+# vLLM plugin lane; NOT stock compressed-tensors — see docs/lanes/nvfp4-cb).
+# The k-bit VQ index stream lives in scale_bits (fp4 family, weight_bits=0,
+# group_size=256).  FormatSpec retains the legacy-v1 4k+16 nominal field for
+# old generic consumers; exact producer paths use CBSerializationContext and
+# price/render production layout-v2 as 4k+9.  FP8's FormatSpec likewise omits
+# its shape-dependent FP32 row-scale plane.  Consequently neither
+# ``effective_bits`` nor ``effective_bits_for_shape`` is authoritative for CB.
+# The FP8 index body is represented by the same group_size=256 superblock
+# stream as FP4-CB. Its per-output-channel FP32 scale cannot be represented by
+# that single-plane FormatSpec, so only the context-bound accountant adds the
+# shape-dependent 32/in_features term. quantize_dequantize
+# is the weighted-VQ closure that also feeds the (Milestone B) byte packer;
+# activations are byte-identical to NVFP4 (fp4) / FP8 dynamic (fp8).
+def _make_nvfp4_cb_spec(k: int) -> FormatSpec:
+    return FormatSpec(
+        name=f"NVFP4_CB_K{k}",
+        weight_bits=0, group_size=SUPERBLOCK,
+        scale_bits=(CODEWORDS_PER_SUPERBLOCK * k
+                    + 8 * SCALE_PLANE_BYTES[("fp4", SCALE_CODING_V1)]),
+        scale_dtype_name="nvfp4_cb_vq",
+        weight_element_dtype=f"nvfp4_cb_k{k}",
+        act_bits=4, act_dtype_name="fp4_e2m1", act_group_size=FP4_GROUP,
+        family="nvfp4_cb", min_capability_sm=100,
+        autoround_config=(
+            lambda k=k: dict(bits=0, group_size=SUPERBLOCK, data_type="nvfp4_cb",
+                             cb_k=k, sym=True, act_bits=4,
+                             act_data_type="nv_fp4_with_static_gs",
+                             act_group_size=FP4_GROUP, act_dynamic=True)
+        ),
+        # Kept at v1 for direct legacy/research callers. Producer-cost paths
+        # bind CBSerializationContext explicitly; a FormatSpec alone cannot
+        # establish the artifact layout/codebook identity.
+        quantize_dequantize=make_nvfp4_cb_qdq(k, "fp4", "product"),
+        activation_quantize_dequantize=_make_rtn("fp4_e2m1", FP4_GROUP),
+    )
+
+
+def _make_nvfp4_cb_signed_spec(k: int) -> FormatSpec:
+    # Sign-magnitude VQ: 8 explicit sign bits + (k-8)-bit positive-grid
+    # magnitude index per 8-dim vector; the 8 sign bits are INSIDE k, so the
+    # accounting is identical to the flat rungs (32k + 128 bits / 256).
+    return FormatSpec(
+        name=f"NVFP4_CB_S{k}",
+        weight_bits=0, group_size=SUPERBLOCK,
+        scale_bits=(CODEWORDS_PER_SUPERBLOCK * k
+                    + 8 * SCALE_PLANE_BYTES[("fp4", SCALE_CODING_V1)]),
+        scale_dtype_name="nvfp4_cb_vq",
+        weight_element_dtype=f"nvfp4_cb_s{k}",
+        act_bits=4, act_dtype_name="fp4_e2m1", act_group_size=FP4_GROUP,
+        family="nvfp4_cb", min_capability_sm=100,
+        autoround_config=(
+            lambda k=k: dict(bits=0, group_size=SUPERBLOCK, data_type="nvfp4_cb",
+                             cb_k=k, cb_mode="signed", sym=True, act_bits=4,
+                             act_data_type="nv_fp4_with_static_gs",
+                             act_group_size=FP4_GROUP, act_dynamic=True)
+        ),
+        quantize_dequantize=make_nvfp4_cb_qdq(k, "fp4", "signed"),
+        activation_quantize_dequantize=_make_rtn("fp4_e2m1", FP4_GROUP),
+    )
+
+
+def _make_fp8_cb_spec(k: int) -> FormatSpec:
+    # Index stream in scale_bits (32k bits / 256-superblock, weight_bits=0,
+    # group_size=256) so effective_bits = k/8 exactly, mirroring the GGUF /
+    # NVFP4_CB accounting. FP8_CB has NO group-16 scale plane; its
+    # per-output-channel fp32 scales are accounted by nvfp4_cb_footprint
+    # (the authoritative byte accountant, format-pipeline §1.5), which a
+    # single-scale FormatSpec cannot model on top of the superblock stream.
+    return FormatSpec(
+        name=f"FP8_CB_K{k}",
+        weight_bits=0, group_size=SUPERBLOCK,
+        scale_bits=CODEWORDS_PER_SUPERBLOCK * k,
+        scale_dtype_name="fp8_cb_vq",
+        weight_element_dtype=f"fp8_cb_k{k}",
+        act_bits=8, act_dtype_name="fp8_e4m3", act_group_size=0,
+        family="fp8_cb", min_capability_sm=100,
+        autoround_config=(
+            lambda k=k: dict(bits=0, group_size=0, data_type="fp8_cb",
+                             cb_k=k, sym=True, act_bits=8,
+                             act_data_type="fp8_e4m3", act_dynamic=True)
+        ),
+        quantize_dequantize=make_nvfp4_cb_qdq(k, "fp8", "product"),
+        activation_quantize_dequantize=_make_plain_fp8_activation_vllm_rtn(
+            torch.float8_e4m3fn, 448.0,
+        ),
+    )
+
+
+for _k in NVFP4_PRODUCT_RUNGS:               # 2.000 .. 3.500 bpw in 0.125 steps
+    register_format(_make_nvfp4_cb_spec(_k))
+for _k in NVFP4_SIGNED_RUNGS:                # signed: 2.125 .. 2.5 bpw
+    register_format(_make_nvfp4_cb_signed_spec(_k))
+for _k in FP8_PRODUCT_RUNGS:                 # 3.5 .. 6.0 bpw in 0.125 steps
+    register_format(_make_fp8_cb_spec(_k))
 
 
 def list_formats(family: str | None = None) -> list[FormatSpec]:

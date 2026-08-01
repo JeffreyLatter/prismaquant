@@ -56,4 +56,4 @@ Repository = "https://github.com/RobTand/prismaquant"
 include = ["prismaquant*"]
 
 [tool.setuptools.package-data]
-prismaquant = ["*.sh", "model_profiles/specs/*.json", "serving_profile_specs/*.json"]
+prismaquant = ["*.sh", "model_profiles/specs/*.json", "serving_profile_specs/*.json", "lane_specs/*.json"]

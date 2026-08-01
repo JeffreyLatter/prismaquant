@@ -497,6 +497,67 @@ def format_report_md(rep: ValidationReport) -> str:
 
 
 # -----------------------------------------------------------------
+# Ship record (R13)
+# -----------------------------------------------------------------
+def _resolve_artifact_dir(args, card_model_dir: str | None) -> str | None:
+    """Which directory this verdict is about.
+
+    The validator drives an HTTP endpoint, so it cannot see what the server
+    loaded; the honest fallback order is explicit flag, then --model-name if it
+    happens to be a local path, then the directory the shipcard was opened on.
+    """
+    if args.artifact_dir:
+        return args.artifact_dir
+    if args.model_name and os.path.isdir(args.model_name):
+        return args.model_name
+    return card_model_dir
+
+
+def _fill_shipcard(args, rep: "ValidationReport") -> None:
+    if not getattr(args, "shipcard", None):
+        return
+    from .shipcard import (
+        compute_model_sha, fill_if_requested, git_provenance, load_shipcard,
+        make_record,
+    )
+
+    try:
+        card = load_shipcard(args.shipcard)
+    except Exception as exc:
+        print(f"[shipcard] WARN {args.shipcard} unreadable: {exc!r}")
+        return
+    model_dir = _resolve_artifact_dir(args, card.get("model_dir"))
+    try:
+        model_sha = compute_model_sha(model_dir) if model_dir else None
+    except Exception:
+        model_sha = None
+
+    ppl_check = next((c for c in rep.checks if c.name == "perplexity"), None)
+    spec_detected = None
+    if ppl_check is not None:
+        spec_detected = bool(ppl_check.metrics.get("spec_decode_detected", False))
+    metrics = {c.name: {"passed": c.passed, **c.metrics} for c in rep.checks}
+    record = make_record(
+        slot="ship_gate",
+        tool="validate_quantized_model.py",
+        passed=bool(rep.passed),
+        model_sha=model_sha,
+        metrics=metrics,
+        detail="; ".join(
+            f"{c.name}={'pass' if c.passed else 'FAIL'}" for c in rep.checks),
+        spec_decode_detected=spec_detected,
+        git_commit=git_provenance().get("commit"),
+        extra={
+            "base_url": rep.base_url,
+            "served_model_name": rep.model_name,
+            "thresholds": rep.thresholds,
+            "model_sha_source": model_dir,
+        },
+    )
+    fill_if_requested(args.shipcard, "ship_gate", record)
+
+
+# -----------------------------------------------------------------
 # CLI
 # -----------------------------------------------------------------
 def main() -> int:
@@ -530,6 +591,15 @@ def main() -> int:
                     help="Max time to wait for /health 200 before giving up")
     ap.add_argument("--report", default=None,
                     help="Optional path to write the markdown report")
+    ap.add_argument("--shipcard", default=None,
+                    help="Path to the artifact's shipcard.json; this run's "
+                         "verdict is appended to the ship_gate slot "
+                         "(see tools/shipcard.py).")
+    ap.add_argument("--artifact-dir", default=None,
+                    help="Local directory of the artifact being served, used "
+                         "to stamp model_sha on the shipcard record. Defaults "
+                         "to --model-name when that is a directory, then to "
+                         "the shipcard's own model_dir.")
     args = ap.parse_args()
 
     rep = run_validation(
@@ -548,6 +618,7 @@ def main() -> int:
     if args.report:
         with open(args.report, "w") as f:
             f.write(md)
+    _fill_shipcard(args, rep)
     return 0 if rep.passed else 1
 
 

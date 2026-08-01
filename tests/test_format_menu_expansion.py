@@ -12,8 +12,6 @@ from prismaquant.export_native_compressed import (
     FORMAT_SCHEME,
     canonicalize_format,
 )
-from prismaquant.kl_sensitivity_probe import _production_cache_formats
-
 
 VLLM_PROFILE = "vllm_packed_moe"
 
@@ -23,13 +21,31 @@ class _ProfileWithServingDefault:
         return VLLM_PROFILE
 
 
+def _non_bf16_format_menu(requested: list[str], floor_format: str) -> list[str]:
+    """The format-menu expansion rule: canonicalize every requested name plus
+    the floor, drop BF16, sort.
+
+    Was `kl_sensitivity_probe._production_cache_formats` until 2026-07-30, when
+    the probe was walled with the L3 cascade
+    (`archive/l3_propagated_2026-07-30/`, re-vet R4). The rule itself is still
+    the live contract — `run-pipeline.sh` computes exactly this for
+    `CACHE_FORMATS` / `AURA_CACHE_FORMATS` — so the registry canonicalization it
+    depends on stays pinned here.
+    """
+    formats = {
+        fr.canonical_format_name(str(fmt).strip().upper())
+        for fmt in [*requested, floor_format]
+    }
+    return sorted(fmt for fmt in formats if fmt != "BF16")
+
+
 def test_production_cache_formats_include_all_non_bf16_registry_picks():
-    assert _production_cache_formats(
+    assert _non_bf16_format_menu(
         ["NVFP4", "MXFP8_E4M3", "FP8_E4M3", "BF16"],
         "NVFP4",
     ) == ["FP8_E4M3", "MXFP8_E4M3", "NVFP4"]
 
-    assert _production_cache_formats(
+    assert _non_bf16_format_menu(
         ["MXFP8_E5M2", "FP8_E5M2", "BF16"],
         "NVFP4",
     ) == ["FP8_E5M2", "MXFP8_E5M2", "NVFP4"]

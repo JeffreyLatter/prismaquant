@@ -221,6 +221,28 @@ def test_perturbed_cache_strict_miss_escape_allows_rtn(tmp_path, monkeypatch):
     assert out.shape == (1, 64)
 
 
+def test_perturbed_cache_never_uses_unweighted_cb_rtn_fallback(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("PRISMAQUANT_STRICT_PRODUCTION_CACHE", "0")
+    model = nn.Sequential(nn.Linear(256, 256, bias=False)).eval()
+    cache = PerturbedActivationCache(
+        model,
+        {"0": "NVFP4_CB_K16"},
+        tmp_path,
+        input_rows=0,
+        cal_hash="test",
+        production_weight_cache=ProductionWeightCache({}, levers={}),
+    )
+
+    cache.install()
+    try:
+        with pytest.raises(RuntimeError, match="required for CB fallback"):
+            model(torch.randn(1, 256))
+    finally:
+        cache.remove()
+
+
 def test_perturbed_cache_can_disable_capture_for_inplace_replay(tmp_path):
     model = nn.Sequential(nn.Linear(64, 64, bias=False)).eval()
     x = torch.randn(2, 64)

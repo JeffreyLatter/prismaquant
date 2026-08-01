@@ -7,11 +7,18 @@ import torch
 import torch.nn as nn
 import pytest
 
-from prismaquant.kl_sensitivity_probe import _normalized_production_cache_levers
+from prismaquant.export_native_compressed import (
+    _resolve_gptq_fixed_damp,
+    gptq_damp_sweep_enabled,
+)
+from prismaquant.production_weight_cache import _resolve_production_render_levers
 from prismaquant.build_production_cache import (
     validate_render_assignment_cache_coverage,
 )
 from prismaquant.production_weight_cache import ProductionWeightCache
+from prismaquant.production_weight_cache import (
+    canonical_cb_col_weights_sha256,
+)
 from prismaquant.production_weight_cache import fill_packed_expert_cache_entries
 from prismaquant.production_weight_cache import _format_supports_render_mechanism
 from prismaquant.production_weight_cache import fill_production_weight_cache
@@ -23,6 +30,39 @@ from prismaquant.production_recache import (
     production_cache_keys_for_assignment,
     recache_production_weight_cache,
 )
+
+
+def _normalized_production_cache_levers(value: str | None) -> dict[str, object]:
+    """The `--production-cache-levers` string -> provenance dict contract.
+
+    Lived on `kl_sensitivity_probe` until 2026-07-30, when the L3 probe was
+    walled (`archive/l3_propagated_2026-07-30/`, re-vet R4). The probe's copy
+    was a one-line delegation to `_resolve_production_render_levers` after D5
+    was fixed earlier that day, so this shim is that delegation verbatim — the
+    assertions below still pin the ONE production render-lever contract
+    (notably: sweep OFF by default since 2026-06-12, and sweep-off renders must
+    record which fixed damp they used).
+    """
+    enabled = {
+        part.strip()
+        for part in str(value or "").split(",")
+        if part.strip()
+    }
+    return dict(sorted(
+        _resolve_production_render_levers({name: True for name in enabled}).items()
+    ))
+
+
+class _CBIdentityTiny(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.l1 = nn.Linear(32, 32, bias=False)
+
+    def forward(self, input_ids, use_cache=False):
+        batch, seqlen = input_ids.shape
+        x = torch.ones((batch, seqlen, 32), dtype=torch.float32)
+        return self.l1(x)
+
 
 
 def test_prefetch_loads_disk_entries_and_respects_lru(tmp_path):
@@ -174,6 +214,252 @@ def test_build_render_assignment_coverage_does_not_skip_packed_experts():
     validate_render_assignment_cache_coverage(cache, assignment)
 
 
+def test_cb_col_weights_digest_is_canonical_over_order_dtype_and_strides():
+    base = torch.arange(24, dtype=torch.float64).reshape(2, 3, 4)
+    noncontiguous = base[:, :, 1]
+    assert not noncontiguous.is_contiguous()
+    same = noncontiguous.to(torch.float32).contiguous()
+
+    first = canonical_cb_col_weights_sha256(
+        {"z": torch.tensor([3.0, 4.0]), "a": noncontiguous},
+        ["z", "a"],
+    )
+    second = canonical_cb_col_weights_sha256(
+        {"a": same, "z": torch.tensor([3, 4], dtype=torch.int64)},
+        ["a", "z"],
+    )
+    changed = canonical_cb_col_weights_sha256(
+        {"a": same, "z": torch.tensor([3.0, 5.0])},
+        ["a", "z"],
+    )
+
+    assert first == second
+    assert first != changed
+
+
+def test_cb_source_weight_chunked_digest_matches_contiguous_fp32_reference():
+    import hashlib
+
+    from prismaquant.production_weight_cache import (
+        _source_weight_value_identity,
+    )
+
+    # Exceed the implementation's 4M-element chunk ceiling so this exercises
+    # the bounded-memory path rather than only checking the small-tensor case.
+    trailing = 1024 * 1024 + 1
+    source = torch.arange(2 * 2 * trailing, dtype=torch.int32).reshape(
+        2, 2, trailing
+    )
+    source = source.transpose(0, 1)
+    assert not source.is_contiguous()
+    shape, observed = _source_weight_value_identity(source)
+    reference = source.to(torch.float32).contiguous().numpy().astype(
+        "<f4", copy=False
+    ).tobytes(order="C")
+
+    assert shape == list(source.shape)
+    assert observed == hashlib.sha256(reference).hexdigest()
+
+
+def test_fresh_cb_cache_records_and_validates_render_identity(monkeypatch):
+    import prismaquant.production_weight_cache as pwc
+    from prismaquant.nvfp4_cb_footprint import CBSerializationContext
+
+    model = _CBIdentityTiny()
+    context = CBSerializationContext.production()
+    col_weights = {"l1": torch.linspace(0.1, 1.0, model.l1.in_features)}
+    monkeypatch.setattr(
+        pwc,
+        "render_production_weight",
+        lambda weight, fmt, **_kwargs: weight.detach().to(torch.float32),
+    )
+
+    cache = fill_production_weight_cache(
+        model,
+        torch.tensor([[0, 1]], dtype=torch.long),
+        qnames=["l1"],
+        formats=["NVFP4_CB_K16"],
+        levers={"gptq": False},
+        col_weights=col_weights,
+        cb_serialization_context=context,
+        progress=False,
+    )
+
+    identity = cache.metadata["cb_render_identity"]
+    assert identity["schema"].endswith("cb_render_identity.v2")
+    assert identity["cb_serialized_payload"]["layout_version"] == 2
+    assert identity["col_weights_qnames"] == ["l1"]
+    assert identity["col_weights_shapes"] == {
+        "l1": [model.l1.in_features]
+    }
+    assert identity["col_weights_sha256"] == canonical_cb_col_weights_sha256(
+        col_weights,
+        ["l1"],
+    )
+    assert cache.validate_cb_render_identity(
+        expected_context=context,
+        col_weights=col_weights,
+        require_for_formats=["NVFP4_CB_K16"],
+    ) == context
+
+    changed_col_weights = {"l1": col_weights["l1"].clone()}
+    changed_col_weights["l1"][0] += 1.0
+    with pytest.raises(ValueError, match="col_weights identity differs"):
+        cache.validate_cb_render_identity(
+            col_weights=changed_col_weights,
+            require_for_formats=["NVFP4_CB_K16"],
+        )
+
+    from prismaquant.production_weight_cache import (
+        validate_cb_render_source_weight,
+    )
+
+    validate_cb_render_source_weight(
+        identity,
+        "l1",
+        model.l1.weight.detach(),
+        where="test source",
+    )
+    with pytest.raises(ValueError, match="source-weight value differs"):
+        validate_cb_render_source_weight(
+            identity,
+            "l1",
+            model.l1.weight.detach() + 1.0,
+            where="test source",
+        )
+
+    wrong = CBSerializationContext.legacy_v1()
+    with pytest.raises(ValueError, match="differs from allocator recipe"):
+        cache.validate_cb_render_identity(expected_context=wrong)
+
+
+def test_cb_render_identity_projection_recomputes_assignment_scope_hashes():
+    from prismaquant.nvfp4_cb_footprint import CBSerializationContext
+    from prismaquant.production_weight_cache import (
+        bind_cb_render_identity_source_weights,
+        build_production_cache_cb_render_identity,
+        project_cb_render_identity,
+        validate_cb_render_identity_metadata,
+    )
+
+    fmt = "NVFP4_CB_K16"
+    col_weights = {
+        "a": torch.arange(256, dtype=torch.float32),
+        "b": torch.arange(256, dtype=torch.float32) + 1,
+    }
+    source = {
+        "a": torch.randn(2, 256),
+        "b": torch.randn(3, 256),
+    }
+    identity = build_production_cache_cb_render_identity(
+        {"a": [fmt], "b": [fmt]},
+        cb_serialization_context=CBSerializationContext.production(),
+        col_weights=col_weights,
+        render_levers={"weighted_vq": True},
+        render_mechanism_plan=[],
+    )
+    identity = bind_cb_render_identity_source_weights(identity, source)
+
+    projected = project_cb_render_identity(
+        identity,
+        {"b": fmt},
+        col_weights=col_weights,
+        where="test projection",
+    )
+
+    assert projected["col_weights_qnames"] == ["b"]
+    assert set(projected["source_weights_content_sha256"]) == {"b"}
+    assert projected["col_weights_sha256"] != identity["col_weights_sha256"]
+    validate_cb_render_identity_metadata(
+        projected,
+        col_weights=col_weights,
+        source_weights={"b": source["b"]},
+        where="test projection",
+    )
+
+
+def test_dense_cb_resume_rejects_preexisting_shard(tmp_path, monkeypatch):
+    import prismaquant.production_weight_cache as pwc
+    from prismaquant.nvfp4_cb_footprint import CBSerializationContext
+
+    model = _CBIdentityTiny()
+    shard = tmp_path / pwc._cache_weight_filename("l1", "NVFP4_CB_K16")
+    torch.save(model.l1.weight.detach(), shard)
+    monkeypatch.setattr(
+        pwc,
+        "render_production_weight",
+        lambda weight, fmt, **_kwargs: weight.detach().to(torch.float32),
+    )
+
+    with pytest.raises(RuntimeError, match="CB cache resume is disabled"):
+        fill_production_weight_cache(
+            model,
+            torch.tensor([[0, 1]], dtype=torch.long),
+            qnames=["l1"],
+            formats=["NVFP4_CB_K16"],
+            cache_dir=tmp_path,
+            levers={"gptq": False},
+            col_weights={"l1": torch.ones(model.l1.in_features)},
+            cb_serialization_context=CBSerializationContext.production(),
+            progress=False,
+        )
+
+
+def test_fresh_cb_render_drops_stale_score_sidecar_entry(tmp_path, monkeypatch):
+    import json
+
+    import prismaquant.production_weight_cache as pwc
+    from prismaquant.nvfp4_cb_footprint import CBSerializationContext
+
+    fmt = "NVFP4_CB_K16"
+    stale_key = f"l1|{fmt}"
+    (tmp_path / "render_scores.json").write_text(json.dumps({
+        "schema": "prismaquant.production_render_scores.v1",
+        "records": {
+            stale_key: {
+                "qname": "l1",
+                "format": fmt,
+                "metric": "output_mse",
+                "score": 123.0,
+                "score_sum": 123.0,
+            },
+        },
+    }))
+    model = _CBIdentityTiny()
+
+    def fail_fresh_render(*_args, **_kwargs):
+        raise RuntimeError("fresh render failed")
+
+    monkeypatch.setattr(pwc, "render_production_weight", fail_fresh_render)
+    cache = fill_production_weight_cache(
+        model,
+        torch.tensor([[0, 1]], dtype=torch.long),
+        qnames=["l1"],
+        formats=[fmt],
+        cache_dir=tmp_path,
+        levers={"gptq": False},
+        col_weights={"l1": torch.ones(model.l1.in_features)},
+        cb_serialization_context=CBSerializationContext.production(),
+        progress=False,
+    )
+
+    assert ("l1", fmt) in cache.failed
+    assert stale_key not in cache.metadata["render_scores"]["records"]
+    sidecar = json.loads((tmp_path / "render_scores.json").read_text())
+    assert stale_key not in sidecar["records"]
+
+
+def test_legacy_cb_cache_cannot_be_consumed_without_render_identity():
+    cache = ProductionWeightCache(
+        weights={("l1", "NVFP4_CB_K16"): torch.ones(2, 256)},
+        levers={},
+        metadata={},
+    )
+
+    with pytest.raises(ValueError, match="legacy or partially resumed"):
+        cache.get("l1", "NVFP4_CB_K16")
+
+
 def test_production_cache_file_page_prefetch_does_not_load_tensors(tmp_path, monkeypatch):
     import prismaquant.production_weight_cache as pwc
 
@@ -227,14 +513,24 @@ def test_production_cache_records_damp_sweep_lever(monkeypatch):
     )
 
     assert cache.levers["gptq_damp_sweep"] is False
-    assert _normalized_production_cache_levers(
-        "gptq,scale_sweep"
-    )["gptq_damp_sweep"] is False
+    off = _normalized_production_cache_levers("gptq,scale_sweep")
+    assert off["gptq_damp_sweep"] is False
+    # Sweep-off renders must record WHICH fixed damp they used, or two
+    # fixed-damp caches are metadata-indistinguishable.
+    assert off["gptq_fixed_damp"] == _resolve_gptq_fixed_damp()
 
     monkeypatch.setenv("PRISMAQUANT_GPTQ_DAMP_SWEEP", "1")
+    on = _normalized_production_cache_levers("gptq,scale_sweep")
+    assert on["gptq_damp_sweep"] is True
+    assert "gptq_fixed_damp" not in on
+
+    # The probe's provenance must follow the production policy default
+    # (sweep OFF since 2026-06-12, f2363e2) — it kept a stale sweep-ON
+    # fork of this defaulting until 2026-07-30.
+    monkeypatch.delenv("PRISMAQUANT_GPTQ_DAMP_SWEEP", raising=False)
     assert _normalized_production_cache_levers(
         "gptq,scale_sweep"
-    )["gptq_damp_sweep"] is True
+    )["gptq_damp_sweep"] is gptq_damp_sweep_enabled() is False
 
 
 def test_production_cache_none_lever_disables_defaults(monkeypatch):

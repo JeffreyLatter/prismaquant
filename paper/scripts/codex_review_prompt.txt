@@ -40,13 +40,13 @@ Sources you should consult (in priority order)
 
 3. Handover notes (the historical record of what happened)
    - /home/rob/prismaquant/.claude/prismaquant-handover-*.md  (multiple dates)
-   - /home/rob/prismaquant/docs/prismascout_overview.md
-   - /home/rob/prismaquant/docs/prismascout_handover_2026-05-03.md
-   - /home/rob/prismaquant/docs/propagated_cost.md
+   - /home/rob/prismaquant/docs/archive/prismascout_overview.md
+   - /home/rob/prismaquant/docs/archive/prismascout_handover_2026-05-03.md
+   - /home/rob/prismaquant/docs/archive/propagated_cost.md
    - /home/rob/prismaquant/docs/joint_optimizer.md
-   - /home/rob/prismaquant/docs/validation_harness.md
-   - /home/rob/prismaquant/docs/v20_memory_and_scheduling.md
-   - /home/rob/prismaquant/docs/runtime_flags.md
+   - /home/rob/prismaquant/docs/design/validation_harness.md
+   - /home/rob/prismaquant/docs/design/v20_memory_and_scheduling.md
+   - /home/rob/prismaquant/docs/design/runtime_flags.md
 
 4. Multi-agent deliberation record (Claude/Codex/Gemini)
    - /home/rob/prismaquant/scratch/deliberation/*.md

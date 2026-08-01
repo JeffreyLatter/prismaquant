@@ -15,6 +15,7 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+from .layer_config import is_layer_config_meta_key
 from .artifact_registry import (
     DEFAULT_REGISTRY_PATH,
     ArtifactRecord,
@@ -790,6 +791,8 @@ def _load_layer_config_input(layer_config: Mapping | str | Path) -> tuple[dict, 
 def _layer_config_to_assignment(layer_config: Mapping[str, Any]) -> dict[str, str]:
     assignment: dict[str, str] = {}
     for name, entry in layer_config.items():
+        if is_layer_config_meta_key(name):
+            continue
         fmt = _entry_format_name(entry)
         if fmt is None:
             raise ValueError(f"could not map layer_config entry for {name!r}: {entry!r}")
@@ -882,7 +885,9 @@ def _hash_file(h: "hashlib._Hash", path: Path) -> None:
 
 def _format_histogram_from_layer_config(layer_config: Mapping[str, Any]) -> dict:
     counts: dict[str, int] = {}
-    for entry in layer_config.values():
+    for name, entry in layer_config.items():
+        if is_layer_config_meta_key(name):
+            continue
         fmt = _entry_format_name(entry) or _entry_label(entry)
         counts[fmt] = counts.get(fmt, 0) + 1
     return dict(sorted(counts.items()))

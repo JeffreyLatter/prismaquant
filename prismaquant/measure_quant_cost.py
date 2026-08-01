@@ -24,6 +24,7 @@ rel_output_mse}. When h-detail is supplied, entries may also include
 from __future__ import annotations
 
 import json
+import math
 import os
 import pickle
 import re
@@ -37,6 +38,145 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from . import format_registry as fr
+from .nvfp4_cb_footprint import (
+    cb_cost_provenance,
+    cb_quantize_dequantize_for_context,
+    cb_serialization_context_from_env,
+)
+
+
+def _cb_cost_quantize_dequantize(
+    spec: fr.FormatSpec,
+    weight: torch.Tensor,
+    *,
+    col_weights: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Render CB weights under the producer context stamped on cost.pkl."""
+    if col_weights is None:
+        raise RuntimeError(
+            f"{spec.name}: production CB cost render has no col_weights; "
+            "export is imatrix-weighted, so an unweighted cost row would "
+            "describe different bytes"
+        )
+    return cb_quantize_dequantize_for_context(
+        spec,
+        weight,
+        context=cb_serialization_context_from_env(
+            require_explicit=True,
+            where="CB local cost render",
+        ),
+        col_weights=col_weights,
+    )
+
+
+def cost_payload_provenance(specs: list[fr.FormatSpec]) -> dict:
+    """Identity fields shared by monolithic and incremental cost writers."""
+    has_cb = any(spec.family in _CB_COST_FAMILIES for spec in specs)
+    context = (
+        cb_serialization_context_from_env(
+            require_explicit=True,
+            where="CB cost producer",
+        )
+        if has_cb else None
+    )
+    return cb_cost_provenance(specs, context=context)
+
+
+def cb_render_provenance_for_results(
+    model: nn.Module,
+    results: dict,
+    specs: list[fr.FormatSpec],
+    *,
+    profile=None,
+    render_levers: dict[str, object] | None = None,
+    where: str,
+) -> dict[str, object]:
+    """Build source/imatrix-complete provenance for measured CB rows."""
+    cb_names = {
+        spec.name for spec in specs if spec.family in _CB_COST_FAMILIES
+    }
+    if not cb_names:
+        return cost_payload_provenance(specs)
+    scope: dict[str, list[str]] = {}
+    for qname, per_format in results.items():
+        if not isinstance(per_format, dict):
+            continue
+        measured = sorted(
+            fmt for fmt in cb_names
+            if isinstance(per_format.get(fmt), dict)
+            and "error" not in per_format[fmt]
+        )
+        if measured:
+            scope[str(qname)] = measured
+    base = cost_payload_provenance(specs)
+    if not scope:
+        # Empty visual/MTP shards carry the exact global producer context but
+        # no value identity: no CB row exists to project or consume.
+        return base
+
+    col_weights = {
+        qname: _cb_col_weights_lookup(qname)
+        for qname in scope
+    }
+    missing_col = sorted(
+        qname for qname, value in col_weights.items() if value is None
+    )
+    if missing_col:
+        raise ValueError(
+            f"{where}: measured CB rows are missing exact col_weights; "
+            f"sample={missing_col[:8]}"
+        )
+
+    targets = set(scope)
+    source_weights: dict[str, torch.Tensor] = {}
+    for param_name, param in model.named_parameters():
+        candidates = [str(param_name)]
+        if str(param_name).endswith(".weight"):
+            candidates.append(str(param_name)[:-7])
+        for candidate in candidates:
+            resolved = resolve_cost_target_name(candidate, targets, profile)
+            if resolved in targets and resolved not in source_weights:
+                source_weights[resolved] = param.detach()
+    missing_source = sorted(targets - set(source_weights))
+    if missing_source:
+        raise ValueError(
+            f"{where}: cannot bind exact decoded source weights for measured "
+            f"CB rows; sample={missing_source[:8]}"
+        )
+
+    from .production_weight_cache import (
+        _resolve_production_render_levers,
+        _resolve_render_mechanism_plan,
+        bind_cb_render_identity_source_weights,
+        build_production_cache_cb_render_identity,
+    )
+
+    resolved_levers = _resolve_production_render_levers(
+        render_levers or {"weighted_vq": True}
+    )
+    mechanism_plan = _resolve_render_mechanism_plan(resolved_levers)
+    context = cb_serialization_context_from_env(
+        require_explicit=True,
+        where=where,
+    )
+    identity = build_production_cache_cb_render_identity(
+        scope,
+        cb_serialization_context=context,
+        col_weights=col_weights,
+        render_levers=resolved_levers,
+        render_mechanism_plan=mechanism_plan,
+    )
+    identity = bind_cb_render_identity_source_weights(
+        identity,
+        source_weights,
+        require_complete=True,
+        where=where,
+    )
+    base["cb_serialized_payload"] = dict(
+        identity["cb_serialized_payload"]
+    )
+    base["cb_render_identity"] = identity
+    return base
 
 
 def _packed_expert_parent_for_projection(profile, projection_name: str) -> str | None:
@@ -695,20 +835,32 @@ def measure_unbatched(model: nn.Module, act_cache: "ActivationIndex",
             )
 
         gguf_qw = None
-        if _gguf_imatrix_enabled() and any(s.family == "gguf" for s in specs):
-            # Same op/data as export_gguf.build_imatrix_from_act_cache and
-            # the batched path: full fp32 rows, mean over dim 0.
+        if any(_cost_render_uses_imatrix(s) for s in specs):
+            # Shared activation imatrix (per-input-column mean-sq act). Same
+            # op/data as export_gguf.build_imatrix_from_act_cache AND
+            # export_nvfp4_cb's --col-weights: full fp32 rows, mean over dim 0.
             gguf_qw = X_cpu.float().pow(2).mean(dim=0).to(W.device)
 
         for spec in specs:
             try:
-                if spec.family == "gguf" and gguf_qw is not None:
+                if (spec.family == "gguf" and gguf_qw is not None
+                        and _gguf_imatrix_enabled()):
                     from prismaquant.gguf_formats import (
                         gguf_quantize_dequantize,
                     )
 
                     W_hat = gguf_quantize_dequantize(
                         W.clone(), spec.name, col_weights=gguf_qw,
+                    )
+                elif spec.family in _CB_COST_FAMILIES:
+                    # Lockstep: layout-v1/v2 changes the reachable FP4 scale
+                    # set, not just its byte count. Render under the same
+                    # CBSerializationContext the cost payload records and the
+                    # exporter later validates.
+                    W_hat = _cb_cost_quantize_dequantize(
+                        spec,
+                        W.clone(),
+                        col_weights=gguf_qw,
                     )
                 else:
                     W_hat = spec.quantize_dequantize(W.clone())
@@ -1085,6 +1237,19 @@ def _measure_packed_experts(
     entries = _enumerate_packed_experts(model, target_names, profile)
     if not entries:
         return
+    if os.environ.get("PRISMAQUANT_SKIP_PACKED_EXPERT_COST", "0") == "1":
+        # CB M4-hybrid: the expert_empirical_cost stage REPLACES every
+        # packed-expert row wholesale (merge_cost_payloads
+        # replace_experts=True pops them), so measuring them here — the
+        # single most expensive part of the local cost stage (full-stack
+        # imatrix-weighted CB encodes per rung) — is discarded work. The
+        # pipeline sets this env only when that replacement is guaranteed
+        # to run; if the empirical stage then fails, the pipeline dies
+        # there, before the allocator ever sees the row-less payload.
+        print(f"[cost] SKIPPING {len(entries)} packed-expert tensors "
+              f"(PRISMAQUANT_SKIP_PACKED_EXPERT_COST=1: the CB empirical "
+              f"expert stage replaces these rows)", flush=True)
+        return
     measured = 0
     fallback = 0
     for full_name, packed_param, experts_qname, experts_mod in entries:
@@ -1162,7 +1327,7 @@ def _measure_packed_experts(
             if h.shape == (w.size(0), w.size(1)):
                 h_em = h
         packed_gguf_qw = None
-        if _gguf_imatrix_enabled() and any(s.family == "gguf" for s in specs):
+        if any(_cost_render_uses_imatrix(s) for s in specs):
             # Pooled imatrix from the experts-module input snapshot: exact
             # source for gate_up_proj (its input IS the module input); the
             # shape guard leaves down_proj unweighted (its input is the
@@ -1200,10 +1365,20 @@ def _measure_packed_experts(
                     w_in = w[s_idx]
                 else:
                     w_in = w
+                cw_use = packed_gguf_qw
+                if _cost_render_uses_imatrix(spec):
+                    ext_cw = _cb_col_weights_lookup(full_name)
+                    if ext_cw is not None:
+                        cw_use = ext_cw.to(device=w.device,
+                                           dtype=torch.float32)
+                        if (use_sample and cw_use.ndim >= 3
+                                and cw_use.shape[0] == w.shape[0]):
+                            cw_use = cw_use[s_idx]
                 w_hat = _batched_quantize(
                     spec, w_in,
                     col_weights=(
-                        packed_gguf_qw if spec.family == "gguf" else None
+                        cw_use
+                        if _cost_render_uses_imatrix(spec) else None
                     ),
                 )
                 err = (w_in - w_hat).float()
@@ -1398,6 +1573,40 @@ def _gguf_imatrix_enabled() -> bool:
     return value not in {"0", "false", "no", "off"}
 
 
+# VQ codebook families whose exporter (export_nvfp4_cb) ships imatrix-weighted
+# bytes UNCONDITIONALLY: --col-weights is required, there is no unweighted CB
+# export. So their measured COST render must ALWAYS apply the imatrix to stay in
+# lockstep (cost == shipped-bytes weighting; the one-cache/no-confound rule).
+# Unlike gguf there is deliberately NO toggle — a toggle could only desync the
+# cost from an export that is always weighted.
+_CB_COST_FAMILIES = ("nvfp4_cb", "fp8_cb")
+
+
+def _cost_render_uses_imatrix(spec: fr.FormatSpec) -> bool:
+    """Whether this spec's COST render is activation-imatrix-weighted, matching
+    the family's exporter. gguf tracks the PRISMAQUANT_GGUF_IMATRIX toggle (its
+    export is optionally --imatrix-from-act-cache); CB families are always
+    weighted (their export always is)."""
+    if spec.family == "gguf":
+        return _gguf_imatrix_enabled()
+    return spec.family in _CB_COST_FAMILIES
+
+
+def _item_col_weights(
+    col_weights: torch.Tensor | None, i: int, n: int
+) -> torch.Tensor | None:
+    """Per-input-column imatrix vector for stacked item ``i`` as 1-D
+    ``(in_features,)`` (the registry qdq broadcasts it to ``(out, in)``). A
+    per-item stack ``(N, ..., in)`` is indexed; a single pooled/broadcast
+    vector ``(1, 1, in)`` or ``(in,)`` is shared across all items."""
+    if col_weights is None:
+        return None
+    cw = col_weights
+    if cw.ndim >= 1 and cw.shape[0] == n:
+        cw = cw[i]
+    return cw.reshape(-1)
+
+
 def _batched_quantize(
     spec: fr.FormatSpec,
     stacked_w: torch.Tensor,
@@ -1447,10 +1656,28 @@ def _batched_quantize(
         return gguf_quantize_dequantize(
             stacked_w, spec.name, col_weights=col_weights,
         )
+    if spec.family in _CB_COST_FAMILIES:
+        # VQ codebook families: render per-slice through the SAME registry qdq
+        # closure the unbatched path and the exporter use (fixed lattice + the
+        # default-on scale sweep), so the measured cost is the render export
+        # ships. col_weights (per-input-column imatrix) bias the weighted VQ
+        # search exactly as export_nvfp4_cb's --col-weights does. Per-slice
+        # (like the nv family) keeps each stacked Linear independent and matches
+        # the unbatched path bit-for-bit — no cross-slice coupling exists (fp4
+        # scales are per-group-16, fp8 scales per-output-channel; lattice fixed).
+        n = stacked_w.shape[0]
+        return torch.stack([
+            _cb_cost_quantize_dequantize(
+                spec,
+                stacked_w[i].clone(),
+                col_weights=_item_col_weights(col_weights, i, n),
+            )
+            for i in range(n)
+        ])
     if col_weights is not None:
         raise ValueError(
-            f"col_weights is only supported for gguf-family formats, "
-            f"got {spec.name}"
+            f"col_weights is only supported for gguf-family and CB codebook "
+            f"formats, got {spec.name}"
         )
     if elt in _CODEBOOK_NAMES:
         # Reuse the registry's codebook tables. MX-family formats need
@@ -1467,6 +1694,100 @@ def _batched_quantize(
     else:
         raise ValueError(f"Unknown weight_element_dtype {elt!r} for "
                          f"batched RTN")
+
+
+# Holdout-gate tolerance FLOOR for the dense-path ladder (matches the expert
+# stage's --ladder-holdout-tol default). This is NOT the gate threshold: the
+# shared gate derives its tolerance per fit from the anchors' own residual
+# noise (encode_tiers.md B — "trust the fit only where the holdout error
+# clears the between-seed cost noise") and takes the larger of the two. The
+# constant survives only as an explicit floor for the cases where that datum
+# is absent at call time (2 anchors, or the exact 3-point floor-law solve:
+# residual dof 0). See expert_empirical_cost._cb_ladder_holdout_tol.
+_CB_LADDER_TOL = float(os.environ.get("PRISMAQUANT_CB_LADDER_TOL", "0.10"))
+
+_CB_CW_CACHE: dict | None = None
+
+
+def _cb_col_weights_lookup(name: str):
+    """Shared CB col-weights pickle (PRISMAQUANT_CB_COL_WEIGHTS, set by the
+    pipeline when local packed-expert costs must match the exporter's
+    weighting — incl. the synthesized per-expert down_proj replay entries the
+    inline module-input pool can never provide)."""
+    global _CB_CW_CACHE
+    path = os.environ.get("PRISMAQUANT_CB_COL_WEIGHTS")
+    if not path:
+        return None
+    if _CB_CW_CACHE is None:
+        with open(path, "rb") as fh:
+            _CB_CW_CACHE = {k: torch.as_tensor(v)
+                            for k, v in pickle.load(fh).items()}
+        print(f"[cost] packed-expert col-weights from {path} "
+              f"({len(_CB_CW_CACHE)} entries)", flush=True)
+    return _CB_CW_CACHE.get(name)
+
+
+def _cb_ladder_plan(specs: list[fr.FormatSpec]):
+    """Dense-path RD-ladder plan (PRISMAQUANT_CB_LADDER_INTERP=1, default
+    OFF): per-(family,mode) CB rung ladders from the shared splitter. Returns
+    ``(ladders, predicted_names)`` or None. Anchors+holdout are measured
+    normally; predicted rungs are fitted per TENSOR and holdout-gated, with a
+    measured fallback — so a tensor that defies the law never receives an
+    interpolated cost (encode_tiers.md §B/§C)."""
+    if os.environ.get("PRISMAQUANT_CB_LADDER_INTERP", "0") != "1":
+        return None
+    # Lazy import: expert_empirical_cost lazily imports helpers from this
+    # module, so a top-level import would be a cycle.
+    from prismaquant.expert_empirical_cost import _cb_ladder_split
+    split = _cb_ladder_split([s.name for s in specs])
+    if not split:
+        return None
+    predicted_names = {f for (_, _, _, pred) in split for f in pred}
+    print(f"[cost] CB ladder interp ON: predicting {sorted(predicted_names)} "
+          f"per tensor from anchors (holdout-gated)", flush=True)
+    return split, predicted_names
+
+
+def _ladder_rate_factor(fmt_name: str, k: int) -> float:
+    """Exact per-sub rate factor R(k) under the ceil-first bit split.
+
+    Thin re-export of the canonical implementation
+    (``expert_empirical_cost._cb_ladder_rate_factor``) — kept as a name here
+    because the dense path and its tests have always reached for it under
+    this name."""
+    from prismaquant.expert_empirical_cost import _cb_ladder_rate_factor
+    return _cb_ladder_rate_factor(fmt_name, k)
+
+
+def _ladder_metric_fit(kmap, anchors, fmt_values, target_fmt):
+    """Fit ONE metric on the anchors and predict target_fmt.
+
+    Delegates to the SHARED law ``expert_empirical_cost._cb_ladder_law``
+    (floored-linear-in-R(k) -> smooth floor law -> log-linear). Before R20
+    (2026-07-30) this was a second, drifting copy of the chain and the
+    expert path's copy carried no R(k) term at all.
+
+    Returns None if any anchor value is unusable."""
+    from prismaquant.expert_empirical_cost import _cb_ladder_law
+    law = _cb_ladder_law(kmap, anchors, fmt_values)
+    if law is None:
+        return None
+    return law.predict(target_fmt)
+
+
+def _chunk_metric(accum, name, fmt, key, count_key="_count"):
+    row = accum.get(name, {}).get(fmt)
+    if not row or "_count" not in row or row["_count"] <= 0:
+        return None
+    if key == "predicted_dloss":
+        if row.get("_predicted_dloss_count", 0) <= 0:
+            return None
+        return row["_predicted_dloss_sum"] / row["_predicted_dloss_count"]
+    if key == "fisher_output_mse":
+        if row.get("_fisher_output_mse_count", 0) <= 0:
+            return None
+        return row["_fisher_output_mse_sum"] / row["_fisher_output_mse_count"]
+    return row.get(f"_{key}_sum", 0.0) / row["_count"]
 
 
 def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
@@ -1502,6 +1823,12 @@ def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
           f"{total_linears} Linears total"
           + (f" (expert sample: {len(expert_extrapolate)} extrapolated)"
              if expert_extrapolate else ""), flush=True)
+    ladder_plan = _cb_ladder_plan(specs)
+    # Visible accept/reject rate for the holdout gate (R20): a ladder that is
+    # mostly rejecting pays full measurement PLUS the anchors, and the
+    # operator must be able to read that off the log.
+    ladder_accept = 0
+    ladder_reject = 0
 
     accum: dict[str, dict[str, dict]] = {}
     processed = 0
@@ -1578,9 +1905,7 @@ def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
                 for idx in row_indices_cpu
             ]
             gguf_qw = None
-            if _gguf_imatrix_enabled() and any(
-                s.family == "gguf" for s in specs
-            ):
+            if any(_cost_render_uses_imatrix(s) for s in specs):
                 # Per-item imatrix, computed with the IDENTICAL op on the
                 # IDENTICAL data as export_gguf.build_imatrix_from_act_cache
                 # (FULL fp32 CPU act rows, mean over dim 0) — NOT from the
@@ -1641,45 +1966,64 @@ def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
                     gq_stacked = torch.stack(gq_items, dim=0)  # (N, rows)
                 del h_items, gq_items
 
-            for spec in specs:
+            def _measure_spec_into_accum(spec, idx=None):
+                """One spec's batched measure for the whole chunk (idx=None)
+                or an index-subset (the ladder's per-tensor measured
+                fallback). Identical math either way."""
+                sub_names = (names if idx is None
+                             else [names[i] for i in idx])
                 try:
+                    Ws = W if idx is None else W[idx]
+                    Xs = X if idx is None else X[idx]
+                    y_refs = y_ref if idx is None else y_ref[idx]
+                    ref_e = ref_energy if idx is None else ref_energy[idx]
+                    gqw = gguf_qw if (gguf_qw is None or idx is None) \
+                        else gguf_qw[idx]
+                    hs = h_stacked if (h_stacked is None or idx is None) \
+                        else h_stacked[idx]
+                    gqs = gq_stacked if (gq_stacked is None or idx is None) \
+                        else gq_stacked[idx]
+                    n_sub = Ws.size(0)
                     W_hat = _batched_quantize(
-                        spec, W,
+                        spec, Ws,
                         col_weights=(
-                            gguf_qw if spec.family == "gguf" else None
+                            gqw if _cost_render_uses_imatrix(spec) else None
                         ),
                     )
-                    X_hat = spec.activation_quantize_dequantize(X.clone())
-                    err = (W - W_hat).float()
-                    weight_mse = err.pow(2).mean(dim=(1, 2))  # (N,)
+                    X_hat = spec.activation_quantize_dequantize(Xs.clone())
+                    err = (Ws - W_hat).float()
+                    weight_mse = err.pow(2).mean(dim=(1, 2))  # (n_sub,)
                     y_q = torch.bmm(X_hat, W_hat.transpose(1, 2))
-                    y_err_sq = (y_ref - y_q).float().pow(2)
-                    output_mse = y_err_sq.mean(dim=(1, 2))  # (N,)
-                    rel_mse = output_mse / ref_energy.clamp_min(1e-12)
+                    y_err_sq = (y_refs - y_q).float().pow(2)
+                    output_mse = y_err_sq.mean(dim=(1, 2))  # (n_sub,)
+                    rel_mse = output_mse / ref_e.clamp_min(1e-12)
                     fisher_output_mse = None
-                    if gq_stacked is not None:
+                    if gqs is not None:
                         fisher_output_mse = (
-                            y_err_sq * gq_stacked.unsqueeze(2)
+                            y_err_sq * gqs.unsqueeze(2)
                         ).mean(dim=(1, 2))
                     # Per-item predicted Δloss from full per-weight
-                    # Fisher. shape (N,).
+                    # Fisher. shape (n_sub,).
                     dloss_per = None
-                    if h_stacked is not None:
-                        dloss_per = 0.5 * (h_stacked * err.pow(2)).sum(dim=(1, 2))
+                    if hs is not None:
+                        dloss_per = 0.5 * (hs * err.pow(2)).sum(dim=(1, 2))
                     # Move all scalar metrics back to the host in one shot.
-                    # Calling `.item()` per Linear forces a CUDA sync for each
-                    # row and turns the batched path back into serialized work.
+                    # Calling `.item()` per Linear forces a CUDA sync for
+                    # each row and turns the batched path back into
+                    # serialized work.
                     metric_cols = [weight_mse, output_mse, rel_mse]
                     if fisher_output_mse is not None:
                         metric_cols.append(fisher_output_mse)
-                    metrics = torch.stack(metric_cols, dim=1).detach().cpu().tolist()
+                    metrics = torch.stack(
+                        metric_cols, dim=1).detach().cpu().tolist()
                     if dloss_per is not None:
                         dloss_values = dloss_per.detach().cpu().tolist()
                     else:
-                        dloss_values = [None] * N
+                        dloss_values = [None] * n_sub
 
                     # Unpack per-item into results dict after the single sync.
-                    for name, row, dloss_val in zip(names, metrics, dloss_values):
+                    for name, row, dloss_val in zip(sub_names, metrics,
+                                                    dloss_values):
                         w_mse, out_mse, rel = row[:3]
                         fisher_val = row[3] if len(row) > 3 else None
                         _accumulate_result(
@@ -1703,13 +2047,81 @@ def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
                     del W_hat, X_hat, err, y_q, y_err_sq
                     del weight_mse, output_mse, rel_mse
                     del metrics, dloss_values
-                    if dloss_per is not None:
-                        del dloss_per
-                    if fisher_output_mse is not None:
-                        del fisher_output_mse
                 except Exception as e:
-                    for name in names:
-                        accum.setdefault(name, {})[spec.name] = {"error": str(e)}
+                    for name in sub_names:
+                        accum.setdefault(name, {})[spec.name] = {
+                            "error": str(e)}
+
+            measured_specs = (
+                specs if ladder_plan is None
+                else [s for s in specs if s.name not in ladder_plan[1]])
+            for spec in measured_specs:
+                _measure_spec_into_accum(spec)
+
+            if ladder_plan is not None:
+                # Per-tensor fit + holdout gate; fill accepted predictions,
+                # batch-measure the rejects (exact same math via the closure).
+                from prismaquant.expert_empirical_cost import _cb_ladder_gate
+                specs_by_name = {s.name: s for s in specs}
+                for kmap, anchors, holdout, predicted in ladder_plan[0]:
+                    if not all(f in specs_by_name for f in
+                               list(anchors) + [holdout] + list(predicted)):
+                        continue
+                    primary = ("predicted_dloss" if h_stacked is not None
+                               else "output_mse")
+                    fail_idx = []
+                    for i, name in enumerate(names):
+                        vals = {f: _chunk_metric(accum, name, f, primary)
+                                for f in list(anchors) + [holdout]}
+                        if any(v is None or v <= 0 for v in vals.values()):
+                            fail_idx.append(i)
+                            continue
+                        # Shared fit + gate. No `windows` datum here: this
+                        # path measures each (tensor, format) exactly once
+                        # (accumulator _count == 1), so there is no
+                        # between-draw spread to derive a tolerance from and
+                        # _CB_LADDER_TOL stands (encode_tiers.md B).
+                        law, _rel, _tol = _cb_ladder_gate(
+                            kmap, anchors, vals, holdout, _CB_LADDER_TOL)
+                        if law is None:
+                            fail_idx.append(i)
+                            continue
+                        ladder_accept += 1
+                        for fmt in predicted:
+                            fills = {}
+                            for key in ("weight_mse", "output_mse",
+                                        "rel_output_mse", "predicted_dloss",
+                                        "fisher_output_mse"):
+                                mvals = {f: _chunk_metric(accum, name, f,
+                                                          key)
+                                         for f in anchors}
+                                if any(v is None or v <= 0
+                                       for v in mvals.values()):
+                                    fills[key] = None
+                                else:
+                                    fills[key] = _ladder_metric_fit(
+                                        kmap, anchors, mvals, fmt)
+                            _accumulate_result(
+                                accum, name, fmt,
+                                float(fills["weight_mse"] or 0.0),
+                                float(fills["output_mse"] or 0.0),
+                                float(fills["rel_output_mse"] or 0.0),
+                                predicted_dloss=fills["predicted_dloss"],
+                                fisher_output_mse=fills["fisher_output_mse"],
+                                output_mse_measured=False,
+                            )
+                    if fail_idx:
+                        ladder_reject += len(fail_idx)
+                        print(f"[cost] ladder holdout rejected "
+                              f"{len(fail_idx)}/{N} tensors in chunk — "
+                              f"measuring {sorted(predicted)} for them "
+                              f"(running accept rate "
+                              f"{ladder_accept}/{ladder_accept + ladder_reject}"
+                              f" = {ladder_accept / max(ladder_accept + ladder_reject, 1):.0%})",
+                              flush=True)
+                        for fmt in predicted:
+                            _measure_spec_into_accum(
+                                specs_by_name[fmt], idx=fail_idx)
 
             del W, X, y_ref, ref_energy
             if h_stacked is not None:
@@ -1725,6 +2137,14 @@ def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
                       flush=True)
     if _prefetch_pool is not None:
         _prefetch_pool.shutdown(wait=False)
+    if ladder_plan is not None:
+        n_gate = ladder_accept + ladder_reject
+        print(f"[cost] CB ladder holdout gate: {ladder_accept}/{n_gate} "
+              f"tensor-fits accepted "
+              f"({ladder_accept / max(n_gate, 1):.0%}), {ladder_reject} "
+              f"rejected -> measured (tol {_CB_LADDER_TOL:.0%}: the dense "
+              f"path measures each (tensor, format) once, so it has no "
+              f"between-draw noise datum to derive from)", flush=True)
     results = _finalize_results(accum)
     _extrapolate_expert_costs(results, expert_extrapolate)
     return results
@@ -1777,6 +2197,18 @@ def prepare_cost_context(probe_path: str,
     act_cache = ActivationIndex(cache, stats)
     print(f"[cost] activation cache (lazy index): "
           f"{len(act_cache)} Linears mapped", flush=True)
+    if len(act_cache) == 0 and stats:
+        # Fail LOUD, not empty: an unpopulated act dir (e.g. probe.pkl copied
+        # from a prior run without its act cache — the probe stage is what
+        # writes activations) would otherwise produce a 0-row cost.pkl and a
+        # blanket-INFEASIBLE allocator (27B 2026-07-21). Measurement gap ->
+        # error, never silent garbage.
+        raise SystemExit(
+            f"activation cache {cache} maps 0 Linears while {len(stats)} "
+            "targets expect activations. The act cache is written by the "
+            "PROBE stage: if probe.pkl was reused from another run, copy its "
+            "act/ directory too, or delete probe.pkl so the probe re-runs "
+            "and repopulates activations.")
 
     target_names = set(stats.keys())
     def _has_activation_for_target(name: str) -> bool:
@@ -1868,10 +2300,18 @@ def run_cost_pass(model: nn.Module,
 
     out_path = Path(output_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    provenance = cb_render_provenance_for_results(
+        model,
+        results,
+        specs,
+        profile=model_profile,
+        where="monolithic CB cost",
+    )
     with open(out_path, "wb") as f:
         pickle.dump({
             "costs": results,
             "formats": [s.name for s in specs],
+            "provenance": provenance,
             "meta": {
                 "model": model_name,
                 "probe": probe_path,

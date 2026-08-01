@@ -15,9 +15,19 @@ External architectures can register their own profile at runtime:
 
     register_profile(MyArchProfile)
 
-Registered profiles are consulted in registration order; the first one
-whose `.matches()` returns True wins. `DefaultProfile` is the terminal
-fallback when nothing matches.
+Registered profiles are consulted in `ModelProfile.priority` order (lower
+first, ties broken by registration order); the first one whose `.matches()`
+returns True wins. `DefaultProfile` is the terminal fallback when nothing
+matches.
+
+Two kinds of profile take part in detection:
+
+  - **Python profiles** in `_REGISTERED`, matched by `cls.matches()`.
+  - **Spec-only profiles** — a `SpecMatchProfile` per `specs/<id>.json` whose
+    `id` no registered Python profile claims, matched by its declarative
+    `match` block. This is the extension point that makes a pure-JSON
+    architecture possible; while a Python profile of the same name exists it
+    wins outright, so adding a spec never silently re-routes a shipped model.
 """
 from __future__ import annotations
 
@@ -35,33 +45,52 @@ from .qwen3_moe import Qwen3MoeProfile
 
 # MiniMaxM2Profile: re-imported from its live mirror after the 2026-04-24
 # session's Phase-3 archive move. The profile is still tracked under
-# archive/minimax_m2p7/ as its canonical home; this live import enables
+# archive/minimax_m2p7_2026-04-24/ as its canonical home; this live import enables
 # allocator Pareto runs without uprooting the archive commit.
 from .minimax_m2 import MiniMaxM2Profile
 from .deepseek_v4 import DeepseekV4Profile
 from .hy_v3 import HyV3Profile
+from .laguna import LagunaProfile
 
 
+# Detection order is load-bearing — subsets must precede supersets, and
+# getting it wrong silently re-routes a shipped model to another profile. It
+# used to be encoded in this list's *order* plus two comments; it is now
+# encoded in each profile's `priority` class attribute (lower = consulted
+# first), which survives being read from a spec file after the Python body is
+# deleted. The comments below record why each pair is ordered as it is; the
+# numbers are the contract, and `tests/test_spec_match_profile.py` asserts that
+# priority order still equals this list's literal order.
 _REGISTERED: list[type[ModelProfile]] = [
-    Qwen3_5DenseProfile,  # must precede Qwen3_5Profile (dense is a subset)
-    Qwen3_5Profile,
-    Qwen3MoeProfile,  # must precede Qwen3Profile (MoE model_type includes qwen3)
-    Qwen3Profile,  # original Qwen3 (dense, no MoE, no MTP) — after the 3.5 siblings
-    Gemma4Profile,
-    Lfm2MoeProfile,
-    MiniMaxM2Profile,
-    DeepseekV4Profile,
-    HyV3Profile,
+    Qwen3_5DenseProfile,  # 100 — must precede Qwen3_5Profile (dense is a subset)
+    Qwen3_5Profile,       # 110
+    Qwen3MoeProfile,      # 120 — must precede Qwen3Profile (MoE model_type includes qwen3)
+    Qwen3Profile,         # 130 — original Qwen3 (dense, no MoE, no MTP)
+    Gemma4Profile,        # 140
+    Lfm2MoeProfile,       # 150
+    MiniMaxM2Profile,     # 160
+    DeepseekV4Profile,    # 170
+    HyV3Profile,          # 180
+    LagunaProfile,        # 190
 ]
+
+# Bumped whenever `_REGISTERED` changes, so the derived detection order (which
+# folds in spec-only profiles) can be cached without going stale.
+_REGISTRY_GENERATION = 0
+_DETECTION_ORDER_CACHE: tuple[int, tuple] | None = None
 
 
 def register_profile(cls: type[ModelProfile]) -> None:
     """Register a new ModelProfile subclass for auto-detection.
 
-    Profiles are consulted in registration order. Register earlier than
-    built-in profiles to override them."""
+    Profiles are consulted in `priority` order (lower first). A profile that
+    does not declare one inherits `ModelProfile.priority = 0`, which is ahead
+    of every built-in (100+) — so the historical "register earlier than
+    built-in profiles to override them" contract holds unchanged."""
+    global _REGISTRY_GENERATION
     if cls not in _REGISTERED:
         _REGISTERED.insert(0, cls)
+        _REGISTRY_GENERATION += 1
 
 
 def _refuse_dead_vendored_override(model_type: str) -> None:
@@ -168,12 +197,74 @@ def profile_from_model(model) -> ModelProfile:
     return profile_from_config(getattr(model, "config", None))
 
 
-def _resolve(model_type: str, archs: list[str]) -> ModelProfile:
-    """Walk registered profile classes, instantiate the first match."""
+def _python_profile_names() -> set[str]:
+    """Names claimed by registered Python profiles (`specs/<name>.json` keys)."""
+    names: set[str] = set()
     for cls in _REGISTERED:
         try:
-            if cls.matches(model_type, archs):
-                inst = cls()
+            names.add(cls().name)
+        except Exception:
+            continue
+    return names
+
+
+def detection_order() -> tuple:
+    """Every detection candidate, ordered by priority (lower first).
+
+    Entries are either a `ModelProfile` subclass (matched via `cls.matches()`)
+    or a `SpecMatchProfile` instance (matched via its declarative `match`
+    block). Ties keep `_REGISTERED` order, and Python profiles precede
+    spec-only ones at equal priority: an executable claim is the more specific
+    statement, and this keeps a spec that copies its Python profile's priority
+    from reordering detection.
+    """
+    global _DETECTION_ORDER_CACHE
+    cached = _DETECTION_ORDER_CACHE
+    if cached is not None and cached[0] == _REGISTRY_GENERATION:
+        return cached[1]
+
+    from .spec_profile import SpecMatchProfile
+    from .structure import iter_structure_specs
+
+    entries: list[tuple[int, int, int, object]] = []
+    for index, cls in enumerate(_REGISTERED):
+        entries.append((int(getattr(cls, "priority", 0)), 0, index, cls))
+
+    claimed = _python_profile_names()
+    try:
+        specs = iter_structure_specs()
+    except Exception:
+        specs = ()
+    for index, spec in enumerate(specs):
+        if spec.id in claimed or not spec.match.declared:
+            continue
+        entries.append((int(spec.priority), 1, index, SpecMatchProfile(spec)))
+
+    entries.sort(key=lambda item: item[:3])
+    order = tuple(item[3] for item in entries)
+    _DETECTION_ORDER_CACHE = (_REGISTRY_GENERATION, order)
+    return order
+
+
+def _claims(candidate, model_type: str, archs: list[str]) -> bool:
+    if isinstance(candidate, type):
+        return bool(candidate.matches(model_type, archs))
+    return bool(candidate.claims(model_type, archs))
+
+
+def _new_instance(candidate) -> ModelProfile:
+    """Fresh profile instance per resolution (lazy caches are not shared)."""
+    if isinstance(candidate, type):
+        return candidate()
+    return type(candidate)(candidate.spec)
+
+
+def _resolve(model_type: str, archs: list[str]) -> ModelProfile:
+    """Walk detection candidates in priority order, build the first match."""
+    for cls in detection_order():
+        try:
+            if _claims(cls, model_type, archs):
+                inst = _new_instance(cls)
                 # Some profiles need to register vendored modeling code
                 # with transformers before the model loads. Defer to
                 # the profile method (refactor #32) so callers don't

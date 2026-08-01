@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 import sys
@@ -7,7 +8,21 @@ from pathlib import Path
 
 import math
 
+import pytest
+import torch
+
+from prismaquant.nvfp4_cb_footprint import (
+    CBSerializationContext,
+    assignment_serialization_sha256,
+    cb_serialization_context_stamp,
+)
+from prismaquant.production_weight_cache import (
+    bind_cb_render_identity_source_weights,
+    build_production_cache_cb_render_identity,
+)
 from prismaquant.select_validated_frontier import (
+    DEFAULT_TAIL_ETA,
+    DEFAULT_TAIL_VETO,
     _frontier_from_rows,
     _kneedle_convex_decreasing,
     _log_error_values,
@@ -18,8 +33,52 @@ from prismaquant.select_validated_frontier import (
     practical_knee,
     select_frontier_point,
     spearman_rank_correlation,
+    tail_eta_auto,
+    tail_veto_inert_reason,
     worst_rank_inversion,
 )
+
+
+def _production_cb_stamp(formats=("NVFP4_CB_K16",)):
+    return cb_serialization_context_stamp(
+        CBSerializationContext.production(), formats=formats
+    )
+
+
+def _canonical_payload_sha256(payload):
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _complete_cb_render_identity(formats_by_qname):
+    context = CBSerializationContext.production()
+    qnames = sorted(formats_by_qname)
+    col_weights = {
+        qname: torch.linspace(0.1, 1.0, 256)
+        for qname in qnames
+    }
+    identity = build_production_cache_cb_render_identity(
+        formats_by_qname,
+        cb_serialization_context=context,
+        col_weights=col_weights,
+        render_levers={"weighted_vq": True},
+        render_mechanism_plan=[],
+    )
+    assert identity is not None
+    return bind_cb_render_identity_source_weights(
+        identity,
+        {
+            qname: torch.full((2, 256), index, dtype=torch.float32)
+            for index, qname in enumerate(qnames, start=1)
+        },
+    )
 
 
 def _sat_results(stderr):
@@ -259,6 +318,11 @@ def test_select_validated_frontier_cli_writes_layer_config(tmp_path):
         }],
     }))
     layer_config = tmp_path / "layer_config.json"
+    layer_config.write_text(json.dumps({
+        "__prismaquant__": {
+            "cb_serialized_payload": _production_cb_stamp(),
+        },
+    }))
     assignment_out = tmp_path / "selected_assignment.json"
     summary = tmp_path / "selection.json"
 
@@ -294,6 +358,499 @@ def test_select_validated_frontier_cli_writes_layer_config(tmp_path):
 
     selected = json.loads(summary.read_text())["selected"]
     assert selected["label"] == "candidate"
+
+
+def test_selector_preserves_cb_global_and_per_layer_serialization_identity(
+    tmp_path,
+):
+    qname = "model.layers.0.self_attn.q_proj"
+    assignment = {qname: "NVFP4_CB_K16"}
+    render_identity = _complete_cb_render_identity(assignment)
+    context = render_identity["cb_serialized_payload"]
+    identity = "exact-tensor-identity"
+    assignment_path = tmp_path / "candidate_cb.json"
+    assignment_path.write_text(json.dumps({
+        "schema": "prismaquant.allocator.pareto_assignment.v1",
+        "cb_serialized_payload": context,
+        "cb_render_identity": render_identity,
+        "cb_serialized_identities": {
+            qname: identity,
+        },
+        "assignment": assignment,
+    }))
+    validation_path = tmp_path / "validation.json"
+    validation_path.write_text(json.dumps({
+        "results": [{
+            "label": "candidate_cb",
+            "path": str(assignment_path),
+            "bpp": 2.3,
+            "last_token_kl": 0.01,
+            "format_counts": {"NVFP4_CB_K16": 1},
+        }],
+    }))
+    layer_config = tmp_path / "layer_config.json"
+    assignment_out = tmp_path / "selected_assignment.json"
+    summary = tmp_path / "selection.json"
+
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "prismaquant.select_validated_frontier",
+            "--validation-json",
+            str(validation_path),
+            "--mode",
+            "best-kl",
+            "--output-layer-config",
+            str(layer_config),
+            "--output-assignment",
+            str(assignment_out),
+            "--output-summary",
+            str(summary),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        check=True,
+    )
+
+    emitted_layer = json.loads(layer_config.read_text())
+    assert emitted_layer["__prismaquant__"]["cb_serialized_payload"] == context
+    assert emitted_layer["__prismaquant__"][
+        "cb_render_identity"
+    ] == render_identity
+    assert emitted_layer[qname][
+        "cb_serialized_identity"
+    ] == identity
+    emitted_assignment = json.loads(assignment_out.read_text())
+    assert emitted_assignment["cb_serialized_payload"] == context
+    assert emitted_assignment["cb_render_identity"] == render_identity
+    assert emitted_assignment["cb_serialized_identities"] == {
+        qname: identity,
+    }
+
+
+def test_selector_uses_validator_resolved_full_assignment_not_raw_delta(tmp_path):
+    body = "model.layers.0.self_attn.q_proj"
+    visual = "model.visual.blocks.0.mlp.fc1"
+    assignment = {
+        body: "NVFP4_CB_K16",
+        visual: "NVFP4_CB_K16",
+    }
+    render_identity = _complete_cb_render_identity(assignment)
+    context = render_identity["cb_serialized_payload"]
+    raw_path = tmp_path / "raw_delta.json"
+    raw_path.write_text(json.dumps({
+        "assignment": {body: "NVFP4_CB_K16"},
+        "cb_serialized_payload": context,
+        "cb_serialized_identities": {body: "body-identity"},
+    }))
+    resolved = {
+        "schema": "prismaquant.validated_resolved_assignment.v1",
+        "source_path": str(raw_path),
+        "assignment": assignment,
+        "cb_serialized_payload": context,
+        "cb_render_identity": render_identity,
+        "cb_serialized_identities": {
+            body: "body-identity",
+            visual: "visual-identity",
+        },
+    }
+    resolved["assignment_sha256"] = assignment_serialization_sha256(
+        resolved["assignment"]
+    )
+    validation_path = tmp_path / "validation.json"
+    validation_path.write_text(json.dumps({
+        "results": [{
+            "label": "candidate",
+            "path": str(raw_path),
+            "bpp": 2.3,
+            "last_token_kl": 0.01,
+            "assignment_sha256": resolved["assignment_sha256"],
+            "resolved_assignment_payload": resolved,
+            "resolved_assignment_payload_sha256": (
+                _canonical_payload_sha256(resolved)
+            ),
+        }],
+    }))
+    layer_config = tmp_path / "layer_config.json"
+    assignment_out = tmp_path / "selected_assignment.json"
+
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "prismaquant.select_validated_frontier",
+            "--validation-json",
+            str(validation_path),
+            "--mode",
+            "best-kl",
+            "--output-layer-config",
+            str(layer_config),
+            "--output-assignment",
+            str(assignment_out),
+            "--output-summary",
+            str(tmp_path / "selection.json"),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        check=True,
+    )
+
+    emitted = json.loads(assignment_out.read_text())
+    assert emitted["assignment"] == resolved["assignment"]
+    assert emitted["cb_serialized_identities"] == (
+        resolved["cb_serialized_identities"]
+    )
+    assert emitted["cb_render_identity"] == render_identity
+    emitted_layer = json.loads(layer_config.read_text())
+    assert emitted_layer[visual]["cb_serialized_identity"] == "visual-identity"
+
+
+@pytest.mark.parametrize("splice", ["assignment", "cb_render_identity"])
+def test_selector_rejects_spliced_resolved_assignment_payload(tmp_path, splice):
+    qname = "model.layers.0.self_attn.q_proj"
+    assignment = {qname: "NVFP4_CB_K16"}
+    render_identity = _complete_cb_render_identity(assignment)
+    raw_path = tmp_path / "candidate.json"
+    raw_path.write_text(json.dumps({"assignment": assignment}))
+    resolved = {
+        "schema": "prismaquant.validated_resolved_assignment.v1",
+        "source_path": str(raw_path),
+        "assignment": assignment,
+        "assignment_sha256": assignment_serialization_sha256(assignment),
+        "cb_serialized_payload": render_identity["cb_serialized_payload"],
+        "cb_render_identity": render_identity,
+        "cb_serialized_identities": {qname: "exact-tensor-identity"},
+    }
+    validator_payload_sha256 = _canonical_payload_sha256(resolved)
+    spliced_payload = json.loads(json.dumps(resolved))
+    if splice == "assignment":
+        spliced_payload["assignment"][qname] = "NVFP4_CB_K14"
+    else:
+        spliced_payload["cb_render_identity"][
+            "col_weights_content_sha256"
+        ][qname] = "0" * 64
+
+    validation_path = tmp_path / "validation.json"
+    validation_path.write_text(json.dumps({
+        "results": [{
+            "label": "spliced",
+            "path": str(raw_path),
+            "bpp": 2.3,
+            "last_token_kl": 0.01,
+            "assignment_sha256": resolved["assignment_sha256"],
+            "resolved_assignment_payload": spliced_payload,
+            "resolved_assignment_payload_sha256": validator_payload_sha256,
+        }],
+    }))
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "prismaquant.select_validated_frontier",
+            "--validation-json",
+            str(validation_path),
+            "--mode",
+            "best-kl",
+            "--output-layer-config",
+            str(tmp_path / "layer_config.json"),
+            "--output-assignment",
+            str(tmp_path / "selected_assignment.json"),
+            "--output-summary",
+            str(tmp_path / "selection.json"),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert (
+        "resolved measured assignment payload does not match the identity "
+        "bound to its KL result"
+    ) in (result.stderr + result.stdout)
+
+
+def test_selector_carries_non_cb_whole_artifact_budget_to_layer_config(tmp_path):
+    assignment = {
+        "model.layers.0.self_attn.q_proj": "NVFP4",
+    }
+    budget = {
+        "schema": "prismaquant.whole_artifact_budget.v2",
+        "scope": "all_regular_files_recursive",
+        "budget_bytes": 10_000,
+        "selection_tensor_payload_bytes": 8_000,
+        "selection_non_tensor_reserve_bytes": 1_000,
+        "selection_whole_artifact_upper_bound_bytes": 9_000,
+        "selection_assignment_sha256": assignment_serialization_sha256(
+            assignment
+        ),
+        "selection_contract": (
+            "tensor_payload_plus_operator_supplied_non_tensor_reserve"
+        ),
+        "final_contract": "stat_all_regular_files_recursive_fail_closed",
+    }
+    assignment_path = tmp_path / "candidate.json"
+    assignment_path.write_text(json.dumps({
+        "whole_artifact_budget": budget,
+        "assignment": assignment,
+    }))
+    validation_path = tmp_path / "validation.json"
+    validation_path.write_text(json.dumps({
+        "results": [{
+            "label": "candidate",
+            "path": str(assignment_path),
+            "bpp": 4.5,
+            "last_token_kl": 0.01,
+        }],
+    }))
+    layer_config = tmp_path / "layer_config.json"
+    assignment_out = tmp_path / "selected_assignment.json"
+
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "prismaquant.select_validated_frontier",
+            "--validation-json",
+            str(validation_path),
+            "--mode",
+            "best-kl",
+            "--output-layer-config",
+            str(layer_config),
+            "--output-assignment",
+            str(assignment_out),
+            "--output-summary",
+            str(tmp_path / "selection.json"),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        check=True,
+    )
+
+    emitted_layer = json.loads(layer_config.read_text())
+    assert emitted_layer["__prismaquant__"]["whole_artifact_budget"] == budget
+    assert "cb_serialized_payload" not in emitted_layer["__prismaquant__"]
+    emitted_assignment = json.loads(assignment_out.read_text())
+    assert emitted_assignment["whole_artifact_budget"] == budget
+
+
+def test_selector_rejects_global_cb_stamp_without_per_layer_identities(tmp_path):
+    assignment_path = tmp_path / "candidate_cb.json"
+    assignment_path.write_text(json.dumps({
+        "cb_serialized_payload": _production_cb_stamp(),
+        "assignment": {
+            "model.layers.0.self_attn.q_proj": "NVFP4_CB_K16",
+        },
+    }))
+    validation_path = tmp_path / "validation.json"
+    validation_path.write_text(json.dumps({
+        "results": [{
+            "label": "candidate_cb",
+            "path": str(assignment_path),
+            "bpp": 2.3,
+            "last_token_kl": 0.01,
+        }],
+    }))
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "prismaquant.select_validated_frontier",
+            "--validation-json",
+            str(validation_path),
+            "--mode",
+            "best-kl",
+            "--output-layer-config",
+            str(tmp_path / "layer_config.json"),
+            "--output-assignment",
+            str(tmp_path / "selected_assignment.json"),
+            "--output-summary",
+            str(tmp_path / "selection.json"),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert "global serialized-payload context but no per-layer identities" in (
+        result.stderr + result.stdout
+    )
+
+
+def test_selector_rejects_cb_assignment_with_no_serialization_metadata(tmp_path):
+    assignment_path = tmp_path / "candidate_cb.json"
+    assignment_path.write_text(json.dumps({
+        "assignment": {
+            "model.layers.0.self_attn.q_proj": "NVFP4_CB_K16",
+        },
+    }))
+    validation_path = tmp_path / "validation.json"
+    validation_path.write_text(json.dumps({
+        "results": [{
+            "label": "candidate_cb",
+            "path": str(assignment_path),
+            "bpp": 2.3,
+            "last_token_kl": 0.01,
+        }],
+    }))
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "prismaquant.select_validated_frontier",
+            "--validation-json",
+            str(validation_path),
+            "--mode",
+            "best-kl",
+            "--output-layer-config",
+            str(tmp_path / "layer_config.json"),
+            "--output-assignment",
+            str(tmp_path / "selected_assignment.json"),
+            "--output-summary",
+            str(tmp_path / "selection.json"),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert "missing its global serialized-payload context" in (
+        result.stderr + result.stdout
+    )
+
+
+@pytest.mark.parametrize(
+    "case,stamp_budget,stamp_upper,expected_error",
+    [
+        (
+            "missing_stamp",
+            None,
+            None,
+            "has no whole_artifact_budget stamp",
+        ),
+        (
+            "wrong_budget",
+            11_000,
+            9_000,
+            "budget differs from --target-disk-gb",
+        ),
+        (
+            "wrong_upper",
+            10_000,
+            8_000,
+            "upper bound does not reconcile",
+        ),
+    ],
+)
+def test_budget_selector_requires_reconciled_export_gate(
+    tmp_path, case, stamp_budget, stamp_upper, expected_error,
+):
+    assignment_payload = {
+        "assignment": {
+            "model.layers.0.self_attn.q_proj": "NVFP4",
+        },
+    }
+    if stamp_budget is not None:
+        reserve = 1_000
+        assignment_payload["whole_artifact_budget"] = {
+            "schema": "prismaquant.whole_artifact_budget.v2",
+            "scope": "all_regular_files_recursive",
+            "budget_bytes": stamp_budget,
+            "selection_tensor_payload_bytes": stamp_upper - reserve,
+            "selection_non_tensor_reserve_bytes": reserve,
+            "selection_whole_artifact_upper_bound_bytes": stamp_upper,
+            "selection_assignment_sha256": assignment_serialization_sha256(
+                assignment_payload["assignment"]
+            ),
+            "selection_contract": (
+                "tensor_payload_plus_operator_supplied_non_tensor_reserve"
+            ),
+            "final_contract": (
+                "stat_all_regular_files_recursive_fail_closed"
+            ),
+        }
+    assignment_path = tmp_path / f"{case}.json"
+    assignment_path.write_text(json.dumps(assignment_payload))
+    validation_path = tmp_path / "validation.json"
+    validation_path.write_text(json.dumps({
+        "results": [{
+            "label": case,
+            "path": str(assignment_path),
+            "bpp": 4.5,
+            "last_token_kl": 0.01,
+            "whole_artifact_upper_bound_bytes": 9_000,
+        }],
+    }))
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "prismaquant.select_validated_frontier",
+            "--validation-json",
+            str(validation_path),
+            "--mode",
+            "budget",
+            "--target-disk-gb",
+            "0.00001",  # floor(1e-5 * 1e9) = 10,000 bytes
+            "--tail-veto",
+            "none",
+            "--output-layer-config",
+            str(tmp_path / "layer_config.json"),
+            "--output-assignment",
+            str(tmp_path / "selected_assignment.json"),
+            "--output-summary",
+            str(tmp_path / "selection.json"),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert expected_error in (result.stderr + result.stdout)
+
+
+def test_selector_rejects_stale_cb_stamp_on_non_cb_assignment(tmp_path):
+    assignment_path = tmp_path / "candidate.json"
+    assignment_path.write_text(json.dumps({
+        "cb_serialized_payload": _production_cb_stamp(),
+        "assignment": {
+            "model.layers.0.self_attn.q_proj": "NVFP4",
+        },
+    }))
+    validation_path = tmp_path / "validation.json"
+    validation_path.write_text(json.dumps({
+        "results": [{
+            "label": "candidate",
+            "path": str(assignment_path),
+            "bpp": 4.5,
+            "last_token_kl": 0.01,
+        }],
+    }))
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "prismaquant.select_validated_frontier",
+            "--validation-json",
+            str(validation_path),
+            "--mode",
+            "best-kl",
+            "--output-layer-config",
+            str(tmp_path / "layer_config.json"),
+            "--output-assignment",
+            str(tmp_path / "selected_assignment.json"),
+            "--output-summary",
+            str(tmp_path / "selection.json"),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert "global serialized-payload context but no per-layer identities" in (
+        result.stderr + result.stdout
+    )
 
 
 def test_select_validated_frontier_diagnostics_include_dominated_rows(tmp_path):
@@ -496,3 +1053,250 @@ def test_load_assignment_unwraps_assignment_key(tmp_path):
         "assignment": {"model.layers.0.mlp.up_proj": "nvfp4"},
     }))
     assert _load_assignment(path) == {"model.layers.0.mlp.up_proj": "NVFP4"}
+
+
+# --------------------------------------------------------------------------
+# R9 / D1 tail veto
+# --------------------------------------------------------------------------
+
+def _tail_rows():
+    """A frontier where mean KL falls monotonically but the tail does not.
+
+    ``c`` is the D1 shape: the best mean KL on the curve, bought with a p99
+    that is 3x the incumbent's. Selecting on the mean alone ships it.
+    """
+    return [
+        {"label": "a", "path": "a", "bpp": 4.5, "kl": 0.30,
+         "kl_p99": 0.90, "kl_max": 1.10, "nll_p99": 3.0},
+        {"label": "b", "path": "b", "bpp": 5.0, "kl": 0.20,
+         "kl_p99": 0.60, "kl_max": 0.70, "nll_p99": 2.8},
+        {"label": "c", "path": "c", "bpp": 5.5, "kl": 0.10,
+         "kl_p99": 1.80, "kl_max": 2.40, "nll_p99": 4.5},
+        {"label": "d", "path": "d", "bpp": 6.0, "kl": 0.05,
+         "kl_p99": 0.40, "kl_max": 0.50, "nll_p99": 2.5},
+    ]
+
+
+def test_tail_veto_none_mode_is_frontier_identity():
+    """`--tail-veto none` must reproduce the pre-R9 envelope exactly."""
+    rows = _tail_rows()
+    baseline = _frontier_from_rows(rows)
+    assert [r["label"] for r in baseline] == ["a", "b", "c", "d"]
+    for explicit_off in (None, "none"):
+        vetoed = []
+        again = _frontier_from_rows(rows, tail_veto=explicit_off, vetoed=vetoed)
+        assert again == baseline
+        assert vetoed == []
+
+
+def test_tail_veto_refuses_a_mean_win_that_regresses_the_tail():
+    rows = _tail_rows()
+    vetoed = []
+    frontier = _frontier_from_rows(rows, tail_veto="kl_p99", vetoed=vetoed)
+    # c wins on the mean and loses on p99 -> refused; d still enters, because
+    # its tail improves on the last ADMITTED point (b), not on the vetoed c.
+    assert [r["label"] for r in frontier] == ["a", "b", "d"]
+    assert [r["label"] for r in vetoed] == ["c"]
+    assert vetoed[0]["veto_reason"] == "tail_regression"
+    assert vetoed[0]["veto_column"] == "kl_p99"
+    assert vetoed[0]["veto_value"] == 1.80
+    assert vetoed[0]["veto_incumbent"] == 0.60
+
+
+def test_tail_veto_eta_admits_within_slack():
+    rows = [
+        {"label": "a", "path": "a", "bpp": 4.5, "kl": 0.30, "kl_p99": 1.00},
+        {"label": "b", "path": "b", "bpp": 5.0, "kl": 0.20, "kl_p99": 1.05},
+    ]
+    assert [r["label"] for r in _frontier_from_rows(rows, tail_veto="kl_p99")] == ["a"]
+    admitted = _frontier_from_rows(rows, tail_veto="kl_p99", tail_eta=0.10)
+    assert [r["label"] for r in admitted] == ["a", "b"]
+
+
+def test_tail_veto_reports_missing_column_rather_than_admitting():
+    rows = [
+        {"label": "a", "path": "a", "bpp": 4.5, "kl": 0.30, "nll_p99": 3.0},
+        {"label": "b", "path": "b", "bpp": 5.0, "kl": 0.20},
+    ]
+    vetoed = []
+    frontier = _frontier_from_rows(rows, tail_veto="nll_p99", vetoed=vetoed)
+    assert [r["label"] for r in frontier] == ["a"]
+    assert vetoed[0]["veto_reason"] == "tail_missing"
+
+
+def test_measured_rows_pass_through_tail_columns():
+    results = [{
+        "label": "a", "path": "a.json", "bpp": 5.0, "kl_mean": 0.10,
+        "kl_p95": 0.3, "kl_p99": 0.5, "kl_max": 0.9,
+        "nll_mean": 2.0, "nll_p99": 3.0,
+    }]
+    row = measured_rows(results)[0]
+    assert row["kl"] == 0.10  # kl_mean resolves as the mean metric
+    assert row["kl_p95"] == 0.3
+    assert row["kl_p99"] == 0.5
+    assert row["kl_max"] == 0.9
+    assert row["nll_mean"] == 2.0
+    assert row["nll_p99"] == 3.0
+
+
+def test_select_frontier_point_threads_the_veto():
+    results = [
+        {"label": r["label"], "path": f"{r['label']}.json", "bpp": r["bpp"],
+         "last_token_kl": r["kl"], "kl_p99": r["kl_p99"]}
+        for r in _tail_rows()
+    ]
+    vetoed = []
+    selected, frontier = select_frontier_point(
+        results, mode="best-kl", tail_veto="kl_p99", vetoed=vetoed)
+    assert selected["label"] == "d"
+    assert [r["label"] for r in frontier] == ["a", "b", "d"]
+    assert [r["label"] for r in vetoed] == ["c"]
+
+    # Off, the mean-only frontier keeps c and best-kl still lands on d.
+    _sel_off, frontier_off = select_frontier_point(results, mode="best-kl")
+    assert [r["label"] for r in frontier_off] == ["a", "b", "c", "d"]
+
+
+def _write_validation(tmp_path, rows, columns=("kl_p99",)):
+    results = []
+    for row in rows:
+        path = tmp_path / f"{row['label']}.json"
+        path.write_text(json.dumps({
+            "schema": "prismaquant.allocator.pareto_assignment.v1",
+            "assignment": {"model.layers.0.mlp.down_proj": "NVFP4"},
+        }))
+        results.append({
+            "label": row["label"], "path": str(path), "bpp": row["bpp"],
+            "last_token_kl": row["kl"],
+            **{c: row[c] for c in columns if c in row},
+        })
+    validation_path = tmp_path / "validation.json"
+    validation_path.write_text(json.dumps({"results": results}))
+    return validation_path
+
+
+def _run_select(tmp_path, validation_path, extra, tag="run"):
+    summary = tmp_path / f"selection-{tag}.json"
+    subprocess.run(
+        [sys.executable, "-m", "prismaquant.select_validated_frontier",
+         "--validation-json", str(validation_path),
+         "--mode", "best-kl",
+         "--output-layer-config", str(tmp_path / "lc.json"),
+         "--output-assignment", str(tmp_path / "sa.json"),
+         "--output-summary", str(summary), *extra],
+        cwd=Path(__file__).resolve().parents[1], check=True,
+    )
+    return json.loads(summary.read_text())
+
+
+def test_tail_veto_cli_default_is_on_with_kl_max(tmp_path):
+    """Ruled 2026-07-30: the veto ships DEFAULT-ON with kl_max as the contract."""
+    assert DEFAULT_TAIL_VETO == "kl_max"
+    assert DEFAULT_TAIL_ETA == "auto"
+    validation_path = _write_validation(
+        tmp_path, _tail_rows(), columns=("kl_p99", "kl_max"))
+    default = _run_select(tmp_path, validation_path, [], tag="default")
+    assert default["tail_veto"]["column"] == "kl_max"
+    assert default["tail_veto"]["eta"] == "auto"
+    assert default["tail_veto"]["eta_mode"] == "auto"
+    assert default["tail_veto"]["inert_reason"] is None
+    # c wins the mean and blows the worst-sequence tail (2.40 vs 0.70): refused.
+    assert [r["label"] for r in default["vetoed_rows"]] == ["c"]
+    assert [r["label"] for r in default["frontier"]] == ["a", "b", "d"]
+    assert default["vetoed_rows"][0]["veto_column"] == "kl_max"
+    # No per-repeat tails on these rows -> the derived slack degrades to strict 0.
+    assert {e["source"] for e in default["tail_veto"]["eta_resolved"]} == {"absent"}
+
+
+def test_tail_veto_cli_none_mode_restores_the_pre_r9_envelope(tmp_path):
+    validation_path = _write_validation(
+        tmp_path, _tail_rows(), columns=("kl_p99", "kl_max"))
+    off = _run_select(tmp_path, validation_path, ["--tail-veto", "none"],
+                      tag="off")
+    assert off["tail_veto"]["column"] is None
+    assert off["vetoed_rows"] == []
+    assert [r["label"] for r in off["frontier"]] == ["a", "b", "c", "d"]
+
+
+def test_tail_veto_cli_goes_inert_on_a_pre_r9_validation_json(tmp_path):
+    """Default-on must not turn a tail-less (pre-R9) input into an empty frontier."""
+    validation_path = _write_validation(tmp_path, _tail_rows(), columns=())
+    out = _run_select(tmp_path, validation_path, [], tag="inert")
+    assert out["tail_veto"]["column"] == "kl_max"
+    assert out["tail_veto"]["inert_reason"] == "tail_column_absent_on_every_row"
+    assert out["vetoed_rows"] == []
+    assert [r["label"] for r in out["frontier"]] == ["a", "b", "c", "d"]
+
+
+def test_tail_veto_cli_records_vetoed_rows(tmp_path):
+    validation_path = _write_validation(tmp_path, _tail_rows())
+    on = _run_select(tmp_path, validation_path,
+                     ["--tail-veto", "kl_p99", "--tail-eta", "0.0"], tag="p99")
+    assert on["tail_veto"]["column"] == "kl_p99"
+    assert on["tail_veto"]["eta"] == 0.0
+    assert on["tail_veto"]["eta_mode"] == "explicit"
+    assert on["tail_veto"]["n_vetoed"] == 1
+    assert [r["label"] for r in on["vetoed_rows"]] == ["c"]
+    assert [r["label"] for r in on["frontier"]] == ["a", "b", "d"]
+
+
+def test_tail_veto_cli_explicit_eta_beats_auto(tmp_path):
+    rows = [
+        {"label": "a", "path": "a", "bpp": 4.5, "kl": 0.30, "kl_max": 1.00},
+        {"label": "b", "path": "b", "bpp": 5.0, "kl": 0.20, "kl_max": 1.05},
+    ]
+    validation_path = _write_validation(tmp_path, rows, columns=("kl_max",))
+    strict = _run_select(tmp_path, validation_path, [], tag="strict")
+    assert [r["label"] for r in strict["frontier"]] == ["a"]
+    loose = _run_select(tmp_path, validation_path, ["--tail-eta", "0.10"],
+                        tag="loose")
+    assert loose["tail_veto"]["eta"] == 0.10
+    assert [r["label"] for r in loose["frontier"]] == ["a", "b"]
+
+
+# ---- the derived slack (--tail-eta auto) --------------------------------
+
+
+def test_tail_eta_auto_is_the_between_repeat_relative_stderr():
+    repeats = [1.0, 1.1, 0.9, 1.0]
+    eta, source = tail_eta_auto({"kl_max_repeats": repeats}, "kl_max")
+    assert source == "derived"
+    mean = sum(repeats) / len(repeats)
+    var = sum((v - mean) ** 2 for v in repeats) / (len(repeats) - 1)
+    assert eta == math.sqrt(var) / math.sqrt(len(repeats)) / mean
+    assert eta > 0.0
+
+
+def test_tail_eta_auto_degrades_to_strict_zero_without_a_spread():
+    assert tail_eta_auto({"kl_max_repeats": [1.0]}, "kl_max") == (0.0, "single_repeat")
+    assert tail_eta_auto({}, "kl_max") == (0.0, "absent")
+    assert tail_eta_auto({"kl_max_repeats": [0.0, 0.0]}, "kl_max") == (0.0, "degenerate")
+
+
+def test_tail_eta_auto_admits_inside_the_measured_noise_and_refuses_outside():
+    """The slack is the tail's own noise: 4% moves are noise, 100% is a regression."""
+    rows = [
+        {"label": "a", "path": "a", "bpp": 4.5, "kl": 0.30, "kl_max": 1.00,
+         "kl_max_repeats": [1.0, 1.1, 0.9, 1.0]},
+        {"label": "b", "path": "b", "bpp": 5.0, "kl": 0.20, "kl_max": 1.02},
+        {"label": "c", "path": "c", "bpp": 5.5, "kl": 0.10, "kl_max": 2.00},
+    ]
+    vetoed = []
+    frontier = _frontier_from_rows(
+        rows, tail_veto="kl_max", tail_eta="auto", vetoed=vetoed)
+    assert [r["label"] for r in frontier] == ["a", "b"]
+    assert [r["label"] for r in vetoed] == ["c"]
+    assert vetoed[0]["veto_eta_source"] == "absent"  # b carries no repeats
+    # With eta hard-zero, b's 2% is refused too: the derived slack is doing work.
+    strict = _frontier_from_rows(rows, tail_veto="kl_max", tail_eta=0.0)
+    assert [r["label"] for r in strict] == ["a"]
+
+
+def test_tail_veto_inert_reason_only_fires_when_no_row_carries_the_column():
+    rows = _tail_rows()
+    assert tail_veto_inert_reason(rows, "kl_max") is None
+    assert tail_veto_inert_reason(rows, None) is None
+    bare = [{"label": "a", "bpp": 4.5, "kl": 0.3}]
+    assert tail_veto_inert_reason(bare, "kl_max") == "tail_column_absent_on_every_row"
+    # Inert -> the envelope is the mean-only one, not an empty frontier.
+    assert len(_frontier_from_rows(bare, tail_veto="kl_max")) == 1

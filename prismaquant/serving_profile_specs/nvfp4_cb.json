@@ -1,0 +1,52 @@
+{
+  "schema": "prismaquant.serving_profile.v1",
+  "id": "nvfp4_cb",
+  "runtime": "gridbook_plugin",
+  "description": "NVFP4-CB / FP8-CB codebook container lane: the separately released Gridbook vLLM plugin (immutable pin in scripts/lib/gridbook_runtime_pin.json; registered under quant_method 'gridbook', with the pre-rename 'prismaquant' key kept as a read alias for already-shipped artifacts) decodes the codebook schemes into NVFP4/FP8 buffers and delegates plain NVFP4/FP8/BF16 layers to stock compressed-tensors. PrismaQuant contains no runtime copy. Deliberately a MIXED container (PLAN.md decision #1, 'FP8 in every recipe'): CB rungs coexist with plain NVFP4, FP8_DYNAMIC and BF16 in one artifact. The scheme vocabulary is prismaquant-custom (NOT stock compressed-tensors, whose schemes cannot express codebooks); ships via prismaquant.export_nvfp4_cb, docs/lanes/nvfp4-cb/LAYOUT.md is the byte contract.",
+  "export_lane": {
+    "id": "nvfp4_cb",
+    "exporter": "prismaquant.export_nvfp4_cb",
+    "codec_formats_from": ["prismaquant.export_nvfp4_cb:EXPORTABLE_FORMATS"],
+    "reason": "exporter_cannot_emit",
+    "detail": "The exporter's codec surface remains the structural upper bound: NVFP4_CB_K12..K24, research-compatible NVFP4_CB_S13..S16, FP8_CB_K28..K48, delegated NVFP4/FP8_DYNAMIC, FP8_SOURCE, and BF16. The production format rule below deliberately narrows that emittable set by excluding signed S13..S16; their decoder/export support remains available for legacy and explicitly research-scoped artifacts. INT4_W4A16 remains a registry-only research format until the approved Gridbook-owned packing/profile/loader/delegation work is implemented and validated. Anything outside the exporter declaration hard-fails rather than silently BF16-coercing a Linear and blowing the allocated byte budget."
+  },
+  "format_rules": [
+    {
+      "id": "nvfp4_cb_container_formats",
+      "allow_formats_from": [
+        "prismaquant.cb_layout:PRODUCT_CB_FORMAT_NAMES"
+      ],
+      "allow_formats": [
+        "NVFP4",
+        "FP8_DYNAMIC",
+        "FP8_SOURCE",
+        "BF16"
+      ],
+      "reason": "profile_mismatch",
+      "detail": "The production nvfp4_cb menu carries product-VQ NVFP4_CB_K12..K24 (fp4/E2M1 grid, two-tier-v2 serialized rate 1.78125..3.28125 bpw), product-VQ FP8_CB_K28..K48 (fp8/E4M3 grid, 3.5..6.0 index bpw plus the serialized per-output FP32 scale), and the native carriers. Signed S13..S16 remain codec-compatible but are research-only after losing 78.48% (609/776) of matched weight-MSE comparisons, so this production rule excludes them. Plain NVFP4 is W4A4 and FP8_DYNAMIC/FP8-CB are W8A8; comparisons therefore name the full activation/backend contract. FP8_SOURCE is passthrough-only and BF16 is unquantized passthrough. This allow-list proves only exporter/runtime legality; served KL/PPL and phase-specific performance remain external release gates recorded by the native-parity benchmark protocol."
+    },
+    {
+      "id": "cb_packed_expert_stock_ct_unsupported",
+      "scope": "packed_experts",
+      "deny_formats": [
+        "NVFP4",
+        "FP8_DYNAMIC",
+        "FP8_E4M3",
+        "FP8_SOURCE"
+      ],
+      "reason": "runtime_unsupported",
+      "detail": "The nvfp4_cb container's stock compressed-tensors delegation is DENSE-ONLY today: neither export_nvfp4_cb nor the Gridbook runtime carries a stock-CT packed-MoE emission/serving path (35B first-contact, 2026-07-19 \u2014 the exporter's stock-NVFP4 global-scale pass is 2-D and Gridbook's MoE method is CB-only). Packed expert stacks use CB rungs (per-expert weighted VQ, served by Gridbook) or the BF16 passthrough until that path is built AND serve-validated. This is a declared capability of the container, not a quality judgement on the formats."
+    }
+  ],
+  "shape_rules": [
+    {
+      "id": "cb_superblock_shape",
+      "formats_from": [
+        "prismaquant.cb_layout:CB_FORMAT_NAMES"
+      ],
+      "in_features_multiple_of": 256,
+      "reason": "kernel_shape",
+      "detail": "CB rungs pack a 256-weight superblock along the input dim (32 k-bit codewords plus the family-specific serialized scales: production fp4 two-tier v2 is 4k+9 bytes/superblock; fp8 is a 4k-byte index body plus one FP32 scale per output row). The 256-superblock is both the byte-exactness unit and the 8-wide vector-tiling unit; a Linear with in_features % 256 != 0 has no legal CB rung and is masked to another legal candidate. Signed S-rungs stay in this shape contract so legacy/research artifacts remain decodable even though the production format rule excludes them."
+    }
+  ]
+}

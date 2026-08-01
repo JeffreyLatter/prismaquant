@@ -1,0 +1,69 @@
+{
+  "schema": "prismaquant.lane_spec.v1",
+  "id": "compressed_tensors",
+  "export_container": "compressed-tensors",
+  "runtime": "vllm",
+  "description": "The default lane: a stock compressed-tensors checkpoint that vanilla vLLM serves with no forked runtime and no custom kernels. This is the only lane whose correctness depends on nothing we maintain, which is why it is the default even where CB wins the matched-byte accuracy pair.",
+  "serving_profiles": ["vllm_packed_moe", "vllm_qwen3_5_packed_moe", "research"],
+  "endpoint": {
+    "kind": "openai",
+    "base_url": "http://127.0.0.1:8000/v1",
+    "health_path": "/health",
+    "metrics_path": "/metrics"
+  },
+  "serve": {
+    "scripts": [],
+    "command": [
+      "docker", "run", "-d", "--rm", "--gpus", "all",
+      "-p", "8000:8000", "--name", "${NAME}",
+      "-v", "/home/rob/dq-runs:/dqruns",
+      "vllm-fresh-b12x:latest",
+      "--model", "${MODEL}", "--served-model-name", "${SERVED_NAME}",
+      "--host", "0.0.0.0", "--port", "8000",
+      "--max-model-len", "${MAXLEN}",
+      "--gpu-memory-utilization", "${UTIL}"
+    ]
+  },
+  "gates": [
+    {
+      "id": "load_generate.eager",
+      "runner": "prismaquant.validate_native_export --shipcard",
+      "shipcard_slot": "native_export.eager",
+      "description": "vLLM eager load + greedy generate on the exported artifact."
+    },
+    {
+      "id": "load_generate.graph",
+      "runner": "prismaquant.validate_native_export --shipcard --no-enforce-eager",
+      "shipcard_slot": "native_export.graph",
+      "description": "Same, with CUDA-graph capture on (a format may load eager and fail capture)."
+    },
+    {
+      "id": "ship_gate.ppl_p99nll",
+      "runner": "prismaquant.validate_quantized_model --base-url ... --shipcard",
+      "shipcard_slot": "ship_gate",
+      "description": "PPL + p99 per-prompt NLL + coherence against a running serve. p99 exists because a broken 27B once passed on the mean while 80% of prompts were broken."
+    },
+    {
+      "id": "gold.kl",
+      "runner": "tools/measure_vllm_full_kl.py",
+      "shipcard_slot": "gold.kl",
+      "description": "Exact full-vocab vLLM KL-vs-BF16 on WikiText, served artifact, matched bpp (n=8 x seqlen=512). The gold metric; manual by design."
+    },
+    {
+      "id": "gold.ppl",
+      "runner": "tools/measure_wikitext_ppl.py",
+      "shipcard_slot": "gold.ppl",
+      "description": "Direct WikiText PPL on the served artifact. Must be a NO-spec-decode serve: echo+logprobs returns the draft model's NLL."
+    }
+  ],
+  "kl_evaluator": {
+    "kind": "validate_assignments_kl",
+    "entrypoint": "prismaquant.validate_assignments_kl:main",
+    "note": "Resident held-out KL over Pareto assignments, production-cache rendered; feeds select_validated_frontier. Returns (mean, per_sequence, stats) with kl_p95/kl_p99/kl_max/nll_p99 (R9)."
+  },
+  "advisory_gates": true,
+  "notes": [
+    "Nothing in run-pipeline.sh blocks on a quality number on ANY lane, native included: `vllm` is not importable in the build venv, so the build tool would have to own the serving stack. The shipcard is the refusal contract instead (R13).",
+    "Whether these gates become BLOCKING is the open half of R16's verdict and is deferred to Robert."
+  ]
+}

@@ -11,9 +11,10 @@ Each shard installs its decoder layers on demand, runs
 on the matching Linears, writes a per-shard pickle, then unloads.
 
 MTP is folded in as a built-in shard kind: when `--include-mtp` (default
-True), a shard's regex like `^mtp\\.layers\\.0\\.` triggers synthesis
-of an `MtpModule` (via `mtp_module.MtpModule`), loading of `mtp.*`
-safetensors (via `_load_into_mtp`), enumeration of MTP Linears + packed
+True), a shard's regex like `^mtp\\.layers\\.0\\.` triggers synthesis of
+the profile's MTP module (`profile.build_mtp_module`), loading of the
+source MTP safetensors (`profile.read_mtp_source_state_dict` /
+`profile.load_mtp_state_dict`), enumeration of MTP Linears + packed
 experts, then the same measurement pipeline against the MTP activation
 cache (the probe writes those activations to the same
 `--activation-cache-dir` when its own `--include-mtp` was set).
@@ -58,11 +59,14 @@ from .measure_quant_cost import (
     ActivationIndex,
     HDetailIndex,
     _accumulate_result,
+    _cb_col_weights_lookup,
     _expert_cost_sample_split,
     _extrapolate_expert_costs,
     _finalize_results,
     _measure_packed_experts,
     _normalize_fisher_output_mse_row_weights,
+    cost_payload_provenance,
+    cb_render_provenance_for_results,
     h_detail_expected_norm_tokens,
     measure_batched_gpu,
     measure_unbatched,
@@ -75,15 +79,35 @@ from .streaming_model import (
     _build_streaming_context,
     _classify_shard,
 )
+from .nvfp4_cb_footprint import (
+    cb_serialization_context_from_env,
+    validate_cb_cost_provenance,
+)
 
 
 # ---------------------------------------------------------------------------
 # Per-shard pickle merge helpers (unchanged public API vs. prior version)
 # ---------------------------------------------------------------------------
+# The pipeline COST_MODE this table was produced under (re-vet R2 precondition
+# (i)). `cost.pkl` is the same path under every mode, so without this stamp a
+# re-run silently allocates on the previous mode's estimator.
+_PIPELINE_COST_MODE = ""
+
+
+def _cost_mode_provenance(
+    specs: list[fr.FormatSpec] | None = None,
+) -> dict:
+    out = {"cost_mode": _PIPELINE_COST_MODE} if _PIPELINE_COST_MODE else {}
+    if specs:
+        out.update(cost_payload_provenance(specs))
+    return out
+
+
 def merge_cost_pickles(paths: list[Path], output_path: Path):
     merged_costs = {}
     merged_formats = None
     shard_metas = []
+    cb_render_identities: list[dict[str, object]] = []
     for path in paths:
         with open(path, "rb") as f:
             data = pickle.load(f)
@@ -94,7 +118,63 @@ def merge_cost_pickles(paths: list[Path], output_path: Path):
         merged_costs.update(costs)
         if merged_formats is None:
             merged_formats = data.get("formats", [])
+        elif list(data.get("formats", [])) != list(merged_formats):
+            raise ValueError(
+                f"cost shard {path} format menu differs from the first "
+                f"shard: {data.get('formats', [])!r} != {merged_formats!r}"
+            )
+        has_cb = any(
+            fr.get_format(name).family in {"nvfp4_cb", "fp8_cb"}
+            for name in data.get("formats", [])
+        )
+        if has_cb:
+            validate_cb_cost_provenance(
+                data,
+                data.get("formats", []),
+                context=cb_serialization_context_from_env(
+                    require_explicit=True,
+                    where="incremental cost merge",
+                ),
+                where=f"incremental cost shard {path}",
+            )
+        identity = (data.get("provenance") or {}).get(
+            "cb_render_identity"
+        )
+        if has_cb and costs and not isinstance(identity, dict):
+            raise ValueError(
+                f"incremental cost shard {path} has measured CB rows but no "
+                "source/imatrix-complete render identity"
+            )
+        if isinstance(identity, dict):
+            cb_render_identities.append(identity)
         shard_metas.append(data.get("meta", {}))
+
+    merged_cb_identity = None
+    if cb_render_identities:
+        from .production_weight_cache import merge_cb_render_identities
+
+        qnames = sorted({
+            str(name)
+            for identity in cb_render_identities
+            for name in identity["col_weights_qnames"]
+        })
+        current_col_weights = {
+            name: _cb_col_weights_lookup(name) for name in qnames
+        }
+        missing_col = sorted(
+            name for name, value in current_col_weights.items()
+            if value is None
+        )
+        if missing_col:
+            raise ValueError(
+                "incremental cost merge is missing current CB col_weights; "
+                f"sample={missing_col[:8]}"
+            )
+        merged_cb_identity = merge_cb_render_identities(
+            cb_render_identities,
+            col_weights=current_col_weights,
+            where="incremental cost merge",
+        )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "wb") as f:
@@ -109,9 +189,20 @@ def merge_cost_pickles(paths: list[Path], output_path: Path):
                     h_detail_dir = nested.get("h_detail_dir")
             if h_detail_dir is not None:
                 h_detail_dirs.add(h_detail_dir)
+        merged_provenance = _cost_mode_provenance(
+            [fr.get_format(name) for name in (merged_formats or [])]
+        )
+        if merged_cb_identity is not None:
+            merged_provenance.update({
+                "cb_serialized_payload": dict(
+                    merged_cb_identity["cb_serialized_payload"]
+                ),
+                "cb_render_identity": merged_cb_identity,
+            })
         pickle.dump({
             "costs": merged_costs,
             "formats": merged_formats or [],
+            "provenance": merged_provenance,
             "meta": {
                 "incremental": True,
                 "n_shards": len(paths),
@@ -148,6 +239,10 @@ def _expected_cost_shard_meta(*,
         "shard_idx": shard_idx,
         "formats": list(formats),
         "n_linears_expected": int(n_linears_expected),
+        # Persisted in each shard's annotated metadata, so changing the FP4
+        # layout or codebook-sharing policy invalidates shard reuse before a
+        # merged cost table can be stamped with a different identity.
+        **cost_payload_provenance([fr.get_format(name) for name in formats]),
     }
     if render_path != "registry":
         meta["render_path"] = render_path
@@ -174,6 +269,16 @@ def cost_shard_is_reusable(path: Path, expected_meta: dict[str, Any]) -> bool:
     if "costs" not in data or "meta" not in data:
         return False
     if not isinstance(data["costs"], dict):
+        return False
+    if data["costs"] and any(
+        fr.get_format(name).family in {"nvfp4_cb", "fp8_cb"}
+        for name in data.get("formats", [])
+    ):
+        # A reusable measured-CB shard would need its exact decoded source
+        # tensors reloaded and re-hashed before acceptance. The skip path has
+        # deliberately not materialized that layer yet, so fail closed and
+        # rebuild. Empty visual/MTP slots remain reusable because they carry
+        # no CB row/value claim.
         return False
     # Empty-costs guard: a shard whose target regex is known to match at
     # least one probed Linear but produced zero entries is the signature
@@ -255,6 +360,20 @@ def _run_cost_measurement(
     return results
 
 
+def _production_cost_render_levers() -> dict[str, object]:
+    return {
+        "gptq": True,
+        "joint_scale_opt": True,
+        "scale_sweep": False,
+        "static_act_order": True,
+        "weighted_vq": True,
+        "nvfp4_scale_rule": os.environ.get(
+            "PRISMAQUANT_NVFP4_SCALE_RULE",
+            "static_6",
+        ),
+    }
+
+
 def _measure_production_render_dense(
     module: nn.Module,
     *,
@@ -294,16 +413,17 @@ def _measure_production_render_dense(
         print(f"{log_prefix} production-render expert sample: "
               f"{n_total} measured, {len(expert_extrapolate)} extrapolated",
               flush=True)
-    levers: dict[str, object] = {
-        "gptq": True,
-        "joint_scale_opt": True,
-        "scale_sweep": False,
-        "static_act_order": True,
-        "nvfp4_scale_rule": os.environ.get(
-            "PRISMAQUANT_NVFP4_SCALE_RULE",
-            "static_6",
-        ),
-    }
+    levers = _production_cost_render_levers()
+    cb_context = (
+        cb_serialization_context_from_env(
+            require_explicit=True,
+            where="incremental production render cost",
+        )
+        if any(
+            spec.family in {"nvfp4_cb", "fp8_cb"} for spec in specs
+        )
+        else None
+    )
 
     for name, mod in module.named_modules():
         canonical_name = resolve_cost_target_name(name, target_names, profile)
@@ -351,6 +471,12 @@ def _measure_production_render_dense(
                         activations=activations,
                         levers=levers,
                         fisher_row_weights=gq_rows,
+                        col_weights=(
+                            _cb_col_weights_lookup(canonical_name)
+                            if spec.family in {"nvfp4_cb", "fp8_cb"}
+                            else None
+                        ),
+                        cb_serialization_context=cb_context,
                         gate_trace=gate_trace,
                     )
                     gptq_steps = [
@@ -500,6 +626,7 @@ def _run_body_cost_shard(
             pickle.dump({
                 "costs": {},
                 "formats": [s.name for s in specs],
+                "provenance": _cost_mode_provenance(specs),
                 "meta": {
                     "model": model_name,
                     "probe": probe_path,
@@ -541,6 +668,17 @@ def _run_body_cost_shard(
             profile=profile,
             render_path=render_path,
         )
+        shard_provenance = cb_render_provenance_for_results(
+            model,
+            results,
+            specs,
+            profile=profile,
+            render_levers=(
+                _production_cost_render_levers()
+                if render_path == "production" else None
+            ),
+            where=f"incremental {shard_kind} CB cost shard",
+        )
     finally:
         for L in installed:
             pressure_trim_bytes += int(ctx.unload(L) or 0)
@@ -563,6 +701,10 @@ def _run_body_cost_shard(
         pickle.dump({
             "costs": results,
             "formats": [s.name for s in specs],
+            "provenance": {
+                **_cost_mode_provenance(),
+                **shard_provenance,
+            },
             "meta": {
                 "model": model_name,
                 "probe": probe_path,
@@ -601,14 +743,14 @@ def _run_mtp_cost_shard(
     probe_path: str,
     render_path: str = "registry",
 ):
-    from .mtp_module import MtpModule, _load_into_mtp, _load_mtp_state_dict
-
     inc = re.compile(linear_include)
-    try:
-        from .model_profiles import profile_from_model
-        profile = profile_from_model(ctx.model)
-    except Exception:
-        profile = None
+    from .model_profiles import profile_from_model
+    # The MTP module layout + its checkpoint prefix are profile
+    # decisions, so this lookup is no longer best-effort: without a
+    # profile there is nothing to build. (The `profile` local is also
+    # passed to the packed-expert helpers further down, which do
+    # tolerate None — but reaching this shard at all means has_mtp().)
+    profile = profile_from_model(ctx.model)
     # Prune the probe stats to this MTP shard's regex before building
     # anything — if there's nothing to measure, emit an empty pickle.
     shard_targets: set[str] = {n for n in probe_stats if inc.search(n)}
@@ -621,6 +763,7 @@ def _run_mtp_cost_shard(
             pickle.dump({
                 "costs": {},
                 "formats": [s.name for s in specs],
+                "provenance": _cost_mode_provenance(specs),
                 "meta": {
                     "model": model_name,
                     "probe": probe_path,
@@ -633,14 +776,20 @@ def _run_mtp_cost_shard(
 
     device_t = torch.device(device)
     text_config = ctx.model.config
-    inner_mtp = MtpModule(text_config)
+    inner_mtp = profile.build_mtp_module(text_config)
+    if inner_mtp is None:
+        raise RuntimeError(
+            f"profile '{profile.name}' declares has_mtp() but "
+            f"build_mtp_module() returned None — the MTP cost shard "
+            f"cannot be measured. Either implement build_mtp_module() or "
+            f"set has_mtp() -> False.")
     mtp_wrapper = nn.Module()
     mtp_wrapper.add_module("mtp", inner_mtp)
     mtp_wrapper.to(device=device_t, dtype=dtype)
     mtp_wrapper.eval()
 
-    raw = _load_mtp_state_dict(model_path)
-    missing, extra = _load_into_mtp(inner_mtp, raw)
+    raw = profile.read_mtp_source_state_dict(model_path)
+    missing, extra = profile.load_mtp_state_dict(inner_mtp, raw)
     loaded = len(raw) - len(missing)
     print(f"[incremental-cost/mtp] loaded {loaded}/{len(raw)} mtp weights "
           f"(missing={len(missing)}, module_params_unset={len(extra)})",
@@ -676,6 +825,7 @@ def _run_mtp_cost_shard(
             pickle.dump({
                 "costs": {},
                 "formats": [s.name for s in specs],
+                "provenance": _cost_mode_provenance(specs),
                 "meta": {
                     "model": model_name,
                     "probe": probe_path,
@@ -705,6 +855,17 @@ def _run_mtp_cost_shard(
             profile=profile,
             render_path=render_path,
         )
+        shard_provenance = cb_render_provenance_for_results(
+            mtp_wrapper,
+            results,
+            specs,
+            profile=profile,
+            render_levers=(
+                _production_cost_render_levers()
+                if render_path == "production" else None
+            ),
+            where="incremental MTP CB cost shard",
+        )
     finally:
         del mtp_wrapper, inner_mtp, raw
         gc.collect()
@@ -717,6 +878,10 @@ def _run_mtp_cost_shard(
         pickle.dump({
             "costs": results,
             "formats": [s.name for s in specs],
+            "provenance": {
+                **_cost_mode_provenance(),
+                **shard_provenance,
+            },
             "meta": {
                 "model": model_name,
                 "probe": probe_path,
@@ -745,6 +910,7 @@ def _write_empty_cost_shard(
         pickle.dump({
             "costs": {},
             "formats": [s.name for s in specs],
+            "provenance": _cost_mode_provenance(specs),
             "meta": {
                 "model": model_name,
                 "probe": probe_path,
@@ -895,6 +1061,17 @@ def _run_visual_cost_shard(
         profile=profile,
         render_path=render_path,
     )
+    shard_provenance = cb_render_provenance_for_results(
+        model,
+        results,
+        specs,
+        profile=profile,
+        render_levers=(
+            _production_cost_render_levers()
+            if render_path == "production" else None
+        ),
+        where="incremental visual CB cost shard",
+    )
     if device.startswith("cuda"):
         torch.cuda.empty_cache()
 
@@ -904,6 +1081,10 @@ def _run_visual_cost_shard(
         pickle.dump({
             "costs": results,
             "formats": [s.name for s in specs],
+            "provenance": {
+                **_cost_mode_provenance(),
+                **shard_provenance,
+            },
             "meta": {
                 "model": model_name,
                 "probe": probe_path,
@@ -925,6 +1106,11 @@ def _run_visual_cost_shard(
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
+    ap.add_argument("--cost-mode", default="",
+                    help="Pipeline COST_MODE this table is produced under; "
+                         "stamped into provenance['cost_mode'] so a re-run "
+                         "cannot silently reuse another mode's table "
+                         "(re-vet R2).")
     ap.add_argument("--probe", required=True)
     ap.add_argument("--activation-cache-dir", required=True)
     ap.add_argument("--output", required=True)
@@ -972,6 +1158,10 @@ def main():
                          "Fisher row-weighted fisher_output_mse alongside "
                          "weight_mse in cost.pkl.")
     args = ap.parse_args()
+    from prismaquant.gpu_guard import require_cuda_hot_path
+    require_cuda_hot_path("incremental_measure_quant_cost", args.device)
+    global _PIPELINE_COST_MODE
+    _PIPELINE_COST_MODE = str(getattr(args, "cost_mode", "") or "")
 
     n_layers = load_num_hidden_layers(args.model)
     start = max(0, args.start_layer)
@@ -1252,6 +1442,30 @@ def main():
             mm_ctx.shutdown()
 
     merge_cost_pickles(shard_paths, Path(args.output))
+    # Coverage gate: every body layer the probe measured must appear in
+    # the merged cost table. A silent hole here flows straight into the
+    # allocation (the allocator only allocates what has costs) and the
+    # export passes the hole through as passthrough bytes.
+    import pickle as _pkl
+    import re as _re
+    with open(args.probe, "rb") as _pf:
+        _probe_stats = _pkl.load(_pf).get("stats", {})
+    with open(args.output, "rb") as _cf:
+        _cost_names = set(_pkl.load(_cf).get("costs", {}))
+    _lay = _re.compile(r"\blayers\.(\d+)\.")
+    def _layers_of(names):
+        out = set()
+        for n in names:
+            m = _lay.search(str(n))
+            if m:
+                out.add(int(m.group(1)))
+        return out
+    _missing = sorted(_layers_of(_probe_stats) - _layers_of(_cost_names))
+    if _missing:
+        print(f"[incremental-cost] FATAL: merged cost table has no entries "
+              f"for probed body layers {_missing} — refusing to hand the "
+              f"allocator a cost table with silent holes.", flush=True)
+        raise SystemExit(2)
     print(f"[incremental-cost] wrote merged cost to {args.output}", flush=True)
 
 

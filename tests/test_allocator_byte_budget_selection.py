@@ -48,6 +48,7 @@ from prismaquant import format_registry as fr
 _NAMES = [f"model.layers.{i}.self_attn.o_proj" for i in range(4)]
 _OUT = _IN = 256
 _NPARAMS = _OUT * _IN
+_OVERHEAD_RESERVE = 512
 _FLOOR_TENSORS = {                      # never re-encoded: the floor
     "model.embed_tokens.weight": ("BF16", (512, 64)),   # 65536 B
     "lm_head.weight": ("BF16", (512, 64)),              # 65536 B
@@ -147,12 +148,12 @@ def _artifact_bytes(model_dir, fmt, stats):
 
 
 def _run(monkeypatch, tmp_path, probe_p, cost_p, *, disk_gb, fmt_for_target,
-         pareto="4.5,8.0"):
+         pareto="4.6,8.2", overhead_reserve=_OVERHEAD_RESERVE):
     monkeypatch.setattr(alloc, "solve_with_promotion",
                         _stub_solver(fmt_for_target))
     lc = tmp_path / "layer_config.json"
     csv = tmp_path / "pareto.csv"
-    monkeypatch.setattr(sys, "argv", [
+    argv = [
         "allocator",
         "--probe", str(probe_p),
         "--costs", str(cost_p),
@@ -162,7 +163,12 @@ def _run(monkeypatch, tmp_path, probe_p, cost_p, *, disk_gb, fmt_for_target,
         "--layer-config", str(lc),
         "--pareto-csv", str(csv),
         "--allow-default-profile",
-    ])
+    ]
+    if overhead_reserve is not None:
+        argv.extend([
+            "--artifact-overhead-reserve-bytes", str(overhead_reserve)
+        ])
+    monkeypatch.setattr(sys, "argv", argv)
     alloc.main()
     selection = json.loads((tmp_path / "selection.json").read_text())
     layer_cfg = json.loads(lc.read_text())
@@ -172,6 +178,43 @@ def _run(monkeypatch, tmp_path, probe_p, cost_p, *, disk_gb, fmt_for_target,
 # ---------------------------------------------------------------------------
 # 1. One accounting path (#23)
 # ---------------------------------------------------------------------------
+
+
+def test_whole_artifact_budget_requires_explicit_non_tensor_reserve(
+    monkeypatch, tmp_path,
+):
+    _model_dir, probe_p, cost_p, _stats = _fixture(
+        tmp_path, nvfp4_dloss=1e-4, fp8_dloss=1e-6
+    )
+    with pytest.raises(SystemExit, match="requires a positive"):
+        _run(
+            monkeypatch,
+            tmp_path,
+            probe_p,
+            cost_p,
+            disk_gb=1.0,
+            fmt_for_target=lambda _target: "NVFP4",
+            overhead_reserve=None,
+        )
+
+
+@pytest.mark.parametrize("disk_gb", [0.0, -1.0, float("nan")])
+def test_whole_artifact_budget_must_be_positive_and_finite(
+    monkeypatch, tmp_path, disk_gb,
+):
+    _model_dir, probe_p, cost_p, _stats = _fixture(
+        tmp_path, nvfp4_dloss=1e-4, fp8_dloss=1e-6
+    )
+    with pytest.raises(SystemExit, match="positive finite"):
+        _run(
+            monkeypatch,
+            tmp_path,
+            probe_p,
+            cost_p,
+            disk_gb=disk_gb,
+            fmt_for_target=lambda _target: "NVFP4",
+        )
+
 
 def test_selector_prices_through_the_shared_footprint_function(
         monkeypatch, tmp_path):
@@ -188,7 +231,7 @@ def test_selector_prices_through_the_shared_footprint_function(
         return real(assignment, s, **kw)
 
     monkeypatch.setattr(fp, "assignment_artifact_bytes", spy)
-    selection, _cfg = _run(
+    selection, cfg = _run(
         monkeypatch, tmp_path, probe_p, cost_p,
         disk_gb=(fp8_bytes + 10_000) / fp.GB,
         fmt_for_target=lambda t: "FP8_E4M3" if t >= 6.0 else "NVFP4")
@@ -200,10 +243,25 @@ def test_selector_prices_through_the_shared_footprint_function(
     # holds against the shipping selector: same floor, to the byte.
     assert selection["predicted_floor_gb"] * fp.GB == pytest.approx(
         float(floor), abs=1.0)
-    # ...and the artifact size is the shared function's, sidecars included.
-    for row, expect in ((4.5, nvfp4_bytes), (8.0, fp8_bytes)):
+    # ...and the tensor payload is the shared function's, sidecars included;
+    # the separately named whole-artifact selection upper bound adds the
+    # operator-supplied non-tensor reserve.
+    for row, expect in ((4.6, nvfp4_bytes), (8.2, fp8_bytes)):
         [g] = [r for r in selection["grid"] if r["target_bits"] == row]
-        assert g["disk_gb"] * fp.GB == pytest.approx(float(expect), abs=1.0)
+        assert g["tensor_payload_gb"] * fp.GB == pytest.approx(
+            float(expect), abs=1.0
+        )
+        assert g["whole_artifact_upper_bound_gb"] * fp.GB == pytest.approx(
+            float(expect + _OVERHEAD_RESERVE), abs=1.0
+        )
+    budget_stamp = cfg["__prismaquant__"]["whole_artifact_budget"]
+    assert budget_stamp["budget_bytes"] == selection["budget_bytes"]
+    assert budget_stamp["selection_non_tensor_reserve_bytes"] == (
+        _OVERHEAD_RESERVE
+    )
+    assert budget_stamp["selection_whole_artifact_upper_bound_bytes"] <= (
+        budget_stamp["budget_bytes"]
+    )
 
 
 def test_shared_function_changes_only_the_nvfp4_global_sidecars(
@@ -232,17 +290,17 @@ def test_shared_function_changes_only_the_nvfp4_global_sidecars(
         disk_gb=(fp8_bytes + 10_000) / fp.GB,
         fmt_for_target=lambda t: "FP8_E4M3" if t >= 6.0 else "NVFP4")
 
-    [nvfp4_rung] = [r for r in selection["grid"] if r["target_bits"] == 4.5]
-    new_bytes = round(nvfp4_rung["disk_gb"] * fp.GB)
+    [nvfp4_rung] = [r for r in selection["grid"] if r["target_bits"] == 4.6]
+    new_bytes = round(nvfp4_rung["tensor_payload_gb"] * fp.GB)
     assert round(selection["predicted_floor_gb"] * fp.GB) == floor
     assert new_bytes - (floor + retired_body) == 8 * len(_NAMES)
 
     # The FP8 rung has no NVFP4 sidecars, so it is byte-identical either way.
-    [fp8_rung] = [r for r in selection["grid"] if r["target_bits"] == 8.0]
+    [fp8_rung] = [r for r in selection["grid"] if r["target_bits"] == 8.2]
     fp8_retired = floor + sum(
         fr.get_format("FP8_E4M3").memory_bytes_for_shape((_OUT, _IN))
         for _ in _NAMES)
-    assert round(fp8_rung["disk_gb"] * fp.GB) == fp8_retired
+    assert round(fp8_rung["tensor_payload_gb"] * fp.GB) == fp8_retired
 
 
 # ---------------------------------------------------------------------------
@@ -267,22 +325,26 @@ def test_denser_fitting_rung_with_worse_dloss_is_rejected(
 
     assert selection["ratchet_objective"] == (
         "min_predicted_dloss__ties_to_larger_footprint")
-    assert selection["feasibility_test"] == (
-        "exact_artifact_bytes <= budget_bytes")
+    assert selection["selection_feasibility_test"] == (
+        "exact_tensor_payload_bytes + operator_non_tensor_reserve_bytes "
+        "<= whole_artifact_budget_bytes")
+    assert selection["final_feasibility_test"] == (
+        "stat_all_regular_files_recursive <= whole_artifact_budget_bytes")
     # The objective change is a semantic change to what `chosen_*` means.
     assert selection["schema"] == (
-        "prismaquant.allocator.byte_budget_selection.v2")
+        "prismaquant.allocator.byte_budget_selection.v3")
     # Every rung fits, so the choice is purely the objective's.
     assert all(r["fits"] for r in selection["grid"])
-    assert selection["chosen_target_bits"] == 4.5
+    assert selection["chosen_target_bits"] == 4.6
     assert selection["predicted_dloss"] < selection["max_bytes_pick_dloss"], (
         "the retired max-bytes objective must be recorded and be worse here")
-    assert selection["max_bytes_pick_target_bits"] == 8.0
+    assert selection["max_bytes_pick_target_bits"] == 8.2
     assert not selection["max_bytes_grid_pick_agrees"]
     # The shipped artifact is the sparser, better one.
-    assert {cfg["data_type"] for cfg in layer_cfg.values()} == {"nv_fp"}
+    assert {cfg["data_type"] for name, cfg in layer_cfg.items()
+            if name != "__prismaquant__"} == {"nv_fp"}
     # Headroom is deliberately left on the card: filling it costs quality.
-    assert selection["headroom_gb"] > 0
+    assert selection["selection_headroom_gb"] > 0
     # The near-lossless cap was probed and REJECTED, not ignored.
     caps = [r for r in selection["ratchet_trace"] if r["stage"] == "search_hi_cap"]
     assert len(caps) == 1 and caps[0]["fits"] and not caps[0]["accepted"]
@@ -300,11 +362,12 @@ def test_monotone_case_still_fills_the_card(monkeypatch, tmp_path):
         disk_gb=(fp8_bytes + 10_000) / fp.GB,
         fmt_for_target=lambda t: "FP8_E4M3" if t >= 6.0 else "NVFP4")
 
-    assert selection["chosen_target_bits"] == 8.0
+    assert selection["chosen_target_bits"] == 8.2
     assert selection["max_bytes_grid_pick_agrees"], (
         "in the monotone regime the objective change must be a no-op")
     assert selection["predicted_dloss"] == selection["max_bytes_pick_dloss"]
-    assert {cfg["data_type"] for cfg in layer_cfg.values()} == {"fp8_e4m3"}
+    assert {cfg["data_type"] for name, cfg in layer_cfg.items()
+            if name != "__prismaquant__"} == {"fp8_e4m3"}
     assert selection["has_slack"]
 
 
@@ -319,9 +382,13 @@ def test_over_budget_rung_is_never_selected(monkeypatch, tmp_path):
         disk_gb=(nvfp4_bytes + 1_000) / fp.GB,   # only the NVFP4 rung fits
         fmt_for_target=lambda t: "FP8_E4M3" if t >= 6.0 else "NVFP4")
 
-    assert selection["chosen_target_bits"] == 4.5
-    assert {cfg["data_type"] for cfg in layer_cfg.values()} == {"nv_fp"}
-    assert selection["predicted_artifact_gb"] * fp.GB <= selection["budget_bytes"]
+    assert selection["chosen_target_bits"] == 4.6
+    assert {cfg["data_type"] for name, cfg in layer_cfg.items()
+            if name != "__prismaquant__"} == {"nv_fp"}
+    assert (
+        selection["predicted_whole_artifact_upper_bound_gb"] * fp.GB
+        <= selection["budget_bytes"]
+    )
     assert not any(r["accepted"] for r in selection["ratchet_trace"]
                    if not r["fits"])
 
@@ -357,13 +424,14 @@ def test_search_hi_tightening_and_skipped_bisection_are_recorded(
     selection, _cfg = _run(
         monkeypatch, tmp_path, probe_p, cost_p,
         disk_gb=(nvfp4_bytes + 1_000) / fp.GB,
-        fmt_for_target=lambda t: "FP8_E4M3" if t < 6.0 else "NVFP4")
+        fmt_for_target=lambda t: "FP8_E4M3" if t < 8.3 else "NVFP4",
+        pareto="8.2,8.4")
 
-    assert selection["chosen_target_bits"] == 8.0
+    assert selection["chosen_target_bits"] == 8.4
     assert selection["search_hi_tightened"]
-    assert selection["search_hi_tightened_by_rung"] == 4.5
-    assert selection["search_hi_target_bits"] == 4.5
-    assert selection["search_hi_cap_target_bits"] > 4.5
+    assert selection["search_hi_tightened_by_rung"] == 8.2
+    assert selection["search_hi_target_bits"] == 8.2
+    assert selection["search_hi_cap_target_bits"] > 8.2
     assert not selection["bisection_ran"]
     assert selection["bisection_skipped_reason"] == (
         "tightened_search_hi_at_or_below_grid_pick_target")

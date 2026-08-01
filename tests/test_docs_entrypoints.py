@@ -6,7 +6,7 @@ ROOT = Path(__file__).resolve().parent.parent
 
 def test_deleted_prismascout_l3_entrypoint_is_not_live_documented():
     live_paths = [
-        ROOT / "docs" / "propagated_cost.md",
+        ROOT / "docs" / "archive" / "propagated_cost.md",
         ROOT / "examples" / "launchers" / "run-perturbed-x-smoke.sh",
         ROOT
         / "examples"
@@ -27,7 +27,6 @@ def test_readme_shipping_menu_matches_pipeline_default():
 
     assert 'FORMATS:=NVFP4,FP8_DYNAMIC,BF16' in script
     assert "export FORMATS=NVFP4,FP8_DYNAMIC,BF16" in readme
-    assert "--formats NVFP4,FP8_DYNAMIC,BF16" in readme
     assert "MXFP8_E4M3,BF16" not in readme
 
 
