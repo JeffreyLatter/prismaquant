@@ -117,22 +117,21 @@ def test_routed_down_samples_preserve_route_and_token_metadata(ckpt):
     expected_values = []
     for row, expert in zip(sampled_rows, routed.expert_indices, strict=True):
         expert_id = int(expert.item())
-        gate = x[row] @ weights[
+        gate = x[row].double() @ weights[
             f"model.layers.0.mlp.experts.{expert_id}.gate_proj.weight"
-        ].float().t()
-        up = x[row] @ weights[
+        ].double().t()
+        up = x[row].double() @ weights[
             f"model.layers.0.mlp.experts.{expert_id}.up_proj.weight"
-        ].float().t()
+        ].double().t()
         expected_values.append(torch.nn.functional.silu(gate) * up)
-    # Production replays every expert's routed tokens as one batched GEMM;
-    # this independent oracle uses one GEMV per route.  FP32 accumulation
-    # order differs between those kernels (and across CPU BLAS backends), so
-    # compare mathematical equivalence with an explicit FP32 tolerance.
+    # Compare the production FP32 expert-batched replay against an independent
+    # float64 route oracle. This validates the computed values without binding
+    # the test to one CPU backend's FP32 GEMM/GEMV accumulation order.
     torch.testing.assert_close(
-        routed.values,
+        routed.values.double(),
         torch.stack(expected_values),
         rtol=1e-5,
-        atol=1e-5,
+        atol=1e-6,
     )
 
 
