@@ -1,18 +1,20 @@
 # PrismaQuant Architecture
 
-As of: 2026-08-01 · branch `release/prismaquant-0.5.2` · verified against implementation
-baseline commit `48c069d`, with the external Gridbook runtime pinned to
-`593f524e0a5d73b18e56d290a7b1355e66b2f9ce` (v0.5.0).
+As of: 2026-08-02 · branch `release/prismaquant-0.6.0` · verified against implementation
+baseline commit `193c762`, with the external Gridbook runtime pinned to
+`ca0f0f562d3f398e094bfa5356a9ce3fa47472f1` (v0.6.0).
 
 This revision retains the four 2026-07-30 architecture re-vet waves documented in
 `docs/audits/architecture_re-vet_2026-07-30.md` and closes the runtime-ownership debt: the
 vendored Gridbook tree and sync path are gone, producer ABI/menu/config facts have one owner,
-and required CI checks the independent producer and consumer at one immutable commit. The 0.5.2
-release advances only that boundary to Gridbook 0.5.0: the producer ABI, format menu, allocation
-and export defaults, and quality-promotion status are unchanged, and DSv4 remains gated. The
-three behavioural facts a returning reader must know are that **`COST_MODE` defaults to `aura`**
-(§3.3), Gridbook serving is native CUDA/CUTLASS-only and fails closed (§9.2), and fused
-native-NVFP4 remains default-off after its teacher-backed quality gate (§9.2).
+and required CI checks the independent producer and consumer at one immutable commit. The 0.6.0
+release advances that boundary to Gridbook 0.6.0 and lands the producer half of the cross-repo
+performance ultraplan (P5a–P5d, K0.2): candidates are priced and described differently and gain
+a second hard constraint axis, while the producer ABI, format menu, export defaults, and
+quality-promotion status are unchanged and DSv4 remains gated. The three behavioural facts a
+returning reader must know are that **`COST_MODE` defaults to `aura`** (§3.3), Gridbook serving
+is native CUDA/CUTLASS-only and fails closed (§9.2), and fused native-NVFP4 remains default-off
+after its teacher-backed quality gate (§9.2).
 
 **Prime directive:** the code is the authority. Where this document and the tree disagree, the
 document is wrong — fix it, or record the divergence in §12; never propagate it.
@@ -1851,7 +1853,7 @@ producer codec remains an intentionally independent implementation of the artifa
 compares every packing/layout field and every rung so incompatibility fails at the boundary.
 
 At runtime `register()` registers `"gridbook"` plus the legacy artifact alias `"prismaquant"`
-and installs the per-architecture loader hooks. It does not patch vLLM core. Gridbook 0.5.0
+and installs the per-architecture loader hooks. It does not patch vLLM core. Gridbook 0.6.0
 resolves and attests every serving-reachable extension, optional-kernel mode, ABI, device, and
 shape contract during model load. Decode, expansion, activation QDQ, and routing support are
 native CUDA; GEMM and grouped GEMM are native CUTLASS. A missing or ineligible required native
@@ -1891,7 +1893,7 @@ keeps vLLM's weight loader off it.
 
 **Runtime defaults and kernel provenance live only in Gridbook.** The old table
 here was removed after it drifted from the runtime it described. The current pin is Gridbook
-0.5.0 at `593f524e0a5d73b18e56d290a7b1355e66b2f9ce`; resolve it from
+0.6.0 at `ca0f0f562d3f398e094bfa5356a9ce3fa47472f1`; resolve it from
 `prismaquant/gridbook_runtime/gridbook_runtime_pin.json`, then consult that source's
 `docs/PLUGIN.md`, `docs/KERNELS.md`, and dated audits. The cross-project policy
 is only this: a numerics-changing path cannot be promoted by kernel arithmetic
@@ -1942,7 +1944,7 @@ AURA is native-lane evidence and no served CB objective A/B exists. Lane default
 shipping practice (§12 D15 closed).
 
 **Proven results.** These measurements remain tied to their recorded runtime commits; they are
-not relabelled as Gridbook 0.5.0 native-only measurements.
+not relabelled as Gridbook 0.6.0 native-only measurements.
 
 | artifact | result |
 |---|---|
@@ -2182,9 +2184,9 @@ polish, full rejected-methods catalog) is at
 
 ## 12. Known gaps and debt register
 
-Honest register, code-cited, as of 2026-08-01 (`release/prismaquant-0.5.2`, implementation
-baseline commit `48c069d`; external Gridbook pin
-`593f524e0a5d73b18e56d290a7b1355e66b2f9ce`, v0.5.0).
+Honest register, code-cited, as of 2026-08-02 (`release/prismaquant-0.6.0`, implementation
+baseline commit `193c762`; external Gridbook pin
+`ca0f0f562d3f398e094bfa5356a9ce3fa47472f1`, v0.6.0).
 Severity is operational risk, not effort. Plugin-contract leaks are stated in §8.5 and only
 referenced here. Entries closed on 2026-07-30 are kept, marked, for one cycle so a reader
 returning with a stale copy sees the resolution rather than silence.
@@ -2238,7 +2240,7 @@ New with the 2026-07-30 merge:
 
 **Open items carried from session handovers.** Of the 41 items the handover census could not
 map to a verified closure, the prior FP4-CB fast-expander/Triton item is now closed by the
-exact pinned Gridbook 0.5.0 runtime: FP4-v2 prepares its native expander at model load, decode
+exact pinned Gridbook 0.6.0 runtime: FP4-v2 prepares its native expander at model load, decode
 uses native CUDA GEMV, M>8 uses native BF16 expansion plus Gridbook's owned CUTLASS grouped
 bridge, and a missing operation fails closed. The remaining re-verified items are folded in
 above: tail-veto (D1), `TARGET_DISK_GB` (D12), the DSv4 CB lane (D3), and the shipped
