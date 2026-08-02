@@ -432,11 +432,14 @@ class ServingLaneSpec:
     ``fused_mid_m_rungs_by_runtime_version`` is keyed by the pinned Gridbook
     version (``prismaquant/gridbook_runtime/gridbook_runtime_pin.json``)
     because the backed set is a property of the consumer release, not of the
-    format: Gridbook 0.5.0 instantiates K ∈ {28,32,36,40,44,48} for FP8-CB
-    while full K28..K48 coverage lands concurrently. A pinned version with no
-    entry resolves to the EMPTY backed set — fail-closed, because assuming a
-    newer runtime backs what an older one did is exactly how an unbacked fast
-    path gets priced.
+    format: Gridbook 0.5.0 and 0.6.0 both instantiate K ∈ {28,32,36,40,44,48}
+    for FP8-CB while production permits every K28..K48 — and 0.6.0's K1.2
+    resolution showed that set is not a partial one. ``k % 4 == 0`` is a
+    format+TMA law (``gridbook/codec.py`` ``FP8_FUSED_KBITS``), so the five
+    off-law rungs of the 27B ladder are permanently fallback-served. A pinned
+    version with no entry resolves to the EMPTY backed set — fail-closed,
+    because assuming a newer runtime backs what an older one did is exactly
+    how an unbacked fast path gets priced.
 
     This is metadata only. It carries no latency term and imposes no
     constraint on the DP; the constrained Pareto solver is P5c.

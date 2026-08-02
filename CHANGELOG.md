@@ -1,17 +1,25 @@
 # Changelog
 
-## Unreleased
+## 0.6.0 — 2026-08-02
 
-Producer-side items **P5a**–**P5d** of the cross-repo performance ultraplan,
+This release advances the immutable runtime boundary to Gridbook 0.6.0 at exact
+commit `ca0f0f562d3f398e094bfa5356a9ce3fa47472f1`, and lands the producer-side
+items **P5a**–**P5d** of the cross-repo performance ultraplan,
 [gridbook
 `docs/audits/ultraplan_perf_2026-08-01.md`](https://github.com/RobTand/gridbook/blob/main/docs/audits/ultraplan_perf_2026-08-01.md)
-§6 ("Producer-side allocation: NVFP4 vs FP8-CB at matched bytes").
+§6 ("Producer-side allocation: NVFP4 vs FP8-CB at matched bytes"), together with
+the producer half of gridbook **K0.2**.
 
 P5a and P5b change how candidates are **priced and described**;
 `solve_allocation`'s DP semantics are untouched. P5c adds a **second hard
 constraint axis** — served latency and device memory — at assignment level,
 still without changing the DP and still without any λ: latency never enters
 the objective. P5d adds the D0.3 exact-rate experiment harness.
+
+The producer ABI, format menu, allocation and export defaults, and
+quality-promotion status are unchanged by the runtime advance. This release
+makes no DeepSeek-V4 (DSV4) qualification or support claim; that work remains
+paused.
 
 ### Activation-fair pricing on the weight-only cost branches (P5a)
 
@@ -210,6 +218,41 @@ replaced with what it does and what still gates promotion.
   publishes no `execution_contracts` record — its activation scalars remain
   optional/defaultable — but it now refuses to render a packed FusedMoE stage
   whose sibling stage has no calibrated max-abs.
+
+### Gridbook runtime pin advanced to 0.6.0
+
+- `prismaquant/gridbook_runtime/gridbook_runtime_pin.json` now names Gridbook
+  **0.6.0** at exact commit `ca0f0f562d3f398e094bfa5356a9ce3fa47472f1` — the
+  peeled `refs/tags/v0.6.0^{}` commit, not the annotated tag object. The
+  required `pinned Gridbook contract` CI job installs that exact VCS revision
+  and checks PEP 610 provenance, the packaged `runtime_contract.json`, producer
+  profiles, rungs, layouts and emitted artifacts against it; all of it passes
+  unchanged at 0.6.0, so no producer surface moved under this advance.
+- The `nvfp4_cb` serving profile's FP8-CB fused mid-M lane now declares
+  `"0.6.0": [28, 32, 36, 40, 44, 48]` — the SAME set as 0.5.0, and added as a
+  NEW version key rather than by editing the old one. An artifact produced
+  under the 0.5.0 pin therefore stays resolvable at the route it actually
+  shipped on, and a pin with no key here still backs nothing (fail-closed).
+- That set is now known to be **complete, not partial**. Gridbook 0.6.0
+  resolved ROADMAP K1.2: `k % 4 == 0` is a format + TMA **law**, not a build
+  option — `type_size = 4k` is the packed-B TMA box's contiguous extent and
+  must be a 16-byte multiple, and the fused mainloop decodes with a single
+  sub-table width `CbSubW = k/4` while the format splits `k` over `n_sub = 4`
+  raggedly, so at k37 the true widths are `(10,9,9,9)` and a uniform decode
+  would be *wrong*, not merely unaligned. The five off-law rungs of the
+  published 27B K36..K47 ladder are therefore permanently expand+GEMM-served,
+  and the allocator prices them on the fallback row for good rather than
+  pending coverage that cannot arrive. The compiled set is queryable
+  (`cb_fused_kbits()`), so the declaration is checkable against the runtime
+  rather than transcribed from it.
+- **No FP4-CB backed set was added.** Gridbook 0.6.0's contract-preserving
+  FP4-CB v2 fused mid-M kernel exists only as an opt-in behind
+  `PRISMAQUANT_CB_FP4_FUSED_MIDM=1`, pending its served NATIVE-PARITY gate;
+  with the flag unset the dispatch is byte-for-byte the BF16 bridge. The honest
+  backed set for the DEFAULT contract is therefore still empty, and the lane's
+  `detail` records the available-versus-backed distinction and cites the flag.
+  Pricing a rung on a lane the default serve never takes is exactly the P5b
+  defect this data exists to prevent.
 
 ## 0.5.2 — 2026-08-01
 

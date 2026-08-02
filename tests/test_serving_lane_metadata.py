@@ -138,22 +138,88 @@ def test_the_superblock_gate_is_unchanged():
 # ---------------------------------------------------------------------------
 
 def test_backed_fused_mid_m_rungs_are_spec_data_for_the_pinned_runtime():
-    """Gridbook 0.5.0 instantiates K in {28,32,36,40,44,48} while production
+    """Gridbook 0.6.0 instantiates K in {28,32,36,40,44,48} while production
     permits every K28..K48 — so five of the published 27B ladder's eight
     rungs silently take expand+GEMM (gridbook ROADMAP K1.2). That set is
     DATA, read against the version in gridbook_runtime_pin.json."""
-    assert sp.gridbook_runtime_version() == "0.5.0"
+    assert sp.gridbook_runtime_version() == "0.6.0"
     backed = sp.serving_lane_route(_PROFILE, "FP8_CB_K36")
     assert backed.fused_mid_m_backed
     assert backed.fused_mid_m_rungs == (28, 32, 36, 40, 44, 48)
     assert backed.fused_mid_m_range == (9, 128)
     assert backed.activation_contract == "w8a8-dynamic-e4m3"
-    assert backed.rungs_source == "serving_profile_spec:0.5.0"
+    assert backed.rungs_source == "serving_profile_spec:0.6.0"
 
     for k in (37, 38, 39, 41, 47):
         unbacked = sp.serving_lane_route(_PROFILE, f"FP8_CB_K{k}")
         assert not unbacked.fused_mid_m_backed, k
         assert "expand+GEMM" in unbacked.fallback_route
+
+
+def test_the_0_6_0_backed_set_is_the_k_mod_4_law_not_a_missing_five():
+    """Gridbook 0.6.0 RESOLVED K1.2, and the answer was that the set was
+    never incomplete. ``gridbook/codec.py`` derives ``FP8_FUSED_KBITS`` from a
+    format+TMA law rather than transcribing an instantiation list:
+    ``type_size = 4k`` is the packed-B TMA box's contiguous extent and must be
+    a 16-byte multiple, and the fused mainloop decodes with ONE sub-table
+    width ``CbSubW = k/4`` while the format splits k over ``n_sub = 4``
+    raggedly — at k37 the true widths are ``(10,9,9,9)``, so a uniform decode
+    would be WRONG, not merely unaligned. Both conditions are ``k % 4 == 0``.
+
+    So the five off-law rungs of the published 27B K36..K47 ladder are
+    permanently fallback-served, not pending; the producer must keep pricing
+    them on the fallback row forever rather than waiting for coverage that
+    cannot arrive. This test states the law, so a future spec edit that
+    "completes" the set to every K28..K48 fails here."""
+    backed = sp.serving_lane_route(_PROFILE, "FP8_CB_K36").fused_mid_m_rungs
+    assert backed == tuple(range(28, 49, 4))
+    for k in range(28, 49):
+        route = sp.serving_lane_route(_PROFILE, f"FP8_CB_K{k}")
+        assert route.fused_mid_m_backed == (k % 4 == 0), k
+
+
+def test_advancing_the_pin_adds_a_version_key_and_never_edits_an_old_one():
+    """The lane spec's own rule ("ADD the version key rather than editing an
+    existing list"). An artifact produced under the 0.5.0 pin must stay
+    resolvable at the route it actually shipped on, so the historical key
+    survives the 0.6.0 advance — and both keys answer for themselves."""
+    lane = next(l for l in sp.load_serving_profile(_PROFILE).serving_lanes
+                if l.id == "fp8_cb_fused_mid_m")
+    declared = dict(lane.fused_mid_m_rungs_by_runtime_version)
+    assert "0.5.0" in declared and "0.6.0" in declared
+    assert declared["0.5.0"] == declared["0.6.0"] == tuple(range(28, 49, 4))
+
+    old = sp.serving_lane_route(
+        _PROFILE, "FP8_CB_K36", runtime_version="0.5.0")
+    assert old.fused_mid_m_backed
+    assert old.rungs_source == "serving_profile_spec:0.5.0"
+    # ...and the two resolutions are distinguishable, because the runtime
+    # version is part of a route's identity even when the rungs agree.
+    assert old.route_key() != sp.serving_lane_route(
+        _PROFILE, "FP8_CB_K36").route_key()
+
+
+def test_the_fp4_opt_in_fused_mid_m_lane_is_available_not_backed():
+    """Gridbook 0.6.0 ships a contract-preserving fp4-CB v2 fused mid-M
+    kernel (``csrc/cb_fused_fp4v2_gemm.cu``, dense, 9 <= M <= 128, decoded
+    weights bit-identical to ``cb_expand_v2`` at all 13 K12..K24 rungs) — but
+    OPT-IN behind ``PRISMAQUANT_CB_FP4_FUSED_MIDM=1`` pending the served
+    NATIVE-PARITY gate, and with the flag unset the dispatch is byte-for-byte
+    the BF16 bridge.
+
+    This data declares what the DEFAULT contract serves, so the backed set
+    stays EMPTY: a lane the operator must set an env flag to reach is
+    AVAILABLE, not BACKED, and pricing a rung on a lane the default serve
+    never takes is precisely the P5b defect this file exists to prevent. The
+    distinction is recorded in the lane's ``detail`` and cites the flag."""
+    lane = next(l for l in sp.load_serving_profile(_PROFILE).serving_lanes
+                if l.id == "nvfp4_cb_quality_path")
+    assert lane.fused_mid_m_rungs_by_runtime_version == ()
+    assert "PRISMAQUANT_CB_FP4_FUSED_MIDM" in lane.detail
+    for fmt in ("NVFP4_CB_K12", "NVFP4_CB_K24", "NVFP4_CB_S16"):
+        route = sp.serving_lane_route(_PROFILE, fmt)
+        assert not route.fused_mid_m_backed, fmt
+        assert route.rungs_source == "lane_declares_no_fused_mid_m_lane"
 
 
 def test_an_undeclared_runtime_version_backs_nothing():
@@ -195,7 +261,7 @@ def test_profiles_without_a_declared_lane_return_none():
 def test_the_lane_catalog_is_reportable_and_names_its_runtime():
     catalog = sp.serving_lane_catalog(_PROFILE)
     assert catalog["schema"] == sp.SERVING_LANE_SCHEMA
-    assert catalog["gridbook_runtime_version"] == "0.5.0"
+    assert catalog["gridbook_runtime_version"] == "0.6.0"
     assert set(catalog["lanes"]) == {
         "nvfp4_cb_quality_path", "fp8_cb_fused_mid_m"}
     assert catalog["lanes"]["fp8_cb_fused_mid_m"]["fused_mid_m_rungs"] == [
@@ -256,7 +322,7 @@ def test_selection_provenance_splits_backed_rungs_from_the_fallback():
     }
     prov = selection_serving_lane_provenance(
         assignment, None, target_profile=_PROFILE)
-    assert prov["gridbook_runtime_version"] == "0.5.0"
+    assert prov["gridbook_runtime_version"] == "0.6.0"
     assert prov["units_total"] == 4
     assert prov["units_on_backed_fused_mid_m_lane"] == 1
     assert prov["units_on_fallback_route"] == 2
