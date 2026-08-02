@@ -1,8 +1,11 @@
 # PrismaQuant Architecture
 
-As of: 2026-08-02 · branch `release/prismaquant-0.6.0` · verified against implementation
-baseline commit `193c762`, with the external Gridbook runtime pinned to
-`ca0f0f562d3f398e094bfa5356a9ce3fa47472f1` (v0.6.0).
+As of: 2026-08-02 · branch `dsv4/flash-0731-92gb` · verified against implementation
+baseline commit `e16302e`, with the external Gridbook runtime pinned to
+`ca0f0f562d3f398e094bfa5356a9ce3fa47472f1` (v0.6.0). This branch ports the dated
+2026-08-01 DeepSeek-V4-Flash-0731 92 GB study record (§9.2) forward from its 0.5.1
+working tree; the study's Gridbook-candidate claims were **not** carried over, because
+the candidate they described has since been reviewed, cut, and pinned as Gridbook 0.6.0.
 
 This revision retains the four 2026-07-30 architecture re-vet waves documented in
 `docs/audits/architecture_re-vet_2026-07-30.md` and closes the runtime-ownership debt: the
@@ -1900,6 +1903,26 @@ is only this: a numerics-changing path cannot be promoted by kernel arithmetic
 or speed alone. The latest teacher-backed LFM gate rejected both fused-NVFP4
 defaults, so dense and grouped paths remain explicit opt-ins.
 
+**DSv4-Flash-0731 exact-shape native A/B (dated record, measured 2026-08-01).** This
+paragraph is ported verbatim from the 0.5.1-era study working tree and is kept under its
+measurement date. It was taken against the then-uncommitted native-only Gridbook candidate
+(base `4e7c1bc6` plus a dirty tree), which has since been cut and pinned as Gridbook 0.6.0
+at `ca0f0f562d3f398e094bfa5356a9ce3fa47472f1`; the numbers are therefore candidate-era
+evidence for that pin, not a re-measurement of it.
+
+The exact-shape native A/B used the seven ordinary Linear calls repeated across all 43 DSV4
+body blocks (301 calls total), flushing 256 MiB before each timed call. K36 was 1.083x faster
+at `M=1` and 1.064x at `M=2`; native NVFP4 crossed over by `M=4` (1.120x), reached 1.589x at
+`M=8`, and was 1.34–2.50x faster over measured `M=9..1400`. Replacing the retired
+Triton-containing `M=16` route reduced K36's weighted block subtotal from about 1.168 ms to
+0.763 ms (1.53x). All 12 fused quality gates passed: worst relative L2 `2.146e-5`, max absolute
+`0.015625`, and at least 99.9983% BF16 output equality. Evidence:
+`/home/rob/dq-runs/dsv4-flash-0731/synthetic-bench-native-quality/README.md`; harness SHA-256
+`e38338b1e07469560ecc359af9e35af2ceb35476f72e79edcef0450acae765cb`, wide-result SHA-256
+`b63fec8a08930b5d1091dc17577261642d2df84786cfb8925c561375ad85a8ca`, decode-result SHA-256
+`a93cf8957c531ba3108ea27671de50f9b0fda2db26a710c85d4fbc0fb6b7cad5`. These are
+candidate-kernel measurements, not served tokens/s.
+
 **Per-arch wiring — the no-longer-silent no-load trap** (R10, 2026-07-30). Archs whose vLLM
 loader maps experts at the top level never call the per-layer `FusedMoE.load_weights`, so
 Gridbook installs its top-level wrapper from the packaged runtime contract. The authoritative
@@ -1970,14 +1993,25 @@ assignment, but same-session served KL/PPL/tasks plus end-to-end timing decide i
 Stage 0 favors production-faithful K36 weight error (493/496 units at 27B, 252/252 at 4B), but
 that is a stop-only surrogate, not a served promotion. Plain M=1 decode evidence does not imply
 batched/speculative parity, and the Hy3 zero-NVFP4 allocation is circular under its
-accuracy-only objective.
+accuracy-only objective. The DSv4 screen makes the same conditional rule concrete: K36 won
+301/301 activation-fitted ordinary-Linears at `0.390x` NVFP4's sensitivity-weighted error and
+adds only `8,019,608` bytes to the proposed 92 GB artifact, so it is the quality-first,
+low-concurrency arm; native NVFP4 is the TTFT/batching/speculative-throughput arm because its
+kernel crossover occurs before `M=4`. Whole-model served A/B remains authoritative.
 
 **Implementation status:** this constrained Pareto formulation is normative
 future work, not current allocator behavior. Today the profile legality masks
 (including signed-rung exclusion) are enforced, tensor-payload costs feed the
 quality-only allocator, and final SLO/quality selection is an external release
 gate. A format allow-list does not prove a backend, activation contract, or
-promotion state; those live in the structured native-parity benchmark record.
+promotion state; those live in the structured native-parity benchmark record. For the DSv4
+92 GB study, the quality arm is 35 routed-expert layers at K15, eight provisional layers
+`23,24,25,27,28,31,32,33` at K14, and 301 ordinary Linears at K36: tensor payload
+`91,724,116,088` bytes, or `91,992,551,544` bytes with the 256 MiB reserve. Replacing those
+301 ordinary Linears with native NVFP4 yields `91,716,096,480` payload bytes. Neither arm is
+release-eligible until DSv4 body/MTP/DSpark loader coverage, production expert calibration,
+export/load/generation, and whole-model quality/speed gates pass; the current Gridbook pin
+still declares DSv4 unsupported (§8.4).
 
 ### 9.3 GGUF
 
@@ -2184,9 +2218,13 @@ polish, full rejected-methods catalog) is at
 
 ## 12. Known gaps and debt register
 
-Honest register, code-cited, as of 2026-08-02 (`release/prismaquant-0.6.0`, implementation
-baseline commit `193c762`; external Gridbook pin
-`ca0f0f562d3f398e094bfa5356a9ce3fa47472f1`, v0.6.0).
+Honest register, code-cited, as of 2026-08-02 (`dsv4/flash-0731-92gb`, implementation
+baseline commit `e16302e`; external Gridbook pin
+`ca0f0f562d3f398e094bfa5356a9ce3fa47472f1`, v0.6.0). The DSv4 study's working tree carried a
+proposed **D29** ("the native-only Gridbook candidate is measured but not yet an attested
+runtime"). It is deliberately **not** ported: the 0.6.0 merge cut and pinned that candidate,
+so re-adding the row would assert a stale pin (`59cebf9f…`, v0.4.1) that no longer exists in
+this tree. The study's measurement half survives as the dated §9.2 record.
 Severity is operational risk, not effort. Plugin-contract leaks are stated in §8.5 and only
 referenced here. Entries closed on 2026-07-30 are kept, marked, for one cycle so a reader
 returning with a stale copy sees the resolution rather than silence.
