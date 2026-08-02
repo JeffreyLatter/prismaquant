@@ -112,6 +112,12 @@
 #   colw    — harvest cb_col_weights.pkl from act/              [CPU/GPU]
 #   cost    — exact per-(Linear, rung) cost, K14/K15/K36/BF16   [GPU, hours]
 #   alloc   — byte-budget allocation -> selection.json          [CPU]
+#   export  — stream the 92 GB CB artifact from layer_config    [GPU, hours]
+#
+# The export stage collapses the allocator's 768 per-expert entries per layer
+# into the two packed stacks gridbook's deepseek_v4 contract names
+# (`ffn.experts.{gate_up_proj,down_proj}`), refusing any layer whose experts do
+# not agree on one format.
 #
 # The cost stage shards by layer and reuses completed shards, so it can be
 # resumed or split with --start-layer/--end-layer. CB shards are deliberately
@@ -332,11 +338,40 @@ print(json.dumps(sel, indent=2)[:4000])
 PY"
 }
 
+run_export() {
+  echo "[dsv4] export: ${RUN_ROOT}/artifact-92gb from ${WORK_DIR}/artifacts/layer_config.json"
+  # Runs under the SAME DOCKER_COMMON producer identity as cost/alloc
+  # (CB_CODEBOOK_SOURCE / CB_SCALE_CODING / CB_SCALE_SWEEP /
+  # PRISMAQUANT_CB_ENCODE_TIER), so the render the allocator priced and the
+  # render this ships are provably the same one — the exporter re-validates
+  # that stamp against the layer_config and refuses a mismatch.
+  #
+  # --activation-cache-dir is MANDATORY, not optional: the layer_config carries
+  # the static W4A4 activation contract, and without the cache the export
+  # refuses rather than shipping uncalibrated fused W4A4.
+  #
+  # Deliberately absent, and they must stay absent for a production artifact:
+  #   --allow-unstamped-research  (would ship CB bytes with no render identity)
+  #   --reuse-prior               (DELTA-EXPORT is disabled; fails closed anyway)
+  docker run --name pq-dsv4-export "${DOCKER_COMMON[@]}" \
+    --entrypoint bash "$IMAGE" -c "
+python3 -m prismaquant.export_nvfp4_cb_streaming \
+  --model-dir ${MODEL_PATH} \
+  --layer-config ${WORK_DIR}/artifacts/layer_config.json \
+  --out ${RUN_ROOT}/artifact-92gb \
+  --col-weights ${WORK_DIR}/artifacts/cb_col_weights.pkl \
+  --activation-cache-dir ${WORK_DIR}/act \
+  --codebook-source lattice \
+  --scale-coding two_tier \
+  > ${WORK_DIR}/logs/export.log 2>&1"
+}
+
 case "$STAGE" in
-  probe) run_probe ;;
-  colw)  run_colw  ;;
-  cost)  run_cost  ;;
-  alloc) run_alloc ;;
+  probe)  run_probe  ;;
+  colw)   run_colw   ;;
+  cost)   run_cost   ;;
+  alloc)  run_alloc  ;;
+  export) run_export ;;
   all)   run_probe; echo "[dsv4] probe detached; run STAGE=colw once it exits" ;;
-  *) echo "unknown STAGE=$STAGE (probe|colw|cost|alloc|all)" >&2; exit 2 ;;
+  *) echo "unknown STAGE=$STAGE (probe|colw|cost|alloc|export|all)" >&2; exit 2 ;;
 esac

@@ -191,6 +191,28 @@ class _LazySkeleton:
     def get_shape(self, name: str) -> tuple[int, ...]:
         return tuple(self._handle(name).get_slice(name).get_shape())
 
+    def logical_shape(self, name: str) -> tuple[int, ...]:
+        """Shape of the DECODED weight — what ``dequant_weight`` returns.
+
+        Identical to the stored shape except for a declared MXFP4 nibble-pack,
+        where two logical elements share each stored byte along the reduce dim
+        (DSv4-Flash routed experts: stored ``[2048, 2048]`` I8 = logical
+        ``[2048, 4096]``). The streaming plan sizes every output from metadata
+        alone, so a physical shape here would size the CB payload at half its
+        in_features and then fail the col_weights coverage gate."""
+        shape = self.get_shape(name)
+        if not shape:
+            return shape
+        from prismaquant.cb_source_decode import checkpoint_weight_to_live_name
+
+        mxfp4 = getattr(self._fp8_scale_inv_map, "mxfp4_names", frozenset())
+        if not mxfp4:
+            return shape
+        live = checkpoint_weight_to_live_name(name, profile=self._profile)
+        if live in mxfp4:
+            return (*shape[:-1], int(shape[-1]) * 2)
+        return shape
+
     def get_dtype(self, name: str) -> torch.dtype:
         t = self._handle(name).get_slice(name)[0:0]
         return t.dtype
@@ -427,25 +449,48 @@ def _plan_expert_stacks(skeleton: _LazySkeleton, profile=None) -> dict[str, dict
         pat = re.compile(regex[len("re:"):] if regex.startswith("re:")
                          else regex)
 
-    def _profile_match(base: str) -> bool:
+    def _matching_name(name: str, base: str) -> str | None:
+        """The spelling of this per-expert tensor that the profile's
+        per-expert regex matches, or None.
+
+        Three spellings are tried, in increasing distance from the bytes on
+        disk: the checkpoint base itself, its vLLM-internal name, and its LIVE
+        (transformers) name via ``checkpoint_to_live_name``. The live bridge is
+        what admits a checkpoint whose per-expert naming is its OWN
+        (DSv4-Flash stores ``layers.N.ffn.experts.{i}.w{1,2,3}`` while the
+        recipe, the imatrix, the probe and the regex all speak
+        ``model.layers.N.mlp.experts.{i}.{gate,up,down}_proj``). Whichever
+        spelling matched becomes the group key, so ``_resolve_target`` finds
+        the group under the recipe name while the members stay CHECKPOINT
+        bases for ``_expert_weight`` to read."""
         if pat is None:
-            return False
-        if pat.match(base):
-            return True
-        try:
-            return bool(pat.match(profile.to_vllm_internal_name(base)))
-        except Exception:
-            return False
+            return None
+        candidates = [base]
+        for resolve in (
+            lambda: profile.to_vllm_internal_name(base),
+            lambda: _checkpoint_to_live_base(name, profile),
+        ):
+            try:
+                cand = resolve()
+            except Exception:
+                cand = None
+            if cand and cand not in candidates:
+                candidates.append(cand)
+        for cand in candidates:
+            if pat.match(cand):
+                return cand
+        return None
 
     for name in skeleton.keys():
         if not name.endswith(".weight"):
             continue
         base = name[:-len(".weight")]
         if pat is not None:
-            if not _profile_match(base):
+            matched = _matching_name(name, base)
+            if matched is None:
                 continue
             try:
-                head, proj = base.rsplit(".", 1)
+                head, proj = matched.rsplit(".", 1)
                 prefix, idx_s = head.rsplit(".", 1)
             except ValueError:
                 continue
@@ -465,6 +510,228 @@ def _plan_expert_stacks(skeleton: _LazySkeleton, profile=None) -> dict[str, dict
             prefix, idx, proj = m.group(1), int(m.group(2)), m.group(3)
         experts.setdefault(prefix, {}).setdefault(proj, {})[idx] = base
     return experts
+
+
+def _checkpoint_to_live_base(weight_key: str, profile) -> str | None:
+    """Checkpoint ``<base>.weight`` key -> live module base, or None."""
+    if profile is None:
+        return None
+    live = profile.checkpoint_to_live_name(weight_key, multimodal=False)
+    if not live or not live.endswith(".weight"):
+        return None
+    return live[: -len(".weight")]
+
+
+def _expert_member_qnames(prefix, packed_proj, members, profile
+                          ) -> dict[tuple[str, int], str]:
+    """``{(projection, expert_id): recipe qname}`` for one packed stack, in the
+    profile's fusion order. The recipe qname is rebuilt from the GROUP KEY, so
+    it is exactly the name the allocator, the imatrix and the render identity
+    carry for that per-expert Linear."""
+    projections = _packed_expert_projection_names(profile, packed_proj)
+    n = _n_experts(members, projections)
+    return {(proj, e): f"{prefix}.{e}.{proj}"
+            for proj in projections
+            for e in range(n)}
+
+
+def _collapse_per_expert_assignment(assignment, expert_groups, profile):
+    """Collapse an EXPANDED per-expert assignment into packed-stack targets.
+
+    The allocator decides an expert group ATOMICALLY but writes its
+    layer_config EXPANDED per tensor (allocator.py:4662-4668), so one DSv4
+    layer arrives as 768 entries (256 experts x gate/up/down) that all agree on
+    one format. Gridbook's stacked-expert contract has no per-expert spelling at
+    all: its loader anchors on ``.experts.{gate_up_proj,down_proj}.<leaf>``
+    (gridbook moe_toplevel_loader.py:125-132), and a per-expert CB key misses
+    every resolver silently and then dies as a bare ``KeyError`` in the
+    architecture's own loader. So the export must name the two stacks per layer
+    instead — the reduction the allocator never had to perform.
+
+    A stack whose members do NOT all carry the same format is REFUSED rather
+    than named: "All experts of one stack MUST share one format and one
+    codebook ... experts MAY differ across layers but MUST be uniform within a
+    layer" (gridbook docs/SPEC.md:288-291). The runtime's own uniformity checks
+    are a byte-width assert and a scheme-signature comparison, so a mixed stack
+    that reached serving would be a load-time crash at best.
+
+    Returns ``(collapsed_assignment, members_by_target, report)``. Members are
+    ``{packed_qname: {(projection, expert_id): member_recipe_qname}}`` so the
+    imatrix, the render identity and the source-value verification all stay
+    keyed by the names the recipe actually carries.
+    """
+    collapsed = dict(assignment)
+    members_by_target: dict[str, dict[tuple[str, int], str]] = {}
+    report: dict[str, object] = {"stacks": 0, "members": 0}
+    packed_names = _packed_expert_param_names(profile)
+    for prefix in sorted(expert_groups):
+        group = expert_groups[prefix]
+        consumed: set[str] = set()
+        # Widest parent first: the profile-less fallback vocabulary lists
+        # `gate_proj`/`up_proj` as packed parents alongside `gate_up_proj`, and
+        # a projection must land in the FUSED stack, not in a singleton one.
+        for packed_proj in sorted(
+            packed_names,
+            key=lambda name: (
+                -len(_packed_expert_projection_names(profile, name)), name),
+        ):
+            projections = _packed_expert_projection_names(profile, packed_proj)
+            if any(p in consumed for p in projections):
+                continue
+            if any(p not in group for p in projections):
+                continue
+            try:
+                member_qnames = _expert_member_qnames(
+                    prefix, packed_proj, group, profile)
+            except ValueError:
+                continue
+            present = {q for q in member_qnames.values() if q in assignment}
+            if not present:
+                continue
+            packed_qname = f"{prefix}.{packed_proj}"
+            if packed_qname in assignment:
+                raise ValueError(
+                    f"{packed_qname}: the layer config carries BOTH the packed "
+                    f"stack and {len(present)} per-expert member(s) for it; "
+                    "one allocation must describe each serving unit once")
+            missing = sorted(set(member_qnames.values()) - present)
+            if missing:
+                raise ValueError(
+                    f"{packed_qname}: {len(present)} of "
+                    f"{len(member_qnames)} per-expert members are in the layer "
+                    f"config; a packed stack is exported whole or not at all "
+                    f"(missing e.g. {missing[:4]})")
+            formats = sorted({str(assignment[q]) for q in present})
+            if len(formats) > 1:
+                by_fmt = {
+                    fmt: sorted(q for q in present
+                                if str(assignment[q]) == fmt)[:3]
+                    for fmt in formats
+                }
+                raise ValueError(
+                    f"{packed_qname}: packed MoE experts must be uniform "
+                    f"within a layer (gridbook SPEC.md:288-291) but the "
+                    f"allocation mixes {formats} across this stack's "
+                    f"{len(present)} members — refusing to name it. "
+                    f"Sample per format: {by_fmt}. Re-run the allocator with "
+                    "the expert group constrained to one rung.")
+            for q in present:
+                del collapsed[q]
+            consumed.update(projections)
+            collapsed[packed_qname] = formats[0]
+            members_by_target[packed_qname] = member_qnames
+            report["stacks"] = int(report["stacks"]) + 1
+            report["members"] = int(report["members"]) + len(present)
+    return collapsed, members_by_target, report
+
+
+def _member_serialized_shapes(packed_qname, member_qnames, expert_groups,
+                              skeleton, profile):
+    """``{member recipe qname: decoded 2-D shape}`` for one collapsed stack.
+
+    Read from the checkpoint rather than divided out of the stack shape, so a
+    fused parent whose projections are NOT equal-width is described exactly."""
+    if not member_qnames:
+        return {}
+    prefix, packed_proj = packed_qname.rsplit(".", 1)
+    group = expert_groups[prefix]
+    out = {}
+    for (proj, expert_id), member in member_qnames.items():
+        base = group[proj][expert_id]
+        out[member] = tuple(
+            int(d) for d in skeleton.logical_shape(base + ".weight"))
+    return out
+
+
+def _assert_packed_plan_reconciles_to_recipe(recipe_formats, recipe_shapes,
+                                             packed_payload,
+                                             members_by_target, *, context,
+                                             where):
+    """The packed plan must equal the recipe's per-expert accounting EXACTLY,
+    minus the deduplicated static-activation scalars.
+
+    CB scales are per-expert/per-row/per-group, so a stack's packed bytes are
+    the exact sum of its members' (the property that makes streaming a stack
+    one expert at a time byte-identical in the first place). The one thing the
+    collapse legitimately removes is ``input_global_scale``: the recipe carries
+    one fp32 scalar per per-expert Linear, and gridbook's contract carries one
+    per STACK. Anything else differing means the collapse changed the bytes,
+    which it must never do."""
+    recipe_payload = cb_assignment_payload_breakdown(
+        recipe_formats, recipe_shapes, context=context)
+    deduplicated = sum(
+        len(members) - 1 for members in members_by_target.values())
+    scalar_bytes = int(
+        recipe_payload["input_global_scale_bytes"]
+        - packed_payload["input_global_scale_bytes"]
+    )
+    expected_scalar_bytes = 0 if not deduplicated else scalar_bytes
+    delta = int(recipe_payload["tensor_payload_bytes"]) - int(
+        packed_payload["tensor_payload_bytes"])
+    if delta != expected_scalar_bytes:
+        raise AssertionError(
+            f"{where}: packed expert stacks account for "
+            f"{packed_payload['tensor_payload_bytes']}B against the recipe's "
+            f"{recipe_payload['tensor_payload_bytes']}B — a difference of "
+            f"{delta}B, but collapsing {len(members_by_target)} stack(s) may "
+            f"only deduplicate {expected_scalar_bytes}B of "
+            "input_global_scale scalars"
+        )
+    if int(packed_payload["index_bytes"]) != int(
+        recipe_payload["index_bytes"]
+    ) or int(packed_payload["fp4_scale_bytes"]) != int(
+        recipe_payload["fp4_scale_bytes"]
+    ) or int(packed_payload["fp8_row_scale_bytes"]) != int(
+        recipe_payload["fp8_row_scale_bytes"]
+    ):
+        raise AssertionError(
+            f"{where}: packed expert stacking moved CB weight bytes "
+            f"(index/scale planes) relative to the recipe's per-expert "
+            "accounting; per-expert and whole-stack packing must be "
+            "byte-identical"
+        )
+
+
+def _packed_expert_col_weights(col_weights, members_by_target, profile):
+    """Per-expert imatrix vectors -> the ``(E, 1, in)`` stack entry each packed
+    target needs, returned as a NEW mapping (the per-expert entries survive for
+    the render identity, which is keyed by them).
+
+    A FUSED parent (``gate_up_proj`` = gate then up) has ONE input, so its two
+    projections' vectors are two samples of the same per-column mean-square and
+    are pooled by averaging. They are not identical in practice only because
+    the probe caches each Linear's inputs separately under a row limit
+    (DSv4-Flash layer 0: max |gate-up| ~ 0.3 against a vector norm ~ 4.6).
+    Weighting one projection by the other's sample would be the actual error;
+    per-row vectors cannot be expressed here at all, since the pack broadcasts
+    ``(E, 1, in)`` across the whole stack."""
+    out = dict(col_weights)
+    for packed_qname, member_qnames in members_by_target.items():
+        if packed_qname in out:
+            continue
+        packed_proj = packed_qname.rsplit(".", 1)[1]
+        projections = _packed_expert_projection_names(profile, packed_proj)
+        experts = sorted({e for _p, e in member_qnames})
+        rows = []
+        for e in experts:
+            vecs = []
+            for proj in projections:
+                q = member_qnames[(proj, e)]
+                if q not in col_weights:
+                    raise ValueError(
+                        f"{packed_qname}: CB stack member {q!r} has no "
+                        "col_weights entry (no silent RTN)")
+                vecs.append(torch.as_tensor(col_weights[q])
+                            .reshape(-1).to(torch.float32))
+            widths = {int(v.numel()) for v in vecs}
+            if len(widths) != 1:
+                raise ValueError(
+                    f"{packed_qname}: expert {e} imatrix widths disagree "
+                    f"across the fused projections {projections}: {widths}")
+            rows.append(torch.stack(vecs).mean(dim=0) if len(vecs) > 1
+                        else vecs[0])
+        out[packed_qname] = torch.stack(rows).unsqueeze(1).contiguous()
+    return out
 
 
 def _stacked_source_weight(skeleton, profile, prefix, packed_proj, members) -> \
@@ -501,12 +768,22 @@ def _n_experts(members: dict[str, dict[int, str]],
 
 
 def _expert_weight(skeleton, profile, prefix, packed_proj, members,
-                   e) -> torch.Tensor:
+                   e, *, on_member=None) -> torch.Tensor:
     """Materialize one expert's packed projection using profile-declared
-    projection names and order (for example LFM gate_up = ``w1`` then ``w3``)."""
+    projection names and order (for example LFM gate_up = ``w1`` then ``w3``).
+
+    ``on_member(projection, expert_id, checkpoint_base, decoded)`` is called for
+    each source tensor as it is decoded — the hook the render identity uses to
+    verify a stack MEMBER BY MEMBER, since a checkpoint that stores experts
+    per-expert has its source-value digests keyed per expert, not per stack."""
     projections = _packed_expert_projection_names(profile, packed_proj)
-    tensors = [skeleton.dequant_weight(members[p][e] + ".weight")
-               for p in projections]
+    tensors = []
+    for p in projections:
+        base = members[p][e]
+        t = skeleton.dequant_weight(base + ".weight")
+        if on_member is not None:
+            on_member(p, e, base, t)
+        tensors.append(t)
     return tensors[0] if len(tensors) == 1 else torch.cat(tensors, dim=0)
 
 
@@ -841,6 +1118,39 @@ def export_nvfp4_cb_streaming(
     except Exception:
         profile = None
     expert_groups = _plan_expert_stacks(skeleton, profile)
+    # The allocator writes its layer_config EXPANDED per tensor even though it
+    # decided each expert group atomically, so a per-expert checkpoint arrives
+    # as one entry per (expert, projection). Gridbook only names stacks. Do the
+    # reduction here, once, before anything reads the assignment.
+    assignment, expert_stack_members, expert_stack_report = (
+        _collapse_per_expert_assignment(assignment, expert_groups, profile)
+    )
+    if expert_stack_members:
+        col_weights = _packed_expert_col_weights(
+            col_weights, expert_stack_members, profile)
+        print(
+            f"[export-cb-stream] collapsed "
+            f"{expert_stack_report['members']} per-expert allocation entries "
+            f"into {expert_stack_report['stacks']} packed expert stack(s)",
+            flush=True,
+        )
+    # Every recipe qname a CB target is VERIFIED and IMATRIX-WEIGHTED under.
+    # For a packed stack that is its members, not the stack: the recipe's
+    # render identity, the cost rows and the col_weights pickle are all keyed
+    # per expert, and inventing a stack-level identity would certify nothing.
+    def _identity_scope(qname: str) -> tuple[str, ...]:
+        members = expert_stack_members.get(qname)
+        if members is None:
+            return (qname,)
+        return tuple(sorted(members.values()))
+
+    def _packed_stack_target(qname: str) -> bool:
+        return qname in expert_stack_members
+
+    def _base_name(qname: str) -> str:
+        return _export_base_name(
+            qname, profile, skeleton,
+            assume_resolvable=_packed_stack_target(qname))
 
     # --- Stock-CT codecs (mixed container: the plugin delegates non-"scheme"
     # groups to vLLM's CompressedTensors path). REUSE the authoritative
@@ -898,7 +1208,7 @@ def export_nvfp4_cb_streaming(
         outside = sorted(
             q for q in list(cb_targets) + list(source_targets)
             + list(stock_targets)
-            if not any(_export_base_name(q, profile, skeleton).startswith(p)
+            if not any(_base_name(q).startswith(p)
                        for p in subset_prefixes))
         if outside:
             raise ValueError(
@@ -939,12 +1249,12 @@ def export_nvfp4_cb_streaming(
     def _target_shape(qname):
         kind, h = _resolve_target(qname)
         if kind == "tensor":
-            return tuple(skeleton.get_shape(h))
+            return tuple(skeleton.logical_shape(h))
         if kind == "experts":
             prefix, packed_proj, grp = h
             projections = _packed_expert_projection_names(profile, packed_proj)
             n = _n_experts(grp, projections)
-            shapes = [skeleton.get_shape(grp[p][0] + ".weight")
+            shapes = [skeleton.logical_shape(grp[p][0] + ".weight")
                       for p in projections]
             in_f = int(shapes[0][1])
             if any(len(s) != 2 or int(s[1]) != in_f for s in shapes):
@@ -1118,7 +1428,9 @@ def export_nvfp4_cb_streaming(
             _recipe_cb_render_identity,
             expected_context=serialization_context,
             expected_formats_by_qname={
-                qname: (assignment[qname],) for qname in sorted(cb_targets)
+                member: (assignment[qname],)
+                for qname in sorted(cb_targets)
+                for member in _identity_scope(qname)
             },
             col_weights=col_weights,
             where="export_nvfp4_cb_streaming assignment render identity",
@@ -1161,17 +1473,41 @@ def export_nvfp4_cb_streaming(
             qname for qname in fp4_activation_targets
             if qname.endswith((".gate_up_proj", ".down_proj"))
         }
-        supplemental_samples = (
-            synthesize_packed_expert_activation_samples(
-                model_dir,
-                activation_cache_dir,
-                packed_candidates,
-                profile,
-                device=device,
+        # A checkpoint whose experts are PACKED caches only the experts
+        # module's input, so the routed intermediate has to be replayed from
+        # the checkpoint. A checkpoint whose experts are PER-EXPERT cached both
+        # stages' real inputs, so the same numbers are pooled, not replayed —
+        # and the replay's own entry condition would silently decline it.
+        per_expert_stacks = {
+            qname: expert_stack_members[qname]
+            for qname in packed_candidates
+            if qname in expert_stack_members
+        }
+        supplemental_max_abs: dict[str, float] = {}
+        supplemental_samples: dict[str, object] = {}
+        if per_expert_stacks:
+            from prismaquant.moe_imatrix import (
+                per_expert_stage_activation_calibration,
             )
-            if packed_candidates and profile is not None
-            else {}
-        )
+
+            supplemental_samples, supplemental_max_abs = (
+                per_expert_stage_activation_calibration(
+                    activation_cache_dir,
+                    per_expert_stacks,
+                    policy=activation_scale_policy_id,
+                )
+            )
+        replay_candidates = packed_candidates - set(per_expert_stacks)
+        if replay_candidates and profile is not None:
+            supplemental_samples.update(
+                synthesize_packed_expert_activation_samples(
+                    model_dir,
+                    activation_cache_dir,
+                    replay_candidates,
+                    profile,
+                    device=device,
+                )
+            )
         (
             logical_scales,
             activation_calibration_sources,
@@ -1181,6 +1517,7 @@ def export_nvfp4_cb_streaming(
             policy=activation_scale_policy_id,
             profile=profile,
             supplemental_activations=supplemental_samples,
+            supplemental_max_abs=supplemental_max_abs,
             calibration_device=device,
         )
         (
@@ -1189,9 +1526,7 @@ def export_nvfp4_cb_streaming(
         ) = build_execution_contract(
             logical_scales,
             policy=activation_scale_policy_id,
-            target_name=lambda qname: _export_base_name(
-                qname, profile, skeleton
-            ),
+            target_name=_base_name,
             calibration_sources=activation_calibration_sources,
             profile=profile,
         )
@@ -1227,7 +1562,7 @@ def export_nvfp4_cb_streaming(
 
     # CB + FP8_SOURCE targets (keyed by canonical/recipe qname).
     for qname in list(cb_targets) + list(source_targets):
-        export_base = _export_base_name(qname, profile, skeleton)
+        export_base = _base_name(qname)
         kind, h = _resolve_target(qname)
         if qname in source_set:
             wkey = _try_resolve_skeleton(qname, skeleton, profile)
@@ -1286,7 +1621,8 @@ def export_nvfp4_cb_streaming(
                 col_weights[qname], scale_sweep, coding, shape, device,
                 serialization_context.encode_tier,
                 _recipe_cb_render_identity,
-                verified_cb_source_qnames)
+                verified_cb_source_qnames,
+                expert_stack_members.get(qname))
             state["scale"] = scale
             return packed.reshape(packed_shape)
 
@@ -1377,7 +1713,8 @@ def export_nvfp4_cb_streaming(
                     col_weights[qname], scale_sweep, coding, shape, device,
                     serialization_context.encode_tier,
                     _recipe_cb_render_identity,
-                    verified_cb_source_qnames)
+                    verified_cb_source_qnames,
+                    expert_stack_members.get(qname))
                 out = {qw_name: packed.reshape(packed_shape)}
                 if scale is not None:
                     out[scale_name] = scale.reshape(scale_shape).to(
@@ -1422,7 +1759,7 @@ def export_nvfp4_cb_streaming(
     # group from its base boundary and rewrites identical bytes.
     for qname in sorted(stock_targets):
         canon_fmt = stock_targets[qname]
-        export_base = _export_base_name(qname, profile, skeleton)
+        export_base = _base_name(qname)
         kind, h = _resolve_target(qname)              # dense: kind == "tensor"
         shape = _target_shape(qname)
         override = (_nvfp4_shared_global.get(qname)
@@ -1572,11 +1909,37 @@ def export_nvfp4_cb_streaming(
         context=serialization_context,
     )
     if _recipe_cb_context_stamp is not None or _recipe_cb_tensor_stamps:
+        # A collapsed stack's stamps are its MEMBERS' — the recipe priced 768
+        # per-expert tensors, so that is the scope its per-layer identities
+        # have to be checked against. The packed plan is then reconciled to
+        # that scope explicitly rather than being compared to a stamp set the
+        # recipe never wrote.
+        recipe_formats = {
+            member: assignment[qname]
+            for qname in cb_targets
+            for member in _identity_scope(qname)
+        }
+        recipe_shapes = dict(cb_serialized_shapes)
+        for qname in cb_targets:
+            member_shapes = _member_serialized_shapes(
+                qname, expert_stack_members.get(qname), expert_groups,
+                skeleton, profile)
+            if member_shapes:
+                recipe_shapes.pop(qname, None)
+                recipe_shapes.update(member_shapes)
         validate_cb_assignment_serialization_stamps(
-            {qname: assignment[qname] for qname in cb_targets},
-            cb_serialized_shapes,
+            recipe_formats,
+            recipe_shapes,
             context=serialization_context,
             stamps=_recipe_cb_tensor_stamps,
+            where="export_nvfp4_cb_streaming",
+        )
+        _assert_packed_plan_reconciles_to_recipe(
+            recipe_formats,
+            recipe_shapes,
+            serialized_payload,
+            expert_stack_members,
+            context=serialization_context,
             where="export_nvfp4_cb_streaming",
         )
     if planned_cb_tensor_bytes != serialized_payload["tensor_payload_bytes"]:
@@ -1592,7 +1955,7 @@ def export_nvfp4_cb_streaming(
     serialized_payload_summary = cb_payload_summary(serialized_payload)
 
     def _cb_target_name(qname: str) -> str:
-        return _export_base_name(qname, profile, skeleton)
+        return _base_name(qname)
 
     def _delegated_target_name(qname: str) -> str:
         return (
@@ -1639,16 +2002,19 @@ def export_nvfp4_cb_streaming(
     from safetensors.torch import save_file
 
     def _assert_source_coverage_before_publish():
+        expected_scope = {
+            member for qname in cb_targets for member in _identity_scope(qname)
+        }
         if (
             _recipe_cb_render_identity is not None
-            and verified_cb_source_qnames != set(cb_targets)
+            and verified_cb_source_qnames != expected_scope
         ):
             raise AssertionError(
                 "streaming CB source-value validation did not cover the exact "
                 "assignment: missing="
-                f"{sorted(set(cb_targets) - verified_cb_source_qnames)[:8]}, "
+                f"{sorted(expected_scope - verified_cb_source_qnames)[:8]}, "
                 "extra="
-                f"{sorted(verified_cb_source_qnames - set(cb_targets))[:8]}"
+                f"{sorted(verified_cb_source_qnames - expected_scope)[:8]}"
             )
 
     writer.write(
@@ -1694,7 +2060,7 @@ def export_nvfp4_cb_streaming(
 def _stream_pack_target(skeleton, profile, resolved, qname, grid, mode, k,
                         codebook, cw, scale_sweep, coding, shape, device,
                         encode_tier, cb_render_identity,
-                        verified_source_qnames):
+                        verified_source_qnames, member_qnames=None):
     """Pack ONE target, streaming experts. Returns (packed uint8 (rows,bytes)
     or (E,out,bytes), scale-plane fp32 or None). Per-expert scales make
     per-expert packing byte-identical to whole-stack packing."""
@@ -1730,10 +2096,44 @@ def _stream_pack_target(skeleton, profile, resolved, qname, grid, mode, k,
     prefix, packed_proj, grp = h
     projections = _packed_expert_projection_names(profile, packed_proj)
     n = _n_experts(grp, projections)
-    w = torch.stack([_expert_weight(skeleton, profile, prefix, packed_proj,
-                                    grp, e)
-                     for e in range(n)]).to(device)
-    if cb_render_identity is not None:
+    on_member = None
+    if cb_render_identity is not None and member_qnames is not None:
+        # A per-expert checkpoint's render identity is keyed PER EXPERT (the
+        # cost rows and the imatrix are too), so the stack is verified member
+        # by member as it is decoded. Hashing the concatenated stack instead
+        # would certify a name the recipe never priced.
+        from prismaquant.production_weight_cache import (
+            validate_cb_render_source_weight,
+        )
+
+        def on_member(proj, e, _base, decoded, _q=member_qnames):
+            member = _q[(proj, e)]
+            validate_cb_render_source_weight(
+                cb_render_identity,
+                member,
+                decoded,
+                where="export_nvfp4_cb_streaming expert stack member",
+            )
+            verified_source_qnames.add(member)
+
+    # Fill a PREALLOCATED device buffer one expert at a time. Building a list
+    # of E decoded experts, stacking it, then copying the stack to the device
+    # holds three copies of the whole stack at once — on DSv4-Flash that is
+    # 3 x 17.2 GB for a single `gate_up` group (256 x 4096 x 4096 fp32) and the
+    # box has ~23 GB free while the cost run holds the rest. One buffer plus
+    # one resident expert is the actual working set the module docstring
+    # claims.
+    first = _expert_weight(skeleton, profile, prefix, packed_proj, grp, 0,
+                           on_member=on_member)
+    w = torch.empty((n, *first.shape), dtype=first.dtype, device=device)
+    w[0] = first.to(device)
+    del first
+    for e in range(1, n):
+        chunk = _expert_weight(skeleton, profile, prefix, packed_proj, grp, e,
+                               on_member=on_member)
+        w[e] = chunk.to(device)
+        del chunk
+    if cb_render_identity is not None and member_qnames is None:
         from prismaquant.production_weight_cache import (
             validate_cb_render_source_weight,
         )
