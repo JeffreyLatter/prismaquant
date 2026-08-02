@@ -1,8 +1,9 @@
 # gridbook / NVFP4-CB — FINAL kernel & format standards
 
 Dated 2026-07-21 (Robert: "make a definitive determination about final kernel
-and format standards"). This page is the contract production runs build
-against. Changes to it require a served A/B, not a preference.
+and format standards"); runtime boundary updated 2026-08-01 for Gridbook
+0.5.0. This page is the contract production runs build against. Changes to it
+require a served A/B, not a preference.
 
 The separately versioned, exact-commit-pinned Gridbook runtime follows this
 contract. Dense and MoE fused-FP4 prefill are disabled unless their respective
@@ -54,6 +55,14 @@ operator evidence live only in the Gridbook repository and its packaged
 contract. Consult `docs/PLUGIN.md`, `docs/KERNELS.md`, and the dated audits from
 the exact commit in `prismaquant/gridbook_runtime/gridbook_runtime_pin.json`; this producer
 document intentionally carries no parallel dispatch table.
+
+For PrismaQuant 0.5.2 that pin is Gridbook 0.5.0 at exact commit
+`593f524e0a5d73b18e56d290a7b1355e66b2f9ce`. Every serving-reachable Gridbook
+operation is native CUDA/CUTLASS and is resolved and attested at model load.
+Gridbook has no Triton dependency, dispatch arm, or fallback; if an artifact,
+shape, ABI, or device lacks its required native operation, serving fails closed.
+This runtime-only advance does not change this producer's format/layout ABI,
+menu, or quality-promotion status, and it makes no DSV4 qualification claim.
 
 The producer-side decision needed here is fixed: both fused NVFP4 activation
 contracts remain explicit opt-ins and default OFF. The 2026-08-01 LFM
