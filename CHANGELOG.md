@@ -6,7 +6,7 @@ This release advances the immutable runtime boundary to Gridbook 0.6.0 at exact
 commit `ca0f0f562d3f398e094bfa5356a9ce3fa47472f1`, and lands the producer-side
 items **P5a**–**P5d** of the cross-repo performance ultraplan,
 [gridbook
-`docs/audits/ultraplan_perf_2026-08-01.md`](https://github.com/RobTand/gridbook/blob/main/docs/audits/ultraplan_perf_2026-08-01.md)
+`docs/audits/ultraplan_perf_2026-08-01.md`](https://github.com/RobTand/gridbook/blob/master/docs/audits/ultraplan_perf_2026-08-01.md)
 §6 ("Producer-side allocation: NVFP4 vs FP8-CB at matched bytes"), together with
 the producer half of gridbook **K0.2**.
 
@@ -71,7 +71,10 @@ paused.
   activation contract (`w8a8-dynamic-e4m3` vs `w4-bf16-bridge`), the fused
   mid-M rung set **as data keyed by the pinned Gridbook runtime version**, and
   the fallback route. Gridbook 0.5.0 backs FP8-CB fused mid-M for
-  K ∈ {28,32,36,40,44,48}; an undeclared runtime version backs nothing.
+  K ∈ {28,32,36,40,44,48}, and **Gridbook 0.6.0 — the version this release
+  pins — backs the same set** (`nvfp4_cb.json` declares both keys; 0.6.0's
+  K1.2 resolution proved `k % 4 == 0` is a format+TMA law, so the set is
+  complete rather than pending); an undeclared runtime version backs nothing.
 - Candidates carry the resolved route, and `selection.json` records which
   selected rungs ride a backed fused lane versus the expand+GEMM fallback —
   the producer-side mirror of gridbook K1.2, so neither repo can price an

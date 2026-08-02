@@ -56,6 +56,25 @@ contract. Consult `docs/PLUGIN.md`, `docs/KERNELS.md`, and the dated audits from
 the exact commit in `prismaquant/gridbook_runtime/gridbook_runtime_pin.json`; this producer
 document intentionally carries no parallel dispatch table.
 
+**One honest exception, and it is load-bearing.** The fused mid-M rung set
+below is a **hand-maintained mirror** of a Gridbook fact, not a derivation from
+the pinned package. Its machine-readable form is this producer's own
+`prismaquant/serving_profile_specs/nvfp4_cb.json`
+(`serving_lanes[].fused_mid_m.rungs_by_runtime_version`), parsed at
+`prismaquant/serving_profiles.py:460-489` and resolved against the pinned
+runtime version into the per-candidate `fused_mid_m_backed` /
+`fused_mid_m_rungs` the P5b router prices on; the prose here restates that data. The mirror exists because Gridbook's **packaged
+`runtime_contract.json` does not carry the fused rung set** — verified against
+the pinned commit `ca0f0f562d3f398e094bfa5356a9ce3fa47472f1`, whose contract
+declares `quant_method`, `packing`, `layout`, `formats` and
+`producer_profiles` and nothing about fused dispatch. So the only cross-repo
+check on this mirror is Gridbook's own tests over `gridbook/codec.py`
+(`FP8_FUSED_KBITS`, `cb_fused_kbits()`); PrismaQuant CI cannot catch it drifting,
+because `tests/test_gridbook_runtime_contract.py` compares rungs, layouts and
+`quant_method` against a contract that is silent on this axis. Treat any change
+to the rung set as a two-repo change, and re-read `codec.py` at the pinned
+commit before editing either the JSON or the paragraph below.
+
 For PrismaQuant 0.6.0 that pin is Gridbook 0.6.0 at exact commit
 `ca0f0f562d3f398e094bfa5356a9ce3fa47472f1`. Every serving-reachable Gridbook
 operation is native CUDA/CUTLASS and is resolved and attested at model load.
