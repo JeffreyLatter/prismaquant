@@ -24,6 +24,8 @@ from __future__ import annotations
 import hashlib
 import json
 from collections import defaultdict
+from collections.abc import Mapping
+from typing import Any
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -487,3 +489,73 @@ def synthesize_packed_expert_activation_samples(
         write_col_weights=False,
     )
     return samples
+
+
+def synthesize_unrouted_expert_col_weights(
+    probe_stats: Mapping[str, Mapping[str, Any]],
+    col_weights: dict[str, torch.Tensor],
+) -> dict[str, list[str]]:
+    """Give never-routed per-expert Linears a neutral-prior imatrix, IN PLACE.
+
+    Architectures that expose routed experts as PER-EXPERT ``nn.Linear``s
+    (DeepSeek-V4-Flash) build col-weights straight from the activation cache,
+    so an expert that received zero calibration tokens has no entry at all.
+    That is not a measurement the run can go and get: the expert is simply not
+    on the calibration distribution. It is also not optional to resolve, because
+    BOTH ends fail closed on it — ``measure_quant_cost`` refuses to price a CB
+    row without exact col-weights, and the exporter refuses to ship a CB target
+    without them ("no silent RTN"). The artifact cannot be built while the hole
+    exists.
+
+    The rule, stated once here rather than left to be an accident of missing
+    rows: an expert with ``n_tokens_seen == 0`` inherits the MEAN of that same
+    layer's routed experts' vectors for the same projection. This is exactly the
+    convention the packed path already ships for the same situation
+    (``_replay_down_proj_col_weights`` assigns ``out[~hit] = out[hit].mean(0)``
+    for partially-routed stacks), so per-expert and packed checkpoints are
+    treated alike.
+
+    It is honest for the same reason it is safe: a never-routed expert's
+    measured sensitivity is exactly zero (the probe records ``h_trace == 0.0``
+    and ``h_w2_sum == 0.0``), so the allocator will hand it the cheapest legal
+    rung and it consumes no budget it did not earn. The neutral prior decides
+    only HOW its bytes are rendered, never how many it gets.
+
+    Returns ``{"names": [...], "rule": ...}`` for the caller to stamp into
+    provenance — a synthesized entry must never be indistinguishable from a
+    measured one.
+    """
+    by_layer_proj: dict[tuple[str, str], list[str]] = {}
+    unrouted: list[str] = []
+    for qname, stat in probe_stats.items():
+        if ".mlp.experts." not in qname:
+            continue
+        head, _, proj = qname.rpartition(".")
+        layer = head.split(".mlp.experts.")[0]
+        if int(stat.get("n_tokens_seen", 0) or 0) > 0:
+            if qname in col_weights:
+                by_layer_proj.setdefault((layer, proj), []).append(qname)
+        else:
+            unrouted.append(qname)
+
+    added: list[str] = []
+    for qname in sorted(unrouted):
+        if qname in col_weights:
+            continue
+        head, _, proj = qname.rpartition(".")
+        layer = head.split(".mlp.experts.")[0]
+        donors = by_layer_proj.get((layer, proj)) or []
+        if not donors:
+            raise ValueError(
+                f"{qname}: no routed sibling expert in {layer} for projection "
+                f"{proj}; cannot form a neutral prior. The calibration reached "
+                f"none of this layer's experts — re-probe rather than invent a "
+                f"vector for an entire layer.")
+        stack = torch.stack([col_weights[d].to(torch.float32) for d in donors])
+        col_weights[qname] = stack.mean(dim=0)
+        added.append(qname)
+    return {
+        "names": added,
+        "rule": "unrouted_expert_neutral_prior:layer_routed_mean",
+        "basis": "probe n_tokens_seen == 0",
+    }

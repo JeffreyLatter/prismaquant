@@ -46,12 +46,15 @@
 #   allocator's own remedy text asks for.
 #
 # LADDER SCOPE — {K14, K15} only, plus FP8_CB_K36 for the 301 body Linears and
-#   BF16 as the identity-activation rung. The frozen decision is per-layer K14
-#   vs K15; measuring the whole fp4 ladder multiplies encode volume across 43
-#   layers x 256 experts x 3 projections for rungs no one can select. BF16 is
-#   in the menu on purpose: it is an identity-activation rung, which is the
-#   documented escape for any Linear whose activation-side cost cannot be
-#   measured (allocator_candidates build_candidates guard).
+#   BF16 for menu completeness. The frozen decision is per-layer K14 vs K15;
+#   measuring the whole fp4 ladder multiplies encode volume across 43 layers x
+#   256 experts x 3 projections for rungs no one can select.
+#   CORRECTION (verified 2026-08-02): BF16 CANNOT act as the identity-activation
+#   escape rung on this checkpoint. DSv4-Flash is FP8-source (manifest scan:
+#   33,393 fp8 / 238 bf16), and PASSTHROUGH_SOURCE_REQUIREMENTS masks BF16
+#   model-wide with `source_dtype_mismatch`. An uncovered Linear therefore gets
+#   ZERO candidates, not a BF16 fallback — which is why the unrouted-expert rule
+#   below is mandatory rather than a convenience.
 #
 # CB_LADDER_INTERP — left at 0, and it is INERT here regardless: _cb_ladder_split
 #   requires at least 4 rungs of one CB (family, mode) before it will anchor and
@@ -191,8 +194,9 @@ run_colw() {
     -e CB_COL_WEIGHTS="${WORK_DIR}/artifacts/cb_col_weights.pkl" \
     -e MODEL_PATH="${MODEL_PATH}" \
     -e COLW_LOG="${WORK_DIR}/logs/colw.log" \
+    -e PROBE_PKL="${WORK_DIR}/artifacts/probe.pkl" \
     --entrypoint bash "$IMAGE" -c '
-python3 - <<'PYEOF' 2>&1 | tee "$COLW_LOG"
+python3 - <<\PYEOF 2>&1 | tee "$COLW_LOG"
 import os, pickle, torch
 from pathlib import Path
 # Inlined from export_gguf.build_imatrix_from_act_cache: llama.cpp imatrix
@@ -211,8 +215,17 @@ for p in sorted(act.glob("*.pt")):
 if not cw:
     raise SystemExit(f"no activation cache under {act!r}")
 # synthesize_packed_expert_col_weights is a no-op on DSv4: it only fills
-# `<experts>.gate_up_proj`/`.down_proj` entries for PACKED 3-D stacks, and
-# DSv4-Flash exposes routed experts as per-expert nn.Linears.
+# packed 3-D stack entries, and DSv4-Flash exposes routed experts as per-expert
+# nn.Linears. Those need the declared unrouted-expert rule instead.
+import pickle as _p
+from prismaquant.moe_imatrix import synthesize_unrouted_expert_col_weights
+stats = _p.load(open(os.environ["PROBE_PKL"], "rb"))["stats"]
+report = synthesize_unrouted_expert_col_weights(stats, cw)
+n_syn = len(report["names"])
+print("neutral-prior entries for never-routed experts: "
+      + str(n_syn) + " (rule=" + report["rule"] + ", basis=" + report["basis"] + ")")
+import json as _j
+_j.dump(report, open(os.environ["CB_COL_WEIGHTS"] + ".provenance.json", "w"), indent=1)
 with open(out, "wb") as fh:
     pickle.dump(cw, fh)
 print(f"wrote {out}: {len(cw)} entries (33,325 = full CB coverage)")
