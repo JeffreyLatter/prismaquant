@@ -1582,6 +1582,67 @@ def _gguf_imatrix_enabled() -> bool:
 _CB_COST_FAMILIES = ("nvfp4_cb", "fp8_cb")
 
 
+UNROUTED_EXPERT_COST_SOURCE = "unrouted_expert_weight_only"
+
+
+def _load_unrouted_expert_declaration() -> frozenset[str]:
+    """Names allowed to receive a weight-only row, from the col-weights rule.
+
+    The set is the SAME provenance sidecar `synthesize_unrouted_expert_col_weights`
+    writes, so the two halves of the never-routed policy cannot drift: a name is
+    eligible here only because the col-weights harvest already recorded giving it
+    a neutral prior. Unset -> empty set -> the CB coverage gate behaves exactly
+    as before. This deliberately does NOT read the probe directly: the gate's
+    protection must narrow by a declared, counted class, never by a category
+    anyone can re-derive loosely at cost time.
+    """
+    import json
+    import os
+    path = os.environ.get("PRISMAQUANT_UNROUTED_EXPERT_PROVENANCE", "")
+    if not path:
+        return frozenset()
+    with open(path) as fh:
+        report = json.load(fh)
+    if report.get("rule") != "unrouted_expert_neutral_prior:layer_routed_mean":
+        raise ValueError(
+            f"{path}: unrecognized unrouted-expert rule "
+            f"{report.get('rule')!r}; refusing to widen the CB coverage gate "
+            f"on a declaration this build does not implement")
+    return frozenset(report.get("names") or ())
+
+
+def _emit_weight_only_rows(accum: dict, entries, specs, device, dtype) -> list[str]:
+    """Price `entries` in weight space only and stamp them as such."""
+    emitted: list[str] = []
+    for name, mod in entries:
+        W = mod.weight.detach().to(device=device, dtype=dtype)
+        cw = _cb_col_weights_lookup(name)
+        for spec in specs:
+            if spec.name in ("BF16", "FP8_SOURCE"):
+                _accumulate_result(accum, name, spec.name, 0.0, 0.0, 0.0)
+                continue
+            uses_imatrix = _cost_render_uses_imatrix(spec)
+            if uses_imatrix and cw is None:
+                raise ValueError(
+                    f"{name}: declared never-routed expert has no col_weights; "
+                    f"run the col-weights harvest with the unrouted rule first")
+            W_hat = _batched_quantize(
+                spec, W.unsqueeze(0),
+                col_weights=(cw.to(W.device).reshape(1, 1, -1)
+                             if uses_imatrix else None),
+            )[0]
+            wmse = float((W - W_hat).float().pow(2).mean().item())
+            # _finalize_results always writes output_mse, so the row carries
+            # output_mse=0.0 — the honest marker is output_mse_measured=False,
+            # which _has_measured_output_mse short-circuits on before ever
+            # reading the value. predicted_dloss stays absent so the allocator
+            # derives it from the probe's own (exactly zero) sensitivity.
+            _accumulate_result(accum, name, spec.name, wmse, 0.0, 0.0,
+                               output_mse_measured=False)
+        emitted.append(name)
+    return emitted
+
+
 def _cost_render_uses_imatrix(spec: fr.FormatSpec) -> bool:
     """Whether this spec's COST render is activation-imatrix-weighted, matching
     the family's exporter. gguf tracks the PRISMAQUANT_GGUF_IMATRIX toggle (its
@@ -1856,8 +1917,27 @@ def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
     def _load_chunk_acts(_names):
         return [act_cache.load_with_row_indices(n) for n in _names]
 
+    _unrouted_declared = _load_unrouted_expert_declaration()
+    _unrouted_emitted: list[str] = []
+
     for (in_f, out_f), entries in groups.items():
         entries_with_acts = [(n, m) for n, m in entries if n in act_cache]
+        # Declared never-routed experts (n_tokens_seen == 0) have no activation
+        # rows and never will: they are not on the calibration distribution.
+        # They still need a priced row or the allocator's CB-coverage gate
+        # refuses the whole table. Emit a WEIGHT-ONLY row — the render is the
+        # exact one the exporter ships (imatrix-weighted with the neutral-prior
+        # col-weights), the output side is honestly absent, and the row is
+        # stamped so P5a corrects it instead of reading it as an anomaly.
+        # Scope is exactly the declared set: a missing row for a ROUTED expert
+        # still hits the refusal.
+        _unrouted = [
+            (n, m) for n, m in entries
+            if n not in act_cache and n in _unrouted_declared
+        ]
+        if _unrouted:
+            _unrouted_emitted.extend(
+                _emit_weight_only_rows(accum, _unrouted, specs, device, dtype))
         if not entries_with_acts:
             continue
 
@@ -2147,6 +2227,22 @@ def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
               f"between-draw noise datum to derive from)", flush=True)
     results = _finalize_results(accum)
     _extrapolate_expert_costs(results, expert_extrapolate)
+    if _unrouted_emitted:
+        # Stamp per row, not just in aggregate: a weight-only row must announce
+        # itself to every consumer that reads it, including P5a's correction
+        # pass, which exists precisely for this row class.
+        for _n in _unrouted_emitted:
+            for _fmt, _fe in results.get(_n, {}).items():
+                # Passthrough rows are structurally zero and stay bit-exact: an
+                # explicit cost_source would make cost_entry_is_bit_exact return
+                # False and the row would read as BRANCH_MEASURED, claiming a
+                # measurement it never had.
+                if isinstance(_fe, dict) and _fmt not in ("BF16", "FP8_SOURCE"):
+                    _fe["cost_source"] = UNROUTED_EXPERT_COST_SOURCE
+        print(f"[cost] weight-only rows for {len(_unrouted_emitted)} declared "
+              f"never-routed experts (cost_source="
+              f"{UNROUTED_EXPERT_COST_SOURCE}); output_mse_measured=False",
+              flush=True)
     return results
 
 

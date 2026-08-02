@@ -236,6 +236,7 @@ run_cost() {
   echo "[dsv4] cost: exact per-(Linear, rung) over ${FORMATS}"
   docker run -d --name pq-dsv4-cost "${DOCKER_COMMON[@]}" \
     -e PRISMAQUANT_CB_COL_WEIGHTS="${WORK_DIR}/artifacts/cb_col_weights.pkl" \
+    -e PRISMAQUANT_UNROUTED_EXPERT_PROVENANCE="${WORK_DIR}/artifacts/cb_col_weights.pkl.provenance.json" \
     --entrypoint bash "$IMAGE" -c "
 python3 -m prismaquant.incremental_measure_quant_cost \
   --model ${MODEL_PATH} \
