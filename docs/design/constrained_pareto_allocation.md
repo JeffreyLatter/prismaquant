@@ -82,7 +82,7 @@ Schema `prismaquant.serve_dispatch_table.v1`. Torch-free, stdlib only.
   standalone kernel timing is never served evidence."
 
 The `lane` axis is what P5b made answerable. `FP8_CB_K36` and `FP8_CB_K37` are
-the same format family and the same bpw class; Gridbook 0.6.0 instantiates the
+the same format family and the same bpw class; Gridbook 0.7.0 instantiates the
 fused mid-M kernel for one and not the other, permanently (K1.2 resolved to a
 `k % 4 == 0` format+TMA law). They must not be priced identically, and here
 they are not.

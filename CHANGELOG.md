@@ -1,5 +1,139 @@
 # Changelog
 
+## 0.7.0 — 2026-08-02
+
+This release advances the immutable runtime boundary to Gridbook 0.7.0 at exact
+commit `746473c8459acd24c71e7602d1c982da2f8fa80e`, and carries the
+DeepSeek-V4-Flash-0731 92 GB pipeline work, the cross-repository K0.2
+stage-attestation interop test, and a verified docs-truth batch.
+
+MINOR, not patch: the cost stage prices packed experts differently (per-Linear
+activation rows, declared never-routed experts) and the CB encoder was rewritten
+for speed, so a production run's numbers and provenance move even though the
+producer ABI, format menu, allocation and export defaults, and
+quality-promotion status are unchanged. This release makes no DeepSeek-V4
+(DSV4) qualification or support claim; the DSv4 CB export lane remains
+unbuilt (`docs/lanes/nvfp4-cb/dsv4_readiness.md`) and that work stays paused.
+
+### The DSv4-Flash-0731 92 GB pipeline (merged from `dsv4/flash-0731-92gb`)
+
+- Ported the 2026-08-01 92 GB study work onto the 0.6.0 line: the Stage-0
+  format screen (`scripts/ab_nvfp4_vs_k36_dense.py`) now loads through
+  `_LazySkeleton.dequant_weight` — the same profile-aware decoder the CB cost
+  stage and the exporter use — instead of reading raw safetensors bytes, which
+  compared *storage codes* against values for a checkpoint that ships packed
+  I8-MXFP4 experts and F8_E4M3 dense tensors. It hard-fails on an unscaled
+  float8 tensor rather than silently mis-measuring, resolves its checkout from
+  `__file__` instead of a hard-coded `sys.path.insert`, and indexes through
+  `detect_profile().checkpoint_to_live_name` so profile-rewritten names
+  resolve. Pinned by `tests/test_format_choice_stage0_source.py`.
+- Added the production calibration driver `scripts/run_dsv4_flash_92gb.sh`,
+  runnable against the `gridbook:test` image, plus the exclusive-GPU
+  old-vs-new validation harness (`tools/cb_encode_exclusive_bench.sh` and the
+  `tools/cb_encode_*` / `tools/cost_*` probes behind it). The harness refuses
+  to benchmark a contended GPU, stops orphaning driver containers, and
+  distinguishes "no output" from "different output" rather than scoring a
+  silent failure as a pass.
+- **Cost-stage correctness.** Every Linear is now measured on its own
+  activation rows and fails loud instead of borrowing a sibling's; declared
+  never-routed routed experts get weight-only cost rows (Option A) under the
+  new never-routed rule; and the CB cost encode is ~2x faster
+  **bit-identically**, pinned by
+  `tests/test_nvfp4_cb_encode_perf_identity.py` and the v1-vs-v2 K14-excess
+  rank-stability cross-check.
+- Corrected the DeepSeek-V4-Flash parameter count: **~285 B total** by
+  checkpoint arithmetic (281,263,734,784 probe-measured quantizable
+  parameters), not the 671 B DeepSeek-V3-family headline; and the 172 GB
+  "below the floor" figure is the Pareto grid, not a fixture. The three
+  dsv4-branch cost-stage flags are documented in
+  `docs/design/runtime_flags.md`.
+
+### K0.2 stage attestation executed across the repository boundary
+
+- `tests/test_gridbook_attestation_interop.py` is the first place one process
+  runs **both** halves of the producer/consumer stage attestation. It builds a
+  routed-MoE record through the real emitter — a synthetic two-stage FusedMoE
+  checkpoint through `synthesize_packed_expert_activation_samples`,
+  `calibrated_input_global_scales_with_sources` and `build_execution_contract`
+  — then parses it with Gridbook's own v2 parser and verifies it
+  `attested_and_verified`, including the artifact-level K0.2 verdict read off a
+  tmp `quant_config.json` + `model.safetensors` exactly as
+  `k02_readiness_verdict` reads a real artifact.
+- It closes a real trap rather than adding tidiness. The attestation was held
+  together by 4 pinned digest hexes, 3 schema literals, and a Gridbook-side
+  fixture that hand-mirrors this emitter; neither suite ever executed the
+  other's code. Gridbook's parser requires a stage entry to declare *exactly*
+  `_STAGE_ENTRY_FIELDS` (extra keys rejected), while every digest is framed
+  over those same five fields **by name** — so an "additive, backwards-
+  compatible" producer-side field moves no hex on either side, leaves every
+  pinned-hex test green, and first surfaces at vLLM model load. The new tests
+  demonstrate that mutation end to end and name the exact load-time error.
+- Wired into the required `pinned Gridbook contract` CI job's file list, which
+  already installs the exact VCS pin. Skip semantics match the three tests
+  already there: gated on `PRISMAQUANT_REQUIRE_GRIDBOOK_CONTRACT` with
+  `importorskip` behind it.
+
+### Docs-truth batch
+
+- Fixed eight verified defects from a corpus review — docs and one provenance
+  data file, no code and no behaviour change. The load-bearing ones: §9.2's
+  claim that the constrained Pareto formulation was "normative future work"
+  had been false since P5c shipped; `docs/design/runtime_flags.md` carried 13
+  ghost env vars left standing by the 2026-07-30 L2/L3 wall (retired into a new
+  §9.1 ledger recording each token's last reader, rather than silently
+  deleted); and 18 `file.py:NNN` citations in `docs/` pointed past EOF, 14 of
+  them citing `kl_measurement.py` lines 2054-5516 against a 1,246-line file.
+  Citations inside dated audit records were **annotated in place** per the D21
+  ledger convention rather than rewritten.
+- `docs/lanes/nvfp4-cb/STANDARDS.md` now states that its FP8-CB fused rung set
+  is a hand-maintained mirror whose machine-readable form is this producer's
+  own `nvfp4_cb.json`, and that PrismaQuant CI *cannot* catch it drifting,
+  because Gridbook's packaged `runtime_contract.json` does not carry the fused
+  rung set at all.
+- The example serve-dispatch table's `provenance.source` strings were
+  normalized to byte-match the Gridbook headings they cite (U+00D7 and U+2014
+  had been ASCII stand-ins), so a `grep` against the source now resolves them.
+  No claim changed — only the citations became resolvable.
+
+### Gridbook runtime pin advanced to 0.7.0
+
+- `prismaquant/gridbook_runtime/gridbook_runtime_pin.json` now names Gridbook
+  **0.7.0** at exact commit `746473c8459acd24c71e7602d1c982da2f8fa80e` — the
+  peeled `refs/tags/v0.7.0^{}` commit, not the annotated tag object
+  (`c23393750fc53d0463892571a8854457a091ea0c`).
+- **The producer/runtime lane gate is now directional.** Gridbook 0.7.0's D0.1
+  registers `deepseek_v4` in the packaged `runtime_contract.json`, so for the
+  first time the runtime *leads* this producer on an architecture: it declares
+  it can serve DSV4, while the DSV4 CB export lane remains unlanded here
+  (`docs/lanes/nvfp4-cb/dsv4_readiness.md` gaps 1-3 — the exporter still loads
+  the whole model in `_load_skeleton`, has no fp8-block dequant-on-read, and
+  does no per-expert to packed-expert stacking). The required contract job had
+  asserted strict set EQUALITY between declared CB lanes and the runtime's
+  `producer_profiles.supported_ids`, which made the intended landing order —
+  serving contract first, exporter second — unrepresentable. It now asserts
+  CONTAINMENT (`declared ⊆ supported`). The dangerous direction is unchanged
+  and still fails closed: declaring a lane the runtime cannot serve does not
+  crash, it ships an artifact that serves uninitialised memory, so a new
+  negative-control test fabricates exactly that case and requires the check to
+  fail and name the architecture. PrismaQuant makes no DSV4 export or
+  qualification claim on the strength of the runtime's registration.
+- The `nvfp4_cb` serving profile's FP8-CB fused mid-M lane now declares
+  `"0.7.0": [28, 32, 36, 40, 44, 48]` — the SAME set as 0.5.0 and 0.6.0, and
+  added as a NEW version key rather than by editing an existing one. An
+  artifact produced under an older pin therefore stays resolvable at the route
+  it actually shipped on, and a pin with no key here still backs nothing
+  (fail-closed).
+- The set did not move because it **cannot**: 0.6.0's K1.2 resolution proved
+  `k % 4 == 0` is a format + TMA law, and `FP8_FUSED_KBITS` is still
+  `range(28, 49, 4)` at 0.7.0. The five off-law rungs of the published 27B
+  K36..K47 ladder stay permanently expand+GEMM-served and the allocator keeps
+  pricing them on the fallback row.
+- **No FP4-CB backed set was added.** Gridbook 0.7.0's contract-preserving
+  FP4-CB v2 fused mid-M kernel is *still* opt-in behind
+  `PRISMAQUANT_CB_FP4_FUSED_MIDM=1`, pending its served NATIVE-PARITY gate;
+  with the flag unset the dispatch is byte-for-byte the BF16 bridge. Available
+  is not backed, so the honest backed set for the DEFAULT contract stays empty.
+
 ## 0.6.0 — 2026-08-02
 
 This release advances the immutable runtime boundary to Gridbook 0.6.0 at exact
