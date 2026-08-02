@@ -115,10 +115,12 @@ from .allocator_candidates import (
     aggregate_fused_siblings,
     aggregate_packed_serving_groups,
     build_candidates,
+    calibrate_activation_fair_pricing,
     check_stats_format_applicability,
     expand_fused_sibling_assignment,
     expand_packed_group_assignment,
     packed_role_split_profile,
+    selection_serving_lane_provenance,
     serialized_candidate_payload,
     summarize_applicability_masks,
 )
@@ -146,7 +148,11 @@ from .serving_profiles import (
     check_serving_format,
     require_per_role_expert_scheme_support,
     resolve_target_profile,
+    serving_lane_catalog,
     serving_profile_names,
+)
+from .cb_ladder_cross_family import (
+    cross_family_verdict_from_cost_payload,
 )
 from .decision_units import block_id_from_qname
 from .layer_config import LAYER_CONFIG_META_KEY
@@ -2322,6 +2328,56 @@ def main():
             "with complete production col_weights or remove the CB rung."
         )
 
+    # ---- Activation-fair pricing (ultraplan P5a) ----
+    # ONE per-family calibration for the whole run, fit before any candidate
+    # is built so the body, MTP and visual menus cannot end up on three
+    # different scales. See activation_fair_pricing for the functional form,
+    # the fail-closed policy, and the PRISMAQUANT_ACTIVATION_FAIR_PRICING
+    # kill switch (this call raises AssertionError on a mixed scale).
+    activation_pricing = calibrate_activation_fair_pricing(
+        stats, costs, specs_sorted)
+    if activation_pricing.enabled:
+        print(
+            "[alloc] activation-fair pricing: "
+            + ", ".join(
+                f"{family} x{fit.penalty:.4g} (n={fit.n_rows}, "
+                f"log2 sd={fit.log2_stdev:.3f}, rung-dep "
+                f"{fit.rung_dependence_log2_range:.3f})"
+                for family, fit in sorted(activation_pricing.families.items())
+            ),
+            flush=True,
+        )
+    else:
+        print(
+            "[alloc] activation-fair pricing DISABLED "
+            f"({activation_pricing.reason}): weight-only-priced rows keep "
+            "their pre-P5a prices, so any W4A4-vs-W8A8 comparison drawn "
+            "from this run is NOT activation-fair "
+            f"(weight_only rows by family: "
+            f"{dict(sorted(activation_pricing.weight_only_rows_by_family.items()))})",
+            flush=True,
+        )
+
+    # ---- Cross-family CB-ladder symmetry verdict (ultraplan P5a item 2) ----
+    # Computed by the cost stage on its own held-out units; the allocator
+    # republishes it so a consumer reading only the allocation artifacts can
+    # see whether this run's ladder fits support a cross-family (NVFP4-CB vs
+    # FP8-CB) claim at all. A failure is surfaced, never fatal: the
+    # allocation is still solvable, only the cross-family verdict is not
+    # publishable.
+    cross_family_verdict = cross_family_verdict_from_cost_payload(cost_data)
+    if cross_family_verdict is not None:
+        line = (
+            "[alloc] CB ladder cross-family symmetry: "
+            f"{str(cross_family_verdict.get('verdict', '?')).upper()} — "
+            f"{cross_family_verdict.get('detail', '')}"
+        )
+        if not cross_family_verdict.get(
+                "cross_family_comparison_publishable", False):
+            print(f"[alloc] WARNING: {line[8:]}", flush=True)
+        else:
+            print(line, flush=True)
+
     candidate_mask_records: list[dict] = []
     candidates = build_candidates(
         stats, costs, specs_sorted, calibrated_gains,
@@ -2329,6 +2385,7 @@ def main():
         target_profile=target_profile,
         mask_records=candidate_mask_records,
         cb_serialization_context=cb_serialization_context,
+        activation_pricing=activation_pricing,
     )
     print(f"[alloc] candidates built for {len(candidates)} Linears")
 
@@ -2367,6 +2424,7 @@ def main():
             target_profile=target_profile,
             mask_records=candidate_mask_records,
             cb_serialization_context=cb_serialization_context,
+            activation_pricing=activation_pricing,
         )
         missing_mtp_candidates = [
             name for name in mtp_names
@@ -2438,6 +2496,7 @@ def main():
                 target_profile=target_profile,
                 mask_records=candidate_mask_records,
                 cb_serialization_context=cb_serialization_context,
+                activation_pricing=activation_pricing,
             )
             visual_aux_candidates = {
                 name: cand for name in visual_cost_names
@@ -2625,7 +2684,8 @@ def main():
     if not args.no_packed_aggregation:
         stats, costs, candidates = aggregate_packed_serving_groups(
             stats, costs, specs_sorted, candidates, profile=model_profile,
-            calibrated_gains=calibrated_gains)
+            calibrated_gains=calibrated_gains,
+            activation_pricing=activation_pricing)
         packed_groups = sum(
             1 for n in candidates if _PACKED_GROUP_MARKER in n)
         packed_member_rows = sum(
@@ -2646,7 +2706,8 @@ def main():
     if not args.no_fused_aggregation:
         stats, costs, candidates = aggregate_fused_siblings(
             stats, costs, specs_sorted, candidates, profile=model_profile,
-            calibrated_gains=calibrated_gains)
+            calibrated_gains=calibrated_gains,
+            activation_pricing=activation_pricing)
         sib_groups = sum(1 for n in candidates if _FUSED_SIBLING_MARKER in n)
         print(f"[alloc] fused-sibling aggregation: {sib_groups} groups "
               f"(qkv_proj / gate_up_proj / ...)")
@@ -2700,6 +2761,12 @@ def main():
             "predicted_dloss": fixed_total_dloss,
             "budget_scope": "auxiliary_excluded_from_body_budget",
         },
+        # Ultraplan P5a/P5b: how every candidate's activation contract was
+        # priced, whether this run's per-family ladder fits are
+        # cross-comparable, and the concrete serving route each format rides.
+        "activation_fair_pricing": activation_pricing.as_dict(),
+        "cb_ladder_cross_family_verdict": cross_family_verdict,
+        "serving_lanes": serving_lane_catalog(target_profile),
         **summarize_applicability_masks(candidate_mask_records),
     }
     applicability_report_path.write_text(
@@ -3818,6 +3885,15 @@ def main():
                 max_bytes_pick is not None
                 and max_bytes_pick["target_bits"] == grid_pick["target_bits"]),
             "whole_artifact_budget": selected_whole_artifact_budget_stamp,
+            # Ultraplan P5a/P5b provenance for the SHIPPED assignment: how
+            # each selected unit's activation cost was priced, whether this
+            # run's per-family ladder fits are cross-comparable, and which
+            # selected rungs ride a backed fused mid-M lane vs the
+            # expand+GEMM fallback.
+            "activation_fair_pricing": activation_pricing.as_dict(),
+            "cb_ladder_cross_family_verdict": cross_family_verdict,
+            "serving_lane_provenance": selection_serving_lane_provenance(
+                chosen_info["assignment"], candidates, target_profile),
         })
         sel_path.write_text(json.dumps(selection, indent=2, sort_keys=True) + "\n")
         print(

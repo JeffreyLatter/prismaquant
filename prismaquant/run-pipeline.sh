@@ -540,6 +540,22 @@ fi
 : "${CB_EXPERT_SAMPLE:=0}"
 : "${CB_LADDER_INTERP:=0}"
 : "${CB_COL_WEIGHTS:=${WORK_DIR}/artifacts/cb_col_weights.pkl}"
+# Activation-fair pricing (ultraplan P5a; gridbook
+# docs/audits/ultraplan_perf_2026-08-01.md §6). The allocator's cost
+# precedence prices the W4A4-vs-W8A8 activation contract ONLY on the measured
+# output_mse branch, and the two levers above are exactly what removes that
+# branch from most rows of a production run: CB_EXPERT_SAMPLE /
+# PRISMAQUANT_EXPERT_COST_SAMPLE make measure_quant_cost stamp
+# output_mse_measured=False on every packed-expert row, and CB_LADDER_INTERP=1
+# fills interpolated rungs weight-only. On those rows NVFP4-CB is credited
+# with its cheaper index stream and charged none of its A-side cost. The
+# allocator now calibrates one per-format-family correction per run from the
+# measured rows that DO exist and applies it to the weight-only ones.
+# 1 (default) = calibrate wherever the inputs exist; 0 = reproduce a pre-0.5.3
+# artifact's pricing bit-for-bit. It is NOT a knob to tune — the run refuses
+# outright rather than hand the DP a half-corrected (mixed-scale) menu.
+: "${ACTIVATION_FAIR_PRICING:=1}"
+export PRISMAQUANT_ACTIVATION_FAIR_PRICING="${ACTIVATION_FAIR_PRICING}"
 
 PROBE_PATH="${WORK_DIR}/artifacts/probe.pkl"
 case "$COST_MODE" in
@@ -775,6 +791,7 @@ STAGE_SETTINGS_ENV=(
   "CB_EXPERT_SEQLEN=$CB_EXPERT_SEQLEN"
   "CB_EXPERT_SAMPLE=$CB_EXPERT_SAMPLE"
   "CB_LADDER_INTERP=$CB_LADDER_INTERP"
+  "ACTIVATION_FAIR_PRICING=$ACTIVATION_FAIR_PRICING"
   "CB_SCALE_CODING=${CB_SCALE_CODING:-}"
   "CB_CODEBOOK_SOURCE=${CB_CODEBOOK_SOURCE:-}"
   "CB_SCALE_SWEEP=${CB_SCALE_SWEEP:-}"

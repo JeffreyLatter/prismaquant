@@ -50,6 +50,10 @@ from prismaquant.cb_layout import (
     parse_format_name,
     subtable_bit_widths,
 )
+from prismaquant.cb_ladder_cross_family import (
+    PROVENANCE_KEY as CROSS_FAMILY_PROVENANCE_KEY,
+)
+from prismaquant.cb_ladder_cross_family import verdict_from_unit_kls
 from prismaquant.emu_forward_kl import _qdq_accepts_col_weights
 from prismaquant.nvfp4_cb_footprint import (
     cb_cost_provenance,
@@ -427,6 +431,47 @@ def _cb_ladder_split(measured_fmts: Sequence[str]):
     return ladders or None
 
 
+def _ladder_family_prefix(kmap: Mapping[str, int]) -> str:
+    """The CB family prefix a ladder's kmap belongs to.
+
+    ``_cb_ladder_split`` already buckets by ``family.prefix``, so every key of
+    one kmap shares a family; recovering it here keeps the splitter's 4-tuple
+    shape (both cost chains and their tests unpack it) while letting the
+    cross-family check know WHICH curve each residual came from.
+    """
+    for name in sorted(kmap):
+        parsed = parse_format_name(name)
+        if parsed is not None:
+            return str(parsed[0].prefix)
+    return ""
+
+
+def _cb_ladder_signed_residual(kmap: Mapping[str, int],
+                               anchors: Sequence[str],
+                               values: Mapping[str, float],
+                               holdout: str) -> float | None:
+    """Signed relative holdout residual ``(predicted - measured)/|measured|``.
+
+    ``_cb_ladder_gate`` keeps only the magnitude, which is the right input to
+    a per-unit accept/reject. The cross-family symmetry check needs the SIGN:
+    two families can miss by the same amount in opposite directions, and that
+    is precisely the biased-estimator state the audit's gate exists to catch
+    (``cb_ladder_cross_family``). Refits the same shared law, so the two
+    numbers cannot disagree about which law produced them.
+    """
+    law = _cb_ladder_law(kmap, anchors, values)
+    if law is None:
+        return None
+    try:
+        meas = float(values[holdout])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not math.isfinite(meas) or meas == 0.0:
+        return None
+    resid = (law.predict(holdout) - meas) / abs(meas)
+    return resid if math.isfinite(resid) else None
+
+
 def _fit_floor_law(ks: Sequence[float], ds: Sequence[float]):
     """Solve D(k) = F + C * 2^(-b*k) exactly through three (k, D) anchors
     (unequal spacing; bisection on b). The floor term matters for the FP8_CB
@@ -737,6 +782,10 @@ def measure_expert_unit_costs(
     stats: dict = {}
     costs: dict = {}
     unit_kls: dict = {}
+    # Cleared up front so a caller cannot read a PREVIOUS call's cross-family
+    # verdict off this function after an early return (no units / no measured
+    # formats) — a stale symmetry certificate is worse than none.
+    measure_expert_unit_costs.last_cross_family_verdict = None
     if not units or not measured_fmts:
         return stats, costs, unit_kls
 
@@ -815,6 +864,14 @@ def measure_expert_unit_costs(
                    if fmt not in predicted_all}
             ladder_meta_all = []
             for kmap, anchors, holdout, predicted in ladder:
+                # Recorded for EVERY ladder, accepted or not: the family the
+                # curve belongs to and the SIGNED holdout residual. Both are
+                # inputs to the cross-family symmetry gate (ultraplan P5a
+                # item 2, cb_ladder_cross_family) — a per-family accept rate
+                # alone cannot tell a symmetric miss from a biased one.
+                family = _ladder_family_prefix(kmap)
+                signed = _cb_ladder_signed_residual(
+                    kmap, anchors, kls, holdout)
                 pred_kls, rel, tol_used = _cb_ladder_fit(
                     kls, kmap, anchors, holdout, predicted, ladder_tol,
                     kl_windows)
@@ -827,13 +884,20 @@ def measure_expert_unit_costs(
                              f"{tol_used:.1%} — measuring {predicted}")
                     kls.update({fmt: kl_of(fmt) for fmt in predicted})
                     ladder_meta_all.append(
-                        {"accepted": False, "holdout_rel_err": round(rel, 4),
+                        {"accepted": False, "family": family,
+                         "holdout": holdout,
+                         "holdout_rel_err": round(rel, 4),
+                         "holdout_signed_rel_resid": (
+                             round(signed, 6) if signed is not None else None),
                          "holdout_tol": round(tol_used, 4),
                          "anchors": anchors})
                 else:
                     ladder_accept += 1
                     ladder_meta_all.append({
-                        "accepted": True, "holdout_rel_err": round(rel, 4),
+                        "accepted": True, "family": family,
+                        "holdout_rel_err": round(rel, 4),
+                        "holdout_signed_rel_resid": (
+                            round(signed, 6) if signed is not None else None),
                         "holdout_tol": round(tol_used, 4),
                         "anchors": anchors, "holdout": holdout,
                         "predicted": predicted,
@@ -897,6 +961,16 @@ def measure_expert_unit_costs(
              f"rejected -> measured (tolerance derived per unit from the "
              f"between-window noise of the measured rungs; "
              f"{ladder_tol:.0%} where that datum is degenerate)")
+        # Cross-family symmetry gate (ultraplan P5a item 2). A failure does
+        # not abort the run — it says the CROSS-FAMILY verdict this run's
+        # ladder fits could support is not publishable — but it must be loud
+        # here and travel into the artifact provenance.
+        verdict = verdict_from_unit_kls(unit_kls)
+        _log(f"CB ladder cross-family symmetry: {verdict['verdict'].upper()} "
+             f"— {verdict['detail']}")
+        measure_expert_unit_costs.last_cross_family_verdict = verdict
+    else:
+        measure_expert_unit_costs.last_cross_family_verdict = None
     return stats, costs, unit_kls
 
 
@@ -1178,6 +1252,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         "expert_sample": int(args.expert_sample),
         "max_units": int(args.max_units),
         "unit_filter": args.unit_filter,
+        # Cross-family ladder symmetry (ultraplan P5a item 2). None when no
+        # ladder ran; the allocator reads it back through
+        # cb_ladder_cross_family.cross_family_verdict_from_cost_payload and
+        # republishes it in its own diagnostics/selection provenance.
+        CROSS_FAMILY_PROVENANCE_KEY: getattr(
+            measure_expert_unit_costs, "last_cross_family_verdict", None),
         **cb_cost_provenance(formats),
     }
 
