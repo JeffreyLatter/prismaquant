@@ -13,8 +13,10 @@ one. That is the quantity the knapsack trades against bytes.
 
 Emits, per layer: Spearman rho and Kendall tau between the v1 and v2 orderings,
 the top-k set overlap (the Linears that actually get promoted), and the count of
-Linears whose n_activation_rows was 1 in v1 (i.e. how much of the layer was
-being decided on a single token).
+Linears whose n_activation_rows is 1 in V2 (v1 pickles lack the field). NOTE
+this UNDERCOUNTS v1's single-row damage: v1 truncated every chunk member to the
+CHUNK minimum, so a Linear with 64 own rows was still measured on 1 row whenever
+a chunk-mate had 1 — the v2 count only reflects genuinely sparse experts.
 """
 from __future__ import annotations
 
@@ -107,7 +109,7 @@ def main():
 
     report = {}
     print(f"{'layer':>5s} {'n':>5s} {'spearman':>9s} {'kendall':>8s} "
-          f"{'top%d_overlap' % args.topk:>13s} {'v1_1row':>8s}")
+          f"{'top%d_overlap' % args.topk:>13s} {'v2_1row':>8s}")
     for layer in sorted(by_layer):
         names = by_layer[layer]
         pairs = []

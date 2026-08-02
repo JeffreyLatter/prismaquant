@@ -3,10 +3,15 @@
 # run_dsv4_flash_92gb.sh — DeepSeek-V4-Flash-0731 production calibration for
 #                          the 92 decimal GB CB artifact
 # ============================================================================
-# Freezes the eight K14 routed-expert layers that the 2026-08-01 study could
-# only pick provisionally. The study's allocation is 35 expert layers at
-# NVFP4_CB_K15, eight at NVFP4_CB_K14 (provisionally 23,24,25,27,28,31,32,33 —
-# the eight lowest aggregate h_w2_sum in a lightweight probe), and 301 ordinary
+# Produces the production K14/K15 boundary decision the 2026-08-01 study could
+# only make provisionally. The study's REFERENCE allocation was 35 expert layers
+# at NVFP4_CB_K15, eight at NVFP4_CB_K14 (provisionally 23,24,25,27,28,31,32,33
+# from a 35.8%-coverage probe), and 301 ordinary body Linears at FP8_CB_K36 —
+# but the alloc stage below is NOT constrained to that split: the DP decides all
+# 344 serving units under the exact 92 GB byte budget, may move layers between
+# K14/K15 and body units onto fp4 rungs, and its selection.json is the verdict.
+# A selection that deviates from the study's 35/8 split is a RESULT, not a bug
+# (see the alloc-stage comment below). The study's split is 35 K15 + 8 K14 + 301
 # body Linears at FP8_CB_K36. Study record: docs/ARCHITECTURE.md §9.2 and
 # /home/rob/dq-runs/dsv4-flash-0731/README.md.
 #
@@ -30,7 +35,7 @@
 # measure_quant_cost.py:124 raises "measured CB rows are missing exact
 # col_weights" — which is exactly what killed screen-1x128/cost-k14-k15/
 # (it left only an empty work-dir skeleton, dead ~3 s after creation).
-# Unsampled, the inactive experts get no row at all and allocator.py:2422
+# Unsampled, the inactive experts get no row at all and allocator.py:2427 (guard at :2422)
 # refuses instead: "production CB cost coverage is incomplete ... missing/error
 # rows cannot be silently pruned from the menu". The fix is more calibration
 # tokens, then a re-harvest, then the cost stage.
