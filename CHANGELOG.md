@@ -1,5 +1,72 @@
 # Changelog
 
+## Unreleased
+
+Producer-side items **P5a** and **P5b** of the cross-repo performance
+ultraplan, [gridbook
+`docs/audits/ultraplan_perf_2026-08-01.md`](https://github.com/RobTand/gridbook/blob/main/docs/audits/ultraplan_perf_2026-08-01.md)
+§6 ("Producer-side allocation: NVFP4 vs FP8-CB at matched bytes"). These
+change how candidates are **priced and described**, not what the solver
+optimizes: `solve_allocation`'s DP semantics are untouched, and no latency
+term enters the objective or the constraints (that is P5c, still
+unimplemented — see `docs/lanes/nvfp4-cb/format-speed-policy.md` §1).
+
+### Activation-fair pricing on the weight-only cost branches (P5a)
+
+- Fixed the audit's first cost-model asymmetry: W4A4-vs-W8A8 activation cost
+  was priced **only** on the measured `output_mse` branch, so packed experts
+  under `PRISMAQUANT_EXPERT_COST_SAMPLE` and ladder-interpolated rungs under
+  `PRISMAQUANT_CB_LADDER_INTERP` — most rows of a production run — were
+  priced weight-only, crediting NVFP4-CB with its cheaper index stream and
+  none of its A-side cost. The allocator now calibrates one per-format-family
+  correction per run (geometric mean of the measured-over-weight-only Δloss
+  ratio, over the rows that carry both estimators) and applies it to that
+  family's weight-only-priced rows.
+- The correction is multiplicative, so it cannot reorder rungs within a
+  family (the holdout-gated ladder shape is untouched) and cannot lift an
+  exactly-0.0 price off the DP's global minimum — the existing
+  `activation_cost_unmeasured` candidate removal keeps full strength.
+- Fail-closed: a run that would hand the DP a **mixed** scale (one family
+  calibrated, another still uncorrected) refuses by name. A run with no
+  measured activation rows anywhere corrects nothing, prints the verdict, and
+  stamps it — no currently-legal run becomes illegal.
+- Added `PRISMAQUANT_ACTIVATION_FAIR_PRICING` (default on; `0` reproduces
+  prior pricing bit-for-bit), wired as the pipeline knob
+  `ACTIVATION_FAIR_PRICING` and documented in `docs/design/runtime_flags.md`.
+- Every candidate now records which estimator priced its activation contract,
+  and the fit — sample, digest, residual band, per-rung dependence — is
+  stamped into `format_applicability.json` and `selection.json`.
+
+### Cross-family CB-ladder symmetry verdict (P5a)
+
+- Fixed the audit's second asymmetry: the per-family RD-law ladders were never
+  cross-calibrated. The expert cost stage now records each ladder's family and
+  its **signed** holdout residual, and computes a family-symmetry verdict over
+  held-out units with a tolerance derived the way `_cb_ladder_holdout_tol`
+  derives its own — the sampling noise of the difference, floored at each
+  family's declared resolution. No taste constant.
+- A failure does not abort: it publishes
+  `cross_family_comparison_publishable: false` with the numbers into the cost
+  provenance, and the allocator republishes it in its diagnostics and
+  selection provenance.
+
+### Gridbook serving eligibility as candidate metadata (P5b)
+
+- Fixed the audit's third asymmetry: the producer modelled exactly one
+  gridbook kernel gate (`in_features % 256`). The `nvfp4_cb` serving profile
+  now also declares the N-dimension load gates — `out_features % 8` for the
+  fp4-CB families, `out_features % 16` for fp8-CB — per grid from the
+  `cb_layout` family table.
+- Added a declarative `serving_lanes` block: per CB format family, the served
+  activation contract (`w8a8-dynamic-e4m3` vs `w4-bf16-bridge`), the fused
+  mid-M rung set **as data keyed by the pinned Gridbook runtime version**, and
+  the fallback route. Gridbook 0.5.0 backs FP8-CB fused mid-M for
+  K ∈ {28,32,36,40,44,48}; an undeclared runtime version backs nothing.
+- Candidates carry the resolved route, and `selection.json` records which
+  selected rungs ride a backed fused lane versus the expand+GEMM fallback —
+  the producer-side mirror of gridbook K1.2, so neither repo can price an
+  unbacked fast path.
+
 ## 0.5.2 — 2026-08-01
 
 This patch release advances the immutable runtime boundary to Gridbook 0.5.0

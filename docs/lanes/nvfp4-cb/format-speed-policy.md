@@ -61,13 +61,45 @@ The relevant serialized contracts are:
   reference/format identity. A lattice reference does not imply a free
   sidecar.
 
-The full execution contract must be selection and benchmark identity. The
-current `Candidate` encodes format, predicted loss, payload bytes, serialized
-layout, and sidecar identity through `CBSerializationContext`; it does **not**
-yet encode activation contract, concrete backend/fallback, or serving-unit
-identity. Until those fields land, they remain explicit feasibility inputs and
-benchmark provenance rather than properties enforced by the candidate object.
-A format name alone is not a byte or execution identity.
+The full execution contract must be selection and benchmark identity. A format
+name alone is not a byte or execution identity.
+
+`Candidate` encodes format, predicted loss, payload bytes, serialized layout,
+and sidecar identity through `CBSerializationContext`. Since the ultraplan P5
+producer work (gridbook `docs/audits/ultraplan_perf_2026-08-01.md` §6) it also
+encodes:
+
+- **the concrete serving-lane route** (`Candidate.serving_lane`), resolved
+  from the target serving profile's declarative `serving_lanes` block: the
+  served activation contract (`w8a8-dynamic-e4m3` for FP8-CB,
+  `w4-bf16-bridge` for the default FP4-CB quality path), whether the
+  consumer's fused mid-M kernel actually instantiates **this rung**, and the
+  fallback route it takes when it does not. The backed rung set is spec data
+  keyed by the pinned Gridbook version in
+  `prismaquant/gridbook_runtime/gridbook_runtime_pin.json`; a pinned version
+  the spec does not declare backs nothing. Gridbook 0.5.0 instantiates
+  FP8-CB fused mid-M for K ∈ {28,32,36,40,44,48} while production permits
+  every K28..K48, so the allocator can no longer price an unbacked fast path
+  without recording that it did (the producer-side mirror of gridbook K1.2).
+- **which estimator priced its activation contract**
+  (`Candidate.activation_pricing`): the measured `output_mse` branch, a
+  weight-only branch corrected by the per-family activation calibration, or a
+  weight-only branch left uncorrected. Weight-only rows — packed experts
+  under `PRISMAQUANT_EXPERT_COST_SAMPLE`, interpolated rungs under
+  `CB_LADDER_INTERP` — no longer read as if their A side had been measured.
+
+The serving profile additionally models gridbook's real load gates, not just
+the `in_features % 256` superblock rule: `out_features % 8` for the fp4-CB
+families and `out_features % 16` for fp8-CB, declared per grid from the
+`cb_layout` family table.
+
+`selection.json` records, for the shipped assignment, which selected rungs
+ride a backed fused lane versus the expand+GEMM fallback, the activation
+contracts in play, the per-family activation calibration (fit, sample digest,
+residual band), and the cross-family CB-ladder symmetry verdict. Serving-unit
+identity and hard latency constraints remain feasibility inputs and benchmark
+provenance rather than properties the solver enforces — the constrained Pareto
+solver of §1 is still not implemented.
 
 ## 3. Benchmark the execution contract
 
