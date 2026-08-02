@@ -149,11 +149,22 @@ from .serving_profiles import (
     require_per_role_expert_scheme_support,
     resolve_target_profile,
     serving_lane_catalog,
+    serving_lane_route,
     serving_profile_names,
 )
 from .cb_ladder_cross_family import (
     cross_family_verdict_from_cost_payload,
 )
+from .serve_constraints import (
+    ServeConstraintContext,
+    ServeConstraintError,
+    ServeSLOs,
+    WorkloadMix,
+    evaluate_assignment as evaluate_serve_constraints,
+    fastest_feasible_summary,
+    rejection_record,
+)
+from .serve_dispatch_table import DispatchTableError, load_dispatch_table
 from .decision_units import block_id_from_qname
 from .layer_config import LAYER_CONFIG_META_KEY
 from .schemas import validate_cost_payload, validate_probe_payload
@@ -1870,6 +1881,53 @@ def main():
                     help="Optional path: write the flat per-Linear bit "
                          "attribution table (qname, block, role, format, "
                          "bits, bpp, n_params, h_trace, predicted_dloss).")
+    # ---- Hard serving constraints: the second selection axis (P5c) ----
+    # format-speed-policy.md §1's constrained problem. Latency is NEVER
+    # blended into the objective (no lambda, no phase-weighted serve_ms):
+    # these are hard constraints, an assignment that misses one is INFEASIBLE,
+    # and the objective stays minimum predicted Delta-loss among the feasible.
+    # Supply NONE of them and every code path is byte-identical to the
+    # pre-P5c allocator apart from a stamp recording that constraints were
+    # absent. See prismaquant/serve_constraints.py for the aggregation model
+    # and its named assumptions.
+    ap.add_argument("--serve-dispatch-table", default=None,
+                    help="Path to a measured serve dispatch table "
+                         "(prismaquant.serve_dispatch_table.v1): per "
+                         "(format-family, phase, M-regime, lane) relative "
+                         "serving costs, every row citing its source. An "
+                         "example built only from published Gridbook "
+                         "measurements ships at "
+                         "prismaquant/serve_dispatch_tables/"
+                         "gridbook_gb10_2026-08-01.example.json and is "
+                         "PROPOSAL DATA, not a qualified serving model.")
+    ap.add_argument("--serve-workload-mix", default=None,
+                    help="Workload M-regime mix, e.g. "
+                         "'prefill:dense_prefill_1400=1.0,"
+                         "decode:decode_batch1=1.0'. Per-phase weights must "
+                         "sum to 1.0. There is deliberately no default: "
+                         "policy §1 forbids a default workload mix hidden in "
+                         "the allocator.")
+    ap.add_argument("--slo-prefill-p95-ttft-ms", type=float, default=None,
+                    help="Hard constraint: predicted p95 TTFT (ms) must be "
+                         "<= this. Prefill and decode are separate "
+                         "constraints and are never blended.")
+    ap.add_argument("--slo-decode-p95-itl-ms", type=float, default=None,
+                    help="Hard constraint: predicted p95 inter-token latency "
+                         "(ms) must be <= this.")
+    ap.add_argument("--slo-decode-p05-tps", type=float, default=None,
+                    help="Hard constraint: predicted p05 decode throughput "
+                         "(tok/s) must be >= this.")
+    ap.add_argument("--serve-device-budget-bytes", type=int, default=None,
+                    help="Hard constraint: resident weight bytes + "
+                         "--serve-kv-bytes + --serve-peak-scratch-bytes must "
+                         "be <= this.")
+    ap.add_argument("--serve-kv-bytes", type=int, default=0,
+                    help="Operator-supplied KV-cache bytes for the device "
+                         "memory constraint (not modelled by the allocator).")
+    ap.add_argument("--serve-peak-scratch-bytes", type=int, default=0,
+                    help="Operator-supplied peak scratch bytes for the "
+                         "device memory constraint (not modelled by the "
+                         "allocator).")
     args = ap.parse_args()
 
     if args.cb_codebook_source == "learned":
@@ -1905,6 +1963,52 @@ def main():
         raise SystemExit(
             "[alloc] ERROR: --artifact-overhead-reserve-bytes is meaningful "
             "only with --target-disk-gb"
+        )
+
+    # ---- Hard serving constraints, resolved once (ultraplan P5c) ----
+    # Built before any expensive work so a malformed table, an unbalanced
+    # workload mix, or an SLO with nothing to price it fails on the command
+    # line rather than after a multi-minute solve. An INACTIVE context (no
+    # table / no SLOs) makes every downstream call a no-op that only stamps
+    # "constraints were absent" — the pre-P5c behaviour, byte for byte.
+    try:
+        serve_dispatch = (
+            load_dispatch_table(args.serve_dispatch_table)
+            if args.serve_dispatch_table else None
+        )
+        serve_context = ServeConstraintContext(
+            table=serve_dispatch,
+            mix=WorkloadMix.parse(args.serve_workload_mix),
+            slos=ServeSLOs(
+                p95_ttft_ms=args.slo_prefill_p95_ttft_ms,
+                p95_itl_ms=args.slo_decode_p95_itl_ms,
+                p05_tps=args.slo_decode_p05_tps,
+                device_budget_bytes=args.serve_device_budget_bytes,
+                kv_bytes=int(args.serve_kv_bytes or 0),
+                peak_scratch_bytes=int(args.serve_peak_scratch_bytes or 0),
+            ),
+        )
+        serve_context.validate()
+    except (DispatchTableError, ServeConstraintError) as exc:
+        raise SystemExit(f"[alloc] ERROR: {exc}") from None
+    if serve_context.active:
+        print(
+            "[alloc] serving constraints ACTIVE (ultraplan P5c): table="
+            f"{serve_dispatch.table_id!r} status={serve_dispatch.status!r}, "
+            f"mix={args.serve_workload_mix!r}, "
+            f"SLOs={serve_context.slos.as_dict()}. These are HARD "
+            "constraints: an assignment that misses one is infeasible, never "
+            "scored worse. The objective is unchanged (min predicted Δloss); "
+            "no λ blending exists. Table-driven latency is PROPOSAL DATA — "
+            "the served NATIVE-PARITY protocol is the release gate.",
+            flush=True,
+        )
+    elif serve_dispatch is not None or args.serve_workload_mix:
+        print(
+            "[alloc] serving constraints INACTIVE: a dispatch table and/or "
+            "workload mix was supplied but no SLO, so no serving constraint "
+            "is evaluated and selection is the pre-P5c byte-budget objective.",
+            flush=True,
         )
 
     if args.threads > 0:
@@ -2813,6 +2917,45 @@ def main():
             legal_formats=per_linear_legal_formats,
         )
 
+    _serve_lane_cache: dict[str, object] = {}
+
+    def _serve_lane_for(name: str, fmt: str):
+        """The concrete serving-lane route one assigned unit would ride (P5b).
+
+        Same resolution order as ``selection_serving_lane_provenance``: prefer
+        the ``Candidate`` the DP actually saw, and re-resolve from the target
+        profile for expanded members of aggregated super items, which have no
+        candidate of their own. This is what makes the constraint axis price a
+        rung whose fused lane the pinned Gridbook version does NOT instantiate
+        with its FALLBACK route's numbers instead of the fused lane's.
+        """
+        for cand in candidates.get(name, ()):
+            if cand.fmt == fmt:
+                return cand.serving_lane
+        if fmt not in _serve_lane_cache:
+            _serve_lane_cache[fmt] = serving_lane_route(target_profile, fmt)
+        return _serve_lane_cache[fmt]
+
+    def _serve_feasibility(
+        expanded_assignment: Mapping[str, str],
+        *,
+        resident_bytes: int | None = None,
+    ):
+        """Policy §1's hard serving constraints for one expanded assignment.
+
+        Inactive context -> a stamp and ``feasible=True``; nothing downstream
+        changes. The stats view is the same three-map precedence the footprint
+        accounting uses, so a super-item-expanded name resolves to real
+        parameter counts (the aggregation is parameter-share weighted).
+        """
+        return evaluate_serve_constraints(
+            expanded_assignment,
+            {**accounting_stats, **fixed_stats, **stats},
+            serve_context,
+            lane_for=_serve_lane_for,
+            resident_bytes=resident_bytes,
+        )
+
     def _assignment_payload_totals(
         assignment: Mapping[str, str],
         *,
@@ -3614,6 +3757,15 @@ def main():
                     + ". The byte-budget selector would price them at source "
                     "precision and under-count the artifact. Fix the probe / "
                     "expansion so every allocated name carries stats.")
+            # The SECOND hard axis (ultraplan P5c), evaluated on the same
+            # exact expanded assignment the byte axis just priced — after
+            # super-item expansion and serving-unit promotion, so the verdict
+            # is about the assignment that would actually ship. Resident bytes
+            # are the exact serialized tensor payload (assumption A6).
+            serve = _serve_feasibility(
+                expanded_t,
+                resident_bytes=int(info["artifact_payload_bytes"]),
+            )
             return {
                 "target_bits": float(t), "achieved_bits": float(ach_t),
                 "bpp": float(ach_t), "dloss": float(tot_t),
@@ -3623,6 +3775,7 @@ def main():
                     info["artifact_payload_bytes"]
                 ) + overhead_reserve_bytes,
                 "floor_bytes": float(info["floor_bytes"]),
+                "serve": serve,
             }
 
         grid = []
@@ -3723,11 +3876,35 @@ def main():
         # feasibility is intentionally deferred to the exporter, which stats
         # the recursive regular-file set and fails closed. The ratchet is
         # seeded at the grid pick already proven selection-feasible.
-        def _fits(cand) -> bool:
+        def _fits_bytes(cand) -> bool:
             return (
                 cand is not None
                 and cand["whole_artifact_upper_bound_bytes"] <= budget_bytes
             )
+
+        def _serve_ok(cand) -> bool:
+            """The second hard axis. Always True when constraints are absent.
+
+            Deliberately a separate predicate from the byte test so the two
+            reasons a probe was rejected stay distinguishable in the trace —
+            and so that with no constraints supplied ``_fits`` is the
+            pre-P5c function, evaluated on the pre-P5c inputs.
+            """
+            if cand is None:
+                return False
+            serve = cand.get("serve")
+            return serve is None or bool(serve.feasible)
+
+        def _fits(cand) -> bool:
+            """Feasibility = BOTH hard axes (policy §1).
+
+            Bytes and SLOs are constraints, never terms in the objective. A
+            probe that misses either is removed from the candidate set; it is
+            not ranked below the others. The ratchet below then minimises
+            predicted Δloss over exactly the survivors, with its tie-break
+            unchanged.
+            """
+            return _fits_bytes(cand) and _serve_ok(cand)
 
         def _beats(cand, best) -> bool:
             """The ratchet objective: min Δloss, ties -> larger footprint."""
@@ -3743,12 +3920,36 @@ def main():
         best = None
         emit_target = None
         ratchet_trace: list[dict] = []
+        # Every probe the SLO axis removed, and which limit removed it. Empty
+        # (and omitted from selection.json) when constraints are inactive.
+        serve_rejections: list[dict] = []
+        serve_probe_rows: list[dict] = []
+
+        def _record_serve(cand, target: float, stage: str) -> None:
+            """Note a probe's serving verdict; nothing when constraints are off."""
+            if cand is None or not serve_context.active:
+                return
+            serve = cand["serve"]
+            serve_probe_rows.append({
+                "label": f"{stage}@{float(target):.4f}",
+                "feasible": bool(serve.feasible),
+                "predicted": dict(serve.predicted),
+            })
+            if not serve.feasible:
+                serve_rejections.append(rejection_record(
+                    serve,
+                    stage=stage,
+                    target_bits=float(target),
+                    achieved_bits=float(cand["achieved_bits"]),
+                    dloss=float(cand["dloss"]),
+                ))
 
         def _consider(cand, target: float, stage: str) -> bool:
             """Ratchet ``cand`` in; record the probe. Returns whether it fits."""
             nonlocal best, emit_target
             fits = _fits(cand)
             accepted = bool(fits and _beats(cand, best))
+            _record_serve(cand, target, stage)
             ratchet_trace.append({
                 "stage": stage,
                 "target_bits": float(target),
@@ -3765,16 +3966,64 @@ def main():
                 "dloss": float(cand["dloss"]) if cand is not None else None,
                 "fits": fits,
                 "accepted": accepted,
+                # Additive and CONDITIONAL: with no constraints supplied the
+                # trace rows are byte-identical to the pre-P5c allocator's.
+                **({
+                    "fits_bytes": _fits_bytes(cand),
+                    "serve_feasible": (
+                        bool(cand["serve"].feasible)
+                        if cand is not None else None),
+                    "serve_binding_constraint": (
+                        cand["serve"].binding_constraint
+                        if cand is not None else None),
+                    "serve_violated_constraints": (
+                        list(cand["serve"].violation_names())
+                        if cand is not None else None),
+                } if serve_context.active else {}),
             })
             if accepted:
                 best, emit_target = cand, float(target)
             return fits
 
         fitting = [c for c in grid if _fits(c)]
+        for cand in grid:
+            _record_serve(cand, float(cand["target_bits"]), "grid")
         grid_pick = None
         for cand in fitting:
             if _beats(cand, grid_pick):
                 grid_pick = cand
+
+        if grid_pick is None:
+            # Bytes alone were satisfiable (checked above) but the serving
+            # constraints removed every grid rung. That is an INFEASIBLE
+            # problem, not a reason to relax an SLO silently: policy §1 makes
+            # these hard constraints. Write the evidence, then exit naming the
+            # limits that bound.
+            binding = sorted({
+                str(r["binding_constraint"]) for r in serve_rejections
+                if r.get("binding_constraint")
+            })
+            selection.update({
+                "feasible": False,
+                "serve_constraints_infeasible": True,
+                "serve_constraints": {
+                    **serve_context.stamp_inactive(),
+                    "active": True,
+                    "reason": "no_grid_rung_satisfied_the_serving_constraints",
+                    "binding_constraints": binding,
+                    "rejected_assignments": serve_rejections,
+                },
+            })
+            sel_path.write_text(
+                json.dumps(selection, indent=2, sort_keys=True) + "\n")
+            raise SystemExit(
+                "[alloc] every allocation that fits the "
+                f"{args.target_disk_gb:.3f}GB card misses a hard serving "
+                f"constraint ({', '.join(binding) or 'unpriced'}). Policy §1 "
+                "makes these constraints, not penalties: nothing here is "
+                "'close enough'. Raise the SLO, widen --formats, change "
+                "--serve-workload-mix, or supply a dispatch table that prices "
+                f"the families in this menu. Selection written to {sel_path}.")
 
         # Near-lossless cap: all of the most expensive format, +1 bit of slack
         # so the DP can actually reach it.
@@ -3894,6 +4143,34 @@ def main():
             "cb_ladder_cross_family_verdict": cross_family_verdict,
             "serving_lane_provenance": selection_serving_lane_provenance(
                 chosen_info["assignment"], candidates, target_profile),
+            # Ultraplan P5c: which hard serving constraints were active, which
+            # probed assignments the axis REJECTED and for which SLO, and
+            # which constraint binds at the shipped optimum. Present on every
+            # run; when no table/SLO was supplied it says exactly that and
+            # nothing else in this file differs from the pre-P5c allocator.
+            "serve_constraints": (
+                {
+                    **chosen_info["serve"].as_dict(),
+                    "rejected_assignments": serve_rejections,
+                    "n_probes_rejected_by_serving_constraints": len(
+                        serve_rejections),
+                    "binding_constraint_at_optimum": (
+                        chosen_info["serve"].binding_constraint),
+                    "fastest_feasible_reference": fastest_feasible_summary(
+                        serve_probe_rows,
+                        scope_note=(
+                            "Scope: the assignments this byte-budget ratchet "
+                            "PROBED (grid rungs, the near-lossless cap, and "
+                            "the bisection midpoints) — not an enumeration of "
+                            "the globally feasible set. Treat it as the "
+                            "fastest feasible assignment SEEN, and say so "
+                            "wherever it is used as a denominator."
+                        ),
+                    ),
+                }
+                if serve_context.active
+                else serve_context.stamp_inactive()
+            ),
         })
         sel_path.write_text(json.dumps(selection, indent=2, sort_keys=True) + "\n")
         print(
@@ -3917,6 +4194,22 @@ def main():
             + f" -> {sel_path}",
             flush=True,
         )
+        if serve_context.active:
+            chosen_serve = chosen_info["serve"]
+            print(
+                "[alloc] serving constraints: "
+                + "; ".join(
+                    f"{c.name} {c.predicted if c.predicted is None else round(c.predicted, 4)}"
+                    f" {c.direction} {c.limit} {c.units} "
+                    f"[{'ok' if c.satisfied else 'VIOLATED'}]"
+                    for c in chosen_serve.checks
+                )
+                + f" | binding={chosen_serve.binding_constraint} | "
+                + f"{len(serve_rejections)} probed assignment(s) rejected by "
+                + "the SLO axis. Proposal data (table-driven); the served "
+                + "NATIVE-PARITY protocol is the release gate.",
+                flush=True,
+            )
 
     # Emit chosen layer_config for target_bits.
     assignment, achieved, total, mutable_total = _solve_for_target(args.target_bits)
@@ -4117,6 +4410,40 @@ def main():
         require_all_stats=False,
     )
 
+    # ---- Hard serving constraints on the SHIPPED assignment (P5c) ----
+    # The byte-budget selector already filtered its probes; this is the check
+    # on the emit path, which the plain --target-bits mode reaches without any
+    # ratchet. Policy §1 makes an SLO miss INFEASIBLE, so a violation exits
+    # rather than shipping a layer_config that quietly does not meet the
+    # deployment constraint the operator stated. Inactive -> no evaluation, no
+    # stamp, no behaviour change.
+    final_serve_feasibility = None
+    if serve_context.active:
+        final_serve_feasibility = _serve_feasibility(
+            final_body_assignment,
+            resident_bytes=int(
+                round(float(final_body_payload["bits_total"]) / 8.0)),
+        )
+        if not final_serve_feasibility.feasible:
+            violated = ", ".join(
+                f"{c.name}: predicted={c.predicted} {c.direction} "
+                f"{c.limit} {c.units}"
+                + (f" (unpriced: {c.unpriced_reason})"
+                   if c.unpriced_reason else "")
+                for c in final_serve_feasibility.violations
+            )
+            raise SystemExit(
+                "[alloc] ERROR: the emitted assignment at "
+                f"target_bits={args.target_bits} misses a hard serving "
+                f"constraint — {violated}. Binding: "
+                f"{final_serve_feasibility.binding_constraint}. Policy §1 "
+                "(docs/lanes/nvfp4-cb/format-speed-policy.md) makes these "
+                "hard constraints, not penalties: there is no λ that trades "
+                "them against predicted Δloss. Raise the SLO, widen "
+                "--formats, adjust --serve-workload-mix, or supply a dispatch "
+                "table that prices this menu's format families."
+            )
+
     final_cb_serialization_stamps = _cb_stamps_for_assignment(
         assignment_expanded
     )
@@ -4188,6 +4515,13 @@ def main():
         **({
             "whole_artifact_budget": selected_whole_artifact_budget_stamp,
         } if selected_whole_artifact_budget_stamp is not None else {}),
+        # Only when the constraint axis actually ran, so an unconstrained run
+        # writes byte-identical layer-config metadata (the "constraints were
+        # absent" stamp lives in selection.json, which every byte-budget run
+        # writes anyway).
+        **({
+            "serve_constraints": final_serve_feasibility.as_dict(),
+        } if final_serve_feasibility is not None else {}),
     }
 
     out = Path(args.layer_config)
