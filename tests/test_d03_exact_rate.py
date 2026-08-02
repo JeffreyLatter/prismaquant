@@ -385,7 +385,7 @@ def test_report_records_serving_lanes_per_arm(tmp_path):
     lanes = report["serving_lane_provenance_by_arm"]
     cb = lanes["cb:FP8_CB_K36"]
     native = lanes["native:NVFP4"]
-    # K36 IS in gridbook 0.6.0's backed fused mid-M set; vanilla NVFP4 has no
+    # K36 IS in gridbook 0.7.0's backed fused mid-M set; vanilla NVFP4 has no
     # declared CB lane at all.
     assert cb["units_on_backed_fused_mid_m_lane"] == len(_DENSE)
     assert cb["selected_rungs_fused_mid_m_backed"] == [36]

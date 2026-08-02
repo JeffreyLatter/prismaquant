@@ -339,7 +339,7 @@ def _profile_lane(_name, fmt):
 
 
 def test_backed_and_unbacked_rungs_take_different_table_rows():
-    """Gridbook 0.6.0 instantiates FP8-CB fused mid-M for K in
+    """Gridbook 0.7.0 instantiates FP8-CB fused mid-M for K in
     {28,32,36,40,44,48}. K36 is backed; K37 is not, and production permits it
     — permanently, since K1.2 resolved to a k % 4 == 0 format+TMA law rather
     than to five missing instantiations. Both are 'FP8_CB' to the family
