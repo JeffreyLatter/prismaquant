@@ -30,7 +30,26 @@ log() { echo "[$(date +%H:%M:%S)] $*" | tee -a "$OUT/bench.log"; }
 while docker ps --format '{{.Names}}' | grep -q "^${PROD}\$"; do
   log "waiting for $PROD to exit..."; sleep 60
 done
-log "GPU is exclusive; settling 15s"
+# Pre-flight: refuse to benchmark against a dirty GPU. A stray container from
+# an earlier `timeout N docker run --rm` (timeout kills the CLIENT, not the
+# container) silently halves every number here -- it contaminated the first
+# rerun before this check existed.
+cleanup() { for c in "$@"; do docker rm -f "$c" >/dev/null 2>&1; done; }
+trap 'cleanup pq-perf-layer-base pq-perf-layer-new' EXIT INT TERM
+cleanup pq-perf-layer-base pq-perf-layer-new
+for attempt in 1 2 3 4 5 6 7 8 9 10; do
+  stray=$(docker ps --format '{{.Names}}' | grep -v -E "^${SIDE}\$" | tr '\n' ' ')
+  apps=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader | wc -l)
+  util=$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits)
+  if [ -z "$stray" ] && [ "$apps" -eq 0 ] && [ "$util" -lt 15 ]; then break; fi
+  log "GPU not idle (containers='$stray' compute_apps=$apps util=${util}%); waiting 30s"
+  sleep 30
+done
+if [ -n "$stray" ] || [ "$apps" -ne 0 ]; then
+  log "REFUSING to benchmark a contended GPU: containers='$stray' apps=$apps"
+  echo "CONTENDED_GPU" > "$OUT/gate.txt"; exit 1
+fi
+log "GPU verified idle (util=${util}%, compute_apps=0); settling 15s"
 sleep 15
 
 dmon_start() {
@@ -57,7 +76,9 @@ for arm in base new; do
   log "=== end-to-end layer 0 [$arm] ==="
   d=$(dmon_start "layer_$arm")
   t0=$(date +%s)
-  flock "$LOCK" docker run --rm --gpus all --ipc=host --entrypoint bash \
+  docker rm -f "pq-perf-layer-$arm" >/dev/null 2>&1
+  flock "$LOCK" docker run --rm --name "pq-perf-layer-$arm" \
+    --gpus all --ipc=host --entrypoint bash \
     -v "$RUN":"$RUN" -v /home/rob/pq-perf-wt:/wt \
     -v /home/rob/prismaquant-ultraplan:/pq:ro \
     -e PRISMAQUANT_ACTIVATION_FAIR_PRICING=1 \
@@ -87,6 +108,9 @@ python3 -m prismaquant.incremental_measure_quant_cost \
   ls -la "$wd/shards/" 2>&1 | tail -3 | tee -a "$OUT/bench.log"
   grep -E "activation-row coverage|FATAL|empty layer range" \
     "$OUT/layer_$arm.txt" | head -4 | tee -a "$OUT/bench.log"
+  cleanup "pq-perf-layer-$arm"
+  a=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader | wc -l)
+  [ "$a" -ne 0 ] && log "WARNING: $a compute app(s) still resident after [$arm]"
 done
 
 # --- C: identity gate ----------------------------------------------------
