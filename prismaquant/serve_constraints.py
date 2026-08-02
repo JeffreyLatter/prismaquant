@@ -477,7 +477,7 @@ def lane_key_for(lane: Any, arena_m: int | None) -> str:
     mechanical, and it is why P5b had to land first. A rung whose fused lane
     the pinned Gridbook version does NOT instantiate is priced with its
     FALLBACK route's row — never the fused lane's — even though both rungs
-    carry the same format-family name. Gridbook 0.6.0 backs FP8-CB fused
+    carry the same format-family name. Gridbook 0.7.0 backs FP8-CB fused
     mid-M for K in {28,32,36,40,44,48} while production permits every
     K28..K48, so on the published 27B K36..K47 ladder this distinction is
     load-bearing for five of eight rungs — permanently, since gridbook K1.2

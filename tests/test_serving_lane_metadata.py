@@ -138,17 +138,17 @@ def test_the_superblock_gate_is_unchanged():
 # ---------------------------------------------------------------------------
 
 def test_backed_fused_mid_m_rungs_are_spec_data_for_the_pinned_runtime():
-    """Gridbook 0.6.0 instantiates K in {28,32,36,40,44,48} while production
+    """Gridbook 0.7.0 instantiates K in {28,32,36,40,44,48} while production
     permits every K28..K48 — so five of the published 27B ladder's eight
     rungs silently take expand+GEMM (gridbook ROADMAP K1.2). That set is
     DATA, read against the version in gridbook_runtime_pin.json."""
-    assert sp.gridbook_runtime_version() == "0.6.0"
+    assert sp.gridbook_runtime_version() == "0.7.0"
     backed = sp.serving_lane_route(_PROFILE, "FP8_CB_K36")
     assert backed.fused_mid_m_backed
     assert backed.fused_mid_m_rungs == (28, 32, 36, 40, 44, 48)
     assert backed.fused_mid_m_range == (9, 128)
     assert backed.activation_contract == "w8a8-dynamic-e4m3"
-    assert backed.rungs_source == "serving_profile_spec:0.6.0"
+    assert backed.rungs_source == "serving_profile_spec:0.7.0"
 
     for k in (37, 38, 39, 41, 47):
         unbacked = sp.serving_lane_route(_PROFILE, f"FP8_CB_K{k}")
@@ -170,7 +170,11 @@ def test_the_0_6_0_backed_set_is_the_k_mod_4_law_not_a_missing_five():
     permanently fallback-served, not pending; the producer must keep pricing
     them on the fallback row forever rather than waiting for coverage that
     cannot arrive. This test states the law, so a future spec edit that
-    "completes" the set to every K28..K48 fails here."""
+    "completes" the set to every K28..K48 fails here.
+
+    The law is why the surface did not move again at 0.7.0: that release
+    carries the deepseek_v4 serving contract (D0.1) and the post-0.6.0 review
+    remediation, and ``FP8_FUSED_KBITS`` is still ``range(28, 49, 4)``."""
     backed = sp.serving_lane_route(_PROFILE, "FP8_CB_K36").fused_mid_m_rungs
     assert backed == tuple(range(28, 49, 4))
     for k in range(28, 49):
@@ -180,19 +184,23 @@ def test_the_0_6_0_backed_set_is_the_k_mod_4_law_not_a_missing_five():
 
 def test_advancing_the_pin_adds_a_version_key_and_never_edits_an_old_one():
     """The lane spec's own rule ("ADD the version key rather than editing an
-    existing list"). An artifact produced under the 0.5.0 pin must stay
-    resolvable at the route it actually shipped on, so the historical key
-    survives the 0.6.0 advance — and both keys answer for themselves."""
+    existing list"). An artifact produced under the 0.5.0 or 0.6.0 pin must
+    stay resolvable at the route it actually shipped on, so every historical
+    key survives the 0.7.0 advance — and each answers for itself."""
     lane = next(l for l in sp.load_serving_profile(_PROFILE).serving_lanes
                 if l.id == "fp8_cb_fused_mid_m")
     declared = dict(lane.fused_mid_m_rungs_by_runtime_version)
-    assert "0.5.0" in declared and "0.6.0" in declared
-    assert declared["0.5.0"] == declared["0.6.0"] == tuple(range(28, 49, 4))
+    assert {"0.5.0", "0.6.0", "0.7.0"} <= set(declared)
+    assert (declared["0.5.0"] == declared["0.6.0"] == declared["0.7.0"]
+            == tuple(range(28, 49, 4)))
 
+    for old_version in ("0.5.0", "0.6.0"):
+        old = sp.serving_lane_route(
+            _PROFILE, "FP8_CB_K36", runtime_version=old_version)
+        assert old.fused_mid_m_backed, old_version
+        assert old.rungs_source == f"serving_profile_spec:{old_version}"
     old = sp.serving_lane_route(
         _PROFILE, "FP8_CB_K36", runtime_version="0.5.0")
-    assert old.fused_mid_m_backed
-    assert old.rungs_source == "serving_profile_spec:0.5.0"
     # ...and the two resolutions are distinguishable, because the runtime
     # version is part of a route's identity even when the rungs agree.
     assert old.route_key() != sp.serving_lane_route(
@@ -200,12 +208,12 @@ def test_advancing_the_pin_adds_a_version_key_and_never_edits_an_old_one():
 
 
 def test_the_fp4_opt_in_fused_mid_m_lane_is_available_not_backed():
-    """Gridbook 0.6.0 ships a contract-preserving fp4-CB v2 fused mid-M
+    """Gridbook 0.6.0 shipped a contract-preserving fp4-CB v2 fused mid-M
     kernel (``csrc/cb_fused_fp4v2_gemm.cu``, dense, 9 <= M <= 128, decoded
-    weights bit-identical to ``cb_expand_v2`` at all 13 K12..K24 rungs) — but
-    OPT-IN behind ``PRISMAQUANT_CB_FP4_FUSED_MIDM=1`` pending the served
-    NATIVE-PARITY gate, and with the flag unset the dispatch is byte-for-byte
-    the BF16 bridge.
+    weights bit-identical to ``cb_expand_v2`` at all 13 K12..K24 rungs) — and
+    at 0.7.0, the version this release pins, it is STILL OPT-IN behind
+    ``PRISMAQUANT_CB_FP4_FUSED_MIDM=1`` pending the served NATIVE-PARITY gate,
+    with the flag unset leaving the dispatch byte-for-byte the BF16 bridge.
 
     This data declares what the DEFAULT contract serves, so the backed set
     stays EMPTY: a lane the operator must set an env flag to reach is
@@ -261,7 +269,7 @@ def test_profiles_without_a_declared_lane_return_none():
 def test_the_lane_catalog_is_reportable_and_names_its_runtime():
     catalog = sp.serving_lane_catalog(_PROFILE)
     assert catalog["schema"] == sp.SERVING_LANE_SCHEMA
-    assert catalog["gridbook_runtime_version"] == "0.6.0"
+    assert catalog["gridbook_runtime_version"] == "0.7.0"
     assert set(catalog["lanes"]) == {
         "nvfp4_cb_quality_path", "fp8_cb_fused_mid_m"}
     assert catalog["lanes"]["fp8_cb_fused_mid_m"]["fused_mid_m_rungs"] == [
@@ -322,7 +330,7 @@ def test_selection_provenance_splits_backed_rungs_from_the_fallback():
     }
     prov = selection_serving_lane_provenance(
         assignment, None, target_profile=_PROFILE)
-    assert prov["gridbook_runtime_version"] == "0.6.0"
+    assert prov["gridbook_runtime_version"] == "0.7.0"
     assert prov["units_total"] == 4
     assert prov["units_on_backed_fused_mid_m_lane"] == 1
     assert prov["units_on_fallback_route"] == 2

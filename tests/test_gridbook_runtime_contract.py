@@ -62,16 +62,81 @@ def test_installed_gridbook_is_the_exact_external_vcs_pin():
     assert vcs.get("requested_revision") == pin["commit"]
 
 
-def test_declared_cb_lanes_equal_gridbook_supported_producer_profiles():
+def _declared_cb_lane_profiles() -> set[str]:
+    """Architectures whose model profile offers the `nvfp4_cb` export lane."""
     from prismaquant.model_profiles import registry
 
-    declared = {
-        cls().name for cls in registry._REGISTERED
-        if "nvfp4_cb" in cls().supported_export_lanes()
-    }
+    declared = set()
+    for cls in registry._REGISTERED:
+        profile = cls()
+        if "nvfp4_cb" in profile.supported_export_lanes():
+            declared.add(profile.name)
+    return declared
+
+
+def _assert_declared_cb_lanes_are_servable() -> None:
+    """The directional check, shared with its negative control below."""
+    declared = _declared_cb_lane_profiles()
     supported = set(
         _runtime_contract()["producer_profiles"]["supported_ids"])
-    assert declared == supported
+    unservable = declared - supported
+    assert not unservable, (
+        "these architectures declare the nvfp4_cb export lane but the pinned "
+        f"Gridbook runtime does not serve them: {sorted(unservable)} "
+        f"(runtime serves {sorted(supported)})")
+
+
+def test_declared_cb_lanes_are_a_subset_of_gridbook_supported():
+    """The producer must never declare a lane the pinned runtime cannot serve.
+
+    The invariant is DIRECTIONAL. Only one of the two differences is a defect.
+
+    DANGEROUS — `declared - supported`: a model profile offers the `nvfp4_cb`
+    lane for an architecture the pinned Gridbook runtime does not serve. Nothing
+    crashes, which is the whole problem. Per
+    `ModelProfile.supported_export_lanes`, where that wiring is missing "the run
+    still *completes* and the artifact serves uninitialised memory — coherent
+    garbage, not a crash" (commit `9a79963`, Laguna). Catching that is why this
+    test exists; the negative control below proves it still does.
+
+    NORMAL — `supported - declared`: the runtime serves an architecture this
+    producer cannot yet export. That is the ordinary consumer-first leading
+    state, since a serving contract has to exist before any artifact can be
+    produced against it.
+
+    This asserted strict EQUALITY until Gridbook 0.7.0, whose D0.1 registered
+    `deepseek_v4` in the packaged `runtime_contract.json` while the DSV4 CB
+    export lane remains unlanded here (`docs/lanes/nvfp4-cb/dsv4_readiness.md`
+    gaps 1-3: `export_nvfp4_cb.py`'s `_load_skeleton` still reads the whole
+    model, there is no fp8-block dequant-on-read, and no per-expert to packed
+    expert stacking). Equality made the intended landing order — serving
+    contract first, exporter second — unrepresentable, so it was the assertion
+    that was wrong, not the pin.
+    """
+    _assert_declared_cb_lanes_are_servable()
+
+
+def test_a_declared_lane_the_runtime_cannot_serve_still_fails(monkeypatch):
+    """Negative control for the relaxation above.
+
+    Containment has to stay a real gate rather than a check that passes because
+    it happens to subtract in the harmless direction. Fabricate one extra
+    DECLARED lane for an architecture no runtime contract lists, and the check
+    must fail and name it."""
+    from prismaquant.model_profiles import registry
+
+    class _UnservableProfile:
+        name = "fabricated_arch_no_runtime_serves"
+
+        def supported_export_lanes(self):
+            return ("compressed-tensors", "nvfp4_cb")
+
+    monkeypatch.setattr(
+        registry, "_REGISTERED", [*registry._REGISTERED, _UnservableProfile])
+
+    assert _UnservableProfile.name in _declared_cb_lane_profiles()
+    with pytest.raises(AssertionError, match=_UnservableProfile.name):
+        _assert_declared_cb_lanes_are_servable()
 
 
 def test_cb_rungs_layouts_and_quant_method_fit_the_runtime_contract():

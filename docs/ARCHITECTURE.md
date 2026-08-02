@@ -1,8 +1,8 @@
 # PrismaQuant Architecture
 
-As of: 2026-08-02 · branch `dsv4/flash-0731-92gb` · verified against implementation
-baseline commit `e16302e`, with the external Gridbook runtime pinned to
-`ca0f0f562d3f398e094bfa5356a9ce3fa47472f1` (v0.6.0). This branch ports the dated
+As of: 2026-08-02 · branch `release/prismaquant-0.7.0` · verified against implementation
+baseline commit `7183d21`, with the external Gridbook runtime pinned to
+`746473c8459acd24c71e7602d1c982da2f8fa80e` (v0.7.0). This branch ports the dated
 2026-08-01 DeepSeek-V4-Flash-0731 92 GB study record (§9.2) forward from its 0.5.1
 working tree; the study's Gridbook-candidate claims were **not** carried over, because
 the candidate they described has since been reviewed, cut, and pinned as Gridbook 0.6.0.
@@ -1863,7 +1863,7 @@ the artifact ABI; CI
 compares every packing/layout field and every rung so incompatibility fails at the boundary.
 
 At runtime `register()` registers `"gridbook"` plus the legacy artifact alias `"prismaquant"`
-and installs the per-architecture loader hooks. It does not patch vLLM core. Gridbook 0.6.0
+and installs the per-architecture loader hooks. It does not patch vLLM core. Gridbook 0.7.0
 resolves and attests every serving-reachable extension, optional-kernel mode, ABI, device, and
 shape contract during model load. Decode, expansion, activation QDQ, and routing support are
 native CUDA; GEMM and grouped GEMM are native CUTLASS. A missing or ineligible required native
@@ -1903,7 +1903,7 @@ keeps vLLM's weight loader off it.
 
 **Runtime defaults and kernel provenance live only in Gridbook.** The old table
 here was removed after it drifted from the runtime it described. The current pin is Gridbook
-0.6.0 at `ca0f0f562d3f398e094bfa5356a9ce3fa47472f1`; resolve it from
+0.7.0 at `746473c8459acd24c71e7602d1c982da2f8fa80e`; resolve it from
 `prismaquant/gridbook_runtime/gridbook_runtime_pin.json`, then consult that source's
 `docs/PLUGIN.md`, `docs/KERNELS.md`, and dated audits. The cross-project policy
 is only this: a numerics-changing path cannot be promoted by kernel arithmetic
@@ -1974,7 +1974,7 @@ AURA is native-lane evidence and no served CB objective A/B exists. Lane default
 shipping practice (§12 D15 closed).
 
 **Proven results.** These measurements remain tied to their recorded runtime commits; they are
-not relabelled as Gridbook 0.6.0 native-only measurements.
+not relabelled as Gridbook 0.7.0 native-only measurements.
 
 | artifact | result |
 |---|---|
@@ -2246,9 +2246,9 @@ polish, full rejected-methods catalog) is at
 
 ## 12. Known gaps and debt register
 
-Honest register, code-cited, as of 2026-08-02 (`dsv4/flash-0731-92gb`, implementation
-baseline commit `e16302e`; external Gridbook pin
-`ca0f0f562d3f398e094bfa5356a9ce3fa47472f1`, v0.6.0). The DSv4 study's working tree carried a
+Honest register, code-cited, as of 2026-08-02 (`release/prismaquant-0.7.0`, implementation
+baseline commit `7183d21`; external Gridbook pin
+`746473c8459acd24c71e7602d1c982da2f8fa80e`, v0.7.0). The DSv4 study's working tree carried a
 proposed **D29** ("the native-only Gridbook candidate is measured but not yet an attested
 runtime"). It is deliberately **not** ported: the 0.6.0 merge cut and pinned that candidate,
 so re-adding the row would assert a stale pin (`59cebf9f…`, v0.4.1) that no longer exists in
@@ -2306,7 +2306,7 @@ New with the 2026-07-30 merge:
 
 **Open items carried from session handovers.** Of the 41 items the handover census could not
 map to a verified closure, the prior FP4-CB fast-expander/Triton item is now closed by the
-exact pinned Gridbook 0.6.0 runtime: FP4-v2 prepares its native expander at model load, decode
+exact pinned Gridbook 0.7.0 runtime: FP4-v2 prepares its native expander at model load, decode
 uses native CUDA GEMV, M>8 uses native BF16 expansion plus Gridbook's owned CUTLASS grouped
 bridge, and a missing operation fails closed. The remaining re-verified items are folded in
 above: tail-veto (D1), `TARGET_DISK_GB` (D12), the DSv4 CB lane (D3), and the shipped

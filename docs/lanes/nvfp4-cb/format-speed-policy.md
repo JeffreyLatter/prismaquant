@@ -131,7 +131,7 @@ encodes:
   fallback route it takes when it does not. The backed rung set is spec data
   keyed by the pinned Gridbook version in
   `prismaquant/gridbook_runtime/gridbook_runtime_pin.json`; a pinned version
-  the spec does not declare backs nothing. Gridbook 0.6.0 instantiates
+  the spec does not declare backs nothing. Gridbook 0.7.0 instantiates
   FP8-CB fused mid-M for K ∈ {28,32,36,40,44,48} while production permits
   every K28..K48, so the allocator can no longer price an unbacked fast path
   without recording that it did (the producer-side mirror of gridbook K1.2).
