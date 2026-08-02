@@ -112,6 +112,37 @@
 # resumed or split with --start-layer/--end-layer. CB shards are deliberately
 # never reused across runs (cost_shard_is_reusable fails closed on CB formats),
 # so a resumed cost run re-measures the layers of any shard it did not finish.
+#
+# ---------------------------------------------------------------------------
+# ALLOC STAGE PRE-FLIGHT (2026-08-02, verified against layer 0's REAL rows)
+# ---------------------------------------------------------------------------
+# Two defects that would each have killed the alloc stage AFTER the ~12-hour
+# cost run finished are fixed below; both were reproduced on real production
+# rows, not on a fixture.
+#
+# 1. --cb-scale-sweep / --cb-encode-tier were MISSING. allocator.main hard-
+#    exits within seconds on any CB menu without all four CB context flags
+#    ("refusing implicit render defaults") — the render the cost stage
+#    measured and the render the exporter ships must be provably the same
+#    one, so the allocator will not infer them from the cost pickle.
+# 2. --pareto-targets was left at the default. See PARETO_TARGETS below.
+#
+# LEGALITY, verified on the real shard: NVFP4_CB_K14, NVFP4_CB_K15 and
+# FP8_CB_K36 are legal for BOTH expert shapes — w13-class (out 2048, in 4096)
+# and w2/down_proj-class (out 4096, in 2048) clear the CB in_features % 256
+# superblock rule and both fp4 (%8) and fp8 (%16) out_features load gates. The
+# ONLY masked format is BF16, model-wide, source_dtype_mismatch, exactly as
+# the CORRECTION note above predicts. All 775 real layer-0 rows carry the
+# full {K14, K15, K36} menu; no CB rung is masked on any shape.
+#
+# DP GRANULARITY, also verified: aggregate_packed_serving_groups collapses a
+# layer's 768 routed projections (256 experts x gate/up/down) into ONE group,
+# and fused-sibling aggregation finds ZERO groups here — so the DP decides 43
+# expert-layer units plus 301 body Linears, exactly the 344 units the per-layer
+# K14-vs-K15 question assumes. It is NOT constrained to the study's 35/8 split
+# or to body-at-K36: the min-Δloss DP may put body Linears on fp4 rungs and
+# spread the expert layers across all three rungs. The 92 GB budget is the
+# constraint; the format map is the allocator's verdict, not the study's.
 # ============================================================================
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -142,6 +173,19 @@ FORMATS="${FORMATS:-NVFP4_CB_K14,NVFP4_CB_K15,FP8_CB_K36,BF16}"
 # 92 decimal GB with the 256 MiB non-tensor reserve (study README).
 TARGET_DISK_GB="${TARGET_DISK_GB:-92}"
 ARTIFACT_OVERHEAD_RESERVE_BYTES="${ARTIFACT_OVERHEAD_RESERVE_BYTES:-268435456}"
+
+# PARETO GRID — the allocator's default (4.5..8.25) was written for a 4-bit/
+# 8-bit menu and does not touch this one. This menu's cheapest allocation is
+# 2.0313 bpp (all NVFP4_CB_K14 = 87.153 GB whole-artifact) and the 92 GB plan
+# sits at 2.169 bpp; every default rung is more than twice as dense, so the
+# byte-budget selector saw nothing below 172.422 GB and reported "92.000 is
+# below the floor" — verified end to end on layer 0's REAL production rows
+# (dq-runs/dsv4-flash-0731/alloc-feasibility-check/). allocator.main now
+# probes below the sweep before declaring a budget infeasible, so this list is
+# belt-and-braces: it also puts the low rungs on the Pareto CSV and gives the
+# ratchet a tighter bracket around the budget (measured: 91.987 GB shipped
+# with this grid vs 91.890 GB from the repair path alone).
+PARETO_TARGETS="${PARETO_TARGETS:-2.04,2.06,2.08,2.10,2.12,2.14,2.15,2.16,2.17,2.18,2.20,2.25,2.35,2.50,3.00,3.50,4.00,4.50}"
 
 mkdir -p "$WORK_DIR"/{artifacts,act,work,logs}
 
@@ -262,12 +306,15 @@ python3 -m prismaquant.allocator \
   --probe ${WORK_DIR}/artifacts/probe.pkl \
   --costs ${WORK_DIR}/artifacts/cost.pkl \
   --formats '${FORMATS}' \
-  --target-bits 4.5 \
+  --target-bits 2.17 \
+  --pareto-targets '${PARETO_TARGETS}' \
   --target-disk-gb ${TARGET_DISK_GB} \
   --artifact-overhead-reserve-bytes ${ARTIFACT_OVERHEAD_RESERVE_BYTES} \
   --target-profile nvfp4_cb \
   --cb-scale-coding two_tier \
   --cb-codebook-source lattice \
+  --cb-scale-sweep 1 \
+  --cb-encode-tier balanced \
   --cb-col-weights ${WORK_DIR}/artifacts/cb_col_weights.pkl \
   --layer-config ${WORK_DIR}/artifacts/layer_config.json \
   --pareto-csv ${WORK_DIR}/artifacts/pareto.csv \

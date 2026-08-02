@@ -486,3 +486,116 @@ def test_double_charged_source_span_exits_like_an_allocator_failure(
     msg = str(exc.value)
     assert msg.startswith("[alloc] ERROR:")
     assert "charged twice" in msg
+
+
+# ---------------------------------------------------------------------------
+# 4. "The cheapest allocation" must mean the MENU's floor, not the sweep's
+# ---------------------------------------------------------------------------
+# The Pareto grid is a coarse SAMPLE of the RD curve; the byte-budget selector
+# reads its cheapest point as the cheapest allocation. That is only true while
+# the sample reaches the bottom of the format menu, and --pareto-targets
+# defaults to 4.5..8.25 — a range written for a 4-bit/8-bit menu. On the CB
+# menu (NVFP4-CB is ~2.03 bpp) DeepSeek-V4-Flash's 92.0 GB budget, whose menu
+# floor is 87.2 GB, was rejected against a "cheapest allocation" of 172.4 GB
+# that is nothing but the 4.5 bpp rung — with a remedy ("raise the budget")
+# pointing the operator in exactly the wrong direction. Reproduced on that
+# run's REAL layer-0 production rows, so it is not a fixture artifact.
+
+
+# FP8_E4M3's exact assignment payload on this fixture, in bpp (8 bits/param
+# plus the shared-payload overhead the exact filter charges). A target below
+# it cannot hold FP8, which is what makes the stub below spend-to-target the
+# way a real solver does rather than ignoring the budget it was given.
+_FP8_EXACT_BPP = 8.125
+
+
+def _menu_floor_scenario(monkeypatch, tmp_path, *, disk_gb):
+    """Grid sampled far above the menu floor; only the cheap rung can fit.
+
+    The stub spends up to its target (densest format the target can hold),
+    so ``pareto="8.2,9.0"`` samples ONLY the expensive rung while NVFP4 —
+    the menu's own cheapest candidate, ~4.5 bpp — is never sampled. That is
+    the DeepSeek-V4-Flash shape in miniature: a 4.5..8.25 default grid over
+    a menu whose floor is less than half of it.
+    """
+    _model_dir, probe_p, cost_p, _stats = _fixture(
+        tmp_path, nvfp4_dloss=1e-4, fp8_dloss=1e-6)
+    return _run(
+        monkeypatch, tmp_path, probe_p, cost_p,
+        disk_gb=disk_gb,
+        fmt_for_target=(
+            lambda t: "FP8_E4M3" if t >= _FP8_EXACT_BPP else "NVFP4"),
+        pareto="8.2,9.0")
+
+
+def test_budget_below_the_swept_grid_but_above_the_menu_floor_still_ships(
+        monkeypatch, tmp_path):
+    sizing = tmp_path / "sizing"
+    sizing.mkdir()
+    model_dir, _probe_p, _cost_p, stats = _fixture(
+        sizing, nvfp4_dloss=1e-4, fp8_dloss=1e-6)
+    nvfp4_bytes, _floor = _artifact_bytes(model_dir, "NVFP4", stats)
+    fp8_bytes, _ = _artifact_bytes(model_dir, "FP8_E4M3", stats)
+    # A budget the MENU can meet with room to spare and no SAMPLED rung can.
+    budget = nvfp4_bytes + _OVERHEAD_RESERVE + 5_000
+    assert budget < fp8_bytes + _OVERHEAD_RESERVE
+
+    selection, _cfg = _menu_floor_scenario(
+        monkeypatch, tmp_path, disk_gb=budget / fp.GB)
+
+    assert selection["feasible"] and not selection["below_floor"]
+    ext = selection["pareto_grid_extension"]
+    assert ext["reason"] == "swept_grid_min_target_above_menu_floor"
+    assert ext["swept_min_target_bits"] == 8.2
+    # The probe starts AT the menu floor, and that rung must be one the
+    # solver can actually land on — an epsilon-below nominal rate is not.
+    assert ext["menu_floor_target_bits"] < 8.2
+    assert ext["added_targets"]
+    assert not ext["infeasible_targets"]
+    assert min(ext["added_targets"]) == pytest.approx(
+        ext["menu_floor_target_bits"])
+    # ...and the shipped allocation is one of the probed rungs, under budget.
+    assert selection["chosen_target_bits"] < 8.2
+    assert (selection["predicted_whole_artifact_upper_bound_gb"] * fp.GB
+            <= selection["budget_bytes"])
+
+
+def test_menu_floor_probe_does_not_run_when_the_swept_grid_already_fits(
+        monkeypatch, tmp_path):
+    """Repair path only. A run that selects today keeps its exact grid."""
+    model_dir, probe_p, cost_p, stats = _fixture(
+        tmp_path, nvfp4_dloss=1e-4, fp8_dloss=1e-6)
+    fp8_bytes, _floor = _artifact_bytes(model_dir, "FP8_E4M3", stats)
+    selection, _cfg = _run(
+        monkeypatch, tmp_path, probe_p, cost_p,
+        disk_gb=(fp8_bytes + _OVERHEAD_RESERVE + 10_000) / fp.GB,
+        fmt_for_target=lambda t: "FP8_E4M3" if t >= 6.0 else "NVFP4")
+    assert selection["feasible"]
+    assert selection["pareto_grid_extension"] is None
+    assert {row["target_bits"] for row in selection["grid"]} == {4.6, 8.2}
+
+
+def test_genuine_below_floor_reports_the_menu_floor_not_the_swept_minimum(
+        monkeypatch, tmp_path):
+    """Still fails closed — but on a number that means what the label says."""
+    sizing = tmp_path / "sizing"
+    sizing.mkdir()
+    model_dir, _probe_p, _cost_p, stats = _fixture(
+        sizing, nvfp4_dloss=1e-4, fp8_dloss=1e-6)
+    nvfp4_bytes, _floor = _artifact_bytes(model_dir, "NVFP4", stats)
+    fp8_bytes, _ = _artifact_bytes(model_dir, "FP8_E4M3", stats)
+
+    with pytest.raises(SystemExit, match="below the floor"):
+        _menu_floor_scenario(
+            monkeypatch, tmp_path,
+            disk_gb=(nvfp4_bytes + _OVERHEAD_RESERVE - 5_000) / fp.GB)
+
+    selection = json.loads((tmp_path / "selection.json").read_text())
+    assert not selection["feasible"] and selection["below_floor"]
+    cheapest = selection["cheapest_whole_artifact_upper_bound_gb"] * fp.GB
+    # The floor quoted is the MENU's cheapest allocation, not the cheapest
+    # rung the sweep happened to sample.
+    assert cheapest == pytest.approx(
+        float(nvfp4_bytes + _OVERHEAD_RESERVE), abs=1.0)
+    assert cheapest < fp8_bytes
+    assert selection["pareto_grid_extension"]["added_targets"]
