@@ -1849,10 +1849,17 @@ Gridbook commit, so an A/B cannot silently compare different runtime code.
 CB rung ranges, serialized packing/type-size rules, and supported producer-profile ids.
 PrismaQuant's required `gridbook-contract` CI job VCS-installs the exact pinned commit, verifies
 its PEP 610 provenance and package version, and compares the producer's declarations against
-that contract. Adding an architecture or changing a runtime ABI therefore starts in Gridbook,
-then advances this repository's single pin only after the contract test passes. PrismaQuant does
-not import Gridbook while exporting and carries no parallel runtime alias or loader table. Its
-producer codec remains an intentionally independent implementation of the artifact ABI; CI
+that contract. That job is also where the **K0.2** stage attestation runs end to end in a single
+process: `tests/test_gridbook_attestation_interop.py` emits a routed-MoE record with the real
+producer and feeds it to the pinned runtime's parser, payload validator, stage verifier, and
+artifact-level K0.2 verdict. It exists because a stage entry must declare *exactly* its five
+attested fields while every digest in the contract is framed over those same five by name — so a
+field ADDED on the producer side moves no hex, leaves both repositories' suites green, and fails
+for the first time at vLLM model load. Adding an architecture or changing a runtime ABI therefore
+starts in Gridbook, then advances this repository's single pin only after the contract test
+passes. PrismaQuant does not import Gridbook while exporting and carries no parallel runtime
+alias or loader table. Its producer codec remains an intentionally independent implementation of
+the artifact ABI; CI
 compares every packing/layout field and every rung so incompatibility fails at the boundary.
 
 At runtime `register()` registers `"gridbook"` plus the legacy artifact alias `"prismaquant"`
@@ -1999,12 +2006,33 @@ adds only `8,019,608` bytes to the proposed 92 GB artifact, so it is the quality
 low-concurrency arm; native NVFP4 is the TTFT/batching/speculative-throughput arm because its
 kernel crossover occurs before `M=4`. Whole-model served A/B remains authoritative.
 
-**Implementation status:** this constrained Pareto formulation is normative
-future work, not current allocator behavior. Today the profile legality masks
-(including signed-rung exclusion) are enforced, tensor-payload costs feed the
-quality-only allocator, and final SLO/quality selection is an external release
-gate. A format allow-list does not prove a backend, activation contract, or
-promotion state; those live in the structured native-parity benchmark record. For the DSv4
+**Implementation status: SHIPPED (ultraplan P5c, `b052255`).** The constrained
+Pareto formulation above is current allocator behaviour, not future work.
+`prismaquant/serve_constraints.py` + `prismaquant/serve_dispatch_table.py` are
+wired into the allocator (`allocator.py:158-163` imports, `:1979-2009` context
+construction and the ACTIVE/INACTIVE banner, `:2951` the per-assignment
+evaluation). The constraints are **hard and enforced at assignment level** — in
+the exact-payload / byte-budget ratchet, on the EXPANDED promoted assignment
+that actually ships, not inside `solve_allocation`'s bits-DP, whose
+unconstrained semantics are unchanged and pinned by test. An assignment that
+misses p95 TTFT, p95 ITL, p05 TPS or `resident + KV + peak_scratch` is
+INFEASIBLE and leaves the candidate set; it is never merely re-ranked. There is
+**no λ**, no phase-weighted `serve_ms` and no default workload mix: the
+objective is still exactly minimum predicted Δloss, with the existing ratchet
+tie-break. Fail-closed — an assignment the dispatch table cannot price is
+infeasible, not passed. Supplying no table and no SLOs leaves every code path
+**byte-identical** to the pre-P5c allocator, with a stamp recording that
+constraints were absent. Profile legality masks (including signed-rung
+exclusion) are enforced as before. What has *not* changed is the promotion
+rule: table-driven latency is proposal data, and the same-session served
+NATIVE-PARITY protocol is what promotes an assignment. A format allow-list
+still does not prove a backend, activation contract, or promotion state; those
+live in the structured native-parity benchmark record. Normative policy and the
+full shipped/gating split: `docs/lanes/nvfp4-cb/format-speed-policy.md:42-98`
+("What is implemented, and what still gates promotion"); design and the eight
+named assumptions: `docs/design/constrained_pareto_allocation.md`.
+
+For the DSv4
 92 GB study, the quality arm is 35 routed-expert layers at K15, eight provisional layers
 `23,24,25,27,28,31,32,33` at K14, and 301 ordinary Linears at K36: tensor payload
 `91,724,116,088` bytes, or `91,992,551,544` bytes with the 256 MiB reserve. Replacing those
