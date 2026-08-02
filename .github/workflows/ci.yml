@@ -103,7 +103,11 @@ jobs:
   # Cross-project compatibility without a source mirror. The one JSON pin is
   # immutable; PEP 610 proves the installed runtime came from that exact Git
   # commit. The packaged consumer contract is compared with PrismaQuant's
-  # independent producer layout/rung source rather than copied into it.
+  # independent producer layout/rung source rather than copied into it. This
+  # job is also the only place the K0.2 stage attestation is executed end to
+  # end: one process emits a routed-MoE record here and parses it there, so a
+  # producer-side field that no digest can see fails in CI and not at model
+  # load (tests/test_gridbook_attestation_interop.py).
   gridbook-contract:
     name: pinned Gridbook contract
     runs-on: ubuntu-24.04
@@ -133,4 +137,5 @@ jobs:
         run: |
           pytest tests/test_gridbook_runtime_contract.py \
             tests/test_gridbook_artifact_conformance.py \
+            tests/test_gridbook_attestation_interop.py \
             tests/test_profile_export_lanes.py -q --timeout=300 -p no:cacheprovider
