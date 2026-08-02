@@ -76,7 +76,7 @@ from prismaquant.nvfp4_activation_contract import (
     NVFP4_ACTIVATION_CONTRACT_SCHEMA,
     NVFP4_ACTIVATION_EXECUTION,
     build_execution_contract,
-    calibrated_input_global_scales,
+    calibrated_input_global_scales_with_sources,
     input_global_scale_tensor,
     resolve_input_global_scale_policy,
 )
@@ -893,7 +893,10 @@ def export_nvfp4_cb(
             if packed_candidates and _profile is not None
             else {}
         )
-        logical_scales = calibrated_input_global_scales(
+        (
+            logical_scales,
+            activation_calibration_sources,
+        ) = calibrated_input_global_scales_with_sources(
             fp4_activation_targets,
             activation_cache_dir=activation_cache_dir,
             policy=activation_scale_policy_id,
@@ -908,6 +911,8 @@ def export_nvfp4_cb(
             logical_scales,
             policy=activation_scale_policy_id,
             target_name=_resident_export_target,
+            calibration_sources=activation_calibration_sources,
+            profile=_profile,
         )
 
     # --- Pack targets; copy everything else verbatim. ---

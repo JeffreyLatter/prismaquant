@@ -171,6 +171,46 @@ replaced with what it does and what still gates promotion.
   no stock-compressed-tensors packed-expert emit path exists, and building one
   is out of scope under the one-payload / no-new-packer rule.
 
+### Routed-MoE stage attestation in the execution contract (gridbook K0.2)
+
+- The NVFP4 W4A4 execution-contract record now carries a per-packed-FusedMoE
+  stage section under `routed_moe_stages`
+  (`prismaquant.nvfp4_w4a4_activation_stages.v1`). Each module attests BOTH
+  stages — `w13` (the experts-module input) and `w2` (the routed intermediate)
+  — with the stage label, the exact serialized physical target prefix, the
+  input-global-scale policy, the calibration source that produced the scalar,
+  and a per-stage value digest. A section digest covers the whole set. The
+  scales were already stage-specific by construction (distinct physical
+  targets; `unify_fused_sibling_input_global_scales` never joins across
+  stages); what was missing was an attestation making that verifiable by a
+  consumer.
+- **Deliberate record-schema bump.** A record carrying the stage section
+  declares `prismaquant.nvfp4_w4a4_activation.v2`; a dense-only record still
+  declares `...v1` and is byte-identical to before. `target_values_sha256` is
+  still framed with the **v1** literal, so the whole-model digest fields never
+  move under the bump and an old reader verifies exactly what it always
+  verified. The bump exists so a reader that cannot check stage attestation
+  fails closed on a routed-MoE artifact instead of accepting a fused-readiness
+  claim it cannot verify.
+- `calibrated_input_global_scales_with_sources` reports which mechanism
+  produced each scalar (target cache, parent experts-module cache, supplemental
+  module-input sample, supplemental routed-intermediate replay, supplemental
+  max-abs, packed-expert render max-abs). The stage attestation refuses an
+  illegal pairing in either direction: `w2` can never be calibrated from the
+  experts-module input, and `w13` can never be calibrated from a routed-
+  intermediate replay.
+- Fails closed exactly as before on a missing calibration input, and
+  additionally makes it impossible to emit a routed-MoE artifact whose contract
+  claims fused readiness with only one stage attested, or with no calibration
+  source at all.
+- All three emit paths build the section through one shared builder: the
+  resident CB exporter, the streaming CB exporter (same inputs → byte-identical
+  contract, as the existing resident-vs-streaming identity test requires), and
+  the legacy native-compressed packed-expert path. The native container still
+  publishes no `execution_contracts` record — its activation scalars remain
+  optional/defaultable — but it now refuses to render a packed FusedMoE stage
+  whose sibling stage has no calibrated max-abs.
+
 ## 0.5.2 — 2026-08-01
 
 This patch release advances the immutable runtime boundary to Gridbook 0.5.0
