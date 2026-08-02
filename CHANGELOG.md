@@ -2,14 +2,16 @@
 
 ## Unreleased
 
-Producer-side items **P5a** and **P5b** of the cross-repo performance
-ultraplan, [gridbook
+Producer-side items **P5a**–**P5d** of the cross-repo performance ultraplan,
+[gridbook
 `docs/audits/ultraplan_perf_2026-08-01.md`](https://github.com/RobTand/gridbook/blob/main/docs/audits/ultraplan_perf_2026-08-01.md)
-§6 ("Producer-side allocation: NVFP4 vs FP8-CB at matched bytes"). These
-change how candidates are **priced and described**, not what the solver
-optimizes: `solve_allocation`'s DP semantics are untouched, and no latency
-term enters the objective or the constraints (that is P5c, still
-unimplemented — see `docs/lanes/nvfp4-cb/format-speed-policy.md` §1).
+§6 ("Producer-side allocation: NVFP4 vs FP8-CB at matched bytes").
+
+P5a and P5b change how candidates are **priced and described**;
+`solve_allocation`'s DP semantics are untouched. P5c adds a **second hard
+constraint axis** — served latency and device memory — at assignment level,
+still without changing the DP and still without any λ: latency never enters
+the objective. P5d adds the D0.3 exact-rate experiment harness.
 
 ### Activation-fair pricing on the weight-only cost branches (P5a)
 
@@ -66,6 +68,108 @@ unimplemented — see `docs/lanes/nvfp4-cb/format-speed-policy.md` §1).
   selected rungs ride a backed fused lane versus the expand+GEMM fallback —
   the producer-side mirror of gridbook K1.2, so neither repo can price an
   unbacked fast path.
+
+### The constrained Pareto solver (P5c)
+
+`docs/lanes/nvfp4-cb/format-speed-policy.md` §1 specified this solver and
+deferred it ("not yet implemented"). It exists now; that paragraph has been
+replaced with what it does and what still gates promotion.
+
+- Added `prismaquant/serve_dispatch_table.py`: a torch-free declarative schema
+  (`prismaquant.serve_dispatch_table.v1`) for measured per-(format-family,
+  phase, M-regime, serving-lane) serving costs. **Provenance is mandatory on
+  every row** — source document, date, GPU identity, measured quantity, units,
+  and the derivation from the published number to the ratio — and a row
+  without a source is a load error, not a defaulted field.
+- Each `(phase, M-regime)` **arena** names exactly one reference route, so
+  ratios measured against different denominators can never be silently
+  composed (the 27B 1.44× is against a native artifact; the fused mid-M
+  1.04×/1.26×/1.45× are against FP8-CB's own expand+GEMM route — multiplying
+  them would manufacture a measurement). Isolated-operator (`operator_ms`)
+  arenas and arenas with no published absolute are kept as evidence but are
+  never SLO-eligible: policy §5, "raw standalone kernel timing is never served
+  evidence".
+- Shipped ONE example table,
+  `prismaquant/serve_dispatch_tables/gridbook_gb10_2026-08-01.example.json`,
+  populated **only** from measurements already published in Gridbook, each row
+  citing its source. It is marked proposal data in both the file and the
+  module docstring. It deliberately has **no whole-model NVFP4_CB row**: none
+  is published, so an assignment containing NVFP4_CB cannot be certified
+  against a latency SLO from it, and the evaluator refuses rather than
+  interpolating.
+- Added `prismaquant/serve_constraints.py`: policy §1's hard constraints
+  (p95 TTFT, p95 ITL, p05 TPS, `resident + KV + peak_scratch`) evaluated on the
+  exact expanded assignment. **No λ-blended objective anywhere.** Prefill and
+  decode stay separate constraints. An assignment that misses an SLO is
+  INFEASIBLE — removed from the candidate set, never re-ranked — and the
+  objective and its tie-break (min predicted Δloss, ties toward the larger
+  footprint) are unchanged among the survivors.
+- Enforced at **assignment level**, in the byte-budget ratchet beside the
+  exact byte filter, not inside `solve_allocation`. The DP is unchanged for
+  the unconstrained case and that is pinned by test; the filter also sees the
+  promoted, expanded assignment that actually ships, which the DP does not.
+  The solver claims no global optimality it does not have: it stamps that
+  every ACCEPTED assignment is feasible on both axes, not that the feasible
+  set was enumerated.
+- The aggregation model is explicit and stamped
+  (`additive_layer_time__param_share_weighted__table_driven_proposal`) with
+  **eight named assumptions** — additivity, parameter-share weighting, route
+  locality, regime uniformity, baseline transfer, resident bytes, the
+  single-stream `p05_TPS = 1000 / p95_ITL_ms` identity, and statistic
+  transfer — carried in every artifact, along with policy §1's
+  fastest-globally-feasible-assignment rule for any relative-tax denominator.
+- Fail-closed: a unit with no dispatch row, an arena with no absolute
+  reference, and an operator-microbenchmark arena all make the phase UNPRICED
+  and therefore infeasible. "We could not price it" is never "it passed".
+- Lane-aware pricing consumes P5b: a rung whose fused mid-M lane the pinned
+  Gridbook version does not instantiate is priced with its **fallback** route's
+  row, never the fused lane's. `FP8_CB_K36` (backed by 0.5.0) and
+  `FP8_CB_K37` (not) therefore take different table rows despite sharing a
+  family and a bpw class.
+- `selection.json` records which constraints were active, which probed
+  assignments the SLO axis rejected and the limit that rejected each, and
+  which constraint binds at the shipped optimum. With no table and no SLOs
+  supplied, every code path is byte-identical to the pre-P5c allocator apart
+  from a stamp saying constraints were absent — pinned by an end-to-end test
+  that compares `selection.json` and `layer_config.json` across a run with the
+  feature absent and a run with it present-but-unused.
+- New allocator flags: `--serve-dispatch-table`, `--serve-workload-mix`,
+  `--slo-prefill-p95-ttft-ms`, `--slo-decode-p95-itl-ms`,
+  `--slo-decode-p05-tps`, `--serve-device-budget-bytes`, `--serve-kv-bytes`,
+  `--serve-peak-scratch-bytes`. Wired into `run-pipeline.sh` as
+  `SERVE_DISPATCH_TABLE`, `SERVE_WORKLOAD_MIX`, `SLO_*`,
+  `SERVE_DEVICE_BUDGET_BYTES`, `SERVE_KV_BYTES`, `SERVE_PEAK_SCRATCH_BYTES`
+  and recorded in `STAGE_SETTINGS_ENV`. There is **no default workload mix**:
+  policy §1 forbids one hidden in the allocator, and a latency SLO with no
+  table or mix is refused by name.
+- Design note: `docs/design/constrained_pareto_allocation.md`.
+
+### D0.3 exact-rate experiment harness (P5d)
+
+- Added `prismaquant/d03_exact_rate.py` and `scripts/run_d03_exact_rate.sh`:
+  the two experiments gridbook ROADMAP **D0.3** names, run against a model's
+  existing probe/cost artifacts. (i) `FP8_CB_K36` vs vanilla `NVFP4` on dense
+  units at matched **exact whole-artifact bytes**, using the same non-additive
+  accounting as the allocator's exact filter (shared CB codebook sidecars
+  charged once per physical identity). (ii) Below 4.5 bpw, byte-neutral sweeps
+  whose vanilla-NVFP4 promotions are **funded** by demoting other units down
+  their own CB ladder, with a reclaim pass so each point sits at the baseline
+  rate rather than under it.
+- Each arm reports its assignment, exact bytes, predicted Δloss under the new
+  activation-fair pricing, the P5c constraint verdict, and the serving-lane
+  provenance (which selected rungs ride a backed fused lane).
+- **Two refusals.** No cross-family verdict is printed when P5a's band check
+  failed — suppressing it is that check's entire purpose, and printing it with
+  a caveat would defeat it. No quality verdict follows when the two arms miss
+  the ≤0.1% whole-artifact byte-match target policy §5 already names (the
+  threshold the published 0.6B endpoint pair missed at +0.154%).
+- **The harness prepares release-gate evidence; it does not claim it.** Every
+  output is labelled proposal data pending the served NATIVE-PARITY protocol.
+- Packed-expert vanilla NVFP4 is **excluded** from the contest and the
+  exclusion is recorded explicitly in every report, citing gridbook **D0.2**:
+  the producer profile denies stock NVFP4/FP8 on packed expert stacks because
+  no stock-compressed-tensors packed-expert emit path exists, and building one
+  is out of scope under the one-payload / no-new-packer rule.
 
 ## 0.5.2 — 2026-08-01
 
