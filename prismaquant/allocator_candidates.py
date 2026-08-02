@@ -9,6 +9,17 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import format_registry as fr
+from .activation_fair_pricing import (
+    APPLIED_MARKER_KEY,
+    BRANCH_ACTIVATION_IDENTITY,
+    BRANCH_BIT_EXACT,
+    BRANCH_CALIBRATED,
+    BRANCH_MEASURED,
+    BRANCH_UNCALIBRATED,
+    ActivationFairPricing,
+    CalibrationRow,
+)
+from .activation_fair_pricing import calibrate as _calibrate_activation_pricing
 from .allocator_solver import (
     Candidate,
     PackedExpertRoleUnknown,
@@ -21,8 +32,11 @@ from .nvfp4_cb_footprint import (
     is_cb_format,
 )
 from .serving_profiles import (
+    SERVING_LANE_SCHEMA,
     check_serving_format,
     check_serving_shape,
+    gridbook_runtime_version,
+    serving_lane_route,
 )
 
 PASSTHROUGH_SOURCE_REQUIREMENTS: dict[str, str] = {
@@ -369,34 +383,49 @@ def _fisher_output_mse_allocator_enabled() -> bool:
     return value.strip().lower() not in {"", "0", "false", "no", "off"}
 
 
-def cost_entry_predicted_dloss(
+def cost_entry_measured_activation_dloss(
     stats_entry: dict,
     cost_entry: dict,
     *,
     gain: float = 1.0,
-    format_name: str | None = None,
 ) -> float:
-    """Return the allocator's authoritative Δloss for one cost entry."""
-    if cost_entry_is_bit_exact(cost_entry, format_name):
-        # Lossless re-encode END TO END (weights verbatim AND identity
-        # activation path): zero cost by construction, regardless of any
-        # noisy output_mse measurement (see cost_entry_is_bit_exact).
-        return 0.0
-    if _has_measured_output_mse(stats_entry, cost_entry):
-        if (
-            _fisher_output_mse_allocator_enabled()
-            and "fisher_output_mse" in cost_entry
-        ):
-            return predicted_dloss(
-                stats_entry["h_trace"],
-                float(cost_entry["fisher_output_mse"]),
-                gain=gain,
-            )
+    """The ACTIVATION-INCLUSIVE price of one row, or 0.0 when unmeasured.
+
+    Split out of ``cost_entry_predicted_dloss`` so the P5a calibration reads
+    exactly the number the measured branch would have priced — one
+    implementation of "what does the output_mse branch say", not a second
+    copy that can drift from the precedence chain it calibrates against.
+    ``measure_quant_cost`` applies ``activation_quantize_dequantize(X)``
+    before measuring ``output_mse``, which is why this branch — and only this
+    branch — carries the A side.
+    """
+    if (
+        _fisher_output_mse_allocator_enabled()
+        and "fisher_output_mse" in cost_entry
+    ):
         return predicted_dloss(
             stats_entry["h_trace"],
-            float(cost_entry["output_mse"]),
+            float(cost_entry["fisher_output_mse"]),
             gain=gain,
         )
+    return predicted_dloss(
+        stats_entry["h_trace"],
+        float(cost_entry.get("output_mse", 0.0)),
+        gain=gain,
+    )
+
+
+def cost_entry_weight_only_dloss(
+    stats_entry: dict,
+    cost_entry: dict,
+    *,
+    gain: float = 1.0,
+) -> float:
+    """The WEIGHT-ONLY price of one row (``predicted_dloss``/``weight_mse``).
+
+    Uncorrected by any activation calibration — this is the number the
+    calibration divides into, and the number the correction multiplies.
+    """
     if "predicted_dloss" in cost_entry:
         base = float(cost_entry["predicted_dloss"])
         # Uncertainty-aware allocation (opt-in): charge z·stderr on top of the
@@ -416,6 +445,95 @@ def cost_entry_predicted_dloss(
         float(cost_entry.get("weight_mse", 0.0)),
         gain=gain,
     )
+
+
+def cost_entry_activation_pricing_branch(
+    stats_entry: dict,
+    cost_entry: dict,
+    format_name: str | None = None,
+    activation_pricing: ActivationFairPricing | None = None,
+) -> str:
+    """Name the estimator that priced one row's ACTIVATION contract.
+
+    Orthogonal to ``cost_entry_source`` (which names the cost *field*): this
+    answers the audit's question — did this row's price ever see the A side,
+    and if not, was it corrected? Stamped on every ``Candidate`` so the
+    question is answerable from the artifact rather than from the code
+    version that produced it.
+    """
+    if cost_entry_is_bit_exact(cost_entry, format_name):
+        return BRANCH_BIT_EXACT
+    if _has_measured_output_mse(stats_entry, cost_entry):
+        return BRANCH_MEASURED
+    if cost_entry.get(APPLIED_MARKER_KEY) is True:
+        # An aggregated super-item entry: the members' penalties are already
+        # folded into its predicted_dloss (aggregate_* below).
+        return BRANCH_CALIBRATED
+    act_changes = _format_act_quant_changes_input(format_name)
+    if activation_pricing is None:
+        return (
+            BRANCH_ACTIVATION_IDENTITY if not act_changes
+            else BRANCH_UNCALIBRATED
+        )
+    return activation_pricing.penalty_for(format_name, act_changes)[1]
+
+
+def _format_act_quant_changes_input(format_name: str | None) -> bool:
+    if format_name is None:
+        return False
+    try:
+        return bool(fr.get_format(str(format_name)).act_quant_changes_input)
+    except KeyError:
+        return False
+
+
+def _activation_penalty(
+    format_name: str | None,
+    activation_pricing: ActivationFairPricing | None,
+) -> float:
+    if activation_pricing is None:
+        return 1.0
+    return activation_pricing.penalty_for(
+        format_name, _format_act_quant_changes_input(format_name))[0]
+
+
+def cost_entry_predicted_dloss(
+    stats_entry: dict,
+    cost_entry: dict,
+    *,
+    gain: float = 1.0,
+    format_name: str | None = None,
+    activation_pricing: ActivationFairPricing | None = None,
+) -> float:
+    """Return the allocator's authoritative Δloss for one cost entry.
+
+    ``activation_pricing`` (P5a) applies the per-family activation calibration
+    to the WEIGHT-ONLY branches only — the measured branch is already
+    activation-inclusive and the bit-exact branch is, by construction, an
+    identity activation path. ``None`` (the default) is bit-for-bit the
+    pre-P5a precedence, which is what ``kl_measurement`` and every direct
+    caller outside candidate construction still want.
+
+    The correction is multiplicative, so it scales the UCB hedge with the
+    point estimate (both are in the same weight-only units and the transfer
+    to the measured scale applies to both), and it cannot lift an exactly-0.0
+    price off zero — ``cost_entry_prices_unmeasured_activation_at_zero``
+    keeps its full strength.
+    """
+    if cost_entry_is_bit_exact(cost_entry, format_name):
+        # Lossless re-encode END TO END (weights verbatim AND identity
+        # activation path): zero cost by construction, regardless of any
+        # noisy output_mse measurement (see cost_entry_is_bit_exact).
+        return 0.0
+    if _has_measured_output_mse(stats_entry, cost_entry):
+        return cost_entry_measured_activation_dloss(
+            stats_entry, cost_entry, gain=gain)
+    base = cost_entry_weight_only_dloss(stats_entry, cost_entry, gain=gain)
+    if cost_entry.get(APPLIED_MARKER_KEY) is True:
+        # Aggregated super item: its members were penalized individually and
+        # the result summed. Re-applying here would square the correction.
+        return base
+    return base * _activation_penalty(format_name, activation_pricing)
 
 
 ACTIVATION_COST_UNMEASURED_REASON = "activation_cost_unmeasured"
@@ -489,6 +607,92 @@ def cost_entry_prices_unmeasured_activation_at_zero(
     return h_trace > 0.0
 
 
+def collect_activation_calibration_rows(
+    stats: dict,
+    costs: dict,
+    formats: list[fr.FormatSpec],
+) -> tuple[list[CalibrationRow], dict[str, int], dict[str, int]]:
+    """Extract the P5a calibration sample from the run's own cost tables.
+
+    Returns ``(rows, measured_rows_by_family, weight_only_rows_by_family)``
+    over ACTIVATION-QUANTIZING formats only (``act_quant_changes_input``): a
+    passthrough/A16 rung has no A side to transfer, and its measured-vs-
+    weight-only disagreement is a different question.
+
+    A row joins the calibration sample when it carries BOTH estimators —
+    a real measured ``output_mse`` (``_has_measured_output_mse``) AND a
+    weight-only field, both strictly positive. Exactly-zero prices are
+    excluded on both sides: a zero denominator has no ratio, and a zero
+    measured price is the lossless-re-encode case the bit-exact
+    short-circuit and ``cost_entry_prices_unmeasured_activation_at_zero``
+    already own.
+
+    Everything is computed at ``gain=1.0`` (the ratio is gain-invariant) and
+    the iteration order is the sorted cost table, so the sample — and its
+    digest — is deterministic.
+    """
+    rows: list[CalibrationRow] = []
+    measured_by_family: dict[str, int] = {}
+    weight_only_by_family: dict[str, int] = {}
+    for spec in formats:
+        if not spec.act_quant_changes_input:
+            continue
+        family = str(spec.family)
+        measured_by_family.setdefault(family, 0)
+        weight_only_by_family.setdefault(family, 0)
+        for name in sorted(costs):
+            stats_entry = stats.get(name)
+            if not isinstance(stats_entry, dict):
+                continue
+            entry, _entry_fmt = _resolve_cost_entry(costs[name], spec.name)
+            if entry is None or "error" in entry:
+                continue
+            if cost_entry_is_bit_exact(entry, spec.name):
+                continue
+            if _has_measured_output_mse(stats_entry, entry):
+                measured_by_family[family] += 1
+                if not ("predicted_dloss" in entry or "weight_mse" in entry):
+                    continue
+                measured = cost_entry_measured_activation_dloss(
+                    stats_entry, entry)
+                weight_only = cost_entry_weight_only_dloss(stats_entry, entry)
+                if measured > 0.0 and weight_only > 0.0:
+                    rows.append(CalibrationRow(
+                        qname=str(name),
+                        fmt=spec.name,
+                        family=family,
+                        measured_dloss=float(measured),
+                        weight_only_dloss=float(weight_only),
+                    ))
+            else:
+                weight_only_by_family[family] += 1
+    return rows, measured_by_family, weight_only_by_family
+
+
+def calibrate_activation_fair_pricing(
+    stats: dict,
+    costs: dict,
+    formats: list[fr.FormatSpec],
+    *,
+    enabled: bool | None = None,
+) -> ActivationFairPricing:
+    """Calibrate the per-family activation penalty ONCE for a run.
+
+    The allocator calls this before ``build_candidates`` and threads the
+    result through every candidate-construction path, so body, MTP and visual
+    menus share one fit (the audit's "calibrated once per model") instead of
+    three menu-dependent ones.
+    """
+    rows, measured, weight_only = collect_activation_calibration_rows(
+        stats, costs, formats)
+    return _calibrate_activation_pricing(
+        rows,
+        measured_rows_by_family=measured,
+        weight_only_rows_by_family=weight_only,
+        enabled=enabled,
+    )
+
+
 def _cost_ucb_z() -> float:
     """PRISMAQUANT_COST_UCB_Z: stderr multiples added to predicted_dloss."""
     try:
@@ -521,7 +725,15 @@ def _super_item_ucb_hedge(member_terms, ucb_z: float) -> tuple[float, float]:
     estimates are independent measurements, so the stderr of the group SUM is
     ``sqrt(Σ (stderr·gain)²)``.
 
-    ``member_terms`` yields ``(stats_entry, cost_entry, member_dloss, gain)``.
+    ``member_terms`` yields ``(stats_entry, cost_entry, member_dloss, scale)``
+    where ``scale`` is every multiplicative factor already applied to that
+    member's dloss but NOT to the raw ``predicted_dloss_stderr`` in the cost
+    row — the calibrated gain and, since ultraplan P5a, the per-family
+    activation penalty. Both scale the point estimate and its stderr
+    identically, so a member whose price was penalized must have its stderr
+    penalized too or the conversion would over-subtract the linear hedge it
+    exists to undo.
+
     Returns ``(hedge_linear, stderr_agg)``: subtract ``hedge_linear`` from the
     member sum and add ``ucb_z * stderr_agg`` to get the independence
     aggregate. At ``ucb_z == 0`` ``hedge_linear`` is exactly 0.0, so the
@@ -561,18 +773,32 @@ def build_candidates(stats: dict, costs: dict, formats: list[fr.FormatSpec],
                      target_profile: str | None = None,
                      mask_records: list[dict] | None = None,
                      cb_serialization_context: CBSerializationContext | None = None,
+                     activation_pricing: ActivationFairPricing | None = None,
                      ) -> dict[str, list[Candidate]]:
     """Build runtime-legal format candidates for every measured Linear.
 
     This is the optimizer's first legality gate. Export keeps a final
     defensive check for stale or hand-written recipes, but the DP must never
     see choices that the selected serving profile cannot run.
+
+    ``activation_pricing`` (ultraplan P5a) is the run's ONE per-family
+    activation calibration; it corrects the weight-only branches and stamps
+    the branch that priced every candidate. ``target_profile``'s declared
+    serving lanes (P5b) are resolved once per format and attached to every
+    candidate, so the concrete route — activation contract, whether the
+    consumer's fused mid-M kernel backs this rung, fallback — travels WITH
+    the choice instead of being reconstructed from the format name later.
     """
     gains = calibrated_gains or {}
     out: dict[str, list[Candidate]] = {}
     masked: dict[tuple[str, str], list[str]] = {}
     source_counts: Counter[str] = Counter()
+    activation_branch_counts: Counter[str] = Counter()
     unpriceable: dict[str, list[str]] = {}
+    lane_by_format: dict[str, object] = {
+        spec.name: serving_lane_route(target_profile, spec.name)
+        for spec in formats
+    }
     for name, s in stats.items():
         if name not in costs:
             continue
@@ -624,7 +850,8 @@ def build_candidates(stats: dict, costs: dict, formats: list[fr.FormatSpec],
             # cost_entry_predicted_dloss falls back to predicted_dloss or
             # weight_mse for those entries.
             predicted = cost_entry_predicted_dloss(
-                s, entry, gain=gain, format_name=spec.name)
+                s, entry, gain=gain, format_name=spec.name,
+                activation_pricing=activation_pricing)
             priced = max(predicted, 0.0)
             if cost_entry_prices_unmeasured_activation_at_zero(
                     s, entry, priced, spec.name):
@@ -666,6 +893,9 @@ def build_candidates(stats: dict, costs: dict, formats: list[fr.FormatSpec],
                 unpriceable.setdefault(name, []).append(spec.name)
                 continue
             source_counts[cost_entry_source(s, entry, spec.name)] += 1
+            activation_branch = cost_entry_activation_pricing_branch(
+                s, entry, spec.name, activation_pricing)
+            activation_branch_counts[activation_branch] += 1
             (
                 memory_bytes,
                 serialized_identity,
@@ -684,6 +914,9 @@ def build_candidates(stats: dict, costs: dict, formats: list[fr.FormatSpec],
                 s.setdefault("_serialized_sidecar_identity_by_format", {})[
                     spec.name
                 ] = serialized_sidecar_identity
+            lane = lane_by_format.get(spec.name)
+            if lane is not None:
+                s.setdefault("_serving_lane_by_format", {})[spec.name] = lane
             cands.append(Candidate(
                 fmt=spec.name,
                 bits_per_param=8.0 * memory_bytes / max(int(math.prod(shape)), 1),
@@ -691,6 +924,8 @@ def build_candidates(stats: dict, costs: dict, formats: list[fr.FormatSpec],
                 predicted_dloss=priced,
                 serialized_identity=serialized_identity,
                 serialized_sidecar_identity=serialized_sidecar_identity,
+                activation_pricing=activation_branch,
+                serving_lane=lane,
             ))
         if cands:
             out[name] = cands
@@ -706,6 +941,15 @@ def build_candidates(stats: dict, costs: dict, formats: list[fr.FormatSpec],
             f"{source}={count}" for source, count in sorted(source_counts.items())
         )
         print(f"[alloc] cost-source usage: {summary}", flush=True)
+    if activation_branch_counts:
+        # The audit's core complaint made visible per run: how many priced
+        # rows never saw an activation measurement, and of those how many the
+        # per-family calibration corrected.
+        summary = ", ".join(
+            f"{branch}={count}"
+            for branch, count in sorted(activation_branch_counts.items())
+        )
+        print(f"[alloc] activation-pricing branch: {summary}", flush=True)
     starved = sorted(n for n in unpriceable if n not in out)
     if starved:
         # Excluding the unmeasured-activation candidates left these Linears
@@ -736,6 +980,85 @@ def build_candidates(stats: dict, costs: dict, formats: list[fr.FormatSpec],
             "MXFP8A16) in the format menu."
         )
     return out
+
+
+def selection_serving_lane_provenance(
+    assignment: dict[str, str],
+    candidates: dict[str, list[Candidate]] | None = None,
+    target_profile: str | None = None,
+) -> dict:
+    """Per-selected-unit serving-route + activation-pricing provenance (P5b).
+
+    "Neither repo can price an unbacked lane" only holds if the shipped
+    artifact says which lane every selected unit actually rides. This walks
+    the FINAL (expanded) assignment and reports, per format and in aggregate:
+    the activation contract, whether the consumer's fused mid-M kernel backs
+    that rung, the fallback route it takes when it does not, and which
+    estimator priced the unit's activation cost.
+
+    Routes are read from the chosen ``Candidate`` where one exists — the
+    candidate is the object the DP actually saw — and re-resolved from the
+    target profile for expanded members of aggregated super items, which have
+    no candidate of their own. The two agree by construction (the lane is a
+    function of format and profile); the fallback exists so an expanded
+    packed-expert assignment is not silently reported as laneless.
+    """
+    lane_cache: dict[str, object] = {}
+    by_format: dict[str, dict] = {}
+    branch_counts: Counter[str] = Counter()
+    contract_counts: Counter[str] = Counter()
+    backed_rungs: set[int] = set()
+    fallback_rungs: set[int] = set()
+    n_backed = n_fallback = n_no_lane = 0
+
+    for name in sorted(assignment):
+        fmt = str(assignment[name])
+        lane = None
+        branch = None
+        for cand in (candidates or {}).get(name, ()):
+            if cand.fmt == fmt:
+                lane = cand.serving_lane
+                branch = cand.activation_pricing
+                break
+        if lane is None:
+            if fmt not in lane_cache:
+                lane_cache[fmt] = serving_lane_route(target_profile, fmt)
+            lane = lane_cache[fmt]
+        branch_counts[str(branch) if branch else "unrecorded"] += 1
+        if lane is None:
+            n_no_lane += 1
+            by_format.setdefault(fmt, {
+                "format": fmt, "units": 0, "route": None})["units"] += 1
+            continue
+        row = by_format.setdefault(fmt, {
+            "format": fmt, "units": 0, "route": lane.as_dict()})
+        row["units"] += 1
+        contract_counts[lane.activation_contract or "unspecified"] += 1
+        if lane.fused_mid_m_backed:
+            n_backed += 1
+            if lane.rung is not None:
+                backed_rungs.add(int(lane.rung))
+        else:
+            n_fallback += 1
+            if lane.rung is not None:
+                fallback_rungs.add(int(lane.rung))
+
+    return {
+        "schema": SERVING_LANE_SCHEMA,
+        "target_profile": str(target_profile or "research"),
+        "gridbook_runtime_version": gridbook_runtime_version(),
+        "units_total": len(assignment),
+        "units_on_backed_fused_mid_m_lane": n_backed,
+        "units_on_fallback_route": n_fallback,
+        "units_without_declared_lane": n_no_lane,
+        "selected_rungs_fused_mid_m_backed": sorted(backed_rungs),
+        "selected_rungs_on_fallback_route": sorted(fallback_rungs),
+        "activation_contracts": dict(sorted(contract_counts.items())),
+        "activation_pricing_branches": dict(sorted(branch_counts.items())),
+        "by_format": {
+            fmt: row for fmt, row in sorted(by_format.items())
+        },
+    }
 
 
 def summarize_applicability_masks(records: list[dict]) -> dict:
@@ -798,6 +1121,50 @@ def summarize_applicability_masks(records: list[dict]) -> dict:
     }
 
 
+def _member_activation_branch(
+    member_candidates: dict[str, dict[str, Candidate]],
+    members: list[str],
+    fmt: str,
+) -> str | None:
+    """The activation-pricing branch of an AGGREGATED super item.
+
+    A super item's Δloss is the SUM of its members', so a single member
+    priced on an uncalibrated weight-only branch taints the whole unit's
+    claim. Unanimity reports the branch; disagreement is reported as
+    ``mixed:<a>+<b>`` rather than collapsed to the majority, because "some
+    rows of this serving unit never saw an activation measurement" is
+    precisely the fact the stamp exists to preserve.
+    """
+    branches = sorted({
+        str(member_candidates[m][fmt].activation_pricing)
+        for m in members
+        if member_candidates[m][fmt].activation_pricing is not None
+    })
+    if not branches:
+        return None
+    if len(branches) == 1:
+        return branches[0]
+    return "mixed:" + "+".join(branches)
+
+
+def _member_serving_lane(
+    member_candidates: dict[str, dict[str, Candidate]],
+    members: list[str],
+    fmt: str,
+) -> object | None:
+    """The serving-lane route of an aggregated super item.
+
+    Every member of a fused-sibling / packed serving group loads under ONE
+    format, and the lane is a function of the format and the target profile,
+    so the members' routes are identical by construction.
+    """
+    for m in members:
+        lane = member_candidates[m][fmt].serving_lane
+        if lane is not None:
+            return lane
+    return None
+
+
 _FUSED_SIBLING_MARKER = ".__siblings__."
 
 
@@ -808,6 +1175,7 @@ def aggregate_fused_siblings(
     candidates: dict[str, list[Candidate]],
     profile,
     calibrated_gains: dict[str, float] | None = None,
+    activation_pricing: ActivationFairPricing | None = None,
 ) -> tuple[dict, dict, dict]:
     """Aggregate fused siblings into single DP items.
 
@@ -898,6 +1266,11 @@ def aggregate_fused_siblings(
                 super_cost_entry_fmt[spec.name] = resolved_entries[0][0]
             sum_pred = 0.0
             member_terms = []
+            # P5a: the per-family activation penalty is a MULTIPLIER on the
+            # weight-only branch, so it scales the member dloss and the
+            # member stderr identically — passed as the hedge's scale below
+            # (the calibrated gain enters once, later).
+            act_penalty = _activation_penalty(spec.name, activation_pricing)
             for m, (_entry_fmt, c) in zip(members, resolved_entries):
                 # Mirrors build_candidates, including unmeasured packed
                 # output_mse fallback, bit-exact short-circuit, and
@@ -906,9 +1279,10 @@ def aggregate_fused_siblings(
                 # the per-member terms here — and the hedge conversion — are
                 # un-gained.
                 member_pred = cost_entry_predicted_dloss(
-                    stats[m], c, format_name=spec.name)
+                    stats[m], c, format_name=spec.name,
+                    activation_pricing=activation_pricing)
                 sum_pred += member_pred
-                member_terms.append((stats[m], c, member_pred, 1.0))
+                member_terms.append((stats[m], c, member_pred, act_penalty))
             # Same UCB conversion as aggregate_packed_serving_groups: the
             # LINEAR z·Σ(stderr) baked into sum_pred becomes the independence
             # z·sqrt(Σ stderr²) (a qkv triple over-hedged at 3x linear now
@@ -925,6 +1299,10 @@ def aggregate_fused_siblings(
                 "predicted_dloss": base_pred,
                 "predicted_dloss_stderr": stderr_agg,
             }
+            if activation_pricing is not None:
+                # The members' penalties are already inside base_pred; mark
+                # the super entry so a re-price cannot square the correction.
+                super_cost[spec.name][APPLIED_MARKER_KEY] = True
         costs_ext[super_name] = super_cost
 
         member_format_sets = [
@@ -995,6 +1373,10 @@ def aggregate_fused_siblings(
                 bits_per_param=bits_per_param,
                 memory_bytes=total_bytes,
                 predicted_dloss=max(predicted, 0.0),
+                activation_pricing=_member_activation_branch(
+                    member_by_name, members, spec.name),
+                serving_lane=_member_serving_lane(
+                    member_by_name, members, spec.name),
                 serialized_identity=(
                     json.dumps(serialized_identities, separators=(",", ":"))
                     if serialized_identities else None
@@ -1091,6 +1473,7 @@ def aggregate_packed_serving_groups(
     candidates: dict[str, list[Candidate]],
     profile,
     calibrated_gains: dict[str, float] | None = None,
+    activation_pricing: ActivationFairPricing | None = None,
 ) -> tuple[dict, dict, dict]:
     """Aggregate packed-MoE serving groups into single DP decision units.
 
@@ -1203,6 +1586,10 @@ def aggregate_packed_serving_groups(
             # and the per-format dloss stays the exact sum of member
             # candidates. Shared with aggregate_fused_siblings.
             member_terms = []
+            # P5a: member candidates were priced WITH the family penalty, so
+            # the hedge conversion must scale each member's stderr by the same
+            # factor or it would over-subtract the linear hedge it is undoing.
+            act_penalty = _activation_penalty(spec.name, activation_pricing)
             for m in members:
                 entry, entry_fmt = _resolve_cost_entry(
                     costs.get(m, {}), spec.name)
@@ -1210,7 +1597,8 @@ def aggregate_packed_serving_groups(
                     stats[m],
                     entry,
                     float(member_cands[m][spec.name].predicted_dloss),
-                    float(gains.get(spec.name, gains.get(entry_fmt, 1.0))),
+                    float(gains.get(spec.name, gains.get(entry_fmt, 1.0)))
+                    * act_penalty,
                 ))
             hedge_linear, stderr_agg = _super_item_ucb_hedge(
                 member_terms, ucb_z)
@@ -1221,11 +1609,17 @@ def aggregate_packed_serving_groups(
                 "predicted_dloss": base_pred,
                 "predicted_dloss_stderr": stderr_agg,
             }
+            if activation_pricing is not None:
+                super_cost[spec.name][APPLIED_MARKER_KEY] = True
             cands.append(Candidate(
                 fmt=spec.name,
                 bits_per_param=8.0 * total_bytes / max(n_params, 1),
                 memory_bytes=total_bytes,
                 predicted_dloss=max(hedged_pred, 0.0),
+                activation_pricing=_member_activation_branch(
+                    member_cands, members, spec.name),
+                serving_lane=_member_serving_lane(
+                    member_cands, members, spec.name),
                 serialized_identity=(
                     json.dumps(sorted({
                         identity

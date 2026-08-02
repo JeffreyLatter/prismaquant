@@ -9,23 +9,36 @@ from safetensors.torch import load_file, save_file
 
 from prismaquant.cb_export_config import build_cb_scheme, build_quant_config
 from prismaquant.nvfp4_activation_contract import (
+    CALIBRATION_SOURCE_PACKED_EXPERT_RENDER,
+    CALIBRATION_SOURCE_PARENT_MODULE_CACHE,
+    CALIBRATION_SOURCE_SUPPLEMENTAL_MAX_ABS,
+    CALIBRATION_SOURCE_SUPPLEMENTAL_MODULE_INPUT,
+    CALIBRATION_SOURCE_SUPPLEMENTAL_ROUTED_REPLAY,
+    CALIBRATION_SOURCE_TARGET_CACHE,
     FULL_E4M3_INPUT_GLOBAL_SCALE_POLICY,
     LEGACY_INPUT_GLOBAL_SCALE_POLICY,
     MSE_GRID_INPUT_GLOBAL_SCALE_POLICY,
     NVFP4_ACTIVATION_CONTRACT_KEY,
     NVFP4_ACTIVATION_CONTRACT_SCHEMA,
+    NVFP4_ACTIVATION_CONTRACT_SCHEMA_V2,
     NVFP4_ACTIVATION_EXECUTION,
     NVFP4_INPUT_GLOBAL_SCALE_SUFFIX,
+    NVFP4_ROUTED_MOE_STAGE_KEY,
+    NVFP4_ROUTED_MOE_STAGE_SCHEMA,
     UNCALIBRATED_INPUT_GLOBAL_SCALE,
     build_execution_contract,
+    build_routed_moe_stage_attestation,
     calibrated_input_global_scales,
+    calibrated_input_global_scales_with_sources,
     fused_dense_group,
     fused_sibling_group_key,
     group_fused_sibling_targets,
     input_global_scale_from_max_abs,
     nvfp4_activation_qdq_served,
     resolve_input_global_scale_value,
+    routed_moe_stage,
     select_mse_grid_input_global_scale,
+    stage_values_sha256,
     target_values_sha256,
     unify_fused_sibling_input_global_scales,
     unify_fused_sibling_max_abs,
@@ -576,3 +589,375 @@ def test_v2_stamped_export_remains_fused_ineligible(tmp_path):
     assert qname + ".input_global_scale" not in tensors
     group = next(iter(config["config_groups"].values()))
     assert "activation_contract" not in group["scheme"]
+
+
+# ---------------------------------------------------------------------------
+# ROADMAP K0.2 — routed-MoE stage attestation
+# ---------------------------------------------------------------------------
+
+_W13 = "model.layers.0.mlp.experts.gate_up_proj"
+_W2 = "model.layers.0.mlp.experts.down_proj"
+_STAGE_SOURCES = {
+    _W13: CALIBRATION_SOURCE_PARENT_MODULE_CACHE,
+    _W2: CALIBRATION_SOURCE_SUPPLEMENTAL_ROUTED_REPLAY,
+}
+
+
+class _PackedExpertProfile:
+    """Profile whose on-disk packed-expert leaves are LFM2.5's w1/w3/w2."""
+
+    @staticmethod
+    def packed_expert_role_group(qname):
+        leaf = str(qname).rsplit(".", 1)[-1]
+        if leaf in {"w1", "w3"}:
+            return "gate_up_proj"
+        if leaf == "w2":
+            return "down_proj"
+        return None
+
+    @staticmethod
+    def source_tensor_name(name):
+        return name
+
+
+def _stage_section(scales=None, *, sources=None, policy=None, profile=None):
+    scales = {_W13: 1.0, _W2: 2.0} if scales is None else scales
+    return build_routed_moe_stage_attestation(
+        scales,
+        policy=policy or LEGACY_INPUT_GLOBAL_SCALE_POLICY,
+        calibration_sources=sources or _STAGE_SOURCES,
+        profile=profile,
+    )
+
+
+def test_stage_schema_literals_are_pinned_cross_repo():
+    # Gridbook pins the identical literals in
+    # ``tests/test_nvfp4_activation_contract.py``; they are a cross-repo ABI,
+    # not a local constant.  The v1 literal must stay put because it also
+    # frames ``target_values_sha256``.
+    assert NVFP4_ACTIVATION_CONTRACT_SCHEMA == (
+        "prismaquant.nvfp4_w4a4_activation.v1"
+    )
+    assert NVFP4_ACTIVATION_CONTRACT_SCHEMA_V2 == (
+        "prismaquant.nvfp4_w4a4_activation.v2"
+    )
+    assert NVFP4_ROUTED_MOE_STAGE_SCHEMA == (
+        "prismaquant.nvfp4_w4a4_activation_stages.v1"
+    )
+    assert NVFP4_ROUTED_MOE_STAGE_KEY == "routed_moe_stages"
+
+
+def test_routed_moe_stage_names_only_packed_fusedmoe_stage_targets():
+    assert routed_moe_stage(_W13) == ("model.layers.0.mlp.experts", "w13")
+    assert routed_moe_stage(_W2) == ("model.layers.0.mlp.experts", "w2")
+    # A dense MLP projection spells the same leaf but is not a routed stage.
+    assert routed_moe_stage("model.layers.0.mlp.down_proj") is None
+    # The per-expert split form is a Linear, not a FusedMoE stage.
+    assert routed_moe_stage("model.layers.0.mlp.experts.7.gate_proj") is None
+    assert routed_moe_stage("model.layers.0.self_attn.q_proj") is None
+    # Profile-declared leaf naming resolves the same two stages.
+    profile = _PackedExpertProfile()
+    assert routed_moe_stage(
+        "model.layers.0.mlp.experts.w1", profile=profile
+    ) == ("model.layers.0.mlp.experts", "w13")
+    assert routed_moe_stage(
+        "model.layers.0.mlp.experts.w2", profile=profile
+    ) == ("model.layers.0.mlp.experts", "w2")
+
+
+def test_packed_contract_bumps_schema_and_dense_stays_v1_byte_for_byte():
+    dense_record, _ = build_execution_contract(
+        {"layer.q_proj": 2.0},
+        policy=LEGACY_INPUT_GLOBAL_SCALE_POLICY,
+        calibration_sources={"layer.q_proj": CALIBRATION_SOURCE_TARGET_CACHE},
+    )
+    assert dense_record["schema"] == NVFP4_ACTIVATION_CONTRACT_SCHEMA
+    assert NVFP4_ROUTED_MOE_STAGE_KEY not in dense_record
+    # A dense-only artifact is bit-identical to the pre-K0.2 record.
+    legacy_record, _ = build_execution_contract(
+        {"layer.q_proj": 2.0},
+        policy=LEGACY_INPUT_GLOBAL_SCALE_POLICY,
+    )
+    assert dense_record == legacy_record
+
+    record, physical = build_execution_contract(
+        {_W13: 1.0, _W2: 2.0, "layer.q_proj": 2.0},
+        policy=LEGACY_INPUT_GLOBAL_SCALE_POLICY,
+        calibration_sources={
+            **_STAGE_SOURCES,
+            "layer.q_proj": CALIBRATION_SOURCE_TARGET_CACHE,
+        },
+    )
+    assert record["schema"] == NVFP4_ACTIVATION_CONTRACT_SCHEMA_V2
+    section = record[NVFP4_ROUTED_MOE_STAGE_KEY]
+    assert section["schema"] == NVFP4_ROUTED_MOE_STAGE_SCHEMA
+    assert section["module_names"] == ["model.layers.0.mlp.experts"]
+    assert section["module_count"] == 1
+    module = section["modules"]["model.layers.0.mlp.experts"]
+    assert list(module) == ["w13", "w2"]
+    assert module["w13"]["target"] == _W13
+    assert module["w2"]["target"] == _W2
+    assert module["w2"]["calibration_source"] == (
+        CALIBRATION_SOURCE_SUPPLEMENTAL_ROUTED_REPLAY
+    )
+    # The whole-model digest fields are exactly what a pre-K0.2 reader
+    # computed: the record-schema bump must not move them.
+    assert record["target_values_sha256"] == target_values_sha256(
+        physical, policy=LEGACY_INPUT_GLOBAL_SCALE_POLICY
+    )
+    assert record["target_names"] == sorted((_W13, _W2, "layer.q_proj"))
+
+
+def test_stage_digests_are_independent_per_stage():
+    base = _stage_section()
+    moved = _stage_section({_W13: 1.0, _W2: 4.0})
+    base_modules = base["modules"]["model.layers.0.mlp.experts"]
+    moved_modules = moved["modules"]["model.layers.0.mlp.experts"]
+    assert base_modules["w13"]["stage_values_sha256"] == (
+        moved_modules["w13"]["stage_values_sha256"]
+    )
+    assert base_modules["w2"]["stage_values_sha256"] != (
+        moved_modules["w2"]["stage_values_sha256"]
+    )
+    assert base["stages_sha256"] != moved["stages_sha256"]
+    # The calibration source is attested, not decorative.
+    resourced = _stage_section(sources={
+        **_STAGE_SOURCES,
+        _W2: CALIBRATION_SOURCE_SUPPLEMENTAL_MAX_ABS,
+    })
+    assert resourced["modules"]["model.layers.0.mlp.experts"]["w2"][
+        "stage_values_sha256"
+    ] != base_modules["w2"]["stage_values_sha256"]
+
+
+def test_half_attested_routed_moe_module_fails_closed():
+    with pytest.raises(ValueError, match="both w13 and w2"):
+        _stage_section({_W13: 1.0}, sources={_W13: _STAGE_SOURCES[_W13]})
+    with pytest.raises(ValueError, match="both w13 and w2"):
+        _stage_section({_W2: 2.0}, sources={_W2: _STAGE_SOURCES[_W2]})
+    with pytest.raises(ValueError, match="no attested calibration source"):
+        _stage_section(sources={_W13: _STAGE_SOURCES[_W13]})
+    # w2 may never be calibrated from the experts-module input, and w13 may
+    # never be calibrated from a routed-intermediate replay.
+    with pytest.raises(ValueError, match="not a legal input for that stage"):
+        _stage_section(sources={
+            **_STAGE_SOURCES,
+            _W2: CALIBRATION_SOURCE_PARENT_MODULE_CACHE,
+        })
+    with pytest.raises(ValueError, match="not a legal input for that stage"):
+        _stage_section(sources={
+            **_STAGE_SOURCES,
+            _W13: CALIBRATION_SOURCE_SUPPLEMENTAL_ROUTED_REPLAY,
+        })
+    # An exporter that cannot attest sources at all must not claim readiness.
+    with pytest.raises(ValueError, match="require calibration-source"):
+        build_execution_contract(
+            {_W13: 1.0, _W2: 2.0},
+            policy=LEGACY_INPUT_GLOBAL_SCALE_POLICY,
+        )
+    # A physical mapper that renames the stage away fails closed too.
+    with pytest.raises(ValueError, match="does not spell a packed FusedMoE"):
+        build_execution_contract(
+            {_W13: 1.0, _W2: 2.0},
+            policy=LEGACY_INPUT_GLOBAL_SCALE_POLICY,
+            calibration_sources=_STAGE_SOURCES,
+            target_name=lambda name: name.replace(".experts.", ".merged."),
+        )
+
+
+def test_sibling_unification_never_joins_across_stages():
+    joined = unify_fused_sibling_input_global_scales({_W13: 0.5, _W2: 0.25})
+    assert joined == {_W13: 0.5, _W2: 0.25}
+    groups = group_fused_sibling_targets([_W13, _W2])
+    assert sorted(map(tuple, groups.values())) == sorted([(_W13,), (_W2,)])
+
+
+def test_stage_digest_framing_has_pinned_vector():
+    assert stage_values_sha256(
+        stage="w13",
+        target="m.experts.gate_up_proj",
+        policy=LEGACY_INPUT_GLOBAL_SCALE_POLICY,
+        calibration_source=CALIBRATION_SOURCE_PARENT_MODULE_CACHE,
+        value=1.0,
+    ) == "c15c44ac3c290d4e596967218b41ffba2f12a857a2cc2356a1ed4e159a40e630"
+    assert stage_values_sha256(
+        stage="w2",
+        target="m.experts.down_proj",
+        policy=LEGACY_INPUT_GLOBAL_SCALE_POLICY,
+        calibration_source=CALIBRATION_SOURCE_SUPPLEMENTAL_ROUTED_REPLAY,
+        value=2.0,
+    ) == "91f005ef177c3c8ccfb1f25a528d0a9a601ef4bdde61db8d33947a1a951cfe2e"
+    section = build_routed_moe_stage_attestation(
+        {"m.experts.gate_up_proj": 1.0, "m.experts.down_proj": 2.0},
+        policy=LEGACY_INPUT_GLOBAL_SCALE_POLICY,
+        calibration_sources={
+            "m.experts.gate_up_proj": CALIBRATION_SOURCE_PARENT_MODULE_CACHE,
+            "m.experts.down_proj": (
+                CALIBRATION_SOURCE_SUPPLEMENTAL_ROUTED_REPLAY
+            ),
+        },
+    )
+    assert section["stages_sha256"] == (
+        "77c830f2b1989a9a0069dcc7afabbe73f0913ccbfb634287346a0c097e231882"
+    )
+    # A stage digest is rooted at the stage schema and can never collide with
+    # a whole-model digest over the same name/value pairs.
+    assert section["stages_sha256"] != target_values_sha256(
+        {"m.experts.gate_up_proj": 1.0, "m.experts.down_proj": 2.0},
+        policy=LEGACY_INPUT_GLOBAL_SCALE_POLICY,
+    )
+
+
+def test_all_three_emit_paths_build_identical_stage_sections():
+    from prismaquant.export_native_compressed import (
+        _packed_expert_stage_attestation,
+    )
+    from prismaquant.production_weight_cache import ProductionWeightCache
+
+    max_abs = {_W13: 3.0, _W2: 1.5}
+    scales = {
+        name: input_global_scale_from_max_abs(
+            value, policy=LEGACY_INPUT_GLOBAL_SCALE_POLICY
+        )
+        for name, value in max_abs.items()
+    }
+    sources = {name: CALIBRATION_SOURCE_PACKED_EXPERT_RENDER for name in scales}
+    # Both CB exporters reach the same builder through
+    # ``build_execution_contract``; the resident path maps logical -> physical
+    # via the resolved skeleton name and the streaming path via its export
+    # base name.  On these names both mappers are the identity.
+    resident, _ = build_execution_contract(
+        scales,
+        policy=LEGACY_INPUT_GLOBAL_SCALE_POLICY,
+        calibration_sources=sources,
+        target_name=lambda name: name,
+    )
+    streaming, _ = build_execution_contract(
+        scales,
+        policy=LEGACY_INPUT_GLOBAL_SCALE_POLICY,
+        calibration_sources=sources,
+        target_name=lambda name: str(name),
+    )
+    cache = ProductionWeightCache(
+        weights={}, levers={}, activation_max_abs=dict(max_abs)
+    )
+    native = _packed_expert_stage_attestation(_W2, cache=cache)
+    assert json.dumps(resident[NVFP4_ROUTED_MOE_STAGE_KEY], sort_keys=True) == (
+        json.dumps(streaming[NVFP4_ROUTED_MOE_STAGE_KEY], sort_keys=True)
+    )
+    assert json.dumps(native, sort_keys=True) == json.dumps(
+        resident[NVFP4_ROUTED_MOE_STAGE_KEY], sort_keys=True
+    )
+
+
+def test_native_container_refuses_a_half_calibrated_fusedmoe_module():
+    from prismaquant.export_native_compressed import (
+        _packed_expert_stage_attestation,
+    )
+    from prismaquant.production_weight_cache import ProductionWeightCache
+
+    cache = ProductionWeightCache(
+        weights={}, levers={}, activation_max_abs={_W13: 3.0}
+    )
+    with pytest.raises(RuntimeError, match=r"no calibrated \['w2'\] stage"):
+        _packed_expert_stage_attestation(_W13, cache=cache)
+    # A dense projection carries no stage claim at all.
+    assert _packed_expert_stage_attestation(
+        "model.layers.0.mlp.down_proj", cache=cache
+    ) is None
+
+
+def _routed_moe_checkpoint(tmp_path):
+    """Minimal per-expert MoE checkpoint plus its experts-module act entry."""
+
+    hidden, inter, experts = 16, 8, 2
+    model_dir = tmp_path / "moe"
+    act_dir = tmp_path / "moe_act"
+    model_dir.mkdir()
+    generator = torch.Generator().manual_seed(19)
+    tensors = {
+        "model.layers.0.mlp.gate.weight": torch.randn(
+            experts, hidden, generator=generator
+        ),
+    }
+    for expert in range(experts):
+        for leaf in ("gate_proj", "up_proj"):
+            tensors[
+                f"model.layers.0.mlp.experts.{expert}.{leaf}.weight"
+            ] = torch.randn(inter, hidden, generator=generator)
+    save_file(tensors, str(model_dir / "model.safetensors"))
+    (model_dir / "config.json").write_text(json.dumps(
+        {"num_experts_per_tok": 1, "norm_topk_prob": True}
+    ))
+    _write_activation(
+        act_dir,
+        "model.layers.0.mlp.experts",
+        torch.randn(32, hidden, generator=generator),
+    )
+    return model_dir, act_dir
+
+
+def test_routed_replay_and_module_input_are_distinct_attested_sources(tmp_path):
+    from prismaquant.moe_imatrix import (
+        synthesize_packed_expert_activation_samples,
+    )
+
+    model_dir, act_dir = _routed_moe_checkpoint(tmp_path)
+    profile = _PackedExpertProfile()
+    supplemental = synthesize_packed_expert_activation_samples(
+        model_dir,
+        act_dir,
+        {_W13, _W2},
+        profile,
+        device="cpu",
+    )
+    scales, sources = calibrated_input_global_scales_with_sources(
+        [_W13, _W2],
+        activation_cache_dir=act_dir,
+        policy=FULL_E4M3_INPUT_GLOBAL_SCALE_POLICY,
+        profile=profile,
+        supplemental_activations=supplemental,
+        calibration_device="cpu",
+    )
+    assert sources == {
+        _W13: CALIBRATION_SOURCE_SUPPLEMENTAL_MODULE_INPUT,
+        _W2: CALIBRATION_SOURCE_SUPPLEMENTAL_ROUTED_REPLAY,
+    }
+    # Two stages, two tensors, two values: the w2 scale is fitted on the
+    # routed intermediate, so it is not the module-input scale.
+    assert scales[_W13] != scales[_W2]
+    record, _ = build_execution_contract(
+        scales,
+        policy=FULL_E4M3_INPUT_GLOBAL_SCALE_POLICY,
+        calibration_sources=sources,
+        profile=profile,
+    )
+    assert record["schema"] == NVFP4_ACTIVATION_CONTRACT_SCHEMA_V2
+    module = record[NVFP4_ROUTED_MOE_STAGE_KEY]["modules"][
+        "model.layers.0.mlp.experts"
+    ]
+    assert module["w2"]["calibration_source"] == (
+        CALIBRATION_SOURCE_SUPPLEMENTAL_ROUTED_REPLAY
+    )
+    assert module["w13"]["calibration_source"] == (
+        CALIBRATION_SOURCE_SUPPLEMENTAL_MODULE_INPUT
+    )
+
+
+def test_missing_routed_intermediate_still_fails_closed(tmp_path):
+    _model_dir, act_dir = _routed_moe_checkpoint(tmp_path)
+    # Only the experts-module input is cached: w13 resolves from the parent
+    # entry, w2 has no calibrated input at all.
+    scales, sources = calibrated_input_global_scales_with_sources(
+        [_W13],
+        activation_cache_dir=act_dir,
+        policy=FULL_E4M3_INPUT_GLOBAL_SCALE_POLICY,
+    )
+    assert sources == {_W13: CALIBRATION_SOURCE_PARENT_MODULE_CACHE}
+    assert set(scales) == {_W13}
+    with pytest.raises(ValueError, match="no calibrated input"):
+        calibrated_input_global_scales(
+            [_W13, _W2],
+            activation_cache_dir=act_dir,
+            policy=FULL_E4M3_INPUT_GLOBAL_SCALE_POLICY,
+        )

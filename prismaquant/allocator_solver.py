@@ -9,8 +9,15 @@ from __future__ import annotations
 import os
 import time
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from . import format_registry as fr
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    # Import-time-free: the solver must not depend on the serving-profile
+    # loader at runtime (the lane is attached by candidate construction and
+    # never read by the DP), but the annotation should still name the type.
+    from .serving_profiles import ResolvedServingLane
 
 
 class PackedExpertRoleUnknown(RuntimeError):
@@ -55,6 +62,23 @@ class Candidate:
     # export assertions can deduplicate/compare sidecars without parsing the
     # complete tensor-layout JSON above.
     serialized_sidecar_identity: str | None = None
+    # WHICH estimator priced this candidate's activation contract (ultraplan
+    # P5a). One of activation_fair_pricing.BRANCH_*: measured_output_mse,
+    # bit_exact, activation_identity, weight_only_activation_calibrated,
+    # weight_only_uncalibrated, weight_only_kill_switch. Kept out of solver
+    # logic — like serialized_identity it is provenance, not an input to the
+    # DP — so that "was this row's A side ever priced" is recoverable from the
+    # artifact instead of inferred from the producer commit.
+    activation_pricing: str | None = None
+    # The CONCRETE serving-lane route this candidate would ride (ultraplan
+    # P5b): activation contract, whether the consumer's fused mid-M kernel
+    # actually instantiates this rung, and the fallback route when it does
+    # not. ``serving_profiles.ResolvedServingLane``; None where the target
+    # profile declares no lane for the format. Also kept out of solver logic:
+    # latency is NOT an objective or constraint here (that is P5c), this only
+    # stops the allocator from pricing a fast path nobody backs without at
+    # least recording that it did.
+    serving_lane: ResolvedServingLane | None = None
 
 
 def _shape_from_stats(entry: dict) -> tuple[int, ...]:

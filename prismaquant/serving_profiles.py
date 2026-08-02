@@ -18,6 +18,7 @@ from . import format_registry as fr
 
 
 SCHEMA = "prismaquant.serving_profile.v1"
+SERVING_LANE_SCHEMA = "prismaquant.serving_lane_route.v1"
 
 
 @dataclass(frozen=True)
@@ -360,6 +361,154 @@ class ExportLaneSpec:
 
 
 @dataclass(frozen=True)
+class ResolvedServingLane:
+    """One format's concrete serving route, resolved against the pinned
+    runtime version.
+
+    ``fused_mid_m_backed`` is the P5b question the allocator could not ask
+    before: does the consumer's fused mid-M kernel actually instantiate THIS
+    rung, or does the rung fall to expand+GEMM? Gridbook K1.2 is the same
+    defect seen from the runtime end — the published 27B artifact ships an
+    8-rung K36..K47 ladder of which five rungs have no fused mid-M
+    instantiation — so recording the answer per selected unit is what stops
+    either repo from pricing an unbacked fast path.
+    """
+
+    lane_id: str
+    format: str
+    activation_contract: str
+    fallback_route: str
+    fused_mid_m_backed: bool
+    fused_mid_m_rungs: tuple[int, ...]
+    fused_mid_m_range: tuple[int, int] | None
+    runtime_version: str
+    rungs_source: str
+    rung: int | None = None
+    detail: str = ""
+
+    def as_dict(self) -> dict:
+        return {
+            "lane_id": self.lane_id,
+            "format": self.format,
+            "rung": self.rung,
+            "activation_contract": self.activation_contract,
+            "fused_mid_m_backed": bool(self.fused_mid_m_backed),
+            "fused_mid_m_rungs": list(self.fused_mid_m_rungs),
+            "fused_mid_m_range": (
+                list(self.fused_mid_m_range)
+                if self.fused_mid_m_range is not None else None
+            ),
+            "fallback_route": self.fallback_route,
+            "runtime_version": self.runtime_version,
+            "fused_mid_m_rungs_source": self.rungs_source,
+            "detail": self.detail,
+        }
+
+    def route_key(self) -> str:
+        """Stable one-line identity for candidate/provenance comparison."""
+        return json.dumps(
+            {
+                "lane": self.lane_id,
+                "act": self.activation_contract,
+                "fused_mid_m": bool(self.fused_mid_m_backed),
+                "runtime": self.runtime_version,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+
+
+@dataclass(frozen=True)
+class ServingLaneSpec:
+    """Declarative per-format-family serving route (ultraplan P5b).
+
+    The producer previously modelled exactly ONE gridbook kernel gate
+    (``K % 256``) and nothing else — not the ``N % 8`` / ``N % 16`` load
+    gates, not the fused mid-M rung set, not the activation contract. A
+    format name alone is not an execution identity
+    (``docs/lanes/nvfp4-cb/format-speed-policy.md`` §2), so the concrete
+    route is declared here as SPEC DATA and attached to every candidate.
+
+    ``fused_mid_m_rungs_by_runtime_version`` is keyed by the pinned Gridbook
+    version (``prismaquant/gridbook_runtime/gridbook_runtime_pin.json``)
+    because the backed set is a property of the consumer release, not of the
+    format: Gridbook 0.5.0 instantiates K ∈ {28,32,36,40,44,48} for FP8-CB
+    while full K28..K48 coverage lands concurrently. A pinned version with no
+    entry resolves to the EMPTY backed set — fail-closed, because assuming a
+    newer runtime backs what an older one did is exactly how an unbacked fast
+    path gets priced.
+
+    This is metadata only. It carries no latency term and imposes no
+    constraint on the DP; the constrained Pareto solver is P5c.
+    """
+
+    id: str
+    formats: tuple[str, ...] = ()
+    activation_contract: str = ""
+    fallback_route: str = ""
+    fused_mid_m_range: tuple[int, int] | None = None
+    fused_mid_m_rungs_by_runtime_version: tuple[
+        tuple[str, tuple[int, ...]], ...
+    ] = ()
+    detail: str = ""
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "ServingLaneSpec":
+        fused = dict(payload.get("fused_mid_m") or {})
+        m_range = fused.get("m_range")
+        by_version = fused.get("rungs_by_runtime_version") or {}
+        return cls(
+            id=str(payload["id"]),
+            formats=_declared_formats(
+                payload.get("formats", ()),
+                payload.get("formats_from", ()),
+                owner=f"serving lane {payload['id']!r}",
+            ),
+            activation_contract=str(payload.get("activation_contract", "")),
+            fallback_route=str(payload.get("fallback_route", "")),
+            fused_mid_m_range=(
+                (int(m_range[0]), int(m_range[1]))
+                if m_range is not None else None
+            ),
+            fused_mid_m_rungs_by_runtime_version=tuple(
+                (str(version), tuple(sorted(int(k) for k in rungs)))
+                for version, rungs in sorted(by_version.items())
+            ),
+            detail=str(payload.get("detail", "")),
+        )
+
+    def covers(self, fmt: str) -> bool:
+        return _format_in(fmt, self.formats)
+
+    def backed_rungs(self, runtime_version: str) -> tuple[
+            tuple[int, ...], str]:
+        """``(rungs, source)`` for one runtime version; fail-closed on miss."""
+        for version, rungs in self.fused_mid_m_rungs_by_runtime_version:
+            if version == runtime_version:
+                return rungs, f"serving_profile_spec:{version}"
+        if not self.fused_mid_m_rungs_by_runtime_version:
+            return (), "lane_declares_no_fused_mid_m_lane"
+        return (), "pinned_runtime_version_not_declared"
+
+    def resolve(self, fmt: str, *, runtime_version: str,
+                rung: int | None) -> ResolvedServingLane:
+        rungs, source = self.backed_rungs(runtime_version)
+        return ResolvedServingLane(
+            lane_id=self.id,
+            format=fr.canonical_format_name(fmt),
+            activation_contract=self.activation_contract,
+            fallback_route=self.fallback_route,
+            fused_mid_m_backed=bool(rung is not None and rung in rungs),
+            fused_mid_m_rungs=rungs,
+            fused_mid_m_range=self.fused_mid_m_range,
+            runtime_version=runtime_version,
+            rungs_source=source,
+            rung=rung,
+            detail=self.detail,
+        )
+
+
+@dataclass(frozen=True)
 class RuntimePackageSpec:
     id: str
     module: str | None = None
@@ -395,6 +544,9 @@ class ServingProfile:
     shape_rules: tuple[ShapeRule, ...] = ()
     runtime_shape_validators: tuple[RuntimeShapeValidatorRule, ...] = ()
     runtime_packages: tuple[RuntimePackageSpec, ...] = ()
+    # Declarative per-format-family serving routes (ultraplan P5b). Empty for
+    # profiles that describe no concrete lane (e.g. `research`).
+    serving_lanes: tuple[ServingLaneSpec, ...] = ()
     description: str = ""
     # The artifact container this profile ships through. Bounds the format
     # menu by what the lane's exporter declares it can emit (see
@@ -441,6 +593,10 @@ class ServingProfile:
                 RuntimePackageSpec.from_dict(entry)
                 for entry in payload.get("runtime_packages", ())
             ),
+            serving_lanes=tuple(
+                ServingLaneSpec.from_dict(entry)
+                for entry in payload.get("serving_lanes", ())
+            ),
             description=str(payload.get("description", "")),
             export_lane=(
                 ExportLaneSpec.from_dict(payload["export_lane"])
@@ -479,6 +635,34 @@ class ServingProfile:
                 return package
         return None
 
+    def serving_lane_for(
+        self,
+        fmt: str,
+        *,
+        runtime_version: str | None = None,
+    ) -> ResolvedServingLane | None:
+        """The concrete serving route for one format, or None.
+
+        LAST declaration wins, mirroring how ``extends`` layers a derived
+        profile's rules after its bases': a lane redeclared downstream is an
+        override, not a second opinion.
+        """
+        chosen: ServingLaneSpec | None = None
+        for lane in self.serving_lanes:
+            if lane.covers(fmt):
+                chosen = lane
+        if chosen is None:
+            return None
+        return chosen.resolve(
+            fmt,
+            runtime_version=(
+                runtime_version
+                if runtime_version is not None
+                else gridbook_runtime_version()
+            ),
+            rung=_cb_rung_of(fmt),
+        )
+
     def check_shape(
         self,
         fmt: str,
@@ -510,6 +694,7 @@ class ServingProfile:
 
 _CACHE: dict[str, ServingProfile] = {}
 _EMITTABLE_CACHE: dict["ExportLaneSpec", frozenset[str]] = {}
+_RUNTIME_VERSION: str | None = None
 
 
 def _declared_format_source(path: str, owner: str) -> tuple[str, ...]:
@@ -617,6 +802,11 @@ def load_serving_profile(profile_id: str | None) -> ServingProfile:
                 for base in bases
                 for package in base.runtime_packages
             ) + profile.runtime_packages,
+            serving_lanes=tuple(
+                lane
+                for base in bases
+                for lane in base.serving_lanes
+            ) + profile.serving_lanes,
             description=profile.description,
             export_lane=(
                 profile.export_lane
@@ -787,6 +977,80 @@ def lane_emittable_formats(profile_id: str | None) -> frozenset[str] | None:
     if profile.export_lane is None:
         return None
     return profile.export_lane.emittable_formats()
+
+
+def gridbook_runtime_version() -> str:
+    """The pinned Gridbook release the serving lanes are declared against.
+
+    Read from ``prismaquant/gridbook_runtime/gridbook_runtime_pin.json`` —
+    the repo's single immutable record of the consumer integration — so the
+    fused-mid-M backed set cannot drift from the runtime that is actually
+    installed. Unreadable/unversioned pin resolves to ``""``, which matches
+    no declared version and therefore backs nothing (fail-closed).
+    """
+    global _RUNTIME_VERSION
+    if _RUNTIME_VERSION is None:
+        try:
+            text = resources.files("prismaquant").joinpath(
+                "gridbook_runtime", "gridbook_runtime_pin.json"
+            ).read_text(encoding="utf-8")
+            _RUNTIME_VERSION = str(json.loads(text).get("version", "") or "")
+        except Exception:
+            _RUNTIME_VERSION = ""
+    return _RUNTIME_VERSION
+
+
+def _cb_rung_of(fmt: str) -> int | None:
+    """The CB k-rung of a format name, or None for a non-CB format."""
+    from .cb_layout import parse_format_name
+
+    parsed = parse_format_name(fr.canonical_format_name(fmt))
+    return None if parsed is None else int(parsed[1])
+
+
+def serving_lane_route(
+    profile_id: str | None,
+    fmt: str,
+    *,
+    runtime_version: str | None = None,
+) -> ResolvedServingLane | None:
+    """Resolve one format's serving-lane route under a target profile."""
+    try:
+        profile = load_serving_profile(profile_id)
+    except FileNotFoundError:
+        return None
+    return profile.serving_lane_for(fmt, runtime_version=runtime_version)
+
+
+def serving_lane_catalog(profile_id: str | None) -> dict:
+    """Every declared lane of a profile, resolved, for provenance reports."""
+    try:
+        profile = load_serving_profile(profile_id)
+    except FileNotFoundError:
+        return {}
+    version = gridbook_runtime_version()
+    lanes: dict[str, dict] = {}
+    for lane in profile.serving_lanes:
+        rungs, source = lane.backed_rungs(version)
+        lanes[lane.id] = {
+            "lane_id": lane.id,
+            "formats": sorted(lane.formats),
+            "activation_contract": lane.activation_contract,
+            "fallback_route": lane.fallback_route,
+            "fused_mid_m_rungs": list(rungs),
+            "fused_mid_m_range": (
+                list(lane.fused_mid_m_range)
+                if lane.fused_mid_m_range is not None else None
+            ),
+            "fused_mid_m_rungs_source": source,
+            "detail": lane.detail,
+        }
+    return {
+        "schema": SERVING_LANE_SCHEMA,
+        "target_profile": str(profile_id or "research"),
+        "gridbook_runtime_version": version,
+        "lanes": lanes,
+    }
 
 
 def check_serving_shape(

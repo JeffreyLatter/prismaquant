@@ -59,6 +59,94 @@ NVFP4_INPUT_GLOBAL_SCALE_POLICIES = frozenset({
     MSE_GRID_INPUT_GLOBAL_SCALE_POLICY,
 })
 
+# ---------------------------------------------------------------------------
+# Routed-MoE stage attestation (ROADMAP K0.2)
+# ---------------------------------------------------------------------------
+# A packed FusedMoE module runs TWO activation-quantized stages against two
+# different tensors: ``w13`` consumes the experts-module input, ``w2`` consumes
+# the routed intermediate.  The scales have always been stage-specific by
+# construction (distinct physical targets, and
+# :func:`unify_fused_sibling_input_global_scales` never joins across them), but
+# nothing in the exported record said so — so a consumer could not distinguish
+# a fully calibrated routed-MoE artifact from one that merely happened to carry
+# two scalars.  The stage section makes the two stages, their calibration
+# inputs, and their values explicitly attested and independently verifiable.
+#
+# ``NVFP4_ACTIVATION_CONTRACT_SCHEMA`` stays the DIGEST FRAMING constant and the
+# dense-only record schema: bumping it would move every existing
+# ``target_values_sha256`` and silently invalidate shipped artifacts.  The v2
+# literal is the RECORD schema and appears only when the stage section does, so
+# a reader that predates stage attestation fails closed on a routed-MoE
+# artifact instead of accepting a fused-readiness claim it cannot verify.  A
+# dense-only artifact keeps emitting v1, byte-for-byte.
+NVFP4_ACTIVATION_CONTRACT_SCHEMA_V2 = "prismaquant.nvfp4_w4a4_activation.v2"
+NVFP4_ROUTED_MOE_STAGE_SCHEMA = (
+    "prismaquant.nvfp4_w4a4_activation_stages.v1"
+)
+NVFP4_ROUTED_MOE_STAGE_KEY = "routed_moe_stages"
+NVFP4_STAGE_W13 = "w13"
+NVFP4_STAGE_W2 = "w2"
+NVFP4_ROUTED_MOE_STAGES = (NVFP4_STAGE_W13, NVFP4_STAGE_W2)
+_PACKED_ROLE_STAGES = {
+    "gate_up_proj": NVFP4_STAGE_W13,
+    "down_proj": NVFP4_STAGE_W2,
+}
+# Profile-free fallback leaf -> packed-parameter role, kept identical to
+# ``ModelProfile._fallback_packed_expert_role_parents`` so a name the profile
+# can bucket is a name this module can stage without one.
+_PACKED_LEAF_ROLES = {
+    "gate_up_proj": "gate_up_proj",
+    "gate_proj": "gate_up_proj",
+    "up_proj": "gate_up_proj",
+    "w1": "gate_up_proj",
+    "w3": "gate_up_proj",
+    "down_proj": "down_proj",
+    "w2": "down_proj",
+}
+
+# Calibration-source vocabulary: exactly the resolution mechanisms
+# :func:`calibrated_input_global_scales` implements, named so an artifact
+# reader can tell the experts-module input apart from the routed intermediate.
+CALIBRATION_SOURCE_TARGET_CACHE = "target_activation_cache"
+CALIBRATION_SOURCE_PARENT_MODULE_CACHE = "parent_module_activation_cache"
+CALIBRATION_SOURCE_SUPPLEMENTAL_MODULE_INPUT = (
+    "supplemental_module_input_sample"
+)
+CALIBRATION_SOURCE_SUPPLEMENTAL_ROUTED_REPLAY = (
+    "supplemental_routed_intermediate_replay"
+)
+CALIBRATION_SOURCE_SUPPLEMENTAL_MAX_ABS = "supplemental_max_abs"
+# The legacy native container measures both packed-expert stages during its
+# GPTQ render (module input for gate/up, routed intermediate for down) and
+# stores them in the production cache's packed-expert max-abs sidecar.
+CALIBRATION_SOURCE_PACKED_EXPERT_RENDER = "packed_expert_render_max_abs"
+NVFP4_CALIBRATION_SOURCES = frozenset({
+    CALIBRATION_SOURCE_TARGET_CACHE,
+    CALIBRATION_SOURCE_PARENT_MODULE_CACHE,
+    CALIBRATION_SOURCE_SUPPLEMENTAL_MODULE_INPUT,
+    CALIBRATION_SOURCE_SUPPLEMENTAL_ROUTED_REPLAY,
+    CALIBRATION_SOURCE_SUPPLEMENTAL_MAX_ABS,
+    CALIBRATION_SOURCE_PACKED_EXPERT_RENDER,
+})
+# ``w2`` must never be calibrated from the experts-module input — that is the
+# exact defect this attestation exists to make impossible — and ``w13`` must
+# never be calibrated from a routed-intermediate replay.
+NVFP4_STAGE_CALIBRATION_SOURCES = {
+    NVFP4_STAGE_W13: frozenset({
+        CALIBRATION_SOURCE_TARGET_CACHE,
+        CALIBRATION_SOURCE_PARENT_MODULE_CACHE,
+        CALIBRATION_SOURCE_SUPPLEMENTAL_MODULE_INPUT,
+        CALIBRATION_SOURCE_SUPPLEMENTAL_MAX_ABS,
+        CALIBRATION_SOURCE_PACKED_EXPERT_RENDER,
+    }),
+    NVFP4_STAGE_W2: frozenset({
+        CALIBRATION_SOURCE_TARGET_CACHE,
+        CALIBRATION_SOURCE_SUPPLEMENTAL_ROUTED_REPLAY,
+        CALIBRATION_SOURCE_SUPPLEMENTAL_MAX_ABS,
+        CALIBRATION_SOURCE_PACKED_EXPERT_RENDER,
+    }),
+}
+
 _E2M1_POSITIVE = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 
 
@@ -516,18 +604,49 @@ def calibrated_input_global_scales(
     supplemental_activations: Mapping[str, Any] | None = None,
     calibration_device: str | torch.device | None = None,
 ) -> dict[str, float]:
-    """Resolve complete target coverage and return fused-coherent scalars.
+    """Resolve complete target coverage and return fused-coherent scalars."""
+
+    scales, _sources = calibrated_input_global_scales_with_sources(
+        targets,
+        activation_cache_dir=activation_cache_dir,
+        policy=policy,
+        profile=profile,
+        supplemental_max_abs=supplemental_max_abs,
+        supplemental_activations=supplemental_activations,
+        calibration_device=calibration_device,
+    )
+    return scales
+
+
+def calibrated_input_global_scales_with_sources(
+    targets: Iterable[str],
+    *,
+    activation_cache_dir: str | Path,
+    policy: str,
+    profile=None,
+    supplemental_max_abs: Mapping[str, float] | None = None,
+    supplemental_activations: Mapping[str, Any] | None = None,
+    calibration_device: str | torch.device | None = None,
+) -> tuple[dict[str, float], dict[str, str]]:
+    """Resolve coverage and return ``(scales, calibration source per target)``.
 
     Packed gate/up targets consume the experts-module input and therefore may
     use that parent cache entry.  Packed down targets require their routed
     intermediate max-abs in ``supplemental_max_abs``; exporters synthesize it
     with the same checkpoint replay used by the imatrix harvester.
+
+    The second return value names which of those mechanisms actually produced
+    each scalar.  That distinction is not diagnostic decoration: it is what the
+    routed-MoE stage attestation publishes so a consumer can verify that ``w2``
+    was calibrated on the routed intermediate rather than on the module input.
     """
 
     requested = tuple(sorted({str(target) for target in targets}))
     supplemental_samples: dict[str, torch.Tensor] = {}
+    supplemental_sample_sources: dict[str, str] = {}
     for name, raw_sample in (supplemental_activations or {}).items():
         sample = raw_sample
+        source = CALIBRATION_SOURCE_SUPPLEMENTAL_MODULE_INPUT
         if not isinstance(sample, torch.Tensor):
             validate = getattr(sample, "validate", None)
             if not callable(validate):
@@ -537,6 +656,7 @@ def calibrated_input_global_scales(
                 )
             validate()
             sample = getattr(sample, "values", None)
+            source = CALIBRATION_SOURCE_SUPPLEMENTAL_ROUTED_REPLAY
         if not isinstance(sample, torch.Tensor) or sample.numel() == 0:
             raise ValueError(
                 f"supplemental activation {name!r} has no value-bearing rows"
@@ -544,6 +664,7 @@ def calibrated_input_global_scales(
         supplemental_samples[str(name)] = (
             sample.detach().to("cpu").float().contiguous()
         )
+        supplemental_sample_sources[str(name)] = source
     supplemental = {
         str(name): float(value)
         for name, value in (supplemental_max_abs or {}).items()
@@ -551,6 +672,7 @@ def calibrated_input_global_scales(
     canonical_policy = resolve_input_global_scale_policy(policy)
     groups = group_fused_sibling_targets(requested, profile=profile)
     result: dict[str, float] = {}
+    sources: dict[str, str] = {}
     for members in groups.values():
         # Cache rows can be very large (tens of GB on 27B+ models).  Load and
         # fit one execution/fusion unit at a time; no policy needs samples from
@@ -563,16 +685,30 @@ def calibrated_input_global_scales(
         resolved_samples: dict[str, torch.Tensor] = {}
         resolved_max_abs: dict[str, float] = {}
         for target in members:
-            sample = supplemental_samples.get(target, cached.get(target))
+            if target in supplemental_samples:
+                sample = supplemental_samples[target]
+                source = supplemental_sample_sources[target]
+            elif target in cached:
+                sample = cached[target]
+                source = CALIBRATION_SOURCE_TARGET_CACHE
+            else:
+                sample = None
+                source = None
             value = supplemental.get(target)
+            if value is not None and sample is None:
+                source = CALIBRATION_SOURCE_SUPPLEMENTAL_MAX_ABS
             if sample is None and value is None and target.endswith((
                 ".gate_up_proj", ".gate_proj", ".up_proj"
             )):
                 parent = target.rsplit(".", 1)[0]
                 sample = cached.get(parent)
+                if sample is not None:
+                    source = CALIBRATION_SOURCE_PARENT_MODULE_CACHE
             if sample is not None:
                 value = float(sample.abs().max().item())
                 resolved_samples[target] = sample
+            if source is not None:
+                sources[target] = source
             if value is None:
                 raise ValueError(
                     f"NVFP4 activation contract has no calibrated input for "
@@ -606,7 +742,206 @@ def calibrated_input_global_scales(
             )
         for target in members:
             result[target] = shared_scale
-    return result
+    return result, sources
+
+
+def routed_moe_stage(name: str, *, profile=None) -> tuple[str, str] | None:
+    """Return ``(module_prefix, stage)`` for one packed FusedMoE stage target.
+
+    ``None`` means the name is not a packed routed-expert stage: a dense
+    ``mlp.down_proj`` and the per-expert split form
+    ``<parent>.experts.7.gate_proj`` are Linears, not stages, and must not
+    contribute a stage claim.  The profile owns leaf naming (LFM2.5 spells the
+    stages ``w1``/``w3``/``w2``); the leaf table is only the profile-free
+    fallback the rest of this module already uses.
+    """
+
+    target = str(name)
+    parts = target.split(".")
+    # Packed form only: ``<parent>.experts.<packed-parameter>``.
+    if len(parts) < 2 or parts[-2] != "experts":
+        return None
+    role = None
+    role_fn = getattr(profile, "packed_expert_role_group", None)
+    if callable(role_fn):
+        role = role_fn(target)
+    if role is None:
+        role = _PACKED_LEAF_ROLES.get(parts[-1])
+    stage = _PACKED_ROLE_STAGES.get(str(role)) if role is not None else None
+    if stage is None:
+        return None
+    return ".".join(parts[:-1]), stage
+
+
+def stage_values_sha256(
+    *,
+    stage: str,
+    target: str,
+    policy: str,
+    calibration_source: str,
+    value: float,
+) -> str:
+    """Digest one routed-MoE stage's complete attested identity and value.
+
+    Framing mirrors :func:`target_values_sha256` (length-prefixed UTF-8 fields
+    then the serialized F32) but is rooted at the stage schema, so a stage
+    digest can never collide with a whole-model digest.  Every attested field
+    participates: a stage whose policy or calibration source changed is a
+    different attestation even at an identical scalar.
+    """
+
+    canonical_policy = resolve_input_global_scale_policy(policy)
+    if stage not in NVFP4_ROUTED_MOE_STAGES:
+        raise ValueError(
+            f"unknown routed-MoE stage {stage!r}; expected one of "
+            f"{list(NVFP4_ROUTED_MOE_STAGES)}"
+        )
+    if calibration_source not in NVFP4_CALIBRATION_SOURCES:
+        raise ValueError(
+            f"unknown NVFP4 calibration source {calibration_source!r}; "
+            f"expected one of {sorted(NVFP4_CALIBRATION_SOURCES)}"
+        )
+    digest = hashlib.sha256()
+    for field in (
+        NVFP4_ROUTED_MOE_STAGE_SCHEMA,
+        canonical_policy,
+        str(stage),
+        str(target),
+        str(calibration_source),
+    ):
+        encoded = field.encode("utf-8")
+        digest.update(struct.pack("<I", len(encoded)))
+        digest.update(encoded)
+    digest.update(
+        struct.pack("<f", float(input_global_scale_tensor(value).item()))
+    )
+    return digest.hexdigest()
+
+
+def routed_moe_stages_sha256(
+    modules: Mapping[str, Mapping[str, Mapping[str, Any]]],
+) -> str:
+    """Digest the whole stage section from its per-stage digests."""
+
+    digest = hashlib.sha256()
+    encoded = NVFP4_ROUTED_MOE_STAGE_SCHEMA.encode("utf-8")
+    digest.update(struct.pack("<I", len(encoded)))
+    digest.update(encoded)
+    for module in sorted(modules):
+        encoded = str(module).encode("utf-8")
+        digest.update(struct.pack("<I", len(encoded)))
+        digest.update(encoded)
+        entries = modules[module]
+        for stage in NVFP4_ROUTED_MOE_STAGES:
+            if stage not in entries:
+                raise ValueError(
+                    f"packed FusedMoE module {module!r} has no {stage} stage; "
+                    "a routed-MoE contract must attest both stages"
+                )
+            encoded = str(stage).encode("utf-8")
+            digest.update(struct.pack("<I", len(encoded)))
+            digest.update(encoded)
+            digest.update(
+                bytes.fromhex(str(entries[stage]["stage_values_sha256"]))
+            )
+    return digest.hexdigest()
+
+
+def build_routed_moe_stage_attestation(
+    scales: Mapping[str, float],
+    *,
+    policy: str,
+    calibration_sources: Mapping[str, str],
+    profile=None,
+    target_name: Callable[[str], str] | None = None,
+) -> dict[str, Any] | None:
+    """Return the per-module ``w13``/``w2`` section, or ``None`` when dense.
+
+    This is the single builder every exporter uses, so the same logical
+    scales, policy, and calibration sources produce a byte-identical section
+    whichever emit path ran.  It fails closed on a packed FusedMoE module that
+    reaches export with only one attested stage: that is precisely the state
+    the existing partial LFM artifact is in, and no artifact may claim
+    fused-MoE readiness from it.
+    """
+
+    mapper = target_name or (lambda name: name)
+    canonical_policy = resolve_input_global_scale_policy(policy)
+    modules: dict[str, dict[str, dict[str, Any]]] = {}
+    for logical_name in sorted(scales):
+        logical = str(logical_name)
+        if routed_moe_stage(logical, profile=profile) is None:
+            continue
+        physical = str(mapper(logical))
+        parsed = routed_moe_stage(physical, profile=profile)
+        if parsed is None:
+            raise ValueError(
+                f"routed-MoE stage target {logical!r} maps to physical prefix "
+                f"{physical!r}, which does not spell a packed FusedMoE stage; "
+                "the stage attestation must name the exact serialized prefix"
+            )
+        module, stage = parsed
+        source = calibration_sources.get(logical)
+        if source is None:
+            raise ValueError(
+                f"routed-MoE stage target {logical!r} has no attested "
+                "calibration source; production export refuses an unattested "
+                "fused-MoE stage"
+            )
+        allowed = NVFP4_STAGE_CALIBRATION_SOURCES[stage]
+        if source not in allowed:
+            raise ValueError(
+                f"routed-MoE stage {stage} target {logical!r} was calibrated "
+                f"from {source!r}, which is not a legal input for that stage "
+                f"(expected one of {sorted(allowed)})"
+            )
+        entries = modules.setdefault(module, {})
+        if stage in entries:
+            raise ValueError(
+                f"packed FusedMoE module {module!r} has two {stage} stage "
+                f"targets: {entries[stage]['target']!r} and {physical!r}"
+            )
+        entries[stage] = {
+            "stage": stage,
+            "target": physical,
+            "input_global_scale_policy": canonical_policy,
+            "calibration_source": source,
+            "stage_values_sha256": stage_values_sha256(
+                stage=stage,
+                target=physical,
+                policy=canonical_policy,
+                calibration_source=source,
+                value=float(scales[logical_name]),
+            ),
+        }
+    if not modules:
+        return None
+    incomplete = {
+        module: [
+            stage for stage in NVFP4_ROUTED_MOE_STAGES if stage not in entries
+        ]
+        for module, entries in sorted(modules.items())
+        if len(entries) != len(NVFP4_ROUTED_MOE_STAGES)
+    }
+    if incomplete:
+        raise ValueError(
+            "routed-MoE activation contract requires both w13 and w2 stages "
+            f"for every packed FusedMoE module; missing {incomplete}"
+        )
+    return {
+        "schema": NVFP4_ROUTED_MOE_STAGE_SCHEMA,
+        "stages": list(NVFP4_ROUTED_MOE_STAGES),
+        "module_count": len(modules),
+        "module_names": sorted(modules),
+        "modules": {
+            module: {
+                stage: modules[module][stage]
+                for stage in NVFP4_ROUTED_MOE_STAGES
+            }
+            for module in sorted(modules)
+        },
+        "stages_sha256": routed_moe_stages_sha256(modules),
+    }
 
 
 def target_values_sha256(
@@ -614,7 +949,13 @@ def target_values_sha256(
     *,
     policy: str,
 ) -> str:
-    """Digest exact physical target names and their serialized F32 values."""
+    """Digest exact physical target names and their serialized F32 values.
+
+    The framing constant is deliberately pinned at
+    ``NVFP4_ACTIVATION_CONTRACT_SCHEMA`` (the v1 literal) even when the record
+    declares the v2 stage-attested schema, so the whole-model digest a shipped
+    artifact carries never moves under a record-schema bump.
+    """
 
     canonical_policy = resolve_input_global_scale_policy(policy)
     digest = hashlib.sha256()
@@ -635,8 +976,18 @@ def build_execution_contract(
     *,
     policy: str,
     target_name: Callable[[str], str] | None = None,
+    calibration_sources: Mapping[str, str] | None = None,
+    profile=None,
 ) -> tuple[dict[str, Any], dict[str, float]]:
-    """Return the top-level record plus scales keyed by physical target name."""
+    """Return the top-level record plus scales keyed by physical target name.
+
+    ``calibration_sources`` is what :func:`calibrated_input_global_scales_with_sources`
+    returns.  Supplying it is mandatory whenever any target is a packed
+    FusedMoE stage: without it the record cannot attest which tensor calibrated
+    each stage, and a routed-MoE artifact must never claim fused readiness it
+    cannot back.  Dense-only exports may omit it and keep emitting the v1
+    record byte-for-byte.
+    """
 
     mapper = target_name or (lambda name: name)
     physical: dict[str, float] = {}
@@ -676,6 +1027,31 @@ def build_execution_contract(
             policy=canonical_policy,
         ),
     }
+    if calibration_sources is None:
+        unattested = sorted(
+            str(name) for name in scales
+            if routed_moe_stage(str(name), profile=profile) is not None
+        )
+        if unattested:
+            raise ValueError(
+                "packed FusedMoE stage targets require calibration-source "
+                "attestation in the NVFP4 execution contract; "
+                f"{unattested} were offered without one"
+            )
+    else:
+        stage_section = build_routed_moe_stage_attestation(
+            scales,
+            policy=canonical_policy,
+            calibration_sources=calibration_sources,
+            profile=profile,
+            target_name=mapper,
+        )
+        if stage_section is not None:
+            # Deliberate record-schema bump: the whole-model fields above stay
+            # bit-identical, but a reader that cannot verify stage attestation
+            # must fail closed on a routed-MoE artifact rather than accept it.
+            record["schema"] = NVFP4_ACTIVATION_CONTRACT_SCHEMA_V2
+            record[NVFP4_ROUTED_MOE_STAGE_KEY] = stage_section
     return record, physical
 
 
@@ -753,6 +1129,12 @@ def nvfp4_activation_qdq_served(
 
 
 __all__ = [
+    "CALIBRATION_SOURCE_PACKED_EXPERT_RENDER",
+    "CALIBRATION_SOURCE_PARENT_MODULE_CACHE",
+    "CALIBRATION_SOURCE_SUPPLEMENTAL_MAX_ABS",
+    "CALIBRATION_SOURCE_SUPPLEMENTAL_MODULE_INPUT",
+    "CALIBRATION_SOURCE_SUPPLEMENTAL_ROUTED_REPLAY",
+    "CALIBRATION_SOURCE_TARGET_CACHE",
     "FP4_E2M1_MAX",
     "FP4_GROUP_SIZE",
     "FP8_E4M3_MAX",
@@ -761,12 +1143,22 @@ __all__ = [
     "MSE_GRID_INPUT_GLOBAL_SCALE_POLICY",
     "NVFP4_ACTIVATION_CONTRACT_KEY",
     "NVFP4_ACTIVATION_CONTRACT_SCHEMA",
+    "NVFP4_ACTIVATION_CONTRACT_SCHEMA_V2",
     "NVFP4_ACTIVATION_EXECUTION",
+    "NVFP4_CALIBRATION_SOURCES",
     "NVFP4_INPUT_GLOBAL_SCALE_POLICIES",
     "NVFP4_INPUT_GLOBAL_SCALE_SUFFIX",
+    "NVFP4_ROUTED_MOE_STAGES",
+    "NVFP4_ROUTED_MOE_STAGE_KEY",
+    "NVFP4_ROUTED_MOE_STAGE_SCHEMA",
+    "NVFP4_STAGE_CALIBRATION_SOURCES",
+    "NVFP4_STAGE_W2",
+    "NVFP4_STAGE_W13",
     "UNCALIBRATED_INPUT_GLOBAL_SCALE",
     "build_execution_contract",
+    "build_routed_moe_stage_attestation",
     "calibrated_input_global_scales",
+    "calibrated_input_global_scales_with_sources",
     "fused_dense_group",
     "fused_sibling_group_key",
     "group_fused_sibling_targets",
@@ -777,7 +1169,10 @@ __all__ = [
     "nvfp4_activation_qdq_served",
     "resolve_input_global_scale_policy",
     "resolve_input_global_scale_value",
+    "routed_moe_stage",
+    "routed_moe_stages_sha256",
     "select_mse_grid_input_global_scale",
+    "stage_values_sha256",
     "target_values_sha256",
     "unify_fused_sibling_max_abs",
     "unify_fused_sibling_input_global_scales",

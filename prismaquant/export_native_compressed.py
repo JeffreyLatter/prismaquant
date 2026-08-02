@@ -65,7 +65,7 @@ from collections import Counter, defaultdict
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable, NamedTuple, Sequence
+from typing import Any, Callable, Iterable, NamedTuple, Sequence
 
 import torch
 import torch.nn as nn
@@ -2413,6 +2413,86 @@ def _packed_expert_input_global_scale(
     if mx is None or float(mx) <= 0:
         return None
     return _nvfp4_input_global_scale_from_max_abs(float(mx))
+
+
+def _packed_expert_stage_attestation(
+    experts_param_name: str,
+    *,
+    cache: "ProductionWeightCache | None" = None,
+    profile=None,
+) -> dict[str, Any] | None:
+    """Attest one packed FusedMoE module's w13/w2 stages (ROADMAP K0.2).
+
+    This legacy container deliberately publishes no
+    ``execution_contracts.nvfp4_w4a4`` record (its activation scalars are
+    optional/defaultable and cannot carry the strict Gridbook fused-W4A4
+    claim), but it must not be able to emit a routed-MoE artifact whose two
+    stages were not both calibrated.  The section is built by the same shared
+    builder both CB exporters use, from the same calibration-source vocabulary,
+    so all three emit paths agree on stage identity, framing, and digests.
+
+    Returns ``None`` for anything that is not a packed routed-expert stage.
+    Raises when the sibling stage of the same FusedMoE module has no calibrated
+    max-abs — the exact half-calibrated state that makes fused MoE fail closed
+    at serving time.
+    """
+    parsed = _nvfp4_activation_contract.routed_moe_stage(
+        experts_param_name, profile=profile
+    )
+    if parsed is None:
+        return None
+    module, stage = parsed
+    if cache is None:
+        cache = _PRODUCTION_WEIGHT_CACHE
+    max_abs_map = (
+        getattr(cache, "activation_max_abs", None) or {}
+    ) if cache is not None else {}
+    max_abs_by_target: dict[str, float] = {}
+    for name, value in max_abs_map.items():
+        found = _nvfp4_activation_contract.routed_moe_stage(
+            str(name), profile=profile
+        )
+        if found is None or found[0] != module:
+            continue
+        if value is None or not math.isfinite(float(value)) or float(value) <= 0:
+            continue
+        max_abs_by_target[str(name)] = float(value)
+    staged = {
+        _nvfp4_activation_contract.routed_moe_stage(
+            name, profile=profile
+        )[1]: name
+        for name in sorted(max_abs_by_target)
+    }
+    missing = [
+        s for s in _nvfp4_activation_contract.NVFP4_ROUTED_MOE_STAGES
+        if s not in staged
+    ]
+    if missing:
+        raise RuntimeError(
+            f"[export-native] packed FusedMoE module {module!r} has a "
+            f"calibrated {stage} activation scale but no calibrated "
+            f"{missing} stage. A routed-MoE artifact must attest BOTH stages "
+            "(w13 from the experts-module input, w2 from the routed "
+            "intermediate); re-run build_production_cache with the packed "
+            "experts in scope so the missing packed_expert_max_abs entry is "
+            "recomputed."
+        )
+    policy = _nvfp4_activation_contract.resolve_input_global_scale_policy()
+    return _nvfp4_activation_contract.build_routed_moe_stage_attestation(
+        {
+            name: _nvfp4_input_global_scale_from_max_abs(value)
+            for name, value in max_abs_by_target.items()
+        },
+        policy=policy,
+        calibration_sources={
+            name: (
+                _nvfp4_activation_contract
+                .CALIBRATION_SOURCE_PACKED_EXPERT_RENDER
+            )
+            for name in max_abs_by_target
+        },
+        profile=profile,
+    )
 
 
 # Module-level flag bundle that controls which activation-aware
@@ -6588,6 +6668,11 @@ def materialize_tensors_streaming(
                         f"— re-run build_production_cache so the scale is "
                         f"recomputed, or delete the expert shard to force a "
                         f"full re-render.")
+                if expert_input_scale is not None and fmt == "NVFP4":
+                    # K0.2: a calibrated stage may only ship alongside its
+                    # attested sibling stage.
+                    _packed_expert_stage_attestation(
+                        full, cache=active_cache, profile=profile)
 
                 # M2: re-derive under the render's RECORDED NVFP4 scale
                 # rule (the dense _pack_production_cached_2d wrap, lifted
@@ -6901,6 +6986,11 @@ def _materialize_tensors_inmemory(
                     f"(would ship the 1.0 placeholder). Re-run "
                     f"build_production_cache to recompute the scale, or delete "
                     f"the expert shard to force a full re-render.")
+            if expert_input_scale is not None and fmt == "NVFP4":
+                # K0.2: a calibrated stage may only ship alongside its
+                # attested sibling stage.
+                _packed_expert_stage_attestation(
+                    full_name, cache=active_cache, profile=profile)
 
             # M2: re-derive under the render's RECORDED NVFP4 scale rule
             # (same wrap as the streaming packed-expert path).

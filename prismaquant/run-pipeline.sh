@@ -540,6 +540,74 @@ fi
 : "${CB_EXPERT_SAMPLE:=0}"
 : "${CB_LADDER_INTERP:=0}"
 : "${CB_COL_WEIGHTS:=${WORK_DIR}/artifacts/cb_col_weights.pkl}"
+# Activation-fair pricing (ultraplan P5a; gridbook
+# docs/audits/ultraplan_perf_2026-08-01.md §6). The allocator's cost
+# precedence prices the W4A4-vs-W8A8 activation contract ONLY on the measured
+# output_mse branch, and the two levers above are exactly what removes that
+# branch from most rows of a production run: CB_EXPERT_SAMPLE /
+# PRISMAQUANT_EXPERT_COST_SAMPLE make measure_quant_cost stamp
+# output_mse_measured=False on every packed-expert row, and CB_LADDER_INTERP=1
+# fills interpolated rungs weight-only. On those rows NVFP4-CB is credited
+# with its cheaper index stream and charged none of its A-side cost. The
+# allocator now calibrates one per-format-family correction per run from the
+# measured rows that DO exist and applies it to the weight-only ones.
+# 1 (default) = calibrate wherever the inputs exist; 0 = reproduce a pre-0.5.3
+# artifact's pricing bit-for-bit. It is NOT a knob to tune — the run refuses
+# outright rather than hand the DP a half-corrected (mixed-scale) menu.
+: "${ACTIVATION_FAIR_PRICING:=1}"
+export PRISMAQUANT_ACTIVATION_FAIR_PRICING="${ACTIVATION_FAIR_PRICING}"
+
+# ---------------------------------------------------------------------------
+# Hard serving constraints — the allocator's SECOND selection axis
+# (ultraplan P5c; docs/lanes/nvfp4-cb/format-speed-policy.md §1)
+# ---------------------------------------------------------------------------
+# Policy §1's production problem is "minimize predicted quality loss SUBJECT TO
+# exact bytes <= B, p95 TTFT <= SLO_prefill, p95 ITL <= SLO_decode_itl,
+# p05 TPS >= SLO_decode_tps, resident + KV + peak_scratch <= device budget".
+# Latency is NEVER blended into the objective: there is no lambda and no
+# phase-weighted serve_ms. An assignment that misses an SLO is INFEASIBLE and
+# is removed from the candidate set; the objective stays minimum predicted
+# Delta-loss over the survivors, with the existing ratchet tie-break intact.
+#
+# ALL OF THESE ARE OFF BY DEFAULT. Leave SERVE_DISPATCH_TABLE empty and the
+# allocator behaves exactly as it did before P5c, with a provenance stamp in
+# selection.json recording that no serving constraint was evaluated (so an
+# artifact never implies a latency claim it did not make).
+#
+# SERVE_DISPATCH_TABLE — measured per-(format-family, phase, M-regime, lane)
+#   serving costs, every row citing its source document, date, GPU identity,
+#   measured quantity, units and the derivation that produced the ratio. A row
+#   without a source is refused at load. An EXAMPLE table built only from
+#   published Gridbook measurements ships in-tree; it is PROPOSAL DATA, not a
+#   qualified serving model for your hardware:
+#     prismaquant/serve_dispatch_tables/gridbook_gb10_2026-08-01.example.json
+# SERVE_WORKLOAD_MIX — which M-regimes the workload actually runs, e.g.
+#   "prefill:dense_prefill_1400=1.0,decode:decode_batch1=1.0". Per-phase
+#   weights must sum to 1.0. There is deliberately no default: policy §1
+#   forbids "a default workload mix hidden in the allocator".
+# SLO_* / SERVE_DEVICE_BUDGET_BYTES — the operator's hard limits. Prefill and
+#   decode are separate constraints because a format can move them in opposite
+#   directions (FP8-CB measures 1.44x on dense prefill and at parity on
+#   batch-1 decode).
+# SERVE_KV_BYTES / SERVE_PEAK_SCRATCH_BYTES — operator inputs to the device
+#   memory constraint. The allocator models resident WEIGHT bytes exactly and
+#   models neither of these, so it will not guess them.
+#
+# Whatever these produce is PROPOSAL DATA. Per NATIVE-PARITY and policy §1,
+# per-layer timing tables generate candidate assignments; only the served
+# protocol promotes one.
+: "${SERVE_DISPATCH_TABLE:=}"
+: "${SERVE_WORKLOAD_MIX:=}"
+: "${SLO_PREFILL_P95_TTFT_MS:=}"
+: "${SLO_DECODE_P95_ITL_MS:=}"
+: "${SLO_DECODE_P05_TPS:=}"
+: "${SERVE_DEVICE_BUDGET_BYTES:=}"
+: "${SERVE_KV_BYTES:=0}"
+: "${SERVE_PEAK_SCRATCH_BYTES:=0}"
+if [[ -z "$SERVE_DISPATCH_TABLE" ]] && [[ -n "$SLO_PREFILL_P95_TTFT_MS$SLO_DECODE_P95_ITL_MS$SLO_DECODE_P05_TPS" ]]; then
+  echo "[pipeline] ERROR: a latency SLO was set but SERVE_DISPATCH_TABLE is empty. Latency constraints are priced from MEASURED rows; there is no built-in cost model to fall back on, and inventing one is exactly what the constrained-Pareto axis exists to prevent (gridbook docs/audits/ultraplan_perf_2026-08-01.md §6, P5c). Point SERVE_DISPATCH_TABLE at a measured table (the in-tree example is prismaquant/serve_dispatch_tables/gridbook_gb10_2026-08-01.example.json, which is PROPOSAL DATA)." >&2
+  exit 2
+fi
 
 PROBE_PATH="${WORK_DIR}/artifacts/probe.pkl"
 case "$COST_MODE" in
@@ -775,6 +843,15 @@ STAGE_SETTINGS_ENV=(
   "CB_EXPERT_SEQLEN=$CB_EXPERT_SEQLEN"
   "CB_EXPERT_SAMPLE=$CB_EXPERT_SAMPLE"
   "CB_LADDER_INTERP=$CB_LADDER_INTERP"
+  "ACTIVATION_FAIR_PRICING=$ACTIVATION_FAIR_PRICING"
+  "SERVE_DISPATCH_TABLE=${SERVE_DISPATCH_TABLE:-}"
+  "SERVE_WORKLOAD_MIX=${SERVE_WORKLOAD_MIX:-}"
+  "SLO_PREFILL_P95_TTFT_MS=${SLO_PREFILL_P95_TTFT_MS:-}"
+  "SLO_DECODE_P95_ITL_MS=${SLO_DECODE_P95_ITL_MS:-}"
+  "SLO_DECODE_P05_TPS=${SLO_DECODE_P05_TPS:-}"
+  "SERVE_DEVICE_BUDGET_BYTES=${SERVE_DEVICE_BUDGET_BYTES:-}"
+  "SERVE_KV_BYTES=${SERVE_KV_BYTES:-0}"
+  "SERVE_PEAK_SCRATCH_BYTES=${SERVE_PEAK_SCRATCH_BYTES:-0}"
   "CB_SCALE_CODING=${CB_SCALE_CODING:-}"
   "CB_CODEBOOK_SOURCE=${CB_CODEBOOK_SOURCE:-}"
   "CB_SCALE_SWEEP=${CB_SCALE_SWEEP:-}"
@@ -1327,6 +1404,25 @@ if [[ -n "$TARGET_DISK_GB" ]]; then
     --artifact-overhead-reserve-bytes "$ARTIFACT_OVERHEAD_RESERVE_BYTES"
   )
 fi
+# Hard serving constraints (ultraplan P5c). Empty SERVE_DISPATCH_TABLE ->
+# no flags -> the pre-P5c allocator, byte for byte. Latency never enters the
+# objective; these are constraints only.
+ALLOCATOR_SERVE_ARGS=()
+if [[ -n "$SERVE_DISPATCH_TABLE" ]]; then
+  ALLOCATOR_SERVE_ARGS+=(--serve-dispatch-table "$SERVE_DISPATCH_TABLE")
+  [[ -n "$SERVE_WORKLOAD_MIX" ]] && ALLOCATOR_SERVE_ARGS+=(--serve-workload-mix "$SERVE_WORKLOAD_MIX")
+  [[ -n "$SLO_PREFILL_P95_TTFT_MS" ]] && ALLOCATOR_SERVE_ARGS+=(--slo-prefill-p95-ttft-ms "$SLO_PREFILL_P95_TTFT_MS")
+  [[ -n "$SLO_DECODE_P95_ITL_MS" ]] && ALLOCATOR_SERVE_ARGS+=(--slo-decode-p95-itl-ms "$SLO_DECODE_P95_ITL_MS")
+  [[ -n "$SLO_DECODE_P05_TPS" ]] && ALLOCATOR_SERVE_ARGS+=(--slo-decode-p05-tps "$SLO_DECODE_P05_TPS")
+  if [[ -n "$SERVE_DEVICE_BUDGET_BYTES" ]]; then
+    ALLOCATOR_SERVE_ARGS+=(
+      --serve-device-budget-bytes "$SERVE_DEVICE_BUDGET_BYTES"
+      --serve-kv-bytes "$SERVE_KV_BYTES"
+      --serve-peak-scratch-bytes "$SERVE_PEAK_SCRATCH_BYTES"
+    )
+  fi
+  echo "[pipeline] serving constraints ACTIVE: table=$SERVE_DISPATCH_TABLE mix='${SERVE_WORKLOAD_MIX}' (PROPOSAL DATA; the served NATIVE-PARITY protocol is the release gate)"
+fi
 ALLOCATOR_CB_ARGS=()
 if [[ "$EXPORT_CONTAINER" == "nvfp4_cb" ]]; then
   harvest_cb_col_weights "[3/4] allocator identity"
@@ -1345,6 +1441,7 @@ python3 -m prismaquant.allocator \
   --formats "$FORMATS" \
   "${ALLOCATOR_PROFILE_ARGS[@]}" \
   "${ALLOCATOR_BUDGET_ARGS[@]+"${ALLOCATOR_BUDGET_ARGS[@]}"}" \
+  "${ALLOCATOR_SERVE_ARGS[@]+"${ALLOCATOR_SERVE_ARGS[@]}"}" \
   "${ALLOCATOR_CB_ARGS[@]+"${ALLOCATOR_CB_ARGS[@]}"}" \
   --pareto-targets "$PARETO_TARGETS" \
   --visual-format "$VISUAL_FORMAT" \

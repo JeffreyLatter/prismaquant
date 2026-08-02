@@ -39,9 +39,63 @@ fastest format is invalid: that combination can exceed the byte budget,
 especially below 4.5 bpp. Define the fastest feasible reference independently
 for prefill and decode; do not blend the phases.
 
-The constrained Pareto solver described here is not yet implemented. Until it
-is, timing tables are proposal data and final selection is an external release
-gate, not an allocator capability claim.
+### What is implemented, and what still gates promotion
+
+The constrained Pareto solver described here **is implemented** as of the
+ultraplan P5c producer work (gridbook
+`docs/audits/ultraplan_perf_2026-08-01.md` §6). Concretely:
+
+- **The constraints are hard and separate.** `prismaquant/serve_constraints.py`
+  evaluates p95 TTFT, p95 ITL, p05 TPS and `resident + KV + peak_scratch`
+  against operator-supplied SLOs. An assignment that misses any of them is
+  INFEASIBLE — removed from the candidate set, never re-ranked. There is no
+  `lambda`, no phase-weighted `serve_ms`, and no default workload mix: the
+  objective is still exactly minimum predicted Δloss, and among feasible
+  assignments the existing ratchet tie-break (min Δloss, ties toward the
+  larger footprint) is unchanged.
+- **Where it is enforced.** At assignment level, in the allocator's
+  exact-payload / byte-budget ratchet — the same point the exact byte filter
+  sits — and not inside `solve_allocation`'s bits-DP, whose semantics for the
+  unconstrained case are unchanged and pinned by test. The filter sees the
+  EXPANDED, promoted assignment, which is the object that actually ships.
+- **What it consumes.** A declarative measured dispatch table
+  (`prismaquant/serve_dispatch_table.py`, schema
+  `prismaquant.serve_dispatch_table.v1`): per (format family, phase, M-regime,
+  serving lane) relative serving cost, with mandatory per-row provenance —
+  source document, date, GPU identity, measured quantity, units, and the
+  derivation from the published number to the ratio. **A row without a source
+  is a load error.** Each `(phase, M-regime)` arena names exactly one
+  reference route, so ratios measured against different denominators are never
+  silently composed. Lane resolution uses the §2 serving-lane metadata: a rung
+  whose fused mid-M lane the pinned Gridbook version does not instantiate is
+  priced with its FALLBACK route's row, never the fused lane's.
+- **The aggregation model is explicit and stamped**: an additive layer-time
+  model, parameter-share weighted, with eight named assumptions (additivity,
+  parameter-share weighting, route locality, regime uniformity, baseline
+  transfer, resident bytes, the single-stream `p05_TPS = 1000 / p95_ITL_ms`
+  identity, and statistic transfer). It is stamped as
+  `additive_layer_time__param_share_weighted__table_driven_proposal` beside
+  the existing `additive_candidate_proposal_then_exact_assignment_filter`
+  honesty stamp, and it claims no global optimality: the filter guarantees
+  every ACCEPTED assignment is feasible on both axes, not that the feasible
+  set was enumerated.
+- **Fail-closed.** An assignment the table cannot price is infeasible, not
+  "passed": a missing row, an arena with no absolute reference, and an
+  isolated-operator microbenchmark arena all refuse to certify. `selection.json`
+  records which constraints were active, which probed assignments were
+  rejected and for which SLO, and which constraint binds at the optimum.
+
+What has **not** changed is the promotion rule. Table-driven latency remains
+**proposal data**, exactly as the paragraphs above say: per-layer and
+per-operator timing tables generate candidate assignments; the same-session
+served protocol (streaming TTFT/ITL/TPS percentiles plus served KL/PPL/tasks,
+NATIVE-PARITY) is what promotes one. Supplying no table and no SLOs leaves
+every code path byte-identical to the pre-P5c allocator, with a stamp
+recording that constraints were absent — so an artifact never implies a
+latency claim it did not make.
+
+See `docs/design/constrained_pareto_allocation.md` for the design and the
+assumptions in full.
 
 ## 2. Bytes are a serialized-artifact constraint
 
@@ -61,13 +115,47 @@ The relevant serialized contracts are:
   reference/format identity. A lattice reference does not imply a free
   sidecar.
 
-The full execution contract must be selection and benchmark identity. The
-current `Candidate` encodes format, predicted loss, payload bytes, serialized
-layout, and sidecar identity through `CBSerializationContext`; it does **not**
-yet encode activation contract, concrete backend/fallback, or serving-unit
-identity. Until those fields land, they remain explicit feasibility inputs and
-benchmark provenance rather than properties enforced by the candidate object.
-A format name alone is not a byte or execution identity.
+The full execution contract must be selection and benchmark identity. A format
+name alone is not a byte or execution identity.
+
+`Candidate` encodes format, predicted loss, payload bytes, serialized layout,
+and sidecar identity through `CBSerializationContext`. Since the ultraplan P5
+producer work (gridbook `docs/audits/ultraplan_perf_2026-08-01.md` §6) it also
+encodes:
+
+- **the concrete serving-lane route** (`Candidate.serving_lane`), resolved
+  from the target serving profile's declarative `serving_lanes` block: the
+  served activation contract (`w8a8-dynamic-e4m3` for FP8-CB,
+  `w4-bf16-bridge` for the default FP4-CB quality path), whether the
+  consumer's fused mid-M kernel actually instantiates **this rung**, and the
+  fallback route it takes when it does not. The backed rung set is spec data
+  keyed by the pinned Gridbook version in
+  `prismaquant/gridbook_runtime/gridbook_runtime_pin.json`; a pinned version
+  the spec does not declare backs nothing. Gridbook 0.5.0 instantiates
+  FP8-CB fused mid-M for K ∈ {28,32,36,40,44,48} while production permits
+  every K28..K48, so the allocator can no longer price an unbacked fast path
+  without recording that it did (the producer-side mirror of gridbook K1.2).
+- **which estimator priced its activation contract**
+  (`Candidate.activation_pricing`): the measured `output_mse` branch, a
+  weight-only branch corrected by the per-family activation calibration, or a
+  weight-only branch left uncorrected. Weight-only rows — packed experts
+  under `PRISMAQUANT_EXPERT_COST_SAMPLE`, interpolated rungs under
+  `CB_LADDER_INTERP` — no longer read as if their A side had been measured.
+
+The serving profile additionally models gridbook's real load gates, not just
+the `in_features % 256` superblock rule: `out_features % 8` for the fp4-CB
+families and `out_features % 16` for fp8-CB, declared per grid from the
+`cb_layout` family table.
+
+`selection.json` records, for the shipped assignment, which selected rungs
+ride a backed fused lane versus the expand+GEMM fallback, the activation
+contracts in play, the per-family activation calibration (fit, sample digest,
+residual band), and the cross-family CB-ladder symmetry verdict. Since P5c it
+also records the hard serving constraints that were active, the probed
+assignments the SLO axis rejected and the limit that rejected each, and the
+constraint that binds at the shipped optimum (§1). Serving-unit identity
+remains a feasibility input and benchmark provenance rather than a property of
+the candidate object.
 
 ## 3. Benchmark the execution contract
 
@@ -176,7 +264,19 @@ before the full integration and served-quality gates pass.
 2. Keep fused FP4 opt-in until the served quality/routing gate passes.
 3. Rebuild exact-byte 0.6B/4B/27B endpoints and optimized menus over the full
    workload matrix.
-4. Check whether per-layer timing tables predict end-to-end ranks.
-5. Implement the constrained Pareto allocator above.
+4. Check whether per-layer timing tables predict end-to-end ranks. **Still
+   open, and it is now the gating question** — the constrained solver of §1
+   consumes a measured dispatch table, so whether that table's per-layer
+   ratios rank whole-request outcomes correctly is what decides if the
+   constraint axis is predictive or merely self-consistent. The
+   `d03_exact_rate` harness (§4, gridbook ROADMAP D0.3) prepares the offline
+   half of the evidence; the served protocol supplies the other half.
+5. Implement the constrained Pareto allocator above. **Done** (ultraplan P5c):
+   hard p95 TTFT / p95 ITL / p05 TPS / device-memory constraints as a second
+   axis in the byte-budget ratchet, priced from a provenance-gated measured
+   dispatch table, with no λ anywhere and the min-Δloss objective and its
+   tie-break untouched. Its output is proposal data; the served protocol is
+   still what promotes. See §1 and
+   `docs/design/constrained_pareto_allocation.md`.
 6. Resume the Gridbook-owned W4A16 packing/delegation feature when validation
    hardware and the upstream backend are available.
