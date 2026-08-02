@@ -1972,12 +1972,31 @@ that is a stop-only surrogate, not a served promotion. Plain M=1 decode evidence
 batched/speculative parity, and the Hy3 zero-NVFP4 allocation is circular under its
 accuracy-only objective.
 
-**Implementation status:** this constrained Pareto formulation is normative
-future work, not current allocator behavior. Today the profile legality masks
-(including signed-rung exclusion) are enforced, tensor-payload costs feed the
-quality-only allocator, and final SLO/quality selection is an external release
-gate. A format allow-list does not prove a backend, activation contract, or
-promotion state; those live in the structured native-parity benchmark record.
+**Implementation status: SHIPPED (ultraplan P5c, `b052255`).** The constrained
+Pareto formulation above is current allocator behaviour, not future work.
+`prismaquant/serve_constraints.py` + `prismaquant/serve_dispatch_table.py` are
+wired into the allocator (`allocator.py:158-163` imports, `:1979-2009` context
+construction and the ACTIVE/INACTIVE banner, `:2951` the per-assignment
+evaluation). The constraints are **hard and enforced at assignment level** — in
+the exact-payload / byte-budget ratchet, on the EXPANDED promoted assignment
+that actually ships, not inside `solve_allocation`'s bits-DP, whose
+unconstrained semantics are unchanged and pinned by test. An assignment that
+misses p95 TTFT, p95 ITL, p05 TPS or `resident + KV + peak_scratch` is
+INFEASIBLE and leaves the candidate set; it is never merely re-ranked. There is
+**no λ**, no phase-weighted `serve_ms` and no default workload mix: the
+objective is still exactly minimum predicted Δloss, with the existing ratchet
+tie-break. Fail-closed — an assignment the dispatch table cannot price is
+infeasible, not passed. Supplying no table and no SLOs leaves every code path
+**byte-identical** to the pre-P5c allocator, with a stamp recording that
+constraints were absent. Profile legality masks (including signed-rung
+exclusion) are enforced as before. What has *not* changed is the promotion
+rule: table-driven latency is proposal data, and the same-session served
+NATIVE-PARITY protocol is what promotes an assignment. A format allow-list
+still does not prove a backend, activation contract, or promotion state; those
+live in the structured native-parity benchmark record. Normative policy and the
+full shipped/gating split: `docs/lanes/nvfp4-cb/format-speed-policy.md:42-98`
+("What is implemented, and what still gates promotion"); design and the eight
+named assumptions: `docs/design/constrained_pareto_allocation.md`.
 
 ### 9.3 GGUF
 

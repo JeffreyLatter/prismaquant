@@ -21,7 +21,7 @@
       "absolute_value": 746.0,
       "statistic": "single_seed_point_measurement",
       "provenance": {
-        "source": "gridbook docs/BENCHMARKS.md, section '27B (Qwen3-class hybrid) - validated quality win at 5.5 bpp', Speed table",
+        "source": "gridbook docs/BENCHMARKS.md, section '27B (Qwen3-class hybrid) — validated quality win at 5.5 bpp', Speed table",
         "date": "2026-07-18",
         "gpu": "single NVIDIA GB10 / DGX Spark, Blackwell sm_121, 128 GB unified memory, ~273 GB/s",
         "measured_quantity": "TTFT at 1400 input tokens (TTFT(1400)) for the native NVFP4/FP8 baseline arm",
@@ -40,7 +40,7 @@
       "absolute_value": 10.26,
       "statistic": "single_seed_point_measurement",
       "provenance": {
-        "source": "gridbook docs/BENCHMARKS.md, section '27B (Qwen3-class hybrid) - validated quality win at 5.5 bpp', Speed table",
+        "source": "gridbook docs/BENCHMARKS.md, section '27B (Qwen3-class hybrid) — validated quality win at 5.5 bpp', Speed table",
         "date": "2026-07-18",
         "gpu": "single NVIDIA GB10 / DGX Spark, Blackwell sm_121, 128 GB unified memory, ~273 GB/s",
         "measured_quantity": "batch-1 decode throughput for the native NVFP4/FP8 baseline arm",
@@ -59,7 +59,7 @@
       "absolute_value": null,
       "statistic": "ratio_only_no_absolute",
       "provenance": {
-        "source": "gridbook docs/KERNELS.md, section 'FP8-CB fused decode-in-prologue (the 1x fix)'",
+        "source": "gridbook docs/KERNELS.md, section 'FP8-CB fused decode-in-prologue (the 1× fix)'",
         "date": "2026-08-01",
         "gpu": "NVIDIA GB10 / DGX Spark, Blackwell sm_121",
         "measured_quantity": "GEMM-level speed of the fused decode-in-prologue kernel relative to the transient expand+GEMM route, at M=32",
@@ -77,7 +77,7 @@
       "absolute_value": null,
       "statistic": "ratio_only_no_absolute",
       "provenance": {
-        "source": "gridbook docs/KERNELS.md, section 'FP8-CB fused decode-in-prologue (the 1x fix)'",
+        "source": "gridbook docs/KERNELS.md, section 'FP8-CB fused decode-in-prologue (the 1× fix)'",
         "date": "2026-08-01",
         "gpu": "NVIDIA GB10 / DGX Spark, Blackwell sm_121",
         "measured_quantity": "GEMM-level speed of the fused decode-in-prologue kernel relative to the transient expand+GEMM route, at M=64",
@@ -95,7 +95,7 @@
       "absolute_value": null,
       "statistic": "ratio_only_no_absolute",
       "provenance": {
-        "source": "gridbook docs/KERNELS.md, section 'FP8-CB fused decode-in-prologue (the 1x fix)'",
+        "source": "gridbook docs/KERNELS.md, section 'FP8-CB fused decode-in-prologue (the 1× fix)'",
         "date": "2026-08-01",
         "gpu": "NVIDIA GB10 / DGX Spark, Blackwell sm_121",
         "measured_quantity": "GEMM-level speed of the fused decode-in-prologue kernel relative to the transient expand+GEMM route, at M=128",
@@ -113,7 +113,7 @@
       "absolute_value": null,
       "statistic": "ratio_only_no_absolute",
       "provenance": {
-        "source": "gridbook docs/KERNELS.md, section 'FP8-CB fused decode-in-prologue (the 1x fix)'",
+        "source": "gridbook docs/KERNELS.md, section 'FP8-CB fused decode-in-prologue (the 1× fix)'",
         "date": "2026-08-01",
         "gpu": "NVIDIA GB10 / DGX Spark, Blackwell sm_121",
         "measured_quantity": "GEMM-level speed of the fused decode-in-prologue kernel relative to the transient expand+GEMM route, at M~1400",
@@ -295,7 +295,7 @@
       "lane": "fallback",
       "relative_unit_cost": 1.0,
       "provenance": {
-        "source": "gridbook docs/KERNELS.md, 'FP8-CB fused decode-in-prologue (the 1x fix)'",
+        "source": "gridbook docs/KERNELS.md, 'FP8-CB fused decode-in-prologue (the 1× fix)'",
         "date": "2026-08-01",
         "gpu": "NVIDIA GB10 / DGX Spark, Blackwell sm_121",
         "measured_quantity": "the transient expand+GEMM route at M=32 - the denominator of the published 1.04x speedup",
@@ -310,7 +310,7 @@
       "lane": "fused_mid_m",
       "relative_unit_cost": 0.9615,
       "provenance": {
-        "source": "gridbook docs/KERNELS.md, 'FP8-CB fused decode-in-prologue (the 1x fix)'",
+        "source": "gridbook docs/KERNELS.md, 'FP8-CB fused decode-in-prologue (the 1× fix)'",
         "date": "2026-08-01",
         "gpu": "NVIDIA GB10 / DGX Spark, Blackwell sm_121",
         "measured_quantity": "fused decode-in-prologue kernel vs transient expand+GEMM at M=32, published as a 1.04x speedup",
@@ -326,7 +326,7 @@
       "lane": "fallback",
       "relative_unit_cost": 1.0,
       "provenance": {
-        "source": "gridbook docs/KERNELS.md, 'FP8-CB fused decode-in-prologue (the 1x fix)'",
+        "source": "gridbook docs/KERNELS.md, 'FP8-CB fused decode-in-prologue (the 1× fix)'",
         "date": "2026-08-01",
         "gpu": "NVIDIA GB10 / DGX Spark, Blackwell sm_121",
         "measured_quantity": "the transient expand+GEMM route at M=64 - the denominator of the published 1.26x speedup",
@@ -341,7 +341,7 @@
       "lane": "fused_mid_m",
       "relative_unit_cost": 0.7937,
       "provenance": {
-        "source": "gridbook docs/KERNELS.md, 'FP8-CB fused decode-in-prologue (the 1x fix)'",
+        "source": "gridbook docs/KERNELS.md, 'FP8-CB fused decode-in-prologue (the 1× fix)'",
         "date": "2026-08-01",
         "gpu": "NVIDIA GB10 / DGX Spark, Blackwell sm_121",
         "measured_quantity": "fused decode-in-prologue kernel vs transient expand+GEMM at M=64, published as a 1.26x speedup",
@@ -356,7 +356,7 @@
       "lane": "fallback",
       "relative_unit_cost": 1.0,
       "provenance": {
-        "source": "gridbook docs/KERNELS.md, 'FP8-CB fused decode-in-prologue (the 1x fix)'",
+        "source": "gridbook docs/KERNELS.md, 'FP8-CB fused decode-in-prologue (the 1× fix)'",
         "date": "2026-08-01",
         "gpu": "NVIDIA GB10 / DGX Spark, Blackwell sm_121",
         "measured_quantity": "the transient expand+GEMM route at M=128 - the denominator of the published 1.45x speedup",
@@ -371,7 +371,7 @@
       "lane": "fused_mid_m",
       "relative_unit_cost": 0.6897,
       "provenance": {
-        "source": "gridbook docs/KERNELS.md, 'FP8-CB fused decode-in-prologue (the 1x fix)'",
+        "source": "gridbook docs/KERNELS.md, 'FP8-CB fused decode-in-prologue (the 1× fix)'",
         "date": "2026-08-01",
         "gpu": "NVIDIA GB10 / DGX Spark, Blackwell sm_121",
         "measured_quantity": "fused decode-in-prologue kernel vs transient expand+GEMM at M=128, published as a 1.45x speedup",
@@ -386,7 +386,7 @@
       "lane": "fallback",
       "relative_unit_cost": 1.0,
       "provenance": {
-        "source": "gridbook docs/KERNELS.md, 'FP8-CB fused decode-in-prologue (the 1x fix)'",
+        "source": "gridbook docs/KERNELS.md, 'FP8-CB fused decode-in-prologue (the 1× fix)'",
         "date": "2026-08-01",
         "gpu": "NVIDIA GB10 / DGX Spark, Blackwell sm_121",
         "measured_quantity": "the transient expand+GEMM route at M~1400 - the denominator of the published 0.22x figure",
@@ -401,7 +401,7 @@
       "lane": "fused_mid_m",
       "relative_unit_cost": 4.545,
       "provenance": {
-        "source": "gridbook docs/KERNELS.md, 'FP8-CB fused decode-in-prologue (the 1x fix)'",
+        "source": "gridbook docs/KERNELS.md, 'FP8-CB fused decode-in-prologue (the 1× fix)'",
         "date": "2026-08-01",
         "gpu": "NVIDIA GB10 / DGX Spark, Blackwell sm_121",
         "measured_quantity": "fused decode-in-prologue kernel vs transient expand+GEMM at M~1400, published as ~0.22x (a loss)",

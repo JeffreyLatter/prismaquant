@@ -218,7 +218,7 @@ findings are self-contained.
   Confidence: **CONFIRMED** (math + repro); design-choice status noted.
 
 ### M7. `_end_kl` teacher/student KL-scope mismatch under `PRISMAQUANT_FULL_SEQUENCE_KL=1`
-- **Where:** `validation_harness.py:685-696` + `kl_measurement.py:5390-5395/5507-5513`.
+- **Where:** `validation_harness.py:685-696` + `kl_measurement.py:5390-5395/5507-5513` (line numbers as audited @ `e233818`). **Current locations, and the fix:** `_end_kl` is `validation_harness.py:657`, and the recommended fix landed — it now passes `kl_scope="last_token"` explicitly at `validation_harness.py:719`. The scope resolution is `resolve_kl_scope` (`kl_measurement.py:59-78`, env read at `:75`) and the consumer is `measure_assignment_kl` (`kl_measurement.py:1051`, scope resolved at `:1082`).
 - **Issue:** `_end_kl` hard-codes a last-token teacher (`logits[:, -1:, :]`)
   but calls `measure_assignment_kl` without `kl_scope`, which resolves from the
   env; a [1,1,V] teacher silently broadcasts against [1,T,V] student log-probs,
@@ -253,7 +253,7 @@ findings are self-contained.
   max precision. Confidence: **CONFIRMED** (code paths read end-to-end); latent.
 
 ### M10 (latent). Lane-replay KL mispairs teacher microbatches when `calib_microbatch_size > 1` meets the replay cache
-- **Where:** `kl_measurement.py:3389-3401` + `:3617-3646`.
+- **Where:** `kl_measurement.py:3389-3401` + `:3617-3646` (line numbers as audited @ `e233818`). **Current location, and the fix:** the pairing is now `_replay_lane_kl_totals` (`kl_measurement.py:794-865`), which consumes each teacher entry's row count at a running offset and **raises** on a row-count mismatch instead of broadcasting teacher group *i* against student row *i* and mis-normalizing by N — the docstring at `:794-819` names this finding. The L3 callers moved to `archive/l3_propagated_2026-07-30/prismaquant/kl_measurement_l3.py` with the 2026-07-30 wall.
 - **Issue:** refs regrouped to [mb,L,V] but the replay branch pairs teacher
   group i against student row i via broadcast and divides by N — simulated 2×
   error (0.881 → 0.396). Unreachable today (both call sites pin mb=1); nothing
