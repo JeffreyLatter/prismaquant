@@ -1846,10 +1846,17 @@ Gridbook commit, so an A/B cannot silently compare different runtime code.
 CB rung ranges, serialized packing/type-size rules, and supported producer-profile ids.
 PrismaQuant's required `gridbook-contract` CI job VCS-installs the exact pinned commit, verifies
 its PEP 610 provenance and package version, and compares the producer's declarations against
-that contract. Adding an architecture or changing a runtime ABI therefore starts in Gridbook,
-then advances this repository's single pin only after the contract test passes. PrismaQuant does
-not import Gridbook while exporting and carries no parallel runtime alias or loader table. Its
-producer codec remains an intentionally independent implementation of the artifact ABI; CI
+that contract. That job is also where the **K0.2** stage attestation runs end to end in a single
+process: `tests/test_gridbook_attestation_interop.py` emits a routed-MoE record with the real
+producer and feeds it to the pinned runtime's parser, payload validator, stage verifier, and
+artifact-level K0.2 verdict. It exists because a stage entry must declare *exactly* its five
+attested fields while every digest in the contract is framed over those same five by name — so a
+field ADDED on the producer side moves no hex, leaves both repositories' suites green, and fails
+for the first time at vLLM model load. Adding an architecture or changing a runtime ABI therefore
+starts in Gridbook, then advances this repository's single pin only after the contract test
+passes. PrismaQuant does not import Gridbook while exporting and carries no parallel runtime
+alias or loader table. Its producer codec remains an intentionally independent implementation of
+the artifact ABI; CI
 compares every packing/layout field and every rung so incompatibility fails at the boundary.
 
 At runtime `register()` registers `"gridbook"` plus the legacy artifact alias `"prismaquant"`
