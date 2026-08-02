@@ -126,6 +126,14 @@ NSAMPLES="${NSAMPLES:-16}"
 SEQLEN="${SEQLEN:-512}"
 ACTIVATION_ROWS_LIMIT="${ACTIVATION_ROWS_LIMIT:-64}"
 
+# The diverse-v1 corpus (prose 0.4 / code 0.2 / math 0.2 / multilingual 0.2,
+# docs/design/calibration_diverse_v1.md) rather than the wikitext default: a
+# mixed-domain corpus fires more of the routing table per token, which is the
+# binding constraint here, and it is a local .jsonl so the probe does not need
+# the `datasets` package — gridbook:test does not ship it.
+CALIB_DIR="${CALIB_DIR:-/home/rob/dq-runs/calibration}"
+DATASET="${DATASET:-${CALIB_DIR}/diverse-v1.jsonl}"
+
 FORMATS="${FORMATS:-NVFP4_CB_K14,NVFP4_CB_K15,FP8_CB_K36,BF16}"
 
 # 92 decimal GB with the 256 MiB non-tensor reserve (study README).
@@ -139,11 +147,18 @@ mkdir -p "$WORK_DIR"/{artifacts,act,work,logs}
 DOCKER_COMMON=(
   --rm --gpus all --ipc=host
   -v "${RUN_ROOT}:${RUN_ROOT}"
+  -v "${CALIB_DIR}:${CALIB_DIR}:ro"
   -v "${REPO}:/pq" -w /pq
   -e PYTHONPATH=/pq
   -e PRISMAQUANT_CB_EXT_DIR="${RUN_ROOT}/ext"
   -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
   -e PRISMAQUANT_ACTIVATION_FAIR_PRICING=1
+  # Explicit CB producer identity. cb_serialization_context_from_env refuses
+  # to guess: measured cost and shipped bytes must be the same render.
+  -e CB_CODEBOOK_SOURCE=lattice
+  -e CB_SCALE_CODING=two_tier
+  -e CB_SCALE_SWEEP=1
+  -e PRISMAQUANT_CB_ENCODE_TIER=balanced
   # PRISMAQUANT_EXPERT_COST_SAMPLE intentionally NOT set — see header.
 )
 
@@ -153,6 +168,7 @@ run_probe() {
     --entrypoint bash "$IMAGE" -c "
 python3 -m prismaquant.incremental_probe \
   --model ${MODEL_PATH} \
+  --dataset ${DATASET} \
   --nsamples ${NSAMPLES} --seqlen ${SEQLEN} \
   --device cuda --dtype bf16 \
   --output ${WORK_DIR}/artifacts/probe.pkl \
@@ -174,21 +190,33 @@ run_colw() {
     -e CB_ACT_DIR="${WORK_DIR}/act" \
     -e CB_COL_WEIGHTS="${WORK_DIR}/artifacts/cb_col_weights.pkl" \
     -e MODEL_PATH="${MODEL_PATH}" \
+    -e COLW_LOG="${WORK_DIR}/logs/colw.log" \
     --entrypoint bash "$IMAGE" -c '
-python3 - <<PY 2>&1 | tee '"${WORK_DIR}"'/logs/colw.log
-import os, pickle
-from prismaquant.export_gguf import build_imatrix_from_act_cache
-from prismaquant.moe_imatrix import synthesize_packed_expert_col_weights
-act = os.environ["CB_ACT_DIR"]; out = os.environ["CB_COL_WEIGHTS"]
-cw = build_imatrix_from_act_cache(act)
+python3 - <<'PYEOF' 2>&1 | tee "$COLW_LOG"
+import os, pickle, torch
+from pathlib import Path
+# Inlined from export_gguf.build_imatrix_from_act_cache: llama.cpp imatrix
+# semantics (mean squared activation per input column). Inlined because
+# export_gguf imports `gguf` at module scope and gridbook:test does not ship
+# it; the arithmetic here is identical.
+act = Path(os.environ["CB_ACT_DIR"]); out = os.environ["CB_COL_WEIGHTS"]
+cw = {}
+for p in sorted(act.glob("*.pt")):
+    blob = torch.load(p, map_location="cpu", weights_only=False)
+    inputs = blob.get("inputs") if isinstance(blob, dict) else None
+    if inputs is None or inputs.ndim != 2:
+        continue
+    name = (blob.get("name") if isinstance(blob, dict) else None) or p.stem.replace("__", ".")
+    cw[name] = inputs.float().pow(2).mean(dim=0)
 if not cw:
     raise SystemExit(f"no activation cache under {act!r}")
-added = synthesize_packed_expert_col_weights(os.environ["MODEL_PATH"], act, cw)
-print(f"synthesized {len(added)} packed-expert entries")
+# synthesize_packed_expert_col_weights is a no-op on DSv4: it only fills
+# `<experts>.gate_up_proj`/`.down_proj` entries for PACKED 3-D stacks, and
+# DSv4-Flash exposes routed experts as per-expert nn.Linears.
 with open(out, "wb") as fh:
     pickle.dump(cw, fh)
-print(f"wrote {out}: {len(cw)} entries (need 33,325 for full CB coverage)")
-PY'
+print(f"wrote {out}: {len(cw)} entries (33,325 = full CB coverage)")
+PYEOF'
 }
 
 run_cost() {
@@ -208,7 +236,7 @@ python3 -m prismaquant.incremental_measure_quant_cost \
   --mode batched --chunk-size 256 \
   --layers-per-shard 1 \
   --start-layer ${START_LAYER:-0} --end-layer ${END_LAYER:-43} \
-  --no-include-lm-head \
+  --skip-missing-activations --no-include-lm-head \
   > ${WORK_DIR}/logs/cost.log 2>&1"
 }
 
