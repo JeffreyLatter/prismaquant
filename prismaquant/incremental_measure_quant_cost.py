@@ -1451,7 +1451,25 @@ def main():
     with open(args.probe, "rb") as _pf:
         _probe_stats = _pkl.load(_pf).get("stats", {})
     with open(args.output, "rb") as _cf:
-        _cost_names = set(_pkl.load(_cf).get("costs", {}))
+        _cost_table = _pkl.load(_cf).get("costs", {})
+    _cost_names = set(_cost_table)
+    # Rows a measurement exception poisoned. measure_batched_gpu aborts the
+    # shard by default, so reaching here means someone ran with
+    # PRISMAQUANT_COST_FAIL_FAST=0 — the table must still never reach the
+    # allocator, which cannot tell a failed row from an unoffered format.
+    _failed = sorted(
+        f"{_n}/{_f}"
+        for _n, _row in _cost_table.items()
+        if isinstance(_row, dict)
+        for _f, _e in _row.items()
+        if isinstance(_e, dict) and _e.get("cost_measurement_failed")
+    )
+    if _failed:
+        print(f"[incremental-cost] FATAL: {len(_failed)} (Linear, format) "
+              f"rows failed measurement and carry no usable cost, e.g. "
+              f"{_failed[:5]} — refusing to hand the allocator a cost table "
+              f"with fail-open holes.", flush=True)
+        raise SystemExit(2)
     _lay = _re.compile(r"\blayers\.(\d+)\.")
     def _layers_of(names):
         out = set()

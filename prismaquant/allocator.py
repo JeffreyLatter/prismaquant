@@ -3785,6 +3785,96 @@ def main():
             r = _artifact_for_target(float(row["target_bits"]))
             if r is not None:
                 grid.append(r)
+
+        def _menu_floor_target_bits() -> float | None:
+            """Exact bpp of the cheapest allocation this run's MENU can reach.
+
+            Every DP unit takes its own cheapest candidate; the proposal is
+            expanded and priced through the same exact accountant
+            ``_solve_for_target`` filters against, so the returned bpp is a
+            target the solver can actually land on (an epsilon-below value
+            like the format's nominal rate is NOT: per-shape row scales and
+            the shared CB sidecar push the achievable mean a hair above it,
+            and the rung comes back INFEASIBLE).
+
+            ``None`` when a unit has no candidate at all or the proposal
+            cannot be priced — both are upstream legality/coverage bugs that
+            their own gates report; this probe stays silent about them.
+            """
+            cheapest_fmt: dict[str, str] = {}
+            for cand_name, cand_list in candidates.items():
+                if not cand_list:
+                    return None
+                cheapest_fmt[cand_name] = min(
+                    cand_list, key=lambda c: (c.memory_bytes, c.fmt)).fmt
+            try:
+                expanded_floor = _expand_assignment_for_seed_json(
+                    cheapest_fmt, include_auxiliary=False)
+                totals = _assignment_payload_totals(
+                    expanded_floor, require_all_stats=True)
+            except Exception:
+                return None
+            floor_bits = float(totals["bits_per_param"])
+            if not math.isfinite(floor_bits) or floor_bits <= 0.0:
+                return None
+            return floor_bits
+
+        def _extend_grid_to_menu_floor() -> dict:
+            """Probe below the swept grid before calling a budget infeasible.
+
+            The Pareto grid is a COARSE SAMPLE of the RD curve, but the
+            byte-budget selector reads its cheapest point as "the cheapest
+            allocation". That reading holds only while the grid actually
+            reaches the bottom of the format menu, and ``--pareto-targets``
+            defaults to 4.5..8.25 — a range written for a 4-bit/8-bit menu.
+            On the CB menu (NVFP4-CB is ~2.03 bpp) every sampled point is
+            more than twice as dense as the operator's budget, so a budget
+            the menu can meet with room to spare is rejected as "below the
+            floor" and the remedy printed with it ("raise the budget, widen
+            the menu") is exactly backwards. Measured on DeepSeek-V4-Flash:
+            a 92.0 GB budget whose menu floor is 87.2 GB was reported
+            infeasible against a "cheapest allocation" of 172.4 GB, which is
+            simply the 4.5 bpp rung.
+
+            This runs ONLY after the swept grid has already failed, so a run
+            that selects today keeps its exact grid, ratchet and selection.
+            A run that would have died gets the rungs it was missing, and a
+            budget genuinely below the menu floor gets a truthful floor in
+            the error instead of an artifact of where the sweep happened to
+            start.
+            """
+            record: dict = {
+                "swept_min_target_bits": (min(targets) if targets else None),
+                "menu_floor_target_bits": None,
+                "added_targets": [],
+                "infeasible_targets": [],
+                "reason": None,
+            }
+            floor_bits = _menu_floor_target_bits()
+            record["menu_floor_target_bits"] = floor_bits
+            if floor_bits is None:
+                record["reason"] = "menu_floor_not_priceable"
+                return record
+            swept_min = record["swept_min_target_bits"]
+            if swept_min is None or float(swept_min) <= floor_bits + 1e-9:
+                record["reason"] = "swept_grid_already_reaches_menu_floor"
+                return record
+            record["reason"] = "swept_grid_min_target_above_menu_floor"
+            # Geometric fill: densest sampling at the floor, where a budget
+            # that the sweep missed by this much almost always sits.
+            n_fill = 8
+            ratio = (float(swept_min) / floor_bits) ** (1.0 / n_fill)
+            for step in range(n_fill):
+                probe_t = floor_bits * (ratio ** step)
+                probe = _artifact_for_target(float(probe_t))
+                if probe is None:
+                    record["infeasible_targets"].append(float(probe_t))
+                    continue
+                grid.append(probe)
+                record["added_targets"].append(float(probe_t))
+            grid.sort(key=lambda c: float(c["target_bits"]))
+            return record
+
         # select_under_byte_budget is used here as the FEASIBILITY gate
         # (feasible / below_floor / rejected_next). Its own `chosen` is the
         # largest-footprint fitting candidate, which is deliberately NOT the
@@ -3796,6 +3886,27 @@ def main():
             budget_bytes,
             bytes_key="whole_artifact_upper_bound_bytes",
         )
+        grid_extension: dict | None = None
+        if not sel["feasible"]:
+            grid_extension = _extend_grid_to_menu_floor()
+            if grid_extension["added_targets"]:
+                print(
+                    "[alloc] byte-budget: the swept Pareto grid bottoms out "
+                    f"at {grid_extension['swept_min_target_bits']:.4f} bpp, "
+                    "above this menu's cheapest allocation "
+                    f"({grid_extension['menu_floor_target_bits']:.4f} bpp) — "
+                    f"probing {len(grid_extension['added_targets'])} rung(s) "
+                    "below the sweep so 'the cheapest allocation' means the "
+                    "cheapest the MENU can reach, not the cheapest that was "
+                    "sampled. Pass --pareto-targets covering the menu to see "
+                    "these rungs on the Pareto curve too.",
+                    flush=True,
+                )
+                sel = select_under_byte_budget(
+                    grid,
+                    budget_bytes,
+                    bytes_key="whole_artifact_upper_bound_bytes",
+                )
 
         rd = knee_summary.get("rd_curve") if isinstance(knee_summary, dict) else None
         selection = {
@@ -3825,6 +3936,10 @@ def main():
             "feasible": bool(sel["feasible"]),
             "below_floor": bool(sel["below_floor"]),
             "lm_head_unpinned": bool(allow_pinned),
+            # Present only when the swept grid failed and rungs below it were
+            # probed; ``menu_floor_target_bits`` is what "the cheapest
+            # allocation" is measured against from here on.
+            "pareto_grid_extension": grid_extension,
             "rd_curve": rd,
             "grid": [
                 {"target_bits": c["target_bits"],
@@ -3847,11 +3962,31 @@ def main():
             )
             selection["cheapest_whole_artifact_upper_bound_gb"] = cheapest_gb
             sel_path.write_text(json.dumps(selection, indent=2, sort_keys=True) + "\n")
+            # The floor probe already ran (above), so this number is the
+            # menu's floor and not the sweep's — EXCEPT when the probe itself
+            # could not be priced or came back INFEASIBLE, which is the one
+            # case where "cheapest" may still be an artifact of the sweep.
+            # Say so rather than let the operator read a sampling boundary as
+            # a property of the model.
+            floor_caveat = ""
+            if grid_extension is not None and not grid_extension["added_targets"]:
+                if grid_extension["reason"] == "menu_floor_not_priceable":
+                    floor_caveat = (
+                        " NOTE: the menu's own cheapest allocation could not "
+                        "be priced, so this figure is the cheapest SAMPLED "
+                        "rung; widen --pareto-targets before trusting it as "
+                        "a floor.")
+                elif grid_extension["infeasible_targets"]:
+                    floor_caveat = (
+                        " NOTE: rungs below the sweep were probed down to "
+                        f"{grid_extension['menu_floor_target_bits']:.4f} bpp "
+                        "and the solver could not land any of them, so this "
+                        "figure is the cheapest SAMPLED rung.")
             raise SystemExit(
                 f"[alloc] --target-disk-gb={args.target_disk_gb:.3f} is below the "
                 f"floor: the cheapest allocation is {cheapest_gb:.3f}GB. Raise the "
                 f"budget, unpin lm_head (--allow-pinned lm_head), or widen the "
-                f"format menu. Selection written to {sel_path}.")
+                f"format menu. Selection written to {sel_path}." + floor_caveat)
 
         # Among allocations whose conservative selection upper bound fits the
         # card, ship the

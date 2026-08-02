@@ -1,9 +1,16 @@
 """DeepSeek-V4-Flash / -Flash-Base profile.
 
 Covers:
-  - DeepseekV4ForCausalLM (671 B params total, 256 routed + 1 shared expert,
-    top-k=6, hybrid HCA/CSA attention with compressor + indexer, MTP head,
-    hyper-connections, hash-routed first 3 MoE blocks).
+  - DeepseekV4ForCausalLM as released in DeepSeek-V4-Flash-0731: ~285 B params
+    total by checkpoint arithmetic, of which 281,263,734,784 are quantizable
+    across 33,325 probeable Linears (probe-measured 2026-08-02, 16x512
+    diverse-v1); 43 layers, 256 routed + 1 shared expert, top-k=6, hybrid
+    HCA/CSA attention with compressor + indexer, MTP head, hyper-connections,
+    hash-routed first 3 MoE blocks. The 671 B figure that previously stood
+    here is the DeepSeek-V3-family headline total and does not describe
+    Flash; the DeepSeek family ships several differently-sized generations
+    and variants, so size claims in this profile are per-checkpoint from the
+    probe inventory, never the family headline.
 
 The DSv4 checkpoint uses a non-standard naming convention compared to the
 transformers `DeepseekV4Model` live module names. PrismaQuant must bridge

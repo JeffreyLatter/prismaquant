@@ -6,7 +6,9 @@ FP8-CB K36 on the dense/attention/shared tier at matched bits? Measures BOTH
 formats through ONE code path -- format_registry RTN qdq -> weight-MSE
 (unweighted AND activation-column-weighted) x probe h_trace -- so the
 comparison is internally consistent with the allocation's local cost
-convention. Reads the BF16 source directly; GPU-first.
+convention. Reads source weights through the same profile-aware BF16-value
+decoder as CB cost/export, so native FP8 and declared MXFP4 checkpoints are
+compared after their serialized scales are applied; GPU-first.
 
 Model-general since 2026-07-30 (format_choice_4p5.md Stage 0): the target list
 falls back to the probe's own Linear inventory when the work dir has no
@@ -34,12 +36,18 @@ import re
 import struct
 import sys
 from collections import defaultdict
+from pathlib import Path
 
 import torch
 
-sys.path.insert(0, "/home/rob/prismaquant")
+# Resolve the checkout containing this script.  A hard-coded developer clone
+# silently imported a stale branch when this tool ran from a clean worktree.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
 from prismaquant.format_registry import REGISTRY, canonical_format_name  # noqa: E402
 from prismaquant import nvfp4_cb_formats as cb           # noqa: E402
+from prismaquant.export_nvfp4_cb_streaming import _LazySkeleton  # noqa: E402
+from prismaquant.model_profiles import detect_profile  # noqa: E402
 
 
 def load_st_headers(src):
@@ -54,17 +62,15 @@ def load_st_headers(src):
     return hdrs
 
 
-def load_tensor(hdrs, name):
-    st, meta = hdrs[name]
-    off = meta["data_offsets"]
-    dt = {"BF16": torch.bfloat16, "F32": torch.float32,
-          "F16": torch.float16}[meta["dtype"]]
-    with open(st, "rb") as f:
-        hlen = struct.unpack("<Q", f.read(8))[0]
-        f.seek(8 + hlen + off[0])
-        buf = f.read(off[1] - off[0])
-    t = torch.frombuffer(bytearray(buf), dtype=dt).reshape(meta["shape"])
-    return t
+def load_source_weight(skeleton, name, device):
+    """Load one checkpoint weight under the canonical producer value contract.
+
+    ``_LazySkeleton.dequant_weight`` applies profile-resolved block-FP8 or
+    MXFP4 scales and rounds through the BF16 model-load value.  Calling it here
+    keeps this screen bit-comparable with CB cost/export and hard-fails on an
+    unscaled float8 tensor instead of treating storage codes as values.
+    """
+    return skeleton.dequant_weight(name).to(device, torch.bfloat16)
 
 
 # --- namespace-robust source lookup -----------------------------------------
@@ -88,10 +94,14 @@ def collapse_namespace(name: str) -> str:
     return ".".join(["model"] + parts[i:])
 
 
-def build_source_index(hdrs):
+def build_source_index(hdrs, profile=None):
     idx = {}
     for k in hdrs:
         idx.setdefault(collapse_namespace(k), k)
+        if profile is not None:
+            live = profile.checkpoint_to_live_name(k)
+            if live is not None:
+                idx.setdefault(str(live), k)
     return idx
 
 
@@ -149,7 +159,7 @@ def h_trace_of(probe, name):
 def unit_role(t):
     if ".experts." in t:
         return "expert"
-    if "shared_mlp" in t:
+    if "shared_mlp" in t or "shared_experts" in t:
         return "shared"
     return "dense/attn"
 
@@ -208,7 +218,9 @@ def main():
     spec_a = REGISTRY[canonical_format_name(args.fmt_a)]
     spec_b = REGISTRY[canonical_format_name(args.fmt_b)]
     hdrs = load_st_headers(args.source)
-    src_idx = build_source_index(hdrs)
+    skeleton = _LazySkeleton(args.source)
+    profile = detect_profile(args.source)
+    src_idx = build_source_index(hdrs, profile)
     print(f"[cfg] work={args.work}\n[cfg] source={args.source}\n"
           f"[cfg] targets={len(targets)} from {src_of_targets}; "
           f"A={spec_a.name} B={spec_b.name}; "
@@ -254,7 +266,7 @@ def main():
         if len(meta["shape"]) != 2:
             print(f"[skip] {t}: shape {meta['shape']} not 2-D", flush=True)
             continue
-        W = load_tensor(hdrs, key).to(dev, torch.bfloat16)
+        W = load_source_weight(skeleton, key, dev)
         h = h_trace_of(probe, t)
         cw = colw.get(t) if hasattr(colw, "get") else None
         fit_cw = (cw.to(dev, torch.float32)
