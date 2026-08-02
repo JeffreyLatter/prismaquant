@@ -98,6 +98,23 @@ PRODUCT_CB_FORMATS = tuple(
     for k in family.rungs
 )
 PRODUCT_CB_FORMAT_NAMES = frozenset(PRODUCT_CB_FORMATS)
+# Per-GRID rung sets. Gridbook's load gates are grid-specific — the fp4
+# families share one N-dimension packing (`out_features % 8`) and the fp8
+# family another (`out_features % 16`) — so a serving profile that has to
+# name "every fp4-CB rung" must derive it from the family table rather than
+# hand-list 17 names that drift the next time a rung is added.
+NVFP4_CB_FORMAT_NAMES = frozenset(
+    family.name(k)
+    for family in FAMILIES
+    if family.grid == "fp4"
+    for k in family.rungs
+)
+FP8_CB_FORMAT_NAMES = frozenset(
+    family.name(k)
+    for family in FAMILIES
+    if family.grid == "fp8"
+    for k in family.rungs
+)
 _FORMAT_RE = re.compile(r"^(NVFP4_CB_[KS]|FP8_CB_K)(\d+)$")
 
 

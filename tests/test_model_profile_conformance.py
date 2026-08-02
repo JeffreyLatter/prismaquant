@@ -306,10 +306,10 @@ STRUCTURE_DESCEND_LISTS = frozenset({
     "fused_groups", "live_to_recipe", "recipe_to_source", "recipe_to_vllm",
     "fast_kernel_packages",
 })
-SERVING_DESCEND_DICTS = frozenset({"export_lane", "when"})
+SERVING_DESCEND_DICTS = frozenset({"export_lane", "when", "fused_mid_m"})
 SERVING_DESCEND_LISTS = frozenset({
     "format_rules", "shape_rules", "runtime_shape_validators",
-    "runtime_packages",
+    "runtime_packages", "serving_lanes",
 })
 
 # Descriptive / documentation-only keys. Both spec families already share
