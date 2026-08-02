@@ -328,7 +328,8 @@ def _accumulate_result(bucket: dict, name: str, fmt: str,
                        rel_output_mse: float,
                        predicted_dloss: float | None = None,
                        fisher_output_mse: float | None = None,
-                       output_mse_measured: bool = True):
+                       output_mse_measured: bool = True,
+                       n_activation_rows: int | None = None):
     per_name = bucket.setdefault(name, {})
     acc = per_name.setdefault(fmt, {
         "_count": 0,
@@ -340,8 +341,14 @@ def _accumulate_result(bucket: dict, name: str, fmt: str,
         "_fisher_output_mse_sum": 0.0,
         "_fisher_output_mse_count": 0,
         "_output_mse_measured": True,
+        "_n_activation_rows": None,
     })
     acc["_count"] += 1
+    if n_activation_rows is not None:
+        prev = acc.get("_n_activation_rows")
+        acc["_n_activation_rows"] = (
+            int(n_activation_rows) if prev is None
+            else min(int(prev), int(n_activation_rows)))
     acc["_weight_mse_sum"] += weight_mse
     acc["_output_mse_sum"] += output_mse
     acc["_rel_output_mse_sum"] += rel_output_mse
@@ -370,6 +377,7 @@ def _finalize_results(bucket: dict[str, dict]) -> dict[str, dict]:
             fisher_n = int(acc.pop("_fisher_output_mse_count", 0) or 0)
             fisher_sum = acc.pop("_fisher_output_mse_sum", 0.0)
             output_mse_measured = bool(acc.pop("_output_mse_measured", True))
+            n_act_rows = acc.pop("_n_activation_rows", None)
             entry = {
                 "weight_mse": acc.pop("_weight_mse_sum") / n,
                 "output_mse": acc.pop("_output_mse_sum") / n,
@@ -377,6 +385,11 @@ def _finalize_results(bucket: dict[str, dict]) -> dict[str, dict]:
             }
             if not output_mse_measured:
                 entry["output_mse_measured"] = False
+            if n_act_rows is not None:
+                # How many activation rows the output-side numbers rest on.
+                # The allocator/provenance needs this to tell a well-covered
+                # expert from a one-token estimate.
+                entry["n_activation_rows"] = int(n_act_rows)
             if dloss_n > 0:
                 # Full per-weight Δloss from the H-detail path. The
                 # allocator prefers this scalar over the scalar-proxy
@@ -1767,6 +1780,16 @@ def _batched_quantize(
 # residual dof 0). See expert_empirical_cost._cb_ladder_holdout_tol.
 _CB_LADDER_TOL = float(os.environ.get("PRISMAQUANT_CB_LADDER_TOL", "0.10"))
 
+# Per-Linear activation-row cap for the batched output measurement. 0 = use
+# every cached row. The cache tops out at 64 rows per Linear, so this exists
+# only as an explicit lever, never as a silent truncation.
+_ACT_ROW_CAP = int(os.environ.get("PRISMAQUANT_COST_MAX_ACT_ROWS", "0") or 0)
+# A measurement exception aborts the shard by default. Set 0 only to triage a
+# broken run; the resulting rows are stamped cost_measurement_failed and the
+# merge gate refuses them.
+_COST_FAIL_FAST = os.environ.get(
+    "PRISMAQUANT_COST_FAIL_FAST", "1") not in ("0", "", "false", "False", "no")
+
 _CB_CW_CACHE: dict | None = None
 
 
@@ -1894,6 +1917,9 @@ def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
     accum: dict[str, dict[str, dict]] = {}
     processed = 0
     tstart = time.time()
+    # Row coverage of the output-side measurement, reported per layer so a
+    # thin calibration is visible in the log instead of silently averaged in.
+    chunk_rows_used: list[int] = []
 
     # v24: async activation prefetch. The previous synchronous path
     # spent ~30-40% of the cost step's wall in the per-Linear file
@@ -1972,17 +1998,42 @@ def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
                 act_items_cpu = [act_cache.load_with_row_indices(n) for n in names]
             acts_cpu = [item[0] for item in act_items_cpu]
             row_indices_cpu = [item[1] for item in act_items_cpu]
-            chunk_min_rows = min(a.size(0) for a in acts_cpu)
+            # Per-item row usage. The chunk USED to be truncated to
+            # min(rows) over its members, which on a MoE layer is set by the
+            # single least-routed expert in the chunk: from DSv4-Flash layer 3
+            # onward that minimum is 1, so every one of the 768 expert Linears
+            # in the layer had its output_mse measured on ONE token row and
+            # up to 63 cached rows were discarded. Each Linear now gets all of
+            # its own rows (capped by _ACT_ROW_CAP when set). Sparse experts
+            # keep their honest high-variance estimate; well-covered experts
+            # stop being dragged down to them.
+            rows_used = [
+                (min(int(a.size(0)), _ACT_ROW_CAP) if _ACT_ROW_CAP > 0
+                 else int(a.size(0)))
+                for a in acts_cpu
+            ]
             # Stack weights
             W = torch.stack([m.weight.detach().to(device=dev, dtype=dtype)
                              for _, m in chunk], dim=0)   # (N, out, in)
-            # Stack activations (truncated to chunk_min_rows)
-            X = torch.stack(
-                [a[:chunk_min_rows].to(device=dev, dtype=dtype)
-                 for a in acts_cpu], dim=0)               # (N, rows, in)
+            # Bucket the chunk by row count so the output-side BMM stays
+            # batched and rectangular WITHOUT padding: one stack per distinct
+            # row count, every member measured on exactly its own rows.
+            row_buckets: dict[int, list[int]] = {}
+            for _i, _r in enumerate(rows_used):
+                row_buckets.setdefault(_r, []).append(_i)
+            X_by_rows = {
+                r: torch.stack([acts_cpu[i][:r].to(device=dev, dtype=dtype)
+                                for i in idxs], dim=0)     # (n_r, r, in)
+                for r, idxs in row_buckets.items()
+            }
+            # Position of each chunk member inside its own row bucket.
+            slot_in_bucket = [0] * N
+            for _r, idxs in row_buckets.items():
+                for _p, _i in enumerate(idxs):
+                    slot_in_bucket[_i] = _p
             row_indices_cpu = [
-                idx[:chunk_min_rows] if isinstance(idx, torch.Tensor) else None
-                for idx in row_indices_cpu
+                (idx[:rows_used[i]] if isinstance(idx, torch.Tensor) else None)
+                for i, idx in enumerate(row_indices_cpu)
             ]
             gguf_qw = None
             if any(_cost_render_uses_imatrix(s) for s in specs):
@@ -1998,14 +2049,19 @@ def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
                     a.float().pow(2).mean(dim=0) for a in acts_cpu
                 ]).unsqueeze(1).to(dev)  # (N, 1, in)
             del acts_cpu, act_items_cpu
-            # Reference output (per-item BMM): shape (N, rows, out)
-            y_ref = torch.bmm(X, W.transpose(1, 2))
-            ref_energy = y_ref.float().pow(2).mean(dim=(1, 2))   # (N,)
+            # Reference output, one BMM per row bucket: (n_r, rows_r, out).
+            y_ref_by_rows = {
+                r: torch.bmm(Xb, W[row_buckets[r]].transpose(1, 2))
+                for r, Xb in X_by_rows.items()
+            }
+            ref_energy = torch.empty(N, dtype=torch.float32, device=dev)
+            for r, yb in y_ref_by_rows.items():
+                ref_energy[row_buckets[r]] = yb.float().pow(2).mean(dim=(1, 2))
 
             # Per-item H full tensor stacked across the chunk, for the
             # per-weight Δloss computation. Missing items get None.
             h_stacked = None
-            gq_stacked = None
+            gq_per_item = None
             if h_detail is not None:
                 h_items = []
                 gq_items = []
@@ -2030,20 +2086,24 @@ def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
                         gq_rows = _normalize_fisher_output_mse_row_weights(
                             gq,
                             row_indices_cpu[idx_nm],
-                            chunk_min_rows,
+                            rows_used[idx_nm],
                             dev,
                         )
                         if gq_rows is not None:
                             gq_items.append(gq_rows)
                         else:
                             all_have_gq = False
+                            gq_items.append(None)
                     else:
                         all_have_h = False
                         all_have_gq = False
+                        gq_items.append(None)
                 if all_have_h and len(h_items) == N:
                     h_stacked = torch.stack(h_items, dim=0)   # (N, out, in)
                 if all_have_gq and len(gq_items) == N:
-                    gq_stacked = torch.stack(gq_items, dim=0)  # (N, rows)
+                    # Ragged now (rows differ per item), so keep it per item
+                    # and stack inside each row bucket.
+                    gq_per_item = list(gq_items)
                 del h_items, gq_items
 
             def _measure_spec_into_accum(spec, idx=None):
@@ -2053,16 +2113,14 @@ def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
                 sub_names = (names if idx is None
                              else [names[i] for i in idx])
                 try:
+                    sel = list(range(N)) if idx is None else list(idx)
+                    slot_of = {c: p for p, c in enumerate(sel)}
                     Ws = W if idx is None else W[idx]
-                    Xs = X if idx is None else X[idx]
-                    y_refs = y_ref if idx is None else y_ref[idx]
                     ref_e = ref_energy if idx is None else ref_energy[idx]
                     gqw = gguf_qw if (gguf_qw is None or idx is None) \
                         else gguf_qw[idx]
                     hs = h_stacked if (h_stacked is None or idx is None) \
                         else h_stacked[idx]
-                    gqs = gq_stacked if (gq_stacked is None or idx is None) \
-                        else gq_stacked[idx]
                     n_sub = Ws.size(0)
                     W_hat = _batched_quantize(
                         spec, Ws,
@@ -2070,18 +2128,34 @@ def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
                             gqw if _cost_render_uses_imatrix(spec) else None
                         ),
                     )
-                    X_hat = spec.activation_quantize_dequantize(Xs.clone())
                     err = (Ws - W_hat).float()
                     weight_mse = err.pow(2).mean(dim=(1, 2))  # (n_sub,)
-                    y_q = torch.bmm(X_hat, W_hat.transpose(1, 2))
-                    y_err_sq = (y_refs - y_q).float().pow(2)
-                    output_mse = y_err_sq.mean(dim=(1, 2))  # (n_sub,)
+                    # Output side, one BMM per row bucket: every Linear is
+                    # scored on ALL of its own cached rows.
+                    output_mse = torch.empty(n_sub, dtype=torch.float32,
+                                             device=dev)
+                    fisher_output_mse = (
+                        torch.empty(n_sub, dtype=torch.float32, device=dev)
+                        if gq_per_item is not None else None)
+                    for r, members in row_buckets.items():
+                        cs = [c for c in members if c in slot_of]
+                        if not cs:
+                            continue
+                        bslots = [slot_in_bucket[c] for c in cs]
+                        wslots = [slot_of[c] for c in cs]
+                        Xb = X_by_rows[r][bslots]
+                        X_hat = spec.activation_quantize_dequantize(Xb.clone())
+                        y_q = torch.bmm(X_hat, W_hat[wslots].transpose(1, 2))
+                        y_err_sq = (
+                            y_ref_by_rows[r][bslots] - y_q).float().pow(2)
+                        output_mse[wslots] = y_err_sq.mean(dim=(1, 2))
+                        if fisher_output_mse is not None:
+                            gqb = torch.stack([gq_per_item[c] for c in cs],
+                                              dim=0)
+                            fisher_output_mse[wslots] = (
+                                y_err_sq * gqb.unsqueeze(2)).mean(dim=(1, 2))
+                        del X_hat, y_q, y_err_sq
                     rel_mse = output_mse / ref_e.clamp_min(1e-12)
-                    fisher_output_mse = None
-                    if gqs is not None:
-                        fisher_output_mse = (
-                            y_err_sq * gqs.unsqueeze(2)
-                        ).mean(dim=(1, 2))
                     # Per-item predicted Δloss from full per-weight
                     # Fisher. shape (n_sub,).
                     dloss_per = None
@@ -2102,8 +2176,8 @@ def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
                         dloss_values = [None] * n_sub
 
                     # Unpack per-item into results dict after the single sync.
-                    for name, row, dloss_val in zip(sub_names, metrics,
-                                                    dloss_values):
+                    for name, row, dloss_val, cpos in zip(
+                            sub_names, metrics, dloss_values, sel):
                         w_mse, out_mse, rel = row[:3]
                         fisher_val = row[3] if len(row) > 3 else None
                         _accumulate_result(
@@ -2123,14 +2197,37 @@ def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
                                 if fisher_val is not None
                                 else None
                             ),
+                            n_activation_rows=rows_used[cpos],
                         )
-                    del W_hat, X_hat, err, y_q, y_err_sq
+                    del W_hat, err
                     del weight_mse, output_mse, rel_mse
                     del metrics, dloss_values
                 except Exception as e:
+                    # FAIL LOUD. This used to swallow everything into a silent
+                    # per-chunk {"error": ...}, which is fail-open: one OOM or
+                    # one bad tensor quietly turned up to `chunk_size` priced
+                    # rows into holes that the allocator would then read as
+                    # "this format was not offered here". Scream, stamp rows
+                    # the merge gate refuses, and (by default) abort the shard
+                    # so the run stops at the first defect instead of
+                    # producing a plausible-looking cost table.
+                    import traceback
+                    msg = (f"[cost] FATAL: {spec.name} measurement raised on "
+                           f"{len(sub_names)} Linears "
+                           f"({sub_names[0]}..{sub_names[-1]}): "
+                           f"{type(e).__name__}: {e}")
+                    print(msg, flush=True)
+                    traceback.print_exc()
                     for name in sub_names:
                         accum.setdefault(name, {})[spec.name] = {
-                            "error": str(e)}
+                            "error": f"{type(e).__name__}: {e}",
+                            "cost_measurement_failed": True,
+                        }
+                    if _COST_FAIL_FAST:
+                        raise RuntimeError(msg) from e
+                    print("[cost] continuing under "
+                          "PRISMAQUANT_COST_FAIL_FAST=0; the merge gate must "
+                          "refuse these rows.", flush=True)
 
             measured_specs = (
                 specs if ladder_plan is None
@@ -2203,11 +2300,12 @@ def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
                             _measure_spec_into_accum(
                                 specs_by_name[fmt], idx=fail_idx)
 
-            del W, X, y_ref, ref_energy
+            del W, X_by_rows, y_ref_by_rows, ref_energy
             if h_stacked is not None:
                 del h_stacked
-            if gq_stacked is not None:
-                del gq_stacked
+            if gq_per_item is not None:
+                del gq_per_item
+            chunk_rows_used.extend(rows_used)
             processed += N
             if processed % (chunk_size * 4) == 0 or processed == total_linears:
                 elapsed = time.time() - tstart
@@ -2217,6 +2315,15 @@ def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
                       flush=True)
     if _prefetch_pool is not None:
         _prefetch_pool.shutdown(wait=False)
+    if chunk_rows_used:
+        rs = sorted(chunk_rows_used)
+        n = len(rs)
+        thin = sum(1 for r in rs if r <= 2)
+        print(f"[cost] activation-row coverage over {n} measured Linears: "
+              f"min={rs[0]} p10={rs[n // 10]} median={rs[n // 2]} "
+              f"max={rs[-1]} mean={sum(rs) / n:.1f}; "
+              f"{thin} ({100.0 * thin / n:.1f}%) rest on <=2 rows",
+              flush=True)
     if ladder_plan is not None:
         n_gate = ladder_accept + ladder_reject
         print(f"[cost] CB ladder holdout gate: {ladder_accept}/{n_gate} "

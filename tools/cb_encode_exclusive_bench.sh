@@ -75,23 +75,42 @@ python3 -m prismaquant.incremental_measure_quant_cost \
   echo "$arm $((t1 - t0))" >> "$OUT/layer_seconds.txt"
 done
 
-# --- C: the shard rows the two arms produced must be identical -----------
-log "=== shard row comparison ==="
+# --- C: identity gate -----------------------------------------------------
+# Layer 0's Linears all have 64 cached rows, so the row fix is a NO-OP there:
+# one row bucket, the old code path's shape. The new arm must therefore
+# reproduce the SHIPPED v1 shard exactly (modulo the added n_activation_rows).
+# Layers 3+ WILL differ -- that is the defect being fixed -- which is why the
+# gate is pinned on layer 0.
+log "=== identity gate: new arm layer 0 vs shipped v1 shard ==="
 flock "$LOCK" docker exec -e PYTHONPATH=/wt -e PYTHONDONTWRITEBYTECODE=1 \
   "$SIDE" python3 -c "
 import pickle
-a=pickle.load(open('$SCRATCH/work-base/shards/cost_shard_000.pkl','rb'))['costs']
-b=pickle.load(open('$SCRATCH/work-new/shards/cost_shard_000.pkl','rb'))['costs']
-assert set(a)==set(b), 'key sets differ'
-bad=[]
-for n in a:
-    for f in a[n]:
-        for k,v in a[n][f].items():
-            w=b[n][f].get(k)
-            if v!=w: bad.append((n,f,k,v,w))
-print('rows', len(a), 'formats', len(next(iter(a.values()))))
-print('EXACT ROW EQUALITY:', not bad, '(mismatches:', len(bad), ')')
-for x in bad[:10]: print('  ', x)
+SHIPPED='$RUN/prod-cal-0p6/work-prod/shards/cost_shard_000.pkl'
+NEW='$SCRATCH/work-new/shards/cost_shard_000.pkl'
+BASE='$SCRATCH/work-base/shards/cost_shard_000.pkl'
+ship=pickle.load(open(SHIPPED,'rb'))['costs']
+new=pickle.load(open(NEW,'rb'))['costs']
+base=pickle.load(open(BASE,'rb'))['costs']
+IGNORE={'n_activation_rows'}
+def diff(a,b):
+    bad=[]
+    if set(a)!=set(b): return [('KEYSET',len(set(a)^set(b)))]
+    for n in a:
+        for f in a[n]:
+            for k,v in a[n][f].items():
+                if k in IGNORE: continue
+                if b[n][f].get(k)!=v: bad.append((n,f,k,v,b[n][f].get(k)))
+    return bad
+d_ship=diff(ship,new); d_base=diff(base,new)
+print('rows',len(ship))
+print('new-vs-SHIPPED-v1 layer0 exact:',not d_ship,'(mismatches',len(d_ship),')')
+for x in d_ship[:6]: print('   ',x)
+print('new-vs-base layer0 exact:',not d_base,'(mismatches',len(d_base),')')
+for x in d_base[:6]: print('   ',x)
+rows=[e.get('n_activation_rows') for v in new.values() for e in v.values()]
+rows=[r for r in rows if r is not None]
+print('n_activation_rows present on',len(rows),'entries; distinct',sorted(set(rows))[:8])
+open('$OUT/gate.txt','w').write('PASS' if not d_ship else 'FAIL')
 " >> "$OUT/bench.log" 2>&1
 tail -20 "$OUT/bench.log"
 
@@ -113,4 +132,43 @@ if rows:
 PY
 done
 tail -8 "$OUT/bench.log"
+
+# --- D: land the branch and relaunch the full run as v2 -------------------
+if [ "$(cat "$OUT/gate.txt" 2>/dev/null)" != "PASS" ]; then
+  log "IDENTITY GATE DID NOT PASS -- not merging, not relaunching."
+  log "DONE (gate failed) -> $OUT"; exit 1
+fi
+log "identity gate PASS; fast-forwarding dsv4/flash-0731-92gb"
+git -C /home/rob/prismaquant-ultraplan merge --ff-only perf/cb-encode-gpu \
+  >> "$OUT/bench.log" 2>&1 || { log "MERGE FAILED"; exit 1; }
+git -C /home/rob/prismaquant-ultraplan log --oneline -3 >> "$OUT/bench.log"
+
+V2=$RUN/prod-cal-0p6-v2
+mkdir -p "$V2/artifacts" "$V2/work-prod" "$V2/logs"
+log "relaunching full 43-layer cost run as pq-dsv4-cost-prod2 -> $V2"
+docker run -d --name pq-dsv4-cost-prod2 --gpus all --ipc=host --entrypoint bash \
+  -v "$RUN":"$RUN" -v /home/rob/prismaquant-ultraplan:/pq \
+  -e PRISMAQUANT_ACTIVATION_FAIR_PRICING=1 \
+  -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  -e CB_CODEBOOK_SOURCE=lattice -e CB_SCALE_CODING=two_tier \
+  -e CB_SCALE_SWEEP=1 -e PRISMAQUANT_CB_ENCODE_TIER=balanced \
+  -e PYTHONPATH=/pq -e PRISMAQUANT_CB_EXT_DIR=$RUN/ext \
+  -e PRISMAQUANT_CB_COL_WEIGHTS=$RUN/prod-cal-0p6/artifacts/cb_col_weights.pkl \
+  -e PRISMAQUANT_UNROUTED_EXPERT_PROVENANCE=$RUN/prod-cal-0p6/artifacts/cb_col_weights.pkl.provenance.json \
+  gridbook:test -c "
+python3 -m prismaquant.incremental_measure_quant_cost \
+  --model $RUN/source --cost-mode local \
+  --probe $RUN/prod-cal-0p6/artifacts/probe.pkl \
+  --activation-cache-dir $RUN/prod-cal-0p6/act \
+  --formats 'NVFP4_CB_K14,NVFP4_CB_K15,FP8_CB_K36,BF16' \
+  --output $V2/artifacts/cost_full.pkl --work-dir $V2/work-prod \
+  --device cuda --dtype bf16 --mode batched --chunk-size 256 \
+  --layers-per-shard 1 --start-layer 0 --end-layer 43 \
+  --skip-missing-activations --no-include-lm-head \
+  > $V2/logs/cost_prod2.log 2>&1
+" >> "$OUT/bench.log" 2>&1
+sleep 20
+docker ps --filter name=pq-dsv4-cost-prod2 --format '{{.Names}} {{.Status}}' \
+  | tee -a "$OUT/bench.log"
+log "prod2 launched; log = $V2/logs/cost_prod2.log"
 log "DONE -> $OUT"
