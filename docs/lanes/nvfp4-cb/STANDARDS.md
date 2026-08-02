@@ -1,8 +1,8 @@
 # gridbook / NVFP4-CB — FINAL kernel & format standards
 
 Dated 2026-07-21 (Robert: "make a definitive determination about final kernel
-and format standards"); runtime boundary updated 2026-08-01 for Gridbook
-0.5.0. This page is the contract production runs build against. Changes to it
+and format standards"); runtime boundary updated 2026-08-02 for Gridbook
+0.6.0. This page is the contract production runs build against. Changes to it
 require a served A/B, not a preference.
 
 The separately versioned, exact-commit-pinned Gridbook runtime follows this
@@ -56,13 +56,23 @@ contract. Consult `docs/PLUGIN.md`, `docs/KERNELS.md`, and the dated audits from
 the exact commit in `prismaquant/gridbook_runtime/gridbook_runtime_pin.json`; this producer
 document intentionally carries no parallel dispatch table.
 
-For PrismaQuant 0.5.2 that pin is Gridbook 0.5.0 at exact commit
-`593f524e0a5d73b18e56d290a7b1355e66b2f9ce`. Every serving-reachable Gridbook
+For PrismaQuant 0.6.0 that pin is Gridbook 0.6.0 at exact commit
+`ca0f0f562d3f398e094bfa5356a9ce3fa47472f1`. Every serving-reachable Gridbook
 operation is native CUDA/CUTLASS and is resolved and attested at model load.
 Gridbook has no Triton dependency, dispatch arm, or fallback; if an artifact,
 shape, ABI, or device lacks its required native operation, serving fails closed.
-This runtime-only advance does not change this producer's format/layout ABI,
+This runtime advance does not change this producer's format/layout ABI,
 menu, or quality-promotion status, and it makes no DSV4 qualification claim.
+
+The FP8-CB fused mid-M rung surface is unchanged at 0.6.0 and is not pending
+completion: Gridbook's K1.2 resolution proved `k % 4 == 0` is a format+TMA law
+(`gridbook/codec.py` `FP8_FUSED_KBITS`, queryable as `cb_fused_kbits()`), so
+`{28,32,36,40,44,48}` is the whole lane and the off-law rungs this producer may
+still assign are permanently expand+GEMM-served. Gridbook 0.6.0's
+contract-preserving FP4-CB v2 fused mid-M kernel is **opt-in** behind
+`PRISMAQUANT_CB_FP4_FUSED_MIDM` pending its served NATIVE-PARITY gate, so the
+fp4-CB backed set in `prismaquant/serving_profile_specs/nvfp4_cb.json` stays
+empty: available is not backed.
 
 The producer-side decision needed here is fixed: both fused NVFP4 activation
 contracts remain explicit opt-ins and default OFF. The 2026-08-01 LFM

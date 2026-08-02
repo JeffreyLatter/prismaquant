@@ -339,11 +339,12 @@ def _profile_lane(_name, fmt):
 
 
 def test_backed_and_unbacked_rungs_take_different_table_rows():
-    """Gridbook 0.5.0 instantiates FP8-CB fused mid-M for K in
+    """Gridbook 0.6.0 instantiates FP8-CB fused mid-M for K in
     {28,32,36,40,44,48}. K36 is backed; K37 is not, and production permits it
-    (ROADMAP K1.2). Both are 'FP8_CB' to the family axis, so only the LANE
-    axis can tell them apart — and it must, or the allocator prices a fast
-    path nobody backs."""
+    — permanently, since K1.2 resolved to a k % 4 == 0 format+TMA law rather
+    than to five missing instantiations. Both are 'FP8_CB' to the family
+    axis, so only the LANE axis can tell them apart — and it must, or the
+    allocator prices a fast path nobody backs."""
     ctx = _lane_ctx(p95_ttft_ms=1e9)
     stats = {"u0": {"n_params": 1}}
     backed = evaluate_assignment(
