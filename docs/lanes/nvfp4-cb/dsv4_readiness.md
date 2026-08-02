@@ -5,6 +5,16 @@
 `file:line` against the tree at HEAD (`a1d11a0`). Skeptical by mandate: this
 records gaps at full strength; nothing here is softened.
 
+> **Size correction (2026-08-02, addendum — findings below left as recorded).**
+> This audit's working assumptions of "~295 GB, 671B-class" predate local
+> inspection of the released checkpoint. The actual DeepSeek-V4-Flash-0731
+> release measures 166.9 GB on disk with ~285 B total parameters —
+> 281,263,734,784 quantizable across 33,325 probeable Linears (probe
+> inventory, 16x512) — and serves TP=1 on a single GB10. 671 B is the
+> DeepSeek-V3-family headline and describes a different model. The scale
+> reasoning in Q2 below is therefore conservative by ~2.4x on parameter
+> count; its streaming conclusions hold a fortiori.
+
 ## Verdict (top line)
 
 **A DSv4-Flash CB run is NOT attemptable today, and the blocker is not one
