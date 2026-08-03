@@ -1,6 +1,6 @@
 {
   "schema": "prismaquant.gridbook_runtime_pin.v1",
   "repository": "https://github.com/RobTand/gridbook.git",
-  "commit": "746473c8459acd24c71e7602d1c982da2f8fa80e",
+  "commit": "7c0b52764c9be7f813294e05c1b4c68d42ae840e",
   "version": "0.7.0"
 }
