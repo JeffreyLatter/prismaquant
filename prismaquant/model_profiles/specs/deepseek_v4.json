@@ -67,6 +67,18 @@
       {
         "regex": "ffn\\.shared_experts\\.down_proj\\.",
         "replace": "ffn.shared_experts.w2."
+      },
+      {
+        "regex": "ffn\\.experts\\.([0-9]+)\\.gate_proj\\.",
+        "replace": "ffn.experts.\\1.w1."
+      },
+      {
+        "regex": "ffn\\.experts\\.([0-9]+)\\.up_proj\\.",
+        "replace": "ffn.experts.\\1.w3."
+      },
+      {
+        "regex": "ffn\\.experts\\.([0-9]+)\\.down_proj\\.",
+        "replace": "ffn.experts.\\1.w2."
       }
     ]
   },

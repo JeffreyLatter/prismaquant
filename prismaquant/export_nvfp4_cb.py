@@ -338,6 +338,35 @@ def _try_resolve_direct_packed_expert(qname, skeleton, profile):
     return None
 
 
+def _source_tensor_key(qname, profile, suffix=".weight"):
+    """Profile-mapped CHECKPOINT key for the tensor ``qname + suffix``.
+
+    The naming rules are written against whole TENSOR names: DSv4's shared- and
+    routed-expert renames anchor on a following ``.`` (``ffn.shared_experts.
+    gate_proj.`` -> ``ffn.shared_experts.w1.``) and hy3's router/expert-bias
+    rules anchor on ``.weight$``. Mapping the BARE module qname and appending
+    the suffix afterwards therefore skips every such rule; the suffix has to be
+    attached BEFORE the rewrite. On DSv4-Flash the bare-name convention left
+    33,153 of 33,325 selectable leaves (129 shared-expert + 33,024 routed-expert
+    projections) resolving to ``gate_proj``/``up_proj``/``down_proj``
+    checkpoint keys that do not exist.
+    """
+    return profile.source_tensor_name(qname + suffix)
+
+
+def _source_module_name(qname, profile):
+    """Profile-mapped CHECKPOINT module base for ``qname`` (no tensor suffix).
+
+    Derived through the ``.weight`` tensor name so the trailing-dot- and
+    ``.weight$``-anchored rules fire, then stripped back to the module base.
+    A rule that rewrites the suffix itself (none today) falls back to the
+    bare-name mapping rather than returning a truncated key."""
+    mapped = _source_tensor_key(qname, profile, ".weight")
+    if mapped.endswith(".weight"):
+        return mapped[: -len(".weight")]
+    return profile.source_tensor_name(qname)
+
+
 def _try_resolve_skeleton(qname, skeleton, profile, suffix=".weight"):
     """Recipe qname -> actual skeleton key, or None if neither the direct name
     nor the profile-mapped (checkpoint-convention) name is present. For the
@@ -347,7 +376,7 @@ def _try_resolve_skeleton(qname, skeleton, profile, suffix=".weight"):
     if direct in skeleton:
         return direct
     if profile is not None:
-        mapped = profile.source_tensor_name(qname) + suffix
+        mapped = _source_tensor_key(qname, profile, suffix)
         if mapped in skeleton:
             return mapped
     if suffix == ".weight":
@@ -363,14 +392,15 @@ def _resolve_skeleton(qname, skeleton, profile, suffix=".weight"):
         return key
     tried = [qname + suffix]
     if profile is not None:
-        tried.append(profile.source_tensor_name(qname) + suffix)
+        tried.append(_source_tensor_key(qname, profile, suffix))
         if suffix == ".weight":
-            tried.extend([qname, profile.source_tensor_name(qname)])
+            tried.extend([qname, _source_module_name(qname, profile)])
     raise KeyError(
         f"{qname}: no skeleton tensor for {suffix!r} (tried {tried})")
 
 
-def _export_base_name(qname, profile, skeleton=None):
+def _export_base_name(qname, profile, skeleton=None, *,
+                      assume_resolvable=False):
     """Recipe qname -> the base name the EXPORTED tensor + its config_groups
     target must carry. The profile's checkpoint mapping is only TRUSTED when
     the mapped name actually resolves in the skeleton — a text-only snapshot
@@ -378,11 +408,21 @@ def _export_base_name(qname, profile, skeleton=None):
     Generation + text_config but model.layers.* keys) otherwise gets every
     config target mis-namespaced under model.language_model.* while the
     tensor writer's fallback uses the real names (2026-07-22 S-rung run:
-    nothing resolved at serve, all layers loaded unquantized, crash)."""
+    nothing resolved at serve, all layers loaded unquantized, crash).
+
+    ``assume_resolvable`` is the caller's assertion that this target HAS a
+    resolved source even though no single skeleton key carries its name — the
+    packed-expert stacks, whose source is a set of per-expert checkpoint
+    tensors (DSv4: ``layers.N.ffn.experts.{i}.w{1,2,3}``) and whose packed
+    parent ``layers.N.ffn.experts.gate_up_proj`` therefore never appears on
+    disk. Without it the existence check silently demotes exactly those
+    targets to the LIVE spelling and the manifest ships two namespaces
+    (``layers.N.attn.*`` beside ``model.layers.N.mlp.experts.*``), which
+    gridbook resolves as no-scheme rather than rejecting."""
     if profile is None:
         return qname
-    mapped = profile.source_tensor_name(qname)
-    if skeleton is not None and mapped != qname:
+    mapped = _source_module_name(qname, profile)
+    if skeleton is not None and mapped != qname and not assume_resolvable:
         if (mapped + ".weight") not in skeleton and mapped not in skeleton:
             return qname
     return mapped
