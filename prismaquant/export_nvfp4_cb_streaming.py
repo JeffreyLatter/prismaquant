@@ -24,8 +24,11 @@ one expert alone equals packing it inside the stack) — pinned byte-for-byte
 in tests/test_nvfp4_cb_streaming.py. Both exporters call the single
 ``cb_export_config`` builder for container/config/sidecar metadata.
 
-Scope: bf16 source + fp8-source READ + CB families + BF16 passthrough +
-FP8_SOURCE passthrough + stock-CT **DENSE** rungs (vanilla NVFP4 / FP8_DYNAMIC
+Scope: bf16 source + fp8-source READ + CB families + BF16 passthrough + the
+SOURCE-PASSTHROUGH family (``allocator_candidates.SOURCE_PASSTHROUGH_CONTRACTS``
+— FP8_SOURCE normalized into the compressed-tensors namespace, MXFP4_SOURCE and
+FP8_BLOCK_UE8M0_SOURCE copied byte-verbatim under the checkpoint's own names)
++ stock-CT **DENSE** rungs (vanilla NVFP4 / FP8_DYNAMIC
 quantised in-container). Stock rungs are packed RTN via the authoritative
 ``export_native_compressed`` codecs (byte-identical to the in-memory
 export_nvfp4_cb and to those packers called directly; no GPTQ/act-order in this
@@ -63,13 +66,21 @@ import torch
 from safetensors import safe_open
 
 from prismaquant import nvfp4_cb_formats as cb
+from prismaquant.allocator_candidates import (
+    ROUTE_PENDING_PASSTHROUGH_FORMATS,
+    SOURCE_PASSTHROUGH_CONTRACTS,
+)
 from prismaquant.cb_export_config import (
+    SOURCE_PASSTHROUGH_EXPORT_FORMATS,
+    parse_source_passthrough_declaration,
     build_cb_scheme,
     build_quant_config,
     cb_scheme_reuse_signature,
     codebook_tensor_names as _codebook_tensor_names,
     codebook_tensors as _codebook_tensors,
+    source_passthrough_wire,
 )
+from prismaquant.format_registry import get_format as _fr_get_format
 from prismaquant.export_nvfp4_cb import (
     _canonical_qname,
     _export_base_name,
@@ -101,6 +112,7 @@ from prismaquant.nvfp4_cb_footprint import (
 )
 from prismaquant.nvfp4_activation_contract import (
     NVFP4_ACTIVATION_CONTRACT_KEY,
+    routed_moe_attested_module_names,
     NVFP4_ACTIVATION_CONTRACT_SCHEMA,
     NVFP4_ACTIVATION_EXECUTION,
     build_execution_contract,
@@ -110,9 +122,19 @@ from prismaquant.nvfp4_activation_contract import (
 )
 
 # safetensors dtype string codes for the tensors we emit.
+#
+# F8_E8M0 is here because the byte-verbatim passthrough lane ships the
+# checkpoint's E8M0 scale plane UNCHANGED: DSv4-Flash carries it for both the
+# routed MXFP4 experts (`layers.N.ffn.experts.E.w{1,2,3}.scale`) and the
+# block-FP8 body (`layers.N.attn.*.scale`). Re-encoding it to F32, as the
+# FP8_SOURCE branch does with its fp32 block scales, would quadruple its size
+# and stop being a byte copy. A missing entry is not a soft failure —
+# `_StreamWriter.write` indexes this map to build the header and would die with
+# a bare KeyError.
 _ST_DTYPE = {
     torch.uint8: "U8", torch.float32: "F32", torch.float16: "F16",
     torch.bfloat16: "BF16", torch.float8_e4m3fn: "F8_E4M3",
+    torch.float8_e8m0fnu: "F8_E8M0",
     torch.int64: "I64", torch.int32: "I32", torch.int8: "I8",
     torch.bool: "BOOL",
 }
@@ -153,6 +175,7 @@ class _LazySkeleton:
             with safe_open(single, framework="pt", device="cpu") as f:
                 self.weight_map = {k: "model.safetensors" for k in f.keys()}
         self._open: dict[str, object] = {}
+        self._shard_hdr: dict[str, tuple[dict, int]] = {}
         try:
             self._profile = detect_profile(str(self.dir))
         except Exception:
@@ -220,6 +243,33 @@ class _LazySkeleton:
     def load(self, name: str) -> torch.Tensor:
         return self._handle(name).get_tensor(name)
 
+    def _hdr(self, shard: Path) -> tuple[dict, int]:
+        """Parsed safetensors header + data-start offset for one shard."""
+        key = str(shard)
+        if key not in self._shard_hdr:
+            with open(shard, "rb") as f:
+                (hlen,) = struct.unpack("<Q", f.read(8))
+                hdr = json.loads(f.read(hlen))
+            self._shard_hdr[key] = (hdr, 8 + hlen)
+        return self._shard_hdr[key]
+
+    def raw_slice(self, name: str) -> tuple[Path, int, int]:
+        """``(shard_path, absolute file offset, nbytes)`` for a raw byte copy.
+
+        The SOURCE-side twin of ``_PriorArtifact.raw_slice``, and the reason
+        the native lane is a passthrough rather than a re-serialization: paired
+        with ``_StreamWriter.add(copy_src=...)`` it moves a source tensor from
+        the checkpoint's file to the artifact's file in 16 MiB chunks without
+        ever constructing a torch.Tensor. On DSv4-Flash that is 147 GB of
+        routed-expert payload the exporter never materialises — "stream, don't
+        load" applied to the one lane where there is nothing to encode.
+        """
+        shard = self.dir / self.weight_map[name]
+        hdr, data0 = self._hdr(shard)
+        meta = hdr[name]
+        lo, hi = meta["data_offsets"]
+        return shard, data0 + int(lo), int(hi) - int(lo)
+
     def dequant_weight(self, weight_key: str) -> torch.Tensor:
         """Return the weight as fp32 for encoding. bf16/fp16 sources cast
         through the BF16 load contract; native-FP8 and declared MXFP4 sources
@@ -256,6 +306,78 @@ def _nbytes(dtype: torch.dtype, shape) -> int:
     for d in shape:
         n *= int(d)
     return n * torch.empty((), dtype=dtype).element_size()
+
+
+# On-disk dtypes each FormatSpec element/scale name can legally appear as.
+# Sourced from the decode side (`layer_streaming._E8M0_SCALE_DTYPES` accepts
+# all three E8M0 spellings) so a checkpoint the loader would decode is a
+# checkpoint this exporter will copy, and no other.
+_PASSTHROUGH_ELEMENT_DTYPES = {
+    "fp8_e4m3": (torch.float8_e4m3fn,),
+    "fp4_e2m1": (torch.int8, torch.uint8),
+}
+_PASSTHROUGH_SCALE_DTYPES = {
+    "uint8_e8m0": (torch.float8_e8m0fnu, torch.uint8, torch.int8),
+    "fp32": (torch.float32,),
+}
+# Logical elements per stored byte. >1 means a sub-byte pack, whose stored
+# shape is NOT its logical shape.
+_PASSTHROUGH_ELEMENTS_PER_BYTE = {"fp8_e4m3": 1, "fp4_e2m1": 2}
+
+
+def _passthrough_scale_shape(spec, logical_shape) -> tuple[int, ...]:
+    """The scale-plane shape one passthrough FormatSpec implies for a weight.
+
+    Derived from the registry rather than hardcoded per format: a block format
+    (``scale_block_shape``) tiles both dims, a group format divides the reduce
+    dim by ``group_size``.  A future census entry gets its expectation for free.
+    """
+    rows, cols = int(logical_shape[0]), int(logical_shape[1])
+    if spec.scale_block_shape is not None:
+        block_rows, block_cols = (int(d) for d in spec.scale_block_shape)
+        return (-(-rows // block_rows), -(-cols // block_cols))
+    group = int(spec.group_size)
+    if group <= 0 or cols % group:
+        raise ValueError(
+            f"{spec.name}: in_features={cols} is not a multiple of the "
+            f"declared group size {group}")
+    return (rows, cols // group)
+
+
+def _assert_passthrough_planes_agree(qname, fmt, spec, wkey, wsh, wdtype,
+                                     skey, ssh, sdtype) -> None:
+    """Metadata-only check that a source pair really is this format on disk.
+
+    The decode-side twins (`layer_streaming._check_mxfp4_packed_grid` /
+    `_check_fp8_scale_grid`) need the tensors; this runs during PLANNING, from
+    safetensors metadata alone, so a declaration/layout disagreement fails
+    before 147 GB has been copied rather than after.
+    """
+    element_dtypes = _PASSTHROUGH_ELEMENT_DTYPES[str(spec.weight_element_dtype)]
+    scale_dtypes = _PASSTHROUGH_SCALE_DTYPES[str(spec.scale_dtype_name)]
+    per_byte = _PASSTHROUGH_ELEMENTS_PER_BYTE[str(spec.weight_element_dtype)]
+    problems = []
+    if len(wsh) != 2 or wdtype not in element_dtypes:
+        problems.append(
+            f"weight {wkey!r} is {wdtype}{wsh}, expected a 2-D "
+            f"{'/'.join(str(d) for d in element_dtypes)} plane")
+    if len(ssh) != 2 or sdtype not in scale_dtypes:
+        problems.append(
+            f"scale {skey!r} is {sdtype}{ssh}, expected a 2-D "
+            f"{'/'.join(str(d) for d in scale_dtypes)} plane")
+    if not problems:
+        logical = (int(wsh[0]), int(wsh[1]) * per_byte)
+        expected = _passthrough_scale_shape(spec, logical)
+        if tuple(ssh) != expected:
+            problems.append(
+                f"scale {skey!r} is {tuple(ssh)}, but {spec.name} over a "
+                f"logical {logical} weight implies {expected}")
+    if problems:
+        raise ValueError(
+            f"{qname}: assigned {fmt}, but the checkpoint pair does not match "
+            f"that on-disk contract — {'; '.join(problems)}. A passthrough "
+            "copies bytes it does not interpret, so the source must already "
+            "BE the format it is being shipped as.")
 
 
 def _stock_output_specs(fmt: str, shape) -> list[tuple[str, torch.dtype, tuple]]:
@@ -311,6 +433,15 @@ class _StreamWriter:
         off = 0
         for name, dtype, shape, _, _ in self._entries:
             nb = _nbytes(dtype, shape)
+            if name in header:
+                # The header is a dict but the data stream is not: a duplicate
+                # name keeps only the LAST span while both blobs are still
+                # written, producing a file whose offsets are silently wrong
+                # from that point on. Cheap to check, and the passthrough lane
+                # adds tens of thousands of names from a second namespace.
+                raise AssertionError(
+                    f"{name}: planned twice; two emit paths claim the same "
+                    "output tensor")
             header[name] = {"dtype": _ST_DTYPE[dtype], "shape": list(shape),
                             "data_offsets": [off, off + nb]}
             off += nb
@@ -555,6 +686,17 @@ def _collapse_per_expert_assignment(assignment, expert_groups, profile):
     are a byte-width assert and a scheme-signature comparison, so a mixed stack
     that reached serving would be a load-time crash at best.
 
+    A SOURCE-PASSTHROUGH group (``cb_export_config
+    .SOURCE_PASSTHROUGH_EXPORT_FORMATS``) is deliberately NOT collapsed. The
+    collapse exists to name a packed parent that gridbook's CB loader anchors
+    on; a passthrough group has no CB loader and no packed parent, because the
+    exporter copies the per-expert checkpoint tensors and whichever loader owns
+    them reads them under their own names. Naming ``…experts.gate_up_proj`` for
+    it would promise a stack that is never written — the same reason
+    export_nvfp4_cb excludes FP8_SOURCE from ``_pack_skeleton_experts``. The
+    uniformity check still runs first, so a layer that MIXES a CB rung with a
+    passthrough is refused rather than silently split across two loaders.
+
     Returns ``(collapsed_assignment, members_by_target, report)``. Members are
     ``{packed_qname: {(projection, expert_id): member_recipe_qname}}`` so the
     imatrix, the render identity and the source-value verification all stay
@@ -615,6 +757,13 @@ def _collapse_per_expert_assignment(assignment, expert_groups, profile):
                     f"{len(present)} members — refusing to name it. "
                     f"Sample per format: {by_fmt}. Re-run the allocator with "
                     "the expert group constrained to one rung.")
+            if formats[0] in SOURCE_PASSTHROUGH_EXPORT_FORMATS:
+                # Keep the per-expert entries EXPANDED: they are the units this
+                # route actually emits. `consumed` still claims the projections
+                # so a narrower packed parent from the profile-less fallback
+                # vocabulary cannot re-collapse them behind this decision.
+                consumed.update(projections)
+                continue
             for q in present:
                 del collapsed[q]
             consumed.update(projections)
@@ -993,6 +1142,55 @@ def _reuse_verify_and_report(prior, reuse, reuse_verify, reuse_prior,
 # Streaming export
 # ---------------------------------------------------------------------------
 
+def assert_routes_reconcile(*, cb_units, passthrough_units, cb_tensors,
+                            passthrough_tensors, cb_modules,
+                            passthrough_modules, attested) -> None:
+    """Producer-side invariant; none of this is written to the artifact.
+
+    This is what ``cb_activation_contract`` used to buy on the wire, kept as an
+    internal check now that the field is gone:
+
+      * NO unit is claimed by both gridbook's codec and a passthrough. That is
+        the load-time refusal the consumer names, and the exporter is the only
+        place that can see it across BOTH namespaces — the declaration speaks
+        recipe names and the config groups speak serialized ones, so the
+        consumer's own same-string test cannot catch it on DSv4.
+      * No TENSOR is emitted by both routes either. The unit check is the
+        contract-level statement; this is the physical one that would catch a
+        namespace bug the unit ids happened to hide.
+      * The K0.2 attestation covers exactly the CB routed groups: a delegated
+        group must never be attested (it has no CB activation contract at all),
+        and an attested module must be a CB group. THAT is what makes a
+        delegated group's ABSENCE from the K0.2 record a declaration rather
+        than a dropped attestation.
+
+    A routed-expert group left entirely on BF16 passthrough is on neither route
+    by definition and is correctly absent from both module sets.
+    """
+    contested = sorted(set(cb_units) & set(passthrough_units))
+    if contested:
+        raise AssertionError(
+            f"{contested[:5]} are claimed by BOTH a CB config group and the "
+            "source_passthrough declaration; a unit is decoded by gridbook's "
+            "codec or handed to the model's own loader, never both")
+    shared = sorted(set(cb_tensors) & set(passthrough_tensors))
+    if shared:
+        raise AssertionError(
+            f"{shared[:5]} are emitted by both a CB target and a "
+            "source-passthrough target")
+    both_routed = sorted(set(attested) & set(passthrough_modules))
+    if both_routed:
+        raise AssertionError(
+            f"{both_routed[:5]} are attested by the routed-MoE activation "
+            "contract AND declared source-passthrough; a delegated group has "
+            "no CB activation contract to attest")
+    unattributed = sorted(set(attested) - set(cb_modules))
+    if unattributed:
+        raise AssertionError(
+            f"the routed-MoE activation contract attests {unattributed[:5]}, "
+            "which no CB expert unit claims")
+
+
 def _reject_disabled_reuse_before_output_transaction(function):
     """Preserve the quarantine gate ahead of any resume/output interpretation."""
     signature = inspect.signature(function)
@@ -1033,6 +1231,7 @@ def export_nvfp4_cb_streaming(
     reuse_prior: str | Path | None = None,
     reuse_verify: int = 3,
     allow_unstamped_research: bool = False,
+    allow_route_pending_passthrough: bool = False,
     activation_cache_dir: str | Path | None = None,
     activation_scale_policy: str | None = None,
 ) -> dict[str, int]:
@@ -1047,6 +1246,14 @@ def export_nvfp4_cb_streaming(
     fast). Default ``None`` = whole-model passthrough, byte-identical to before.
     Used to export just the MTP sidecar (``model.layers.80.``) without dragging
     the ~550 GB body through as bf16 passthrough.
+
+    ``allow_route_pending_passthrough`` overrides the ship gate on a
+    source-passthrough rung whose serve route has not been validated
+    (``allocator_candidates.ROUTE_PENDING_PASSTHROUGH_FORMATS``). The rung stays
+    on the allocator's menu on purpose — an allocation that wants it is
+    reporting a serving gap worth seeing — so the refusal lives here, at the
+    ship step, and the override is recorded in the artifact's provenance rather
+    than only in the operator's shell history.
 
     ``reuse_prior`` is reserved but currently fails closed. The prior gate did
     not bind exact source content, treated an imatrix mismatch as a warning,
@@ -1134,6 +1341,25 @@ def export_nvfp4_cb_streaming(
             f"into {expert_stack_report['stacks']} packed expert stack(s)",
             flush=True,
         )
+    # Every spelling of a routed-expert tensor -> the group prefix that OWNS
+    # it: the packed parents both namespaces can name, and every per-expert
+    # member under both its checkpoint and its recipe name. This is what lets a
+    # CB stack and a delegated per-expert leaf collapse to the same unit id.
+    _expert_group_of: dict[str, str] = {}
+    for _prefix, _projs in expert_groups.items():
+        for _packed_proj in _packed_expert_param_names(profile):
+            _packed = f"{_prefix}.{_packed_proj}"
+            _expert_group_of[_packed] = _prefix
+            _canon_packed = _canonical_qname(_packed, profile)
+            if _canon_packed:
+                _expert_group_of[_canon_packed] = _prefix
+        for _members in _projs.values():
+            for _member in _members.values():
+                _expert_group_of[_member] = _prefix
+                _canon_member = _canonical_qname(_member, profile)
+                if _canon_member:
+                    _expert_group_of[_canon_member] = _prefix
+
     # Every recipe qname a CB target is VERIFIED and IMATRIX-WEIGHTED under.
     # For a packed stack that is its members, not the stack: the recipe's
     # render identity, the cost rows and the col_weights pickle are all keyed
@@ -1163,9 +1389,14 @@ def export_nvfp4_cb_streaming(
     )
     _STOCK_CT_FORMATS = ("NVFP4", "FP8_E4M3")   # FP8_DYNAMIC canonicalizes here
 
-    # --- Classify every target (CB / FP8_SOURCE / stock-CT dense / BF16). ---
+    # --- Classify every target (CB / source passthrough / stock-CT dense /
+    # BF16). The passthrough lane splits by WIRE CONTRACT, not by name:
+    # `cb_export_config.source_passthrough_wire` says whether a format's scale
+    # plane can be normalized into the compressed-tensors namespace or must
+    # ship byte-verbatim under the checkpoint's own names. ---
     cb_targets: dict[str, tuple[str, str, int]] = {}
-    source_targets: list[str] = []
+    source_targets: list[str] = []              # CT-normalized (FP8_SOURCE)
+    native_source_targets: dict[str, str] = {}  # qname -> byte-verbatim format
     stock_targets: dict[str, str] = {}          # qname -> "NVFP4" | "FP8_E4M3"
     illegal = []
     for qname, fmt in assignment.items():
@@ -1176,8 +1407,11 @@ def export_nvfp4_cb_streaming(
             cb_targets[qname] = parsed
             continue
         canon = canonical_format_name(fmt)
-        if canon == "FP8_SOURCE":
-            source_targets.append(qname)
+        if canon in SOURCE_PASSTHROUGH_EXPORT_FORMATS:
+            if source_passthrough_wire(canon).ct_normalized:
+                source_targets.append(qname)
+            else:
+                native_source_targets[qname] = canon
             continue
         if canon in _STOCK_CT_FORMATS:
             stock_targets[qname] = canon
@@ -1186,9 +1420,35 @@ def export_nvfp4_cb_streaming(
     if illegal:
         raise ValueError(
             "streaming CB export carries CB families + stock NVFP4/FP8_DYNAMIC "
-            "(CT-delegated) + FP8_SOURCE + BF16 only; unsupported rung(s) "
-            f"{sorted({f for _, f in illegal})} — assign a legal format or use "
-            "the in-memory export_nvfp4_cb.")
+            "(CT-delegated) + the source-passthrough family "
+            f"{sorted(SOURCE_PASSTHROUGH_EXPORT_FORMATS)} + BF16 only; "
+            f"unsupported rung(s) {sorted({f for _, f in illegal})} — assign a "
+            "legal format or use the in-memory export_nvfp4_cb.")
+
+    # --- ROUTE-PENDING SHIP GATE. A passthrough rung whose serve route has not
+    # been validated stays ON the allocator's menu deliberately: an allocation
+    # that wants it is reporting a serving gap worth seeing, and masking the
+    # rung would hide that signal while removing the unit's only zero-error
+    # option. The fail-closed point is therefore the SHIP step, here. ---
+    route_pending = Counter(
+        fmt for fmt in list(native_source_targets.values())
+        + [canonical_format_name(assignment[q]) for q in source_targets]
+        if fmt in ROUTE_PENDING_PASSTHROUGH_FORMATS
+    )
+    if route_pending and not allow_route_pending_passthrough:
+        lanes = ", ".join(
+            f"{fmt} -> lane {SOURCE_PASSTHROUGH_CONTRACTS[fmt].serving_route} "
+            f"({count} unit(s))"
+            for fmt, count in sorted(route_pending.items())
+        )
+        raise ValueError(
+            "refusing to ship a route-pending source passthrough: "
+            f"{lanes}. No validated serve route exists for these bytes yet "
+            "(allocator_candidates.ROUTE_PENDING_PASSTHROUGH_FORMATS), so the "
+            "artifact would load into a lane nothing has been shown to "
+            "execute. Pass --allow-route-pending-passthrough "
+            "(allow_route_pending_passthrough=True) to ship it anyway; the "
+            "acknowledgement is recorded in the artifact's provenance.")
 
     # Text calibration cannot cover visual/audio sidecar modules that the
     # language-model profile deliberately drops.  Match the resident exporter:
@@ -1207,7 +1467,7 @@ def export_nvfp4_cb_streaming(
     if subset_prefixes is not None:
         outside = sorted(
             q for q in list(cb_targets) + list(source_targets)
-            + list(stock_targets)
+            + list(native_source_targets) + list(stock_targets)
             if not any(_base_name(q).startswith(p)
                        for p in subset_prefixes))
         if outside:
@@ -1554,11 +1814,16 @@ def export_nvfp4_cb_streaming(
     ignore: list[str] = []
     cb_targets_set = set(cb_targets)
     source_set = set(source_targets)
+    native_source_set = set(native_source_targets)
     stock_set = set(stock_targets)
     emitted_bases: set[str] = set()   # checkpoint tensor keys we consume
     cb_serialized_shapes: dict[str, tuple[int, ...]] = {}
     cb_output_tensor_names: set[str] = set()
     planned_cb_tensor_bytes = 0
+    # Physical tensor names each routed-expert target contributes, so the
+    # source_passthrough declaration and the route reconciliation describe what
+    # was actually planned rather than what the naming rules imply.
+    tensor_names_by_target: dict[str, list[str]] = {}
 
     # CB + FP8_SOURCE targets (keyed by canonical/recipe qname).
     for qname in list(cb_targets) + list(source_targets):
@@ -1583,7 +1848,7 @@ def export_nvfp4_cb_streaming(
                 export_base + ".weight_scale", torch.float32, ssh,
                 (lambda k=skey: skeleton.load(k).to(torch.float32)
                  .contiguous()))
-            counts["FP8_SOURCE"] += 1
+            counts[canonical_format_name(assignment[qname])] += 1
             continue
         grid, mode, k = cb_targets[qname]
         ref, fmt, codebook, _ = target_cb[qname]
@@ -1672,6 +1937,7 @@ def export_nvfp4_cb_streaming(
         elif _claimed_activation_contract is not None:
             expected.append((input_scale_name, torch.float32, (1,)))
             cb_output_tensor_names.add(input_scale_name)
+        tensor_names_by_target[qname] = [name for name, _d, _s in expected]
 
         # DELTA-EXPORT eligibility: same format + scheme signature + byte-equal
         # codebook + every planned output already present in the prior at the
@@ -1750,6 +2016,83 @@ def export_nvfp4_cb_streaming(
             if prior is not None:
                 reuse["encoded"] += 1
                 reuse["reasons"][reason] += 1
+        counts[fmt] += 1
+
+    # BYTE-VERBATIM source passthrough: the checkpoint's own element plane and
+    # its own scale plane, copied BYTE FOR BYTE under their CHECKPOINT names.
+    # Covers every format in `DELEGATED_NATIVE_PASSTHROUGH_FORMATS` — DSv4's
+    # nibble-packed MXFP4 routed experts and its UE8M0 block-FP8 body are the
+    # same wire contract at two element grids, so they are one branch.
+    #
+    # Three things this branch deliberately does NOT do, each differing from the
+    # CT-normalized FP8_SOURCE branch above for a stated reason:
+    #
+    #  * it does not widen the scale to F32. FP8_SOURCE renames
+    #    `.weight_scale_inv` -> `.weight_scale` and casts, because vLLM's stock
+    #    block-FP8 CT path reads an fp32 scale. Nothing reads an E8M0 plane
+    #    except the loader that wrote it, which wants the exponents it shipped;
+    #    casting would quadruple 12.5 GB of DSv4 scale bytes to buy a format no
+    #    consumer asked for. That is the whole reason these formats are separate
+    #    registry entries rather than FP8_SOURCE with a different scale dtype.
+    #  * it does not rename. The native DeepseekV4 loader resolves
+    #    `layers.N.ffn.experts.E.w{1,2,3}.{weight,scale}`; emitting the live
+    #    `model.layers.N.mlp.experts.…` spelling would produce an artifact whose
+    #    tensors nothing resolves.
+    #  * it does not add the target to `ignore`. `ignore` means "unquantized,
+    #    load it as-is"; these ARE quantized and are described by their own
+    #    config group — the same rule the FP8_SOURCE branch follows.
+    #
+    # The copy runs through `_LazySkeleton.raw_slice` + `_StreamWriter`'s
+    # chunked copy path, so no source tensor is ever materialised.
+    from prismaquant.cb_source_decode import checkpoint_weight_to_live_name
+
+    for qname in sorted(native_source_targets):
+        fmt = native_source_targets[qname]
+        spec = _fr_get_format(fmt)
+        wkey = _try_resolve_skeleton(qname, skeleton, profile)
+        if wkey is None:
+            raise ValueError(
+                f"{qname}: assigned {fmt} but no source tensor (tried the "
+                ".weight key + the profile-mapped checkpoint name). The "
+                "source-passthrough family is passthrough-only — never "
+                "synthesize it.")
+        live_weight = checkpoint_weight_to_live_name(wkey, profile=profile)
+        scale_entry = skeleton._fp8_scale_inv_map.get(live_weight)
+        skey = scale_entry[1] if scale_entry is not None else None
+        if skey is None or skey not in skeleton:
+            raise ValueError(
+                f"{qname}: assigned {fmt} but {wkey!r} has no resolved "
+                f"{spec.scale_dtype_name} scale sibling; an element plane "
+                "without its scale plane is not a loadable tensor.")
+        elements_per_byte = _PASSTHROUGH_ELEMENTS_PER_BYTE[
+            str(spec.weight_element_dtype)]
+        if elements_per_byte > 1:
+            # A SUB-BYTE element plane is not self-describing: its stored dtype
+            # is just "one byte". Only the checkpoint's own declaration
+            # (`autoscale.declared_fp4_expert_dtype`, surfaced as the scale
+            # map's `mxfp4_names`) says those bytes are packed nibbles, and the
+            # passthrough copies bytes it never interprets — so without the
+            # declaration it would happily ship reinterpreted garbage. A
+            # byte-per-element plane needs no such gate: its dtype IS the claim.
+            declared = getattr(
+                skeleton._fp8_scale_inv_map, "mxfp4_names", frozenset())
+            if live_weight not in declared:
+                raise ValueError(
+                    f"{qname}: assigned {fmt} but the checkpoint does not "
+                    f"DECLARE {wkey!r} as a packed sub-byte plane (config "
+                    "expert_dtype). A shape heuristic here would ship "
+                    "reinterpreted garbage.")
+        wsh = tuple(int(d) for d in skeleton.get_shape(wkey))
+        ssh = tuple(int(d) for d in skeleton.get_shape(skey))
+        wdtype = skeleton.get_dtype(wkey)
+        sdtype = skeleton.get_dtype(skey)
+        _assert_passthrough_planes_agree(
+            qname, fmt, spec, wkey, wsh, wdtype, skey, ssh, sdtype)
+        emitted_bases.add(wkey)
+        emitted_bases.add(skey)
+        writer.add(wkey, wdtype, wsh, None, copy_src=skeleton.raw_slice(wkey))
+        writer.add(skey, sdtype, ssh, None, copy_src=skeleton.raw_slice(skey))
+        tensor_names_by_target[qname] = [wkey, skey]
         counts[fmt] += 1
 
     # Stock-CT DENSE targets: analytic on-disk tensors packed RTN via the
@@ -1867,8 +2210,14 @@ def export_nvfp4_cb_streaming(
         else:
             ckpt_qname = None
         canon = _canonical_qname(ckpt_qname, profile) if ckpt_qname else None
+        # The byte-verbatim passthrough lane is in this test for the same
+        # reason FP8_SOURCE is: its tensors were already emitted (under their
+        # checkpoint names, so `emitted_bases` catches them too) and, more
+        # importantly, they must NOT land in `ignore`. A per-expert passthrough
+        # group is not collapsed, so every one of its 768 per-layer bases
+        # passes through this loop.
         if canon in cb_targets_set or canon in source_set \
-                or canon in stock_set:
+                or canon in native_source_set or canon in stock_set:
             continue
         shape = skeleton.get_shape(name)
         dtype = skeleton.get_dtype(name)
@@ -1964,10 +2313,118 @@ def export_nvfp4_cb_streaming(
             else qname
         )
 
+    def _decision_unit_id(qname: str) -> str:
+        """The unit id the declaration names this target by.
+
+        A UNIT is what the allocator decided atomically. For anything inside a
+        routed-expert group that is the experts MODULE, not the individual
+        Linear: the CB route names a packed parent (``…experts.gate_up_proj``)
+        while the delegated route names 768 per-expert leaves, and the two have
+        to collapse to the same id or "is this unit claimed twice?" cannot be
+        asked. Everything else — a dense body Linear on the UE8M0 lane — is its
+        own unit.
+        """
+        return _expert_group_of.get(qname, qname)
+
+    def _physical_expert_module(prefix: str) -> str | None:
+        """The SERIALIZED prefix K0.2 names this routed-expert group by.
+
+        The activation attestation is keyed by physical names
+        (``layers.7.ffn.experts``) while units are recipe names
+        (``model.layers.7.mlp.experts``); reconciling the two needs this bridge
+        and not a string heuristic. ``assume_resolvable`` is required because
+        the packed parent never exists on disk — the same reason
+        ``_base_name`` needs it for a collapsed CB stack.
+        """
+        for packed_proj in sorted(_packed_expert_param_names(profile)):
+            base = _export_base_name(
+                f"{prefix}.{packed_proj}", profile, skeleton,
+                assume_resolvable=True)
+            if "." in base:
+                return base.rsplit(".", 1)[0]
+        return None
+
+    def _source_passthrough_units() -> dict[str, str]:
+        """``{unit id: registry format}`` for every delegated unit, validated.
+
+        No exhaustiveness claim: this says which units ARE passthrough, not
+        that every unit in the model was enumerated. What it does enforce is
+        that a unit is passthrough WHOLE — a routed-expert group with some
+        members delegated and some not would ship half a layer to the model's
+        own loader and half to gridbook's codec, which neither can serve.
+        """
+        units: dict[str, str] = {}
+        for qname, fmt in native_source_targets.items():
+            unit = _decision_unit_id(qname)
+            previous = units.setdefault(unit, fmt)
+            if previous != fmt:
+                raise ValueError(
+                    f"{unit}: source-passthrough unit mixes {previous} and "
+                    f"{fmt}; a unit ships on ONE contract or the export cannot "
+                    "declare it")
+        for prefix, projs in expert_groups.items():
+            if prefix not in units:
+                continue
+            members = {member for proj in projs.values()
+                       for member in proj.values()}
+            delegated = {
+                member for member in members
+                if member in native_source_set
+                or (_canonical_qname(member, profile) or member)
+                in native_source_set
+            }
+            if delegated != members:
+                raise ValueError(
+                    f"{prefix}: {len(delegated)} of {len(members)} per-expert "
+                    "tensors are on a source passthrough; a delegated expert "
+                    "group is served whole by the model's own loader or not "
+                    "at all")
+        return units
+
+    def _route_reconciliation_sets(units):
+        """Collect the sets ``assert_routes_reconcile`` compares.
+
+        Kept beside the export because only here are BOTH namespaces in hand:
+        the declaration speaks recipe names and the config groups speak
+        serialized ones.
+        """
+        cb_units = {_decision_unit_id(qname) for qname in cb_targets}
+        cb_modules: set[str] = set()
+        passthrough_modules: set[str] = set()
+        for prefix in expert_groups:
+            physical = _physical_expert_module(prefix)
+            if physical is None:
+                continue
+            if prefix in units:
+                passthrough_modules.add(physical)
+            elif prefix in cb_units:
+                cb_modules.add(physical)
+        return {
+            "cb_units": cb_units,
+            "passthrough_units": set(units),
+            "cb_tensors": {
+                name for qname in cb_targets
+                for name in tensor_names_by_target.get(qname, ())
+            },
+            "passthrough_tensors": {
+                name for qname in native_source_targets
+                for name in tensor_names_by_target.get(qname, ())
+            },
+            "cb_modules": cb_modules,
+            "passthrough_modules": passthrough_modules,
+            "attested": set(routed_moe_attested_module_names(
+                activation_execution_contract)),
+        }
+
+    _declared_passthrough_units = _source_passthrough_units()
+    assert_routes_reconcile(
+        **_route_reconciliation_sets(_declared_passthrough_units))
+
     quant_config = build_quant_config(
         assignment=assignment,
         cb_targets=cb_targets,
         source_targets=source_targets,
+        native_source_targets=native_source_targets,
         stock_targets=stock_targets,
         by_group=by_group,
         codebooks=codebooks,
@@ -1985,6 +2442,11 @@ def export_nvfp4_cb_streaming(
         cb_target_name=_cb_target_name,
         delegated_target_name=_delegated_target_name,
         source_target_name=_delegated_target_name,
+        # The byte-verbatim lane keeps the CHECKPOINT spelling: those are the
+        # names its tensors were actually written under, above.
+        native_source_target_name=_base_name,
+        source_passthrough_units=_declared_passthrough_units,
+        route_pending_passthrough_acknowledged=sorted(route_pending),
         weight_only_stock_targets=sidecar_stock,
         streaming_provenance=True,
         include_tensor_formats=False,
@@ -2213,6 +2675,14 @@ def main(argv=None) -> None:
         "identity",
     )
     ap.add_argument(
+        "--allow-route-pending-passthrough",
+        action="store_true",
+        help="ship a source-passthrough rung whose serve route is not yet "
+        "validated (allocator_candidates.ROUTE_PENDING_PASSTHROUGH_FORMATS, "
+        "today MXFP4_SOURCE -> lane delegated_native_mxfp4). Refused by "
+        "default; the acknowledgement is recorded in the artifact provenance.",
+    )
+    ap.add_argument(
         "--scale-coding",
         default=cb.SCALE_CODING_TWO_TIER,
         choices=[cb.SCALE_CODING_V1, cb.SCALE_CODING_TWO_TIER],
@@ -2261,6 +2731,7 @@ def main(argv=None) -> None:
         subset_prefixes=args.subset_prefix, reuse_prior=reuse_prior,
         reuse_verify=reuse_verify,
         allow_unstamped_research=args.allow_unstamped_research,
+        allow_route_pending_passthrough=args.allow_route_pending_passthrough,
         activation_cache_dir=args.activation_cache_dir,
         activation_scale_policy=args.activation_scale_policy)
     size = sum(p.stat().st_size for p in Path(args.out).glob("*")) / 1e9

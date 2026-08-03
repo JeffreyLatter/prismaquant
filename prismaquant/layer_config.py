@@ -58,6 +58,11 @@ _GGUF_FORMAT_NAMES = frozenset(
 # ladder is torch-free ``cb_layout.CB_FORMAT_NAMES``; do not rebuild it here.
 _NVFP4_CB_FORMAT_NAMES = CB_FORMAT_NAMES
 
+# Checkpoint ``quantization_config.scale_fmt`` spellings that mean a one-byte
+# UE8M0 block exponent. Kept as a literal so this module stays torch-free;
+# ``layer_streaming._E8M0_SCALE_FMTS`` is the decode-side twin.
+_UE8M0_SCALE_FMTS = frozenset({"ue8m0", "e8m0"})
+
 
 def canonicalize_format(entry: dict | str | int) -> str:
     """Map a layer-config entry to an export/runtime format name.
@@ -89,6 +94,22 @@ def canonicalize_format(entry: dict | str | int) -> str:
             return "NVFP4"
         if dt == "mx_fp" and bits == 4:
             return "MXFP4"
+        if dt == "fp4_e2m1" and bits == 4:
+            # MXFP4_SOURCE — the byte-verbatim OCP-MX passthrough, named by
+            # its ELEMENT dtype rather than by ``mx_fp`` precisely so it does
+            # not collide with MXFP4 (the rung this pipeline would re-encode
+            # itself). The distinction is not cosmetic: MXFP4 is a format the
+            # exporter produces, MXFP4_SOURCE is a claim that the checkpoint
+            # already ships these exact bytes and the exporter must copy them.
+            # group_size is part of the claim (OCP-MX blocks are 32), so a
+            # different one is a different contract, not a variant.
+            group_size = int(entry.get("group_size", 0))
+            if group_size != 32:
+                raise ValueError(
+                    "MXFP4_SOURCE is the OCP-MX group-of-32 passthrough; "
+                    f"got group_size={group_size} in {entry!r}"
+                )
+            return "MXFP4_SOURCE"
         if dt == "mx_fp" and bits == 8:
             elt = str(entry.get("weight_element_dtype", "fp8_e4m3")).lower()
             if elt == "fp8_e5m2":
@@ -99,6 +120,15 @@ def canonicalize_format(entry: dict | str | int) -> str:
         if dt == "fp8_e4m3" and bits == 8:
             group_size = int(entry.get("group_size", 0))
             if group_size == 128:
+                # Same E4M3 element grid and same 128x128 block, but the SCALE
+                # PLANE differs and that is the whole on-disk contract: a
+                # one-byte UE8M0 exponent (DeepSeek-V3.1/V4) is not the FP32
+                # weight_scale_inv plane FP8_SOURCE names, and the exporter
+                # widens the latter to FP32 on write. Reading them as one
+                # format would ship 4x the scale bytes in a layout the
+                # checkpoint's own loader does not expect.
+                if str(entry.get("scale_fmt", "")).lower() in _UE8M0_SCALE_FMTS:
+                    return "FP8_BLOCK_UE8M0_SOURCE"
                 return "FP8_SOURCE"
             if group_size == 32:
                 return "MXFP8_E4M3"
@@ -125,10 +155,20 @@ def canonicalize_format(entry: dict | str | int) -> str:
             return value.upper()
         if value in ("nvfp4", "fp4", "4"):
             return "NVFP4"
+        if value in ("mxfp4_source", "mx_fp4_source"):
+            # Checked BEFORE the plain MXFP4 spellings: a substring-free
+            # equality test would still pass either way, but keeping the
+            # narrower claim first documents that the two are different
+            # contracts rather than aliases.
+            return "MXFP4_SOURCE"
         if value in ("mxfp4", "mx_fp4"):
             return "MXFP4"
         if value in ("mxfp8", "mxfp8_e4m3"):
             return "MXFP8_E4M3"
+        if value in ("fp8_block_ue8m0_source", "fp8_block_ue8m0"):
+            return "FP8_BLOCK_UE8M0_SOURCE"
+        if value in ("fp8_source", "fp8_block_source"):
+            return "FP8_SOURCE"
         if value in ("fp8", "fp8_dynamic", "fp8_e4m3", "fp8_e4m3fn", "8"):
             return "FP8_E4M3"
         if value in ("mxfp8_e5m2", "mx_fp8_e5m2"):

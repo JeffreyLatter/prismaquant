@@ -271,9 +271,23 @@ def test_the_lane_catalog_is_reportable_and_names_its_runtime():
     assert catalog["schema"] == sp.SERVING_LANE_SCHEMA
     assert catalog["gridbook_runtime_version"] == "0.7.0"
     assert set(catalog["lanes"]) == {
-        "nvfp4_cb_quality_path", "fp8_cb_fused_mid_m"}
+        "nvfp4_cb_quality_path", "fp8_cb_fused_mid_m",
+        # The two SOURCE-PASSTHROUGH lanes. They are declared as lanes of
+        # their own precisely so P5b never files a passthrough unit under a
+        # CB activation contract it does not have.
+        "delegated_native_mxfp4", "delegated_native_fp8_block_ue8m0",
+    }
     assert catalog["lanes"]["fp8_cb_fused_mid_m"]["fused_mid_m_rungs"] == [
         28, 32, 36, 40, 44, 48]
+    # A passthrough lane backs no fused mid-M rung, and says so explicitly
+    # rather than leaving the field absent: there is no decode prologue to
+    # fuse, so an empty backed set is the honest state, not a data gap.
+    for lane_id in ("delegated_native_mxfp4",
+                    "delegated_native_fp8_block_ue8m0"):
+        lane = catalog["lanes"][lane_id]
+        assert lane["fused_mid_m_rungs"] == []
+        assert lane["fused_mid_m_rungs_source"] == (
+            "lane_declares_no_fused_mid_m_lane")
 
 
 # ---------------------------------------------------------------------------

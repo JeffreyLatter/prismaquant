@@ -847,6 +847,53 @@ def routed_moe_stages_sha256(
     return digest.hexdigest()
 
 
+def routed_moe_attested_module_names(
+    record: Mapping[str, Any] | None,
+) -> tuple[str, ...]:
+    """The routed-MoE modules an execution-contract record actually attests.
+
+    ONE definition of "what is in K0.2's scope", read off the record rather
+    than re-derived from the assignment, so the producer's reconciliation and
+    a consumer's audit cannot disagree about it.  ``()`` means the record
+    attests no routed-MoE module at all — either it is dense-only or it is
+    absent.
+
+    THE SCOPE PROBLEM THIS EXISTS FOR.  :func:`build_routed_moe_stage_attestation`
+    can only attest a module that CONTRIBUTED a calibrated fp4 stage scalar.  A
+    routed-expert layer that ships on a source-passthrough rung
+    (``MXFP4_SOURCE``: the checkpoint's own bytes, served by the model's native
+    kernel) has no CB activation contract to attest and is therefore simply
+    ABSENT here — which, read alone, is indistinguishable from a partial or
+    failed export that dropped a module it should have calibrated.  The
+    completeness guard below cannot close that: it only fires for a module that
+    reached the record with ONE of its two stages.
+
+    The gap is closed OUTSIDE this record, deliberately, by the top-level
+    ``source_passthrough`` declaration
+    (``cb_export_config.build_source_passthrough_declaration``): it positively
+    names every unit handed to the model's own loader, and
+    ``export_nvfp4_cb_streaming.assert_routes_reconcile`` proves that scope is
+    disjoint from this one before an artifact ships.  The K0.2 record's own
+    field set stays byte-identical, because it is a pinned cross-repository
+    contract whose consumer rejects unknown keys outright
+    (tests/test_gridbook_attestation_interop.py) — widening it "additively" is
+    exactly the failure that test exists to catch.
+    """
+
+    if not isinstance(record, Mapping):
+        return ()
+    section = record.get(NVFP4_ROUTED_MOE_STAGE_KEY)
+    if not isinstance(section, Mapping):
+        return ()
+    names = section.get("module_names")
+    if not isinstance(names, (list, tuple)):
+        raise ValueError(
+            "routed-MoE stage section has no module_names list; refusing to "
+            "guess the attested scope"
+        )
+    return tuple(str(name) for name in names)
+
+
 def build_routed_moe_stage_attestation(
     scales: Mapping[str, float],
     *,
@@ -863,6 +910,10 @@ def build_routed_moe_stage_attestation(
     reaches export with only one attested stage: that is precisely the state
     the existing partial LFM artifact is in, and no artifact may claim
     fused-MoE readiness from it.
+
+    What it CANNOT see is a routed-expert layer that contributed no stage at
+    all — see :func:`routed_moe_attested_module_names` for why that is not this
+    record's job to declare, and where it is declared instead.
     """
 
     mapper = target_name or (lambda name: name)
@@ -1169,6 +1220,7 @@ __all__ = [
     "nvfp4_activation_qdq_served",
     "resolve_input_global_scale_policy",
     "resolve_input_global_scale_value",
+    "routed_moe_attested_module_names",
     "routed_moe_stage",
     "routed_moe_stages_sha256",
     "select_mse_grid_input_global_scale",

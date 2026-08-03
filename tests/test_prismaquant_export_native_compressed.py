@@ -1063,9 +1063,24 @@ class TestRoundTrip(unittest.TestCase):
             s.name for s in fr.REGISTRY.values()
             if s.family in ("nvfp4_cb", "fp8_cb")
         }
+        nvfp4_cb_container_passthroughs = {
+            # SOURCE-PASSTHROUGH carriers of the nvfp4_cb container. They have
+            # no compressed-tensors served-metadata path because they have no
+            # RENDER at all: the exporter copies the checkpoint's own bytes
+            # (packed MXFP4 + E8M0 group scales; E4M3 + UE8M0 block scales).
+            # "rendered == served" is trivially true and is pinned as the
+            # identity of both the weight and activation paths in
+            # test_registry_render_dequant_matches_served_metadata, and
+            # byte-for-byte against a real source slice in
+            # tests/test_nvfp4_cb_streaming.py. BF16 and FP8_SOURCE stay in
+            # `reconciled` — those two ARE compressed-tensors passthroughs.
+            "MXFP4_SOURCE",
+            "FP8_BLOCK_UE8M0_SOURCE",
+        }
         self.assertEqual(
             set(fr.REGISTRY),
-            reconciled | set(explicit_gaps) | gguf_lane | nvfp4_cb_lane,
+            reconciled | set(explicit_gaps) | gguf_lane | nvfp4_cb_lane
+            | nvfp4_cb_container_passthroughs,
         )
 
     def test_registry_render_dequant_matches_served_metadata(self):
@@ -1157,6 +1172,28 @@ class TestRoundTrip(unittest.TestCase):
                             live_bf16.float(),
                             served.bfloat16().float(),
                         )
+                        continue
+
+                    from prismaquant.allocator_candidates import (
+                        PASSTHROUGH_SOURCE_REQUIREMENTS,
+                    )
+                    if fmt in PASSTHROUGH_SOURCE_REQUIREMENTS:
+                        # The rest of the SOURCE-PASSTHROUGH family
+                        # (FP8_BLOCK_UE8M0_SOURCE, MXFP4_SOURCE, ...). There
+                        # is no render to compare against a serve: the
+                        # exporter copies the checkpoint's own bytes, so the
+                        # served values ARE the source values. The invariant
+                        # that must hold — and that would break if someone
+                        # gave one of these a real codec — is that BOTH sides
+                        # of the format are the identity, which is what makes
+                        # its Δloss exactly 0 by construction rather than by
+                        # measurement.
+                        spec = fr.get_format(fmt)
+                        torch.testing.assert_close(
+                            spec.quantize_dequantize(W), W)
+                        torch.testing.assert_close(
+                            spec.activation_quantize_dequantize(W), W)
+                        self.assertFalse(spec.act_quant_changes_input, fmt)
                         continue
 
                     self.fail(f"unhandled registered format {fmt}")

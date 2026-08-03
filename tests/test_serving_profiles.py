@@ -524,12 +524,26 @@ def test_compressed_tensors_lane_declaration_matches_exporter_behaviour():
     # FP8/FP8_DYNAMIC/MXFP8 aliases before an assignment reaches the
     # exporter, so `_quantize_2d` is only ever handed a canonical name.
     w = torch.randn(64, 256, dtype=torch.bfloat16)
+    nvfp4_cb_emittable = lane_emittable_formats("nvfp4_cb")
     for fmt in sorted(fr.REGISTRY):
         if fmt in PASSTHROUGH_SOURCE_REQUIREMENTS:
-            # BF16 / FP8_SOURCE ship through the container's passthrough
-            # branches (plain bf16 tensor / verbatim fp8 + scale copy), not
-            # through the weight codec.
-            assert fmt in emittable, fmt
+            # Source passthroughs ship through a container's passthrough
+            # branch (plain bf16 tensor, verbatim fp8 + scale copy, verbatim
+            # packed-MXFP4 + E8M0 copy), never through the weight codec.
+            #
+            # Which CONTAINER carries which passthrough is a per-lane fact,
+            # not a global one: BF16 and FP8_SOURCE are compressed-tensors
+            # passthroughs, while FP8_BLOCK_UE8M0_SOURCE and MXFP4_SOURCE are
+            # nvfp4_cb-container passthroughs whose byte layouts the CT
+            # exporter has no emit path for. The invariant that must hold
+            # everywhere is the codec one — a passthrough is never quantized —
+            # plus "no orphans": every declared passthrough is emittable by
+            # SOME lane, so a format cannot be legal to allocate and
+            # impossible to ship.
+            if fmt not in emittable:
+                assert fmt in nvfp4_cb_emittable, fmt
+                with pytest.raises(ValueError):
+                    enc._quantize_2d(w, fmt)
             continue
         if fmt in emittable:
             assert enc._quantize_2d(w, fmt), fmt

@@ -323,13 +323,24 @@ def _extrapolate_expert_costs(
             results[name] = merged
 
 
+# Provenance stamped on a cost row the RD-ladder fitted rather than measured
+# (``PRISMAQUANT_CB_LADDER_INTERP=1``). The row survived that tensor's own
+# holdout gate — a tensor whose law is rejected has its predicted rungs
+# MEASURED instead (see the ladder block in ``measure_batched_gpu``) — so this
+# marks "fitted and validated", not "guessed". The allocator reports it per
+# selected rung so a shipped artifact can say which of its chosen prices were
+# interpolated.
+BAND_INTERPOLATED_COST_SOURCE = "band_interpolated"
+
+
 def _accumulate_result(bucket: dict, name: str, fmt: str,
                        weight_mse: float, output_mse: float,
                        rel_output_mse: float,
                        predicted_dloss: float | None = None,
                        fisher_output_mse: float | None = None,
                        output_mse_measured: bool = True,
-                       n_activation_rows: int | None = None):
+                       n_activation_rows: int | None = None,
+                       cost_source: str | None = None):
     per_name = bucket.setdefault(name, {})
     acc = per_name.setdefault(fmt, {
         "_count": 0,
@@ -342,8 +353,17 @@ def _accumulate_result(bucket: dict, name: str, fmt: str,
         "_fisher_output_mse_count": 0,
         "_output_mse_measured": True,
         "_n_activation_rows": None,
+        "_cost_source": None,
     })
     acc["_count"] += 1
+    if cost_source is not None:
+        # Provenance of the NUMBER, not of the measurement quality:
+        # ``output_mse_measured=False`` already says "no output measurement",
+        # but it cannot distinguish a ladder-interpolated row from a
+        # packed-expert row whose routed forward could not be reconstructed.
+        # A rung that the DP later selects must be able to say which of the
+        # two it was.
+        acc["_cost_source"] = str(cost_source)
     if n_activation_rows is not None:
         prev = acc.get("_n_activation_rows")
         acc["_n_activation_rows"] = (
@@ -378,6 +398,7 @@ def _finalize_results(bucket: dict[str, dict]) -> dict[str, dict]:
             fisher_sum = acc.pop("_fisher_output_mse_sum", 0.0)
             output_mse_measured = bool(acc.pop("_output_mse_measured", True))
             n_act_rows = acc.pop("_n_activation_rows", None)
+            cost_source = acc.pop("_cost_source", None)
             entry = {
                 "weight_mse": acc.pop("_weight_mse_sum") / n,
                 "output_mse": acc.pop("_output_mse_sum") / n,
@@ -385,6 +406,8 @@ def _finalize_results(bucket: dict[str, dict]) -> dict[str, dict]:
             }
             if not output_mse_measured:
                 entry["output_mse_measured"] = False
+            if cost_source is not None:
+                entry["cost_source"] = cost_source
             if n_act_rows is not None:
                 # How many activation rows the output-side numbers rest on.
                 # The allocator/provenance needs this to tell a well-covered
@@ -2286,6 +2309,7 @@ def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
                                 predicted_dloss=fills["predicted_dloss"],
                                 fisher_output_mse=fills["fisher_output_mse"],
                                 output_mse_measured=False,
+                                cost_source=BAND_INTERPOLATED_COST_SOURCE,
                             )
                     if fail_idx:
                         ladder_reject += len(fail_idx)
