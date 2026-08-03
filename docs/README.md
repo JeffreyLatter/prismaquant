@@ -112,6 +112,22 @@ before citing anything.
 
 ---
 
+## research/ — literature surveys
+
+External-evidence surveys: what the published literature and shipped open-source
+practice actually establish, kept separate from this project's own measurements
+so a citation is never mistaken for a result of ours.
+
+| Path | What it is | Status |
+|---|---|---|
+| `research/calibration-data/SURVEY.md` | Calibration data for PTQ, with emphasis on sparse MoE: where the ~0.25M-token dense convention comes from (GPTQ 128×2048, AutoAWQ 128×512, SmoothQuant 512×512) and why it is a convention rather than a measured optimum; what the controlled size and composition studies do and do not establish. Every claim carries a source link and an evidence grade. | CURRENT — evidence checked through 2026-08-03; the MoE-specific gap it identifies (none of the dense size results transfer to rare experts) is still open |
+| `research/rotation-codebooks/SURVEY.md` | Rotations, learned codebooks and second-order compensation: why a change of basis and a codebook solve different problems, and how much of incoherence a flexible per-tensor codebook can absorb. Mechanistic inference from QuIP / QuIP# / QTIP / AQLM, labelled as inference. | CURRENT — evidence checked through 2026-08-03; records an explicit NEGATIVE finding: no measured evidence was found that holds a per-tensor learned, FP-grid-constrained product codebook fixed in capacity and ablates rotation on/off at 2–3 bits, which is exactly the comparison the CB formats would need |
+
+Each survey ships its `bibliography.json` beside it; the survey cites by key and
+the bibliography is what those keys resolve to.
+
+---
+
 ## archive/ — superseded narratives
 
 | Path | What it is | Status |

@@ -730,6 +730,7 @@ def build_quant_config(
     source_passthrough_units: Mapping[str, str] | None = None,
     per_expert_format_groups: Mapping[str, Any] | None = None,
     route_pending_passthrough_acknowledged: Iterable[str] = (),
+    research_cost_selection: Mapping[str, Any] | None = None,
     excluded_namespaces: Iterable[str] = (),
     weight_only_stock_targets: Iterable[str] = (),
     streaming_provenance: bool | None = None,
@@ -899,6 +900,9 @@ def build_quant_config(
         # artifact has to carry the fact that it was used, or "was this shipped
         # knowing no serve route existed?" is unanswerable from the artifact.
         provenance["route_pending_passthrough_acknowledged"] = acknowledged
+    if research_cost_selection is not None:
+        provenance["research_cost_selection"] = dict(research_cost_selection)
+        provenance["research_cost_selection_acknowledged"] = True
     excluded = sorted(set(str(prefix) for prefix in excluded_namespaces))
     if excluded:
         # An artifact that is MISSING a namespace has to say so. Otherwise
