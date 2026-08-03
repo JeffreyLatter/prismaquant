@@ -171,7 +171,6 @@ def tail_metrics(e: torch.Tensor | Iterable[float]) -> dict[str, float]:
         "gini": gini,
     }
 
-
 def _split_point(
     *,
     fraction: float,
@@ -314,4 +313,3 @@ def split_prize_curve(
         "rowwise_better": not violations,
         "monotone_non_increasing": monotone_non_increasing,
     }
-
