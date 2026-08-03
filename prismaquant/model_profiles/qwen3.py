@@ -1,21 +1,16 @@
-"""Qwen3 (original) profile — dense transformer, no MoE, no MTP, no visual.
+"""Original Qwen3 producer profile: dense and routed-MoE text models.
 
-Covers:
-  - Qwen3ForCausalLM  (Qwen3-0.6B, 1.5B, 4B, 8B, 14B, 32B)
+The producer id is deliberately ``qwen3`` for both variants.  That spelling
+is the one Gridbook's runtime contract serves; ``qwen3_moe`` is an HF/vLLM
+model-type/module spelling, not a producer-contract id.
 
-Distinct from Qwen3.5/3.6:
-  - No DeltaNet hybrid — full attention on every layer
-  - No Multi-Token-Prediction head
-  - No MoE (Qwen3 MoE variants use `Qwen3MoeForCausalLM` — separate profile)
-
-vLLM's `Qwen3ForCausalLM` has:
-  - packed_modules_mapping = {'qkv_proj': ['q_proj', 'k_proj', 'v_proj'],
-                              'gate_up_proj': ['gate_proj', 'up_proj']}
-  - no hf_to_vllm_mapper (identity naming)
-
-So the profile is nearly a pass-through: fused-sibling derivation comes
-from the base class via packed_modules_mapping, and name remap is the
-identity.
+The routed model selected for the serving smoke is
+``Qwen/Qwen3-30B-A3B`` / ``Qwen3MoeForCausalLM``.  Its checkpoint stores
+per-expert 2-D ``gate_proj`` / ``up_proj`` / ``down_proj`` tensors while the
+Transformers model packs them into 3-D ``gate_up_proj`` / ``down_proj``
+Parameters.  The structure spec owns that reversible bridge.  Dense Qwen3
+models continue to resolve here; the MoE declarations are inert when no
+packed expert Parameters are present.
 """
 from __future__ import annotations
 
@@ -23,31 +18,63 @@ from .base import ModelProfile
 
 
 class Qwen3Profile(ModelProfile):
+    """Producer-side structure adapter for original Qwen3 text models."""
 
-    # Detection priority (lower = consulted first): original dense Qwen3; after the 3.5/3.6 and MoE siblings.
-    priority = 130
+    priority = 120
 
     @classmethod
     def matches(cls, model_type: str, architectures: list[str]) -> bool:
-        # Must distinguish from Qwen3.5/3.6 (which use Qwen3_5For... or
-        # Qwen3_6For...) and from Qwen3 MoE (Qwen3MoeForCausalLM).
-        if model_type == "qwen3":
+        if model_type in {"qwen3", "qwen3_moe"}:
             return True
-        for arch in architectures:
-            # Exact match — anything with a separator (Qwen3_5, Qwen3Moe)
-            # belongs to another profile.
-            if arch == "Qwen3ForCausalLM":
-                return True
-        return False
+        return any(
+            arch in {"Qwen3ForCausalLM", "Qwen3MoeForCausalLM"}
+            for arch in architectures
+        )
 
     @property
     def name(self) -> str:
         return "qwen3"
 
     def vllm_architecture_class(self) -> str | None:
-        return "Qwen3ForCausalLM"
+        # The selected routed-MoE smoke must be checked against this exact
+        # installed-vLLM registry key.  The declarative spec supplies the
+        # dense gate/up fusion that the MoE class adds only conditionally.
+        return "Qwen3MoeForCausalLM"
+
+    def fused_sibling_group(self, linear_qname: str) -> str | None:
+        """Consult stable spec groups before config-dependent vLLM metadata."""
+        spec = self.structure_spec()
+        if spec is not None:
+            group = spec.fused_group_for(linear_qname)
+            if group is not None:
+                return group
+        return super().fused_sibling_group(linear_qname)
+
+    def fused_sibling_leaf_mapping(self) -> dict[str, tuple[str, ...]]:
+        """Merge the family spec with the installed vLLM class metadata."""
+        mapping = dict(super().fused_sibling_leaf_mapping())
+        spec = self.structure_spec()
+        if spec is None:
+            return mapping
+        for group in spec.fused_groups:
+            target = str(group.target_suffix).rsplit(".", 1)[-1]
+            members = tuple(
+                str(member).rsplit(".", 1)[-1]
+                for member in group.member_suffixes
+            )
+            existing = mapping.get(target)
+            if existing is not None and existing != members:
+                raise ValueError(
+                    f"Qwen3 fused group {target!r} disagrees between vLLM "
+                    f"{existing!r} and the structure spec {members!r}"
+                )
+            mapping[target] = members
+        return mapping
 
     def register_vendored_modeling(self) -> None:
-        """Install the vendored Qwen3 causal-LM class with cached RoPE."""
+        # This registration targets only model_type=qwen3.  Calling it while
+        # handling qwen3_moe is harmless and leaves the installed MoE class
+        # untouched.
         from ..vendored import register_qwen3
+
         register_qwen3()

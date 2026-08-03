@@ -2232,8 +2232,9 @@ def _scan_source_dtype_manifest(
     # Without classifying them the manifest has no source kind for the
     # packed recipe names the allocator costs, and the BF16 passthrough is
     # dropped (source_dtype_mismatch) on a BF16 source — an expert-menu
-    # completeness bug. (Per-expert INDEXED layouts store 2-D ``.weight``
-    # keys and classify their own recipe names via the normal path.)
+    # completeness bug. Per-expert INDEXED layouts store 2-D ``.weight``
+    # keys; below we retain those source names and also fold their kinds onto
+    # the packed recipe parent that probe/cost actually enumerate.
     import re as _re
     _packed_leaf_re = _re.compile(
         r"\.experts\.(?:gate_up_proj|down_proj|gate_proj|up_proj|w1|w2|w3)$"
@@ -2347,6 +2348,46 @@ def _scan_source_dtype_manifest(
                     return name
         return name
 
+    def _per_expert_packed_recipe_name(recipe_name: str) -> str | None:
+        """Map ``experts.E.proj`` source names to the packed recipe unit.
+
+        A per-expert checkpoint and a packed live Transformers module name
+        the same weights at different granularities.  Source-passthrough
+        legality is checked against the live probe/cost key, so recording
+        only the indexed source names makes its source kind look unknown and
+        incorrectly removes BF16 from the expert menu.  The profile owns the
+        projection-to-parent mapping; mixed source kinds fold to ``other`` so
+        no byte-copy format can be admitted for a heterogeneous stack.
+        """
+        if profile is None:
+            return None
+        parent_for = getattr(
+            profile, "packed_expert_parent_for_projection", None)
+        if not callable(parent_for):
+            return None
+        parts = str(recipe_name).split(".")
+        try:
+            experts_idx = len(parts) - 1 - list(reversed(parts)).index(
+                "experts")
+        except ValueError:
+            return None
+        tail = parts[experts_idx + 1:]
+        if len(tail) != 2 or not tail[0].isdigit():
+            return None
+        packed_leaf = parent_for(tail[1])
+        if packed_leaf is None:
+            return None
+        return ".".join(parts[:experts_idx + 1] + [str(packed_leaf)])
+
+    def _record_source_kind(name: str, source_kind: str) -> None:
+        previous = manifest.get(name)
+        if previous is None or previous == source_kind:
+            manifest[name] = source_kind
+        else:
+            # A packed unit is passthrough-legal only when every serialized
+            # constituent has the same native source representation.
+            manifest[name] = "other"
+
     manifest: dict[str, str] = {}
     for base, suffixes in bases.items():
         if "weight" not in suffixes:
@@ -2384,7 +2425,10 @@ def _scan_source_dtype_manifest(
         )
         if not recipe_name:
             continue
-        manifest[recipe_name] = source_kind
+        _record_source_kind(recipe_name, source_kind)
+        packed_recipe_name = _per_expert_packed_recipe_name(recipe_name)
+        if packed_recipe_name is not None:
+            _record_source_kind(packed_recipe_name, source_kind)
     fp8_pairs = None
     if profile is not None:
         pairs_fn = getattr(profile, "fp8_scale_pairs", None)

@@ -11,7 +11,6 @@ from prismaquant.model_profiles.gemma4 import Gemma4Profile
 from prismaquant.model_profiles.qwen3 import Qwen3Profile
 from prismaquant.model_profiles.qwen3_5 import Qwen3_5Profile
 from prismaquant.model_profiles.qwen3_5_dense import Qwen3_5DenseProfile
-from prismaquant.model_profiles.qwen3_moe import Qwen3MoeProfile
 from prismaquant.model_profiles.registry import profile_from_config
 from prismaquant.model_profiles.structure import (
     ModelStructureSpec,
@@ -239,7 +238,7 @@ def test_qwen_graph_exposes_fused_sibling_optimization_units():
     assert down.scope == "tensor"
 
 
-def test_qwen3_dense_and_moe_profiles_are_config_backed():
+def test_qwen3_dense_and_moe_configs_share_contract_profile():
     dense = profile_from_config({
         "model_type": "qwen3",
         "architectures": ["Qwen3ForCausalLM"],
@@ -250,13 +249,17 @@ def test_qwen3_dense_and_moe_profiles_are_config_backed():
     })
 
     assert isinstance(dense, Qwen3Profile)
-    assert not isinstance(dense, Qwen3MoeProfile)
-    assert isinstance(moe, Qwen3MoeProfile)
+    assert isinstance(moe, Qwen3Profile)
     assert dense.structure_spec().id == "qwen3"
-    assert moe.structure_spec().id == "qwen3_moe"
+    assert moe.structure_spec().id == "qwen3"
     assert dense.serving_profile_id() == "vllm_packed_moe"
     assert moe.serving_profile_id() == "vllm_packed_moe"
-    assert dense.packed_expert_param_names() == frozenset()
+    # Family-wide declarations are inert on dense modules, which have no 3-D
+    # packed expert Parameters.
+    assert dense.packed_expert_param_names() == frozenset({
+        "gate_up_proj",
+        "down_proj",
+    })
     assert moe.packed_expert_param_names() == frozenset({
         "gate_up_proj",
         "down_proj",
@@ -309,7 +312,7 @@ def test_qwen3_dense_graph_marks_linears_and_fused_groups():
 
 
 def test_qwen3_moe_graph_marks_packed_experts_without_multimodal_rewrite():
-    graph = Qwen3MoeProfile().build_model_graph(_Qwen3MoeToy())
+    graph = Qwen3Profile().build_model_graph(_Qwen3MoeToy())
     by_recipe = graph.by_recipe_name()
 
     packed = by_recipe["model.layers.0.mlp.experts.gate_up_proj"]
@@ -340,13 +343,11 @@ def test_probe_packed_expert_detection_respects_profile_spec():
 
     experts = _PackedExperts()
 
-    assert _is_packed_experts_module(experts, Qwen3MoeProfile()) is True
-    assert _packed_experts_param_names(experts, Qwen3MoeProfile()) == [
+    assert _is_packed_experts_module(experts, Qwen3Profile()) is True
+    assert _packed_experts_param_names(experts, Qwen3Profile()) == [
         "down_proj",
         "gate_up_proj",
     ]
-    assert _is_packed_experts_module(experts, Qwen3Profile()) is False
-    assert _packed_experts_param_names(experts, Qwen3Profile()) == []
 
 
 def test_packed_expert_format_group_uses_declared_projection_splits():
