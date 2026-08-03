@@ -249,9 +249,28 @@ def test_route_status_follows_the_measurement_not_the_intuition():
     assert not body.route_backed
     # Both carry the evidence for their verdict.
     assert mxfp4.route_evidence and body.route_evidence
-    # Blocked/pending rungs stay ON the menu but gate the export.
-    assert "FP8_BLOCK_UE8M0_SOURCE" in ROUTE_PENDING_PASSTHROUGH_FORMATS
-    assert "MXFP4_SOURCE" not in ROUTE_PENDING_PASSTHROUGH_FORMATS
+
+
+def test_export_gate_set_is_derived_from_route_status_not_transcribed():
+    """The MECHANISM, stated table-agnostically.
+
+    Deliberately separate from the verdict pin above. When the serving side
+    unblocks a route the verdict pin SHOULD fail — someone must consciously
+    update it and its evidence — but this must not, because the rule "anything
+    not measurably backed gates the export" does not change when a single
+    format's verdict does. Asserting today's membership here instead would
+    make one edit look like two failures and invite fixing it by transcribing
+    the new answer.
+    """
+    assert ROUTE_PENDING_PASSTHROUGH_FORMATS == {
+        name for name, contract in SOURCE_PASSTHROUGH_CONTRACTS.items()
+        if contract.route_status != ROUTE_STATUS_BACKED
+    }
+    # ...and `backed` is the ONLY status that ships without an override, so a
+    # future third non-backed status inherits the gate rather than escaping it.
+    for name, contract in SOURCE_PASSTHROUGH_CONTRACTS.items():
+        gated = name in ROUTE_PENDING_PASSTHROUGH_FORMATS
+        assert gated is (not contract.route_backed), name
 
 
 def test_wire_format_ids_are_the_closed_cross_repo_enum():

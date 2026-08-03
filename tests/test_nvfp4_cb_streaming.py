@@ -7,6 +7,7 @@ stock-CT scope gate. No GPU, no torch.compile (PRISMAQUANT_CB_ENCODE_COMPILE=0).
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import importlib
 import os
@@ -61,8 +62,8 @@ def _assert_offsets_consistent(path: Path) -> dict:
     """The streaming header must lay tensors out gap-free, in order, with
     data_offsets matching dtype x shape (requirement a)."""
     header, _ = _st_header(path)
-    _bytes = {"U8": 1, "I8": 1, "BOOL": 1, "F8_E4M3": 1, "F16": 2, "BF16": 2,
-              "I32": 4, "F32": 4, "I64": 8}
+    _bytes = {"U8": 1, "I8": 1, "BOOL": 1, "F8_E4M3": 1, "F8_E8M0": 1,
+              "F16": 2, "BF16": 2, "I32": 4, "F32": 4, "I64": 8}
     off = 0
     for name, meta in header.items():
         if name == "__metadata__":
@@ -1254,3 +1255,596 @@ def test_reuse_does_not_bypass_resume_gate(workdir):
         export_nvfp4_cb_streaming(
             mdl, ap, out, cw, device="cpu", reuse_prior=prior, reuse_verify=1
         )
+
+
+# --- source-passthrough family: byte-verbatim native lanes ------------------
+#
+# Two formats, one wire contract: the exporter copies the checkpoint's own
+# element plane and its own scale plane, under the checkpoint's own names,
+# without ever building a tensor. What these tests actually pin is that the
+# artifact's bytes ARE the source's bytes — a passthrough that re-serializes
+# "equivalently" is not a passthrough, and the failure is invisible to any
+# assertion phrased in terms of decoded values.
+
+_SOURCE_HID = 256          # CB needs logical in_features % 256 == 0
+_SOURCE_EXPERTS = 2
+_MXFP4_RECIPE = {"data_type": "fp4_e2m1", "bits": 4, "group_size": 32}
+_UE8M0_RECIPE = {"data_type": "fp8_e4m3", "bits": 8, "group_size": 128,
+                 "scale_fmt": "ue8m0"}
+_CB_RECIPE = {"data_type": "nvfp4_cb", "cb_k": 16}
+
+
+def _e8m0_plane(shape, generator) -> torch.Tensor:
+    """A real F8_E8M0 exponent plane (the dtype DSv4 ships), not a uint8 stand-in.
+
+    Built through a uint8 view because the exponent codes are what the format
+    is; going via a float cast would round-trip through values E8M0 cannot
+    represent and quietly change the bytes under test.
+    """
+    codes = torch.randint(110, 140, tuple(shape), generator=generator)
+    return codes.to(torch.uint8).view(torch.float8_e8m0fnu)
+
+
+def _dsv4_source_model(mdl: Path, *, mxfp4_layers=(1,), cb_layers=(0,),
+                       dense_ue8m0=True, seed=5) -> dict:
+    """A DSv4-Flash-shaped checkpoint at 1/1000 scale, in its own namespace.
+
+    Routed experts are nibble-packed MXFP4 (`.weight` I8 + `.scale` F8_E8M0)
+    on EVERY layer — which is the real checkpoint's state — so the CB layer
+    and the passthrough layer differ only in what the recipe asks for, not in
+    what is on disk. The dense body Linear is the UE8M0 block-FP8 spelling
+    (F8_E4M3 + F8_E8M0), the second member of the same passthrough family.
+    """
+    mdl.mkdir(parents=True, exist_ok=True)
+    hid = _SOURCE_HID
+    generator = torch.Generator().manual_seed(seed)
+    tensors: dict[str, torch.Tensor] = {}
+    for layer in sorted({*mxfp4_layers, *cb_layers}):
+        for expert in range(_SOURCE_EXPERTS):
+            for leaf in ("w1", "w3", "w2"):
+                base = f"layers.{layer}.ffn.experts.{expert}.{leaf}"
+                tensors[base + ".weight"] = torch.randint(
+                    -128, 128, (hid, hid // 2), dtype=torch.int8,
+                    generator=generator)
+                tensors[base + ".scale"] = _e8m0_plane(
+                    (hid, hid // 32), generator)
+    if dense_ue8m0:
+        tensors["layers.0.attn.wq_a.weight"] = (
+            torch.randn(hid, hid, generator=generator) * 0.3
+        ).to(torch.float8_e4m3fn)
+        tensors["layers.0.attn.wq_a.scale"] = _e8m0_plane((2, 2), generator)
+    tensors["norm.weight"] = torch.ones(hid, dtype=torch.bfloat16)
+    save_file(tensors, str(mdl / "model.safetensors"))
+    (mdl / "config.json").write_text(json.dumps({
+        "model_type": "deepseek_v4",
+        "architectures": ["DeepseekV4ForCausalLM"],
+        "hidden_size": hid,
+        "intermediate_size": hid,
+        "expert_dtype": "fp4",
+        "quantization_config": {
+            "quant_method": "fp8", "fmt": "e4m3",
+            "weight_block_size": [128, 128], "scale_fmt": "ue8m0",
+        },
+    }))
+    return tensors
+
+
+def _dsv4_recipe(*, mxfp4_layers=(1,), cb_layers=(0,), dense_ue8m0=True):
+    """Expanded per-tensor assignment + col_weights, as the allocator writes it."""
+    assignment: dict[str, object] = {}
+    col_weights: dict[str, torch.Tensor] = {}
+    generator = torch.Generator().manual_seed(11)
+    for layers, recipe in ((cb_layers, _CB_RECIPE),
+                           (mxfp4_layers, _MXFP4_RECIPE)):
+        for layer in layers:
+            for expert in range(_SOURCE_EXPERTS):
+                for proj in ("gate_proj", "up_proj", "down_proj"):
+                    qname = f"model.layers.{layer}.mlp.experts.{expert}.{proj}"
+                    assignment[qname] = recipe
+                    if recipe is _CB_RECIPE:
+                        col_weights[qname] = torch.rand(
+                            _SOURCE_HID, generator=generator) + 0.05
+    if dense_ue8m0:
+        assignment["model.layers.0.self_attn.wq_a"] = _UE8M0_RECIPE
+    return assignment, col_weights
+
+
+def _source_bytes(mdl: Path, name: str) -> bytes:
+    header, data0 = _st_header(mdl / "model.safetensors")
+    lo, hi = header[name]["data_offsets"]
+    raw = (mdl / "model.safetensors").read_bytes()
+    return raw[data0 + lo:data0 + hi]
+
+
+def _emitted_bytes(out: Path, name: str) -> bytes:
+    return _source_bytes(out, name)
+
+
+def _export_dsv4(workdir, out_name="out", **model_kwargs):
+    mdl = workdir / "src"
+    tensors = _dsv4_source_model(mdl, **model_kwargs)
+    assignment, col_weights = _dsv4_recipe(**model_kwargs)
+    path = workdir / f"{out_name}.json"
+    _assign(path, assignment)
+    out = workdir / out_name
+    counts = export_nvfp4_cb_streaming(
+        mdl, path, out, col_weights, device="cpu",
+        allow_route_pending_passthrough=True)
+    return mdl, out, tensors, dict(counts)
+
+
+def test_source_passthrough_streams_checkpoint_bytes_verbatim(workdir):
+    """The artifact's bytes ARE the checkpoint's bytes, per tensor, by digest."""
+    mdl, out, tensors, counts = _export_dsv4(workdir)
+    assert counts["MXFP4_SOURCE"] == _SOURCE_EXPERTS * 3
+    assert counts["FP8_BLOCK_UE8M0_SOURCE"] == 1
+
+    header = _assert_offsets_consistent(out / "model.safetensors")
+    source_header, _ = _st_header(mdl / "model.safetensors")
+    passthrough = [
+        f"layers.1.ffn.experts.{expert}.{leaf}.{plane}"
+        for expert in range(_SOURCE_EXPERTS)
+        for leaf in ("w1", "w3", "w2")
+        for plane in ("weight", "scale")
+    ] + ["layers.0.attn.wq_a.weight", "layers.0.attn.wq_a.scale"]
+    for name in passthrough:
+        # (a) the CHECKPOINT spelling, which is what the model's own loader
+        #     resolves — not the live `model.layers.N.mlp.experts.*` name.
+        assert name in header, name
+        # (b) dtype and shape untouched: no widening, no repacking.
+        assert header[name]["dtype"] == source_header[name]["dtype"], name
+        assert header[name]["shape"] == source_header[name]["shape"], name
+        # (c) the bytes themselves.
+        assert hashlib.sha256(_emitted_bytes(out, name)).hexdigest() == \
+            hashlib.sha256(_source_bytes(mdl, name)).hexdigest(), name
+
+    # The dtypes are asserted positively too, so a checkpoint that happened to
+    # ship F32 scales could not satisfy (b) vacuously.
+    assert header["layers.1.ffn.experts.0.w1.weight"]["dtype"] == "I8"
+    assert header["layers.1.ffn.experts.0.w1.scale"]["dtype"] == "F8_E8M0"
+    assert header["layers.0.attn.wq_a.weight"]["dtype"] == "F8_E4M3"
+    assert header["layers.0.attn.wq_a.scale"]["dtype"] == "F8_E8M0"
+
+
+def test_ue8m0_block_scale_is_not_widened_like_fp8_source(workdir):
+    """Regression guard on reusing the FP8_SOURCE branch for a UE8M0 source.
+
+    FP8_SOURCE renames `.weight_scale_inv` -> `.weight_scale` and casts it to
+    F32 because vLLM's stock block-FP8 path reads an fp32 plane. Doing that to
+    a one-byte UE8M0 plane would quadruple its size and emit a tensor the
+    checkpoint's own loader does not expect — and every decoded-value assertion
+    in the suite would still pass.
+    """
+    _mdl, out, _tensors, _counts = _export_dsv4(workdir)
+    header, _ = _st_header(out / "model.safetensors")
+    assert "layers.0.attn.wq_a.weight_scale" not in header
+    assert header["layers.0.attn.wq_a.scale"]["dtype"] == "F8_E8M0"
+    lo, hi = header["layers.0.attn.wq_a.scale"]["data_offsets"]
+    assert hi - lo == 2 * 2          # one byte per 128x128 block, not four
+
+
+def test_source_passthrough_expert_group_is_not_collapsed_or_ignored(workdir):
+    """A delegated group keeps its per-expert tensors and stays out of `ignore`.
+
+    The packed parent gridbook's CB loader anchors on does not exist on disk
+    for this route, so naming one would promise a stack that is never written;
+    and `ignore` means "unquantized, load as-is", which these 4.25 bpw tensors
+    are not.
+    """
+    _mdl, out, _tensors, _counts = _export_dsv4(workdir)
+    emitted = set(load_file(str(out / "model.safetensors")))
+    config = json.loads((out / "quant_config.json").read_text())
+
+    assert "layers.1.ffn.experts.gate_up_proj.cb_qweight" not in emitted
+    assert "layers.1.ffn.experts.down_proj.cb_qweight" not in emitted
+    assert "layers.1.ffn.experts.0.w1.weight" in emitted
+    # The CB layer is the control: there the collapse DID happen.
+    assert "layers.0.ffn.experts.gate_up_proj.cb_qweight" in emitted
+    assert not any(name.startswith("layers.0.ffn.experts.0.")
+                   for name in emitted)
+
+    ignored = set(config["ignore"])
+    assert not any(name.startswith("layers.1.ffn.experts") for name in ignored)
+    assert "layers.0.attn.wq_a" not in ignored
+
+    native = [group for group in config["config_groups"].values()
+              if group.get("source_format") == "MXFP4_SOURCE"]
+    assert len(native) == 1
+    assert native[0]["source_passthrough_id"] == "mxfp4_e2m1_ue8m0_g32"
+    assert native[0]["weights"]["scale_dtype"] == "uint8_e8m0"
+    # Routing is stated once, in the source_passthrough declaration.
+    assert "route" not in native[0] and "route_backed" not in native[0]
+    assert native[0]["input_activations"] is None
+    assert len(native[0]["targets"]) == _SOURCE_EXPERTS * 3
+
+
+def test_cb_expert_layer_beside_a_passthrough_layer_keeps_its_gates(workdir):
+    """The CB half of a mixed artifact is unaffected by the passthrough half."""
+    mdl, out, _tensors, counts = _export_dsv4(workdir)
+    assert counts["NVFP4_CB_K16"] == 2          # gate_up + down, collapsed
+
+    reference = workdir / "cb_only"
+    assignment, col_weights = _dsv4_recipe(
+        mxfp4_layers=(), cb_layers=(0,), dense_ue8m0=False)
+    path = workdir / "cb_only.json"
+    _assign(path, assignment)
+    export_nvfp4_cb_streaming(mdl, path, reference, col_weights, device="cpu")
+
+    mixed_tensors = load_file(str(out / "model.safetensors"))
+    cb_only_tensors = load_file(str(reference / "model.safetensors"))
+    for leaf in ("gate_up_proj", "down_proj"):
+        name = f"layers.0.ffn.experts.{leaf}.cb_qweight"
+        assert torch.equal(mixed_tensors[name], cb_only_tensors[name]), name
+
+    config = json.loads((out / "quant_config.json").read_text())
+    cb_groups = [group for group in config["config_groups"].values()
+                 if "scheme" in group]
+    assert len(cb_groups) == 1
+    assert cb_groups[0]["targets"] == [
+        "layers.0.ffn.experts.down_proj", "layers.0.ffn.experts.gate_up_proj"]
+
+
+def _pending_formats_in(counts) -> set[str]:
+    """Route-pending formats this export actually carries, per the contract table.
+
+    Read at call time, never pinned: the table is measurement-backed and its
+    verdicts move (2026-08-03 inverted both of them). A test that hardcodes
+    which format is pending stops testing the gate and starts testing the
+    measurement.
+    """
+    from prismaquant.allocator_candidates import (
+        ROUTE_PENDING_PASSTHROUGH_FORMATS,
+    )
+
+    return {fmt for fmt in counts if fmt in ROUTE_PENDING_PASSTHROUGH_FORMATS}
+
+
+def test_route_pending_ship_gate_follows_the_contract_table(workdir):
+    """Whatever the table currently marks pending is what must be refused.
+
+    Both branches assert something real, so this stays honest whichever way the
+    measured verdicts land.
+    """
+    mdl = workdir / "src"
+    _dsv4_source_model(mdl)
+    assignment, col_weights = _dsv4_recipe()
+    path = workdir / "a.json"
+    _assign(path, assignment)
+
+    shipped = export_nvfp4_cb_streaming(
+        mdl, path, workdir / "shipped", col_weights, device="cpu",
+        allow_route_pending_passthrough=True)
+    pending = _pending_formats_in(shipped)
+    config = json.loads(
+        (workdir / "shipped" / "quant_config.json").read_text())
+
+    out = workdir / "default"
+    if not pending:
+        # Nothing pending: the override must not be needed at all.
+        export_nvfp4_cb_streaming(mdl, path, out, col_weights, device="cpu")
+        assert "route_pending_passthrough_acknowledged" not in \
+            config["provenance"]
+        return
+    with pytest.raises(ValueError) as error:
+        export_nvfp4_cb_streaming(mdl, path, out, col_weights, device="cpu")
+    message = str(error.value)
+    for fmt in pending:
+        assert fmt in message
+    assert "--allow-route-pending-passthrough" in message
+    assert not out.exists() or not list(out.iterdir())
+    # The override was one flag on one machine; the artifact carries the fact.
+    assert config["provenance"][
+        "route_pending_passthrough_acknowledged"] == sorted(pending)
+
+
+def test_route_pending_ship_gate_refuses_a_format_the_table_marks_pending(
+    workdir, monkeypatch,
+):
+    """The gate itself, pinned independently of today's measured verdicts."""
+    from prismaquant import export_nvfp4_cb_streaming as streaming_module
+    from prismaquant.allocator_candidates import SOURCE_PASSTHROUGH_CONTRACTS
+
+    monkeypatch.setattr(
+        streaming_module, "ROUTE_PENDING_PASSTHROUGH_FORMATS",
+        frozenset({"MXFP4_SOURCE"}))
+    mdl = workdir / "src"
+    _dsv4_source_model(mdl, dense_ue8m0=False)
+    assignment, col_weights = _dsv4_recipe(dense_ue8m0=False)
+    path = workdir / "a.json"
+    _assign(path, assignment)
+    with pytest.raises(ValueError) as error:
+        export_nvfp4_cb_streaming(
+            mdl, path, workdir / "refused", col_weights, device="cpu")
+    message = str(error.value)
+    assert "MXFP4_SOURCE" in message
+    assert SOURCE_PASSTHROUGH_CONTRACTS[
+        "MXFP4_SOURCE"].serving_route in message
+    assert f"{_SOURCE_EXPERTS * 3} unit(s)" in message
+    export_nvfp4_cb_streaming(
+        mdl, path, workdir / "shipped", col_weights, device="cpu",
+        allow_route_pending_passthrough=True)
+
+
+# --- source_passthrough: the cross-repo declaration -------------------------
+
+def test_source_passthrough_declaration_names_every_delegated_unit(workdir):
+    from prismaquant.cb_export_config import (
+        SOURCE_PASSTHROUGH_DECLARATION_KEY,
+        SOURCE_PASSTHROUGH_DECLARATION_VERSION,
+        parse_source_passthrough_declaration,
+    )
+
+    _mdl, out, _tensors, _counts = _export_dsv4(workdir)
+    config = json.loads((out / "quant_config.json").read_text())
+    record = config[SOURCE_PASSTHROUGH_DECLARATION_KEY]
+    assert record == {
+        "version": SOURCE_PASSTHROUGH_DECLARATION_VERSION,
+        "units": {
+            "model.layers.0.self_attn.wq_a": "fp8_e4m3_ue8m0_block128",
+            "model.layers.1.mlp.experts": "mxfp4_e2m1_ue8m0_g32",
+        },
+    }
+    # The declaration is TOP-LEVEL, not an execution contract.
+    assert SOURCE_PASSTHROUGH_DECLARATION_KEY not in config.get(
+        "execution_contracts", {})
+    assert parse_source_passthrough_declaration(config) == record["units"]
+
+    # A routed-expert group is ONE unit even though it emits 12 tensors under
+    # per-expert names, and a dense body Linear is a legal unit too.
+    assert "model.layers.1.mlp.experts.0.gate_proj" not in record["units"]
+    # The CB layer is not in the declaration at all.
+    assert "model.layers.0.mlp.experts" not in record["units"]
+
+
+def test_source_passthrough_key_is_absent_from_an_all_cb_artifact(workdir):
+    """Absence of the key IS the legacy/all-CB signal — never an empty record."""
+    from prismaquant.cb_export_config import (
+        SOURCE_PASSTHROUGH_DECLARATION_KEY,
+        parse_source_passthrough_declaration,
+    )
+
+    mdl = workdir / "src"
+    _dsv4_source_model(mdl, mxfp4_layers=(), cb_layers=(0,),
+                       dense_ue8m0=False)
+    assignment, col_weights = _dsv4_recipe(
+        mxfp4_layers=(), cb_layers=(0,), dense_ue8m0=False)
+    path = workdir / "a.json"
+    _assign(path, assignment)
+    out = workdir / "cb_only"
+    export_nvfp4_cb_streaming(mdl, path, out, col_weights, device="cpu")
+    config = json.loads((out / "quant_config.json").read_text())
+    assert SOURCE_PASSTHROUGH_DECLARATION_KEY not in config
+    assert parse_source_passthrough_declaration(config) is None
+
+
+def test_source_passthrough_wire_ids_are_a_closed_enum_with_no_silent_gaps():
+    """A passthrough format with no wire id must stop the export.
+
+    A unit silently dropped from ``units`` reads to the consumer as "this is
+    CB" — the one wrong answer that loads.
+    """
+    from prismaquant.cb_export_config import (
+        DELEGATED_NATIVE_PASSTHROUGH_FORMATS,
+        SOURCE_PASSTHROUGH_WIRE_FORMATS,
+        SOURCE_PASSTHROUGH_WIRE_IDS,
+        source_passthrough_wire_id,
+    )
+
+    assert SOURCE_PASSTHROUGH_WIRE_IDS["MXFP4_SOURCE"] == \
+        "mxfp4_e2m1_ue8m0_g32"
+    assert SOURCE_PASSTHROUGH_WIRE_IDS["FP8_BLOCK_UE8M0_SOURCE"] == \
+        "fp8_e4m3_ue8m0_block128"
+    assert len(SOURCE_PASSTHROUGH_WIRE_FORMATS) == len(
+        SOURCE_PASSTHROUGH_WIRE_IDS)
+    # Every format that can reach the byte-verbatim emitter has an id.
+    missing = sorted(DELEGATED_NATIVE_PASSTHROUGH_FORMATS
+                     - set(SOURCE_PASSTHROUGH_WIRE_IDS))
+    assert missing == [], missing
+    # FP8_SOURCE is CT-normalized: it never enters this record, and asking for
+    # its wire id is a bug rather than a lookup miss to paper over.
+    with pytest.raises(ValueError, match="no wire id"):
+        source_passthrough_wire_id("FP8_SOURCE")
+
+
+def test_parse_source_passthrough_declaration_refuses_the_load_failure_cases():
+    from prismaquant.cb_export_config import (
+        SOURCE_PASSTHROUGH_DECLARATION_KEY as KEY,
+        parse_source_passthrough_declaration as parse,
+    )
+
+    def config(record):
+        return {"config_groups": {}, KEY: record}
+
+    good = {"version": 1,
+            "units": {"model.layers.1.mlp.experts": "mxfp4_e2m1_ue8m0_g32"}}
+    assert parse(config(good)) == good["units"]
+
+    with pytest.raises(ValueError, match="unsupported .* version"):
+        parse(config({**good, "version": 2}))
+    with pytest.raises(ValueError, match="must be an object"):
+        parse(config(["units"]))
+    with pytest.raises(ValueError, match="carries no units"):
+        parse(config({"version": 1, "units": {}}))
+    with pytest.raises(ValueError, match="string unit ids"):
+        parse(config({"version": 1, "units": {"a": 4}}))
+    with pytest.raises(ValueError, match="unknown format id"):
+        parse(config({"version": 1, "units": {"a": "mxfp4_source"}}))
+    # A unit claimed by BOTH gridbook's codec and the passthrough declaration.
+    contested = {
+        "config_groups": {
+            "group_0": {
+                "format": "NVFP4_CB_K16",
+                "scheme": {"grid": "fp4"},
+                "targets": ["model.layers.1.mlp.experts"],
+            },
+        },
+        KEY: good,
+    }
+    with pytest.raises(ValueError, match="claimed by BOTH"):
+        parse(contested)
+
+
+_RECONCILED = {
+    "cb_units": {"model.layers.0.mlp.experts"},
+    "passthrough_units": {"model.layers.1.mlp.experts"},
+    "cb_tensors": {"layers.0.ffn.experts.gate_up_proj.cb_qweight"},
+    "passthrough_tensors": {"layers.1.ffn.experts.0.w1.weight"},
+    "cb_modules": {"layers.0.ffn.experts"},
+    "passthrough_modules": {"layers.1.ffn.experts"},
+    "attested": {"layers.0.ffn.experts"},
+}
+
+
+def test_route_reconciliation_refuses_every_way_the_two_scopes_can_overlap():
+    """The producer-side invariant, as a predicate over the four set pairs.
+
+    Each case below is a state the artifact must never reach, and each would be
+    invisible in the emitted JSON — which is the point: the wire record no
+    longer carries ``cb_activation_contract``, so this is where the claim that
+    a delegated group's K0.2 absence is DELIBERATE actually gets proved.
+    """
+    from prismaquant.export_nvfp4_cb_streaming import assert_routes_reconcile
+
+    assert_routes_reconcile(**_RECONCILED)          # the reconciled state
+
+    for field, mutation, message in (
+        # One unit handed to two loaders.
+        ("passthrough_units", {"model.layers.0.mlp.experts"},
+         "claimed by BOTH"),
+        # Unit ids disjoint but a tensor emitted twice (a namespace bug).
+        ("passthrough_tensors", {"layers.0.ffn.experts.gate_up_proj.cb_qweight"},
+         "emitted by both"),
+        # A delegated group that somehow reached the K0.2 attestation.
+        ("attested", {"layers.1.ffn.experts"}, "AND declared"),
+        # An attested module no CB unit claims — a dropped/renamed group.
+        ("attested", {"layers.9.ffn.experts"}, "which no CB expert unit claims"),
+    ):
+        state = dict(_RECONCILED)
+        state[field] = mutation
+        with pytest.raises(AssertionError, match=message):
+            assert_routes_reconcile(**state)
+
+    # A routed-expert group left entirely on BF16 is on neither route and is
+    # correctly absent from both module sets.
+    assert_routes_reconcile(**{**_RECONCILED, "attested": set()})
+
+
+def test_producer_refuses_a_k02_attestation_of_a_delegated_group(
+    workdir, monkeypatch,
+):
+    """A delegated group must never appear in the K0.2 attestation.
+
+    This is what ``cb_activation_contract`` bought on the wire; the field is
+    gone but the invariant it protected is not. A delegated group's ABSENCE
+    from the K0.2 record is a DECLARATION, not a dropped attestation — which
+    only holds while the two scopes are provably disjoint.
+    """
+    from prismaquant import export_nvfp4_cb_streaming as streaming_module
+
+    mdl = workdir / "src"
+    _dsv4_source_model(mdl, dense_ue8m0=False)
+    assignment, col_weights = _dsv4_recipe(dense_ue8m0=False)
+    path = workdir / "a.json"
+    _assign(path, assignment)
+    # The delegated group's SERIALIZED module prefix — what K0.2 would name it.
+    monkeypatch.setattr(
+        streaming_module, "routed_moe_attested_module_names",
+        lambda record: ("layers.1.ffn.experts",))
+    with pytest.raises(AssertionError, match="AND declared"):
+        export_nvfp4_cb_streaming(
+            mdl, path, workdir / "conflict", col_weights, device="cpu",
+            allow_route_pending_passthrough=True)
+
+    # ... and an attested module that no CB unit claims is equally refused.
+    monkeypatch.setattr(
+        streaming_module, "routed_moe_attested_module_names",
+        lambda record: ("layers.9.ffn.experts",))
+    with pytest.raises(AssertionError, match="which no CB expert unit claims"):
+        export_nvfp4_cb_streaming(
+            mdl, path, workdir / "orphan", col_weights, device="cpu",
+            allow_route_pending_passthrough=True)
+
+
+def test_declared_units_and_cb_targets_are_disjoint_in_the_artifact(workdir):
+    """The shipped artifact never lets one unit be read by two loaders."""
+    _mdl, out, _tensors, _counts = _export_dsv4(workdir)
+    config = json.loads((out / "quant_config.json").read_text())
+    declared = set(config["source_passthrough"]["units"])
+    cb_targets = {
+        target
+        for group in config["config_groups"].values() if "scheme" in group
+        for target in group["targets"]
+    }
+    assert declared and cb_targets
+    assert not any(
+        target == unit or target.startswith(unit + ".")
+        for unit in declared for target in cb_targets)
+
+
+def test_k02_scope_reader_reads_the_attested_modules():
+    """The producer-side scope reader, on a real routed-MoE record."""
+    from prismaquant.nvfp4_activation_contract import (
+        CALIBRATION_SOURCE_SUPPLEMENTAL_MODULE_INPUT,
+        CALIBRATION_SOURCE_SUPPLEMENTAL_ROUTED_REPLAY,
+        FULL_E4M3_INPUT_GLOBAL_SCALE_POLICY,
+        NVFP4_ROUTED_MOE_STAGE_KEY,
+        build_execution_contract,
+        routed_moe_attested_module_names,
+    )
+
+    module = "model.layers.0.mlp.experts"
+    record, _scales = build_execution_contract(
+        {f"{module}.gate_up_proj": 4.0, f"{module}.down_proj": 8.0},
+        policy=FULL_E4M3_INPUT_GLOBAL_SCALE_POLICY,
+        calibration_sources={
+            f"{module}.gate_up_proj":
+                CALIBRATION_SOURCE_SUPPLEMENTAL_MODULE_INPUT,
+            f"{module}.down_proj":
+                CALIBRATION_SOURCE_SUPPLEMENTAL_ROUTED_REPLAY,
+        },
+    )
+    assert routed_moe_attested_module_names(record) == (module,)
+    assert len(routed_moe_attested_module_names(record)) == record[
+        NVFP4_ROUTED_MOE_STAGE_KEY]["module_count"]
+    # Absent / dense-only records attest nothing, and say so without raising.
+    assert routed_moe_attested_module_names(None) == ()
+    assert routed_moe_attested_module_names({"schema": "x"}) == ()
+
+
+def test_stream_writer_refuses_a_tensor_planned_by_two_emit_paths():
+    """A duplicate header name keeps one span while both blobs are written."""
+    writer = _StreamWriter()
+    writer.add("a.weight", torch.uint8, (4,), lambda: torch.zeros(4).to(
+        torch.uint8))
+    writer.add("a.weight", torch.uint8, (8,), lambda: torch.zeros(8).to(
+        torch.uint8))
+    with pytest.raises(AssertionError, match="planned twice"):
+        writer.write(Path("unused-never-created.safetensors"))
+
+
+def test_source_passthrough_recipes_round_trip_through_canonicalize_format():
+    """The recipe spelling the registry emits is the one the exporter reads.
+
+    Both new carriers sit one field away from a format that already existed —
+    MXFP4_SOURCE beside MXFP4, FP8_BLOCK_UE8M0_SOURCE beside FP8_SOURCE — and
+    collapsing either pair would silently ship the wrong on-disk contract.
+    """
+    from prismaquant import format_registry as fr
+    from prismaquant.layer_config import canonicalize_format
+
+    for name in ("MXFP4_SOURCE", "FP8_BLOCK_UE8M0_SOURCE", "FP8_SOURCE",
+                 "MXFP4", "MXFP8_E4M3", "FP8_E4M3"):
+        assert canonicalize_format(
+            fr.get_format(name).autoround_config()) == name, name
+    # The neighbours stay distinct on the ONE field that separates them.
+    assert canonicalize_format(
+        {"data_type": "fp8_e4m3", "bits": 8, "group_size": 128}) == "FP8_SOURCE"
+    assert canonicalize_format({
+        "data_type": "fp8_e4m3", "bits": 8, "group_size": 128,
+        "scale_fmt": "ue8m0"}) == "FP8_BLOCK_UE8M0_SOURCE"
+    assert canonicalize_format({"data_type": "mx_fp", "bits": 4}) == "MXFP4"
+    # MXFP4_SOURCE is the OCP-MX group-of-32 claim; another group is another
+    # contract, not a variant.
+    with pytest.raises(ValueError, match="group-of-32"):
+        canonicalize_format(
+            {"data_type": "fp4_e2m1", "bits": 4, "group_size": 16})
