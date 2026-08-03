@@ -72,6 +72,8 @@ from prismaquant.allocator_candidates import (
     SOURCE_PASSTHROUGH_CONTRACTS,
 )
 from prismaquant.cb_export_config import (
+    PER_EXPERT_FORMAT_GROUPS_KEY,
+    PER_EXPERT_FORMAT_GROUPS_VERSION,
     SOURCE_PASSTHROUGH_EXPORT_FORMATS,
     STREAMING_REQUANT_EXPORT_FORMATS,
     parse_source_passthrough_declaration,
@@ -81,6 +83,7 @@ from prismaquant.cb_export_config import (
     codebook_tensor_names as _codebook_tensor_names,
     codebook_tensors as _codebook_tensors,
     source_passthrough_wire,
+    source_passthrough_wire_id,
 )
 from prismaquant.format_registry import (
     canonical_format_name,
@@ -96,7 +99,7 @@ from prismaquant.export_nvfp4_cb import (
     _try_resolve_direct_packed_expert,
     _try_resolve_skeleton,
 )
-from prismaquant.layer_config import load_assignment
+from prismaquant.layer_config import canonicalize_assignment, load_assignment
 from prismaquant.model_profiles import detect_profile
 from prismaquant.export_output_safety import (
     prepare_fresh_export_directory,
@@ -155,6 +158,52 @@ _LEGACY_PACKED_PROJECTIONS = {
     "gate_proj": ("gate_proj",),
     "up_proj": ("up_proj",),
 }
+
+_PER_EXPERT_GROUP_DISCRIMINATOR = "format_group_"
+_PER_EXPERT_LAYER_RE = re.compile(r"(?:^|[.])layers[.](\d+)(?:[.]|$)")
+
+
+def _format_group_slug(format_wire_id: str) -> str:
+    """Filesystem/tensor-name-safe discriminator for one wire format id."""
+
+    slug = re.sub(r"[^a-z0-9]+", "_", str(format_wire_id).lower()).strip("_")
+    if not slug:
+        raise ValueError(f"empty format wire id {format_wire_id!r}")
+    return _PER_EXPERT_GROUP_DISCRIMINATOR + slug
+
+
+def _per_expert_format_wire_id(format_name: str) -> str:
+    canonical = canonical_format_name(format_name)
+    if _parse_cb_format(canonical) is not None:
+        return canonical
+    if canonical == "MXFP4_SOURCE":
+        return source_passthrough_wire_id(canonical)
+    raise ValueError(
+        "per-expert stack groups support NVFP4_CB/FP8_CB rungs and "
+        f"MXFP4_SOURCE, got {format_name!r}"
+    )
+
+
+def _per_expert_layer_id(prefix: str) -> str:
+    match = _PER_EXPERT_LAYER_RE.search(prefix)
+    if match is None:
+        raise ValueError(
+            f"{prefix}: cannot derive the numeric layer id required by "
+            f"{PER_EXPERT_FORMAT_GROUPS_KEY}"
+        )
+    return match.group(1)
+
+
+def _per_expert_family(profile, packed_proj: str) -> str:
+    projections = _packed_expert_projection_names(profile, packed_proj)
+    if len(projections) == 2:
+        return "w13"
+    if len(projections) == 1:
+        return "w2"
+    raise ValueError(
+        f"{packed_proj}: proposed per-expert wire contract has only w13/w2 "
+        f"families, got projections={projections}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -827,6 +876,190 @@ def _collapse_per_expert_assignment(assignment, expert_groups, profile):
     return collapsed, members_by_target, report
 
 
+def _load_per_expert_config(path: str | Path) -> dict[str, str]:
+    """Load the Tier-2 flat ``qname -> format`` allocation.
+
+    The sibling counterfactual script writes the same entry spellings as a
+    layer config but may include every dense/body row as well.  Only routed
+    expert rows are consumed by this exporter mode; the ordinary layer config
+    remains authoritative for all other tensors.
+    """
+
+    payload = json.loads(Path(path).read_text())
+    if not isinstance(payload, dict):
+        raise ValueError(
+            f"--per-expert-config {path}: expected a qname->format JSON object"
+        )
+    return canonicalize_assignment(payload)
+
+
+def _split_per_expert_assignment(
+    assignment,
+    per_expert_assignment,
+    expert_groups,
+    profile,
+):
+    """Build one packed target per ``(layer, family, format)``.
+
+    Returns ``(assignment, members_by_target, plans, report)``.  ``plans`` is
+    producer-internal metadata used to emit the proposed declaration after
+    recipe names have been mapped into the physical checkpoint namespace.
+    MXFP4_SOURCE members remain expanded because their checkpoint slices are
+    copied verbatim; the plan, rather than ``source_passthrough.units``, owns
+    their routing declaration.
+    """
+
+    merged = dict(assignment)
+    members_by_target: dict[str, dict[tuple[str, int], str]] = {}
+    plans: dict[str, dict[str, list[dict[str, object]]]] = {}
+    report = {"stacks": 0, "members": 0, "format_groups": 0}
+    matched_config_names: set[str] = set()
+    packed_names = _packed_expert_param_names(profile)
+
+    for prefix in sorted(expert_groups):
+        group = expert_groups[prefix]
+        consumed: set[str] = set()
+        for packed_proj in sorted(
+            packed_names,
+            key=lambda name: (
+                -len(_packed_expert_projection_names(profile, name)), name
+            ),
+        ):
+            projections = _packed_expert_projection_names(profile, packed_proj)
+            if any(projection in consumed for projection in projections):
+                continue
+            if any(projection not in group for projection in projections):
+                continue
+            try:
+                all_members = _expert_member_qnames(
+                    prefix, packed_proj, group, profile
+                )
+            except ValueError:
+                continue
+            configured = {
+                qname for qname in all_members.values()
+                if qname in per_expert_assignment
+            }
+            if not configured:
+                continue
+            missing = sorted(set(all_members.values()) - configured)
+            if missing:
+                raise ValueError(
+                    f"{prefix} {_per_expert_family(profile, packed_proj)}: "
+                    f"--per-expert-config covers {len(configured)} of "
+                    f"{len(all_members)} members; missing e.g. {missing[:8]}"
+                )
+            matched_config_names.update(configured)
+            consumed.update(projections)
+
+            experts = sorted({expert_id for _projection, expert_id in all_members})
+            formats_by_expert: dict[int, str] = {}
+            for expert_id in experts:
+                values = {
+                    canonical_format_name(per_expert_assignment[
+                        all_members[(projection, expert_id)]
+                    ])
+                    for projection in projections
+                }
+                if len(values) != 1:
+                    detail = {
+                        projection: per_expert_assignment[
+                            all_members[(projection, expert_id)]
+                        ]
+                        for projection in projections
+                    }
+                    raise ValueError(
+                        f"{prefix} {_per_expert_family(profile, packed_proj)} "
+                        f"expert {expert_id}: coupled projections disagree: "
+                        f"{detail}"
+                    )
+                formats_by_expert[expert_id] = values.pop()
+
+            by_format: dict[str, list[int]] = {}
+            for expert_id, format_name in formats_by_expert.items():
+                _per_expert_format_wire_id(format_name)  # closed-menu gate
+                by_format.setdefault(format_name, []).append(expert_id)
+
+            packed_parent = f"{prefix}.{packed_proj}"
+            if packed_parent in assignment:
+                raise ValueError(
+                    f"{packed_parent}: the layer config carries the packed "
+                    "stack while --per-expert-config carries its expanded "
+                    "members; describe the expert bank once"
+                )
+            for qname in all_members.values():
+                merged.pop(qname, None)
+
+            layer = _per_expert_layer_id(prefix)
+            family = _per_expert_family(profile, packed_proj)
+            family_plans = plans.setdefault(layer, {}).setdefault(family, [])
+            mixed = len(by_format) > 1
+            for format_name, expert_ids in sorted(by_format.items()):
+                wire_id = _per_expert_format_wire_id(format_name)
+                source_passthrough = format_name == "MXFP4_SOURCE"
+                target = (
+                    f"{packed_parent}.{_format_group_slug(wire_id)}"
+                    if mixed and not source_passthrough
+                    else packed_parent
+                )
+                subgroup_members = {
+                    (projection, expert_id): all_members[(projection, expert_id)]
+                    for projection in projections
+                    for expert_id in expert_ids
+                }
+                if source_passthrough:
+                    for member in subgroup_members.values():
+                        merged[member] = format_name
+                else:
+                    if target in merged:
+                        raise ValueError(
+                            f"{target}: two per-expert format groups resolve "
+                            "to the same packed tensor prefix"
+                        )
+                    merged[target] = format_name
+                    members_by_target[target] = subgroup_members
+                    report["stacks"] += 1
+                    report["members"] += len(subgroup_members)
+                family_plans.append({
+                    "layer": layer,
+                    "family": family,
+                    "format": format_name,
+                    "format_wire_id": wire_id,
+                    "expert_ids": list(expert_ids),
+                    "packed_parent": packed_parent,
+                    "target": target if not source_passthrough else None,
+                    "discriminated": bool(mixed and not source_passthrough),
+                    "source_passthrough": source_passthrough,
+                    "members": subgroup_members,
+                })
+                report["format_groups"] += 1
+
+    unmatched = sorted(
+        qname for qname in per_expert_assignment
+        if ".experts." in qname and qname not in matched_config_names
+    )
+    if unmatched:
+        raise ValueError(
+            f"--per-expert-config contains {len(unmatched)} routed-expert "
+            f"qname(s) that do not resolve in this checkpoint/profile, e.g. "
+            f"{unmatched[:8]}"
+        )
+
+    # A declaration is needed only for a layer carrying more than one format
+    # across its two families.  Single-format layers retain the targets,
+    # codebook sharing, config and bytes of the legacy path byte-for-byte.
+    plans = {
+        layer: families
+        for layer, families in plans.items()
+        if len({
+            str(entry["format"])
+            for entries in families.values()
+            for entry in entries
+        }) > 1
+    }
+    return merged, members_by_target, plans, report
+
+
 def _member_serialized_shapes(packed_qname, member_qnames, expert_groups,
                               skeleton, profile):
     """``{member recipe qname: decoded 2-D shape}`` for one collapsed stack.
@@ -835,7 +1068,8 @@ def _member_serialized_shapes(packed_qname, member_qnames, expert_groups,
     fused parent whose projections are NOT equal-width is described exactly."""
     if not member_qnames:
         return {}
-    prefix, packed_proj = packed_qname.rsplit(".", 1)
+    first_member = next(iter(member_qnames.values()))
+    prefix = first_member.rsplit(".", 2)[0]
     group = expert_groups[prefix]
     out = {}
     for (proj, expert_id), member in member_qnames.items():
@@ -911,8 +1145,9 @@ def _packed_expert_col_weights(col_weights, members_by_target, profile):
     for packed_qname, member_qnames in members_by_target.items():
         if packed_qname in out:
             continue
-        packed_proj = packed_qname.rsplit(".", 1)[1]
-        projections = _packed_expert_projection_names(profile, packed_proj)
+        projections = tuple(dict.fromkeys(
+            projection for projection, _expert_id in member_qnames
+        ))
         experts = sorted({e for _p, e in member_qnames})
         rows = []
         for e in experts:
@@ -936,15 +1171,21 @@ def _packed_expert_col_weights(col_weights, members_by_target, profile):
     return out
 
 
-def _stacked_source_weight(skeleton, profile, prefix, packed_proj, members) -> \
+def _stacked_source_weight(
+        skeleton, profile, prefix, packed_proj, members, expert_ids=None) -> \
         torch.Tensor:
     """Materialise the full stacked source weight (E, out, in) for a packed
     expert group — used only where a stack must be resident (codebook
     training sampling); the packer streams per expert."""
     projections = _packed_expert_projection_names(profile, packed_proj)
-    return torch.stack([_expert_weight(skeleton, profile, prefix, packed_proj,
-                                       members, e)
-                        for e in range(_n_experts(members, projections))])
+    if expert_ids is None:
+        expert_ids = range(_n_experts(members, projections))
+    return torch.stack([
+        _expert_weight(
+            skeleton, profile, prefix, packed_proj, members, expert_id
+        )
+        for expert_id in expert_ids
+    ])
 
 
 def _n_experts(members: dict[str, dict[int, str]],
@@ -1515,6 +1756,7 @@ def export_nvfp4_cb_streaming(
     exclude_namespaces: list[str] | tuple[str, ...] | None = None,
     activation_cache_dir: str | Path | None = None,
     activation_scale_policy: str | None = None,
+    per_expert_config_path: str | Path | None = None,
     warm_state_dir: str | Path | None = None,
     warm_verify_sample: int = 32,
 ) -> dict[str, int]:
@@ -1544,7 +1786,12 @@ def export_nvfp4_cb_streaming(
     Reuse may return only after one immutable producer-input identity covers
     source bytes, imatrix, codebooks, scheme, and exporter ABI for every copied
     tensor. ``reuse_verify`` is retained only for CLI compatibility while reuse
-    is blocked."""
+    is blocked.
+
+    ``per_expert_config_path`` enables the proposed split-stack producer ABI.
+    It is a flat qname-to-format mapping; routed expert rows override the base
+    layer config while all ordinary rows continue to come from that config.
+    """
     model_dir = Path(model_dir)
     out_dir = Path(out_dir)
     if reuse_prior is not None:
@@ -1622,9 +1869,25 @@ def export_nvfp4_cb_streaming(
     # decided each expert group atomically, so a per-expert checkpoint arrives
     # as one entry per (expert, projection). Gridbook only names stacks. Do the
     # reduction here, once, before anything reads the assignment.
-    assignment, expert_stack_members, expert_stack_report = (
-        _collapse_per_expert_assignment(assignment, expert_groups, profile)
-    )
+    per_expert_plans: dict[str, dict[str, list[dict[str, object]]]] = {}
+    if per_expert_config_path is not None:
+        (
+            assignment,
+            expert_stack_members,
+            per_expert_plans,
+            expert_stack_report,
+        ) = _split_per_expert_assignment(
+            assignment,
+            _load_per_expert_config(per_expert_config_path),
+            expert_groups,
+            profile,
+        )
+    else:
+        assignment, expert_stack_members, expert_stack_report = (
+            _collapse_per_expert_assignment(
+                assignment, expert_groups, profile
+            )
+        )
     # Namespace exclusion is validated against the COLLAPSED assignment, i.e.
     # the units as the allocator actually decided them, so a per-expert entry
     # cannot hide a collision behind its expanded spelling.
@@ -1640,7 +1903,12 @@ def export_nvfp4_cb_streaming(
         print(
             f"[export-cb-stream] collapsed "
             f"{expert_stack_report['members']} per-expert allocation entries "
-            f"into {expert_stack_report['stacks']} packed expert stack(s)",
+            f"into {expert_stack_report['stacks']} packed expert stack(s)"
+            + (
+                f" across {expert_stack_report['format_groups']} format "
+                "group(s)"
+                if per_expert_config_path is not None else ""
+            ),
             flush=True,
         )
     # Every spelling of a routed-expert tensor -> the group prefix that OWNS
@@ -1661,6 +1929,13 @@ def export_nvfp4_cb_streaming(
                 _canon_member = _canonical_qname(_member, profile)
                 if _canon_member:
                     _expert_group_of[_canon_member] = _prefix
+    for _families in per_expert_plans.values():
+        for _entries in _families.values():
+            for _entry in _entries:
+                if _entry.get("target") is not None:
+                    _expert_group_of[str(_entry["target"])] = str(
+                        _entry["packed_parent"]
+                    ).rsplit(".", 1)[0]
 
     # Every recipe qname a CB target is VERIFIED and IMATRIX-WEIGHTED under.
     # For a packed stack that is its members, not the stack: the recipe's
@@ -1675,7 +1950,40 @@ def export_nvfp4_cb_streaming(
     def _packed_stack_target(qname: str) -> bool:
         return qname in expert_stack_members
 
+    _per_expert_plan_by_target = {
+        str(entry["target"]): entry
+        for families in per_expert_plans.values()
+        for entries in families.values()
+        for entry in entries
+        if entry.get("target") is not None
+    }
+    _per_expert_source_qnames = {
+        str(member)
+        for families in per_expert_plans.values()
+        for entries in families.values()
+        for entry in entries
+        if entry.get("source_passthrough")
+        for member in entry["members"].values()
+    }
+    _per_expert_source_prefixes = {
+        str(entry["packed_parent"]).rsplit(".", 1)[0]
+        for families in per_expert_plans.values()
+        for entries in families.values()
+        for entry in entries
+        if entry.get("source_passthrough")
+    }
+
     def _base_name(qname: str) -> str:
+        plan = _per_expert_plan_by_target.get(qname)
+        if plan is not None:
+            parent = _export_base_name(
+                str(plan["packed_parent"]), profile, skeleton,
+                assume_resolvable=True,
+            )
+            return (
+                f"{parent}.{_format_group_slug(plan['format_wire_id'])}"
+                if plan.get("discriminated") else parent
+            )
         return _export_base_name(
             qname, profile, skeleton,
             assume_resolvable=_packed_stack_target(qname))
@@ -1791,6 +2099,17 @@ def export_nvfp4_cb_streaming(
         """Locate a target's source: a stacked skeleton tensor, an expert
         group (per-expert on disk), or a resolved skeleton key. Returns
         (kind, handle)."""
+        plan = _per_expert_plan_by_target.get(qname)
+        if plan is not None:
+            parent = str(plan["packed_parent"])
+            prefix, packed_proj = parent.rsplit(".", 1)
+            grp = expert_groups.get(prefix)
+            if grp is None:
+                raise KeyError(
+                    f"{qname}: per-expert format group has no source prefix "
+                    f"{prefix!r}"
+                )
+            return "experts", (prefix, packed_proj, grp)
         key = _try_resolve_skeleton(qname, skeleton, profile, suffix)
         if key is not None:
             return "tensor", key
@@ -1824,7 +2143,12 @@ def export_nvfp4_cb_streaming(
         if kind == "experts":
             prefix, packed_proj, grp = h
             projections = _packed_expert_projection_names(profile, packed_proj)
-            n = _n_experts(grp, projections)
+            member_plan = expert_stack_members.get(qname)
+            n = (
+                len({expert_id for _projection, expert_id in member_plan})
+                if member_plan is not None
+                else _n_experts(grp, projections)
+            )
             shapes = [skeleton.logical_shape(grp[p][0] + ".weight")
                       for p in projections]
             in_f = int(shapes[0][1])
@@ -1934,7 +2258,21 @@ def export_nvfp4_cb_streaming(
     by_group: dict[tuple[str, str], list[str]] = {}
     for qname in cb_targets:
         fmt = assignment[qname]
-        ref = _role_of(qname) if source == "learned" else "lattice"
+        plan = _per_expert_plan_by_target.get(qname)
+        # Every group in a declared mixed layer owns one physical sidecar.
+        # This includes a family that happens to have a single format while
+        # its sibling family is split: the per-expert footprint contract
+        # charges once per declared sub-stack, so sharing that group's lattice
+        # ref with a dense target would make the emitted bytes disagree.
+        # Uniform layers have no retained plan and preserve the legacy shared
+        # ref byte-for-byte.
+        if plan is not None:
+            ref = (
+                f"pe_l{plan['layer']}_{plan['family']}_"
+                f"{_format_group_slug(plan['format_wire_id'])}"
+            )
+        else:
+            ref = _role_of(qname) if source == "learned" else "lattice"
         by_group.setdefault((ref, fmt), []).append(qname)
     for (ref, fmt), qnames in by_group.items():
         grid, mode, k = cb_targets[qnames[0]]
@@ -1946,7 +2284,8 @@ def export_nvfp4_cb_streaming(
             codebooks[(ref, fmt)] = _train_shared_codebook_streaming(
                 skeleton, profile, expert_groups, _resolve_target,
                 qnames, col_weights, grid=grid, mode=mode, k=k, seed=seed,
-                iters=iters, train_cap=train_cap, device=device)
+                iters=iters, train_cap=train_cap, device=device,
+                members_by_target=expert_stack_members)
             kind = "learned"
         elif ref in provided:
             codebooks[(ref, fmt)] = provided[ref]
@@ -2598,9 +2937,10 @@ def export_nvfp4_cb_streaming(
     # artifact at a 4.75 bpp target).
     consumed_expert_bases = set()
     for prefix, projs in expert_groups.items():
-        # Consume only the source projections belonging to an actually-CB
-        # packed parent. A partial layer (for example gate_up=CB, down=BF16)
-        # must retain the untouched per-expert tensors for its BF16 parent.
+        # Legacy/direct packed assignments have no member plan. Consume every
+        # source projection belonging to an actually-CB packed parent. A
+        # partial layer (gate_up=CB, down=BF16) must retain the untouched
+        # expert tensors for its BF16 parent.
         for packed_proj in _packed_expert_param_names(profile):
             checkpoint_qname = f"{prefix}.{packed_proj}"
             canon_qname = _canonical_qname(checkpoint_qname, profile)
@@ -2609,9 +2949,25 @@ def export_nvfp4_cb_streaming(
                 variants.add(canon_qname)
             if not variants & cb_targets_set:
                 continue
-            for proj in _packed_expert_projection_names(profile, packed_proj):
-                for base in projs.get(proj, {}).values():
+            for projection in _packed_expert_projection_names(
+                profile, packed_proj
+            ):
+                for base in projs.get(projection, {}).values():
                     consumed_expert_bases.add(base + ".weight")
+    # A discriminated sub-stack is not named by its packed parent, so consume
+    # only its selected expert ids through the explicit member plan.
+    for target, member_qnames in expert_stack_members.items():
+        if target not in cb_targets_set:
+            continue
+        for projection, expert_id in member_qnames:
+            member = member_qnames[(projection, expert_id)]
+            # The group key is in the recipe namespace; the source handle is
+            # the profile-planned checkpoint base.
+            prefix = member.rsplit(".", 2)[0]
+            source_group = expert_groups[prefix]
+            consumed_expert_bases.add(
+                source_group[projection][expert_id] + ".weight"
+            )
     resolved_source_scale_keys = {
         entry[1] for entry in skeleton._fp8_scale_inv_map.values()
     }
@@ -2815,6 +3171,11 @@ def export_nvfp4_cb_streaming(
         for qname, fmt in requant_targets.items():
             units[_decision_unit_id(qname)] = fmt
         for qname, fmt in native_source_targets.items():
+            if qname in _per_expert_source_qnames:
+                # PROPOSED v1 per-expert declaration is the sole authority for
+                # a mixed MXFP4_SOURCE subgroup.  Adding the layer-level unit
+                # here would double-declare it and erase the expert partition.
+                continue
             unit = _decision_unit_id(qname)
             previous = units.setdefault(unit, fmt)
             if previous != fmt:
@@ -2823,6 +3184,8 @@ def export_nvfp4_cb_streaming(
                     f"{fmt}; a unit ships on ONE contract or the export cannot "
                     "declare it")
         for prefix, projs in expert_groups.items():
+            if prefix in _per_expert_source_prefixes:
+                continue
             if prefix not in units:
                 continue
             members = {member for proj in projs.values()
@@ -2869,6 +3232,7 @@ def export_nvfp4_cb_streaming(
             "passthrough_tensors": {
                 name
                 for qname in (*native_source_targets, *requant_targets)
+                if qname not in _per_expert_source_qnames
                 for name in tensor_names_by_target.get(qname, ())
             },
             "cb_modules": cb_modules,
@@ -2876,6 +3240,118 @@ def export_nvfp4_cb_streaming(
             "attested": set(routed_moe_attested_module_names(
                 activation_execution_contract)),
         }
+
+    def _per_expert_wire_declaration_and_payload():
+        """Materialize PROPOSED v1 plus its independently checked byte sum."""
+
+        if not per_expert_plans:
+            return None, None
+        entry_bytes = {
+            name: _nbytes(dtype, shape)
+            for name, dtype, shape, _producer, _copy_src in writer._entries
+        }
+        declaration_layers: dict[str, dict[str, list[dict[str, object]]]] = {}
+        payload_groups: dict[str, dict[str, object]] = {}
+        for layer, families in sorted(
+            per_expert_plans.items(), key=lambda item: int(item[0])
+        ):
+            if set(families) != {"w13", "w2"}:
+                raise ValueError(
+                    f"layer {layer}: {PER_EXPERT_FORMAT_GROUPS_KEY} requires "
+                    f"both w13 and w2 families, got {sorted(families)}"
+                )
+            layer_record: dict[str, list[dict[str, object]]] = {}
+            for family in ("w13", "w2"):
+                records = []
+                for entry in sorted(
+                    families[family],
+                    key=lambda item: str(item["format_wire_id"]),
+                ):
+                    if entry["source_passthrough"]:
+                        prefix = str(entry["packed_parent"]).rsplit(".", 1)[0]
+                        tensor_prefix = _physical_expert_module(prefix)
+                        if tensor_prefix is None:
+                            raise ValueError(
+                                f"layer {layer} {family}: cannot map source "
+                                "expert prefix into the artifact namespace"
+                            )
+                        tensor_names = sorted({
+                            name
+                            for member in entry["members"].values()
+                            for name in tensor_names_by_target.get(member, ())
+                        })
+                        codebook_bytes = 0
+                        codebook_tensor_names: list[str] = []
+                    else:
+                        target = str(entry["target"])
+                        tensor_prefix = _base_name(target)
+                        tensor_names = sorted(
+                            tensor_names_by_target.get(target, ())
+                        )
+                        per_tensor = serialized_payload["per_tensor"][target]
+                        codebook_bytes = int(
+                            per_tensor["sidecar_payload_bytes"]
+                        )
+                        codebook_tensor_names = [
+                            str(name)
+                            for name in per_tensor["sidecar_identity"][
+                                "codebook_ref"
+                            ]
+                        ]
+                    missing_names = sorted(
+                        name for name in tensor_names if name not in entry_bytes
+                    )
+                    if missing_names:
+                        raise AssertionError(
+                            f"layer {layer} {family} "
+                            f"{entry['format_wire_id']}: planned declaration "
+                            f"names absent tensors {missing_names[:8]}"
+                        )
+                    tensor_bytes = sum(entry_bytes[name] for name in tensor_names)
+                    record = {
+                        "format_wire_id": str(entry["format_wire_id"]),
+                        "expert_ids": [int(value) for value in entry["expert_ids"]],
+                        "tensor_prefix": tensor_prefix,
+                    }
+                    records.append(record)
+                    payload_groups[
+                        f"{layer}/{family}/{entry['format_wire_id']}"
+                    ] = {
+                        **record,
+                        "tensor_names": tensor_names,
+                        "codebook_tensor_names": codebook_tensor_names,
+                        "tensor_payload_bytes": int(tensor_bytes),
+                        "codebook_sidecar_bytes": int(codebook_bytes),
+                        "total_bytes": int(tensor_bytes + codebook_bytes),
+                    }
+                layer_record[family] = records
+            declaration_layers[str(layer)] = layer_record
+        tensor_total = sum(
+            int(group["tensor_payload_bytes"])
+            for group in payload_groups.values()
+        )
+        codebook_total = sum(
+            int(group["codebook_sidecar_bytes"])
+            for group in payload_groups.values()
+        )
+        return (
+            {
+                "version": PER_EXPERT_FORMAT_GROUPS_VERSION,
+                "layers": declaration_layers,
+            },
+            {
+                "schema": "prismaquant.per_expert_format_group_payload.v1",
+                "tensor_payload_bytes": int(tensor_total),
+                "codebook_sidecar_bytes": int(codebook_total),
+                "total_bytes": int(tensor_total + codebook_total),
+                "groups": dict(sorted(payload_groups.items())),
+            },
+        )
+
+    (
+        _per_expert_wire_declaration,
+        _per_expert_group_payload,
+    ) = _per_expert_wire_declaration_and_payload()
 
     _declared_passthrough_units = _source_passthrough_units()
     # Floor block-FP8 units join the SAME declaration as allocated passthrough
@@ -2949,12 +3425,17 @@ def export_nvfp4_cb_streaming(
         # `_base_name(qname)`, so that is the name the group must claim.
         requant_target_name=_base_name,
         source_passthrough_units=_declared_passthrough_units,
+        per_expert_format_groups=_per_expert_wire_declaration,
         route_pending_passthrough_acknowledged=sorted(route_pending),
         excluded_namespaces=excluded_namespaces,
         weight_only_stock_targets=sidecar_stock,
         streaming_provenance=True,
         include_tensor_formats=False,
     )
+    if _per_expert_group_payload is not None:
+        quant_config["provenance"]["per_expert_format_group_payload"] = (
+            _per_expert_group_payload
+        )
 
     # DELTA-EXPORT: verify sampled copies + log the summary BEFORE writing (an
     # abort here leaves no partial artifact). No-op when reuse is disabled.
@@ -3091,7 +3572,12 @@ def _stream_pack_target(skeleton, profile, resolved, qname, grid, mode, k,
     # experts, not the model.
     prefix, packed_proj, grp = h
     projections = _packed_expert_projection_names(profile, packed_proj)
-    n = _n_experts(grp, projections)
+    expert_ids = (
+        sorted({expert_id for _projection, expert_id in member_qnames})
+        if member_qnames is not None
+        else list(range(_n_experts(grp, projections)))
+    )
+    n = len(expert_ids)
     on_member = None
     if cb_render_identity is not None and member_qnames is not None:
         # A per-expert checkpoint's render identity is keyed PER EXPERT (the
@@ -3119,15 +3605,18 @@ def _stream_pack_target(skeleton, profile, resolved, qname, grid, mode, k,
     # box has ~23 GB free while the cost run holds the rest. One buffer plus
     # one resident expert is the actual working set the module docstring
     # claims.
-    first = _expert_weight(skeleton, profile, prefix, packed_proj, grp, 0,
+    first_expert = expert_ids[0]
+    first = _expert_weight(skeleton, profile, prefix, packed_proj, grp,
+                           first_expert,
                            on_member=on_member)
     w = torch.empty((n, *first.shape), dtype=first.dtype, device=device)
     w[0] = first.to(device)
     del first
-    for e in range(1, n):
-        chunk = _expert_weight(skeleton, profile, prefix, packed_proj, grp, e,
+    for local_index, expert_id in enumerate(expert_ids[1:], start=1):
+        chunk = _expert_weight(skeleton, profile, prefix, packed_proj, grp,
+                               expert_id,
                                on_member=on_member)
-        w[e] = chunk.to(device)
+        w[local_index] = chunk.to(device)
         del chunk
     if cb_render_identity is not None and member_qnames is None:
         from prismaquant.production_weight_cache import (
@@ -3197,7 +3686,7 @@ def _pack_with_optional_warm_state(
 def _train_shared_codebook_streaming(skeleton, profile, expert_groups,
                                      resolve_target, qnames, col_weights, *,
                                      grid, mode, k, seed, iters, train_cap,
-                                     device):
+                                     device, members_by_target=None):
     """Bounded-pool learned codebook: sample scaled vectors from each target's
     source (streamed) up to ``train_cap`` total, then train — never all
     role weights resident. For a small role (< train_cap) the pooled set
@@ -3210,8 +3699,14 @@ def _train_shared_codebook_streaming(skeleton, profile, expert_groups,
             weights.append(skeleton.dequant_weight(h).to(device))
         else:
             prefix, packed_proj, grp = h
+            member_qnames = (members_by_target or {}).get(q)
+            expert_ids = (
+                sorted({expert_id for _projection, expert_id in member_qnames})
+                if member_qnames is not None else None
+            )
             weights.append(_stacked_source_weight(
-                skeleton, profile, prefix, packed_proj, grp).to(device))
+                skeleton, profile, prefix, packed_proj, grp,
+                expert_ids=expert_ids).to(device))
         cws.append(col_weights[q].to(device))
     return _train_shared_codebook(
         weights, cws, grid=grid, mode=mode, k=k, seed=seed, iters=iters,
@@ -3222,6 +3717,13 @@ def main(argv=None) -> None:
     ap = argparse.ArgumentParser(description="Streaming NVFP4-CB exporter")
     ap.add_argument("--model-dir", required=True)
     ap.add_argument("--layer-config", required=True)
+    ap.add_argument(
+        "--per-expert-config",
+        default=None,
+        help="PROPOSED v1 split-stack mode: JSON qname->format allocation; "
+        "routed expert rows override --layer-config and emit one sub-stack "
+        "per (layer, w13/w2 family, format)",
+    )
     ap.add_argument("--out", required=True)
     ap.add_argument("--col-weights", required=True,
                     help="pickle {qname: per-column importance}")
@@ -3350,6 +3852,7 @@ def main(argv=None) -> None:
         exclude_namespaces=args.exclude_namespaces,
         activation_cache_dir=args.activation_cache_dir,
         activation_scale_policy=args.activation_scale_policy,
+        per_expert_config_path=args.per_expert_config,
         warm_state_dir=args.warm_state_dir,
         warm_verify_sample=args.warm_verify_sample)
     size = sum(p.stat().st_size for p in Path(args.out).glob("*")) / 1e9
