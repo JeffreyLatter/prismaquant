@@ -1977,7 +1977,18 @@ from the same activation cache the cost stage used (`:1549-1582`; REQUIRED for e
 exceeds `EXPORT_STREAMING_THRESHOLD_GB` (80) — non-streaming goes resident and OOMs the box on
 200–300B sources. Encoder tiers `PRISMAQUANT_CB_ENCODE_TIER ∈ {fast, balanced, max}`, default
 `balanced` (`nvfp4_cb_formats.py:128-141`); `max` is bit-identical to the pre-tier encoder and
-is the regression anchor. There is no in-lane serving smoke — CB artifacts serve only through
+is the regression anchor. Cost measurement can opt into atomic, content-keyed scale-search
+sidecars with `PRISMAQUANT_CB_WARM_STATE_DIR`; streaming export consumes them through
+`--warm-state-dir` and verifies a deterministic random sample through
+`--warm-verify-sample` (default 32). `cb_warm_state.py` accepts a record only when its format,
+exact source/imatrix value digests, initializer identity, and full serialization context all
+match; anything absent, corrupt, or stale falls back to a full encode. Sampled units also run
+that full encode and require exact selected-scale and rendered-byte equality, failing the
+transactional export closed on any difference. The quantization config provenance records
+`encoder_warm_start.{warm_used,cold_fallback,verified_n}`. This changes no format or encoding
+semantics; it only skips a repeated scale sweep whose result was already measured
+(`cb_warm_state.py`, `measure_quant_cost.py`, `export_nvfp4_cb_streaming.py`). There is no
+in-lane serving smoke — CB artifacts serve only through
 the out-of-tree plugin — but the gate set is now *declared* (`prismaquant/lane_specs/nvfp4_cb.json`,
 re-vet **R16**): same OpenAI endpoint, same endpoint-agnostic `validate_quantized_model`, plus
 the lane-specific prefill perf gate (INV-2). Gates are advisory; the shipcard refuses, and
