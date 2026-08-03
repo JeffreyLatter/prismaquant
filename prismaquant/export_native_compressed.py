@@ -8140,6 +8140,12 @@ def _main_impl(argv: Sequence[str] | None = None):
     ap.add_argument("--layer-config", default=None,
                     help="layer_config.json from allocator.py. Optional when "
                          "--perturbed-x-dir is supplied.")
+    ap.add_argument(
+        "--allow-research-cost-selection",
+        action="store_true",
+        help="explicitly acknowledge export of a research-stamped assembled "
+             "cost selection; the default ship gate refuses it",
+    )
     ap.add_argument("--output", required=True,
                     help="Output directory for the compressed checkpoint")
     ap.add_argument("--shard-bytes", type=int, default=5 * 1024**3,
@@ -8289,6 +8295,12 @@ def _main_impl(argv: Sequence[str] | None = None):
     with open(args.layer_config) as _lc_for_cache:
         _layer_config_payload_for_cache = json.load(_lc_for_cache)
     validate_layer_config_payload(_layer_config_payload_for_cache, args.layer_config)
+    from .research_cost_acceptance import enforce_research_export_acknowledgement
+    enforce_research_export_acknowledgement(
+        _layer_config_payload_for_cache,
+        acknowledged=args.allow_research_cost_selection,
+        where="export_native_compressed",
+    )
     _assignment_for_cache = _canonicalize_assignment(_layer_config_payload_for_cache)
     _assignment_for_cache, _ = _coerce_runtime_legal_assignment(
         args.model,

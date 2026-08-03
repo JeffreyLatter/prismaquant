@@ -221,6 +221,7 @@ def export_gguf(
     device: str | None = None,
     allow_imatrix_gaps: bool = False,
     gptq_act_dir: str | Path | None = None,
+    allow_research_cost_selection: bool = False,
 ) -> dict[str, int]:
     out_path = prepare_fresh_export_file(
         skeleton_path,
@@ -232,6 +233,14 @@ def export_gguf(
         device = "cuda" if torch.cuda.is_available() else "cpu"
     assignment = load_assignment(layer_config_path)
     recipe_payload = json.loads(Path(layer_config_path).read_text())
+    from prismaquant.research_cost_acceptance import (
+        enforce_research_export_acknowledgement,
+    )
+    research_cost_selection = enforce_research_export_acknowledgement(
+        recipe_payload,
+        acknowledged=allow_research_cost_selection,
+        where="export_gguf",
+    )
     whole_artifact_budget_from_assignment_payload(
         recipe_payload,
         where="export_gguf preflight",
@@ -436,6 +445,12 @@ def export_gguf(
                          gguf.GGUFValueType.STRING)
     writer.add_key_value("prismaquant.assignment_sha256", digest,
                          gguf.GGUFValueType.STRING)
+    if research_cost_selection is not None:
+        writer.add_key_value(
+            "prismaquant.research_cost_selection",
+            json.dumps(research_cost_selection, sort_keys=True),
+            gguf.GGUFValueType.STRING,
+        )
     writer.add_key_value("prismaquant.tensor_formats",
                          json.dumps(tensor_formats, sort_keys=True),
                          gguf.GGUFValueType.STRING)
@@ -492,6 +507,12 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--skeleton", required=True,
                     help="bf16/f16 GGUF produced by convert_hf_to_gguf.py")
     ap.add_argument("--layer-config", required=True)
+    ap.add_argument(
+        "--allow-research-cost-selection",
+        action="store_true",
+        help="explicitly acknowledge export of a research-stamped assembled "
+             "cost selection; recorded in GGUF metadata",
+    )
     ap.add_argument("--out", required=True)
     ap.add_argument(
         "--default-format", default=None,
@@ -539,6 +560,7 @@ def main(argv: list[str] | None = None) -> None:
         device=args.device,
         allow_imatrix_gaps=args.allow_imatrix_gaps,
         gptq_act_dir=(args.imatrix_from_act_cache if args.gptq else None),
+        allow_research_cost_selection=args.allow_research_cost_selection,
     )
     size = Path(args.out).stat().st_size / 1e9
     print(f"wrote {args.out} ({size:.2f} GB)")

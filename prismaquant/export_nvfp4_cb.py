@@ -515,6 +515,7 @@ def export_nvfp4_cb(
     scale_sweep: bool = True,
     scale_coding: str = cb.SCALE_CODING_TWO_TIER,
     allow_unstamped_research: bool = False,
+    allow_research_cost_selection: bool = False,
     activation_cache_dir: str | Path | None = None,
     activation_scale_policy: str | None = None,
 ) -> dict[str, int]:
@@ -558,6 +559,14 @@ def export_nvfp4_cb(
         cb_serialization_metadata_from_assignment_payload(_recipe_payload)
     )
     _recipe_meta = _recipe_payload.get("__prismaquant__", {})
+    from prismaquant.research_cost_acceptance import (
+        enforce_research_export_acknowledgement,
+    )
+    _research_cost_selection = enforce_research_export_acknowledgement(
+        _recipe_payload,
+        acknowledged=allow_research_cost_selection,
+        where="export_nvfp4_cb",
+    )
     _recipe_cb_render_identity = _recipe_payload.get("cb_render_identity")
     if _recipe_cb_render_identity is None and isinstance(_recipe_meta, dict):
         _recipe_cb_render_identity = _recipe_meta.get("cb_render_identity")
@@ -885,12 +894,18 @@ def export_nvfp4_cb(
             col_weights=col_weights,
             where="export_nvfp4_cb assignment render identity",
         )
-    elif cb_targets and production_recipe_stamped:
+    elif (
+        cb_targets
+        and production_recipe_stamped
+        and _research_cost_selection is None
+    ):
         raise ValueError(
             "export_nvfp4_cb: stamped production CB assignment is missing "
             "its value-bearing render identity"
         )
-    elif cb_targets and not allow_unstamped_research:
+    elif cb_targets and not (
+        allow_unstamped_research or _research_cost_selection is not None
+    ):
         raise ValueError(
             "export_nvfp4_cb: CB export requires a value-bearing render "
             "identity; pass allow_unstamped_research=True only for an "
@@ -1249,6 +1264,7 @@ def export_nvfp4_cb(
         serialized_payload_summary=serialized_payload_summary,
         serialization_context=serialization_context,
         cb_render_identity=_recipe_cb_render_identity,
+        research_cost_selection=_research_cost_selection,
         activation_execution_contract=activation_execution_contract,
         git_commit=_git_commit(),
         cb_target_name=_resident_export_target,
@@ -1360,6 +1376,13 @@ def main(argv: list[str] | None = None) -> None:
         "production recipes must carry a source/imatrix-complete render "
         "identity",
     )
+    ap.add_argument(
+        "--allow-research-cost-selection",
+        action="store_true",
+        help="explicitly acknowledge export of an allocation derived from "
+             "the sanctioned study-grade assembled cost table; recorded in "
+             "artifact provenance",
+    )
     ap.add_argument("--scale-coding", default=cb.SCALE_CODING_TWO_TIER,
                     choices=[cb.SCALE_CODING_V1, cb.SCALE_CODING_TWO_TIER],
                     help="fp4 scale coding: production layout-v2 two-tier "
@@ -1383,6 +1406,7 @@ def main(argv: list[str] | None = None) -> None:
         scale_sweep=not args.no_scale_sweep,
         scale_coding=args.scale_coding,
         allow_unstamped_research=args.allow_unstamped_research,
+        allow_research_cost_selection=args.allow_research_cost_selection,
         activation_cache_dir=args.activation_cache_dir,
         activation_scale_policy=args.activation_scale_policy,
     )

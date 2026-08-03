@@ -1510,6 +1510,7 @@ def export_nvfp4_cb_streaming(
     reuse_prior: str | Path | None = None,
     reuse_verify: int = 3,
     allow_unstamped_research: bool = False,
+    allow_research_cost_selection: bool = False,
     allow_route_pending_passthrough: bool = False,
     exclude_namespaces: list[str] | tuple[str, ...] | None = None,
     activation_cache_dir: str | Path | None = None,
@@ -1579,6 +1580,14 @@ def export_nvfp4_cb_streaming(
         cb_serialization_metadata_from_assignment_payload(_recipe_payload)
     )
     _recipe_meta = _recipe_payload.get("__prismaquant__", {})
+    from prismaquant.research_cost_acceptance import (
+        enforce_research_export_acknowledgement,
+    )
+    _research_cost_selection = enforce_research_export_acknowledgement(
+        _recipe_payload,
+        acknowledged=allow_research_cost_selection,
+        where="export_nvfp4_cb_streaming",
+    )
     _recipe_cb_render_identity = _recipe_payload.get("cb_render_identity")
     if _recipe_cb_render_identity is None and isinstance(_recipe_meta, dict):
         _recipe_cb_render_identity = _recipe_meta.get("cb_render_identity")
@@ -1997,12 +2006,18 @@ def export_nvfp4_cb_streaming(
             col_weights=col_weights,
             where="export_nvfp4_cb_streaming assignment render identity",
         )
-    elif cb_targets and production_recipe_stamped:
+    elif (
+        cb_targets
+        and production_recipe_stamped
+        and _research_cost_selection is None
+    ):
         raise ValueError(
             "export_nvfp4_cb_streaming: stamped production CB assignment is "
             "missing its value-bearing render identity"
         )
-    elif cb_targets and not allow_unstamped_research:
+    elif cb_targets and not (
+        allow_unstamped_research or _research_cost_selection is not None
+    ):
         raise ValueError(
             "export_nvfp4_cb_streaming: CB export requires a value-bearing "
             "render identity; pass allow_unstamped_research=True only for "
@@ -2921,6 +2936,7 @@ def export_nvfp4_cb_streaming(
         serialized_payload_summary=serialized_payload_summary,
         serialization_context=serialization_context,
         cb_render_identity=_recipe_cb_render_identity,
+        research_cost_selection=_research_cost_selection,
         activation_execution_contract=activation_execution_contract,
         git_commit=_git_commit(),
         cb_target_name=_cb_target_name,
@@ -3237,6 +3253,13 @@ def main(argv=None) -> None:
         "identity",
     )
     ap.add_argument(
+        "--allow-research-cost-selection",
+        action="store_true",
+        help="explicitly acknowledge export of an allocation derived from "
+             "the sanctioned study-grade assembled cost table; recorded in "
+             "artifact provenance",
+    )
+    ap.add_argument(
         "--allow-route-pending-passthrough",
         action="store_true",
         default=_route_pending_ack_from_env(),
@@ -3322,6 +3345,7 @@ def main(argv=None) -> None:
         subset_prefixes=args.subset_prefix, reuse_prior=reuse_prior,
         reuse_verify=reuse_verify,
         allow_unstamped_research=args.allow_unstamped_research,
+        allow_research_cost_selection=args.allow_research_cost_selection,
         allow_route_pending_passthrough=args.allow_route_pending_passthrough,
         exclude_namespaces=args.exclude_namespaces,
         activation_cache_dir=args.activation_cache_dir,
