@@ -379,3 +379,82 @@ def test_manifest_namespace_is_uniform_across_cb_targets(tmp_path):
         assert any(n.startswith(target + ".") for n in names), (
             f"config target {target!r} names no emitted tensor — the manifest "
             "and the writer disagree on the namespace")
+
+
+# ---------------------------------------------------------------------------
+# K0.2 — per-expert stage calibration
+# ---------------------------------------------------------------------------
+
+def _write_act_entry(act_dir: Path, name: str, rows: torch.Tensor):
+    import re
+    act_dir.mkdir(parents=True, exist_ok=True)
+    fname = re.sub(r"[^A-Za-z0-9_-]", "__", name) + ".pt"
+    torch.save({"inputs": rows, "name": name,
+                "row_indices": torch.arange(rows.shape[0])},
+               act_dir / fname)
+
+
+def _stage_members(prefix="model.layers.0.mlp.experts", n=4):
+    _c, members, _r = _collapse_per_expert_assignment(
+        _expanded(prefix, n), _groups(prefix, n), _StubProfile())
+    return members
+
+
+def test_per_expert_stage_calibration_splits_w13_from_w2(tmp_path):
+    """w13 gets a value-bearing sample (the module input); w2 gets a max-abs
+    over the routed intermediate. Never the other way round: the whole point
+    of the stage attestation is that w2 was not calibrated on the module
+    input."""
+    from prismaquant.moe_imatrix import per_expert_stage_activation_calibration
+
+    prefix = "model.layers.0.mlp.experts"
+    members = _stage_members(prefix, 4)
+    torch.manual_seed(5)
+    act = tmp_path / "act"
+    for e in range(4):
+        _write_act_entry(act, f"{prefix}.{e}.gate_proj", torch.randn(6, 8))
+        _write_act_entry(act, f"{prefix}.{e}.up_proj", torch.randn(6, 8))
+        _write_act_entry(act, f"{prefix}.{e}.down_proj", torch.randn(6, 5) * 3)
+    samples, max_abs = per_expert_stage_activation_calibration(act, members)
+    assert set(samples) == {f"{prefix}.gate_up_proj"}
+    assert set(max_abs) == {f"{prefix}.down_proj"}
+    # One pooled row per expert, and the pooled max IS the exact global max.
+    gu = samples[f"{prefix}.gate_up_proj"]
+    assert gu.shape == (4, 8)
+    exact = max(
+        torch.load(act / f"model__layers__0__mlp__experts__{e}__{p}.pt",
+                   weights_only=False)["inputs"].abs().max().item()
+        for e in range(4) for p in ("gate_proj", "up_proj"))
+    assert float(gu.max()) == pytest.approx(exact)
+
+
+def test_per_expert_stage_calibration_skips_never_routed_experts(tmp_path):
+    """An expert off the calibration distribution has NO cache entry. It
+    contributes no observed activation and so nothing to a max — but a stack
+    with no routed expert at all is uncalibrated and must fail closed."""
+    from prismaquant.moe_imatrix import per_expert_stage_activation_calibration
+
+    prefix = "model.layers.0.mlp.experts"
+    members = _stage_members(prefix, 4)
+    torch.manual_seed(6)
+    act = tmp_path / "act"
+    for e in (0, 2):                       # experts 1 and 3 never routed
+        _write_act_entry(act, f"{prefix}.{e}.gate_proj", torch.randn(6, 8))
+        _write_act_entry(act, f"{prefix}.{e}.up_proj", torch.randn(6, 8))
+        _write_act_entry(act, f"{prefix}.{e}.down_proj", torch.randn(6, 5))
+    samples, max_abs = per_expert_stage_activation_calibration(act, members)
+    assert samples[f"{prefix}.gate_up_proj"].shape == (2, 8)
+    assert max_abs[f"{prefix}.down_proj"] > 0.0
+
+    with pytest.raises(ValueError, match="no calibrated input at all"):
+        per_expert_stage_activation_calibration(tmp_path / "empty", members)
+
+
+def test_per_expert_stage_calibration_refuses_the_mse_grid_policy(tmp_path):
+    """The pooling is a max reduction: exact for an amax policy, meaningless
+    for a distribution fit."""
+    from prismaquant.moe_imatrix import per_expert_stage_activation_calibration
+
+    with pytest.raises(ValueError, match="mse_grid_calibrated"):
+        per_expert_stage_activation_calibration(
+            tmp_path, _stage_members(), policy="mse_grid_calibrated.v1")

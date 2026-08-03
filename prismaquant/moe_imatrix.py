@@ -630,10 +630,12 @@ def per_expert_stage_activation_calibration(
     act_dir = Path(act_dir)
     samples: dict[str, torch.Tensor] = {}
     max_abs: dict[str, float] = {}
+    unrouted: dict[str, int] = {}
     for packed_qname in sorted(members_by_target):
         member_qnames = members_by_target[packed_qname]
         experts = sorted({e for _proj, e in member_qnames})
         rows: list[torch.Tensor] = []
+        absent = 0
         for e in experts:
             per_expert: list[torch.Tensor] = []
             for (proj, expert_id), member in sorted(member_qnames.items()):
@@ -642,17 +644,23 @@ def per_expert_stage_activation_calibration(
                 path = act_dir / (
                     _ACT_FNAME_SUB.sub("__", member) + ".pt")
                 if not path.exists():
-                    raise ValueError(
-                        f"{packed_qname}: routed-MoE stage calibration has no "
-                        f"activation cache entry for member {member!r} "
-                        f"(looked for {path.name}); production export refuses "
-                        "an incomplete scale mapping")
+                    # A NEVER-ROUTED expert. The probe writes a cache entry per
+                    # Linear it actually saw, so an expert off the calibration
+                    # distribution has no file at all (DSv4-Flash 16x512:
+                    # 5,505 of 33,153 across 40 layers). It contributes no
+                    # observed activation, so it contributes nothing to a max
+                    # — the same reading `synthesize_unrouted_expert_col_weights`
+                    # takes of the same zero. Counted, never silent.
+                    absent += 1
+                    continue
                 _name, inputs, _row_ids = _load_act_entry(path)
                 if inputs is None or inputs.numel() == 0:
                     raise ValueError(
                         f"{packed_qname}: activation cache entry for "
                         f"{member!r} has no value-bearing rows")
                 per_expert.append(inputs.abs().amax(dim=0))
+            if not per_expert:
+                continue
             widths = {int(v.numel()) for v in per_expert}
             if len(widths) != 1:
                 raise ValueError(
@@ -660,6 +668,14 @@ def per_expert_stage_activation_calibration(
                     f"in_features across the fused projections: {widths}")
             rows.append(torch.stack(per_expert).amax(dim=0)
                         if len(per_expert) > 1 else per_expert[0])
+        if not rows:
+            raise ValueError(
+                f"{packed_qname}: NO expert in this stack has an activation "
+                f"cache entry ({len(member_qnames)} members, all absent), so "
+                "the stage has no calibrated input at all; re-probe rather "
+                "than ship an uncalibrated static W4A4 scalar")
+        if absent:
+            unrouted[packed_qname] = absent
         pooled = torch.stack(rows).contiguous()
         value = float(pooled.max().item())
         if not math.isfinite(value) or value <= 0.0:
@@ -669,4 +685,13 @@ def per_expert_stage_activation_calibration(
             samples[packed_qname] = pooled
         else:
             max_abs[packed_qname] = value
+    if unrouted:
+        total = sum(unrouted.values())
+        worst = max(unrouted, key=unrouted.get)
+        print(
+            f"[export-cb-stream] routed-MoE stage calibration skipped {total} "
+            f"never-routed expert projection(s) across {len(unrouted)} "
+            f"stack(s) (worst: {worst} with {unrouted[worst]})",
+            flush=True,
+        )
     return samples, max_abs
