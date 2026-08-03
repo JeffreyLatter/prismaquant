@@ -1447,7 +1447,9 @@ def _fields_block(w2d: torch.Tensor, k: int, grid: str, mode: str,
                   cb, cw2d: torch.Tensor | None, scale_sweep: bool,
                   scale_coding: str = SCALE_CODING_V1,
                   encode_tier: str = "max",
-                  cw_row_broadcast: bool = False) -> dict:
+                  cw_row_broadcast: bool = False,
+                  warm_scale_state: dict[str, torch.Tensor] | None = None,
+                  ) -> dict:
     rows, in_f = w2d.shape
     nvec_per_row = in_f // VEC_DIM
     wq = _col_weight_vectors(cw2d) if cw2d is not None else None
@@ -1457,7 +1459,20 @@ def _fields_block(w2d: torch.Tensor, k: int, grid: str, mode: str,
     wq_period = (nvec_per_row
                  if (wq is not None and cw_row_broadcast and rows > 1)
                  else None)
-    if scale_coding == SCALE_CODING_TWO_TIER:
+    if warm_scale_state is not None:
+        # Warm state is only the sweep argmin.  Assignment still runs through
+        # the ordinary weighted VQ evaluator, and assembly still runs through
+        # the ordinary packer; no codeword/index bytes are trusted or reused.
+        scales = warm_scale_state["scales"].to(
+            device=w2d.device, dtype=torch.float32
+        )
+        _, enc, _ = _eval_candidate(
+            w2d, wq, scales, grid, mode, cb, wq_period
+        )
+        if scale_coding == SCALE_CODING_TWO_TIER:
+            super_e = warm_scale_state["scale_super"].to(w2d.device)
+            sub_c = warm_scale_state["scale_sub"].to(w2d.device)
+    elif scale_coding == SCALE_CODING_TWO_TIER:
         if grid != "fp4":
             raise ValueError("two-tier scale coding is fp4-family only "
                              "(fp8 has no per-superblock scale plane)")
@@ -1493,7 +1508,9 @@ def nvfp4_cb_fields(w: torch.Tensor, k: int, *, grid: str = "fp4",
                     codebook: torch.Tensor | tuple | None = None,
                     scale_sweep: bool = True,
                     scale_coding: str = SCALE_CODING_V1,
-                    encode_tier: str | None = None) -> dict:
+                    encode_tier: str | None = None,
+                    warm_scale_state: dict[str, torch.Tensor] | None = None,
+                    ) -> dict:
     """Quantize ``w`` (2-D or 3-D stacked experts) into VQ fields.
 
     ``scale_sweep`` (default True) jointly optimizes the per-group scale over
@@ -1525,6 +1542,28 @@ def nvfp4_cb_fields(w: torch.Tensor, k: int, *, grid: str = "fp4",
     rows = w2d.shape[0]
     cb = _resolve_codebook(k, grid, mode, codebook, w2d.device)
 
+    warm_state = None
+    if warm_scale_state is not None:
+        # File-level validation lives in cb_warm_state.  These shape checks
+        # are the codec boundary's final defence for direct library callers.
+        groups = in_f // FP4_GROUP if grid == "fp4" else 1
+        expected = (rows, groups)
+        scales = torch.as_tensor(warm_scale_state.get("scales"))
+        if tuple(scales.shape) != expected:
+            raise ValueError(
+                f"warm scales shape {tuple(scales.shape)} != {expected}"
+            )
+        warm_state = {"scales": scales}
+        if scale_coding == SCALE_CODING_TWO_TIER:
+            n_sb = in_f // SUPERBLOCK
+            super_e = torch.as_tensor(warm_scale_state.get("scale_super"))
+            sub_c = torch.as_tensor(warm_scale_state.get("scale_sub"))
+            if tuple(super_e.shape) != (rows, n_sb):
+                raise ValueError("warm two-tier super-scale shape differs")
+            if tuple(sub_c.shape) != expected:
+                raise ValueError("warm two-tier sub-scale shape differs")
+            warm_state.update(scale_super=super_e, scale_sub=sub_c)
+
     # col_weights stays a broadcast VIEW; blocks materialize only their rows
     # (a full-shape fp32 copy is another ~10GB on a Hy3 expert stack).
     cw_view = None
@@ -1547,10 +1586,16 @@ def nvfp4_cb_fields(w: torch.Tensor, k: int, *, grid: str = "fp4",
         return cw_view[idx]                                  # (b-a, in_f)
 
     row_step = max(1, _SLICE_MAX_ELEMS // max(in_f, 1))
+
+    def _warm_rows(a: int, b: int):
+        if warm_state is None:
+            return None
+        return {key: value[a:b] for key, value in warm_state.items()}
+
     if rows <= row_step:
         out = _fields_block(w2d, k, grid, mode, cb, _cw_rows(0, rows),
                             scale_sweep, scale_coding, tier,
-                            cw_row_broadcast)
+                            cw_row_broadcast, _warm_rows(0, rows))
     else:
         parts = []
         for a in range(0, rows, row_step):
@@ -1558,7 +1603,7 @@ def nvfp4_cb_fields(w: torch.Tensor, k: int, *, grid: str = "fp4",
             parts.append(
                 _fields_block(w2d[a:b], k, grid, mode, cb, _cw_rows(a, b),
                               scale_sweep, scale_coding, tier,
-                              cw_row_broadcast))
+                              cw_row_broadcast, _warm_rows(a, b)))
         out = {key: torch.cat([p[key] for p in parts], dim=0)
                for key in parts[0]}
     out["shape"] = orig_shape
@@ -1985,7 +2030,8 @@ def nvfp4_cb_pack(w: torch.Tensor, k: int, *, grid: str = "fp4",
                   codebook: torch.Tensor | tuple | None = None,
                   scale_sweep: bool = True,
                   scale_coding: str = SCALE_CODING_V1,
-                  encode_tier: str | None = None
+                  encode_tier: str | None = None,
+                  warm_scale_state: dict[str, torch.Tensor] | None = None,
                   ) -> tuple[torch.Tensor, dict]:
     """Quantize + bit-pack a weight in one call (mirrors ``gguf_pack``).
 
@@ -1997,6 +2043,7 @@ def nvfp4_cb_pack(w: torch.Tensor, k: int, *, grid: str = "fp4",
                              col_weights=col_weights, codebook=codebook,
                              scale_sweep=scale_sweep,
                              scale_coding=scale_coding,
-                             encode_tier=encode_tier)
+                             encode_tier=encode_tier,
+                             warm_scale_state=warm_scale_state)
     packed = nvfp4_cb_assemble_bytes(fields, k, grid=grid, mode=mode)
     return packed, fields

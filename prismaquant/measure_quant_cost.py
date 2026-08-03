@@ -39,8 +39,8 @@ import torch.nn.functional as F
 
 from . import format_registry as fr
 from .nvfp4_cb_footprint import (
+    cb_fields_for_context,
     cb_cost_provenance,
-    cb_quantize_dequantize_for_context,
     cb_serialization_context_from_env,
 )
 
@@ -50,6 +50,10 @@ def _cb_cost_quantize_dequantize(
     weight: torch.Tensor,
     *,
     col_weights: torch.Tensor | None = None,
+    qname: str | None = None,
+    warm_identities: tuple[
+        tuple[list[int], str], tuple[list[int], str]
+    ] | None = None,
 ) -> torch.Tensor:
     """Render CB weights under the producer context stamped on cost.pkl."""
     if col_weights is None:
@@ -58,14 +62,60 @@ def _cb_cost_quantize_dequantize(
             "export is imatrix-weighted, so an unweighted cost row would "
             "describe different bytes"
         )
-    return cb_quantize_dequantize_for_context(
+    context = cb_serialization_context_from_env(
+        require_explicit=True,
+        where="CB local cost render",
+    )
+    fields = cb_fields_for_context(
         spec,
         weight,
-        context=cb_serialization_context_from_env(
-            require_explicit=True,
-            where="CB local cost render",
-        ),
+        context=context,
         col_weights=col_weights,
+    )
+    warm_dir = os.environ.get("PRISMAQUANT_CB_WARM_STATE_DIR", "").strip()
+    if warm_dir:
+        if not qname:
+            raise RuntimeError(
+                f"{spec.name}: PRISMAQUANT_CB_WARM_STATE_DIR is set but the "
+                "cost render supplied no unit qname"
+            )
+        from .cb_warm_state import CBWarmStateStore, build_warm_record
+
+        CBWarmStateStore(warm_dir).write(build_warm_record(
+            qname=qname,
+            format_name=spec.name,
+            source_weight=weight,
+            col_weights=col_weights,
+            context=context,
+            fields=fields,
+            source_identity=(warm_identities[0] if warm_identities else None),
+            col_weights_identity=(
+                warm_identities[1] if warm_identities else None
+            ),
+        ))
+    from .nvfp4_cb_footprint import _cb_info
+    from .nvfp4_cb_formats import nvfp4_cb_reconstruct
+
+    grid, mode, k = _cb_info(spec.name)
+    return nvfp4_cb_reconstruct(
+        fields, k, grid=grid, mode=mode
+    ).to(weight.dtype)
+
+
+def _cb_warm_record_identities(
+    weight: torch.Tensor,
+    col_weights: torch.Tensor | None,
+) -> tuple[tuple[list[int], str], tuple[list[int], str]] | None:
+    """Hash a cost unit once, then reuse that identity across all CB rungs."""
+    if not os.environ.get("PRISMAQUANT_CB_WARM_STATE_DIR", "").strip():
+        return None
+    if col_weights is None:
+        raise ValueError("CB warm-state identity requires imatrix weights")
+    from .cb_warm_state import tensor_value_identity
+
+    return (
+        tensor_value_identity(weight),
+        tensor_value_identity(col_weights),
     )
 
 
@@ -877,6 +927,12 @@ def measure_unbatched(model: nn.Module, act_cache: "ActivationIndex",
             # export_nvfp4_cb's --col-weights: full fp32 rows, mean over dim 0.
             gguf_qw = X_cpu.float().pow(2).mean(dim=0).to(W.device)
 
+        cb_warm_identities = (
+            _cb_warm_record_identities(W, gguf_qw)
+            if any(spec.family in _CB_COST_FAMILIES for spec in specs)
+            else None
+        )
+
         for spec in specs:
             try:
                 if (spec.family == "gguf" and gguf_qw is not None
@@ -897,6 +953,8 @@ def measure_unbatched(model: nn.Module, act_cache: "ActivationIndex",
                         spec,
                         W.clone(),
                         col_weights=gguf_qw,
+                        qname=canonical_name,
+                        warm_identities=cb_warm_identities,
                     )
                 else:
                     W_hat = spec.quantize_dequantize(W.clone())
@@ -1385,6 +1443,7 @@ def _measure_packed_experts(
         # ~25 min/layer at full E — 2026-07-11). Export always quantizes
         # every expert exactly; this only affects the DP's cost estimates.
         sample_n = _expert_cost_sample_n()
+        packed_cb_warm_identities = None
         for spec in specs:
             try:
                 # Family-agnostic: NVFP4/FP8 registry quantize on a full
@@ -1410,13 +1469,26 @@ def _measure_packed_experts(
                         if (use_sample and cw_use.ndim >= 3
                                 and cw_use.shape[0] == w.shape[0]):
                             cw_use = cw_use[s_idx]
-                w_hat = _batched_quantize(
-                    spec, w_in,
-                    col_weights=(
-                        cw_use
-                        if _cost_render_uses_imatrix(spec) else None
-                    ),
-                )
+                if spec.family in _CB_COST_FAMILIES:
+                    if packed_cb_warm_identities is None:
+                        packed_cb_warm_identities = (
+                            _cb_warm_record_identities(w_in, cw_use)
+                        )
+                    w_hat = _cb_cost_quantize_dequantize(
+                        spec,
+                        w_in,
+                        col_weights=cw_use,
+                        qname=full_name,
+                        warm_identities=packed_cb_warm_identities,
+                    )
+                else:
+                    w_hat = _batched_quantize(
+                        spec, w_in,
+                        col_weights=(
+                            cw_use
+                            if _cost_render_uses_imatrix(spec) else None
+                        ),
+                    )
                 err = (w_in - w_hat).float()
                 weight_mse = float(err.pow(2).mean().item())
                 dloss_val = None
@@ -1661,6 +1733,7 @@ def _emit_weight_only_rows(accum: dict, entries, specs, device, dtype) -> list[s
     for name, mod in entries:
         W = mod.weight.detach().to(device=device, dtype=dtype)
         cw = _cb_col_weights_lookup(name)
+        cb_warm_identities = None
         for spec in specs:
             if spec.name in ("BF16", "FP8_SOURCE"):
                 _accumulate_result(accum, name, spec.name, 0.0, 0.0, 0.0)
@@ -1670,10 +1743,19 @@ def _emit_weight_only_rows(accum: dict, entries, specs, device, dtype) -> list[s
                 raise ValueError(
                     f"{name}: declared never-routed expert has no col_weights; "
                     f"run the col-weights harvest with the unrouted rule first")
+            item_cw = (
+                cw.to(W.device).reshape(1, 1, -1)
+                if uses_imatrix else None
+            )
+            if spec.family in _CB_COST_FAMILIES:
+                cb_warm_identities = cb_warm_identities or [
+                    _cb_warm_record_identities(W, item_cw.reshape(-1))
+                ]
             W_hat = _batched_quantize(
                 spec, W.unsqueeze(0),
-                col_weights=(cw.to(W.device).reshape(1, 1, -1)
-                             if uses_imatrix else None),
+                col_weights=item_cw,
+                qnames=[name],
+                warm_identities=cb_warm_identities,
             )[0]
             wmse = float((W - W_hat).float().pow(2).mean().item())
             # _finalize_results always writes output_mse, so the row carries
@@ -1716,6 +1798,10 @@ def _batched_quantize(
     spec: fr.FormatSpec,
     stacked_w: torch.Tensor,
     col_weights: torch.Tensor | None = None,
+    qnames: list[str] | None = None,
+    warm_identities: list[
+        tuple[tuple[list[int], str], tuple[list[int], str]] | None
+    ] | None = None,
 ) -> torch.Tensor:
     elt = spec.weight_element_dtype
     if spec.name in _EXPORT_ALIGNED_BATCH_FORMATS:
@@ -1787,11 +1873,25 @@ def _batched_quantize(
         # the unbatched path bit-for-bit — no cross-slice coupling exists (fp4
         # scales are per-group-16, fp8 scales per-output-channel; lattice fixed).
         n = stacked_w.shape[0]
+        if qnames is not None and len(qnames) != n:
+            raise ValueError(
+                f"{spec.name}: got {len(qnames)} qnames for {n} CB slices"
+            )
+        if warm_identities is not None and len(warm_identities) != n:
+            raise ValueError(
+                f"{spec.name}: got {len(warm_identities)} warm identities "
+                f"for {n} CB slices"
+            )
         return torch.stack([
             _cb_cost_quantize_dequantize(
                 spec,
                 stacked_w[i].clone(),
                 col_weights=_item_col_weights(col_weights, i, n),
+                qname=(qnames[i] if qnames is not None else None),
+                warm_identities=(
+                    warm_identities[i]
+                    if warm_identities is not None else None
+                ),
             )
             for i in range(n)
         ])
@@ -2105,6 +2205,8 @@ def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
             for r, yb in y_ref_by_rows.items():
                 ref_energy[row_buckets[r]] = yb.float().pow(2).mean(dim=(1, 2))
 
+            cb_warm_identity_by_name = {}
+
             # Per-item H full tensor stacked across the chunk, for the
             # per-weight Δloss computation. Missing items get None.
             h_stacked = None
@@ -2169,11 +2271,27 @@ def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
                     hs = h_stacked if (h_stacked is None or idx is None) \
                         else h_stacked[idx]
                     n_sub = Ws.size(0)
+                    warm_identities = None
+                    if spec.family in _CB_COST_FAMILIES:
+                        warm_identities = []
+                        for item_i, item_name in enumerate(sub_names):
+                            if item_name not in cb_warm_identity_by_name:
+                                cb_warm_identity_by_name[item_name] = (
+                                    _cb_warm_record_identities(
+                                        Ws[item_i],
+                                        _item_col_weights(gqw, item_i, n_sub),
+                                    )
+                                )
+                            warm_identities.append(
+                                cb_warm_identity_by_name[item_name]
+                            )
                     W_hat = _batched_quantize(
                         spec, Ws,
                         col_weights=(
                             gqw if _cost_render_uses_imatrix(spec) else None
                         ),
+                        qnames=sub_names,
+                        warm_identities=warm_identities,
                     )
                     err = (Ws - W_hat).float()
                     weight_mse = err.pow(2).mean(dim=(1, 2))  # (n_sub,)

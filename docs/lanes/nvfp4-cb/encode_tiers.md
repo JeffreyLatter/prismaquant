@@ -12,6 +12,31 @@
 
 Span-curve finding (q_proj, fp8 K44): quality is set by REACH, not granularity — ±24% reach hits max-parity, ±34% BEATS max by 2.1% (the s0-centered search finds basins the fixed [amax/6, amax/4] clip window never visits).
 
+## Encoder warm start
+
+The expensive scale search performed while measuring each `(unit, rung)` can
+be reused by the later streaming export. Set
+`PRISMAQUANT_CB_WARM_STATE_DIR` during cost measurement to write atomic,
+content-keyed sidecars; the default is off. Each record contains only the
+selected scale parameters and encoder initializer/seed identifiers, bound to
+the unit qname, format, exact source and imatrix value digests, and the complete
+serialization context. It does not contain assignments or rendered weights.
+
+Pass the same directory to `export_nvfp4_cb_streaming` with
+`--warm-state-dir` (the environment variable is also its default). An absent,
+corrupt, source-mismatched, imatrix-mismatched, format-mismatched, or
+context-mismatched record silently takes the normal full-search path. For a
+deterministic random sample selected by `--warm-verify-sample N` (default
+`32`), export performs both seeded and full search and requires exact equality
+of the selected scale state and every rendered byte tensor; any difference
+aborts the transactional export before publication. Artifact provenance records
+`warm_used`, `cold_fallback`, and `verified_n`.
+
+Warm start is therefore only an optimization, never a new encoding rule. A
+record is accepted through exact provenance matching and its seeded encoder is
+audited by full recomputation; it is never trusted merely because a sidecar is
+present.
+
 ## 27B-scale launch/volume fix (2026-07-17)
 
 The balanced/fast v1 encoders originally did the scale search as a SEQUENTIAL greedy hill-climb (micro-sweep + accept-if-better steps), and `_moment_eval`/refits REBUILT the (m, K) moment matrices every call. On 0.6B tensors (small chunk×candidate counts) this measured fast, but on a real 27B MLP Linear (5120×17408 = 89M elem, fp8 K44) it took **76.7s** — a super-linear blowup that made the cost stage a ~19-hour job. Fix (`_sweep_encode_moment`):

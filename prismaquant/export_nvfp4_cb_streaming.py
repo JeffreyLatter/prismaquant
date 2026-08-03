@@ -1514,6 +1514,8 @@ def export_nvfp4_cb_streaming(
     exclude_namespaces: list[str] | tuple[str, ...] | None = None,
     activation_cache_dir: str | Path | None = None,
     activation_scale_policy: str | None = None,
+    warm_state_dir: str | Path | None = None,
+    warm_verify_sample: int = 32,
 ) -> dict[str, int]:
     """Streaming counterpart of :func:`export_nvfp4_cb.export_nvfp4_cb`. Same
     signature + container; peak residency ~= one source tensor + codebooks.
@@ -1551,6 +1553,8 @@ def export_nvfp4_cb_streaming(
             "identity for every copied tensor. Re-encode into a fresh output "
             "directory."
         )
+    if int(warm_verify_sample) < 0:
+        raise ValueError("warm_verify_sample must be >= 0")
     if scale_coding not in (cb.SCALE_CODING_V1, cb.SCALE_CODING_TWO_TIER):
         raise ValueError(f"unknown scale_coding {scale_coding!r}")
     out_dir = prepare_fresh_export_directory(
@@ -2010,6 +2014,62 @@ def export_nvfp4_cb_streaming(
             "CB render identity"
         )
 
+    warm_session = None
+    if warm_state_dir is not None:
+        from prismaquant.cb_warm_state import (
+            CBWarmStartSession,
+            CBWarmStateStore,
+        )
+
+        warm_store = CBWarmStateStore(warm_state_dir)
+        warm_records = {}
+        identity = (
+            _recipe_cb_render_identity
+            if isinstance(_recipe_cb_render_identity, dict)
+            else {}
+        )
+        source_shapes = identity.get("source_weights_shapes", {})
+        source_digests = identity.get(
+            "source_weights_content_sha256", {}
+        )
+        col_shapes = identity.get("col_weights_shapes", {})
+        col_digests = identity.get("col_weights_content_sha256", {})
+        for qname in sorted(cb_targets):
+            # Collapsed per-expert stacks deliberately cold-fallback: their
+            # export imatrix pools member vectors, so no individual member's
+            # selected scale is the stack's scale-search argmin.
+            if _identity_scope(qname) != (qname,):
+                continue
+            if not all(
+                qname in values
+                for values in (
+                    source_shapes, source_digests, col_shapes, col_digests
+                )
+            ):
+                continue
+            record = warm_store.load_matching(
+                qname=qname,
+                format_name=assignment[qname],
+                source_shape=list(source_shapes[qname]),
+                source_digest=str(source_digests[qname]),
+                col_weights_shape=list(col_shapes[qname]),
+                col_weights_digest=str(col_digests[qname]),
+                context=serialization_context,
+            )
+            if record is not None:
+                warm_records[qname] = record
+        warm_session = CBWarmStartSession(
+            warm_records,
+            all_qnames=sorted(cb_targets),
+            verify_sample=int(warm_verify_sample),
+        )
+        print(
+            f"[export-cb-stream] encoder warm state: "
+            f"{len(warm_records)}/{len(cb_targets)} matching; "
+            f"verifying {len(warm_session.verify_qnames)}",
+            flush=True,
+        )
+
     # Validate persisted render/serialization identity before reading the
     # activation cache.  Stale recipes must fail for the primary cause and
     # must not trigger an expensive calibration replay.
@@ -2185,7 +2245,9 @@ def export_nvfp4_cb_streaming(
                 serialization_context.encode_tier,
                 _recipe_cb_render_identity,
                 verified_cb_source_qnames,
-                expert_stack_members.get(qname))
+                expert_stack_members.get(qname),
+                warm_session=warm_session,
+                format_name=assignment[qname])
             state["scale"] = scale
             return packed.reshape(packed_shape)
 
@@ -2278,7 +2340,9 @@ def export_nvfp4_cb_streaming(
                     serialization_context.encode_tier,
                     _recipe_cb_render_identity,
                     verified_cb_source_qnames,
-                    expert_stack_members.get(qname))
+                    expert_stack_members.get(qname),
+                    warm_session=warm_session,
+                    format_name=assignment[qname])
                 out = {qw_name: packed.reshape(packed_shape)}
                 if scale is not None:
                     out[scale_name] = scale.reshape(scale_shape).to(
@@ -2907,6 +2971,14 @@ def export_nvfp4_cb_streaming(
         out_dir / "model.safetensors",
         before_publish=_assert_source_coverage_before_publish,
     )
+    if warm_session is not None:
+        warm_provenance = warm_session.provenance()
+        quant_config["provenance"]["encoder_warm_start"] = warm_provenance
+        counts.update(warm_provenance)
+        print(
+            f"[export-cb-stream] encoder warm state: {warm_provenance}",
+            flush=True,
+        )
     if cb_tensor_blobs:
         save_file(cb_tensor_blobs, str(out_dir / codebook_file),
                   metadata={"format": "pt"})
@@ -2966,7 +3038,8 @@ def export_nvfp4_cb_streaming(
 def _stream_pack_target(skeleton, profile, resolved, qname, grid, mode, k,
                         codebook, cw, scale_sweep, coding, shape, device,
                         encode_tier, cb_render_identity,
-                        verified_source_qnames, member_qnames=None):
+                        verified_source_qnames, member_qnames=None, *,
+                        warm_session=None, format_name=None):
     """Pack ONE target, streaming experts. Returns (packed uint8 (rows,bytes)
     or (E,out,bytes), scale-plane fp32 or None). Per-expert scales make
     per-expert packing byte-identical to whole-stack packing."""
@@ -2985,10 +3058,11 @@ def _stream_pack_target(skeleton, profile, resolved, qname, grid, mode, k,
                 where="export_nvfp4_cb_streaming source tensor",
             )
             verified_source_qnames.add(qname)
-        packed, fields = cb.nvfp4_cb_pack(
-            w, k, grid=grid, mode=mode, col_weights=cw.to(device),
-            codebook=cbook, scale_sweep=scale_sweep, scale_coding=coding,
-            encode_tier=encode_tier)
+        packed, fields = _pack_with_optional_warm_state(
+            w, qname=qname, format_name=format_name, grid=grid, mode=mode,
+            k=k, col_weights=cw.to(device), codebook=cbook,
+            scale_sweep=scale_sweep, scale_coding=coding,
+            encode_tier=encode_tier, warm_session=warm_session)
         if w.dim() == 3:
             packed = packed.reshape(w.shape[0], w.shape[1], -1)
         scale = (fields["scales"].reshape(*w.shape[:-1]).cpu()
@@ -3050,14 +3124,58 @@ def _stream_pack_target(skeleton, profile, resolved, qname, grid, mode, k,
             where="export_nvfp4_cb_streaming expert stack",
         )
         verified_source_qnames.add(qname)
-    packed, fields = cb.nvfp4_cb_pack(
-        w, k, grid=grid, mode=mode, col_weights=cw.to(device),
-        codebook=cbook, scale_sweep=scale_sweep, scale_coding=coding,
-        encode_tier=encode_tier)
+    packed, fields = _pack_with_optional_warm_state(
+        w, qname=qname, format_name=format_name, grid=grid, mode=mode, k=k,
+        col_weights=cw.to(device), codebook=cbook,
+        scale_sweep=scale_sweep, scale_coding=coding,
+        encode_tier=encode_tier, warm_session=warm_session)
     packed = packed.reshape(w.shape[0], w.shape[1], -1)
     scale = (fields["scales"].reshape(*w.shape[:-1]).cpu()
              if grid == "fp8" else None)
     return packed.to(torch.uint8).cpu().contiguous(), scale
+
+
+def _pack_with_optional_warm_state(
+    weight, *, qname, format_name, grid, mode, k, col_weights, codebook,
+    scale_sweep, scale_coding, encode_tier, warm_session,
+):
+    """Run normal assignment/packing, optionally seeded by a stored argmin."""
+    from prismaquant.cb_warm_state import (
+        CBEncodedPayload,
+        selected_scale_state,
+    )
+
+    def encode(warm_scale_state=None):
+        packed, fields = cb.nvfp4_cb_pack(
+            weight,
+            k,
+            grid=grid,
+            mode=mode,
+            col_weights=col_weights,
+            codebook=codebook,
+            scale_sweep=scale_sweep,
+            scale_coding=scale_coding,
+            encode_tier=encode_tier,
+            warm_scale_state=warm_scale_state,
+        )
+        rendered = {"packed": packed}
+        if grid == "fp8":
+            rendered["weight_scale"] = fields["scales"]
+        return CBEncodedPayload(
+            value=(packed, fields),
+            selected_scale=selected_scale_state(fields),
+            rendered=rendered,
+        )
+
+    if warm_session is None:
+        return encode().value
+    payload = warm_session.encode(
+        qname,
+        format_name,
+        full_encode=lambda: encode(),
+        seeded_encode=lambda state: encode(state),
+    )
+    return payload.value
 
 
 def _train_shared_codebook_streaming(skeleton, profile, expert_groups,
@@ -3164,6 +3282,20 @@ def main(argv=None) -> None:
                     help="reserved compatibility option while DELTA-EXPORT is "
                          "disabled (default 3; env "
                          "PRISMAQUANT_EXPORT_REUSE_VERIFY)")
+    ap.add_argument(
+        "--warm-state-dir",
+        default=os.environ.get("PRISMAQUANT_CB_WARM_STATE_DIR") or None,
+        help="optional CB encoder scale-search sidecar directory; defaults "
+        "to PRISMAQUANT_CB_WARM_STATE_DIR when set",
+    )
+    ap.add_argument(
+        "--warm-verify-sample",
+        type=int,
+        default=32,
+        metavar="N",
+        help="full-sweep and byte-verify N randomly sampled warm units "
+        "(default: 32; any mismatch aborts)",
+    )
     args = ap.parse_args(argv)
     from prismaquant.gpu_guard import require_cuda_hot_path
     require_cuda_hot_path("export_nvfp4_cb_streaming")
@@ -3193,7 +3325,9 @@ def main(argv=None) -> None:
         allow_route_pending_passthrough=args.allow_route_pending_passthrough,
         exclude_namespaces=args.exclude_namespaces,
         activation_cache_dir=args.activation_cache_dir,
-        activation_scale_policy=args.activation_scale_policy)
+        activation_scale_policy=args.activation_scale_policy,
+        warm_state_dir=args.warm_state_dir,
+        warm_verify_sample=args.warm_verify_sample)
     size = sum(p.stat().st_size for p in Path(args.out).glob("*")) / 1e9
     print(f"wrote {args.out} ({size:.3f} GB)")
     for fmt, n in sorted(counts.items()):
