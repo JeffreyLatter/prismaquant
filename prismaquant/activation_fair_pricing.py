@@ -114,6 +114,13 @@ _PROVENANCE_SAMPLE_ROWS = 12
 # that produced it (the same rule selection.json's ``ratchet_objective``
 # follows).
 BRANCH_BIT_EXACT = "bit_exact"
+# A byte-verbatim SOURCE passthrough (allocator_candidates
+# .SOURCE_PASSTHROUGH_FORMATS): the exporter copies the checkpoint's own bytes,
+# so there is no re-encode to price and no encoder ran. Distinct from
+# ``bit_exact``, which is a MEASURED zero produced by actually re-encoding and
+# finding the result identical — both are free, and the artifact should be able
+# to say which one it got.
+BRANCH_SOURCE_PASSTHROUGH = "source_passthrough"
 BRANCH_MEASURED = "measured_output_mse"
 BRANCH_ACTIVATION_IDENTITY = "activation_identity"
 BRANCH_CALIBRATED = "weight_only_activation_calibrated"

@@ -15,6 +15,7 @@ from .activation_fair_pricing import (
     BRANCH_BIT_EXACT,
     BRANCH_CALIBRATED,
     BRANCH_MEASURED,
+    BRANCH_SOURCE_PASSTHROUGH,
     BRANCH_UNCALIBRATED,
     ActivationFairPricing,
     CalibrationRow,
@@ -39,10 +40,149 @@ from .serving_profiles import (
     serving_lane_route,
 )
 
-PASSTHROUGH_SOURCE_REQUIREMENTS: dict[str, str] = {
-    "FP8_SOURCE": "fp8",
-    "BF16": "bf16",
+# The provenance string a source-passthrough candidate carries in place of a
+# measured cost. It is NOT an estimator name like ``output_mse`` or
+# ``weight_mse``: it says the row was never measured because there is nothing
+# to measure.
+SOURCE_PASSTHROUGH_COST_SOURCE = "source_passthrough"
+
+# Serving-route token for a passthrough whose bytes the model's OWN loader
+# consumes, with no Gridbook codec in the path.
+ROUTE_DELEGATED_NATIVE = "delegated_native"
+
+
+@dataclass(frozen=True)
+class SourcePassthroughContract:
+    """One native source format the producer can ship back UNCHANGED.
+
+    "Any format the model natively uses belongs on a passthrough menu": the
+    allocator's cheapest honest option for a unit is always to keep the bytes
+    the checkpoint already has. This table is that menu, one entry per
+    (source format, unit contract) the census finds, so adding a newly
+    encountered native format is a data change rather than a new code path.
+
+    Fields:
+      ``source_kind``  the token ``_scan_source_dtype_manifest`` stamps on a
+        unit whose stored bytes ARE this format. It is the whole legality
+        gate: the format is legal exactly where the source already is it, in
+        both directions — BF16 is masked on mxfp4 experts and MXFP4_SOURCE is
+        masked on the bf16 embedding by the identical rule.
+      ``zero_cost_by_construction`` whether the allocator SYNTHESIZES the
+        candidate rather than requiring a cost-table column. True for formats
+        no cost run will ever have a column for.
+      ``serving_route``  the P5b lane route id.
+      ``route_backed``  whether a serve route for these bytes is known to
+        EXIST today. False does not remove the rung from the menu — an
+        allocator that wants an unbacked passthrough is reporting a serving
+        gap, and hiding the rung would hide the signal — but it does make the
+        export fail closed without an explicit override.
+      ``detail``  why this entry exists, for the mask/provenance records.
+    """
+
+    format_name: str
+    source_kind: str
+    zero_cost_by_construction: bool
+    serving_route: str
+    route_backed: bool
+    detail: str
+
+
+SOURCE_PASSTHROUGH_CONTRACTS: dict[str, SourcePassthroughContract] = {
+    contract.format_name: contract
+    for contract in (
+        # Legacy DeepSeek-V3 / MiniMax block-FP8: FP32 ``weight_scale_inv``.
+        # Serves through stock compressed-tensors block-fp8 today.
+        SourcePassthroughContract(
+            format_name="FP8_SOURCE",
+            source_kind="fp8",
+            zero_cost_by_construction=False,
+            serving_route=f"{ROUTE_DELEGATED_NATIVE}_fp8_block",
+            route_backed=True,
+            detail=(
+                "native block-FP8 with an FP32 weight_scale_inv plane; the "
+                "cost pipeline emits real rows for it, so its candidate is "
+                "not synthesized"
+            ),
+        ),
+        # DeepSeek-V3.1/V4 block-FP8: one-byte UE8M0 block exponents. Same
+        # element grid as FP8_SOURCE, different scale plane and different
+        # byte count — see the FormatSpec comment.
+        SourcePassthroughContract(
+            format_name="FP8_BLOCK_UE8M0_SOURCE",
+            source_kind="fp8_ue8m0",
+            zero_cost_by_construction=True,
+            serving_route=f"{ROUTE_DELEGATED_NATIVE}_fp8_block_ue8m0",
+            route_backed=True,
+            detail=(
+                "native block-FP8 with UE8M0 block exponents; this IS how the "
+                "released checkpoint serves, so the route is the model's own"
+            ),
+        ),
+        # DeepSeek-V4 routed experts: nibble-packed E2M1 + E8M0 group scales.
+        SourcePassthroughContract(
+            format_name="MXFP4_SOURCE",
+            source_kind="mxfp4",
+            zero_cost_by_construction=True,
+            serving_route=f"{ROUTE_DELEGATED_NATIVE}_mxfp4",
+            route_backed=False,
+            detail=(
+                "native packed MXFP4 routed experts; the serving side loads "
+                "them on the model's own path rather than through a codebook "
+                "decoder, and that route is pending its cross-repo audit"
+            ),
+        ),
+        # Unquantized passthrough. Not a "source format" in the census sense,
+        # but it obeys the same rule and predates this table.
+        SourcePassthroughContract(
+            format_name="BF16",
+            source_kind="bf16",
+            zero_cost_by_construction=False,
+            serving_route=f"{ROUTE_DELEGATED_NATIVE}_bf16",
+            route_backed=True,
+            detail="unquantized passthrough on a bf16 source",
+        ),
+    )
 }
+
+# Kept as the flat {format: required_kind} view every existing consumer
+# (allocator promotion legality, export defensive checks, the visual
+# passthrough contract) already imports. DERIVED from the table above so a new
+# census format cannot be legal in one place and unknown in the other.
+PASSTHROUGH_SOURCE_REQUIREMENTS: dict[str, str] = {
+    name: contract.source_kind
+    for name, contract in SOURCE_PASSTHROUGH_CONTRACTS.items()
+}
+
+# Passthrough formats whose Δloss is EXACT BY CONSTRUCTION, so the allocator
+# synthesizes their candidate instead of requiring a cost-table column.
+#
+# Every cost in this pipeline is measured against the DEQUANTIZED SOURCE. A
+# format that ships the source bytes UNCHANGED is therefore the identity
+# transform on the reference: its Δloss is 0.0 as a matter of arithmetic, not
+# of measurement, and no cost run can ever produce a more accurate number for
+# it. FP8_SOURCE and BF16 are deliberately NOT members: the cost pipeline
+# already emits real rows for them on the checkpoints where they are legal,
+# and synthesizing over a table that has an entry would hide a disagreement.
+# The newer source formats are members because no cost table will ever have a
+# column for them — they are byte-copy contracts, and asking the encoder to
+# "measure" a copy would burn GPU hours to reproduce a zero.
+#
+# Membership is not self-certifying: ``cost_entry_is_source_passthrough``
+# additionally requires the format to be a registered passthrough format whose
+# activation path is the identity, so a stray ``cost_source`` string in a
+# hand-written table cannot claim exactness for an activation-quantizing rung.
+SOURCE_PASSTHROUGH_FORMATS: frozenset[str] = frozenset(
+    name for name, contract in SOURCE_PASSTHROUGH_CONTRACTS.items()
+    if contract.zero_cost_by_construction
+)
+
+# Passthrough formats with no known serve route today. On the menu (an
+# allocator that wants one is reporting a serving gap), but the exporter
+# refuses to ship a selection containing one without an explicit override.
+ROUTE_PENDING_PASSTHROUGH_FORMATS: frozenset[str] = frozenset(
+    name for name, contract in SOURCE_PASSTHROUGH_CONTRACTS.items()
+    if not contract.route_backed
+)
 
 
 def serialized_candidate_payload(
@@ -342,13 +482,168 @@ def cost_entry_is_bit_exact(
         return False
 
 
+def cost_entry_is_source_passthrough(
+    cost_entry: dict,
+    format_name: str | None = None,
+) -> bool:
+    """Whether this entry ships the SOURCE bytes and is therefore exact.
+
+    The dual of ``cost_entry_is_bit_exact``. That predicate proves exactness
+    from a MEASUREMENT (``weight_mse == 0.0`` recorded by a real cost run);
+    this one proves it from a CONTRACT — the exporter copies the source slice
+    verbatim, so the re-encode error is not small, it does not exist.
+
+    Three independent conditions, all required, so the claim cannot be forged
+    by writing a string into a cost table:
+
+      * the entry declares ``cost_source="source_passthrough"``;
+      * the format is a declared member of ``SOURCE_PASSTHROUGH_FORMATS``;
+      * the format's activation path is the identity
+        (``FormatSpec.act_quant_changes_input`` is False) — the same
+        dtype-level gate ``cost_entry_is_bit_exact`` applies, because
+        shipping the weights verbatim only silences the W side.
+
+    ``cost_entry_is_bit_exact`` deliberately refuses ANY entry carrying an
+    explicit ``cost_source``, since those normally mean "an upstream pipeline
+    priced this row and defaulted weight_mse to a placeholder 0.0". A
+    source-passthrough entry is the one case where the explicit provenance is
+    itself the proof, which is why it gets a predicate of its own rather than
+    a hole punched in that rule.
+    """
+    if cost_entry.get("cost_source") != SOURCE_PASSTHROUGH_COST_SOURCE:
+        return False
+    if format_name is None:
+        return False
+    canonical = fr.canonical_format_name(str(format_name))
+    if canonical not in SOURCE_PASSTHROUGH_FORMATS:
+        return False
+    try:
+        spec = fr.get_format(canonical)
+    except KeyError:
+        return False
+    return not spec.act_quant_changes_input
+
+
+BAND_INTERPOLATED_COST_SOURCE = "band_interpolated"
+
+
+def cost_entry_is_band_interpolated(cost_entry: dict) -> bool:
+    """Whether this row's cost was FITTED from ladder anchors, not measured.
+
+    Stamped by the cost stage's RD-ladder interpolation
+    (``measure_quant_cost``, ``PRISMAQUANT_CB_LADDER_INTERP=1``). Such a row
+    is not a guess — the tensor's own law had to clear a holdout gate before
+    the fit was accepted, and a tensor whose law was rejected had its rungs
+    measured instead — but it IS a prediction, and a shipped artifact must be
+    able to say which of its selected prices were predictions.
+    """
+    return cost_entry.get("cost_source") == BAND_INTERPOLATED_COST_SOURCE
+
+
+def drop_interpolated_candidates_dominated_by_measured(
+    candidates: dict[str, list[Candidate]],
+    costs: dict,
+    *,
+    band: float,
+) -> tuple[dict[str, list[Candidate]], int]:
+    """Remove interpolated candidates a measured one already beats.
+
+    The DP optimizes over estimates, so a Δloss gap SMALLER than the
+    interpolator's own validated error is not evidence — it is a coin flip,
+    and letting it decide means an unmeasured rung can displace a measured one
+    on noise alone. This drops an interpolated candidate only when a measured
+    candidate for the SAME unit is both
+
+      * within ``band`` relative Δloss (i.e. indistinguishable at the
+        interpolator's demonstrated resolution), and
+      * no more expensive in bytes.
+
+    Both conditions are required, so a genuine trade survives: an interpolated
+    rung that is materially cheaper in bytes, or materially better in Δloss,
+    is still on the menu. Only the strictly-dominated-within-noise case is
+    removed. ``band`` must be the MEASURED holdout error from this run's own
+    validation, not a taste constant.
+
+    Returns the filtered candidates and the number dropped.
+    """
+    if band <= 0.0:
+        return candidates, 0
+    out: dict[str, list[Candidate]] = {}
+    dropped = 0
+    for name, cands in candidates.items():
+        rows = costs.get(name, {})
+        measured = [
+            c for c in cands
+            if not cost_entry_is_band_interpolated(rows.get(c.fmt, {}))
+        ]
+        kept = []
+        for cand in cands:
+            if not cost_entry_is_band_interpolated(rows.get(cand.fmt, {})):
+                kept.append(cand)
+                continue
+            scale = max(abs(cand.predicted_dloss), 1e-30)
+            if any(
+                other.memory_bytes <= cand.memory_bytes
+                and abs(other.predicted_dloss - cand.predicted_dloss) / scale
+                <= band
+                for other in measured
+            ):
+                dropped += 1
+                continue
+            kept.append(cand)
+        out[name] = kept or cands
+    return out, dropped
+
+
+def cost_entry_is_exact_by_construction(
+    cost_entry: dict,
+    format_name: str | None = None,
+) -> bool:
+    """Whether this row's Δloss is exactly 0.0 with no measurement involved.
+
+    The union of the two ways a row can be free: a measured lossless
+    re-encode (``cost_entry_is_bit_exact``) and a byte-verbatim source
+    passthrough (``cost_entry_is_source_passthrough``). Pricing, the measured
+    branch test and the P5a branch label all key off THIS predicate so the two
+    cannot drift apart; ``cost_entry_source`` still reports which of the two
+    it was.
+    """
+    return (
+        cost_entry_is_bit_exact(cost_entry, format_name)
+        or cost_entry_is_source_passthrough(cost_entry, format_name)
+    )
+
+
+def synthesized_source_passthrough_cost_entry(format_name: str) -> dict:
+    """The cost row for a passthrough candidate the cost table cannot hold.
+
+    Not a placeholder and not an estimate: ``predicted_dloss`` is 0.0 because
+    the exporter ships the source slice unchanged, and the explicit
+    ``cost_source`` records that provenance so no downstream reader mistakes
+    the zero for an unmeasured activation cost (the failure mode
+    ``cost_entry_prices_unmeasured_activation_at_zero`` exists to catch).
+    ``output_mse_measured=False`` states plainly that no output measurement
+    was taken — because none was needed.
+    """
+    return {
+        "cost_source": SOURCE_PASSTHROUGH_COST_SOURCE,
+        "predicted_dloss": 0.0,
+        "weight_mse": 0.0,
+        "output_mse": 0.0,
+        "output_mse_measured": False,
+        "source_passthrough_format": fr.canonical_format_name(
+            str(format_name)
+        ),
+    }
+
+
 def cost_entry_uses_measured_output_mse(
     stats_entry: dict,
     cost_entry: dict,
     format_name: str | None = None,
 ) -> bool:
     """Whether ``cost_entry_predicted_dloss`` will read ``output_mse``."""
-    if cost_entry_is_bit_exact(cost_entry, format_name):
+    if cost_entry_is_exact_by_construction(cost_entry, format_name):
         return False
     return _has_measured_output_mse(stats_entry, cost_entry)
 
@@ -461,6 +756,12 @@ def cost_entry_activation_pricing_branch(
     question is answerable from the artifact rather than from the code
     version that produced it.
     """
+    if cost_entry_is_source_passthrough(cost_entry, format_name):
+        # Neither measured nor weight-only: the row was never priced from an
+        # error estimate at all. It gets its own label so the artifact can
+        # tell "shipped the source bytes" apart from "measured a lossless
+        # re-encode" — both are free, but only one of them ran an encoder.
+        return BRANCH_SOURCE_PASSTHROUGH
     if cost_entry_is_bit_exact(cost_entry, format_name):
         return BRANCH_BIT_EXACT
     if _has_measured_output_mse(stats_entry, cost_entry):
@@ -520,10 +821,13 @@ def cost_entry_predicted_dloss(
     price off zero — ``cost_entry_prices_unmeasured_activation_at_zero``
     keeps its full strength.
     """
-    if cost_entry_is_bit_exact(cost_entry, format_name):
-        # Lossless re-encode END TO END (weights verbatim AND identity
-        # activation path): zero cost by construction, regardless of any
-        # noisy output_mse measurement (see cost_entry_is_bit_exact).
+    if cost_entry_is_exact_by_construction(cost_entry, format_name):
+        # Zero cost by construction, in one of two ways: a lossless re-encode
+        # END TO END (weights verbatim AND identity activation path,
+        # ``cost_entry_is_bit_exact``), or a byte-verbatim source passthrough
+        # whose exporter never re-encodes at all
+        # (``cost_entry_is_source_passthrough``). Either way the answer does
+        # not depend on a measurement, so it outranks any noisy output_mse.
         return 0.0
     if _has_measured_output_mse(stats_entry, cost_entry):
         return cost_entry_measured_activation_dloss(
@@ -818,6 +1122,15 @@ def build_candidates(stats: dict, costs: dict, formats: list[fr.FormatSpec],
                     entry = costs[name][candidate_name]
                     entry_fmt = candidate_name
                     break
+            if entry is None and spec.name in SOURCE_PASSTHROUGH_FORMATS:
+                # No cost table will ever carry a column for a byte-copy
+                # contract. Synthesize the row rather than dropping the
+                # candidate: silently omitting it would take the unit's
+                # CHEAPEST ZERO-ERROR option off the menu and leave the DP
+                # choosing only among lossy re-encodes. The legality gate
+                # below still has to agree the source IS this format.
+                entry = synthesized_source_passthrough_cost_entry(spec.name)
+                entry_fmt = spec.name
             if entry is None or "error" in entry:
                 continue
             verdict = check_stats_format_applicability(
@@ -1811,7 +2124,12 @@ def _scan_source_dtype_manifest(
     packed_bases: set[str] = set()
     for key in weight_map:
         matched = False
-        for suffix in (".weight_scale_inv", ".weight_scale", ".weight"):
+        # ``.scale`` is the OCP-MX / DSv4 group-scale sibling spelling, and it
+        # is listed LAST so it can never shadow ``.weight_scale``: the two do
+        # not overlap as suffixes ("...weight_scale"[-6:] == "_scale", not
+        # ".scale"), but ordering makes that independent of that coincidence.
+        for suffix in (".weight_scale_inv", ".weight_scale", ".weight",
+                       ".scale"):
             if key.endswith(suffix):
                 base = key[: -len(suffix)]
                 bases.setdefault(base, set()).add(suffix[1:])
@@ -1821,9 +2139,11 @@ def _scan_source_dtype_manifest(
             bases.setdefault(key, set()).add("weight")
             packed_bases.add(key)
     weight_dtypes: dict[str, str] = {}
+    scale_dtypes: dict[str, str] = {}
     shard_keys: dict[str, list[str]] = defaultdict(list)
     for key, shard in weight_map.items():
-        if not (key.endswith(".weight") or key in packed_bases):
+        if not (key.endswith(".weight") or key.endswith(".scale")
+                or key in packed_bases):
             continue
         path = src / str(shard)
         if path.is_file():
@@ -1832,16 +2152,21 @@ def _scan_source_dtype_manifest(
         try:
             with safe_open(path, framework="pt", device="cpu") as sf:
                 for key in keys:
-                    base = (
-                        key[:-len(".weight")]
-                        if key.endswith(".weight") else key
-                    )
+                    is_scale = key.endswith(".scale")
+                    if is_scale:
+                        base = key[: -len(".scale")]
+                    elif key.endswith(".weight"):
+                        base = key[: -len(".weight")]
+                    else:
+                        base = key
                     try:
-                        weight_dtypes[base] = str(
-                            sf.get_slice(key).get_dtype()
-                        ).upper()
+                        dtype = str(sf.get_slice(key).get_dtype()).upper()
                     except Exception:
                         continue
+                    if is_scale:
+                        scale_dtypes[base] = dtype
+                    else:
+                        weight_dtypes[base] = dtype
         except Exception:
             continue
 
@@ -1909,7 +2234,23 @@ def _scan_source_dtype_manifest(
         if "weight" not in suffixes:
             continue
         dtype = weight_dtypes.get(base)
-        if "weight_scale_inv" in suffixes or "weight_scale" in suffixes:
+        scale_dtype = scale_dtypes.get(base)
+        # E8M0 group/block exponents are the discriminator for the two native
+        # formats FP8_SOURCE cannot represent. Both tests run BEFORE the
+        # generic ``F8`` test, because the SCALE plane of both is itself
+        # ``F8_E8M0`` and would otherwise be mistaken for an fp8 weight
+        # contract with an FP32 scale_inv plane — a format whose byte count
+        # and whose exported scale dtype are both wrong for this checkpoint.
+        if scale_dtype == "F8_E8M0" and dtype in {"I8", "U8"}:
+            # Nibble-packed 4-bit elements carried in an 8-bit container with
+            # a power-of-two group scale: OCP-MX MXFP4 as DeepSeek-V4 ships
+            # its routed experts.
+            source_kind = "mxfp4"
+        elif scale_dtype == "F8_E8M0" and dtype == "F8_E4M3":
+            # Block-FP8 with UE8M0 block exponents (DeepSeek-V3.1/V4), NOT
+            # the FP32 weight_scale_inv contract FP8_SOURCE models.
+            source_kind = "fp8_ue8m0"
+        elif "weight_scale_inv" in suffixes or "weight_scale" in suffixes:
             source_kind = "fp8"
         elif dtype == "BF16":
             source_kind = "bf16"
@@ -1943,5 +2284,14 @@ def _scan_source_dtype_manifest(
                     live_qname = str(recipe_mapper(live_qname))
                 except Exception:
                     pass
-            manifest[live_qname] = "fp8"
+            # A profile's ``fp8_scale_pairs`` answers "does this weight have a
+            # serialized scale sibling the dequant pass must read", which is
+            # true of EVERY block-scaled format — DSv4's MXFP4 experts and its
+            # UE8M0 body both appear there. It is not a claim about which fp8
+            # contract the bytes are, so it must not overwrite a kind the
+            # header scan derived from the actual dtypes: doing so is what
+            # made 33,024 packed-MXFP4 experts look like FP32-scaled fp8.
+            # It still fills in names the dtype scan could not classify.
+            if manifest.get(live_qname) in (None, "other"):
+                manifest[live_qname] = "fp8"
     return manifest

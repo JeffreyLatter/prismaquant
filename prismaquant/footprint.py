@@ -628,12 +628,33 @@ def assignment_artifact_bytes(
     ``cb_serialization_context`` so a v1/v2 layout or sidecar sharing policy is
     never inferred silently.
     """
+    from prismaquant.allocator_candidates import SOURCE_PASSTHROUGH_FORMATS
+
     body_quant = 0
     cb_assignment: dict[str, str] = {}
     cb_shapes: dict[str, tuple[int, ...]] = {}
     reenc_by_name: dict[str, int] = {}
     priced: list[str] = []
     missing_stats: list[str] = []
+    passthrough_names: list[str] = []
+    # A source-passthrough unit ships the checkpoint's own bytes, so its
+    # contribution must be the SAME number this function subtracts from the
+    # floor for it. On the manifest path those are two different computations
+    # — ``resolve_reencoded_source_bytes`` reads real header spans while the
+    # body loop evaluates a closed form — and they only cancel if the format's
+    # arithmetic reproduces the checkpoint exactly. Resolve the spans FIRST so
+    # a passthrough is charged the measured span itself, and cross-check the
+    # closed form against it below rather than trusting either alone.
+    passthrough_spans: dict[str, int] = {}
+    if source_manifest is not None:
+        passthrough_names = [
+            qname for qname, fmt in assignment.items()
+            if (fr.canonical_format_name(fmt) if canonicalize else fmt)
+            in SOURCE_PASSTHROUGH_FORMATS
+        ]
+        if passthrough_names:
+            passthrough_spans = resolve_reencoded_source_bytes(
+                source_manifest, passthrough_names, context=context)
     for qname, fmt in assignment.items():
         entry = stats.get(qname)
         if entry is None and qname.endswith(".weight"):
@@ -643,7 +664,22 @@ def assignment_artifact_bytes(
             continue
         shape = _shape_from_stats(entry)
         name = fr.canonical_format_name(fmt) if canonicalize else fmt
-        if is_cb_format(name):
+        if name in SOURCE_PASSTHROUGH_FORMATS and qname in passthrough_spans:
+            span = int(passthrough_spans[qname])
+            closed_form = int(fr.get_format(name).memory_bytes_for_shape(shape))
+            if span != closed_form:
+                raise ValueError(
+                    f"[footprint] {context}: {qname} is assigned the "
+                    f"passthrough format {name}, whose exporter copies the "
+                    f"source slice VERBATIM, but the checkpoint's own bytes "
+                    f"for it ({span}) disagree with the format's accounting "
+                    f"({closed_form}). One of the two is wrong about this "
+                    "checkpoint, and shipping either number would make the "
+                    "artifact budget false — the floor subtracts the span "
+                    "while the body would add the closed form."
+                )
+            body_quant += span
+        elif is_cb_format(name):
             if cb_serialization_context is None:
                 raise ValueError(
                     f"[footprint] {context}: assignment contains {name} but "

@@ -7,6 +7,7 @@
     "id": "nvfp4_cb",
     "exporter": "prismaquant.export_nvfp4_cb",
     "codec_formats_from": ["prismaquant.export_nvfp4_cb:EXPORTABLE_FORMATS"],
+    "passthrough_formats": ["MXFP4_SOURCE", "FP8_BLOCK_UE8M0_SOURCE"],
     "reason": "exporter_cannot_emit",
     "detail": "The exporter's codec surface remains the structural upper bound: NVFP4_CB_K12..K24, research-compatible NVFP4_CB_S13..S16, FP8_CB_K28..K48, delegated NVFP4/FP8_DYNAMIC, FP8_SOURCE, and BF16. The production format rule below deliberately narrows that emittable set by excluding signed S13..S16; their decoder/export support remains available for legacy and explicitly research-scoped artifacts. INT4_W4A16 remains a registry-only research format until the approved Gridbook-owned packing/profile/loader/delegation work is implemented and validated. Anything outside the exporter declaration hard-fails rather than silently BF16-coercing a Linear and blowing the allocated byte budget."
   },
@@ -20,10 +21,12 @@
         "NVFP4",
         "FP8_DYNAMIC",
         "FP8_SOURCE",
+        "FP8_BLOCK_UE8M0_SOURCE",
+        "MXFP4_SOURCE",
         "BF16"
       ],
       "reason": "profile_mismatch",
-      "detail": "The production nvfp4_cb menu carries product-VQ NVFP4_CB_K12..K24 (fp4/E2M1 grid, two-tier-v2 serialized rate 1.78125..3.28125 bpw), product-VQ FP8_CB_K28..K48 (fp8/E4M3 grid, 3.5..6.0 index bpw plus the serialized per-output FP32 scale), and the native carriers. Signed S13..S16 remain codec-compatible but are research-only after losing 78.48% (609/776) of matched weight-MSE comparisons, so this production rule excludes them. Plain NVFP4 is W4A4 and FP8_DYNAMIC/FP8-CB are W8A8; comparisons therefore name the full activation/backend contract. FP8_SOURCE is passthrough-only and BF16 is unquantized passthrough. This allow-list proves only exporter/runtime legality; served KL/PPL and phase-specific performance remain external release gates recorded by the native-parity benchmark protocol."
+      "detail": "The production nvfp4_cb menu carries product-VQ NVFP4_CB_K12..K24 (fp4/E2M1 grid, two-tier-v2 serialized rate 1.78125..3.28125 bpw), product-VQ FP8_CB_K28..K48 (fp8/E4M3 grid, 3.5..6.0 index bpw plus the serialized per-output FP32 scale), and the native carriers. Signed S13..S16 remain codec-compatible but are research-only after losing 78.48% (609/776) of matched weight-MSE comparisons, so this production rule excludes them. Plain NVFP4 is W4A4 and FP8_DYNAMIC/FP8-CB are W8A8; comparisons therefore name the full activation/backend contract. FP8_SOURCE, FP8_BLOCK_UE8M0_SOURCE and MXFP4_SOURCE are passthrough-only and BF16 is unquantized passthrough. The three SOURCE carriers are a FAMILY, not three special cases: each ships the checkpoint's own bytes for the units whose source already IS that format, and allocator_candidates.SOURCE_PASSTHROUGH_CONTRACTS is the one table that says which source kind each requires. That source-kind gate — not this allow-list — is what keeps MXFP4_SOURCE off a bf16 embedding and BF16 off an mxfp4 expert; the entries here only state that the container can carry them at all. FP8_BLOCK_UE8M0_SOURCE is the DeepSeek-V3.1/V4 block-FP8 spelling (E4M3 elements, ONE-BYTE UE8M0 block exponents, 8.00049 bpw) and is deliberately distinct from FP8_SOURCE's FP32 weight_scale_inv plane (8.00195 bpw): same element grid, different on-disk contract, different byte count, and FP8_SOURCE's exporter widens its scale plane to FP32, which on a UE8M0 checkpoint would quadruple the scale bytes and emit a tensor the model's own loader does not expect. This allow-list proves only exporter/runtime legality; served KL/PPL and phase-specific performance remain external release gates recorded by the native-parity benchmark protocol."
     },
     {
       "id": "cb_packed_expert_stock_ct_unsupported",
@@ -36,6 +39,17 @@
       ],
       "reason": "runtime_unsupported",
       "detail": "The nvfp4_cb container's stock compressed-tensors delegation is DENSE-ONLY today: neither export_nvfp4_cb nor the Gridbook runtime carries a stock-CT packed-MoE emission/serving path (35B first-contact, 2026-07-19 \u2014 the exporter's stock-NVFP4 global-scale pass is 2-D and Gridbook's MoE method is CB-only). Packed expert stacks use CB rungs (per-expert weighted VQ, served by Gridbook) or the BF16 passthrough until that path is built AND serve-validated. This is a declared capability of the container, not a quality judgement on the formats."
+    },
+    {
+      "id": "mxfp4_source_is_routed_expert_only",
+      "when": {
+        "not_regex": "(^|[.])(?:mlp[.]|moe[.]|ffn[.])?experts([.]|$)"
+      },
+      "deny_formats": [
+        "MXFP4_SOURCE"
+      ],
+      "reason": "runtime_unsupported",
+      "detail": "MXFP4_SOURCE delegates to the MODEL'S OWN packed-expert loader (DeepseekV4's routed-expert path), which exists only for the routed stack \u2014 there is no native packed-MXFP4 load path for a dense attention or shared-expert Linear in this container. On the checkpoints where this matters the source-kind gate already reaches the same verdict (only the routed experts are stored as MXFP4), so this rule is a structural belt on top of a dtype fact, and it fires even on a hypothetical checkpoint that stored a dense Linear in the same packing. It is written as a NAME condition rather than scope=dense deliberately: filter_candidates_for_profile re-checks formats AFTER packed-group aggregation with packed_expert=None, and a scope=dense rule would fire on the aggregated super item (...experts.__packed_serving__...) and strip the format from the very unit it belongs on. The regex still matches that super name, so the deny correctly skips it."
     }
   ],
   "shape_rules": [
@@ -68,6 +82,24 @@
     }
   ],
   "serving_lanes": [
+    {
+      "id": "delegated_native_fp8_block_ue8m0",
+      "formats": [
+        "FP8_BLOCK_UE8M0_SOURCE"
+      ],
+      "activation_contract": "w8a8-dynamic-e4m3-block128-ue8m0",
+      "fallback_route": "delegated_native_fp8_block (the model's own block-FP8 path; no Gridbook codec in the dispatch)",
+      "detail": "SOURCE-PASSTHROUGH lane, not a CB one: the artifact ships the checkpoint's own E4M3 bytes and UE8M0 block exponents unchanged, and the serving side loads them exactly as it loads the released checkpoint. That is what makes this route BACKED without a new kernel — it is the route the source already serves on, so 'does a serve path exist' is answered by the model running at all. There is deliberately no fused_mid_m block: a passthrough rung has no Gridbook decode prologue to fuse, so an empty backed set here is the honest state rather than a data gap, and it resolves with rungs_source=lane_declares_no_fused_mid_m_lane. Byte contract: 8 bits/element plus one UE8M0 byte per 128x128 block = 8.00049 bpw, which the producer pins against the checkpoint's own header spans before an allocation ships (footprint.assignment_artifact_bytes refuses a span/closed-form disagreement)."
+    },
+    {
+      "id": "delegated_native_mxfp4",
+      "formats": [
+        "MXFP4_SOURCE"
+      ],
+      "activation_contract": "delegated-native-mxfp4-e2m1-group32-ue8m0",
+      "fallback_route": "route_pending (no validated Gridbook dispatch; the model's own routed-expert MXFP4 loader is the intended path)",
+      "detail": "SOURCE-PASSTHROUGH lane for the released checkpoint's own packed routed experts: nibble-packed E2M1 with per-32 E8M0 group scales, copied verbatim, served by the model's native DeepseekV4 routed-expert path rather than by any codebook decoder. It is declared as a DISTINCT lane precisely so P5b accounting never files these units under a CB contract they do not have — a unit on this lane has no CB activation contract at all, which is also why the K0.2 attestation scopes itself to CB layers and the artifact declares the source-passthrough groups explicitly rather than leaving them looking like a missing attestation. ROUTE STATUS: pending. The loader side is being built across the repo boundary and has not been serve-validated here, so allocator_candidates.ROUTE_PENDING_PASSTHROUGH_FORMATS lists this format and the exporter refuses to ship a selection containing it without an explicit override. The rung stays ON the menu regardless: an allocator that wants a route-pending passthrough is reporting a serving gap worth seeing, and masking the rung would hide exactly that signal while also removing the unit's only zero-error option. No fused_mid_m block, for the same reason as the lane above."
+    },
     {
       "id": "nvfp4_cb_quality_path",
       "formats_from": [

@@ -846,6 +846,87 @@ register_format(FormatSpec(
     activation_quantize_dequantize=lambda x: x.clone(),
 ))
 
+# Source-FP8 passthrough, UE8M0 block-scale variant — the DeepSeek-V3.1/V4
+# spelling of block-FP8. Same E4M3 element grid and same 128x128 block as
+# FP8_SOURCE, but the block scale is a ONE-BYTE unsigned E8M0 exponent
+# (config.json ``quantization_config.scale_fmt == "ue8m0"``) rather than the
+# FP32 ``weight_scale_inv`` plane FP8_SOURCE was written for.
+#
+# This is a DIFFERENT ON-DISK CONTRACT, not a cosmetic difference, which is why
+# it gets its own format instead of widening FP8_SOURCE:
+#
+#   * bytes. FP8_SOURCE charges 32 bits per 128x128 block (8.00195 bpw); this
+#     charges 8 (8.00049 bpw). Measured on DSv4-Flash: ``layers.0.attn.wo_a``
+#     is 33,554,432 weight bytes + 2,048 scale bytes, which is this formula
+#     exactly and NOT FP8_SOURCE's.
+#   * bit-exactness. The FP8_SOURCE export path widens its scale plane to FP32
+#     on write. Doing that here would quadruple the scale bytes and emit a
+#     tensor the checkpoint's own loader does not expect — the opposite of a
+#     passthrough.
+#
+# Serving: this is how the released checkpoint already serves, so the route is
+# native and BACKED today (allocator_candidates.SOURCE_PASSTHROUGH_CONTRACTS).
+register_format(FormatSpec(
+    name="FP8_BLOCK_UE8M0_SOURCE",
+    weight_bits=8, group_size=128, scale_bits=8,
+    scale_dtype_name="uint8_e8m0",
+    weight_element_dtype="fp8_e4m3",
+    scale_block_shape=(128, 128),
+    act_bits=None,
+    family="fp", min_capability_sm=89,
+    autoround_config=lambda: dict(bits=8, group_size=128,
+                                   data_type="fp8_e4m3", sym=True,
+                                   scale_fmt="ue8m0",
+                                   act_bits=16, act_data_type="float"),
+    quantize_dequantize=lambda w: w.clone(),
+    activation_quantize_dequantize=lambda x: x.clone(),
+))
+
+# Source-MXFP4 passthrough — the OCP-MX sibling of FP8_SOURCE, for models whose
+# ROUTED EXPERTS ship as nibble-packed E2M1 with per-32-block E8M0 scales
+# (DeepSeek-V4-Flash-0731: ``layers.N.ffn.experts.E.{w1,w3,w2}.{weight,scale}``,
+# I8 weight + F8_E8M0 scale, config ``expert_dtype: "fp4"``). When the allocator
+# picks this format the exporter STREAM-COPIES those source tensors verbatim —
+# no dequant, no re-encode, no CB stacking — and the serving side loads them on
+# the model's own native path rather than through a codebook decoder.
+#
+# WHY THE ACCOUNTING IS EXACT, NOT ESTIMATED. MXFP4 is a fixed-rate format, so
+# the generic FormatSpec arithmetic reproduces the checkpoint byte for byte:
+# for a [2048, 4096] expert projection, 2048*4096*4/8 = 4,194,304 weight bytes
+# plus 2048*(4096/32)*8/8 = 262,144 E8M0 scale bytes = 4,456,448 — precisely
+# the two source slices' sizes. ``memory_bytes_for_shape`` is therefore the
+# authoritative producer accountant here (unlike the CB families, whose
+# FormatSpec is deliberately only a nominal view), and
+# ``allocator_candidates.assert_source_passthrough_bytes_match_source`` pins
+# that identity against the real safetensors index before an allocation ships.
+#
+# WHY Δloss IS ZERO BY CONSTRUCTION. Every cost in this pipeline is measured
+# against the DEQUANTIZED SOURCE: the probe's BF16 view of an expert IS the
+# lossless dequant of exactly these bytes. Shipping them unchanged is the
+# identity transform on the reference, so there is nothing to measure and no
+# measurement branch to take — the candidate is priced 0.0 with provenance
+# ``cost_source="source_passthrough"`` (allocator_candidates
+# .SOURCE_PASSTHROUGH_FORMATS). This is the same claim FP8_SOURCE makes, one
+# element grid down; ``act_bits=None`` states the matching dtype-level fact
+# that this producer applies no activation quantization of its own, so the row
+# never enters P5a's activation calibration (its A side is the released
+# checkpoint's own contract, not a re-encode this pipeline chose).
+#
+# effective_bits = 4 + 8/32 = 4.25 bpw exactly.
+register_format(FormatSpec(
+    name="MXFP4_SOURCE",
+    weight_bits=4, group_size=32, scale_bits=8,
+    scale_dtype_name="uint8_e8m0",
+    weight_element_dtype="fp4_e2m1",
+    act_bits=None,
+    family="mx", min_capability_sm=100,
+    autoround_config=lambda: dict(bits=4, group_size=32,
+                                   data_type="fp4_e2m1", sym=True,
+                                   act_bits=16, act_data_type="float"),
+    quantize_dequantize=lambda w: w.clone(),
+    activation_quantize_dequantize=lambda x: x.clone(),
+))
+
 
 # GGUF k-quants (llama.cpp / vLLM-GGUF serving lane) — two-tier superblock
 # formats along the input dim: fp16 super-scale(s) per 256 + quantized

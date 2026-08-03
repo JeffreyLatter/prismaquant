@@ -34,6 +34,7 @@ from typing import Mapping
 import torch
 
 from . import format_registry as fr
+from .allocator_candidates import PASSTHROUGH_SOURCE_REQUIREMENTS
 from .measure_quant_cost import canonical_linear_name
 
 # Teacher-confident threshold: teacher top-1 prob must exceed this for a
@@ -230,9 +231,15 @@ def _collect_targets(model, format_map: Mapping[str, dict]):
         spec = fr.get_format(fmt)
         cw = entry.get("col_weights") if isinstance(entry, Mapping) else None
         smooth = entry.get("smooth_scale") if isinstance(entry, Mapping) else None
-        # Only BF16 / FP8_SOURCE are passthrough-only (CLAUDE.md principle 11);
-        # every other format — including real FP8_E4M3 — is rendered.
-        skip_weight = spec.name in ("BF16", "FP8_SOURCE")
+        # Only the SOURCE-PASSTHROUGH family is passthrough-only (CLAUDE.md
+        # principle 11); every other format — including real FP8_E4M3 — is
+        # rendered. Read from the one table rather than a name tuple: this
+        # list was ("BF16", "FP8_SOURCE") when those were the only two, and a
+        # newly censused native format silently missing from it would be
+        # RE-RENDERED here — emulating quantization error for bytes the
+        # exporter copies verbatim, i.e. reporting a KL the artifact does not
+        # have.
+        skip_weight = spec.name in PASSTHROUGH_SOURCE_REQUIREMENTS
         if skip_weight and not _wants_act_emulation(spec):
             continue
         targets.append((qname, mod, spec, cw, smooth))

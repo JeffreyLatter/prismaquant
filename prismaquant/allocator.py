@@ -2357,10 +2357,18 @@ def main():
                   "allowed WITHOUT source verification", flush=True)
             source_manifest = None
         if source_manifest:
-            n_fp8 = sum(1 for v in source_manifest.values() if v == "fp8")
-            n_bf16 = sum(1 for v in source_manifest.values() if v == "bf16")
-            print(f"[alloc] source-dtype manifest: {n_fp8} fp8, "
-                  f"{n_bf16} bf16 (gates FP8_SOURCE/BF16 per source)",
+            # Report EVERY kind the scan found, not a hardcoded fp8/bf16 pair.
+            # A checkpoint whose units are mxfp4 and fp8_ue8m0 printed "0 fp8,
+            # 238 bf16" under the old line — which reads as "nothing was
+            # classified" precisely when the classification is the interesting
+            # part, and hides a newly censused native format entirely.
+            kinds = Counter(source_manifest.values())
+            summary = ", ".join(
+                f"{count} {kind}" for kind, count in sorted(kinds.items())
+            )
+            gated = ", ".join(sorted(PASSTHROUGH_SOURCE_REQUIREMENTS))
+            print(f"[alloc] source-dtype manifest: {summary} "
+                  f"(gates {gated} per source)",
                   flush=True)
 
     # A requested production CB rung needs a measured row everywhere it is
