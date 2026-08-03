@@ -811,7 +811,7 @@ def lattice_codebook_content_sha256(format_name: str) -> tuple[str, ...]:
     )
 
 
-def cb_quantize_dequantize_for_context(
+def cb_fields_for_context(
     spec: fr.FormatSpec,
     weight,
     *,
@@ -819,7 +819,7 @@ def cb_quantize_dequantize_for_context(
     col_weights=None,
     codebook=None,
 ):
-    """Render a CB weight under the exact artifact serialization context.
+    """Encode CB fields under the exact artifact serialization context.
 
     The v1 and v2 FP4 layouts have different reachable scale sets, so this is
     a correctness contract, not merely a byte-pricing option.  FP8-CB has no
@@ -830,11 +830,7 @@ def cb_quantize_dequantize_for_context(
     if info is None:
         raise ValueError(f"{spec.name!r} is not a CB format")
     grid, mode, k = info
-    from .nvfp4_cb_formats import (
-        SCALE_CODING_V1,
-        nvfp4_cb_fields,
-        nvfp4_cb_reconstruct,
-    )
+    from .nvfp4_cb_formats import SCALE_CODING_V1, nvfp4_cb_fields
 
     if context.codebook_source == "learned" and codebook is None:
         raise ValueError(
@@ -843,7 +839,7 @@ def cb_quantize_dequantize_for_context(
             "it as learned"
         )
     coding = context.scale_coding if grid == "fp4" else SCALE_CODING_V1
-    fields = nvfp4_cb_fields(
+    return nvfp4_cb_fields(
         weight,
         k,
         grid=grid,
@@ -853,6 +849,30 @@ def cb_quantize_dequantize_for_context(
         scale_sweep=context.scale_sweep,
         scale_coding=coding,
         encode_tier=context.encode_tier,
+    )
+
+
+def cb_quantize_dequantize_for_context(
+    spec: fr.FormatSpec,
+    weight,
+    *,
+    context: CBSerializationContext,
+    col_weights=None,
+    codebook=None,
+):
+    """Render a CB weight under the exact artifact serialization context."""
+    info = _cb_info(spec.name)
+    if info is None:
+        raise ValueError(f"{spec.name!r} is not a CB format")
+    grid, mode, k = info
+    from .nvfp4_cb_formats import nvfp4_cb_reconstruct
+
+    fields = cb_fields_for_context(
+        spec,
+        weight,
+        context=context,
+        col_weights=col_weights,
+        codebook=codebook,
     )
     return nvfp4_cb_reconstruct(
         fields,

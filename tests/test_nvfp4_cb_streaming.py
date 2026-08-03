@@ -328,6 +328,34 @@ def test_streaming_byte_identical_dense_and_stacked(workdir):
         assert _tensors_equal(cb_m, cb_s)
 
 
+def test_streaming_warm_fallback_counts_are_artifact_provenance(workdir):
+    qname = "model.layers.0.self_attn.q_proj"
+    mdl = workdir / "warm-provenance-model"
+    _write_model(
+        mdl,
+        {f"{qname}.weight": torch.randn(2, 256).to(torch.bfloat16)},
+    )
+    assignment = workdir / "warm-provenance-assignment.json"
+    _assign(assignment, {qname: "FP8_CB_K28"})
+
+    counts = export_nvfp4_cb_streaming(
+        mdl,
+        assignment,
+        workdir / "warm-provenance-export",
+        {qname: torch.ones(256)},
+        device="cpu",
+        warm_state_dir=workdir / "empty-warm-state",
+        warm_verify_sample=32,
+    )
+
+    config = json.loads(
+        (workdir / "warm-provenance-export" / "quant_config.json").read_text()
+    )
+    expected = {"warm_used": 0, "cold_fallback": 1, "verified_n": 0}
+    assert config["provenance"]["encoder_warm_start"] == expected
+    assert {key: counts[key] for key in expected} == expected
+
+
 def test_streaming_global_cb_stamp_does_not_bypass_missing_render_identity(
     workdir,
 ):
