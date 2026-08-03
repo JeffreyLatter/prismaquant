@@ -50,6 +50,14 @@ SOURCE_PASSTHROUGH_COST_SOURCE = "source_passthrough"
 # consumes, with no Gridbook codec in the path.
 ROUTE_DELEGATED_NATIVE = "delegated_native"
 
+# What a MEASUREMENT says about serving a passthrough's bytes. These are
+# verdicts from a real serve attempt on real hardware, not design intent —
+# which matters, because on DSv4-Flash/GB10 the measured answers came out the
+# OPPOSITE way round from the obvious guess.
+ROUTE_STATUS_BACKED = "backed"          # measured serving, possibly with a requirement
+ROUTE_STATUS_PENDING = "pending"        # no verdict yet; unaudited
+ROUTE_STATUS_BLOCKED = "blocked"        # measured, every known route dead
+
 
 @dataclass(frozen=True)
 class SourcePassthroughContract:
@@ -71,11 +79,21 @@ class SourcePassthroughContract:
         candidate rather than requiring a cost-table column. True for formats
         no cost run will ever have a column for.
       ``serving_route``  the P5b lane route id.
-      ``route_backed``  whether a serve route for these bytes is known to
-        EXIST today. False does not remove the rung from the menu — an
-        allocator that wants an unbacked passthrough is reporting a serving
-        gap, and hiding the rung would hide the signal — but it does make the
-        export fail closed without an explicit override.
+      ``wire_format_id``  the closed-enum spelling the artifact declares and
+        the serving side reads (quant_config.json ``source_passthrough``).
+        Distinct from ``format_name``: the producer's registry name is ours to
+        rename, the wire id is a cross-repo contract.
+      ``route_status``  what a MEASUREMENT says about serving these bytes, per
+        ``ROUTE_STATUS_*``. Never remove a rung from the menu — an allocator
+        that wants an unservable passthrough is reporting a serving gap, and
+        hiding the rung would hide the signal — but anything other than
+        ``backed`` makes the export fail closed without an explicit override.
+      ``route_requirement``  the serving-side condition that makes a BACKED
+        route actually fire (e.g. a non-default vLLM MoE backend). Belongs in
+        the artifact's serving notes; a backed route with an unmet
+        requirement serves no better than a blocked one.
+      ``route_evidence``  what was measured, and on what hardware. A route
+        verdict without its evidence is a rumour.
       ``detail``  why this entry exists, for the mask/provenance records.
     """
 
@@ -83,8 +101,16 @@ class SourcePassthroughContract:
     source_kind: str
     zero_cost_by_construction: bool
     serving_route: str
-    route_backed: bool
+    route_status: str
     detail: str
+    wire_format_id: str | None = None
+    route_requirement: str | None = None
+    route_evidence: str | None = None
+
+    @property
+    def route_backed(self) -> bool:
+        """Whether a serve route for these bytes is known to exist."""
+        return self.route_status == ROUTE_STATUS_BACKED
 
 
 SOURCE_PASSTHROUGH_CONTRACTS: dict[str, SourcePassthroughContract] = {
@@ -97,11 +123,16 @@ SOURCE_PASSTHROUGH_CONTRACTS: dict[str, SourcePassthroughContract] = {
             source_kind="fp8",
             zero_cost_by_construction=False,
             serving_route=f"{ROUTE_DELEGATED_NATIVE}_fp8_block",
-            route_backed=True,
+            route_status=ROUTE_STATUS_BACKED,
             detail=(
                 "native block-FP8 with an FP32 weight_scale_inv plane; the "
                 "cost pipeline emits real rows for it, so its candidate is "
                 "not synthesized"
+            ),
+            route_evidence=(
+                "stock compressed-tensors block-fp8; served on the "
+                "checkpoints this format was written for (MiniMax M2, "
+                "DeepSeek-V3)"
             ),
         ),
         # DeepSeek-V3.1/V4 block-FP8: one-byte UE8M0 block exponents. Same
@@ -110,25 +141,48 @@ SOURCE_PASSTHROUGH_CONTRACTS: dict[str, SourcePassthroughContract] = {
         SourcePassthroughContract(
             format_name="FP8_BLOCK_UE8M0_SOURCE",
             source_kind="fp8_ue8m0",
+            wire_format_id="fp8_e4m3_ue8m0_block128",
             zero_cost_by_construction=True,
             serving_route=f"{ROUTE_DELEGATED_NATIVE}_fp8_block_ue8m0",
-            route_backed=True,
+            route_status=ROUTE_STATUS_BLOCKED,
             detail=(
-                "native block-FP8 with UE8M0 block exponents; this IS how the "
-                "released checkpoint serves, so the route is the model's own"
+                "native block-FP8 with UE8M0 block exponents. 'The checkpoint "
+                "already serves this way' turned out NOT to imply a serve "
+                "route on our target: measured on GB10/sm121, every route is "
+                "dead. Keeping the rung on the menu is deliberate — if the DP "
+                "still wants it, that is the serving gap becoming visible in "
+                "the allocation instead of at deploy time."
+            ),
+            route_evidence=(
+                "sm121 measured 2026-08-03: deep_gemm assert; cutlass "
+                "scaled_mm rejects the block layout; triton KeyError on "
+                "float8_e8m0fnu; flashinfer gated sm90-exact; marlin-linear "
+                "is <=sm89. CONSEQUENCE: CB re-encoding of the body is the "
+                "only way this checkpoint serves on this box at all."
             ),
         ),
         # DeepSeek-V4 routed experts: nibble-packed E2M1 + E8M0 group scales.
         SourcePassthroughContract(
             format_name="MXFP4_SOURCE",
             source_kind="mxfp4",
+            wire_format_id="mxfp4_e2m1_ue8m0_g32",
             zero_cost_by_construction=True,
             serving_route=f"{ROUTE_DELEGATED_NATIVE}_mxfp4",
-            route_backed=False,
+            route_status=ROUTE_STATUS_BACKED,
+            route_requirement="vllm --moe-backend marlin",
             detail=(
-                "native packed MXFP4 routed experts; the serving side loads "
-                "them on the model's own path rather than through a codebook "
-                "decoder, and that route is pending its cross-repo audit"
+                "native packed MXFP4 routed experts, served by the model's "
+                "own path rather than a codebook decoder. BACKED, but only "
+                "off the default: the auto-selected backend is broken on our "
+                "target, so the requirement below is part of the contract, "
+                "not a tuning hint."
+            ),
+            route_evidence=(
+                "sm121 measured 2026-08-03: native-confirmed via vLLM Marlin "
+                "MoE (--moe-backend marlin). The AUTO default DeepGEMM_MXFP4 "
+                "asserts on the SF transformation; FlashInfer is gated to "
+                "capability family 100; the OAI Triton path is hard-excluded "
+                "on SM12x (0/15 kernels)."
             ),
         ),
         # Unquantized passthrough. Not a "source format" in the census sense,
@@ -138,8 +192,9 @@ SOURCE_PASSTHROUGH_CONTRACTS: dict[str, SourcePassthroughContract] = {
             source_kind="bf16",
             zero_cost_by_construction=False,
             serving_route=f"{ROUTE_DELEGATED_NATIVE}_bf16",
-            route_backed=True,
+            route_status=ROUTE_STATUS_BACKED,
             detail="unquantized passthrough on a bf16 source",
+            route_evidence="plain container floats; no kernel required",
         ),
     )
 }
@@ -176,13 +231,46 @@ SOURCE_PASSTHROUGH_FORMATS: frozenset[str] = frozenset(
     if contract.zero_cost_by_construction
 )
 
-# Passthrough formats with no known serve route today. On the menu (an
-# allocator that wants one is reporting a serving gap), but the exporter
-# refuses to ship a selection containing one without an explicit override.
+# Passthrough formats with no DEMONSTRATED serve route on the target — either
+# unaudited (pending) or measured dead (blocked). On the menu (an allocator
+# that wants one is reporting a serving gap), but the exporter refuses to ship
+# a selection containing one without an explicit override.
 ROUTE_PENDING_PASSTHROUGH_FORMATS: frozenset[str] = frozenset(
     name for name, contract in SOURCE_PASSTHROUGH_CONTRACTS.items()
     if not contract.route_backed
 )
+
+# The closed wire enum the artifact declares and the serving side reads
+# (quant_config.json "source_passthrough"). Registry names are ours to rename;
+# these are a cross-repo contract, so they are declared once here and the
+# exporter maps through this table rather than spelling them again.
+PASSTHROUGH_WIRE_FORMAT_IDS: dict[str, str] = {
+    name: contract.wire_format_id
+    for name, contract in SOURCE_PASSTHROUGH_CONTRACTS.items()
+    if contract.wire_format_id is not None
+}
+
+
+def passthrough_serving_notes() -> dict[str, dict[str, str]]:
+    """Per-format serving requirements/evidence for the artifact's notes.
+
+    A BACKED route with an unmet requirement serves no better than a blocked
+    one, so the requirement travels with the artifact rather than living in a
+    run book.
+    """
+    return {
+        name: {
+            key: value
+            for key, value in (
+                ("route_status", contract.route_status),
+                ("route", contract.serving_route),
+                ("requirement", contract.route_requirement),
+                ("evidence", contract.route_evidence),
+            )
+            if value is not None
+        }
+        for name, contract in sorted(SOURCE_PASSTHROUGH_CONTRACTS.items())
+    }
 
 
 def serialized_candidate_payload(

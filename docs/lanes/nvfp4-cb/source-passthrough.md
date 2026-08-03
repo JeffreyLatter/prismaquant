@@ -71,12 +71,43 @@ probe inventory: 33,325 Linears
 
 ## The formats
 
-| Format | Source kind | bpw | Synthesized candidate | Serve route | Backed |
+| Format | Wire id | Source kind | bpw | Synth. | Route status on sm121 |
 |---|---|---|---|---|---|
-| `MXFP4_SOURCE` | `mxfp4` | 4.25 | yes | `delegated_native_mxfp4` | **no — pending** |
-| `FP8_BLOCK_UE8M0_SOURCE` | `fp8_ue8m0` | 8.00049 | yes | `delegated_native_fp8_block_ue8m0` | yes |
-| `FP8_SOURCE` | `fp8` | 8.00195 | no | `delegated_native_fp8_block` | yes |
-| `BF16` | `bf16` | 16 | no | `delegated_native_bf16` | yes |
+| `MXFP4_SOURCE` | `mxfp4_e2m1_ue8m0_g32` | `mxfp4` | 4.25 | yes | **backed — requires `--moe-backend marlin`** |
+| `FP8_BLOCK_UE8M0_SOURCE` | `fp8_e4m3_ue8m0_block128` | `fp8_ue8m0` | 8.00049 | yes | **blocked (measured)** |
+| `FP8_SOURCE` | — | `fp8` | 8.00195 | no | backed (other checkpoints) |
+| `BF16` | — | `bf16` | 16 | no | backed |
+
+### The route verdicts came out the opposite way round
+
+Both were measured on GB10/sm121, 2026-08-03. The intuition "the released
+checkpoint already serves this way, so a route must exist" is **false**:
+
+* **`MXFP4_SOURCE` is native-confirmed** — but only via vLLM's Marlin MoE
+  backend. The auto-selected `DeepGEMM_MXFP4` asserts on the SF
+  transformation, FlashInfer is gated to capability family 100, and the OAI
+  Triton path is hard-excluded on SM12x (0/15 kernels). `--moe-backend marlin`
+  is therefore **part of the serving contract, not a tuning hint**, and it
+  travels with the artifact.
+* **`FP8_BLOCK_UE8M0_SOURCE` is blocked** — every route measured dead:
+  `deep_gemm` assert, cutlass `scaled_mm` rejects the block layout, triton
+  `KeyError: float8_e8m0fnu`, flashinfer's gate is sm90-exact, marlin-linear
+  tops out at sm89.
+
+**The architectural consequence: CB re-encoding of the body is the only way
+DSV4-Flash serves on this box at all.** The body's CB rungs are load-bearing,
+not merely economical.
+
+A blocked or pending rung still stays **on the menu** — if the DP wants it,
+that is the serving gap surfacing in the allocation rather than at deploy
+time — but the exporter refuses to ship a selection containing one without
+`--allow-route-pending-passthrough`.
+
+### Serving notes for the shipped artifact
+
+    --moe-backend marlin        (MXFP4 experts; the default backend asserts)
+    --kv-cache-dtype fp8        (the SM120 MLA backend asserts otherwise)
+    VLLM_USE_DEEP_GEMM=0        (the hyper-connections path breaks otherwise)
 
 "Synthesized candidate" means the allocator *manufactures* the cost row rather
 than requiring a column in the cost table. No cost run will ever have a column
@@ -130,82 +161,48 @@ decode prologue to fuse, so an empty backed set is the honest state rather than
 a data gap; it resolves with
 `rungs_source = lane_declares_no_fused_mid_m_lane`.
 
-### Route status
+### Route status policy
 
-`FP8_BLOCK_UE8M0_SOURCE` is **backed**: it is how the released checkpoint
-already serves, so "does a serve path exist" is answered by the model running
-at all — no new kernel is involved.
+`route_status` is a **measurement**, not design intent: `backed` (measured
+serving, possibly with a requirement), `pending` (unaudited), `blocked`
+(measured, every known route dead). Anything other than `backed` keeps the
+rung on the menu but makes the export fail closed without
+`--allow-route-pending-passthrough`; the acknowledgement is recorded in
+`quant_config["provenance"]["route_pending_passthrough_acknowledged"]`.
 
-`MXFP4_SOURCE` is **route-pending**. The loader side is being built across the
-repo boundary and has not been serve-validated here. The policy:
+## The declaration: `source_passthrough`
 
-* the rung stays **on** the allocator's menu. An allocation that wants a
-  route-pending passthrough is reporting a *serving gap*, and masking the rung
-  would hide exactly that signal while also removing the unit's only
-  zero-error option;
-* the **export** fails closed. Shipping an artifact whose selection contains a
-  format in `ROUTE_PENDING_PASSTHROUGH_FORMATS` requires the explicit
-  `--allow-route-pending-passthrough` flag, and the acknowledgement is recorded
-  in `quant_config["provenance"]["route_pending_passthrough_acknowledged"]`.
-
-## The declaration: `expert_format_routing`
-
-The serving side must be able to tell, per expert group and without inference,
-whether the bytes are a Gridbook codebook payload or the checkpoint's own. That
-declaration lives in `quant_config.json` inside the existing
-`execution_contracts` object — the same family as the K0.2 `nvfp4_w4a4` record.
+The serving side must be able to tell, per unit and without inference, whether
+the bytes are a Gridbook codebook payload or the checkpoint's own. The
+consumer-side reader is implemented and shipped, so this is its exact spelling
+— a top-level key in `quant_config.json`:
 
 ```json
-"execution_contracts": {
-  "nvfp4_w4a4": { "...": "unchanged K0.2 record" },
-  "expert_format_routing": {
-    "schema": "prismaquant.expert_format_routing.v1",
-    "unit": "layer_expert_group",
-    "routes": [
-      "gridbook_cb",
-      "delegated_native_mxfp4",
-      "delegated_native_fp8_block_ue8m0",
-      "delegated_native_fp8_block",
-      "delegated_native_bf16"
-    ],
-    "group_count": 43,
-    "groups": {
-      "model.layers.39.mlp.experts": {
-        "route": "delegated_native_mxfp4",
-        "format": "MXFP4_SOURCE",
-        "route_backed": false,
-        "cb_activation_contract": false,
-        "tensors": ["layers.39.ffn.experts.0.w1.scale", "..."]
-      },
-      "model.layers.0.mlp.experts": {
-        "route": "gridbook_cb",
-        "format": "NVFP4_CB_K14",
-        "route_backed": true,
-        "cb_activation_contract": true,
-        "tensors": ["..."]
-      }
-    },
-    "groups_sha256": "<64 lowercase hex>"
+"source_passthrough": {
+  "version": 1,
+  "units": {
+    "model.layers.39.mlp.experts": "mxfp4_e2m1_ue8m0_g32",
+    "model.layers.7.self_attn.wq_a": "fp8_e4m3_ue8m0_block128"
   }
 }
 ```
 
-Invariants the producer asserts and the loader may re-check:
+* the format-id enum is **closed**: `mxfp4_e2m1_ue8m0_g32`,
+  `fp8_e4m3_ue8m0_block128` (`PASSTHROUGH_WIRE_FORMAT_IDS` is the one mapping
+  from registry name to wire id);
+* a unit may be an expert group **or** a dense body Linear — there is no
+  expert-only framing and no exhaustiveness claim;
+* **absence of the key means a legacy all-CB artifact**, so the key is emitted
+  only when at least one unit is passthrough;
+* load-time refusal on: unknown `version`, unknown format id, malformed
+  `units`, or **a unit claimed by both the CB config groups and
+  `source_passthrough`**. The producer asserts all four before writing.
 
-1. every routed-expert group in the model appears exactly **once**;
-2. `route` is `gridbook_cb` **iff** the format is a CB rung; otherwise it
-   equals that format's `SourcePassthroughContract.serving_route`. An unknown
-   route string or unknown format is a hard refusal on **both** the write and
-   the parse side — the enum is closed and versioned;
-3. `cb_activation_contract` is true **iff** the group contributes an entry to
-   the K0.2 activation attestation. A `delegated_native_*` group must be
-   `false`, and that is what makes its **absence** from the K0.2 record
-   unambiguous rather than a missing attestation;
-4. the count of groups with `cb_activation_contract == true` equals the K0.2
-   record's routed-MoE `module_count`. This is the reconciliation that closes
-   the silent gap: without it, an artifact with source-passthrough layers
-   reports fewer attested MoE modules than the model has, and a consumer
-   cannot tell "by design" from "partially exported".
+The K0.2 reconciliation survives as a **producer-side invariant** rather than
+a wire field: CB-attested routed-expert modules and passthrough units must be
+disjoint and together cover the routed-expert set. That is what makes a
+passthrough layer's absence from the K0.2 attestation a declaration rather
+than a silent gap.
 
 ### Tensor naming
 

@@ -21,6 +21,10 @@ import prismaquant.format_registry as fr
 from prismaquant.activation_fair_pricing import BRANCH_SOURCE_PASSTHROUGH
 from prismaquant.allocator_candidates import (
     PASSTHROUGH_SOURCE_REQUIREMENTS,
+    PASSTHROUGH_WIRE_FORMAT_IDS,
+    ROUTE_STATUS_BACKED,
+    ROUTE_STATUS_BLOCKED,
+    passthrough_serving_notes,
     ROUTE_PENDING_PASSTHROUGH_FORMATS,
     SOURCE_PASSTHROUGH_CONTRACTS,
     SOURCE_PASSTHROUGH_COST_SOURCE,
@@ -226,11 +230,51 @@ def test_lane_metadata_declares_a_distinct_delegated_native_route():
     assert cb_lane["activation_contract"] != lane["activation_contract"]
 
 
-def test_mxfp4_route_is_declared_pending_not_backed():
-    """Honesty gate: the rung ships on the menu, but not silently."""
-    assert "MXFP4_SOURCE" in ROUTE_PENDING_PASSTHROUGH_FORMATS
-    assert "FP8_BLOCK_UE8M0_SOURCE" not in ROUTE_PENDING_PASSTHROUGH_FORMATS
-    assert not SOURCE_PASSTHROUGH_CONTRACTS["MXFP4_SOURCE"].route_backed
+def test_route_status_follows_the_measurement_not_the_intuition():
+    """The measured sm121 verdicts, which came out the opposite way round.
+
+    "The released checkpoint already serves this way, so the route exists"
+    is false for the BODY passthrough and true for the EXPERT one — and only
+    off the default backend. Pinning both directions here keeps a plausible
+    guess from quietly replacing the measurement.
+    """
+    mxfp4 = SOURCE_PASSTHROUGH_CONTRACTS["MXFP4_SOURCE"]
+    body = SOURCE_PASSTHROUGH_CONTRACTS["FP8_BLOCK_UE8M0_SOURCE"]
+    assert mxfp4.route_status == ROUTE_STATUS_BACKED
+    assert mxfp4.route_backed
+    # BACKED only WITH a requirement; a backed route whose requirement is
+    # unmet serves no better than a blocked one, so it must be declared.
+    assert mxfp4.route_requirement == "vllm --moe-backend marlin"
+    assert body.route_status == ROUTE_STATUS_BLOCKED
+    assert not body.route_backed
+    # Both carry the evidence for their verdict.
+    assert mxfp4.route_evidence and body.route_evidence
+    # Blocked/pending rungs stay ON the menu but gate the export.
+    assert "FP8_BLOCK_UE8M0_SOURCE" in ROUTE_PENDING_PASSTHROUGH_FORMATS
+    assert "MXFP4_SOURCE" not in ROUTE_PENDING_PASSTHROUGH_FORMATS
+
+
+def test_wire_format_ids_are_the_closed_cross_repo_enum():
+    """Registry names are ours; wire ids are a contract with the loader."""
+    assert PASSTHROUGH_WIRE_FORMAT_IDS == {
+        "MXFP4_SOURCE": "mxfp4_e2m1_ue8m0_g32",
+        "FP8_BLOCK_UE8M0_SOURCE": "fp8_e4m3_ue8m0_block128",
+    }
+    # Every format the allocator can SYNTHESIZE must be shippable, i.e. must
+    # have a wire id — otherwise the DP can select something the artifact
+    # cannot declare.
+    for name in SOURCE_PASSTHROUGH_FORMATS:
+        assert name in PASSTHROUGH_WIRE_FORMAT_IDS, name
+
+
+def test_serving_notes_carry_requirement_and_evidence():
+    notes = passthrough_serving_notes()
+    assert notes["MXFP4_SOURCE"]["requirement"] == "vllm --moe-backend marlin"
+    assert notes["MXFP4_SOURCE"]["route_status"] == ROUTE_STATUS_BACKED
+    assert notes["FP8_BLOCK_UE8M0_SOURCE"]["route_status"] == (
+        ROUTE_STATUS_BLOCKED)
+    for entry in notes.values():
+        assert entry["evidence"]
 
 
 # ---------------------------------------------------------------------------
