@@ -1,0 +1,49 @@
+{
+  "allocation_churn_at_50pct": {
+    "max": 0.004381095273818455,
+    "mean": 0.0036954238559639913,
+    "median": 0.0036609152288072017,
+    "min": 0.003150787696924231,
+    "p05": 0.003356339084771193,
+    "p95": 0.004178544636159039
+  },
+  "concentration_full": {
+    "100": 0.9365961119180285,
+    "1775": 0.9958705784022829,
+    "500": 0.9821641029996739
+  },
+  "current_expert_coverage_ge8": 0.5691315406976745,
+  "proxy_spearman_vs_h_trace": -0.36108853980716854,
+  "required_samples_512_for_95pct_ge8": {
+    "conditional_on_model": "Gamma-Poisson / negative-binomial expert-rate population; assumes no structural-zero experts and stationary corpus composition",
+    "identifiability": "If more than 5% of experts are structural zeros for this corpus, 95% coverage is unattainable at any sample size. One aggregate count per expert cannot distinguish structural zeros from very rare experts.",
+    "multiplier_layer_bootstrap": {
+      "max": 225060.1048588769,
+      "mean": 32539.950987426553,
+      "median": 20223.828174275717,
+      "min": 1324.3006058743567,
+      "p05": 4053.9610698231854,
+      "p95": 93585.00705814951
+    },
+    "multiplier_point": 20786.807738678748,
+    "samples_512_p05": 64864,
+    "samples_512_p95": 1497361,
+    "samples_512_point": 332589,
+    "tokens_point": 170285529
+  },
+  "top100_jaccard_at_50pct": {
+    "max": 1.0,
+    "mean": 0.9696061467940055,
+    "median": 0.9801980198019802,
+    "min": 0.941747572815534,
+    "p05": 0.941747572815534,
+    "p95": 1.0
+  },
+  "verdict_inputs": {
+    "coverage_gate_95pct_ge8_currently_passes": false,
+    "domain_resampling_possible": false,
+    "exact_fisher_resampling_possible": false,
+    "hotset_pass_by_median": true,
+    "hotset_threshold": 0.8
+  }
+}

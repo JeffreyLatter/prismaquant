@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="440">
+<rect width="100%" height="100%" fill="white"/>
+<text x="380.0" y="24" text-anchor="middle" font-family="sans-serif" font-size="17">Activation second-moment stability</text>
+<line x1="78" y1="376" x2="735" y2="376" stroke="#222"/>
+<line x1="78" y1="48" x2="78" y2="376" stroke="#222"/>
+<text x="78.0" y="396" text-anchor="middle" font-family="sans-serif" font-size="11">0.25</text>
+<text x="69" y="380.0" text-anchor="end" font-family="sans-serif" font-size="11">0</text>
+<line x1="78" y1="376.0" x2="735" y2="376.0" stroke="#ddd"/>
+<text x="209.4" y="396" text-anchor="middle" font-family="sans-serif" font-size="11">0.35</text>
+<text x="69" y="314.4" text-anchor="end" font-family="sans-serif" font-size="11">0.276</text>
+<line x1="78" y1="310.4" x2="735" y2="310.4" stroke="#ddd"/>
+<text x="340.8" y="396" text-anchor="middle" font-family="sans-serif" font-size="11">0.45</text>
+<text x="69" y="248.8" text-anchor="end" font-family="sans-serif" font-size="11">0.552</text>
+<line x1="78" y1="244.8" x2="735" y2="244.8" stroke="#ddd"/>
+<text x="472.2" y="396" text-anchor="middle" font-family="sans-serif" font-size="11">0.55</text>
+<text x="69" y="183.2" text-anchor="end" font-family="sans-serif" font-size="11">0.828</text>
+<line x1="78" y1="179.2" x2="735" y2="179.2" stroke="#ddd"/>
+<text x="603.6" y="396" text-anchor="middle" font-family="sans-serif" font-size="11">0.65</text>
+<text x="69" y="117.6" text-anchor="end" font-family="sans-serif" font-size="11">1.1</text>
+<line x1="78" y1="113.6" x2="735" y2="113.6" stroke="#ddd"/>
+<text x="735.0" y="396" text-anchor="middle" font-family="sans-serif" font-size="11">0.75</text>
+<text x="69" y="52.0" text-anchor="end" font-family="sans-serif" font-size="11">1.38</text>
+<line x1="78" y1="48.0" x2="735" y2="48.0" stroke="#ddd"/>
+<polyline points="78.0,285.8 406.5,323.9 735.0,346.0" fill="none" stroke="#2563eb" stroke-width="2"/>
+<circle cx="78.0" cy="285.8" r="3" fill="#2563eb"/>
+<circle cx="406.5" cy="323.9" r="3" fill="#2563eb"/>
+<circle cx="735.0" cy="346.0" r="3" fill="#2563eb"/>
+<text x="730" y="48" text-anchor="end" font-family="sans-serif" font-size="11" fill="#2563eb">median combined RSD</text>
+<polyline points="78.0,60.6 406.5,193.6 735.0,274.5" fill="none" stroke="#dc2626" stroke-width="2"/>
+<circle cx="78.0" cy="60.6" r="3" fill="#dc2626"/>
+<circle cx="406.5" cy="193.6" r="3" fill="#dc2626"/>
+<circle cx="735.0" cy="274.5" r="3" fill="#dc2626"/>
+<text x="730" y="64" text-anchor="end" font-family="sans-serif" font-size="11" fill="#dc2626">p90 combined RSD</text>
+<polyline points="78.0,355.0 406.5,364.5 735.0,369.6" fill="none" stroke="#059669" stroke-width="2"/>
+<circle cx="78.0" cy="355.0" r="3" fill="#059669"/>
+<circle cx="406.5" cy="364.5" r="3" fill="#059669"/>
+<circle cx="735.0" cy="369.6" r="3" fill="#059669"/>
+<text x="730" y="80" text-anchor="end" font-family="sans-serif" font-size="11" fill="#059669">dloss-weighted combined RSD</text>
+<text x="406.5" y="426" text-anchor="middle" font-family="sans-serif" font-size="12">fraction of cached rows</text>
+<text x="18" y="220.0" text-anchor="middle" transform="rotate(-90 18 220.0)" font-family="sans-serif" font-size="12">relative standard deviation</text>
+</svg>
