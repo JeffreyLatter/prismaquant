@@ -59,6 +59,9 @@ _SCALE_PLANE_DTYPES = frozenset({"F8_E8M0"})
 #: sibling. The gate pairs a weight with whichever one is present rather than
 #: assuming a lane.
 _SCALE_SUFFIXES = (".scale", ".weight_scale", ".weight_scale_inv")
+_PER_EXPERT_FORMAT_GROUPS_KEY = "per_expert_format_groups"
+_PER_EXPERT_FORMAT_GROUPS_VERSION = 1
+_PER_EXPERT_GROUP_TOKEN = ".format_group_"
 
 
 class ArtifactIncomplete(AssertionError):
@@ -88,6 +91,13 @@ class CompletenessReport:
     #: scale planes present whose weight is not declared passthrough
     orphan_scale: list[str] = field(default_factory=list)
 
+    #: PROPOSED per-expert split-stack declaration failures.  Strings carry
+    #: layer/family/expert ids so a 256-way refusal is actionable.
+    group_partition_errors: list[str] = field(default_factory=list)
+    missing_group_tensors: list[str] = field(default_factory=list)
+    undeclared_group_tensors: list[str] = field(default_factory=list)
+    group_byte_mismatches: list[str] = field(default_factory=list)
+
     #: route-pending formats the producer explicitly acknowledged shipping
     route_pending_acknowledged: list[str] = field(default_factory=list)
     #: namespaces the producer recorded as deliberately OMITTED. An absence
@@ -97,8 +107,12 @@ class CompletenessReport:
 
     @property
     def ok(self) -> bool:
-        return not (self.undeclared or self.fp8_in_ignore
-                    or self.missing_scale or self.orphan_scale)
+        return not (
+            self.undeclared or self.fp8_in_ignore or self.missing_scale
+            or self.orphan_scale or self.group_partition_errors
+            or self.missing_group_tensors or self.undeclared_group_tensors
+            or self.group_byte_mismatches
+        )
 
     def failure_text(self) -> str:
         parts: list[str] = []
@@ -124,7 +138,38 @@ class CompletenessReport:
                 f"{len(self.undeclared)} scale-bearing weight(s) are claimed "
                 f"by no mechanism at all (not CB, not declared passthrough, "
                 f"not a verbatim namespace): {sorted(self.undeclared)[:5]}")
+        if self.group_partition_errors:
+            parts.append(
+                "per-expert format groups do not partition their layer/family "
+                f"exactly: {self.group_partition_errors[:5]}"
+            )
+        if self.missing_group_tensors:
+            parts.append(
+                "declared per-expert format-group tensor(s) are absent: "
+                f"{self.missing_group_tensors[:5]}"
+            )
+        if self.undeclared_group_tensors:
+            parts.append(
+                "per-expert format-group tensor(s) have no declaration: "
+                f"{self.undeclared_group_tensors[:5]}"
+            )
+        if self.group_byte_mismatches:
+            parts.append(
+                "per-expert format-group byte accounting disagrees with "
+                f"sub-group sums: {self.group_byte_mismatches[:5]}"
+            )
         return "; ".join(parts)
+
+
+def _read_safetensors_header(path: Path) -> dict[str, dict]:
+    """Read one safetensors-compatible container header, never its data."""
+
+    with open(path, "rb") as handle:
+        (length,) = struct.unpack("<Q", handle.read(8))
+        entries = json.loads(handle.read(length))
+    return {
+        name: meta for name, meta in entries.items() if name != "__metadata__"
+    }
 
 
 def read_artifact_header(artifact_dir: str | Path) -> dict[str, dict]:
@@ -138,13 +183,7 @@ def read_artifact_header(artifact_dir: str | Path) -> dict[str, dict]:
         shards = ["model.safetensors"]
     header: dict[str, dict] = {}
     for shard in shards:
-        path = root / shard
-        with open(path, "rb") as handle:
-            (length,) = struct.unpack("<Q", handle.read(8))
-            entries = json.loads(handle.read(length))
-        for name, meta in entries.items():
-            if name != "__metadata__":
-                header[name] = meta
+        header.update(_read_safetensors_header(root / shard))
     return header
 
 
@@ -214,6 +253,311 @@ def _group_claimed_units(quant_config: dict) -> set[str]:
                 name = name[len("re:^"):-1].replace("[.]", ".")
             claimed.add(name)
     return claimed
+
+
+def _tensor_span(meta: dict) -> int:
+    offsets = meta.get("data_offsets") or ()
+    if len(offsets) != 2:
+        return 0
+    return int(offsets[1]) - int(offsets[0])
+
+
+def _declared_expert_count(config: object) -> int | None:
+    """Best-effort architecture config count; declaration checks still run
+    on synthetic/minimal configs by deriving the range from the other family.
+    """
+
+    keys = ("n_routed_experts", "num_local_experts", "num_experts", "n_experts")
+    if isinstance(config, dict):
+        for key in keys:
+            value = config.get(key)
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                return int(value)
+        for value in config.values():
+            found = _declared_expert_count(value)
+            if found is not None:
+                return found
+    return None
+
+
+def _validate_per_expert_format_groups(
+    root: Path,
+    quant_config: dict,
+    header: dict[str, dict],
+    report: CompletenessReport,
+) -> None:
+    """Validate PROPOSED v1 using only bytes carried by the artifact."""
+
+    declaration = quant_config.get(_PER_EXPERT_FORMAT_GROUPS_KEY)
+    physical_group_prefixes = {
+        name[: -len(".cb_qweight")]
+        for name in header
+        if _PER_EXPERT_GROUP_TOKEN in name and name.endswith(".cb_qweight")
+    }
+    if declaration is None:
+        report.undeclared_group_tensors.extend(sorted(
+            prefix + ".cb_qweight" for prefix in physical_group_prefixes
+        ))
+        return
+    if not isinstance(declaration, dict) or declaration.get("version") != \
+            _PER_EXPERT_FORMAT_GROUPS_VERSION:
+        report.group_partition_errors.append(
+            "declaration version is not supported version 1"
+        )
+        return
+    layers = declaration.get("layers")
+    if not isinstance(layers, dict) or not layers:
+        report.group_partition_errors.append("declaration layers is empty/malformed")
+        return
+
+    model_config = {}
+    try:
+        model_config = json.loads((root / "config.json").read_text())
+    except Exception:
+        pass
+    configured_count = _declared_expert_count(model_config)
+    declared_prefixes: set[str] = set()
+    declaration_index: dict[str, tuple[str, str, str]] = {}
+
+    for raw_layer, families in sorted(layers.items(), key=lambda item: str(item[0])):
+        layer = str(raw_layer)
+        if not isinstance(families, dict):
+            report.group_partition_errors.append(
+                f"layer {layer}: family map is malformed"
+            )
+            continue
+        family_unions: dict[str, set[int]] = {}
+        for family in ("w13", "w2"):
+            entries = families.get(family)
+            if not isinstance(entries, list) or not entries:
+                report.group_partition_errors.append(
+                    f"layer {layer}/{family}: no format groups"
+                )
+                family_unions[family] = set()
+                continue
+            owners: dict[int, str] = {}
+            for index, entry in enumerate(entries):
+                if not isinstance(entry, dict) or set(entry) != {
+                    "format_wire_id", "expert_ids", "tensor_prefix"
+                }:
+                    report.group_partition_errors.append(
+                        f"layer {layer}/{family} group {index}: expected exact "
+                        "keys format_wire_id/expert_ids/tensor_prefix"
+                    )
+                    continue
+                wire_id = str(entry["format_wire_id"])
+                tensor_prefix = str(entry["tensor_prefix"])
+                raw_ids = entry["expert_ids"]
+                if not isinstance(raw_ids, list) or any(
+                    not isinstance(value, int) or isinstance(value, bool)
+                    or value < 0 for value in raw_ids
+                ):
+                    report.group_partition_errors.append(
+                        f"layer {layer}/{family}/{wire_id}: expert_ids malformed"
+                    )
+                    continue
+                expert_ids = [int(value) for value in raw_ids]
+                if expert_ids != sorted(expert_ids):
+                    report.group_partition_errors.append(
+                        f"layer {layer}/{family}/{wire_id}: expert ids are not sorted: "
+                        f"{expert_ids[:12]}"
+                    )
+                for expert_id in expert_ids:
+                    previous = owners.setdefault(expert_id, wire_id)
+                    if previous != wire_id or expert_ids.count(expert_id) > 1:
+                        report.group_partition_errors.append(
+                            f"layer {layer}/{family}: duplicated expert id "
+                            f"{expert_id} in {previous} and {wire_id}"
+                        )
+                declared_prefixes.add(tensor_prefix)
+                declaration_key = f"{layer}/{family}/{wire_id}"
+                if declaration_key in declaration_index:
+                    report.group_partition_errors.append(
+                        f"layer {layer}/{family}: format {wire_id} is "
+                        "declared more than once"
+                    )
+                declaration_index[declaration_key] = (
+                    layer, family, tensor_prefix
+                )
+
+                if wire_id.startswith(("NVFP4_CB_", "FP8_CB_")):
+                    required = [tensor_prefix + ".cb_qweight"]
+                    if wire_id.startswith("FP8_CB_"):
+                        required.append(tensor_prefix + ".weight_scale")
+                    for name in required:
+                        if name not in header:
+                            report.missing_group_tensors.append(
+                                f"layer {layer}/{family} experts "
+                                f"{expert_ids}: {name}"
+                            )
+                elif wire_id == "mxfp4_e2m1_ue8m0_g32":
+                    leaves = (
+                        ("w1", "w3", "gate_proj", "up_proj")
+                        if family == "w13" else ("w2", "down_proj")
+                    )
+                    for expert_id in expert_ids:
+                        weights = [
+                            name for name in header
+                            if name.startswith(f"{tensor_prefix}.{expert_id}.")
+                            and name.endswith(".weight")
+                            and name.rsplit(".", 2)[-2] in leaves
+                        ]
+                        wanted = 2 if family == "w13" else 1
+                        if len(weights) != wanted:
+                            report.missing_group_tensors.append(
+                                f"layer {layer}/{family} expert {expert_id}: "
+                                f"expected {wanted} verbatim weight slice(s) under "
+                                f"{tensor_prefix}, found {len(weights)}"
+                            )
+                        for weight in weights:
+                            base = weight[: -len(".weight")]
+                            if not any(base + suffix in header for suffix in _SCALE_SUFFIXES):
+                                report.missing_group_tensors.append(
+                                    f"layer {layer}/{family} expert {expert_id}: "
+                                    f"{base} has no verbatim scale plane"
+                                )
+                else:
+                    report.group_partition_errors.append(
+                        f"layer {layer}/{family}: unknown format wire id {wire_id}"
+                    )
+            family_unions[family] = set(owners)
+
+        derived_count = max(
+            (max(ids) + 1 for ids in family_unions.values() if ids),
+            default=0,
+        )
+        expected_count = configured_count or derived_count
+        expected = set(range(expected_count))
+        for family, present in family_unions.items():
+            missing = sorted(expected - present)
+            extra = sorted(present - expected)
+            if missing or extra:
+                report.group_partition_errors.append(
+                    f"layer {layer}/{family}: missing expert ids {missing[:16]}; "
+                    f"unexpected expert ids {extra[:16]}"
+                )
+
+    for prefix in sorted(physical_group_prefixes - declared_prefixes):
+        report.undeclared_group_tensors.append(prefix + ".cb_qweight")
+
+    payload = (quant_config.get("provenance") or {}).get(
+        "per_expert_format_group_payload"
+    )
+    if not isinstance(payload, dict):
+        report.group_byte_mismatches.append(
+            "per_expert_format_group_payload provenance is missing"
+        )
+        return
+    groups = payload.get("groups")
+    if not isinstance(groups, dict):
+        report.group_byte_mismatches.append("payload groups map is malformed")
+        return
+    missing_payload_groups = sorted(set(declaration_index) - set(groups))
+    extra_payload_groups = sorted(set(groups) - set(declaration_index))
+    if missing_payload_groups or extra_payload_groups:
+        report.group_byte_mismatches.append(
+            "payload/declaration group keys disagree: missing payload groups "
+            f"{missing_payload_groups[:8]}; extra payload groups "
+            f"{extra_payload_groups[:8]}"
+        )
+    codebook_file = quant_config.get("codebook_file")
+    codebook_header: dict[str, dict] = {}
+    if codebook_file is not None:
+        codebook_path = root / str(codebook_file)
+        if codebook_path.exists():
+            codebook_header = _read_safetensors_header(codebook_path)
+    tensor_sum = 0
+    codebook_sum = 0
+    tensor_owners: dict[str, str] = {}
+    codebook_owners: dict[str, str] = {}
+    for key, group in groups.items():
+        if key not in declaration_index or not isinstance(group, dict):
+            report.group_byte_mismatches.append(
+                f"undeclared/malformed payload group {key}"
+            )
+            continue
+        names = group.get("tensor_names") or []
+        if not isinstance(names, list):
+            report.group_byte_mismatches.append(
+                f"{key}: tensor_names is malformed"
+            )
+            names = []
+        for name in map(str, names):
+            previous = tensor_owners.setdefault(name, key)
+            if previous != key:
+                report.group_byte_mismatches.append(
+                    f"tensor {name} is charged to both {previous} and {key}"
+                )
+        actual = sum(_tensor_span(header[name]) for name in names if name in header)
+        expected_bytes = int(group.get("tensor_payload_bytes", -1))
+        if actual != expected_bytes:
+            layer, family, _prefix = declaration_index[key]
+            report.group_byte_mismatches.append(
+                f"layer {layer}/{family} {key.rsplit('/', 1)[-1]}: "
+                f"declared tensors sum to {actual}B, accounting says "
+                f"{expected_bytes}B"
+            )
+        tensor_sum += expected_bytes
+        codebook_names = group.get("codebook_tensor_names") or []
+        if not isinstance(codebook_names, list):
+            report.group_byte_mismatches.append(
+                f"{key}: codebook_tensor_names is malformed"
+            )
+            codebook_names = []
+        for name in map(str, codebook_names):
+            previous = codebook_owners.setdefault(name, key)
+            if previous != key:
+                report.group_byte_mismatches.append(
+                    f"codebook tensor {name} is charged to both {previous} "
+                    f"and {key}"
+                )
+        missing_codebooks = sorted(
+            str(name) for name in codebook_names
+            if str(name) not in codebook_header
+        )
+        if missing_codebooks:
+            layer, family, _prefix = declaration_index[key]
+            report.missing_group_tensors.append(
+                f"layer {layer}/{family} {key.rsplit('/', 1)[-1]}: "
+                f"missing codebook sidecar tensors {missing_codebooks[:8]}"
+            )
+        actual_codebook_bytes = sum(
+            _tensor_span(codebook_header[str(name)])
+            for name in codebook_names
+            if str(name) in codebook_header
+        )
+        expected_codebook_bytes = int(group.get("codebook_sidecar_bytes", 0))
+        if actual_codebook_bytes != expected_codebook_bytes:
+            layer, family, _prefix = declaration_index[key]
+            report.group_byte_mismatches.append(
+                f"layer {layer}/{family} {key.rsplit('/', 1)[-1]}: "
+                f"codebook tensors sum to {actual_codebook_bytes}B, "
+                f"accounting says {expected_codebook_bytes}B"
+            )
+        expected_total = int(group.get("total_bytes", -1))
+        if expected_total != expected_bytes + expected_codebook_bytes:
+            layer, family, _prefix = declaration_index[key]
+            report.group_byte_mismatches.append(
+                f"layer {layer}/{family} {key.rsplit('/', 1)[-1]}: group "
+                f"total {expected_total}B != tensor/codebook sum "
+                f"{expected_bytes + expected_codebook_bytes}B"
+            )
+        codebook_sum += expected_codebook_bytes
+    if tensor_sum != int(payload.get("tensor_payload_bytes", -1)):
+        report.group_byte_mismatches.append(
+            f"sub-group tensor sum {tensor_sum}B != payload total "
+            f"{payload.get('tensor_payload_bytes')}B"
+        )
+    if codebook_sum != int(payload.get("codebook_sidecar_bytes", -1)):
+        report.group_byte_mismatches.append(
+            f"sub-group codebook sum {codebook_sum}B != payload total "
+            f"{payload.get('codebook_sidecar_bytes')}B"
+        )
+    if tensor_sum + codebook_sum != int(payload.get("total_bytes", -1)):
+        report.group_byte_mismatches.append(
+            f"sub-group total {tensor_sum + codebook_sum}B != payload total "
+            f"{payload.get('total_bytes')}B"
+        )
 
 
 def check_artifact_completeness(
@@ -349,6 +693,8 @@ def check_artifact_completeness(
             # them, so they are not orphans.
             continue
         report.orphan_scale.append(scale_key)
+
+    _validate_per_expert_format_groups(root, quant_config, header, report)
 
     return report
 

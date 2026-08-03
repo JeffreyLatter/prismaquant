@@ -184,6 +184,83 @@ def test_assignment_artifact_bytes_cb_uses_exact_tensor_and_shared_sidecar():
     ] == 8
 
 
+def test_per_expert_assignment_prices_physical_substacks_before_export():
+    prefix = "model.layers.0.mlp.experts"
+    assignment = {}
+    stats = {}
+    for expert_id in range(4):
+        for projection in ("gate_proj", "up_proj", "down_proj"):
+            qname = f"{prefix}.{expert_id}.{projection}"
+            if projection in ("gate_proj", "up_proj"):
+                fmt = "NVFP4_CB_K16" if expert_id < 2 else "FP8_CB_K28"
+            else:
+                fmt = (
+                    "NVFP4_CB_K16", "FP8_CB_K28",
+                    "MXFP4_SOURCE", "MXFP4_SOURCE",
+                )[expert_id]
+            assignment[qname] = fmt
+            stats[qname] = {
+                "n_params": 256 * 256,
+                "in_features": 256,
+                "out_features": 256,
+            }
+    source_total = sum(2 * row["n_params"] for row in stats.values())
+    result = fp.assignment_artifact_bytes(
+        {}, stats,
+        source_total_bytes=source_total,
+        source_manifest=None,
+        regime="bf16",
+        cb_serialization_context=CBSerializationContext.production(),
+        per_expert_assignment=assignment,
+    )
+    payload = result["per_expert_format_group_payload"]
+    assert len(payload["groups"]) == 5  # w13:2, w2:3
+    assert sorted(
+        len(group["expert_ids"]) for group in payload["groups"].values()
+    ) == [1, 1, 2, 2, 2]
+    cb_groups = [
+        group for group in payload["groups"].values()
+        if group["format"].endswith(("K16", "K28"))
+    ]
+    assert len(cb_groups) == 4
+    # Same formats in w13 and w2 have distinct physical sub-stacks and hence
+    # one sidecar charge each; no expert row pays a sidecar by itself.
+    assert payload["codebook_sidecar_bytes"] == sum(
+        group["codebook_sidecar_bytes"] for group in cb_groups
+    )
+    assert all(group["codebook_sidecar_bytes"] > 0 for group in cb_groups)
+    assert result["body_quant_bytes"] == payload["total_bytes"]
+
+
+def test_uniform_per_expert_footprint_stays_on_legacy_shared_stack_path():
+    prefix = "model.layers.0.mlp.experts"
+    assignment = {
+        f"{prefix}.{expert_id}.{projection}": "NVFP4_CB_K16"
+        for expert_id in range(3)
+        for projection in ("gate_proj", "up_proj", "down_proj")
+    }
+    stats = {
+        qname: {
+            "n_params": 256 * 256,
+            "in_features": 256,
+            "out_features": 256,
+        }
+        for qname in assignment
+    }
+    common = dict(
+        source_total_bytes=sum(2 * row["n_params"] for row in stats.values()),
+        source_manifest=None,
+        regime="bf16",
+        cb_serialization_context=CBSerializationContext.production(),
+    )
+    legacy = fp.assignment_artifact_bytes(assignment, stats, **common)
+    uniform = fp.assignment_artifact_bytes(
+        {}, stats, per_expert_assignment=assignment, **common
+    )
+    assert uniform["artifact_bytes"] == legacy["artifact_bytes"]
+    assert uniform["per_expert_format_group_payload"]["groups"] == {}
+
+
 def test_assignment_artifact_bytes_missing_stats_stay_in_floor():
     # A name absent from stats is not subtracted from the floor (stays at source
     # precision) and is counted as missing — the total is still well-defined.

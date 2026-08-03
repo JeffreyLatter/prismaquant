@@ -1,7 +1,7 @@
 # PrismaQuant Architecture
 
-As of: 2026-08-03 · branch `release/prismaquant-0.8.0` · verified against implementation
-baseline commit `7183d21`, with the external Gridbook runtime pinned to
+As of: 2026-08-03 · branch `feat/per-expert-export` · verified against implementation
+baseline commit `11c61b9`, with the external Gridbook runtime pinned to
 `9011a19228ddb96b8a49e11a20ac75c99c83998e` (v0.8.0). This branch ports the dated
 2026-08-01 DeepSeek-V4-Flash-0731 92 GB study record (§9.2) forward from its 0.5.1
 working tree; the study's Gridbook-candidate claims were **not** carried over, because
@@ -1158,6 +1158,40 @@ regex pinned to that layer index** (`_constrain_per_expert_projection_regex` `:7
 through `_vllm_moe_scheme_projection_names` `:4503-4525` so LFM2.5's `w1/w3/w2` are advertised
 as `gate_proj/up_proj/down_proj` (`:7980-7994`).
 
+**PROPOSED per-expert CB producer contract (v1; consumer reconciliation
+pending).** `export_nvfp4_cb_streaming --per-expert-config <json>` consumes the
+Tier-2 flat `qname -> format` allocation and emits one expert sub-stack per
+`(layer, family, format)`, with `family ∈ {w13,w2}`. Within a sub-stack expert
+ids are ascending. A mixed family's physical prefix is
+`<legacy-prefix>.format_group_<lowercase-wire-id>`; a one-group family retains
+the legacy prefix, so a single-format layer is byte-identical to an artifact
+exported without the flag. `quant_config.json` then carries:
+
+```
+per_expert_format_groups = {
+  "version": 1,
+  "layers": {"<layer>": {
+    "w13": [{"format_wire_id": str, "expert_ids": [int, ...], "tensor_prefix": str}],
+    "w2":  [{"format_wire_id": str, "expert_ids": [int, ...], "tensor_prefix": str}]
+  }}
+}
+```
+
+The key is omitted for a single-format layer (absence keeps the legacy
+uniform contract). Every family must partition the architecture's expert ids
+exactly once; `artifact_completeness.py` checks gaps/duplicates, referenced and
+unreferenced physical tensors, and the persisted subgroup byte sums. CB
+payload accounting sums physical sub-stacks and charges each sub-stack's
+codebook sidecar once. MXFP4_SOURCE groups keep the checkpoint's verbatim
+per-expert element/scale slices; their entry in this declaration is the sole
+routing authority, so the same expert module is deliberately absent from
+`source_passthrough.units`. This path is opt-in and **PROPOSED**, not production
+eligible until the independently pinned Gridbook consumer reconciles v1 and
+passes load/generation plus served speed/quality gates. Implementation:
+`export_nvfp4_cb_streaming.py`, `cb_export_config.py`, `footprint.py`, and
+`artifact_completeness.py`; CPU contract coverage:
+`tests/test_per_expert_cb_export.py`.
+
 ### 6.3 FP8_SOURCE verbatim, MTP, audits
 
 `_build_fp8_source_map` `:5747-5854`: a tensor qualifies when `<base>.weight` has a sibling
@@ -1209,7 +1243,8 @@ silently corrupts.
 | Invariant | Enforced at | Failure mode |
 |---|---|---|
 | Fused siblings (q/k/v, gate/up) share **one** format | DP aggregation over the intersection of member candidates; legality-aware union-find `promote_serving_units` `allocator_solver.py:302-327` + `_choose_group_format` `:192-231`; hard assert `promote_fused` `:362-406`; export re-check `:7896-7944` | ≥2 quantized schemes → load crash (merged-column scale-shape assert). Quantized + BF16 → **loads and silently corrupts**: measured 4.3× worse served KL on Qwen3.x DeltaNet `in_proj_ba` (0.106 vs 0.025 at matched bpp) |
-| Packed MoE experts uniform per FusedMoE (mix across layers, never within) | pre-DP `aggregate_packed_serving_groups` (§4.5) + the same union-find pass via `profile.packed_expert_format_group`; export raise `:7780-7792` | unservable; the raise names the usual root cause — allocation produced under `DefaultProfile` because the probe lacked `meta['model']` |
+| Packed MoE experts uniform per FusedMoE on released consumer contracts (mix across layers, never within) | pre-DP `aggregate_packed_serving_groups` (§4.5) + the same union-find pass via `profile.packed_expert_format_group`; native export raise `:7780-7792`; streaming CB legacy mode collapses uniformly | released Gridbook versions cannot consume a mixed bank; the opt-in PROPOSED per-expert v1 producer record above is the explicit exception under consumer reconciliation, not a relaxation of released serving invariants |
+| PROPOSED per-expert sub-stacks partition each w13/w2 family exactly | streaming producer split planner + `artifact_completeness.py`; allocator-side bytes via `footprint.per_expert_format_group_payload_breakdown` | a missing/duplicate expert, undeclared tensor, or subgroup-byte mismatch is refused with layer/family/expert ids before the artifact can be treated as complete |
 | A serving-atomic unit is never left **mixed** by promotion or by export coercion | promotion picks the cheapest legal-for-all format ≥ max rank and writes **every** member unconditionally (`allocator_solver.py:192-299`); export coercion resolves whole unioned components, raising when a quantized format is legal for all and coercing the *whole* unit to BF16 only when none is (`:1452-1756`) | previously reachable via the un-aggregated solve path and, silently, via Pareto seed-JSON promotion (which `compute_achieved` never prices); the fused-coherence gate reported it only at the very END of export, and as a wrong-model-profile problem it is not |
 | Incomplete fused groups → BF16 + `ignore` | `allocator.py:1482`; ignore back-fill `:7643-7700` | the fused loader expects all siblings; a missing `v_proj` breaks the merged Linear |
 | Packed `config_groups` use vLLM **canonical** scheme names | `:7980-7994` | no scheme binds to FusedMoE; `w2_input_global_scale` never registers; `load_weights` KeyError |
@@ -1964,6 +1999,10 @@ the out-of-tree plugin — but the gate set is now *declared* (`prismaquant/lane
 re-vet **R16**): same OpenAI endpoint, same endpoint-agnostic `validate_quantized_model`, plus
 the lane-specific prefill perf gate (INV-2). Gates are advisory; the shipcard refuses, and
 `tools/publish_artifact.py` is where that refusal binds (§7.1).
+The pipeline does not enable per-expert split stacks. Direct streaming-export
+invocations may pass `--per-expert-config`; that producer ABI is the PROPOSED
+v1 contract in §6.2 and remains outside production defaults until Gridbook
+reconciliation and serving gates are complete.
 
 **Milestone C is closed (2026-07-30, re-vet R3).** `render_production_weight` /
 `build_production_cache` take `col_weights`, so a `ProductionWeightCache` render of a CB rung

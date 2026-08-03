@@ -105,6 +105,14 @@ _NO_SCALE_PLANE_DTYPE_NAMES = frozenset({"none", ""})
 # which is a different statement from a file written before this key existed.
 SOURCE_PASSTHROUGH_DECLARATION_KEY = "source_passthrough"
 SOURCE_PASSTHROUGH_DECLARATION_VERSION = 1
+
+# PROPOSED cross-repository producer/consumer contract.  The producer emits
+# this only when at least one routed-expert family is split into more than one
+# format subgroup.  Keep the key/version beside ``source_passthrough``: both
+# declarations decide which loader owns expert bytes, and a mixed MXFP4_SOURCE
+# subgroup must be authoritative in exactly one of them.
+PER_EXPERT_FORMAT_GROUPS_KEY = "per_expert_format_groups"
+PER_EXPERT_FORMAT_GROUPS_VERSION = 1
 # The registry-name -> wire-id map, re-exported from the ONE place the
 # passthrough family is declared (``allocator_candidates
 # .SOURCE_PASSTHROUGH_CONTRACTS``). It is hand-pinned there rather than derived
@@ -612,6 +620,7 @@ def build_cb_scheme(
     codebook: object,
     scale_coding: str,
     activation_contract: str | None = None,
+    codebook_source: str | None = None,
 ) -> dict[str, Any]:
     """Build the canonical scheme for one CB target/group.
 
@@ -634,6 +643,15 @@ def build_cb_scheme(
     tensors = _validated_codebook_sequence(fmt, codebook)
     names = _codebook_names_for_count(ref, fmt, len(tensors))
     coding = scale_coding if grid == "fp4" else SCALE_CODING_V1
+    resolved_codebook_source = (
+        str(codebook_source).lower()
+        if codebook_source is not None
+        else ("lattice" if ref == "lattice" else "learned")
+    )
+    if resolved_codebook_source not in {"lattice", "learned"}:
+        raise ValueError(
+            f"unknown codebook_source {resolved_codebook_source!r}"
+        )
     scheme: dict[str, Any] = {
         "grid": grid,
         "mode": mode,
@@ -644,7 +662,7 @@ def build_cb_scheme(
         "n_sub": family.n_sub,
         "type_size": type_size(k, grid, coding),
         "act_bits": 4 if grid == "fp4" else 8,
-        "codebook_source": "lattice" if ref == "lattice" else "learned",
+        "codebook_source": resolved_codebook_source,
         "codebook_ref": list(names) if len(names) > 1 else names[0],
         "codebook_group": None if ref == "lattice" else ref,
     }
@@ -710,6 +728,7 @@ def build_quant_config(
     native_source_target_name: TargetName = _identity_target,
     requant_target_name: TargetName = _identity_target,
     source_passthrough_units: Mapping[str, str] | None = None,
+    per_expert_format_groups: Mapping[str, Any] | None = None,
     route_pending_passthrough_acknowledged: Iterable[str] = (),
     excluded_namespaces: Iterable[str] = (),
     weight_only_stock_targets: Iterable[str] = (),
@@ -785,6 +804,7 @@ def build_quant_config(
             codebook=codebooks[(ref, fmt)],
             scale_coding=scale_coding,
             activation_contract=activation_contract_ref,
+            codebook_source=codebook_source,
         )
         config_groups[f"group_{group_index}"] = {
             "targets": sorted(cb_target_name(qname) for qname in qnames),
@@ -915,6 +935,18 @@ def build_quant_config(
         # failure at the other end, so the producer must never be the one to
         # generate one.
         parse_source_passthrough_declaration(quant_config)
+    if per_expert_format_groups:
+        declaration = deepcopy(dict(per_expert_format_groups))
+        if declaration.get("version") != PER_EXPERT_FORMAT_GROUPS_VERSION:
+            raise ValueError(
+                "per_expert_format_groups must use proposed version 1"
+            )
+        layers = declaration.get("layers")
+        if not isinstance(layers, Mapping) or not layers:
+            raise ValueError(
+                "per_expert_format_groups requires a non-empty layers map"
+            )
+        quant_config[PER_EXPERT_FORMAT_GROUPS_KEY] = declaration
     if activation_execution_contract is not None:
         quant_config["execution_contracts"] = {
             activation_contract_ref: dict(activation_execution_contract),
@@ -933,6 +965,8 @@ __all__ = [
     "SOURCE_PASSTHROUGH_GROUP_FORMAT",
     "SOURCE_PASSTHROUGH_WIRE_FORMATS",
     "SOURCE_PASSTHROUGH_WIRE_IDS",
+    "PER_EXPERT_FORMAT_GROUPS_KEY",
+    "PER_EXPERT_FORMAT_GROUPS_VERSION",
     "PassthroughWire",
     "build_cb_scheme",
     "build_quant_config",
