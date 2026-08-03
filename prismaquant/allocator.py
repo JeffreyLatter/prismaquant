@@ -1609,6 +1609,25 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--probe", required=True, help="sensitivity_probe pickle")
     ap.add_argument("--costs", required=True, help="measure_quant_cost pickle")
+    ap.add_argument(
+        "--accept-research-cost-table",
+        action="store_true",
+        help="Explicitly accept a table stamped as the sanctioned study-grade "
+             "assembled-segments lane. This never weakens production CB "
+             "provenance checks for unstamped tables.",
+    )
+    ap.add_argument(
+        "--research-cost-base",
+        default=None,
+        help="With --accept-research-cost-table, production v2 base pickle "
+             "to assemble into --costs before allocation.",
+    )
+    ap.add_argument(
+        "--research-cost-segments-dir",
+        default=None,
+        help="With --accept-research-cost-table, complete layer_*.pkl store "
+             "to assemble over --research-cost-base before allocation.",
+    )
     ap.add_argument("--model-override", default=None,
                     help="Override the model path stored in probe.pkl's meta. "
                          "Useful when re-running allocator against a probe "
@@ -2062,12 +2081,67 @@ def main():
         raise SystemExit(f"[alloc] ERROR: unknown target profile {target_profile!r}")
     print(f"[alloc] target profile: {target_profile}", flush=True)
 
+    if bool(args.research_cost_base) != bool(args.research_cost_segments_dir):
+        raise SystemExit(
+            "[alloc] ERROR: --research-cost-base and "
+            "--research-cost-segments-dir must be supplied together"
+        )
+    if args.research_cost_base:
+        if not args.accept_research_cost_table:
+            raise SystemExit(
+                "[alloc] ERROR: assembling segmented research costs requires "
+                "--accept-research-cost-table"
+            )
+        from .research_cost_acceptance import assemble_research_cost_table
+        try:
+            _assembled, _manifest = assemble_research_cost_table(
+                args.research_cost_base,
+                args.research_cost_segments_dir,
+                output_path=args.costs,
+            )
+        except ValueError as exc:
+            raise SystemExit(f"[alloc] ERROR: research cost assembly: {exc}") from None
+        print(
+            "[alloc] RESEARCH COST ACCEPTED: assembled "
+            f"{_manifest['assembled_row_count']} rows x "
+            f"{len(_manifest['formats'])} formats from "
+            f"{_manifest['layer_count']} x {_manifest['rows_per_layer']} "
+            f"layer rows -> {args.costs}",
+            flush=True,
+        )
+
     with open(args.probe, "rb") as f:
         probe = pickle.load(f)
     with open(args.costs, "rb") as f:
         cost_data = pickle.load(f)
     validate_probe_payload(probe, args.probe)
     validate_cost_payload(cost_data, args.costs)
+    from .research_cost_acceptance import (
+        accepted_cost_provenance,
+        propagated_cost_provenance,
+    )
+    try:
+        research_cost_provenance = accepted_cost_provenance(cost_data)
+    except ValueError as exc:
+        raise SystemExit(f"[alloc] ERROR: {exc}") from None
+    if research_cost_provenance is not None and not args.accept_research_cost_table:
+        raise SystemExit(
+            "[alloc] ERROR: cost table is research-stamped; pass "
+            "--accept-research-cost-table to acknowledge its study-grade "
+            "assembled provenance"
+        )
+    if args.accept_research_cost_table and research_cost_provenance is None:
+        raise SystemExit(
+            "[alloc] ERROR: --accept-research-cost-table cannot bless an "
+            "unstamped table; assemble it through the sanctioned path first"
+        )
+    if research_cost_provenance is not None:
+        print(
+            "[alloc] RESEARCH COST ACCEPTANCE ACTIVE: production CB reuse, "
+            "serialized-payload, lattice-coverage, and render-scope guards "
+            "remain unchanged outside this exact stamped table",
+            flush=True,
+        )
     stats = probe["stats"]
     costs = cost_data["costs"]
     print(f"[alloc] stats: {len(stats)} Linears, costs: {len(costs)} Linears")
@@ -2214,23 +2288,24 @@ def main():
             f"renderer_abi={cb_serialization_context.renderer_abi}",
             flush=True,
         )
-        try:
-            validate_cb_cost_provenance(
-                cost_data,
-                cb_requested_names,
-                context=cb_serialization_context,
-                where=f"allocator cost cache {args.costs}",
-            )
-            _stored_context, cb_cost_render_identity = (
-                validate_cb_render_provenance(
+        if research_cost_provenance is None:
+            try:
+                validate_cb_cost_provenance(
                     cost_data,
-                    expected_context=cb_serialization_context,
-                    col_weights=cb_col_weights,
+                    cb_requested_names,
+                    context=cb_serialization_context,
                     where=f"allocator cost cache {args.costs}",
                 )
-            )
-        except ValueError as exc:
-            raise SystemExit(f"[alloc] ERROR: {exc}") from None
+                _stored_context, cb_cost_render_identity = (
+                    validate_cb_render_provenance(
+                        cost_data,
+                        expected_context=cb_serialization_context,
+                        col_weights=cb_col_weights,
+                        where=f"allocator cost cache {args.costs}",
+                    )
+                )
+            except ValueError as exc:
+                raise SystemExit(f"[alloc] ERROR: {exc}") from None
     specs_sorted, serialized_rates = _sort_specs_by_serialized_rate(
         specs,
         accounting_stats,
@@ -3221,6 +3296,12 @@ def main():
         if not selected_scope:
             return None
         if cb_cost_render_identity is None or cb_col_weights is None:
+            if research_cost_provenance is not None:
+                # This absence is the exact production guard the explicit
+                # research-cost acceptance acknowledges. Do not fabricate a
+                # render identity; carry the research manifest instead so the
+                # exporter can demand its own independent acknowledgement.
+                return None
             raise RuntimeError(
                 "CB assignment has no validated value-bearing cost render "
                 "identity"
@@ -3960,6 +4041,7 @@ def main():
                  "fits": c["whole_artifact_upper_bound_bytes"] <= budget_bytes}
                 for c in grid
             ],
+            **propagated_cost_provenance(research_cost_provenance),
         }
         sel_path = Path(args.pareto_csv).with_name("selection.json")
         if not sel["feasible"]:
@@ -4638,6 +4720,7 @@ def main():
             "additive_candidate_proposal_then_exact_assignment_filter"
         ),
         "global_optimality_claimed": False,
+        **propagated_cost_provenance(research_cost_provenance),
         "assignment_payload_bits_total": (
             float(final_assignment_payload["bits_total"])
             if not final_assignment_payload["missing_stats_names"]

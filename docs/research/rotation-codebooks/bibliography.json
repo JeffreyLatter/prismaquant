@@ -1,0 +1,258 @@
+[
+  {
+    "title": "QuIP: 2-Bit Quantization of Large Language Models With Guarantees",
+    "url": "https://proceedings.neurips.cc/paper_files/paper/2023/hash/0df38cd13520747e1e64e5b123a78ef8-Abstract-Conference.html",
+    "venue/type": "NeurIPS 2023 conference paper",
+    "year": 2023,
+    "evidence_quality": "peer-reviewed; full text inspected",
+    "one_line_relevance": "Introduces incoherence processing plus LDLQ, proves the GPTQ/OPTQ relationship, and directly ablates rotation and feedback at low bitwidth."
+  },
+  {
+    "title": "QuIP#: Even Better LLM Quantization with Hadamard Incoherence and Lattice Codebooks",
+    "url": "https://proceedings.mlr.press/v235/tseng24a.html",
+    "venue/type": "ICML 2024 conference paper",
+    "year": 2024,
+    "evidence_quality": "peer-reviewed; full text inspected",
+    "one_line_relevance": "Combines randomized Hadamard incoherence, BlockLDLQ, and a fixed E8P lattice codebook with codebook and throughput ablations."
+  },
+  {
+    "title": "QuIP# reference implementation",
+    "url": "https://github.com/Cornell-RelaxML/quip-sharp",
+    "venue/type": "source-code repository",
+    "year": 2024,
+    "evidence_quality": "repository",
+    "one_line_relevance": "Documents the custom CUDA, fast-Hadamard, model-conversion, and inference requirements behind QuIP# results."
+  },
+  {
+    "title": "QTIP: Quantization with Trellises and Incoherence Processing",
+    "url": "https://proceedings.neurips.cc/paper_files/paper/2024/hash/6de2e84b8da47bb2eb5e2ac96c63d2b0-Abstract-Conference.html",
+    "venue/type": "NeurIPS 2024 conference paper",
+    "year": 2024,
+    "evidence_quality": "peer-reviewed; full text inspected",
+    "one_line_relevance": "Extends the QuIP lineage to high-effective-dimensional trellis codes under RHT and BlockLDLQ."
+  },
+  {
+    "title": "QTIP reference implementation",
+    "url": "https://github.com/Cornell-RelaxML/qtip",
+    "venue/type": "source-code repository",
+    "year": 2024,
+    "evidence_quality": "repository",
+    "one_line_relevance": "Shows the custom CUDA trellis decoder, transform dependencies, and tensor-parallel implementation."
+  },
+  {
+    "title": "AQLM: Extreme Compression of Large Language Models via Additive Quantization",
+    "url": "https://proceedings.mlr.press/v235/egiazarian24a.html",
+    "venue/type": "ICML 2024 conference paper",
+    "year": 2024,
+    "evidence_quality": "peer-reviewed; full text inspected",
+    "one_line_relevance": "Primary learned additive-codebook baseline at 2–3 bits without rotation or GPTQ-style sequential compensation."
+  },
+  {
+    "title": "AQLM reference implementation",
+    "url": "https://github.com/vahe1994/AQLM",
+    "venue/type": "source-code repository",
+    "year": 2024,
+    "evidence_quality": "repository",
+    "one_line_relevance": "Documents learned-codebook optimization, CUDA inference, vLLM integration, and published Mixtral checkpoints."
+  },
+  {
+    "title": "GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers",
+    "url": "https://openreview.net/forum?id=tcbBPnfwxS",
+    "venue/type": "ICLR 2023 conference paper",
+    "year": 2023,
+    "evidence_quality": "peer-reviewed; full text inspected",
+    "one_line_relevance": "Canonical practical sequential inverse-Hessian error-compensation method for LLM weights."
+  },
+  {
+    "title": "GPTVQ: The Blessing of Dimensionality for LLM Quantization",
+    "url": "https://arxiv.org/abs/2402.15319",
+    "venue/type": "arXiv/OpenReview preprint",
+    "year": 2024,
+    "evidence_quality": "preprint; full text inspected",
+    "one_line_relevance": "Directly composes learned vector centroids, Hessian-aware assignment, and GPTQ-style feedback."
+  },
+  {
+    "title": "AIMET GPTVQ API documentation",
+    "url": "https://quic.github.io/aimet-pages/releases/1.34.0/torch_docs/gptvq.html",
+    "venue/type": "official software documentation",
+    "year": 2024,
+    "evidence_quality": "repository documentation",
+    "one_line_relevance": "Evidence that GPTVQ is exposed as an implementable quantization workflow rather than only a paper algorithm."
+  },
+  {
+    "title": "VPTQ: Extreme Low-bit Vector Post-Training Quantization for Large Language Models",
+    "url": "https://aclanthology.org/2024.emnlp-main.467/",
+    "venue/type": "EMNLP 2024 conference paper",
+    "year": 2024,
+    "evidence_quality": "peer-reviewed; full text inspected",
+    "one_line_relevance": "Provides the closest controlled learned-VQ ablation of second-order error propagation at 2.02 bpw."
+  },
+  {
+    "title": "VPTQ reference implementation",
+    "url": "https://github.com/microsoft/VPTQ",
+    "venue/type": "source-code repository",
+    "year": 2024,
+    "evidence_quality": "repository",
+    "one_line_relevance": "Documents the available CUDA/ROCm research implementation and serving roadmap."
+  },
+  {
+    "title": "QuaRot: Outlier-Free 4-Bit Inference in Rotated LLMs",
+    "url": "https://proceedings.neurips.cc/paper_files/paper/2024/hash/b5b939436789f76f08b9d0da5e81af7c-Abstract-Conference.html",
+    "venue/type": "NeurIPS 2024 conference paper",
+    "year": 2024,
+    "evidence_quality": "peer-reviewed; full text inspected",
+    "one_line_relevance": "Separates offline-fused and online rotations, measures Hadamard overhead, and ablates rotation with RTN/GPTQ."
+  },
+  {
+    "title": "QuaRot reference implementation",
+    "url": "https://github.com/spcl/QuaRot",
+    "venue/type": "source-code repository",
+    "year": 2024,
+    "evidence_quality": "repository",
+    "one_line_relevance": "Shows the custom CUDA/fast-Hadamard requirements for the published activation-rotation path."
+  },
+  {
+    "title": "SpinQuant: LLM Quantization with Learned Rotations",
+    "url": "https://openreview.net/forum?id=ogO6DGE6FZ",
+    "venue/type": "ICLR 2025 conference paper",
+    "year": 2025,
+    "evidence_quality": "peer-reviewed; full text inspected",
+    "one_line_relevance": "Learns fused residual/value rotations, retains online Hadamards, and measures accuracy and runtime effects."
+  },
+  {
+    "title": "SpinQuant reference implementation",
+    "url": "https://github.com/facebookresearch/SpinQuant",
+    "venue/type": "source-code repository",
+    "year": 2025,
+    "evidence_quality": "repository",
+    "one_line_relevance": "Documents which transforms are fused and the CUDA fast-Hadamard runtime dependency."
+  },
+  {
+    "title": "FlatQuant: Flatness Matters for LLM Quantization",
+    "url": "https://proceedings.mlr.press/v267/sun25l.html",
+    "venue/type": "ICML 2025 conference paper",
+    "year": 2025,
+    "evidence_quality": "peer-reviewed; full text inspected",
+    "one_line_relevance": "Demonstrates learned online affine transforms and explicitly Triton-fused serving kernels."
+  },
+  {
+    "title": "FlatQuant reference implementation",
+    "url": "https://github.com/ruikangliu/FlatQuant",
+    "venue/type": "source-code repository",
+    "year": 2025,
+    "evidence_quality": "repository",
+    "one_line_relevance": "Provides the Triton kernels and implementation details behind FlatQuant's online transformations."
+  },
+  {
+    "title": "Pyramid Vector Quantization for LLMs",
+    "url": "https://arxiv.org/abs/2410.16926",
+    "venue/type": "arXiv preprint",
+    "year": 2024,
+    "evidence_quality": "preprint; full text inspected",
+    "one_line_relevance": "Combines a fixed implicit vector code, Hadamard preprocessing, and GPTQ-style feedback, though without isolating their effects."
+  },
+  {
+    "title": "QAM-W: Joint 2D Codebook Quantization for LLM Weights via Hadamard Rotation and Activation-Aware Scaling",
+    "url": "https://arxiv.org/abs/2605.26339",
+    "venue/type": "arXiv preprint",
+    "year": 2026,
+    "evidence_quality": "preprint; full text inspected",
+    "one_line_relevance": "Uses deterministic Hadamard mixing with a universal small Lloyd code and identifies learned-codebook rotation comparisons as future work."
+  },
+  {
+    "title": "BTC-LLM: Efficient Sub-1-Bit LLM Quantization via Learnable Transformation and Binary Codebook",
+    "url": "https://aclanthology.org/2026.acl-long.1066/",
+    "venue/type": "ACL 2026 conference paper",
+    "year": 2026,
+    "evidence_quality": "peer-reviewed; full text inspected",
+    "one_line_relevance": "Directly ablates a learned codebook with and without a learned transform, albeit sub-1-bit and requiring online activation transforms."
+  },
+  {
+    "title": "AAAC: Activation-Aware Adaptive Codebooks for 4-bit LLM Weight Quantization",
+    "url": "https://arxiv.org/abs/2605.08692",
+    "venue/type": "arXiv preprint / workshop paper",
+    "year": 2026,
+    "evidence_quality": "preprint; full text inspected",
+    "one_line_relevance": "Recent learned codebook method using activation-aware weighting without rotation or sequential compensation."
+  },
+  {
+    "title": "llama.cpp quantize README",
+    "url": "https://github.com/ggml-org/llama.cpp/blob/master/tools/quantize/README.md",
+    "venue/type": "source-code repository documentation",
+    "year": 2026,
+    "evidence_quality": "repository documentation; rolling version",
+    "one_line_relevance": "Documents current K/IQ quantization choices and the imatrix option in llama.cpp."
+  },
+  {
+    "title": "llama.cpp tensor encoding schemes",
+    "url": "https://github.com/ggml-org/llama.cpp/wiki/Tensor-Encoding-Schemes",
+    "venue/type": "repository wiki",
+    "year": 2026,
+    "evidence_quality": "repository documentation; rolling version",
+    "one_line_relevance": "Describes the fixed GGUF tensor layouts used by K and IQ quantization families."
+  },
+  {
+    "title": "llama.cpp importance matrix derivation",
+    "url": "https://github.com/ggml-org/llama.cpp/discussions/5263",
+    "venue/type": "maintainer community discussion",
+    "year": 2024,
+    "evidence_quality": "community",
+    "one_line_relevance": "Explains the diagonal activation-second-moment weighting used by the imatrix quantization path."
+  },
+  {
+    "title": "llama.cpp imatrix data comparison",
+    "url": "https://github.com/ggml-org/llama.cpp/discussions/5006",
+    "venue/type": "community experiment",
+    "year": 2024,
+    "evidence_quality": "community",
+    "one_line_relevance": "Provides an operational but non-peer-reviewed perplexity comparison for K-quant with and without imatrix data."
+  },
+  {
+    "title": "LLM Compressor",
+    "url": "https://github.com/vllm-project/llm-compressor",
+    "venue/type": "source-code repository",
+    "year": 2026,
+    "evidence_quality": "official repository; rolling version",
+    "one_line_relevance": "Current implementation evidence for GPTQ, imatrix, rotation modifiers, and fixed low-precision formats in the vLLM ecosystem."
+  },
+  {
+    "title": "LLM Compressor imatrix example",
+    "url": "https://docs.vllm.ai/projects/llm-compressor/en/latest/examples/imatrix/",
+    "venue/type": "official software documentation",
+    "year": 2026,
+    "evidence_quality": "official documentation; measured example",
+    "one_line_relevance": "Matched scalar 4-bit comparison of RTN, GPTQ, diagonal imatrix weighting, and their combination."
+  },
+  {
+    "title": "LLM Compressor SpinQuant modifier documentation",
+    "url": "https://docs.vllm.ai/projects/llm-compressor/en/0.9.0/reference/llmcompressor/modifiers/transform/spinquant/base/",
+    "venue/type": "official software documentation",
+    "year": 2025,
+    "evidence_quality": "official versioned documentation",
+    "one_line_relevance": "Documents the exposed rotation types and their fused versus online roles in LLM Compressor."
+  },
+  {
+    "title": "NVIDIA Model Optimizer",
+    "url": "https://github.com/NVIDIA/Model-Optimizer",
+    "venue/type": "source-code repository",
+    "year": 2026,
+    "evidence_quality": "official repository; rolling version",
+    "one_line_relevance": "Implementation evidence for fixed FP/INT formats, GPTQ/local-Hessian algorithms, and deployment integrations."
+  },
+  {
+    "title": "NVIDIA Model Optimizer quantization recipes",
+    "url": "https://nvidia.github.io/Model-Optimizer/guides/10_recipes.html",
+    "venue/type": "official software documentation",
+    "year": 2026,
+    "evidence_quality": "official documentation; rolling version",
+    "one_line_relevance": "Documents practical GPTQ, NVFP4/FP8, MoE, calibration, and deployment recipe coverage."
+  },
+  {
+    "title": "NVIDIA Model Optimizer quantization configuration",
+    "url": "https://nvidia.github.io/Model-Optimizer/guides/_quant_cfg.html",
+    "venue/type": "official software documentation",
+    "year": 2026,
+    "evidence_quality": "official documentation; rolling version",
+    "one_line_relevance": "Documents the Hadamard rotation configuration exposed for QuaRot/SpinQuant-style quantization."
+  }
+]

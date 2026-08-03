@@ -1,0 +1,319 @@
+{
+  "schema": "prismaquant.research_accepted_allocation_grid.v1",
+  "oldmenu_baselines": {
+    "b-92": 5376.61,
+    "c-92": 1325.83
+  },
+  "mtp_bytes_released_in_c": 10862838300,
+  "cells": {
+    "b-92": {
+      "predicted_dloss": 932.9353603732438,
+      "versus_oldmenu_92": -4443.674639626755,
+      "achieved_bits": 2.16453671729681,
+      "reported_artifact_gb": 91.839340412,
+      "effective_selection_gb": 91.839340412,
+      "byte_gate_passed": true,
+      "selection_headroom_gb": 0.160659588,
+      "expert_map": {
+        "MXFP4_SOURCE": [
+          3,
+          4,
+          5,
+          39
+        ],
+        "NVFP4_CB_K12": [
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          27,
+          28,
+          31,
+          33,
+          36
+        ],
+        "NVFP4_CB_K13": [
+          6,
+          7,
+          26,
+          29,
+          30,
+          32,
+          37,
+          41
+        ],
+        "NVFP4_CB_K14": [
+          0
+        ],
+        "NVFP4_CB_K16": [
+          1
+        ],
+        "NVFP4_CB_K17": [
+          2,
+          8,
+          35,
+          40,
+          42
+        ],
+        "NVFP4_CB_K18": [
+          34,
+          38
+        ]
+      },
+      "body_split": {
+        "NVFP4_CB_K12": 252,
+        "FP8_BLOCK_UE8M0_SOURCE": 30,
+        "FP8_CB_K36": 14,
+        "NVFP4_CB_K17": 4,
+        "NVFP4_CB_K18": 1
+      },
+      "cost_provenance": "research_assembled_segments_user_accepted_2026-08-03",
+      "marginal_shave_price_to_88": {
+        "dloss": 550.8351092834498,
+        "achieved_gb_freed": 3.8776769480000013,
+        "dloss_per_gb_freed": 142.05286223432185
+      }
+    },
+    "b-88": {
+      "predicted_dloss": 1483.7704696566936,
+      "versus_oldmenu_92": -3892.8395303433063,
+      "achieved_bits": 2.054243736910187,
+      "reported_artifact_gb": 87.961663464,
+      "effective_selection_gb": 87.961663464,
+      "byte_gate_passed": true,
+      "selection_headroom_gb": 0.038336536,
+      "expert_map": {
+        "MXFP4_SOURCE": [
+          3,
+          4,
+          39
+        ],
+        "NVFP4_CB_K12": [
+          0,
+          1,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          27,
+          28,
+          31,
+          33,
+          36
+        ],
+        "NVFP4_CB_K13": [
+          6,
+          7,
+          8,
+          26,
+          29,
+          30,
+          32,
+          35,
+          37,
+          40,
+          41,
+          42
+        ],
+        "NVFP4_CB_K17": [
+          2,
+          5,
+          34,
+          38
+        ]
+      },
+      "body_split": {
+        "NVFP4_CB_K12": 246,
+        "FP8_BLOCK_UE8M0_SOURCE": 33,
+        "FP8_CB_K36": 16,
+        "NVFP4_CB_K17": 5,
+        "NVFP4_CB_K18": 1
+      },
+      "cost_provenance": "research_assembled_segments_user_accepted_2026-08-03",
+      "marginal_shave_price_from_92": {
+        "dloss": 550.8351092834498,
+        "achieved_gb_freed": 3.8776769480000013,
+        "dloss_per_gb_freed": 142.05286223432185
+      }
+    },
+    "c-92": {
+      "predicted_dloss": 286.2225950857798,
+      "versus_oldmenu_92": -1039.60740491422,
+      "achieved_bits": 2.4774920623987957,
+      "reported_artifact_gb": 91.97937576000001,
+      "effective_selection_gb": 102.84221406,
+      "byte_gate_passed": true,
+      "selection_headroom_gb": 0.02062424,
+      "expert_map": {
+        "MXFP4_SOURCE": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          8,
+          34,
+          38,
+          39
+        ],
+        "NVFP4_CB_K12": [
+          9,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          23,
+          24,
+          25,
+          27,
+          28
+        ],
+        "NVFP4_CB_K13": [
+          10,
+          11,
+          22,
+          26,
+          29,
+          31,
+          32,
+          33,
+          36,
+          37,
+          41
+        ],
+        "NVFP4_CB_K17": [
+          6,
+          7,
+          30,
+          35,
+          40,
+          42
+        ]
+      },
+      "body_split": {
+        "NVFP4_CB_K12": 229,
+        "FP8_BLOCK_UE8M0_SOURCE": 36,
+        "FP8_CB_K36": 28,
+        "NVFP4_CB_K17": 7,
+        "NVFP4_CB_K18": 1
+      },
+      "cost_provenance": "research_assembled_segments_user_accepted_2026-08-03",
+      "marginal_shave_price_to_88": {
+        "dloss": 123.21670998997644,
+        "achieved_gb_freed": 4.081633196000013,
+        "dloss_per_gb_freed": 30.18808993192441
+      }
+    },
+    "c-88": {
+      "predicted_dloss": 409.43930507575624,
+      "versus_oldmenu_92": -916.3906949242437,
+      "achieved_bits": 2.3613979431442234,
+      "reported_artifact_gb": 87.897742564,
+      "effective_selection_gb": 98.760580864,
+      "byte_gate_passed": true,
+      "selection_headroom_gb": 0.102257436,
+      "expert_map": {
+        "MXFP4_SOURCE": [
+          2,
+          3,
+          4,
+          5,
+          34,
+          38,
+          39
+        ],
+        "NVFP4_CB_K12": [
+          9,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          23,
+          24,
+          25,
+          27,
+          28
+        ],
+        "NVFP4_CB_K13": [
+          10,
+          11,
+          22,
+          26,
+          29,
+          31,
+          32,
+          33,
+          37,
+          41
+        ],
+        "NVFP4_CB_K14": [
+          36
+        ],
+        "NVFP4_CB_K17": [
+          6,
+          7,
+          8,
+          30,
+          35,
+          40,
+          42
+        ],
+        "NVFP4_CB_K18": [
+          0,
+          1
+        ]
+      },
+      "body_split": {
+        "NVFP4_CB_K12": 214,
+        "FP8_BLOCK_UE8M0_SOURCE": 40,
+        "FP8_CB_K36": 35,
+        "NVFP4_CB_K17": 12
+      },
+      "cost_provenance": "research_assembled_segments_user_accepted_2026-08-03",
+      "marginal_shave_price_from_92": {
+        "dloss": 123.21670998997644,
+        "achieved_gb_freed": 4.081633196000013,
+        "dloss_per_gb_freed": 30.18808993192441
+      }
+    }
+  }
+}

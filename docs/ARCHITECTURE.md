@@ -1,7 +1,7 @@
 # PrismaQuant Architecture
 
-As of: 2026-08-03 · branch `release/prismaquant-0.8.0` · verified against implementation
-baseline commit `7183d21`, with the external Gridbook runtime pinned to
+As of: 2026-08-03 · branch `feat/research-grade-cost-acceptance` · verified against implementation
+baseline commit `11c61b9`, with the external Gridbook runtime pinned to
 `9011a19228ddb96b8a49e11a20ac75c99c83998e` (v0.8.0). This branch ports the dated
 2026-08-01 DeepSeek-V4-Flash-0731 92 GB study record (§9.2) forward from its 0.5.1
 working tree; the study's Gridbook-candidate claims were **not** carried over, because
@@ -472,6 +472,16 @@ naming both modes; an unstamped (pre-R2) table warns and is reused, never invali
 other modes `cost_baseline.pkl` is mode-agnostic on purpose and is shared across mode changes.
 This is re-vet **R2 precondition (i)** — the prerequisite to flipping the `COST_MODE` default,
 which is *not* done here.
+
+**Sanctioned study-grade assembly (opt-in, 2026-08-03).** The production guards above and the
+CB shard/serialized-payload/lattice/render-scope gates remain fail-closed. For the explicitly
+user-accepted DSv4 learning experiment, `allocator --accept-research-cost-table` may assemble a
+complete `layer_*.pkl` store over a production base when both `--research-cost-base` and
+`--research-cost-segments-dir` are supplied. `research_cost_acceptance.py` verifies layer ids,
+row keying/counts, source hashes and overlap precedence, then stamps
+`cost_provenance="research_assembled_segments_user_accepted_2026-08-03"` plus its manifest.
+The stamp travels into `selection.json` and the reserved layer-config metadata. A stamped table
+is refused without the allocator flag; an unstamped table cannot be blessed by the flag.
 
 ### 3.5 Archived modes — the eleven `exit 2` gates
 
@@ -1113,6 +1123,14 @@ budget it was selected under and leaving the artifact's real bpp disagreeing wit
 profile (`:1548`, `:1574-1589`), with the wrong-container cases (`nvfp4_cb`, GGUF) called out
 by name. The *legitimate* coercion is deliberately kept: a format the exporter can emit but
 which is shape-illegal or profile-denied still falls back to BF16 and is still audited.
+
+**Research-cost ship refusal.** Every exporter reads the reserved layer-config metadata and
+refuses a selection carrying the sanctioned study-grade cost stamp unless the operator passes
+the separate `--allow-research-cost-selection` acknowledgement. This is independent of the
+allocator-side acceptance: allocating a learning experiment does not silently authorize
+shipping it. CB artifacts record the manifest and acknowledgement in `quant_config.json`;
+GGUF records it in metadata. Unstamped production selections follow the existing gates
+unchanged (`research_cost_acceptance.enforce_research_export_acknowledgement`).
 
 **M19 — export honours the render's scale rule.** `_export_match_render_scale_rule`
 `:2130-2147` reads the cache's `levers["nvfp4_scale_rule"]` and re-derives NVFP4 codes under
@@ -1959,7 +1977,18 @@ from the same activation cache the cost stage used (`:1549-1582`; REQUIRED for e
 exceeds `EXPORT_STREAMING_THRESHOLD_GB` (80) — non-streaming goes resident and OOMs the box on
 200–300B sources. Encoder tiers `PRISMAQUANT_CB_ENCODE_TIER ∈ {fast, balanced, max}`, default
 `balanced` (`nvfp4_cb_formats.py:128-141`); `max` is bit-identical to the pre-tier encoder and
-is the regression anchor. There is no in-lane serving smoke — CB artifacts serve only through
+is the regression anchor. Cost measurement can opt into atomic, content-keyed scale-search
+sidecars with `PRISMAQUANT_CB_WARM_STATE_DIR`; streaming export consumes them through
+`--warm-state-dir` and verifies a deterministic random sample through
+`--warm-verify-sample` (default 32). `cb_warm_state.py` accepts a record only when its format,
+exact source/imatrix value digests, initializer identity, and full serialization context all
+match; anything absent, corrupt, or stale falls back to a full encode. Sampled units also run
+that full encode and require exact selected-scale and rendered-byte equality, failing the
+transactional export closed on any difference. The quantization config provenance records
+`encoder_warm_start.{warm_used,cold_fallback,verified_n}`. This changes no format or encoding
+semantics; it only skips a repeated scale sweep whose result was already measured
+(`cb_warm_state.py`, `measure_quant_cost.py`, `export_nvfp4_cb_streaming.py`). There is no
+in-lane serving smoke — CB artifacts serve only through
 the out-of-tree plugin — but the gate set is now *declared* (`prismaquant/lane_specs/nvfp4_cb.json`,
 re-vet **R16**): same OpenAI endpoint, same endpoint-agnostic `validate_quantized_model`, plus
 the lane-specific prefill perf gate (INV-2). Gates are advisory; the shipcard refuses, and
