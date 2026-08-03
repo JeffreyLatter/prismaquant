@@ -7,12 +7,54 @@ import pytest
 import torch
 
 from prismaquant.rotation_ldlq_pilot import (
+    activation_row_split_indices,
     block_error_feedback,
+    compare_output_sse,
     inverse_hessian_cholesky,
     random_hadamard_signs,
     randomized_hadamard_right,
     relative_frobenius_gap,
 )
+
+
+def test_activation_row_split_is_deterministic_disjoint_and_nested():
+    cal32, holdout32 = activation_row_split_indices(64, cal_rows=32, seed=17)
+    repeated, _ = activation_row_split_indices(64, cal_rows=32, seed=17)
+    cal16, _remainder = activation_row_split_indices(64, cal_rows=16, seed=17)
+
+    assert torch.equal(cal32, repeated)
+    assert torch.equal(cal16, cal32[:16])
+    assert len(cal32) == len(holdout32) == 32
+    assert set(cal32.tolist()).isdisjoint(holdout32.tolist())
+    assert sorted(torch.cat((cal32, holdout32)).tolist()) == list(range(64))
+    assert not torch.equal(
+        cal32,
+        activation_row_split_indices(64, cal_rows=32, seed=18)[0],
+    )
+
+
+@pytest.mark.parametrize("row_count,cal_rows", [(1, 0), (8, 0), (8, 8), (8, 9)])
+def test_activation_row_split_rejects_empty_or_overlapping_partitions(
+    row_count, cal_rows
+):
+    with pytest.raises(ValueError):
+        activation_row_split_indices(row_count, cal_rows=cal_rows, seed=0)
+
+
+def test_compare_output_sse_matches_direct_frobenius_objective():
+    x = torch.tensor([[1.0, 2.0], [-1.0, 3.0]], dtype=torch.float64)
+    weight = torch.tensor([[2.0, -1.0], [0.5, 4.0]], dtype=torch.float64)
+    plain = weight + torch.tensor([[1.0, 0.0], [0.0, -2.0]])
+    feedback = weight + torch.tensor([[0.5, 0.0], [0.0, -1.0]])
+
+    result = compare_output_sse(x, weight, plain, feedback)
+    expected_plain = float((x @ (weight - plain).T).square().sum())
+    expected_feedback = float((x @ (weight - feedback).T).square().sum())
+
+    assert result["plain_sse"] == pytest.approx(expected_plain)
+    assert result["feedback_sse"] == pytest.approx(expected_feedback)
+    assert result["feedback_over_plain_ratio"] == pytest.approx(0.25)
+    assert result["reduction"] == pytest.approx(0.75)
 
 
 def test_randomized_hadamard_preserves_linear_identity():

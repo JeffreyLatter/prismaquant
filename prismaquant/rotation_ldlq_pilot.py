@@ -12,6 +12,53 @@ from collections.abc import Callable
 import torch
 
 from .cb_layout import FP4_GROUP, VEC_DIM
+from .row_dispersion import per_row_error
+
+
+def activation_row_split_indices(
+    row_count: int,
+    *,
+    cal_rows: int,
+    seed: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return deterministic, disjoint CAL and HOLDOUT row indices.
+
+    The permutation is generated on CPU so a split is identical regardless of
+    the device used for the experiment.  Asking for CAL16 and CAL32 with the
+    same ``row_count`` and ``seed`` makes CAL16 a prefix (and therefore a
+    subset) of CAL32, which supports a controlled calibration-size probe.
+    """
+    row_count = int(row_count)
+    cal_rows = int(cal_rows)
+    if row_count < 2:
+        raise ValueError(f"row_count must be at least 2, got {row_count}")
+    if not 0 < cal_rows < row_count:
+        raise ValueError(
+            f"cal_rows must lie strictly between 0 and {row_count}, got {cal_rows}"
+        )
+    generator = torch.Generator(device="cpu").manual_seed(int(seed))
+    permutation = torch.randperm(row_count, generator=generator)
+    return permutation[:cal_rows].clone(), permutation[cal_rows:].clone()
+
+
+def compare_output_sse(
+    activations: torch.Tensor,
+    weight: torch.Tensor,
+    plain: torch.Tensor,
+    feedback: torch.Tensor,
+) -> dict[str, float]:
+    """Evaluate plain and feedback reconstructions on one activation split."""
+    plain_sse = float(per_row_error(activations, weight, plain).sum())
+    feedback_sse = float(per_row_error(activations, weight, feedback).sum())
+    if plain_sse <= 0.0:
+        raise ValueError(f"plain output SSE must be positive, got {plain_sse}")
+    ratio = feedback_sse / plain_sse
+    return {
+        "plain_sse": plain_sse,
+        "feedback_sse": feedback_sse,
+        "feedback_over_plain_ratio": ratio,
+        "reduction": 1.0 - ratio,
+    }
 
 
 def random_hadamard_signs(
@@ -232,7 +279,9 @@ def reassign_product_cb(
 
 
 __all__ = [
+    "activation_row_split_indices",
     "block_error_feedback",
+    "compare_output_sse",
     "inverse_hessian_cholesky",
     "product_cb_quantize_block",
     "random_hadamard_signs",
