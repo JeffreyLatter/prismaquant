@@ -1286,7 +1286,7 @@ def _e8m0_plane(shape, generator) -> torch.Tensor:
 
 
 def _dsv4_source_model(mdl: Path, *, mxfp4_layers=(1,), cb_layers=(0,),
-                       dense_ue8m0=True, seed=5) -> dict:
+                       dense_ue8m0=True, floor_fp8=False, seed=5) -> dict:
     """A DSv4-Flash-shaped checkpoint at 1/1000 scale, in its own namespace.
 
     Routed experts are nibble-packed MXFP4 (`.weight` I8 + `.scale` F8_E8M0)
@@ -1313,6 +1313,16 @@ def _dsv4_source_model(mdl: Path, *, mxfp4_layers=(1,), cb_layers=(0,),
             torch.randn(hid, hid, generator=generator) * 0.3
         ).to(torch.float8_e4m3fn)
         tensors["layers.0.attn.wq_a.scale"] = _e8m0_plane((2, 2), generator)
+    if floor_fp8:
+        # THE wo_a SHAPE: a block-FP8 body Linear the recipe never mentions.
+        # Identical on disk to the `dense_ue8m0` unit above — element plane
+        # plus UE8M0 scale plane — and different only in that no allocation
+        # target claims it, which is precisely the distinction that used to
+        # cost it its scale plane and earn it an `ignore` entry.
+        tensors["layers.0.attn.wo_a.weight"] = (
+            torch.randn(hid, hid, generator=generator) * 0.3
+        ).to(torch.float8_e4m3fn)
+        tensors["layers.0.attn.wo_a.scale"] = _e8m0_plane((2, 2), generator)
     tensors["norm.weight"] = torch.ones(hid, dtype=torch.bfloat16)
     save_file(tensors, str(mdl / "model.safetensors"))
     (mdl / "config.json").write_text(json.dumps({
@@ -1329,7 +1339,8 @@ def _dsv4_source_model(mdl: Path, *, mxfp4_layers=(1,), cb_layers=(0,),
     return tensors
 
 
-def _dsv4_recipe(*, mxfp4_layers=(1,), cb_layers=(0,), dense_ue8m0=True):
+def _dsv4_recipe(*, mxfp4_layers=(1,), cb_layers=(0,), dense_ue8m0=True,
+                 floor_fp8=False):
     """Expanded per-tensor assignment + col_weights, as the allocator writes it."""
     assignment: dict[str, object] = {}
     col_weights: dict[str, torch.Tensor] = {}
@@ -1346,6 +1357,8 @@ def _dsv4_recipe(*, mxfp4_layers=(1,), cb_layers=(0,), dense_ue8m0=True):
                             _SOURCE_HID, generator=generator) + 0.05
     if dense_ue8m0:
         assignment["model.layers.0.self_attn.wq_a"] = _UE8M0_RECIPE
+    # `floor_fp8` is deliberately NOT given an assignment entry: the whole
+    # point of that fixture arm is a unit the recipe never mentions.
     return assignment, col_weights
 
 
@@ -1370,6 +1383,13 @@ def _export_dsv4(workdir, out_name="out", **model_kwargs):
     counts = export_nvfp4_cb_streaming(
         mdl, path, out, col_weights, device="cpu",
         allow_route_pending_passthrough=True)
+    # Every DSv4 artifact these tests produce goes through the completeness
+    # gate, so a future change that drops a scale plane or mislabels a unit
+    # fails in whichever test produced it rather than only in the one test
+    # written to look for that.
+    from prismaquant.artifact_completeness import assert_artifact_complete
+
+    assert_artifact_complete(out)
     return mdl, out, tensors, dict(counts)
 
 
@@ -1468,7 +1488,14 @@ def test_cb_expert_layer_beside_a_passthrough_layer_keeps_its_gates(workdir):
         mxfp4_layers=(), cb_layers=(0,), dense_ue8m0=False)
     path = workdir / "cb_only.json"
     _assign(path, assignment)
-    export_nvfp4_cb_streaming(mdl, path, reference, col_weights, device="cpu")
+    # The recipe drops `wq_a`, but the SOURCE still has it — so in this export
+    # it is a floor block-FP8 unit and needs the same acknowledgement any
+    # route-pending passthrough does. Before floor units were declared, this
+    # call silently produced a reference artifact with `wq_a`'s scale plane
+    # dropped and the unit listed in `ignore`; the comparison below still
+    # passed because it only reads the CB tensors.
+    export_nvfp4_cb_streaming(mdl, path, reference, col_weights, device="cpu",
+                              allow_route_pending_passthrough=True)
 
     mixed_tensors = load_file(str(out / "model.safetensors"))
     cb_only_tensors = load_file(str(reference / "model.safetensors"))
@@ -1982,3 +2009,330 @@ def test_mxfp8_requant_declaration_parses_on_the_producer_side(workdir):
     config = json.loads((out / "quant_config.json").read_text())
     parsed = parse_source_passthrough_declaration(config)
     assert parsed["model.layers.0.self_attn.wq_a"] == "mxfp8_e4m3_e8m0_g32"
+
+
+# --- floor block-FP8: units the recipe never allocated ----------------------
+#
+# The bug these pin, stated once: a block-FP8 weight that no allocation target
+# claims used to reach the verbatim copy loop, lose its `.scale` sibling to a
+# skip meant for scales the CB/source lanes had already consumed, and be
+# declared `ignore` — i.e. "plain unquantized floats". A consumer honouring
+# that casts fp8 to bf16 with no scale, passes every size check, and serves
+# weights each off by their own power of two. On DSv4-Flash: 43 `attn.wo_a` +
+# 21 `attn.indexer.wq_b` units, 1.44 GB, no error raised anywhere.
+
+
+def test_floor_block_fp8_ships_its_scale_and_is_declared_not_ignored(workdir):
+    """Weight AND scale present, declared passthrough, absent from `ignore`."""
+    mdl, out, tensors, counts = _export_dsv4(workdir, floor_fp8=True)
+
+    header = _assert_offsets_consistent(out / "model.safetensors")
+    quant_config = json.loads((out / "quant_config.json").read_text())
+
+    unit = "layers.0.attn.wo_a"
+    # (a) BOTH planes ship, byte-for-byte. A weight without its scale is not a
+    #     smaller artifact, it is an unreadable one.
+    for plane in ("weight", "scale"):
+        name = f"{unit}.{plane}"
+        assert name in header, f"{name} missing from the artifact"
+        assert header[name]["dtype"] == \
+            _st_header(mdl / "model.safetensors")[0][name]["dtype"], name
+        assert hashlib.sha256(_emitted_bytes(out, name)).hexdigest() == \
+            hashlib.sha256(_source_bytes(mdl, name)).hexdigest(), name
+
+    # (b) declared under the wire id the consumer routes on.
+    declared = (quant_config.get("source_passthrough") or {}).get("units") or {}
+    assert declared.get(unit) == "fp8_e4m3_ue8m0_block128", declared
+
+    # (c) and NOT claimed to be unquantized. This is the assertion that would
+    #     have caught the original bug on its own.
+    assert unit not in (quant_config.get("ignore") or []), \
+        "a declared block-FP8 unit must not also be listed in `ignore`"
+
+    assert counts["floor_fp8_declared"] == 1
+
+
+def test_floor_block_fp8_declaration_survives_the_completeness_gate(workdir):
+    from prismaquant.artifact_completeness import assert_artifact_complete
+
+    _, out, _, _ = _export_dsv4(workdir, floor_fp8=True)
+    report = assert_artifact_complete(out)
+    assert "layers.0.attn.wo_a" in report.passthrough_units
+    # Route-pending is an honest recorded state, not a reason to fail: the
+    # producer said out loud which lane it shipped into.
+    assert report.route_pending_acknowledged
+
+
+def test_completeness_gate_catches_the_original_silent_corruption(workdir):
+    """The regression pin: reproduce the OLD artifact shape, demand a failure.
+
+    Built by editing a healthy artifact back into the broken state (drop the
+    scale plane, move the unit from the declaration into `ignore`) rather than
+    by reverting the exporter, so the gate is tested against the artifact the
+    bug actually produced.
+    """
+    from prismaquant.artifact_completeness import (
+        ArtifactIncomplete,
+        check_artifact_completeness,
+    )
+
+    _, out, _, _ = _export_dsv4(workdir, floor_fp8=True)
+    unit = "layers.0.attn.wo_a"
+
+    quant_config = json.loads((out / "quant_config.json").read_text())
+    quant_config["source_passthrough"]["units"].pop(unit)
+    quant_config.setdefault("ignore", []).append(unit)
+    (out / "quant_config.json").write_text(json.dumps(quant_config))
+
+    # Drop the scale plane exactly as the old skip did.
+    tensors = load_file(str(out / "model.safetensors"))
+    tensors.pop(f"{unit}.scale")
+    save_file(tensors, str(out / "model.safetensors"))
+
+    report = check_artifact_completeness(out)
+    assert not report.ok
+    assert unit in report.fp8_in_ignore
+    with pytest.raises(ArtifactIncomplete, match="ignore"):
+        from prismaquant.artifact_completeness import assert_artifact_complete
+        assert_artifact_complete(out)
+
+
+def test_completeness_gate_catches_a_declared_unit_with_no_scale(workdir):
+    """Declaring a decode the artifact cannot perform is its own failure."""
+    from prismaquant.artifact_completeness import check_artifact_completeness
+
+    _, out, _, _ = _export_dsv4(workdir, floor_fp8=True)
+    tensors = load_file(str(out / "model.safetensors"))
+    tensors.pop("layers.0.attn.wo_a.scale")
+    save_file(tensors, str(out / "model.safetensors"))
+
+    report = check_artifact_completeness(out)
+    assert not report.ok
+    assert "layers.0.attn.wo_a" in report.missing_scale
+
+
+def test_completeness_gate_passes_a_healthy_artifact_without_floor_units(
+        workdir):
+    """No false positives on the shape the exporter already produced."""
+    from prismaquant.artifact_completeness import assert_artifact_complete
+
+    _, out, _, _ = _export_dsv4(workdir)
+    assert_artifact_complete(out)
+
+
+def test_floor_block_fp8_scale_bytes_are_a_negligible_budget_delta(workdir):
+    """Item 4: declaring the floor costs the scale planes and nothing else.
+
+    Block-128 means one scale byte per 16,384 weight elements, so the fix
+    cannot plausibly move a byte budget — but "cannot plausibly" is exactly
+    the kind of claim that should be measured against the artifact rather
+    than argued, since it is what stands between the fix and the 1.06 MB of
+    headroom tonight's 92 GB selection actually has.
+    """
+    _, out_declared, _, _ = _export_dsv4(
+        workdir, out_name="declared", floor_fp8=True)
+    header = _assert_offsets_consistent(out_declared / "model.safetensors")
+
+    weight = header["layers.0.attn.wo_a.weight"]
+    scale = header["layers.0.attn.wo_a.scale"]
+
+    def _nbytes(meta):
+        lo, hi = meta["data_offsets"]
+        return hi - lo
+
+    weight_bytes, scale_bytes = _nbytes(weight), _nbytes(scale)
+    elements = 1
+    for dim in weight["shape"]:
+        elements *= dim
+    # One E8M0 byte per 128x128 block.
+    assert scale_bytes * (128 * 128) == elements
+    assert scale_bytes / weight_bytes < 1e-3, (
+        f"scale plane is {scale_bytes}B against a {weight_bytes}B weight; "
+        f"block-128 should make it ~1/16384 of the element plane")
+
+
+def test_route_pending_ack_env_defaults_off_and_needs_exactly_one(monkeypatch):
+    """The acknowledgement must never be ambient."""
+    from prismaquant.export_nvfp4_cb_streaming import (
+        _ROUTE_PENDING_ACK_ENV,
+        _route_pending_ack_from_env,
+    )
+
+    monkeypatch.delenv(_ROUTE_PENDING_ACK_ENV, raising=False)
+    assert _route_pending_ack_from_env() is False
+    for value in ("0", "", "true", "yes", "TRUE", "2"):
+        monkeypatch.setenv(_ROUTE_PENDING_ACK_ENV, value)
+        assert _route_pending_ack_from_env() is False, value
+    monkeypatch.setenv(_ROUTE_PENDING_ACK_ENV, "1")
+    assert _route_pending_ack_from_env() is True
+
+
+def test_floor_block_fp8_refuses_to_ship_unacknowledged(workdir):
+    """Without the acknowledgement the export STOPS — it does not ship plainly.
+
+    The asymmetry worth pinning: for an allocated rung, refusing means the DP
+    picks something else. For a floor unit there is no something else, so the
+    refusal has to be loud rather than a quiet downgrade to `ignore`.
+    """
+    mdl = workdir / "src"
+    _dsv4_source_model(mdl, floor_fp8=True)
+    assignment, col_weights = _dsv4_recipe(floor_fp8=True)
+    path = workdir / "recipe.json"
+    _assign(path, assignment)
+
+    with pytest.raises(ValueError, match="route-pending source passthrough"):
+        export_nvfp4_cb_streaming(
+            mdl, path, workdir / "refused", col_weights, device="cpu",
+            allow_route_pending_passthrough=False)
+
+
+# --- namespace exclusion: omitting a floor namespace entirely ---------------
+
+
+def _dsv4_source_with_mtp(mdl: Path, **kwargs) -> dict:
+    """The DSv4 fixture plus an `mtp.*` block, so exclusion has a target."""
+    tensors = _dsv4_source_model(mdl, **kwargs)
+    generator = torch.Generator().manual_seed(77)
+    hid = _SOURCE_HID
+    extra = {
+        "mtp.0.attn.wq_a.weight": (
+            torch.randn(hid, hid, generator=generator) * 0.3
+        ).to(torch.float8_e4m3fn),
+        "mtp.0.attn.wq_a.scale": _e8m0_plane((2, 2), generator),
+        "mtp.0.attn_norm.weight": torch.ones(hid, dtype=torch.bfloat16),
+    }
+    for expert in range(_SOURCE_EXPERTS):
+        for leaf in ("w1", "w3", "w2"):
+            base = f"mtp.0.ffn.experts.{expert}.{leaf}"
+            extra[base + ".weight"] = torch.randint(
+                -128, 128, (hid, hid // 2), dtype=torch.int8,
+                generator=generator)
+            extra[base + ".scale"] = _e8m0_plane((hid, hid // 32), generator)
+    tensors.update(extra)
+    save_file(tensors, str(mdl / "model.safetensors"))
+    return tensors
+
+
+def _export_with_exclusions(workdir, out_name, exclusions, **model_kwargs):
+    mdl = workdir / f"src_{out_name}"
+    _dsv4_source_with_mtp(mdl, **model_kwargs)
+    assignment, col_weights = _dsv4_recipe(**model_kwargs)
+    path = workdir / f"{out_name}.json"
+    _assign(path, assignment)
+    out = workdir / out_name
+    counts = export_nvfp4_cb_streaming(
+        mdl, path, out, col_weights, device="cpu",
+        allow_route_pending_passthrough=True,
+        exclude_namespaces=exclusions)
+    return mdl, out, dict(counts)
+
+
+def test_namespace_exclusion_removes_it_everywhere_and_changes_nothing_else(
+        workdir):
+    """`mtp.*` gone from tensors, index and config; the rest byte-identical."""
+    _mdl, kept, _ = _export_with_exclusions(workdir, "kept", None)
+    mdl, dropped, counts = _export_with_exclusions(
+        workdir, "dropped", ["mtp."])
+
+    kept_header, _ = _st_header(kept / "model.safetensors")
+    dropped_header, _ = _st_header(dropped / "model.safetensors")
+
+    # (a) gone from the tensor set / index entirely.
+    assert any(n.startswith("mtp.") for n in kept_header)
+    assert not any(n.startswith("mtp.") for n in dropped_header)
+
+    # (b) gone from every declaration surface too, not just the payload.
+    dropped_config = json.loads((dropped / "quant_config.json").read_text())
+    serialized = json.dumps(dropped_config)
+    assert "mtp." not in serialized.replace('"excluded_namespaces": ["mtp."]',
+                                            ""), \
+        "an excluded namespace must not survive in ignore/targets/units"
+    assert dropped_config["provenance"]["excluded_namespaces"] == ["mtp."]
+
+    # (c) the byte total drops by exactly the excluded namespace's size.
+    def _payload(header):
+        return sum(meta["data_offsets"][1] - meta["data_offsets"][0]
+                   for name, meta in header.items() if name != "__metadata__")
+
+    excluded_bytes = sum(
+        meta["data_offsets"][1] - meta["data_offsets"][0]
+        for name, meta in kept_header.items()
+        if name.startswith("mtp."))
+    assert excluded_bytes > 0
+    assert _payload(kept_header) - _payload(dropped_header) == excluded_bytes
+
+    # (d) EVERYTHING else is byte-identical — exclusion removes, never rewrites.
+    shared = {n for n in kept_header
+              if not n.startswith("mtp.") and n != "__metadata__"}
+    assert shared == {n for n in dropped_header if n != "__metadata__"}
+    for name in sorted(shared):
+        assert hashlib.sha256(_emitted_bytes(kept, name)).hexdigest() == \
+            hashlib.sha256(_emitted_bytes(dropped, name)).hexdigest(), name
+
+
+def test_namespace_exclusion_defaults_to_nothing(workdir, monkeypatch):
+    """Unset env and unset argument both mean 'exclude nothing'."""
+    from prismaquant.export_nvfp4_cb_streaming import (
+        _EXCLUDE_NAMESPACES_ENV,
+        _exclude_namespaces_from_env,
+    )
+
+    monkeypatch.delenv(_EXCLUDE_NAMESPACES_ENV, raising=False)
+    assert _exclude_namespaces_from_env() == ()
+    for blank in ("", "   ", ",", " , "):
+        monkeypatch.setenv(_EXCLUDE_NAMESPACES_ENV, blank)
+        assert _exclude_namespaces_from_env() == ()
+    monkeypatch.setenv(_EXCLUDE_NAMESPACES_ENV, " mtp. , visual. ")
+    assert _exclude_namespaces_from_env() == ("mtp.", "visual.")
+
+    # Back to unset before exporting: with no argument AND no env, the export
+    # must keep everything. (Leaving the variable set above would exclude
+    # `mtp.` through the env path — which is the knob working, but not what
+    # this test is about.)
+    monkeypatch.delenv(_EXCLUDE_NAMESPACES_ENV, raising=False)
+    _mdl, out, _ = _export_with_exclusions(workdir, "default", None)
+    header, _ = _st_header(out / "model.safetensors")
+    assert any(name.startswith("mtp.") for name in header)
+    config = json.loads((out / "quant_config.json").read_text())
+    assert "excluded_namespaces" not in config["provenance"]
+
+
+def test_namespace_exclusion_refuses_an_allocated_unit(workdir):
+    """Excluding something the recipe priced must hard-fail, not silently drop.
+
+    The allocated unit's bytes are already counted in the selection's achieved
+    bits and predicted loss, so omitting it would make the artifact contradict
+    the recipe that justifies it.
+    """
+    with pytest.raises(ValueError, match="allocates"):
+        _export_with_exclusions(workdir, "illegal", ["layers.0."])
+
+
+def test_namespace_exclusion_refuses_via_the_recipe_spelling_too(workdir):
+    """A prefix written in the RECIPE vintage must collide just the same."""
+    with pytest.raises(ValueError, match="allocates"):
+        _export_with_exclusions(workdir, "illegal2", ["model.layers.0."])
+
+
+def test_excluded_namespace_absence_is_valid_to_the_completeness_gate(workdir):
+    """Absent-and-excluded passes; the same absence unrecorded still fails."""
+    from prismaquant.artifact_completeness import (
+        assert_artifact_complete,
+        check_artifact_completeness,
+    )
+
+    _mdl, dropped, _ = _export_with_exclusions(workdir, "gate", ["mtp."])
+    report = assert_artifact_complete(dropped)
+    assert report.excluded_namespaces == ["mtp."]
+
+    # Strip the record: the artifact is byte-identical, but nothing now says
+    # the absence was intended. A weight whose scale is missing must fail
+    # again, which is what proves the exemption is the RECORD and not the
+    # prefix.
+    _mdl2, kept, _ = _export_with_exclusions(workdir, "gate2", None)
+    tensors = load_file(str(kept / "model.safetensors"))
+    tensors.pop("mtp.0.attn.wq_a.scale")
+    save_file(tensors, str(kept / "model.safetensors"))
+    report = check_artifact_completeness(kept)
+    assert not report.ok
+    assert "mtp.0.attn.wq_a" in report.missing_scale

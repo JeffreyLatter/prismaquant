@@ -218,6 +218,23 @@ DOCKER_COMMON=(
   -e CB_SCALE_SWEEP=1
   -e PRISMAQUANT_CB_ENCODE_TIER=balanced
   # PRISMAQUANT_EXPERT_COST_SAMPLE intentionally NOT set — see header.
+  #
+  # VALUE-LESS forwards: `-e NAME` passes the HOST's value through when the
+  # variable is set and passes nothing at all when it is not. That is the
+  # property wanted here — the launch wrapper decides, per invocation, and the
+  # script needs no per-run edit and carries no default of its own. Writing
+  # `-e NAME=` instead would define them as empty INSIDE the container, which
+  # is a different statement and, for an acknowledgement flag, the wrong one.
+  #
+  #   PQ_ALLOW_ROUTE_PENDING=1        acknowledge shipping a route-pending
+  #                                   passthrough (the exporter refuses
+  #                                   otherwise, and records the
+  #                                   acknowledgement in artifact provenance)
+  #   PQ_EXPORT_EXCLUDE_NAMESPACES    comma-separated tensor-name prefixes to
+  #                                   OMIT from the artifact entirely
+  #                                   (e.g. `mtp.`); empty/unset changes nothing
+  -e PQ_ALLOW_ROUTE_PENDING
+  -e PQ_EXPORT_EXCLUDE_NAMESPACES
 )
 
 run_probe() {

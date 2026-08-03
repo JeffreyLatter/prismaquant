@@ -58,6 +58,7 @@ import os
 import pickle
 import re
 import struct
+import sys
 from collections import Counter
 from functools import wraps
 from pathlib import Path
@@ -1243,6 +1244,232 @@ def assert_routes_reconcile(*, cb_units, passthrough_units, cb_tensors,
             "which no CB expert unit claims")
 
 
+#: Block geometry the ``fp8_e4m3_ue8m0_block128`` wire id NAMES. A checkpoint
+#: whose declared block is anything else stores a different contract under the
+#: same element dtype, so it must not borrow this id.
+_FP8_UE8M0_DECLARED_BLOCK = (128, 128)
+
+#: Registry format a floor block-FP8 unit is declared as. One spelling, so the
+#: wire id it maps to stays the table's decision rather than this module's.
+_FP8_BLOCK_UE8M0_FORMAT = "FP8_BLOCK_UE8M0_SOURCE"
+
+#: Env spelling of ``--allow-route-pending-passthrough``, so a driver script
+#: can pass the acknowledgement without editing the command line it builds.
+_ROUTE_PENDING_ACK_ENV = "PQ_ALLOW_ROUTE_PENDING"
+
+#: Env spelling of ``--exclude-namespace``: comma-separated tensor-name
+#: prefixes to OMIT from the artifact entirely.
+_EXCLUDE_NAMESPACES_ENV = "PQ_EXPORT_EXCLUDE_NAMESPACES"
+
+
+def _exclude_namespaces_from_env() -> tuple[str, ...]:
+    """Read the env form of the namespace exclusion list. Empty by default.
+
+    Empty means "exclude nothing", which is the pre-existing behaviour, so an
+    unset or blank variable cannot change what an export produces.
+    """
+
+    raw = os.environ.get(_EXCLUDE_NAMESPACES_ENV, "")
+    prefixes = tuple(part.strip() for part in raw.split(",") if part.strip())
+    if prefixes:
+        print(f"[export-stream] {_EXCLUDE_NAMESPACES_ENV} -> omitting "
+              f"namespace(s) {list(prefixes)} from this artifact entirely.",
+              file=sys.stderr, flush=True)
+    return prefixes
+
+
+def _validate_namespace_exclusions(
+    exclude_namespaces,
+    *,
+    assignment,
+    profile,
+) -> tuple[str, ...]:
+    """Normalize the exclusion list, refusing anything the recipe allocated.
+
+    OMISSION IS ONLY LEGAL FOR THE FLOOR. A verbatim tensor is one the
+    allocator never reasoned about, so dropping it changes the artifact's
+    contents and nothing else. An ALLOCATED unit is different in kind: the DP
+    priced it, spent budget on it, and the selection's achieved-bits and
+    predicted loss are both computed as though it ships. Silently omitting one
+    would make the artifact disagree with the recipe that justifies it, and
+    the discrepancy would surface as a missing-weights error at load, long
+    after the number it invalidated was reported. So this is a hard refusal
+    rather than a warning: an exclusion that collides with the recipe means
+    the operator meant something else.
+
+    Both namespaces are checked, because a prefix is written in whichever
+    spelling the operator has in hand (``mtp.`` is a checkpoint spelling; the
+    recipe would say ``model.mtp.``), and a prefix that misses only because it
+    was written in the other vintage would be a silent no-op.
+    """
+
+    prefixes = tuple(
+        str(prefix).strip() for prefix in (exclude_namespaces or ())
+        if str(prefix).strip()
+    )
+    if not prefixes:
+        return ()
+
+    collisions: dict[str, list[str]] = {}
+    for qname in assignment:
+        spellings = {str(qname)}
+        checkpoint = _canonical_qname(str(qname), profile)
+        if checkpoint:
+            spellings.add(checkpoint)
+        source = getattr(profile, "source_tensor_name", None)
+        if callable(source):
+            try:
+                spellings.add(source(str(qname)))
+            except Exception:              # pragma: no cover - defensive
+                pass
+        for prefix in prefixes:
+            if any(name.startswith(prefix) for name in spellings):
+                collisions.setdefault(prefix, []).append(str(qname))
+
+    if collisions:
+        detail = "; ".join(
+            f"{prefix!r} matches {len(names)} allocated unit(s) "
+            f"e.g. {sorted(names)[:3]}"
+            for prefix, names in sorted(collisions.items())
+        )
+        raise ValueError(
+            f"refusing to exclude a namespace the recipe allocates: {detail}. "
+            f"Namespace exclusion omits tensors from the artifact entirely, "
+            f"which is only sound for FLOOR units the allocator never priced. "
+            f"An allocated unit's bytes are already counted in the "
+            f"selection's achieved bits and predicted loss, so dropping it "
+            f"here would make the artifact contradict the recipe that "
+            f"justifies it. Re-run the allocation without these units, or "
+            f"narrow the exclusion prefix.")
+    return prefixes
+
+
+def _route_pending_ack_from_env() -> bool:
+    """Read the env form of the route-pending acknowledgement.
+
+    DEFAULTS OFF, and off for every value except exactly ``"1"`` — an
+    acknowledgement that "0"/"false"/"" could switch on would be the opposite
+    of deliberate. It announces itself on stderr when it fires, because the
+    one failure mode an env knob has that a flag does not is being inherited
+    silently by an invocation nobody meant to acknowledge for.
+    """
+
+    if os.environ.get(_ROUTE_PENDING_ACK_ENV) != "1":
+        return False
+    print(f"[export-stream] {_ROUTE_PENDING_ACK_ENV}=1 -> "
+          f"--allow-route-pending-passthrough is ON for this invocation; "
+          f"route-pending passthrough units will ship with the "
+          f"acknowledgement recorded in the artifact provenance.",
+          file=sys.stderr, flush=True)
+    return True
+
+
+def _floor_block_fp8_units(
+    skeleton,
+    *,
+    emitted_bases: set[str],
+    consumed_expert_bases: set[str],
+    claimed_qnames: set[str],
+    profile,
+    subset_prefixes,
+    excluded_namespaces: tuple[str, ...] = (),
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Block-FP8 units the recipe never allocated, which must be DECLARED.
+
+    Returns ``({checkpoint qname: scale checkpoint key},
+    {scale checkpoint key: checkpoint qname})``.
+
+    THE BUG THIS EXISTS TO CLOSE. A weight that no allocation target claims
+    falls to the verbatim copy loop below. That loop was written for BF16
+    norms and buffers, for which "copy the tensor and list it in ``ignore``"
+    is exactly right. For a block-FP8 weight it was silently wrong in two
+    compounding ways: the loop skips ``.scale`` siblings as "consumed with
+    their fp8 weight" — but nothing consumed them, because the weight was
+    never a target — so the scale plane was DROPPED; and the weight was then
+    declared ``ignore``, i.e. unquantized. A consumer honouring that
+    declaration allocates a bf16 parameter, the size assertion passes because
+    the element counts match, and the fp8 bytes are cast to bf16 with no scale
+    applied. Every block is then wrong by its own power of two, with no error
+    raised anywhere. Measured on DSv4-Flash: 43 ``attn.wo_a`` + 21
+    ``attn.indexer.wq_b`` units, 1.44 GB, silently corrupted.
+
+    So a floor block-FP8 unit ships its weight AND its scale, and is declared
+    ``fp8_e4m3_ue8m0_block128`` rather than ignored — the same delegated-native
+    route an ALLOCATED passthrough unit of that format would get. Nothing about
+    the bytes differs between the two cases; only whether the DP happened to
+    choose the unit, which is not a property the consumer can see or should
+    have to.
+
+    MEMBERSHIP IS NARROW, AND DELIBERATELY SO. A unit qualifies only when the
+    checkpoint pairs an ``F8_E4M3`` weight with an ``F8_E8M0`` scale over the
+    declared 128x128 block. That excludes, by construction rather than by
+    name: MXFP4 nibble-packs (int8/uint8 elements), BF16/F32 verbatim tensors
+    (no scale plane, and for which the ``ignore`` cast IS correct), and any
+    architecture whose declared block is not 128x128. Prefixes the profile
+    ships verbatim-and-undeclared (``source_passthrough_prefixes``, e.g. DSv4's
+    ``mtp.*``) are excluded too: those are units no serving stack builds, so
+    declaring them would assert a route nobody exercises.
+    """
+
+    scale_map = skeleton._fp8_scale_inv_map
+    block = getattr(scale_map, "block", None)
+    _verbatim = getattr(profile, "source_passthrough_prefixes", None)
+    verbatim_prefixes = tuple(_verbatim()) if callable(_verbatim) else ()
+
+    units: dict[str, str] = {}
+    for _live, entry in scale_map.items():
+        scale_key = entry[1]
+        if not scale_key.endswith(".scale"):
+            # Legacy `.weight_scale_inv` checkpoints normalize through the
+            # FP8_SOURCE lane and never reach this fallback.
+            continue
+        ckpt_qname = scale_key[: -len(".scale")]
+        weight_key = ckpt_qname + ".weight"
+        if weight_key not in skeleton:
+            continue
+        if subset_prefixes is not None and not any(
+                weight_key.startswith(p) for p in subset_prefixes):
+            continue
+        if any(ckpt_qname.startswith(p) for p in excluded_namespaces):
+            continue                      # omitted from the artifact entirely
+        if any(ckpt_qname.startswith(p) for p in verbatim_prefixes):
+            continue                      # profile ships these undeclared
+        if weight_key in emitted_bases or weight_key in consumed_expert_bases:
+            continue                      # a target already claimed it
+        canon = _canonical_qname(ckpt_qname, profile)
+        if ckpt_qname in claimed_qnames or canon in claimed_qnames:
+            continue
+        if skeleton.get_dtype(weight_key) is not torch.float8_e4m3fn:
+            continue                      # not a block-FP8 element plane
+        if skeleton.get_dtype(scale_key) is not torch.float8_e8m0fnu:
+            continue                      # not a UE8M0 scale plane
+        # Geometry is asserted rather than assumed: the wire id NAMES a
+        # 128x128 block, and a declaration that misdescribes the grid is
+        # worse than no declaration at all — it loads, and it is wrong.
+        if tuple(block or ()) != _FP8_UE8M0_DECLARED_BLOCK:
+            raise ValueError(
+                f"{ckpt_qname}: unallocated block-FP8 unit, but the "
+                f"checkpoint declares weight_block_size {block!r} rather "
+                f"than {list(_FP8_UE8M0_DECLARED_BLOCK)}. The "
+                f"fp8_e4m3_ue8m0_block128 wire id names the 128x128 grid, so "
+                f"this unit cannot be declared under it. Shipping it "
+                f"undeclared is refused: it would be cast to bf16 without "
+                f"its scale.")
+        w_shape = skeleton.get_shape(weight_key)
+        s_shape = skeleton.get_shape(scale_key)
+        expected = tuple(-(-int(d) // b)
+                         for d, b in zip(w_shape, _FP8_UE8M0_DECLARED_BLOCK))
+        if tuple(s_shape) != expected:
+            raise ValueError(
+                f"{ckpt_qname}: block-FP8 scale grid {tuple(s_shape)} does "
+                f"not match weight {tuple(w_shape)} at "
+                f"{_FP8_UE8M0_DECLARED_BLOCK} (expected {expected}). A "
+                f"transposed grid is numel-compatible and would mis-scale "
+                f"every block.")
+        units[ckpt_qname] = scale_key
+    return units, {scale: unit for unit, scale in units.items()}
+
+
 def _reject_disabled_reuse_before_output_transaction(function):
     """Preserve the quarantine gate ahead of any resume/output interpretation."""
     signature = inspect.signature(function)
@@ -1284,6 +1511,7 @@ def export_nvfp4_cb_streaming(
     reuse_verify: int = 3,
     allow_unstamped_research: bool = False,
     allow_route_pending_passthrough: bool = False,
+    exclude_namespaces: list[str] | tuple[str, ...] | None = None,
     activation_cache_dir: str | Path | None = None,
     activation_scale_policy: str | None = None,
 ) -> dict[str, int]:
@@ -1383,6 +1611,15 @@ def export_nvfp4_cb_streaming(
     # reduction here, once, before anything reads the assignment.
     assignment, expert_stack_members, expert_stack_report = (
         _collapse_per_expert_assignment(assignment, expert_groups, profile)
+    )
+    # Namespace exclusion is validated against the COLLAPSED assignment, i.e.
+    # the units as the allocator actually decided them, so a per-expert entry
+    # cannot hide a collision behind its expanded spelling.
+    excluded_namespaces = _validate_namespace_exclusions(
+        exclude_namespaces if exclude_namespaces is not None
+        else _exclude_namespaces_from_env(),
+        assignment=assignment,
+        profile=profile,
     )
     if expert_stack_members:
         col_weights = _packed_expert_col_weights(
@@ -2299,14 +2536,36 @@ def export_nvfp4_cb_streaming(
     resolved_source_scale_keys = {
         entry[1] for entry in skeleton._fp8_scale_inv_map.values()
     }
+    # FLOOR block-FP8: units no allocation target claimed. They ship weight AND
+    # scale and get DECLARED, instead of losing their scale to the skip below
+    # and being cast to bf16 under an `ignore` entry. See
+    # `_floor_block_fp8_units` for the failure this closes.
+    floor_fp8_units, floor_fp8_scale_owner = _floor_block_fp8_units(
+        skeleton,
+        emitted_bases=emitted_bases,
+        consumed_expert_bases=consumed_expert_bases,
+        claimed_qnames=(cb_targets_set | source_set | native_source_set
+                        | stock_set),
+        profile=profile,
+        subset_prefixes=subset_prefixes,
+        excluded_namespaces=excluded_namespaces,
+    )
     for name in skeleton.keys():
         if subset_prefixes is not None and \
                 not any(name.startswith(p) for p in subset_prefixes):
             continue   # outside the declared subset (e.g. non-MTP body layers)
+        if any(name.startswith(p) for p in excluded_namespaces):
+            # OMITTED ENTIRELY: no tensor, no index entry, no `ignore` line, no
+            # declaration. The prefix test is on the raw checkpoint key, so a
+            # unit's scale and other companions leave with it automatically
+            # rather than by a second rule that could disagree.
+            counts["excluded"] += 1
+            continue
         if name in emitted_bases or name in consumed_expert_bases:
             continue
-        if name in resolved_source_scale_keys or name.endswith(
-            ".weight_scale_inv"
+        if name not in floor_fp8_scale_owner and (
+            name in resolved_source_scale_keys
+            or name.endswith(".weight_scale_inv")
         ):
             continue   # consumed with its fp8 weight, or an unused sidecar
         if name.endswith(".weight"):
@@ -2330,7 +2589,13 @@ def export_nvfp4_cb_streaming(
         dtype = skeleton.get_dtype(name)
         writer.add(name, dtype, shape, (lambda k=name: skeleton.load(k)
                                         .contiguous()))
-        if ckpt_qname is not None and len(shape) >= 2:
+        # A declared floor block-FP8 unit must NOT land in `ignore`: the two
+        # statements contradict each other, and `ignore` is the one that
+        # silently loses the scale.  Its scale plane rides this same loop (it
+        # is exempted from the skip above) and needs no entry of its own.
+        if ckpt_qname is not None and ckpt_qname in floor_fp8_units:
+            counts["floor_fp8_declared"] += 1
+        elif ckpt_qname is not None and len(shape) >= 2:
             ignore.append(ckpt_qname)
         counts["copied"] += 1
 
@@ -2534,6 +2799,43 @@ def export_nvfp4_cb_streaming(
         }
 
     _declared_passthrough_units = _source_passthrough_units()
+    # Floor block-FP8 units join the SAME declaration as allocated passthrough
+    # units. They differ only in how they got here — the DP chose one and
+    # skipped the other — and that distinction is invisible to, and irrelevant
+    # for, the consumer: identical bytes, identical wire id, identical route.
+    # Floor units face the SAME ship gate as allocated passthrough units, and
+    # record the SAME acknowledgement. They reach it later only because
+    # membership depends on what the planning pass consumed; the rule is
+    # identical. Note the asymmetry with an allocated rung: shipping this one
+    # undeclared is not a fallback, it is the bug — it drops the scale planes.
+    # So the choice here is "declare and acknowledge" or "stop", never
+    # "declare nothing and continue".
+    if floor_fp8_units and _FP8_BLOCK_UE8M0_FORMAT in \
+            ROUTE_PENDING_PASSTHROUGH_FORMATS:
+        route_pending[_FP8_BLOCK_UE8M0_FORMAT] += len(floor_fp8_units)
+        if not allow_route_pending_passthrough:
+            raise ValueError(
+                f"refusing to ship a route-pending source passthrough: "
+                f"{_FP8_BLOCK_UE8M0_FORMAT} -> lane "
+                f"{SOURCE_PASSTHROUGH_CONTRACTS[_FP8_BLOCK_UE8M0_FORMAT].serving_route} "
+                f"({len(floor_fp8_units)} unallocated unit(s) the recipe "
+                f"never assigned, e.g. "
+                f"{sorted(floor_fp8_units)[:3]}). These are block-FP8 weights "
+                f"with UE8M0 scale planes; they MUST be declared, because the "
+                f"alternative is not 'ship them plainly' but 'ship them with "
+                f"their scales dropped and silently cast to bf16'. Pass "
+                f"--allow-route-pending-passthrough "
+                f"(allow_route_pending_passthrough=True) to ship knowingly; "
+                f"the acknowledgement is recorded in the artifact's "
+                f"provenance.")
+    for _floor_unit in floor_fp8_units:
+        _previous = _declared_passthrough_units.get(_floor_unit)
+        if _previous not in (None, _FP8_BLOCK_UE8M0_FORMAT):
+            raise ValueError(
+                f"{_floor_unit}: reached the verbatim floor as block-FP8 but "
+                f"is already declared {_previous!r}; one unit has one "
+                f"contract")
+        _declared_passthrough_units[_floor_unit] = _FP8_BLOCK_UE8M0_FORMAT
     assert_routes_reconcile(
         **_route_reconciliation_sets(_declared_passthrough_units))
 
@@ -2568,6 +2870,7 @@ def export_nvfp4_cb_streaming(
         requant_target_name=_base_name,
         source_passthrough_units=_declared_passthrough_units,
         route_pending_passthrough_acknowledged=sorted(route_pending),
+        excluded_namespaces=excluded_namespaces,
         weight_only_stock_targets=sidecar_stock,
         streaming_provenance=True,
         include_tensor_formats=False,
@@ -2637,6 +2940,26 @@ def export_nvfp4_cb_streaming(
             else None
         ),
     )
+    # FINAL GATE, read back off the PUBLISHED artifact rather than from the
+    # planning state that produced it. Everything above knows what it meant to
+    # write; this asks the only question a consumer can ask — for every
+    # scale-bearing weight actually on disk, is there a mechanism that decodes
+    # it? Headers only, so it costs a few opens even on a 92 GB artifact.
+    from prismaquant.artifact_completeness import assert_artifact_complete
+
+    _verbatim = getattr(profile, "source_passthrough_prefixes", None)
+    verbatim_prefixes = tuple(_verbatim()) if callable(_verbatim) else ("mtp.",)
+    completeness = assert_artifact_complete(
+        out_dir, verbatim_prefixes=verbatim_prefixes)
+    if excluded_namespaces:
+        print(f"[export-cb-stream] excluded namespace(s) "
+              f"{list(excluded_namespaces)}: {counts['excluded']} tensor(s) "
+              f"omitted from the artifact (recorded in provenance)",
+              flush=True)
+    print(f"[export-cb-stream] completeness: "
+          f"{len(completeness.passthrough_units)} declared passthrough, "
+          f"{len(completeness.verbatim_namespace_units)} verbatim-namespace "
+          f"unit(s); no orphan scale planes", flush=True)
     return dict(counts)
 
 
@@ -2798,10 +3121,25 @@ def main(argv=None) -> None:
     ap.add_argument(
         "--allow-route-pending-passthrough",
         action="store_true",
+        default=_route_pending_ack_from_env(),
         help="ship a source-passthrough rung whose serve route is not yet "
-        "validated (allocator_candidates.ROUTE_PENDING_PASSTHROUGH_FORMATS, "
-        "today MXFP4_SOURCE -> lane delegated_native_mxfp4). Refused by "
-        "default; the acknowledgement is recorded in the artifact provenance.",
+        "validated (allocator_candidates.ROUTE_PENDING_PASSTHROUGH_FORMATS). "
+        "Refused by default; the acknowledgement is recorded in the artifact "
+        f"provenance. May also be set with {_ROUTE_PENDING_ACK_ENV}=1 so a "
+        "driver script can pass it explicitly; the env form announces itself "
+        "on stderr and is OFF unless set to exactly '1'.",
+    )
+    ap.add_argument(
+        "--exclude-namespace",
+        action="append",
+        default=None,
+        dest="exclude_namespaces",
+        help="OMIT every tensor whose checkpoint name starts with this prefix "
+        "from the artifact entirely — no tensor, no index entry, no `ignore` "
+        "line, no declaration. Repeatable. Legal only for floor/verbatim "
+        "tensors: a prefix matching any unit the layer_config allocates is a "
+        f"hard refusal. May also be set with {_EXCLUDE_NAMESPACES_ENV} as a "
+        "comma-separated list; empty/unset excludes nothing.",
     )
     ap.add_argument(
         "--scale-coding",
@@ -2853,6 +3191,7 @@ def main(argv=None) -> None:
         reuse_verify=reuse_verify,
         allow_unstamped_research=args.allow_unstamped_research,
         allow_route_pending_passthrough=args.allow_route_pending_passthrough,
+        exclude_namespaces=args.exclude_namespaces,
         activation_cache_dir=args.activation_cache_dir,
         activation_scale_policy=args.activation_scale_policy)
     size = sum(p.stat().st_size for p in Path(args.out).glob("*")) / 1e9
