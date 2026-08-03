@@ -1,0 +1,314 @@
+[
+  {
+    "title": "GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers",
+    "url": "https://arxiv.org/abs/2210.17323",
+    "venue/type": "ICLR 2023 paper",
+    "year": 2023,
+    "evidence_quality": "peer-reviewed",
+    "one_line_relevance": "Establishes the canonical 128 random C4 segments at 2048 tokens and the activation-covariance reconstruction objective."
+  },
+  {
+    "title": "AWQ: Activation-aware Weight Quantization for LLM Compression and Acceleration",
+    "url": "https://proceedings.mlsys.org/paper_files/paper/2024/file/42a452cbafa9dd64e9ba4aa95cc1ef21-Paper-Conference.pdf",
+    "venue/type": "MLSys 2024 paper",
+    "year": 2024,
+    "evidence_quality": "peer-reviewed",
+    "one_line_relevance": "Defines activation-aware salient-channel scaling and the reference AWQ calibration convention."
+  },
+  {
+    "title": "AutoAWQ",
+    "url": "https://github.com/casper-hansen/AutoAWQ",
+    "venue/type": "official archived repository",
+    "year": 2025,
+    "evidence_quality": "community practice",
+    "one_line_relevance": "Reference AWQ implementation with 128-sample and 512-token calibration ceilings; archived in 2025."
+  },
+  {
+    "title": "SmoothQuant: Accurate and Efficient Post-Training Quantization for Large Language Models",
+    "url": "https://arxiv.org/abs/2211.10438",
+    "venue/type": "ICML 2023 paper",
+    "year": 2023,
+    "evidence_quality": "peer-reviewed",
+    "one_line_relevance": "Introduces activation smoothing; official practice collects maxima on 512 random Pile sentences."
+  },
+  {
+    "title": "SmoothQuant official implementation",
+    "url": "https://github.com/mit-han-lab/smoothquant",
+    "venue/type": "official repository",
+    "year": 2023,
+    "evidence_quality": "community practice",
+    "one_line_relevance": "Documents 512 random Pile validation sentences and exposes sample/sequence-length controls."
+  },
+  {
+    "title": "On the Impact of Calibration Data in Post-training Quantization and Pruning",
+    "url": "https://aclanthology.org/2024.acl-long.544/",
+    "venue/type": "ACL 2024 paper",
+    "year": 2024,
+    "evidence_quality": "peer-reviewed",
+    "one_line_relevance": "Largest controlled source/seed/size study located, including 1–512 example sweeps for GPTQ and other compressors."
+  },
+  {
+    "title": "SqueezeLLM: Dense-and-Sparse Quantization",
+    "url": "https://arxiv.org/html/2306.07629",
+    "venue/type": "ICML 2024 paper",
+    "year": 2024,
+    "evidence_quality": "peer-reviewed",
+    "one_line_relevance": "Uses diagonal empirical Fisher and directly shows saturation near 10 examples for one LLaMA-2-7B setting."
+  },
+  {
+    "title": "HAWQ-V2: Hessian Aware trace-Weighted Quantization of Neural Networks",
+    "url": "https://proceedings.neurips.cc/paper/2020/hash/d77c703536718b95308130ff2e5cf9ee-Abstract.html",
+    "venue/type": "NeurIPS 2020 paper",
+    "year": 2020,
+    "evidence_quality": "peer-reviewed",
+    "one_line_relevance": "Provides average-Hessian-trace sensitivity and Hutchinson trace estimation, though evaluated on vision networks."
+  },
+  {
+    "title": "Enhancing Computation Efficiency in Large Language Models through Weight and Activation Quantization",
+    "url": "https://aclanthology.org/2023.emnlp-main.910/",
+    "venue/type": "EMNLP 2023 paper",
+    "year": 2023,
+    "evidence_quality": "peer-reviewed",
+    "one_line_relevance": "Directly ablates calibration sequence lengths 64, 128, 512, and 2048 and measures task accuracy changes."
+  },
+  {
+    "title": "On the Importance of a Multi-Scale Calibration for Quantization",
+    "url": "https://arxiv.org/html/2602.07465",
+    "venue/type": "arXiv preprint",
+    "year": 2026,
+    "evidence_quality": "preprint",
+    "one_line_relevance": "First located controlled multi-length LLM weight-PTQ study; mixes 256–4096 lengths at fixed token budget."
+  },
+  {
+    "title": "Calibrating Beyond English: Language Diversity for Better Quantized Multilingual LLMs",
+    "url": "https://aclanthology.org/2026.eacl-long.223/",
+    "venue/type": "EACL 2026 paper",
+    "year": 2026,
+    "evidence_quality": "peer-reviewed",
+    "one_line_relevance": "Controlled multilingual, language-matched, code, and math calibration comparisons for GPTQ/AWQ."
+  },
+  {
+    "title": "Compressing Language Models for Specialized Domains",
+    "url": "https://arxiv.org/html/2502.18424",
+    "venue/type": "arXiv preprint",
+    "year": 2025,
+    "evidence_quality": "preprint",
+    "one_line_relevance": "Tests a 50:50 domain/general calibration mixture for biomedical and legal compression."
+  },
+  {
+    "title": "MoEQuant: Enhancing Quantization for Mixture-of-Experts Large Language Models via Expert-Balanced Sampling and Affinity Guidance",
+    "url": "https://arxiv.org/abs/2505.03804",
+    "venue/type": "arXiv/OpenReview manuscript",
+    "year": 2025,
+    "evidence_quality": "preprint",
+    "one_line_relevance": "Introduces expert-balanced self-sampling and token–expert affinity-guided Hessian statistics across Qwen, DeepSeek, and Mixtral."
+  },
+  {
+    "title": "EAC-MoE: Expert-Selection Aware Compressor for Mixture-of-Experts Large Language Models",
+    "url": "https://aclanthology.org/2025.acl-long.633/",
+    "venue/type": "ACL 2025 paper",
+    "year": 2025,
+    "evidence_quality": "peer-reviewed",
+    "one_line_relevance": "Directly measures quantization-induced expert-selection drift and calibrates routers; includes domain-mismatch tables."
+  },
+  {
+    "title": "EAQuant: Enhancing Post-Training Quantization for MoE Models via Expert-Aware Optimization",
+    "url": "https://arxiv.org/abs/2506.13329",
+    "venue/type": "arXiv preprint",
+    "year": 2025,
+    "evidence_quality": "preprint",
+    "one_line_relevance": "Balances rare-expert calibration, aligns router distributions, and reports per-expert quantization errors."
+  },
+  {
+    "title": "QuantMoE-Bench: Examining Post-Training Quantization for Mixture-of-Experts",
+    "url": "https://arxiv.org/abs/2406.08155",
+    "venue/type": "arXiv/OpenReview manuscript",
+    "year": 2024,
+    "evidence_quality": "preprint",
+    "one_line_relevance": "Profiles expert frequency on 512×4096 WikiText tokens and studies frequency-aware mixed precision."
+  },
+  {
+    "title": "DeepSeek-V3 Technical Report",
+    "url": "https://arxiv.org/abs/2412.19437",
+    "venue/type": "technical report/preprint",
+    "year": 2024,
+    "evidence_quality": "preprint",
+    "one_line_relevance": "Clarifies that DeepSeek-V3 uses native FP8 mixed-precision training rather than providing a PTQ calibration ablation."
+  },
+  {
+    "title": "Quantitative Analysis of Performance Drop in DeepSeek Model Quantization",
+    "url": "https://arxiv.org/abs/2505.02390",
+    "venue/type": "technical report/preprint",
+    "year": 2025,
+    "evidence_quality": "preprint",
+    "one_line_relevance": "Evaluates quantized DeepSeek models but does not supply the controlled expert-coverage/composition study sought here."
+  },
+  {
+    "title": "KVQuant: Towards 10 Million Context Length LLM Inference with KV Cache Quantization",
+    "url": "https://openreview.net/forum?id=wnzG7jsO8A",
+    "venue/type": "NeurIPS 2024 paper",
+    "year": 2024,
+    "evidence_quality": "peer-reviewed",
+    "one_line_relevance": "Uses 16×2048 WikiText samples and Fisher-guided non-uniform KV-cache quantization with sink/outlier handling."
+  },
+  {
+    "title": "Efficient Streaming Language Models with Attention Sinks",
+    "url": "https://arxiv.org/abs/2309.17453",
+    "venue/type": "ICLR 2024 paper",
+    "year": 2024,
+    "evidence_quality": "peer-reviewed",
+    "one_line_relevance": "Establishes attention-sink behavior relevant to long-context activation/KV statistics."
+  },
+  {
+    "title": "llama.cpp importance-matrix tool README",
+    "url": "https://github.com/ggml-org/llama.cpp/blob/master/tools/imatrix/README.md",
+    "venue/type": "official repository documentation",
+    "year": 2026,
+    "evidence_quality": "community practice",
+    "one_line_relevance": "Defines current imatrix invocation, chunk processing, matrix merging, and WikiText example."
+  },
+  {
+    "title": "About imatrix overfitting, and importance of input text (llama.cpp discussion #5263)",
+    "url": "https://github.com/ggml-org/llama.cpp/discussions/5263",
+    "venue/type": "GitHub community discussion",
+    "year": 2024,
+    "evidence_quality": "anecdote/community experiment",
+    "one_line_relevance": "Contains measured comparisons of pseudo-random, WikiText, and English/French C4 importance matrices."
+  },
+  {
+    "title": "Importance matrix calculations work best on near-random data (llama.cpp discussion #5006)",
+    "url": "https://github.com/ggml-org/llama.cpp/discussions/5006",
+    "venue/type": "GitHub community discussion",
+    "year": 2024,
+    "evidence_quality": "anecdote/community experiment",
+    "one_line_relevance": "Early imatrix size/context/dataset experiments whose near-random conclusion was later qualified."
+  },
+  {
+    "title": "LLM Compressor: Choosing your dataset",
+    "url": "https://docs.vllm.ai/projects/llm-compressor/en/latest/steps/choosing-dataset/",
+    "venue/type": "official documentation",
+    "year": 2026,
+    "evidence_quality": "community practice",
+    "one_line_relevance": "Current guidance recommends 128–512 samples and composition matched to model use."
+  },
+  {
+    "title": "LLM Compressor: Adding MoE Calibration Support for a New Model",
+    "url": "https://docs.vllm.ai/projects/llm-compressor/en/latest/developer-tutorials/add-moe-support/",
+    "venue/type": "official documentation",
+    "year": 2026,
+    "evidence_quality": "community practice",
+    "one_line_relevance": "Documents inactive-expert failures and the all-tokens/all-experts calibration wrapper."
+  },
+  {
+    "title": "LLM Compressor Qwen3.5 NVFP4 MoE Example",
+    "url": "https://docs.vllm.ai/projects/llm-compressor/en/latest/key-models/qwen3.5/nvfp4-moe-example/",
+    "venue/type": "official production recipe",
+    "year": 2026,
+    "evidence_quality": "community practice",
+    "one_line_relevance": "Uses 256 UltraChat samples, max length 4096, and all-expert MoE calibration."
+  },
+  {
+    "title": "LLM Compressor FP8 Weight and Activation Quantization",
+    "url": "https://docs.vllm.ai/projects/llm-compressor/en/latest/examples/quantization_w8a8_fp8/",
+    "venue/type": "official production recipe",
+    "year": 2026,
+    "evidence_quality": "community practice",
+    "one_line_relevance": "Shows that static-weight/dynamic-token FP8 requires no calibration data."
+  },
+  {
+    "title": "NVIDIA TensorRT Model Optimizer Hugging Face Post-Training Quantization",
+    "url": "https://github.com/NVIDIA/Model-Optimizer/blob/main/examples/hf_ptq/README.md",
+    "venue/type": "official repository documentation",
+    "year": 2026,
+    "evidence_quality": "community practice",
+    "one_line_relevance": "Documents 128–512 sample guidance, current production recipes, and the default dataset mixture."
+  },
+  {
+    "title": "GPTQModel",
+    "url": "https://github.com/ModelCloud/GPTQModel/blob/main/README.md",
+    "venue/type": "official repository documentation",
+    "year": 2026,
+    "evidence_quality": "community practice",
+    "one_line_relevance": "Documents MoE routing override, all-expert bypass, and activation-free FailSafe strategies."
+  },
+  {
+    "title": "vLLM Quantization Documentation",
+    "url": "https://docs.vllm.ai/en/stable/features/quantization/",
+    "venue/type": "official serving documentation",
+    "year": 2026,
+    "evidence_quality": "community practice",
+    "one_line_relevance": "Clarifies vLLM's role as serving consumer and links to supported producer toolchains/formats."
+  },
+  {
+    "title": "AutoAWQ quantizer defaults",
+    "url": "https://github.com/casper-hansen/AutoAWQ/blob/main/awq/quantize/quantizer.py",
+    "venue/type": "official archived source code",
+    "year": 2025,
+    "evidence_quality": "community practice",
+    "one_line_relevance": "Pins the reference implementation defaults to 128 calibration samples and 512 tokens."
+  },
+  {
+    "title": "AutoAWQ examples and calibration guidance",
+    "url": "https://github.com/casper-hansen/AutoAWQ/blob/main/docs/examples.md",
+    "venue/type": "official archived documentation",
+    "year": 2025,
+    "evidence_quality": "community practice",
+    "one_line_relevance": "States the implementation's practical 128–256-sample guidance."
+  },
+  {
+    "title": "LLM Compressor AWQ Modifier Documentation",
+    "url": "https://docs.vllm.ai/projects/llm-compressor/en/stable/api/llmcompressor/modifiers/transform/awq/",
+    "venue/type": "official API documentation",
+    "year": 2026,
+    "evidence_quality": "community practice",
+    "one_line_relevance": "Describes current AWQ activation-range collection and salient-channel scaling."
+  },
+  {
+    "title": "GPTQModel v5.7.0 release",
+    "url": "https://github.com/ModelCloud/GPTQModel/releases/tag/v5.7.0",
+    "venue/type": "official software release",
+    "year": 2026,
+    "evidence_quality": "community practice",
+    "one_line_relevance": "Introduces MoE routing bypass/override and FailSafe support for uneven expert activation."
+  },
+  {
+    "title": "KVQuant official implementation",
+    "url": "https://github.com/SqueezeAILab/KVQuant",
+    "venue/type": "official repository",
+    "year": 2024,
+    "evidence_quality": "community practice",
+    "one_line_relevance": "Implements Fisher-guided KV-cache calibration and attention-sink-aware handling."
+  },
+  {
+    "title": "LLM Compressor integration in vLLM",
+    "url": "https://docs.vllm.ai/en/stable/features/quantization/llm_compressor/",
+    "venue/type": "official serving documentation",
+    "year": 2026,
+    "evidence_quality": "community practice",
+    "one_line_relevance": "Explains that LLM Compressor produces calibrated compressed-tensors checkpoints consumed by vLLM."
+  },
+  {
+    "title": "NVIDIA Model Optimizer hf_ptq.py",
+    "url": "https://github.com/NVIDIA/Model-Optimizer/blob/main/examples/hf_ptq/hf_ptq.py",
+    "venue/type": "official current source code",
+    "year": 2026,
+    "evidence_quality": "community practice",
+    "one_line_relevance": "Pins current generic defaults to 1024 calibration samples and maximum sequence length 512."
+  },
+  {
+    "title": "NVIDIA Model Optimizer Changelog",
+    "url": "https://nvidia.github.io/Model-Optimizer/reference/0_changelog.html",
+    "venue/type": "official release documentation",
+    "year": 2026,
+    "evidence_quality": "community practice",
+    "one_line_relevance": "Documents the 1024-sample default change and current DeepSeek native-top-k/peer-max expert calibration policy."
+  },
+  {
+    "title": "NVIDIA Model Optimizer AutoQuantize API",
+    "url": "https://nvidia.github.io/Model-Optimizer/reference/generated/modelopt.torch.quantization.model_quant.html",
+    "venue/type": "official API documentation",
+    "year": 2026,
+    "evidence_quality": "community practice",
+    "one_line_relevance": "Shows the current 128-sample sensitivity-scoring default for mixed-precision search."
+  }
+]
