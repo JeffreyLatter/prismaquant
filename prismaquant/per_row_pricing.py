@@ -54,7 +54,10 @@ class RecordedActivationFairPricing:
     penalties: Mapping[str, float]
 
     @classmethod
-    def from_dict(cls, payload: Mapping[str, Any] | None):
+    def from_dict(
+        cls,
+        payload: Mapping[str, Any] | None,
+    ) -> "RecordedActivationFairPricing":
         """Rehydrate the recorded run-level verdict from ``selection.json``."""
         raw = payload if isinstance(payload, Mapping) else {}
         families = raw.get("families")
