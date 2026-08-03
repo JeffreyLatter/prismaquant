@@ -7,7 +7,8 @@
     "id": "nvfp4_cb",
     "exporter": "prismaquant.export_nvfp4_cb",
     "codec_formats_from": [
-      "prismaquant.export_nvfp4_cb:EXPORTABLE_FORMATS"
+      "prismaquant.export_nvfp4_cb:EXPORTABLE_FORMATS",
+      "prismaquant.cb_export_config:STREAMING_REQUANT_EXPORT_FORMATS"
     ],
     "passthrough_formats": [
       "MXFP4_SOURCE",
@@ -28,6 +29,7 @@
         "FP8_SOURCE",
         "FP8_BLOCK_UE8M0_SOURCE",
         "MXFP4_SOURCE",
+        "MXFP8_UE8M0_G32",
         "BF16"
       ],
       "reason": "profile_mismatch",
@@ -40,10 +42,11 @@
         "NVFP4",
         "FP8_DYNAMIC",
         "FP8_E4M3",
-        "FP8_SOURCE"
+        "FP8_SOURCE",
+        "MXFP8_UE8M0_G32"
       ],
       "reason": "runtime_unsupported",
-      "detail": "The nvfp4_cb container's stock compressed-tensors delegation is DENSE-ONLY today: neither export_nvfp4_cb nor the Gridbook runtime carries a stock-CT packed-MoE emission/serving path (35B first-contact, 2026-07-19 \u2014 the exporter's stock-NVFP4 global-scale pass is 2-D and Gridbook's MoE method is CB-only). Packed expert stacks use CB rungs (per-expert weighted VQ, served by Gridbook) or the BF16 passthrough until that path is built AND serve-validated. This is a declared capability of the container, not a quality judgement on the formats."
+      "detail": "The nvfp4_cb container's stock compressed-tensors delegation is DENSE-ONLY today: neither export_nvfp4_cb nor the Gridbook runtime carries a stock-CT packed-MoE emission/serving path (35B first-contact, 2026-07-19 \u2014 the exporter's stock-NVFP4 global-scale pass is 2-D and Gridbook's MoE method is CB-only). Packed expert stacks use CB rungs (per-expert weighted VQ, served by Gridbook) or the BF16 passthrough until that path is built AND serve-validated. This is a declared capability of the container, not a quality judgement on the formats. MXFP8_UE8M0_G32 joins the list for the SAME structural reason and not as a bpw judgement: its streaming emission is a 2-D dense path (one E4M3 plane plus one float8_e8m0fnu scale plane per Linear) with no packed-expert stacking, so a routed stack has no MXFP8 emission to ship. Its economic exclusion from the routed-expert ladder is a separate and independent fact recorded where the expert cost menu is enumerated (scripts/run_dsv4_mxfp4_cost.sh): at 8.25 bpw it is nearly double the <= 4.25 bpw rungs that menu measures, so it is simply not on it."
     },
     {
       "id": "mxfp4_source_is_routed_expert_only",
@@ -104,6 +107,15 @@
       "activation_contract": "delegated-native-mxfp4-e2m1-group32-ue8m0",
       "fallback_route": "vllm Marlin MoE (REQUIRES --moe-backend marlin; the auto default DeepGEMM_MXFP4 asserts on sm121)",
       "detail": "SOURCE-PASSTHROUGH lane for the released checkpoint's own packed routed experts: nibble-packed E2M1 with per-32 E8M0 group scales, copied verbatim, served by the model's native DeepseekV4 routed-expert path rather than by any codebook decoder. Declared as a DISTINCT lane so P5b never files these units under a CB contract they do not have -- a unit here has no CB activation contract at all, which is why the K0.2 attestation scopes itself to CB layers and the artifact declares its source-passthrough units explicitly rather than leaving them looking like a missing attestation. ROUTE STATUS: BACKED, measured on GB10/sm121 2026-08-03 -- native-confirmed via vLLM Marlin MoE. But ONLY off the default: the auto-selected DeepGEMM_MXFP4 backend asserts on the SF transformation, FlashInfer is gated to capability family 100, and the OAI Triton path is hard-excluded on SM12x (0/15 kernels). `--moe-backend marlin` is therefore part of the serving contract, not a tuning hint, and it travels with the artifact in its serving notes. No fused_mid_m block: a passthrough rung has no Gridbook decode prologue to fuse, so an empty backed set is the honest state, not a data gap."
+    },
+    {
+      "id": "mxfp8_ue8m0_g32",
+      "formats": [
+        "MXFP8_UE8M0_G32"
+      ],
+      "activation_contract": "w8a8-dynamic-mxfp8-e4m3-group32-ue8m0",
+      "fallback_route": "route_unbacked: Gridbook's Mxfp8DenseLinearMethod is OPT-IN behind GRIDBOOK_MXFP8_DENSE=1 and ships in no released runtime version yet; with the flag unset a unit declaring this format refuses at load (fail-closed)",
+      "detail": "RE-QUANTIZATION lane (not a passthrough): the producer re-encodes any source dtype to E4M3 elements with a float8_e8m0fnu shared exponent per 32 contiguous K, wire id mxfp8_e4m3_e8m0_g32, tensors <unit>.weight + <unit>.weight_scale row-major. ROUTE STATUS: UNBACKED. The consumer-side lane EXISTS and is correctness-audited (gridbook/mxfp8_dense_lane.py, kernel-vs-fp32-oracle over the real DSV4-Flash body shapes on GB10/sm121), but it is opt-in behind GRIDBOOK_MXFP8_DENSE=1 with the NATIVE-PARITY served bench still pending, and Gridbook does not default-enable a lane on correctness evidence alone. This spec's backed set describes what the DEFAULT serve takes, so an operator-flag-gated route is AVAILABLE, NOT BACKED -- the same call nvfp4_cb_quality_path makes about the opt-in fp4 fused mid-M route, and pricing a rung on a lane the default serve never takes is the exact P5b defect this data exists to prevent. NO fused_mid_m KEY, deliberately: a non-CB rung has no CB rung number, so ServingLaneSpec.backed_rungs can never report it backed through that field anyway, and an absent key resolves to the honest 'lane_declares_no_fused_mid_m_lane' source rather than inventing an empty CB ladder. WHEN THIS BECOMES BACKED, key it to the Gridbook version that first RELEASES the lane with the flag defaulted on -- NEVER to 0.7.0, which is the currently pinned version and does not contain it (the consumer branch self-reports 0.7.0 while unreleased, so the version string alone does not distinguish them; the runtime pin's commit does). A pinned version with no entry backs nothing, which is the fail-closed direction. ACTIVATION CONTRACT IS W8A8, not weight-only: the lane quantizes activations dynamically to MXFP8 per 32 reduction-axis elements with the same saturating-ceil rule as the weights (no static global scale, unlike NVFP4). That is why the format's exactness claim on a block-FP8 source is a WEIGHT-PLANE claim (weight_mse == 0.0) and not an output claim, and why cost_entry_is_bit_exact correctly refuses to short-circuit it. Byte contract: 8 + 8/32 = 8.25 bpw exactly, weight plane [N, K] E4M3 plus scale plane [N, K/32] float8_e8m0fnu."
     },
     {
       "id": "nvfp4_cb_quality_path",
