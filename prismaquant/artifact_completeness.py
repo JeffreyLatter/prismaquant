@@ -90,6 +90,10 @@ class CompletenessReport:
 
     #: route-pending formats the producer explicitly acknowledged shipping
     route_pending_acknowledged: list[str] = field(default_factory=list)
+    #: namespaces the producer recorded as deliberately OMITTED. An absence
+    #: covered by one of these is intentional; an absence not covered by one is
+    #: a dropped tensor, which is the failure this module exists to catch.
+    excluded_namespaces: list[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -253,10 +257,25 @@ def check_artifact_completeness(
         (quant_config.get("provenance") or {}).get(
             "route_pending_passthrough_acknowledged") or ())
 
+    excluded = [
+        str(prefix) for prefix in
+        ((quant_config.get("provenance") or {}).get("excluded_namespaces")
+         or ())
+    ]
     report = CompletenessReport(
         declared_units=dict(raw_declared),
         route_pending_acknowledged=acknowledged,
+        excluded_namespaces=excluded,
     )
+    # A declared unit whose tensors are absent because its namespace was
+    # excluded is an intended absence, not a broken promise. Drop those
+    # declarations before checking, so "declared but no tensor" keeps meaning
+    # the one thing that IS a bug.
+    if excluded:
+        declared = {
+            unit: wire for unit, wire in declared.items()
+            if not any(unit.startswith(prefix) for prefix in excluded)
+        }
 
     def _scale_unit(name: str) -> str | None:
         for suffix in _SCALE_SUFFIXES:

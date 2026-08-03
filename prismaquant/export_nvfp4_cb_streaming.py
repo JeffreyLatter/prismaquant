@@ -1257,6 +1257,92 @@ _FP8_BLOCK_UE8M0_FORMAT = "FP8_BLOCK_UE8M0_SOURCE"
 #: can pass the acknowledgement without editing the command line it builds.
 _ROUTE_PENDING_ACK_ENV = "PQ_ALLOW_ROUTE_PENDING"
 
+#: Env spelling of ``--exclude-namespace``: comma-separated tensor-name
+#: prefixes to OMIT from the artifact entirely.
+_EXCLUDE_NAMESPACES_ENV = "PQ_EXPORT_EXCLUDE_NAMESPACES"
+
+
+def _exclude_namespaces_from_env() -> tuple[str, ...]:
+    """Read the env form of the namespace exclusion list. Empty by default.
+
+    Empty means "exclude nothing", which is the pre-existing behaviour, so an
+    unset or blank variable cannot change what an export produces.
+    """
+
+    raw = os.environ.get(_EXCLUDE_NAMESPACES_ENV, "")
+    prefixes = tuple(part.strip() for part in raw.split(",") if part.strip())
+    if prefixes:
+        print(f"[export-stream] {_EXCLUDE_NAMESPACES_ENV} -> omitting "
+              f"namespace(s) {list(prefixes)} from this artifact entirely.",
+              file=sys.stderr, flush=True)
+    return prefixes
+
+
+def _validate_namespace_exclusions(
+    exclude_namespaces,
+    *,
+    assignment,
+    profile,
+) -> tuple[str, ...]:
+    """Normalize the exclusion list, refusing anything the recipe allocated.
+
+    OMISSION IS ONLY LEGAL FOR THE FLOOR. A verbatim tensor is one the
+    allocator never reasoned about, so dropping it changes the artifact's
+    contents and nothing else. An ALLOCATED unit is different in kind: the DP
+    priced it, spent budget on it, and the selection's achieved-bits and
+    predicted loss are both computed as though it ships. Silently omitting one
+    would make the artifact disagree with the recipe that justifies it, and
+    the discrepancy would surface as a missing-weights error at load, long
+    after the number it invalidated was reported. So this is a hard refusal
+    rather than a warning: an exclusion that collides with the recipe means
+    the operator meant something else.
+
+    Both namespaces are checked, because a prefix is written in whichever
+    spelling the operator has in hand (``mtp.`` is a checkpoint spelling; the
+    recipe would say ``model.mtp.``), and a prefix that misses only because it
+    was written in the other vintage would be a silent no-op.
+    """
+
+    prefixes = tuple(
+        str(prefix).strip() for prefix in (exclude_namespaces or ())
+        if str(prefix).strip()
+    )
+    if not prefixes:
+        return ()
+
+    collisions: dict[str, list[str]] = {}
+    for qname in assignment:
+        spellings = {str(qname)}
+        checkpoint = _canonical_qname(str(qname), profile)
+        if checkpoint:
+            spellings.add(checkpoint)
+        source = getattr(profile, "source_tensor_name", None)
+        if callable(source):
+            try:
+                spellings.add(source(str(qname)))
+            except Exception:              # pragma: no cover - defensive
+                pass
+        for prefix in prefixes:
+            if any(name.startswith(prefix) for name in spellings):
+                collisions.setdefault(prefix, []).append(str(qname))
+
+    if collisions:
+        detail = "; ".join(
+            f"{prefix!r} matches {len(names)} allocated unit(s) "
+            f"e.g. {sorted(names)[:3]}"
+            for prefix, names in sorted(collisions.items())
+        )
+        raise ValueError(
+            f"refusing to exclude a namespace the recipe allocates: {detail}. "
+            f"Namespace exclusion omits tensors from the artifact entirely, "
+            f"which is only sound for FLOOR units the allocator never priced. "
+            f"An allocated unit's bytes are already counted in the "
+            f"selection's achieved bits and predicted loss, so dropping it "
+            f"here would make the artifact contradict the recipe that "
+            f"justifies it. Re-run the allocation without these units, or "
+            f"narrow the exclusion prefix.")
+    return prefixes
+
 
 def _route_pending_ack_from_env() -> bool:
     """Read the env form of the route-pending acknowledgement.
@@ -1286,6 +1372,7 @@ def _floor_block_fp8_units(
     claimed_qnames: set[str],
     profile,
     subset_prefixes,
+    excluded_namespaces: tuple[str, ...] = (),
 ) -> tuple[dict[str, str], dict[str, str]]:
     """Block-FP8 units the recipe never allocated, which must be DECLARED.
 
@@ -1343,6 +1430,8 @@ def _floor_block_fp8_units(
         if subset_prefixes is not None and not any(
                 weight_key.startswith(p) for p in subset_prefixes):
             continue
+        if any(ckpt_qname.startswith(p) for p in excluded_namespaces):
+            continue                      # omitted from the artifact entirely
         if any(ckpt_qname.startswith(p) for p in verbatim_prefixes):
             continue                      # profile ships these undeclared
         if weight_key in emitted_bases or weight_key in consumed_expert_bases:
@@ -1422,6 +1511,7 @@ def export_nvfp4_cb_streaming(
     reuse_verify: int = 3,
     allow_unstamped_research: bool = False,
     allow_route_pending_passthrough: bool = False,
+    exclude_namespaces: list[str] | tuple[str, ...] | None = None,
     activation_cache_dir: str | Path | None = None,
     activation_scale_policy: str | None = None,
 ) -> dict[str, int]:
@@ -1521,6 +1611,15 @@ def export_nvfp4_cb_streaming(
     # reduction here, once, before anything reads the assignment.
     assignment, expert_stack_members, expert_stack_report = (
         _collapse_per_expert_assignment(assignment, expert_groups, profile)
+    )
+    # Namespace exclusion is validated against the COLLAPSED assignment, i.e.
+    # the units as the allocator actually decided them, so a per-expert entry
+    # cannot hide a collision behind its expanded spelling.
+    excluded_namespaces = _validate_namespace_exclusions(
+        exclude_namespaces if exclude_namespaces is not None
+        else _exclude_namespaces_from_env(),
+        assignment=assignment,
+        profile=profile,
     )
     if expert_stack_members:
         col_weights = _packed_expert_col_weights(
@@ -2449,11 +2548,19 @@ def export_nvfp4_cb_streaming(
                         | stock_set),
         profile=profile,
         subset_prefixes=subset_prefixes,
+        excluded_namespaces=excluded_namespaces,
     )
     for name in skeleton.keys():
         if subset_prefixes is not None and \
                 not any(name.startswith(p) for p in subset_prefixes):
             continue   # outside the declared subset (e.g. non-MTP body layers)
+        if any(name.startswith(p) for p in excluded_namespaces):
+            # OMITTED ENTIRELY: no tensor, no index entry, no `ignore` line, no
+            # declaration. The prefix test is on the raw checkpoint key, so a
+            # unit's scale and other companions leave with it automatically
+            # rather than by a second rule that could disagree.
+            counts["excluded"] += 1
+            continue
         if name in emitted_bases or name in consumed_expert_bases:
             continue
         if name not in floor_fp8_scale_owner and (
@@ -2763,6 +2870,7 @@ def export_nvfp4_cb_streaming(
         requant_target_name=_base_name,
         source_passthrough_units=_declared_passthrough_units,
         route_pending_passthrough_acknowledged=sorted(route_pending),
+        excluded_namespaces=excluded_namespaces,
         weight_only_stock_targets=sidecar_stock,
         streaming_provenance=True,
         include_tensor_formats=False,
@@ -2843,6 +2951,11 @@ def export_nvfp4_cb_streaming(
     verbatim_prefixes = tuple(_verbatim()) if callable(_verbatim) else ("mtp.",)
     completeness = assert_artifact_complete(
         out_dir, verbatim_prefixes=verbatim_prefixes)
+    if excluded_namespaces:
+        print(f"[export-cb-stream] excluded namespace(s) "
+              f"{list(excluded_namespaces)}: {counts['excluded']} tensor(s) "
+              f"omitted from the artifact (recorded in provenance)",
+              flush=True)
     print(f"[export-cb-stream] completeness: "
           f"{len(completeness.passthrough_units)} declared passthrough, "
           f"{len(completeness.verbatim_namespace_units)} verbatim-namespace "
@@ -3017,6 +3130,18 @@ def main(argv=None) -> None:
         "on stderr and is OFF unless set to exactly '1'.",
     )
     ap.add_argument(
+        "--exclude-namespace",
+        action="append",
+        default=None,
+        dest="exclude_namespaces",
+        help="OMIT every tensor whose checkpoint name starts with this prefix "
+        "from the artifact entirely — no tensor, no index entry, no `ignore` "
+        "line, no declaration. Repeatable. Legal only for floor/verbatim "
+        "tensors: a prefix matching any unit the layer_config allocates is a "
+        f"hard refusal. May also be set with {_EXCLUDE_NAMESPACES_ENV} as a "
+        "comma-separated list; empty/unset excludes nothing.",
+    )
+    ap.add_argument(
         "--scale-coding",
         default=cb.SCALE_CODING_TWO_TIER,
         choices=[cb.SCALE_CODING_V1, cb.SCALE_CODING_TWO_TIER],
@@ -3066,6 +3191,7 @@ def main(argv=None) -> None:
         reuse_verify=reuse_verify,
         allow_unstamped_research=args.allow_unstamped_research,
         allow_route_pending_passthrough=args.allow_route_pending_passthrough,
+        exclude_namespaces=args.exclude_namespaces,
         activation_cache_dir=args.activation_cache_dir,
         activation_scale_policy=args.activation_scale_policy)
     size = sum(p.stat().st_size for p in Path(args.out).glob("*")) / 1e9

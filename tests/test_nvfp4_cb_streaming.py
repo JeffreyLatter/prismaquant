@@ -2184,3 +2184,155 @@ def test_floor_block_fp8_refuses_to_ship_unacknowledged(workdir):
         export_nvfp4_cb_streaming(
             mdl, path, workdir / "refused", col_weights, device="cpu",
             allow_route_pending_passthrough=False)
+
+
+# --- namespace exclusion: omitting a floor namespace entirely ---------------
+
+
+def _dsv4_source_with_mtp(mdl: Path, **kwargs) -> dict:
+    """The DSv4 fixture plus an `mtp.*` block, so exclusion has a target."""
+    tensors = _dsv4_source_model(mdl, **kwargs)
+    generator = torch.Generator().manual_seed(77)
+    hid = _SOURCE_HID
+    extra = {
+        "mtp.0.attn.wq_a.weight": (
+            torch.randn(hid, hid, generator=generator) * 0.3
+        ).to(torch.float8_e4m3fn),
+        "mtp.0.attn.wq_a.scale": _e8m0_plane((2, 2), generator),
+        "mtp.0.attn_norm.weight": torch.ones(hid, dtype=torch.bfloat16),
+    }
+    for expert in range(_SOURCE_EXPERTS):
+        for leaf in ("w1", "w3", "w2"):
+            base = f"mtp.0.ffn.experts.{expert}.{leaf}"
+            extra[base + ".weight"] = torch.randint(
+                -128, 128, (hid, hid // 2), dtype=torch.int8,
+                generator=generator)
+            extra[base + ".scale"] = _e8m0_plane((hid, hid // 32), generator)
+    tensors.update(extra)
+    save_file(tensors, str(mdl / "model.safetensors"))
+    return tensors
+
+
+def _export_with_exclusions(workdir, out_name, exclusions, **model_kwargs):
+    mdl = workdir / f"src_{out_name}"
+    _dsv4_source_with_mtp(mdl, **model_kwargs)
+    assignment, col_weights = _dsv4_recipe(**model_kwargs)
+    path = workdir / f"{out_name}.json"
+    _assign(path, assignment)
+    out = workdir / out_name
+    counts = export_nvfp4_cb_streaming(
+        mdl, path, out, col_weights, device="cpu",
+        allow_route_pending_passthrough=True,
+        exclude_namespaces=exclusions)
+    return mdl, out, dict(counts)
+
+
+def test_namespace_exclusion_removes_it_everywhere_and_changes_nothing_else(
+        workdir):
+    """`mtp.*` gone from tensors, index and config; the rest byte-identical."""
+    _mdl, kept, _ = _export_with_exclusions(workdir, "kept", None)
+    mdl, dropped, counts = _export_with_exclusions(
+        workdir, "dropped", ["mtp."])
+
+    kept_header, _ = _st_header(kept / "model.safetensors")
+    dropped_header, _ = _st_header(dropped / "model.safetensors")
+
+    # (a) gone from the tensor set / index entirely.
+    assert any(n.startswith("mtp.") for n in kept_header)
+    assert not any(n.startswith("mtp.") for n in dropped_header)
+
+    # (b) gone from every declaration surface too, not just the payload.
+    dropped_config = json.loads((dropped / "quant_config.json").read_text())
+    serialized = json.dumps(dropped_config)
+    assert "mtp." not in serialized.replace('"excluded_namespaces": ["mtp."]',
+                                            ""), \
+        "an excluded namespace must not survive in ignore/targets/units"
+    assert dropped_config["provenance"]["excluded_namespaces"] == ["mtp."]
+
+    # (c) the byte total drops by exactly the excluded namespace's size.
+    def _payload(header):
+        return sum(meta["data_offsets"][1] - meta["data_offsets"][0]
+                   for name, meta in header.items() if name != "__metadata__")
+
+    excluded_bytes = sum(
+        meta["data_offsets"][1] - meta["data_offsets"][0]
+        for name, meta in kept_header.items()
+        if name.startswith("mtp."))
+    assert excluded_bytes > 0
+    assert _payload(kept_header) - _payload(dropped_header) == excluded_bytes
+
+    # (d) EVERYTHING else is byte-identical — exclusion removes, never rewrites.
+    shared = {n for n in kept_header
+              if not n.startswith("mtp.") and n != "__metadata__"}
+    assert shared == {n for n in dropped_header if n != "__metadata__"}
+    for name in sorted(shared):
+        assert hashlib.sha256(_emitted_bytes(kept, name)).hexdigest() == \
+            hashlib.sha256(_emitted_bytes(dropped, name)).hexdigest(), name
+
+
+def test_namespace_exclusion_defaults_to_nothing(workdir, monkeypatch):
+    """Unset env and unset argument both mean 'exclude nothing'."""
+    from prismaquant.export_nvfp4_cb_streaming import (
+        _EXCLUDE_NAMESPACES_ENV,
+        _exclude_namespaces_from_env,
+    )
+
+    monkeypatch.delenv(_EXCLUDE_NAMESPACES_ENV, raising=False)
+    assert _exclude_namespaces_from_env() == ()
+    for blank in ("", "   ", ",", " , "):
+        monkeypatch.setenv(_EXCLUDE_NAMESPACES_ENV, blank)
+        assert _exclude_namespaces_from_env() == ()
+    monkeypatch.setenv(_EXCLUDE_NAMESPACES_ENV, " mtp. , visual. ")
+    assert _exclude_namespaces_from_env() == ("mtp.", "visual.")
+
+    # Back to unset before exporting: with no argument AND no env, the export
+    # must keep everything. (Leaving the variable set above would exclude
+    # `mtp.` through the env path — which is the knob working, but not what
+    # this test is about.)
+    monkeypatch.delenv(_EXCLUDE_NAMESPACES_ENV, raising=False)
+    _mdl, out, _ = _export_with_exclusions(workdir, "default", None)
+    header, _ = _st_header(out / "model.safetensors")
+    assert any(name.startswith("mtp.") for name in header)
+    config = json.loads((out / "quant_config.json").read_text())
+    assert "excluded_namespaces" not in config["provenance"]
+
+
+def test_namespace_exclusion_refuses_an_allocated_unit(workdir):
+    """Excluding something the recipe priced must hard-fail, not silently drop.
+
+    The allocated unit's bytes are already counted in the selection's achieved
+    bits and predicted loss, so omitting it would make the artifact contradict
+    the recipe that justifies it.
+    """
+    with pytest.raises(ValueError, match="allocates"):
+        _export_with_exclusions(workdir, "illegal", ["layers.0."])
+
+
+def test_namespace_exclusion_refuses_via_the_recipe_spelling_too(workdir):
+    """A prefix written in the RECIPE vintage must collide just the same."""
+    with pytest.raises(ValueError, match="allocates"):
+        _export_with_exclusions(workdir, "illegal2", ["model.layers.0."])
+
+
+def test_excluded_namespace_absence_is_valid_to_the_completeness_gate(workdir):
+    """Absent-and-excluded passes; the same absence unrecorded still fails."""
+    from prismaquant.artifact_completeness import (
+        assert_artifact_complete,
+        check_artifact_completeness,
+    )
+
+    _mdl, dropped, _ = _export_with_exclusions(workdir, "gate", ["mtp."])
+    report = assert_artifact_complete(dropped)
+    assert report.excluded_namespaces == ["mtp."]
+
+    # Strip the record: the artifact is byte-identical, but nothing now says
+    # the absence was intended. A weight whose scale is missing must fail
+    # again, which is what proves the exemption is the RECORD and not the
+    # prefix.
+    _mdl2, kept, _ = _export_with_exclusions(workdir, "gate2", None)
+    tensors = load_file(str(kept / "model.safetensors"))
+    tensors.pop("mtp.0.attn.wq_a.scale")
+    save_file(tensors, str(kept / "model.safetensors"))
+    report = check_artifact_completeness(kept)
+    assert not report.ok
+    assert "mtp.0.attn.wq_a" in report.missing_scale

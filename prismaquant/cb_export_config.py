@@ -711,6 +711,7 @@ def build_quant_config(
     requant_target_name: TargetName = _identity_target,
     source_passthrough_units: Mapping[str, str] | None = None,
     route_pending_passthrough_acknowledged: Iterable[str] = (),
+    excluded_namespaces: Iterable[str] = (),
     weight_only_stock_targets: Iterable[str] = (),
     streaming_provenance: bool | None = None,
     include_tensor_formats: bool = False,
@@ -878,6 +879,14 @@ def build_quant_config(
         # artifact has to carry the fact that it was used, or "was this shipped
         # knowing no serve route existed?" is unanswerable from the artifact.
         provenance["route_pending_passthrough_acknowledged"] = acknowledged
+    excluded = sorted(set(str(prefix) for prefix in excluded_namespaces))
+    if excluded:
+        # An artifact that is MISSING a namespace has to say so. Otherwise
+        # "were these tensors omitted on purpose, or lost?" is unanswerable
+        # from the artifact — and those two have opposite remedies (re-export
+        # vs. nothing). The completeness gate reads this to tell an intended
+        # absence from a dropped one.
+        provenance["excluded_namespaces"] = excluded
     if cb_render_identity is not None:
         provenance["cb_render_identity"] = cb_render_identity
     if include_tensor_formats:
