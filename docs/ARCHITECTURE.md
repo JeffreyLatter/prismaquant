@@ -1,7 +1,7 @@
 # PrismaQuant Architecture
 
-As of: 2026-08-03 · branch `release/prismaquant-0.8.0` · verified against implementation
-baseline commit `7183d21`, with the external Gridbook runtime pinned to
+As of: 2026-08-03 · branch `feat/research-grade-cost-acceptance` · verified against implementation
+baseline commit `11c61b9`, with the external Gridbook runtime pinned to
 `9011a19228ddb96b8a49e11a20ac75c99c83998e` (v0.8.0). This branch ports the dated
 2026-08-01 DeepSeek-V4-Flash-0731 92 GB study record (§9.2) forward from its 0.5.1
 working tree; the study's Gridbook-candidate claims were **not** carried over, because
@@ -472,6 +472,16 @@ naming both modes; an unstamped (pre-R2) table warns and is reused, never invali
 other modes `cost_baseline.pkl` is mode-agnostic on purpose and is shared across mode changes.
 This is re-vet **R2 precondition (i)** — the prerequisite to flipping the `COST_MODE` default,
 which is *not* done here.
+
+**Sanctioned study-grade assembly (opt-in, 2026-08-03).** The production guards above and the
+CB shard/serialized-payload/lattice/render-scope gates remain fail-closed. For the explicitly
+user-accepted DSv4 learning experiment, `allocator --accept-research-cost-table` may assemble a
+complete `layer_*.pkl` store over a production base when both `--research-cost-base` and
+`--research-cost-segments-dir` are supplied. `research_cost_acceptance.py` verifies layer ids,
+row keying/counts, source hashes and overlap precedence, then stamps
+`cost_provenance="research_assembled_segments_user_accepted_2026-08-03"` plus its manifest.
+The stamp travels into `selection.json` and the reserved layer-config metadata. A stamped table
+is refused without the allocator flag; an unstamped table cannot be blessed by the flag.
 
 ### 3.5 Archived modes — the eleven `exit 2` gates
 
@@ -1113,6 +1123,14 @@ budget it was selected under and leaving the artifact's real bpp disagreeing wit
 profile (`:1548`, `:1574-1589`), with the wrong-container cases (`nvfp4_cb`, GGUF) called out
 by name. The *legitimate* coercion is deliberately kept: a format the exporter can emit but
 which is shape-illegal or profile-denied still falls back to BF16 and is still audited.
+
+**Research-cost ship refusal.** Every exporter reads the reserved layer-config metadata and
+refuses a selection carrying the sanctioned study-grade cost stamp unless the operator passes
+the separate `--allow-research-cost-selection` acknowledgement. This is independent of the
+allocator-side acceptance: allocating a learning experiment does not silently authorize
+shipping it. CB artifacts record the manifest and acknowledgement in `quant_config.json`;
+GGUF records it in metadata. Unstamped production selections follow the existing gates
+unchanged (`research_cost_acceptance.enforce_research_export_acknowledgement`).
 
 **M19 — export honours the render's scale rule.** `_export_match_render_scale_rule`
 `:2130-2147` reads the cache's `levers["nvfp4_scale_rule"]` and re-derives NVFP4 codes under

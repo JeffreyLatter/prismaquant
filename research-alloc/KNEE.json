@@ -1,0 +1,177 @@
+{
+  "schema": "prismaquant.pareto_knee_analysis.v1",
+  "method": "max deviation from the endpoint chord (kneedle), identical to the construction used on the old-menu curve",
+  "old_menu": {
+    "knee_gb": 103.612,
+    "knee_bpp": 2.4994,
+    "menu": "NVFP4_CB_K14/K15 + FP8_CB_K36 + MXFP4_SOURCE"
+  },
+  "n_pareto_points": 38,
+  "frame_note": "The (b)->(c) frame shift is a pure TRANSLATION of the GB axis by the MTP bytes, and the kneedle normalisation (x-x0)/(x1-x0) is translation-invariant -- so the knee is necessarily the SAME allocation in both frames, with its GB label 10.863 lower in (c). The two frames are reported because the question was asked, and because a disagreement between them would indicate an implementation error rather than a finding.",
+  "frames": {
+    "b_mtp_in_floor": {
+      "frame": "MTP in floor",
+      "knee_gb": 96.578,
+      "knee_bpp": 2.2993,
+      "knee_dloss": 505.4,
+      "knee_inside_shave_window_88_92": false,
+      "near_free_zone": {
+        "reference_rate_shave_relevant_dloss_per_gb": 113.8,
+        "reference_rate_buyback_dloss_per_gb": 107.9,
+        "threshold_multiple": 3.0,
+        "boundary_gb": 86.035,
+        "boundary_gb_lenient_reference": 86.035,
+        "meaning": "budgets down to boundary_gb cost within 3.0x the rate already being accepted at 92 GB; below it the shave gets materially more expensive"
+      },
+      "cliff_region_87_93": [
+        {
+          "from_gb": 87.0,
+          "to_gb": 87.094,
+          "dloss_per_gb": -188.9
+        },
+        {
+          "from_gb": 87.094,
+          "to_gb": 87.446,
+          "dloss_per_gb": -282.7
+        },
+        {
+          "from_gb": 87.446,
+          "to_gb": 87.792,
+          "dloss_per_gb": -207.5
+        },
+        {
+          "from_gb": 87.792,
+          "to_gb": 88.143,
+          "dloss_per_gb": -159.1
+        },
+        {
+          "from_gb": 88.143,
+          "to_gb": 88.5,
+          "dloss_per_gb": -145.1
+        },
+        {
+          "from_gb": 88.5,
+          "to_gb": 88.847,
+          "dloss_per_gb": -149.9
+        },
+        {
+          "from_gb": 88.847,
+          "to_gb": 89.202,
+          "dloss_per_gb": -182.7
+        },
+        {
+          "from_gb": 89.202,
+          "to_gb": 89.543,
+          "dloss_per_gb": -163.3
+        },
+        {
+          "from_gb": 89.543,
+          "to_gb": 89.906,
+          "dloss_per_gb": -149.6
+        },
+        {
+          "from_gb": 89.906,
+          "to_gb": 90.252,
+          "dloss_per_gb": -148.3
+        },
+        {
+          "from_gb": 90.252,
+          "to_gb": 90.615,
+          "dloss_per_gb": -143.6
+        },
+        {
+          "from_gb": 90.615,
+          "to_gb": 90.953,
+          "dloss_per_gb": -129.4
+        },
+        {
+          "from_gb": 90.953,
+          "to_gb": 91.316,
+          "dloss_per_gb": -108.2
+        },
+        {
+          "from_gb": 91.316,
+          "to_gb": 91.657,
+          "dloss_per_gb": -113.8
+        },
+        {
+          "from_gb": 91.657,
+          "to_gb": 92.015,
+          "dloss_per_gb": -107.9
+        },
+        {
+          "from_gb": 92.015,
+          "to_gb": 92.357,
+          "dloss_per_gb": -134.9
+        },
+        {
+          "from_gb": 92.357,
+          "to_gb": 92.72,
+          "dloss_per_gb": -112.0
+        },
+        {
+          "from_gb": 92.72,
+          "to_gb": 93.0,
+          "dloss_per_gb": -111.8
+        }
+      ],
+      "old_menu_cliff": {
+        "segment_gb": [
+          88.803,
+          90.23
+        ],
+        "dloss_per_gb": -3890.6,
+        "new_menu_worst_dloss_per_gb_in_same_span": -182.7,
+        "flattened": true,
+        "flattening_factor": 21.3
+      }
+    },
+    "c_mtp_released": {
+      "frame": "MTP bytes released",
+      "knee_gb": 85.715,
+      "knee_bpp": 2.2993,
+      "knee_dloss": 505.4,
+      "knee_inside_shave_window_88_92": false,
+      "near_free_zone": {
+        "reference_rate_shave_relevant_dloss_per_gb": 36.4,
+        "reference_rate_buyback_dloss_per_gb": 31.7,
+        "threshold_multiple": 3.0,
+        "boundary_gb": 82.196,
+        "boundary_gb_lenient_reference": 82.901,
+        "meaning": "budgets down to boundary_gb cost within 3.0x the rate already being accepted at 92 GB; below it the shave gets materially more expensive"
+      },
+      "cliff_region_87_93": [
+        {
+          "from_gb": 87.0,
+          "to_gb": 87.461,
+          "dloss_per_gb": -41.8
+        },
+        {
+          "from_gb": 87.461,
+          "to_gb": 89.229,
+          "dloss_per_gb": -36.4
+        },
+        {
+          "from_gb": 89.229,
+          "to_gb": 92.738,
+          "dloss_per_gb": -31.7
+        },
+        {
+          "from_gb": 92.738,
+          "to_gb": 93.0,
+          "dloss_per_gb": -22.5
+        }
+      ],
+      "old_menu_cliff": {
+        "segment_gb": [
+          88.803,
+          90.23
+        ],
+        "dloss_per_gb": -3890.6,
+        "new_menu_worst_dloss_per_gb_in_same_span": -36.4,
+        "flattened": true,
+        "flattening_factor": 106.88
+      }
+    }
+  }
+}
