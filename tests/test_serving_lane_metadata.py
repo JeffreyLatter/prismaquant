@@ -276,14 +276,19 @@ def test_the_lane_catalog_is_reportable_and_names_its_runtime():
         # their own precisely so P5b never files a passthrough unit under a
         # CB activation contract it does not have.
         "delegated_native_mxfp4", "delegated_native_fp8_block_ue8m0",
+        # The RE-QUANTIZED native lane. Declared for the same P5b reason and
+        # currently UNBACKED: no released Gridbook runtime carries a loader.
+        "mxfp8_ue8m0_g32",
     }
     assert catalog["lanes"]["fp8_cb_fused_mid_m"]["fused_mid_m_rungs"] == [
         28, 32, 36, 40, 44, 48]
     # A passthrough lane backs no fused mid-M rung, and says so explicitly
     # rather than leaving the field absent: there is no decode prologue to
-    # fuse, so an empty backed set is the honest state, not a data gap.
+    # fuse, so an empty backed set is the honest state, not a data gap. The
+    # unbacked re-quant lane reads the same way and for the same reason.
     for lane_id in ("delegated_native_mxfp4",
-                    "delegated_native_fp8_block_ue8m0"):
+                    "delegated_native_fp8_block_ue8m0",
+                    "mxfp8_ue8m0_g32"):
         lane = catalog["lanes"][lane_id]
         assert lane["fused_mid_m_rungs"] == []
         assert lane["fused_mid_m_rungs_source"] == (

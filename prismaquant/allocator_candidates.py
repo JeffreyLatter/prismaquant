@@ -250,6 +250,36 @@ PASSTHROUGH_WIRE_FORMAT_IDS: dict[str, str] = {
     if contract.wire_format_id is not None
 }
 
+# The same cross-repo wire enum, for formats this producer RE-ENCODES rather
+# than copies. Kept as its own table beside the passthrough ids rather than
+# folded into SOURCE_PASSTHROUGH_CONTRACTS, because that table means something
+# specific and load-bearing: every member has an IDENTITY codec and a Δloss of
+# zero by construction. A re-quantization rung has a real encoder and a real
+# measured cost, so declaring it there would let it claim an exactness it has
+# not earned (tests/test_source_passthrough_family.py pins that invariant).
+#
+# What the two tables DO share is that the id is a contract with the consumer:
+# the registry name is ours to rename, the wire id is not.
+#
+# NOTE FOR ORCHESTRATOR RECONCILIATION: ``mxfp8_e4m3_e8m0_g32`` is the
+# spelling the Gridbook consumer side proposed. It diverges from this repo's
+# own convention, which spells the unsigned-E8M0 scale plane ``ue8m0``
+# (``mxfp4_e2m1_ue8m0_g32``, ``fp8_e4m3_ue8m0_block128``). The consumer's
+# spelling is used verbatim here rather than guessed at; if the two repos
+# settle on ``mxfp8_e4m3_ue8m0_g32`` instead, this one string is the only
+# producer-side edit.
+REQUANT_WIRE_FORMAT_IDS: dict[str, str] = {
+    "MXFP8_UE8M0_G32": "mxfp8_e4m3_e8m0_g32",
+}
+
+# Every wire id this producer can declare, from either table. Ids must be
+# globally unique: the consumer dispatches on the id alone and cannot tell
+# which producer-side table it came from.
+WIRE_FORMAT_IDS: dict[str, str] = {
+    **PASSTHROUGH_WIRE_FORMAT_IDS,
+    **REQUANT_WIRE_FORMAT_IDS,
+}
+
 
 def passthrough_serving_notes() -> dict[str, dict[str, str]]:
     """Per-format serving requirements/evidence for the artifact's notes.

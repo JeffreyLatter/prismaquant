@@ -78,6 +78,13 @@ probe inventory: 33,325 Linears
 | `FP8_SOURCE` | — | `fp8` | 8.00195 | no | backed (other checkpoints) |
 | `BF16` | — | `bf16` | 16 | no | backed |
 
+The same routing record also carries the one **re-quantized** native rung,
+which is not a passthrough and has no source kind (it is legal on any):
+
+| Format | Wire id | bpw | Route status on sm121 |
+|---|---|---|---|
+| `MXFP8_UE8M0_G32` | `mxfp8_e4m3_e8m0_g32` | 8.25 | **unbacked — consumer lane exists but is opt-in (`GRIDBOOK_MXFP8_DENSE=1`), serve-parity bench pending** |
+
 ### The route verdicts came out the opposite way round
 
 Both were measured on GB10/sm121, 2026-08-03. The intuition "the released
@@ -188,8 +195,21 @@ consumer-side reader is implemented and shipped, so this is its exact spelling
 ```
 
 * the format-id enum is **closed**: `mxfp4_e2m1_ue8m0_g32`,
-  `fp8_e4m3_ue8m0_block128` (`PASSTHROUGH_WIRE_FORMAT_IDS` is the one mapping
-  from registry name to wire id);
+  `fp8_e4m3_ue8m0_block128`, `mxfp8_e4m3_e8m0_g32`. Ids come from two producer
+  tables — `PASSTHROUGH_WIRE_FORMAT_IDS` (byte-verbatim) and
+  `REQUANT_WIRE_FORMAT_IDS` (re-encoded here) — whose union
+  `WIRE_FORMAT_IDS` must stay 1:1, because the consumer resolves a unit by id
+  alone (`gridbook.source_passthrough.FORMATS`);
+* **what this record actually claims** is *delegated-native routing* — "served
+  by a native Gridbook/model-owned route, not by a CB codebook decoder" —
+  which is the question the consumer's dispatcher asks. It is NOT a claim that
+  every listed unit's bytes are the checkpoint's own; a re-quantized rung is
+  listed here too, and a unit omitted here reads to the consumer as CB, the
+  one wrong answer that loads. The stronger byte-verbatim claim is per unit in
+  its config group's `weights.source_passthrough` flag (`true` for the
+  `*_SOURCE` family, `false` for a re-encode). The key keeps its historical
+  name because it is a shipped cross-repo contract
+  (`gridbook.source_passthrough.SCHEMA_KEY`);
 * a unit may be an expert group **or** a dense body Linear — there is no
   expert-only framing and no exhaustiveness claim;
 * **absence of the key means a legacy all-CB artifact**, so the key is emitted
