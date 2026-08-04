@@ -1,0 +1,7 @@
+.capture-tmp/
+tmp/
+*.log
+*.pkl
+act/
+*.pt
+results.json
