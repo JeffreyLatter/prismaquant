@@ -110,6 +110,7 @@ from prismaquant.nvfp4_cb_footprint import (
     cb_assignment_payload_breakdown,
     cb_payload_summary,
     cb_serialization_metadata_from_assignment_payload,
+    cb_serialization_context_from_env,
     cb_tensor_payload_breakdown,
     finalize_cb_export_artifact_inventory,
     resolve_cb_encode_tier,
@@ -2311,6 +2312,7 @@ def export_nvfp4_cb_streaming(
         scale_coding=scale_coding,
         codebook_source=source,
         scale_sweep=bool(scale_sweep),
+        ldlq=cb_serialization_context_from_env().ldlq,
         encode_tier=resolve_cb_encode_tier(),
         activation_contract=_claimed_activation_contract,
         activation_execution=(
@@ -2329,6 +2331,21 @@ def export_nvfp4_cb_streaming(
         serialization_context,
         where="export_nvfp4_cb_streaming",
     )
+    ldlq_activation_loader = None
+    if serialization_context.ldlq:
+        if activation_cache_dir is None:
+            raise ValueError(
+                "export_nvfp4_cb_streaming: LDLQ requires activation_cache_dir"
+            )
+        from prismaquant.cb_ldlq import CBLDLQActivationLoader
+
+        ldlq_activation_loader = CBLDLQActivationLoader(
+            activation_cache_dir,
+            model_dir=model_dir,
+            profile=profile,
+            expert_stack_members=expert_stack_members,
+            replay_device=device,
+        )
     if cb_targets and _recipe_cb_render_identity is not None:
         from prismaquant.production_weight_cache import (
             validate_cb_render_identity_metadata,
@@ -2601,7 +2618,8 @@ def export_nvfp4_cb_streaming(
                 verified_cb_source_qnames,
                 expert_stack_members.get(qname),
                 warm_session=warm_session,
-                format_name=assignment[qname])
+                format_name=assignment[qname],
+                ldlq_activation_loader=ldlq_activation_loader)
             state["scale"] = scale
             return packed.reshape(packed_shape)
 
@@ -2696,7 +2714,8 @@ def export_nvfp4_cb_streaming(
                     verified_cb_source_qnames,
                     expert_stack_members.get(qname),
                     warm_session=warm_session,
-                    format_name=assignment[qname])
+                    format_name=assignment[qname],
+                    ldlq_activation_loader=ldlq_activation_loader)
                 out = {qw_name: packed.reshape(packed_shape)}
                 if scale is not None:
                     out[scale_name] = scale.reshape(scale_shape).to(
@@ -3536,7 +3555,8 @@ def _stream_pack_target(skeleton, profile, resolved, qname, grid, mode, k,
                         codebook, cw, scale_sweep, coding, shape, device,
                         encode_tier, cb_render_identity,
                         verified_source_qnames, member_qnames=None, *,
-                        warm_session=None, format_name=None):
+                        warm_session=None, format_name=None,
+                        ldlq_activation_loader=None):
     """Pack ONE target, streaming experts. Returns (packed uint8 (rows,bytes)
     or (E,out,bytes), scale-plane fp32 or None). Per-expert scales make
     per-expert packing byte-identical to whole-stack packing."""
@@ -3559,7 +3579,13 @@ def _stream_pack_target(skeleton, profile, resolved, qname, grid, mode, k,
             w, qname=qname, format_name=format_name, grid=grid, mode=mode,
             k=k, col_weights=cw.to(device), codebook=cbook,
             scale_sweep=scale_sweep, scale_coding=coding,
-            encode_tier=encode_tier, warm_session=warm_session)
+            encode_tier=encode_tier, warm_session=warm_session,
+            ldlq_activation_rows=(
+                ldlq_activation_loader.load(
+                    qname,
+                    stack_size=(int(w.shape[0]) if w.dim() == 3 else None),
+                ) if ldlq_activation_loader is not None else None
+            ))
         if w.dim() == 3:
             packed = packed.reshape(w.shape[0], w.shape[1], -1)
         scale = (fields["scales"].reshape(*w.shape[:-1]).cpu()
@@ -3633,7 +3659,11 @@ def _stream_pack_target(skeleton, profile, resolved, qname, grid, mode, k,
         w, qname=qname, format_name=format_name, grid=grid, mode=mode, k=k,
         col_weights=cw.to(device), codebook=cbook,
         scale_sweep=scale_sweep, scale_coding=coding,
-        encode_tier=encode_tier, warm_session=warm_session)
+        encode_tier=encode_tier, warm_session=warm_session,
+        ldlq_activation_rows=(
+            ldlq_activation_loader.load(qname, stack_size=int(w.shape[0]))
+            if ldlq_activation_loader is not None else None
+        ))
     packed = packed.reshape(w.shape[0], w.shape[1], -1)
     scale = (fields["scales"].reshape(*w.shape[:-1]).cpu()
              if grid == "fp8" else None)
@@ -3643,6 +3673,7 @@ def _stream_pack_target(skeleton, profile, resolved, qname, grid, mode, k,
 def _pack_with_optional_warm_state(
     weight, *, qname, format_name, grid, mode, k, col_weights, codebook,
     scale_sweep, scale_coding, encode_tier, warm_session,
+    ldlq_activation_rows=None,
 ):
     """Run normal assignment/packing, optionally seeded by a stored argmin."""
     from prismaquant.cb_warm_state import (
@@ -3662,6 +3693,8 @@ def _pack_with_optional_warm_state(
             scale_coding=scale_coding,
             encode_tier=encode_tier,
             warm_scale_state=warm_scale_state,
+            ldlq=ldlq_activation_rows is not None,
+            activation_rows=ldlq_activation_rows,
         )
         rendered = {"packed": packed}
         if grid == "fp8":

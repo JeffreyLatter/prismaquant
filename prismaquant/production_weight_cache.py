@@ -3151,6 +3151,12 @@ def render_production_weight(
 
     if fmt != "NVFP4":
         spec = fr.get_format(fmt)
+        acts = activations.get(qname)
+        acts_for_render = (
+            acts.detach().to(device=weight.device, dtype=torch.float32)
+            if acts is not None and int(acts.shape[-1]) == int(weight.shape[1])
+            else None
+        )
         # R3 / Milestone C: the weighted families' one render definition,
         # shared with the inline cost render and the emulation path. Calling
         # it for the unweighted case as well is important for CB: it binds the
@@ -3167,6 +3173,7 @@ def render_production_weight(
                 weight.detach(),
                 context=cb_serialization_context,
                 col_weights=col_weights.reshape(-1).to(weight.device),
+                activation_rows=acts_for_render,
             ).to(device=weight.device, dtype=weight.dtype)
         else:
             from prismaquant.emu_forward_kl import weighted_quantize_dequantize
@@ -3178,12 +3185,6 @@ def render_production_weight(
                 else col_weights.reshape(-1).to(weight.device),
             ).to(device=weight.device, dtype=weight.dtype)
         reference = weight.detach().to(torch.float32)
-        acts = activations.get(qname)
-        acts_for_render = (
-            acts.detach().to(device=weight.device, dtype=torch.float32)
-            if acts is not None and int(acts.shape[-1]) == int(weight.shape[1])
-            else None
-        )
         # Clip-consistent gate matrix — same contract as the NVFP4
         # progressive path (audit 2026-07-02 §3.9): score under the matrix
         # the GPTQ/scale-sweep passes optimize on.

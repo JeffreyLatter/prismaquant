@@ -1732,6 +1732,12 @@ def main():
         help="Exact CB scale-search contract; required with CB formats.",
     )
     ap.add_argument(
+        "--cb-ldlq",
+        choices=("0", "1"),
+        default=None,
+        help="Exact CB feedback-assignment contract; required with CB formats.",
+    )
+    ap.add_argument(
         "--cb-encode-tier",
         choices=("fast", "balanced", "max"),
         default=None,
@@ -2226,13 +2232,14 @@ def main():
             args.cb_scale_coding is None
             or args.cb_codebook_source is None
             or args.cb_scale_sweep is None
+            or args.cb_ldlq is None
             or args.cb_encode_tier is None
         ):
             raise SystemExit(
                 "[alloc] ERROR: a CB format is present in the body or fixed "
                 "auxiliary assignment but exact serialized "
                 "and renderer context is missing. Pass --cb-scale-coding, "
-                "--cb-codebook-source, --cb-scale-sweep, and "
+                "--cb-codebook-source, --cb-scale-sweep, --cb-ldlq, and "
                 "--cb-encode-tier; refusing implicit render defaults."
             )
         codebook_digests = None
@@ -2271,6 +2278,7 @@ def main():
                 scale_coding=args.cb_scale_coding,
                 codebook_source=args.cb_codebook_source,
                 scale_sweep=args.cb_scale_sweep == "1",
+                ldlq=args.cb_ldlq == "1",
                 encode_tier=args.cb_encode_tier,
                 activation_contract=NVFP4_ACTIVATION_CONTRACT_SCHEMA,
                 activation_execution=NVFP4_ACTIVATION_EXECUTION,
@@ -2284,6 +2292,7 @@ def main():
             f"layout_version={cb_serialization_context.layout_version} "
             f"codebook_source={cb_serialization_context.codebook_source} "
             f"scale_sweep={cb_serialization_context.scale_sweep} "
+            f"ldlq={cb_serialization_context.ldlq} "
             f"encode_tier={cb_serialization_context.encode_tier} "
             f"renderer_abi={cb_serialization_context.renderer_abi}",
             flush=True,

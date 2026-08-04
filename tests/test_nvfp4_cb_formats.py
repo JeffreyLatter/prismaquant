@@ -1044,6 +1044,7 @@ def test_exporter_explicit_legacy_v1_remains_readable(export_dir):
             "layout_version",
             "codebook_source",
             "scale_sweep",
+            "ldlq",
             "encode_tier",
             "renderer_abi",
         )

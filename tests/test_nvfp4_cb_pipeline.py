@@ -368,7 +368,7 @@ def test_promote_serving_units_lifts_mixed_group_to_max_rank():
 #     through the real allocator.main() (mirrors test_allocator_main_*).
 # ---------------------------------------------------------------------------
 
-def _write_alloc_fixture(tmp_path, menu):
+def _write_alloc_fixture(tmp_path, menu, *, context=_CB_CONTEXT):
     # 256-aligned dense fixture the CB rungs survive on.
     specs = _menu_specs(menu)
     stats, costs = _dense_model(specs)
@@ -386,7 +386,7 @@ def _write_alloc_fixture(tmp_path, menu):
         }
         render_identity = build_production_cache_cb_render_identity(
             formats_by_qname,
-            cb_serialization_context=_CB_CONTEXT,
+            cb_serialization_context=context,
             col_weights=col_weights,
             render_levers={"weighted_vq": True},
             render_mechanism_plan=[],
@@ -427,8 +427,21 @@ def _write_alloc_fixture(tmp_path, menu):
     return p, c, cw
 
 
-def _run_main(tmp_path, monkeypatch, menu, *, enforce, target="3.0"):
-    probe_p, cost_p, col_weights_p = _write_alloc_fixture(tmp_path, menu)
+def _run_main(
+    tmp_path,
+    monkeypatch,
+    menu,
+    *,
+    enforce,
+    target="3.0",
+    ldlq=False,
+):
+    context = CBSerializationContext.production(ldlq=ldlq)
+    probe_p, cost_p, col_weights_p = _write_alloc_fixture(
+        tmp_path,
+        menu,
+        context=context,
+    )
     lc = tmp_path / "layer_config.json"
     csv = tmp_path / "pareto.csv"
     argv = [
@@ -445,6 +458,7 @@ def _run_main(tmp_path, monkeypatch, menu, *, enforce, target="3.0"):
         "--cb-scale-coding", "two_tier",
         "--cb-codebook-source", "lattice",
         "--cb-scale-sweep", "1",
+        "--cb-ldlq", "1" if ldlq else "0",
         "--cb-encode-tier", "balanced",
         "--cb-col-weights", str(col_weights_p),
     ]
@@ -516,6 +530,7 @@ def test_auxiliary_cb_format_requires_cost_serialization_provenance(
             "--cb-scale-coding", "two_tier",
             "--cb-codebook-source", "lattice",
             "--cb-scale-sweep", "1",
+            "--cb-ldlq", "0",
             "--cb-encode-tier", "balanced",
             "--cb-col-weights", str(col_weights_p),
     ])
@@ -552,6 +567,7 @@ def test_allocator_rejects_incomplete_legal_cb_cost_rows(
             "--cb-scale-coding", "two_tier",
             "--cb-codebook-source", "lattice",
             "--cb-scale-sweep", "1",
+            "--cb-ldlq", "0",
             "--cb-encode-tier", "balanced",
             "--cb-col-weights", str(col_weights_p),
     ])
@@ -578,6 +594,18 @@ def test_family_coherence_warns_but_does_not_block(tmp_path, monkeypatch, capsys
 def test_family_coherence_enforced_raises(tmp_path, monkeypatch):
     with pytest.raises(SystemExit):
         _run_main(tmp_path, monkeypatch, _ADJACENT_LADDER, enforce=True)
+
+
+def test_allocator_preserves_ldlq_serialization_identity(tmp_path, monkeypatch):
+    layer_config = _run_main(
+        tmp_path,
+        monkeypatch,
+        _ADJACENT_LADDER,
+        enforce=False,
+        ldlq=True,
+    )
+    emitted = json.loads(layer_config.read_text())
+    assert emitted["__prismaquant__"]["cb_serialized_payload"]["ldlq"] is True
 
 
 def test_task_example_mixed_menu_flows_end_to_end(tmp_path, monkeypatch):
@@ -663,6 +691,7 @@ def _set_explicit_cb_render_env(monkeypatch):
     monkeypatch.setenv("CB_SCALE_CODING", "two_tier")
     monkeypatch.setenv("CB_CODEBOOK_SOURCE", "lattice")
     monkeypatch.setenv("CB_SCALE_SWEEP", "1")
+    monkeypatch.setenv("PRISMAQUANT_CB_LDLQ", "0")
     monkeypatch.setenv("PRISMAQUANT_CB_ENCODE_TIER", "balanced")
 
 
@@ -791,6 +820,8 @@ def _write_production_cb_layer_config(
     assignment: dict[str, str],
     source_weights: dict[str, torch.Tensor],
     col_weights: dict[str, torch.Tensor],
+    *,
+    context: CBSerializationContext = _CB_CONTEXT,
 ) -> str:
     cb_assignment = {
         qname: fmt
@@ -803,7 +834,7 @@ def _write_production_cb_layer_config(
             qname: (fmt,)
             for qname, fmt in sorted(cb_assignment.items())
         },
-        cb_serialization_context=_CB_CONTEXT,
+        cb_serialization_context=context,
         col_weights=col_weights,
         render_levers={"weighted_vq": True},
         render_mechanism_plan=[],
@@ -822,7 +853,7 @@ def _write_production_cb_layer_config(
             qname: tuple(source_weights[qname].shape)
             for qname in sorted(cb_assignment)
         },
-        context=_CB_CONTEXT,
+        context=context,
     )
     payload = {
         qname: {
@@ -839,6 +870,51 @@ def _write_production_cb_layer_config(
         "cb_render_identity": render_identity,
     }
     return _write_layer_config(tmp_path, payload)
+
+
+def test_ldlq_flag_runs_the_production_export_encoder(tmp_path, monkeypatch):
+    from safetensors.torch import load_file
+
+    from prismaquant.export_nvfp4_cb import export_nvfp4_cb
+
+    qname = "model.layers.0.mlp.gate_proj"
+    model_dir = _Path(tmp_path) / "model"
+    model_dir.mkdir()
+    source_weights = _make_synth_model(model_dir, {qname: (8, 256)})
+    activation_cache = _write_activation_cache(tmp_path, {qname: 256})
+    activation_blob = torch.load(
+        _Path(activation_cache) / (qname.replace(".", "__") + ".pt"),
+        map_location="cpu",
+        weights_only=False,
+    )
+    col_weights = {qname: activation_blob["inputs"].square().mean(dim=0)}
+    context = CBSerializationContext.production(ldlq=True)
+    layer_config = _write_production_cb_layer_config(
+        tmp_path,
+        {qname: "NVFP4_CB_K16"},
+        source_weights,
+        col_weights,
+        context=context,
+    )
+    monkeypatch.setenv("PRISMAQUANT_CB_LDLQ", "1")
+    out = _Path(tmp_path) / "ldlq-export"
+
+    export_nvfp4_cb(
+        str(model_dir),
+        layer_config,
+        str(out),
+        col_weights=col_weights,
+        device="cpu",
+        activation_cache_dir=activation_cache,
+    )
+
+    tensors = load_file(str(out / "model.safetensors"))
+    assert f"{qname}.cb_qweight" in tensors
+    quant_config = _json.loads((out / "quant_config.json").read_text())
+    assert quant_config["provenance"]["ldlq"] is True
+    assert quant_config["provenance"]["serialized_payload"]["context"][
+        "ldlq"
+    ] is True
 
 
 def test_stock_nvfp4_export_bitexact_vs_ct_codec(tmp_path):
@@ -971,6 +1047,7 @@ def test_mixed_container_config_groups_schema(tmp_path):
             "layout_version",
             "codebook_source",
             "scale_sweep",
+            "ldlq",
             "encode_tier",
             "renderer_abi",
             "activation_contract",

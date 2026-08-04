@@ -64,6 +64,7 @@ from prismaquant.nvfp4_cb_footprint import (
     cb_assignment_payload_breakdown,
     cb_payload_summary,
     cb_serialization_metadata_from_assignment_payload,
+    cb_serialization_context_from_env,
     cb_tensor_payload_breakdown,
     finalize_cb_export_artifact_inventory,
     resolve_cb_encode_tier,
@@ -849,6 +850,7 @@ def export_nvfp4_cb(
         scale_coding=scale_coding,
         codebook_source=source,
         scale_sweep=bool(scale_sweep),
+        ldlq=cb_serialization_context_from_env().ldlq,
         encode_tier=resolve_cb_encode_tier(),
         activation_contract=_claimed_activation_contract,
         activation_execution=(
@@ -867,6 +869,20 @@ def export_nvfp4_cb(
         serialization_context,
         where="export_nvfp4_cb",
     )
+    ldlq_activation_loader = None
+    if serialization_context.ldlq:
+        if activation_cache_dir is None:
+            raise ValueError(
+                "export_nvfp4_cb: LDLQ requires activation_cache_dir"
+            )
+        from prismaquant.cb_ldlq import CBLDLQActivationLoader
+
+        ldlq_activation_loader = CBLDLQActivationLoader(
+            activation_cache_dir,
+            model_dir=model_dir,
+            profile=_profile,
+            replay_device=device,
+        )
     if production_recipe_stamped and cb_targets:
         validate_cb_assignment_serialization_stamps(
             {qname: assignment[qname] for qname in cb_targets},
@@ -1062,7 +1078,15 @@ def export_nvfp4_cb(
                 codebook=cbook, scale_sweep=scale_sweep,
                 scale_coding=(scale_coding if grid == "fp4"
                               else cb.SCALE_CODING_V1),
-                encode_tier=serialization_context.encode_tier)
+                encode_tier=serialization_context.encode_tier,
+                ldlq=serialization_context.ldlq,
+                activation_rows=(
+                    ldlq_activation_loader.load(
+                        canon,
+                        stack_size=(int(w.shape[0]) if w.dim() == 3 else None),
+                    )
+                    if ldlq_activation_loader is not None else None
+                ))
             if w.dim() == 3:
                 # Stacked packed experts: keep the expert axis explicit —
                 # uint8 (E, out, bytes_per_row); fp8 per-channel scales

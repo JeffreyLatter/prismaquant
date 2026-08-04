@@ -83,6 +83,7 @@ def test_legacy_fp4_v1_read_accounting_is_explicit_4k_plus_16():
         "layout_version": 1,
         "codebook_source": "lattice",
         "scale_sweep": True,
+        "ldlq": False,
         "encode_tier": "balanced",
         "renderer_abi": "prismaquant.nvfp4_cb_renderer.v1",
     }

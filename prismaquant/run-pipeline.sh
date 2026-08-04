@@ -96,6 +96,7 @@ if [[ "$EXPORT_CONTAINER" == "nvfp4_cb" ]]; then
   # until the served KL/PPL gate closes for the concrete artifact.
   : "${NVFP4_ACTIVATION_SCALE_POLICY:=mse_grid_calibrated.v1}"
   : "${CB_SCALE_SWEEP:=1}"
+  : "${PRISMAQUANT_CB_LDLQ:=0}"
   : "${PRISMAQUANT_CB_ENCODE_TIER:=balanced}"
   if [[ "$CB_CODEBOOK_SOURCE" == "learned" ]]; then
     echo "[pipeline] ERROR: learned CB is research-only until one immutable value-bearing codebook bundle is loaded verbatim by cost/cache/KL/export. Digests alone do not supply those values, and export-time retraining depends on the selected assignment. Use CB_CODEBOOK_SOURCE=lattice." >&2
@@ -112,6 +113,14 @@ if [[ "$EXPORT_CONTAINER" == "nvfp4_cb" ]]; then
       exit 2
       ;;
   esac
+  case "$PRISMAQUANT_CB_LDLQ" in
+    1|true|True|TRUE|yes|Yes|YES|on|On|ON) PRISMAQUANT_CB_LDLQ=1 ;;
+    0|false|False|FALSE|no|No|NO|off|Off|OFF) PRISMAQUANT_CB_LDLQ=0 ;;
+    *)
+      echo "[pipeline] ERROR: PRISMAQUANT_CB_LDLQ must be 0 or 1" >&2
+      exit 2
+      ;;
+  esac
   case "$PRISMAQUANT_CB_ENCODE_TIER" in
     fast|balanced|max) ;;
     *)
@@ -123,7 +132,7 @@ if [[ "$EXPORT_CONTAINER" == "nvfp4_cb" ]]; then
     echo "[pipeline] ERROR: CB layout-v2/two_tier requires CB_SCALE_SWEEP=1; its scale encoder has no defined one-shot render" >&2
     exit 2
   fi
-  export CB_CODEBOOK_SOURCE CB_SCALE_CODING CB_SCALE_SWEEP
+  export CB_CODEBOOK_SOURCE CB_SCALE_CODING CB_SCALE_SWEEP PRISMAQUANT_CB_LDLQ
   export PRISMAQUANT_CB_ENCODE_TIER
 fi
 if [[ "$EXPORT_CONTAINER" == "gguf" || "$EXPORT_CONTAINER" == "nvfp4_cb" ]]; then
@@ -855,6 +864,7 @@ STAGE_SETTINGS_ENV=(
   "CB_SCALE_CODING=${CB_SCALE_CODING:-}"
   "CB_CODEBOOK_SOURCE=${CB_CODEBOOK_SOURCE:-}"
   "CB_SCALE_SWEEP=${CB_SCALE_SWEEP:-}"
+  "PRISMAQUANT_CB_LDLQ=${PRISMAQUANT_CB_LDLQ:-}"
   "PRISMAQUANT_CB_ENCODE_TIER=${PRISMAQUANT_CB_ENCODE_TIER:-}"
   "VALIDATED_FRONTIER_DATASET=$VALIDATED_FRONTIER_DATASET"
   "VALIDATED_FRONTIER_NSAMPLES=$VALIDATED_FRONTIER_NSAMPLES"
@@ -1430,6 +1440,7 @@ if [[ "$EXPORT_CONTAINER" == "nvfp4_cb" ]]; then
     --cb-scale-coding "$CB_SCALE_CODING"
     --cb-codebook-source "$CB_CODEBOOK_SOURCE"
     --cb-scale-sweep "$CB_SCALE_SWEEP"
+    --cb-ldlq "$PRISMAQUANT_CB_LDLQ"
     --cb-encode-tier "$PRISMAQUANT_CB_ENCODE_TIER"
     --cb-col-weights "$CB_COL_WEIGHTS"
   )

@@ -53,7 +53,7 @@ run_cell() {
       --artifact-overhead-reserve-bytes 268435456 \
       --target-profile nvfp4_cb \
       --cb-scale-coding two_tier --cb-codebook-source lattice \
-      --cb-scale-sweep 1 --cb-encode-tier balanced \
+      --cb-scale-sweep 1 --cb-ldlq 0 --cb-encode-tier balanced \
       --cb-col-weights "$COL_WEIGHTS" \
       --layer-config "$cell/layer_config.json" \
       --bit-attribution-json "$cell/bit_attribution.json" \
