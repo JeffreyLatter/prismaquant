@@ -31,6 +31,7 @@ import re
 import signal
 import threading
 import time
+from collections.abc import Sequence
 from pathlib import Path
 
 import torch
@@ -54,6 +55,7 @@ def _cb_cost_quantize_dequantize(
     warm_identities: tuple[
         tuple[list[int], str], tuple[list[int], str]
     ] | None = None,
+    activation_rows: torch.Tensor | Sequence[torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """Render CB weights under the producer context stamped on cost.pkl."""
     if col_weights is None:
@@ -71,6 +73,7 @@ def _cb_cost_quantize_dequantize(
         weight,
         context=context,
         col_weights=col_weights,
+        activation_rows=activation_rows,
     )
     warm_dir = os.environ.get("PRISMAQUANT_CB_WARM_STATE_DIR", "").strip()
     if warm_dir:
@@ -955,6 +958,7 @@ def measure_unbatched(model: nn.Module, act_cache: "ActivationIndex",
                         col_weights=gguf_qw,
                         qname=canonical_name,
                         warm_identities=cb_warm_identities,
+                        activation_rows=X_cpu,
                     )
                 else:
                     W_hat = spec.quantize_dequantize(W.clone())
@@ -1346,6 +1350,13 @@ def _measure_packed_experts(
         return
     measured = 0
     fallback = 0
+    ldlq_enabled = (
+        any(spec.family in _CB_COST_FAMILIES for spec in specs)
+        and cb_serialization_context_from_env(
+            require_explicit=True,
+            where="packed-expert CB local cost render",
+        ).ldlq
+    )
     for full_name, packed_param, experts_qname, experts_mod in entries:
         w = packed_param.detach().to(device=dev, dtype=dtype)
         param_name = full_name.rsplit(".", 1)[-1]
@@ -1357,6 +1368,7 @@ def _measure_packed_experts(
         ref_energy = None
         gate_up = None
         down = None
+        parent_mod = None
         can_measure_output = False
         if act_cache is not None and experts_qname in act_cache:
             parent_mod = _packed_experts_parent_module(model, experts_qname)
@@ -1410,6 +1422,17 @@ def _measure_packed_experts(
                 ref_energy = None
                 gate_up = None
                 down = None
+
+        packed_ldlq_activation_rows = None
+        if ldlq_enabled and X is not None:
+            derived = derive_per_expert_activations(
+                experts_mod,
+                X,
+                parent_mod,
+                capture_down=True,
+            )
+            acts_key = "down" if param_name == "down_proj" else "gate_up"
+            packed_ldlq_activation_rows = tuple(derived[acts_key])
 
         # Per-(expert, out-channel) Fisher row-sum h_em, shape [E, M]
         # (= Σ_n grad² over in-features; see the Δloss derivation below).
@@ -1480,6 +1503,11 @@ def _measure_packed_experts(
                         col_weights=cw_use,
                         qname=full_name,
                         warm_identities=packed_cb_warm_identities,
+                        activation_rows=(
+                            tuple(packed_ldlq_activation_rows[int(i)] for i in s_idx)
+                            if use_sample and packed_ldlq_activation_rows is not None
+                            else packed_ldlq_activation_rows
+                        ),
                     )
                 else:
                     w_hat = _batched_quantize(
@@ -1802,6 +1830,7 @@ def _batched_quantize(
     warm_identities: list[
         tuple[tuple[list[int], str], tuple[list[int], str]] | None
     ] | None = None,
+    activation_rows: list[torch.Tensor | None] | None = None,
 ) -> torch.Tensor:
     elt = spec.weight_element_dtype
     if spec.name in _EXPORT_ALIGNED_BATCH_FORMATS:
@@ -1882,6 +1911,11 @@ def _batched_quantize(
                 f"{spec.name}: got {len(warm_identities)} warm identities "
                 f"for {n} CB slices"
             )
+        if activation_rows is not None and len(activation_rows) != n:
+            raise ValueError(
+                f"{spec.name}: got {len(activation_rows)} activation matrices "
+                f"for {n} CB slices"
+            )
         return torch.stack([
             _cb_cost_quantize_dequantize(
                 spec,
@@ -1891,6 +1925,9 @@ def _batched_quantize(
                 warm_identities=(
                     warm_identities[i]
                     if warm_identities is not None else None
+                ),
+                activation_rows=(
+                    activation_rows[i] if activation_rows is not None else None
                 ),
             )
             for i in range(n)
@@ -2292,6 +2329,13 @@ def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
                         ),
                         qnames=sub_names,
                         warm_identities=warm_identities,
+                        activation_rows=(
+                            [
+                                X_by_rows[rows_used[c]][slot_in_bucket[c]]
+                                for c in sel
+                            ]
+                            if spec.family in _CB_COST_FAMILIES else None
+                        ),
                     )
                     err = (Ws - W_hat).float()
                     weight_mse = err.pow(2).mean(dim=(1, 2))  # (n_sub,)

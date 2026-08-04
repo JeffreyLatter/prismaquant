@@ -189,6 +189,7 @@ class TestIncrementalMeasureQuantCost(unittest.TestCase):
                 "CB_SCALE_CODING": "two_tier",
                 "CB_CODEBOOK_SOURCE": "lattice",
                 "CB_SCALE_SWEEP": "1",
+                "PRISMAQUANT_CB_LDLQ": "0",
                 "PRISMAQUANT_CB_ENCODE_TIER": "balanced",
                 "PRISMAQUANT_CB_COL_WEIGHTS": str(col_path),
             }

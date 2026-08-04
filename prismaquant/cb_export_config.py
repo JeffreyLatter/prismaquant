@@ -871,6 +871,7 @@ def build_quant_config(
         "codebook_sha256": codebook_sha,
         "codebook_source": codebook_source,
         "scale_sweep": bool(getattr(serialization_context, "scale_sweep")),
+        "ldlq": bool(getattr(serialization_context, "ldlq")),
         "encode_tier": getattr(serialization_context, "encode_tier"),
         "renderer_abi": getattr(serialization_context, "renderer_abi"),
         "scale_coding": scale_coding,

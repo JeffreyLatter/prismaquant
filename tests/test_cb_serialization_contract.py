@@ -52,6 +52,7 @@ def test_cost_qdq_matches_serialized_pack_unpack(
     monkeypatch.setenv("CB_SCALE_CODING", scale_coding)
     monkeypatch.setenv("CB_CODEBOOK_SOURCE", "lattice")
     monkeypatch.setenv("CB_SCALE_SWEEP", "1")
+    monkeypatch.setenv("PRISMAQUANT_CB_LDLQ", "0")
     monkeypatch.setenv("PRISMAQUANT_CB_ENCODE_TIER", "fast")
     torch.manual_seed(1000 + k)
     weight = torch.randn(*shape) * 0.2
@@ -97,6 +98,7 @@ def test_fp8_cost_qdq_matches_serialized_pack_unpack(monkeypatch, shape):
     monkeypatch.setenv("CB_SCALE_CODING", "two_tier")
     monkeypatch.setenv("CB_CODEBOOK_SOURCE", "lattice")
     monkeypatch.setenv("CB_SCALE_SWEEP", "1")
+    monkeypatch.setenv("PRISMAQUANT_CB_LDLQ", "0")
     monkeypatch.setenv("PRISMAQUANT_CB_ENCODE_TIER", "fast")
     torch.manual_seed(1044)
     weight = torch.randn(*shape) * 0.2
@@ -241,6 +243,7 @@ def test_incremental_merge_rejects_a_stale_cb_shard(tmp_path, monkeypatch):
     monkeypatch.setenv("CB_SCALE_CODING", "two_tier")
     monkeypatch.setenv("CB_CODEBOOK_SOURCE", "lattice")
     monkeypatch.setenv("CB_SCALE_SWEEP", "1")
+    monkeypatch.setenv("PRISMAQUANT_CB_LDLQ", "0")
     monkeypatch.setenv("PRISMAQUANT_CB_ENCODE_TIER", "balanced")
     fresh = tmp_path / "fresh.pkl"
     stale = tmp_path / "stale.pkl"

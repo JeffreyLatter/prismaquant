@@ -64,13 +64,14 @@ _RENDER_SETTINGS: tuple[str, ...] = (
     "PRODUCTION_CACHE_DISABLE_LEVERS",
 )
 
-# CB scale coding changes the reachable FP4 reconstruction as well as bytes;
-# codebook source changes the shared sidecar/render identity.  Every persisted
-# cost/render artifact must invalidate on either change.
+# Every CB producer choice below changes either the fitted/assigned values or
+# their byte layout. Persisted cost/render artifacts must invalidate on any
+# change, including assignment-only LDLQ even though serving stays unchanged.
 _CB_SERIALIZATION_SETTINGS: tuple[str, ...] = (
     "CB_SCALE_CODING",
     "CB_CODEBOOK_SOURCE",
     "CB_SCALE_SWEEP",
+    "PRISMAQUANT_CB_LDLQ",
     "PRISMAQUANT_CB_ENCODE_TIER",
 )
 

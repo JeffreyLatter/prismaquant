@@ -124,6 +124,7 @@ class CBSerializationContext:
     codebook_source: str
     layout_version: int | None = None
     scale_sweep: bool = True
+    ldlq: bool = False
     encode_tier: str = CB_ENCODE_TIER_DEFAULT
     renderer_abi: str = CB_RENDERER_ABI
     activation_contract: str | None = None
@@ -160,6 +161,11 @@ class CBSerializationContext:
             raise TypeError(
                 "CB scale_sweep identity must be an explicit bool, got "
                 f"{self.scale_sweep!r}"
+            )
+        if not isinstance(self.ldlq, bool):
+            raise TypeError(
+                "CB ldlq identity must be an explicit bool, got "
+                f"{self.ldlq!r}"
             )
         if coding == PRODUCTION_FP4_SCALE_CODING and not self.scale_sweep:
             raise ValueError(
@@ -242,6 +248,7 @@ class CBSerializationContext:
         cls,
         *,
         scale_sweep: bool = True,
+        ldlq: bool = False,
         encode_tier: str = CB_ENCODE_TIER_DEFAULT,
         codebook_source: str = "lattice",
         codebook_refs: Mapping[str, str | Sequence[str]] | None = None,
@@ -256,6 +263,7 @@ class CBSerializationContext:
             scale_coding=PRODUCTION_FP4_SCALE_CODING,
             layout_version=2,
             scale_sweep=scale_sweep,
+            ldlq=ldlq,
             encode_tier=encode_tier,
             codebook_source=codebook_source,
             activation_contract=NVFP4_ACTIVATION_CONTRACT_SCHEMA,
@@ -269,6 +277,7 @@ class CBSerializationContext:
         cls,
         *,
         scale_sweep: bool = True,
+        ldlq: bool = False,
         encode_tier: str = CB_ENCODE_TIER_DEFAULT,
         codebook_source: str = "lattice",
         codebook_refs: Mapping[str, str | Sequence[str]] | None = None,
@@ -279,6 +288,7 @@ class CBSerializationContext:
             scale_coding=LEGACY_FP4_SCALE_CODING,
             layout_version=1,
             scale_sweep=scale_sweep,
+            ldlq=ldlq,
             encode_tier=encode_tier,
             codebook_source=codebook_source,
             activation_contract=None,
@@ -311,6 +321,7 @@ def cb_serialization_context_stamp(
         "layout_version": context.layout_version,
         "codebook_source": context.codebook_source,
         "scale_sweep": context.scale_sweep,
+        "ldlq": context.ldlq,
         "encode_tier": context.encode_tier,
         "renderer_abi": context.renderer_abi,
         **({
@@ -389,6 +400,7 @@ def cb_serialization_context_from_stamp(
             "layout_version",
             "codebook_source",
             "scale_sweep",
+            "ldlq",
             "encode_tier",
             "renderer_abi",
         )
@@ -458,6 +470,7 @@ def cb_serialization_context_from_stamp(
         layout_version=int(stamp["layout_version"]),
         codebook_source=str(stamp["codebook_source"]),
         scale_sweep=stamp["scale_sweep"],
+        ldlq=stamp["ldlq"],
         encode_tier=str(stamp["encode_tier"]),
         renderer_abi=str(stamp["renderer_abi"]),
         activation_contract=(
@@ -505,13 +518,18 @@ def cb_serialization_context_from_env(
     scale = environ.get("CB_SCALE_CODING")
     source = environ.get("CB_CODEBOOK_SOURCE")
     raw_sweep = environ.get("CB_SCALE_SWEEP")
+    raw_ldlq = environ.get("PRISMAQUANT_CB_LDLQ")
     raw_tier = environ.get("PRISMAQUANT_CB_ENCODE_TIER")
-    if require_explicit and (not scale or not source or raw_sweep is None or not raw_tier):
+    if require_explicit and (
+        not scale or not source or raw_sweep is None or raw_ldlq is None
+        or not raw_tier
+    ):
         missing = [
             name for name, value in (
                 ("CB_SCALE_CODING", scale),
                 ("CB_CODEBOOK_SOURCE", source),
                 ("CB_SCALE_SWEEP", raw_sweep),
+                ("PRISMAQUANT_CB_LDLQ", raw_ldlq),
                 ("PRISMAQUANT_CB_ENCODE_TIER", raw_tier),
             ) if not value
         ]
@@ -530,6 +548,12 @@ def cb_serialization_context_from_env(
         name="CB_SCALE_SWEEP",
         where=where,
     )
+    ldlq = _parse_bool_setting(
+        raw_ldlq,
+        default=False,
+        name="PRISMAQUANT_CB_LDLQ",
+        where=where,
+    )
     from .nvfp4_activation_contract import (
         NVFP4_ACTIVATION_CONTRACT_SCHEMA,
         NVFP4_ACTIVATION_EXECUTION,
@@ -539,6 +563,7 @@ def cb_serialization_context_from_env(
         scale_coding=scale or PRODUCTION_FP4_SCALE_CODING,
         codebook_source=source or "lattice",
         scale_sweep=scale_sweep,
+        ldlq=ldlq,
         encode_tier=resolve_cb_encode_tier(raw_tier, environ=environ),
         activation_contract=NVFP4_ACTIVATION_CONTRACT_SCHEMA,
         activation_execution=NVFP4_ACTIVATION_EXECUTION,
@@ -632,6 +657,7 @@ def validate_cb_serialization_context_stamp(
         "layout_version",
         "codebook_source",
         "scale_sweep",
+        "ldlq",
         "encode_tier",
         "renderer_abi",
         "activation_contract",
@@ -818,6 +844,7 @@ def cb_fields_for_context(
     context: CBSerializationContext,
     col_weights=None,
     codebook=None,
+    activation_rows=None,
 ):
     """Encode CB fields under the exact artifact serialization context.
 
@@ -839,7 +866,7 @@ def cb_fields_for_context(
             "it as learned"
         )
     coding = context.scale_coding if grid == "fp4" else SCALE_CODING_V1
-    return nvfp4_cb_fields(
+    fields = nvfp4_cb_fields(
         weight,
         k,
         grid=grid,
@@ -850,6 +877,22 @@ def cb_fields_for_context(
         scale_coding=coding,
         encode_tier=context.encode_tier,
     )
+    if context.ldlq:
+        if col_weights is None:
+            raise ValueError(f"{spec.name}: LDLQ requires activation-weighted col_weights")
+        if activation_rows is None:
+            raise ValueError(f"{spec.name}: LDLQ requires calibration activation rows")
+        from .nvfp4_cb_formats import ldlq_reassign_cb_fields
+
+        fields = ldlq_reassign_cb_fields(
+            weight,
+            fields,
+            col_weights,
+            activation_rows,
+            grid=grid,
+            mode=mode,
+        )
+    return fields
 
 
 def cb_quantize_dequantize_for_context(
@@ -859,6 +902,7 @@ def cb_quantize_dequantize_for_context(
     context: CBSerializationContext,
     col_weights=None,
     codebook=None,
+    activation_rows=None,
 ):
     """Render a CB weight under the exact artifact serialization context."""
     info = _cb_info(spec.name)
@@ -873,6 +917,7 @@ def cb_quantize_dequantize_for_context(
         context=context,
         col_weights=col_weights,
         codebook=codebook,
+        activation_rows=activation_rows,
     )
     return nvfp4_cb_reconstruct(
         fields,
@@ -1331,6 +1376,7 @@ def cb_tensor_payload_breakdown(
         "artifact_scale_coding": context.scale_coding,
         "layout_version": context.layout_version,
         "scale_sweep": context.scale_sweep,
+        "ldlq": context.ldlq,
         "encode_tier": context.encode_tier,
         "renderer_abi": context.renderer_abi,
         "activation_contract": context.activation_contract,
@@ -1452,6 +1498,7 @@ def cb_assignment_payload_breakdown(
             "layout_version": context.layout_version,
             "codebook_source": context.codebook_source,
             "scale_sweep": context.scale_sweep,
+            "ldlq": context.ldlq,
             "encode_tier": context.encode_tier,
             "renderer_abi": context.renderer_abi,
             **({

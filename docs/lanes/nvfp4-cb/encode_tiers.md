@@ -12,6 +12,38 @@
 
 Span-curve finding (q_proj, fp8 K44): quality is set by REACH, not granularity — ±24% reach hits max-parity, ±34% BEATS max by 2.1% (the s0-centered search finds basins the fixed [amax/6, amax/4] clip window never visits).
 
+## LDLQ feedback assignment (opt-in encoder mode)
+
+Set `PRISMAQUANT_CB_LDLQ=1` to enable the production LDLQ assignment pass;
+the default is `0`. Codebook fitting and the complete scale sweep run exactly
+as they do in the plain encoder. With those fitted codebooks and scales held
+fixed, the encoder then reassigns indices in deterministic 64-column blocks,
+using Hessian error feedback from the same cached activation rows that supplied
+the render's imatrix weights. Candidate choice retains the pilot's
+activation-weighted metric and 1% mean-diagonal Hessian damping.
+
+The validation sequence found about **95%** in-sample recovery
+(`rotpilot-out/REPORT.md`), **84%** retention on held-out activations
+(`rotpilot-out/holdout/REPORT.md`), and **78%** retention on fresh text (the
+PR-pending `feat/ldlq-fresh-text-validation` report,
+`ldlq-fresh/REPORT.md`). The mode remains explicit rather than becoming a
+model-wide default.
+
+`ldlq` is a required dimension of the CB serialization context. It is stamped
+into cost provenance, render identity, warm records, and export recipes, so an
+LDLQ cost table cannot be reused for a plain render (or vice versa). Export
+refuses a recipe/stamp mismatch. A scale-sweep warm record remains useful in
+principle because the sweep precedes reassignment, but a record carrying the
+opposite `ldlq` context is deliberately treated as a cold fallback.
+
+LDLQ changes assignment time only. Packed artifacts use the ordinary
+grid-native CB fields, so serving and decode kernels have no new branch and no
+runtime cost. A CPU timing check on 2026-08-04 (K16, `fast`, weight
+`[256,1024]`, 64 activation rows, one thread, median of seven alternating
+runs after warm-up) measured 0.2176 s plain versus 0.3117 s LDLQ, or
+**1.43x encoder time**, consistent with the pilot's 1.10–1.43x GPU range at
+the intended coarse precision of this check.
+
 ## Encoder warm start
 
 The expensive scale search performed while measuring each `(unit, rung)` can

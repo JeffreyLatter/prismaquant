@@ -57,6 +57,7 @@ measured under v1 coding.
 from __future__ import annotations
 
 import os
+from collections.abc import Sequence
 from functools import lru_cache
 from pathlib import Path
 
@@ -1613,6 +1614,180 @@ def nvfp4_cb_fields(w: torch.Tensor, k: int, *, grid: str = "fp4",
     return out
 
 
+LDLQ_BLOCK_SIZE = 64
+LDLQ_DAMPING_FRACTION = 0.01
+
+
+def _ldlq_reassign_fields_2d(
+    weight: torch.Tensor,
+    fields: dict,
+    col_weights: torch.Tensor,
+    activation_rows: torch.Tensor,
+    *,
+    grid: str,
+    mode: str,
+    block_size: int,
+    damping_fraction: float,
+) -> dict:
+    """Replace only fixed-codebook assignments using block Hessian feedback."""
+    from .rotation_ldlq_pilot import (
+        block_error_feedback,
+        inverse_hessian_cholesky,
+    )
+
+    if weight.ndim != 2:
+        raise ValueError(f"LDLQ weight must be 2-D, got {tuple(weight.shape)}")
+    rows, columns = map(int, weight.shape)
+    x = torch.as_tensor(activation_rows)
+    if x.ndim != 2 or int(x.shape[1]) != columns:
+        raise ValueError(
+            "LDLQ activation rows must have shape (rows, in_features), got "
+            f"{tuple(x.shape)} for weight {tuple(weight.shape)}"
+        )
+    if int(x.shape[0]) == 0:
+        raise ValueError("LDLQ activation rows must be non-empty")
+    if columns % int(block_size) or int(block_size) % FP4_GROUP:
+        raise ValueError(
+            f"LDLQ block_size={block_size} must divide in_features={columns} "
+            f"and preserve group-{FP4_GROUP} scales"
+        )
+
+    x = x.to(device=weight.device, dtype=torch.float32)
+    hessian = x.T @ x
+    upper, _damping = inverse_hessian_cholesky(
+        hessian,
+        damping_fraction=float(damping_fraction),
+    )
+    del hessian
+
+    scales = fields["scales"].to(weight.device, torch.float32)
+    codebook = fields["codebook"]
+    if isinstance(codebook, tuple):
+        codebook = tuple(table.to(weight.device, torch.float32) for table in codebook)
+    else:
+        codebook = codebook.to(weight.device, torch.float32)
+    cw = torch.broadcast_to(
+        torch.as_tensor(col_weights).to(weight.device, torch.float32),
+        weight.shape,
+    )
+    assignment_parts: list[dict[str, torch.Tensor]] = []
+
+    def quantize_block(block: torch.Tensor, start: int, end: int) -> torch.Tensor:
+        width = end - start
+        block_scales = (
+            scales[:, start // FP4_GROUP:end // FP4_GROUP]
+            if grid == "fp4"
+            else scales
+        )
+        wq = _col_weight_vectors(cw[:, start:end])
+        _err, enc, decoded = _eval_candidate(
+            block.to(torch.float32),
+            wq,
+            block_scales,
+            grid,
+            mode,
+            codebook,
+        )
+        assignment_parts.append(
+            _enc_to_fields(enc, mode, codebook, rows, width, width // VEC_DIM)
+        )
+        return decoded * _per_element_scale(block_scales, grid, width)
+
+    # The returned reconstruction is intentionally discarded: export needs
+    # the assignments, and reconstructing those fields is the shared decoder.
+    block_error_feedback(
+        weight,
+        upper,
+        quantize_block,
+        block_size=int(block_size),
+    )
+    updated = dict(fields)
+    updated["indices"] = torch.cat(
+        [part["indices"] for part in assignment_parts], dim=1
+    )
+    if mode == "signed":
+        updated["signs"] = torch.cat(
+            [part["signs"] for part in assignment_parts], dim=1
+        )
+    return updated
+
+
+def ldlq_reassign_cb_fields(
+    weight: torch.Tensor,
+    fields: dict,
+    col_weights: torch.Tensor,
+    activation_rows: torch.Tensor | Sequence[torch.Tensor],
+    *,
+    grid: str,
+    mode: str,
+    block_size: int = LDLQ_BLOCK_SIZE,
+    damping_fraction: float = LDLQ_DAMPING_FRACTION,
+) -> dict:
+    """Run deterministic fixed-scale/codebook LDLQ assignment.
+
+    Scale and codebook fitting have already completed. For stacked experts a
+    sequence supplies one activation matrix (and Hessian) per expert; a single
+    matrix deliberately shares one Hessian across the stack.
+    """
+    if weight.ndim == 2 or isinstance(activation_rows, torch.Tensor):
+        flat = weight.reshape(-1, weight.shape[-1])
+        flat_col_weights = torch.broadcast_to(
+            torch.as_tensor(col_weights), weight.shape
+        ).reshape_as(flat)
+        return _ldlq_reassign_fields_2d(
+            flat,
+            fields,
+            flat_col_weights,
+            torch.as_tensor(activation_rows),
+            grid=grid,
+            mode=mode,
+            block_size=block_size,
+            damping_fraction=damping_fraction,
+        )
+    if weight.ndim != 3:
+        raise ValueError(
+            "per-slice LDLQ activations require a 3-D expert stack, got "
+            f"{tuple(weight.shape)}"
+        )
+    activations = tuple(activation_rows)
+    if len(activations) != int(weight.shape[0]):
+        raise ValueError(
+            f"LDLQ expert activation count {len(activations)} != "
+            f"stack size {weight.shape[0]}"
+        )
+    cw = torch.broadcast_to(torch.as_tensor(col_weights), weight.shape)
+    rows_per_expert = int(weight.shape[1])
+    assignment_parts: list[dict] = []
+    slice_keys = {"indices", "signs", "scales", "scale_super", "scale_sub"}
+    for expert, x in enumerate(activations):
+        start = expert * rows_per_expert
+        end = start + rows_per_expert
+        local = {
+            key: (value[start:end] if key in slice_keys else value)
+            for key, value in fields.items()
+        }
+        local["shape"] = tuple(weight[expert].shape)
+        assignment_parts.append(_ldlq_reassign_fields_2d(
+            weight[expert],
+            local,
+            cw[expert],
+            x,
+            grid=grid,
+            mode=mode,
+            block_size=block_size,
+            damping_fraction=damping_fraction,
+        ))
+    updated = dict(fields)
+    updated["indices"] = torch.cat(
+        [part["indices"] for part in assignment_parts], dim=0
+    )
+    if mode == "signed":
+        updated["signs"] = torch.cat(
+            [part["signs"] for part in assignment_parts], dim=0
+        )
+    return updated
+
+
 def nvfp4_cb_reconstruct(fields: dict, k: int, *, grid: str = "fp4",
                          mode: str = "product",
                          codebook: torch.Tensor | tuple | None = None
@@ -2032,6 +2207,8 @@ def nvfp4_cb_pack(w: torch.Tensor, k: int, *, grid: str = "fp4",
                   scale_coding: str = SCALE_CODING_V1,
                   encode_tier: str | None = None,
                   warm_scale_state: dict[str, torch.Tensor] | None = None,
+                  ldlq: bool = False,
+                  activation_rows: torch.Tensor | Sequence[torch.Tensor] | None = None,
                   ) -> tuple[torch.Tensor, dict]:
     """Quantize + bit-pack a weight in one call (mirrors ``gguf_pack``).
 
@@ -2045,5 +2222,18 @@ def nvfp4_cb_pack(w: torch.Tensor, k: int, *, grid: str = "fp4",
                              scale_coding=scale_coding,
                              encode_tier=encode_tier,
                              warm_scale_state=warm_scale_state)
+    if ldlq:
+        if col_weights is None:
+            raise ValueError("LDLQ CB packing requires activation-weighted col_weights")
+        if activation_rows is None:
+            raise ValueError("LDLQ CB packing requires calibration activation rows")
+        fields = ldlq_reassign_cb_fields(
+            w,
+            fields,
+            col_weights,
+            activation_rows,
+            grid=grid,
+            mode=mode,
+        )
     packed = nvfp4_cb_assemble_bytes(fields, k, grid=grid, mode=mode)
     return packed, fields

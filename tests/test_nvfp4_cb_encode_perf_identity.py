@@ -35,6 +35,7 @@ _PROD_CB_ENV = {
     "CB_CODEBOOK_SOURCE": "lattice",
     "CB_SCALE_CODING": "two_tier",
     "CB_SCALE_SWEEP": "1",
+    "PRISMAQUANT_CB_LDLQ": "0",
     "PRISMAQUANT_CB_ENCODE_TIER": "balanced",
 }
 

@@ -166,6 +166,7 @@ def test_cost_encoder_persists_real_scale_argmin_cpu(tmp_path, monkeypatch):
     monkeypatch.setenv("CB_CODEBOOK_SOURCE", "lattice")
     monkeypatch.setenv("CB_SCALE_CODING", "two_tier")
     monkeypatch.setenv("CB_SCALE_SWEEP", "1")
+    monkeypatch.setenv("PRISMAQUANT_CB_LDLQ", "0")
     monkeypatch.setenv("PRISMAQUANT_CB_ENCODE_TIER", "fast")
     monkeypatch.setenv("PRISMAQUANT_CB_ENCODE_COMPILE", "0")
     generator = torch.Generator().manual_seed(41)

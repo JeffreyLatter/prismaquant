@@ -131,9 +131,10 @@
 # cost run finished are fixed below; both were reproduced on real production
 # rows, not on a fixture.
 #
-# 1. --cb-scale-sweep / --cb-encode-tier were MISSING. allocator.main hard-
-#    exits within seconds on any CB menu without all four CB context flags
-#    ("refusing implicit render defaults") — the render the cost stage
+# 1. Required CB producer flags were MISSING. allocator.main hard-exits within
+#    seconds on any CB menu without all five CB context flags, including the
+#    now-explicit `--cb-ldlq 0` assignment identity ("refusing implicit render
+#    defaults") — the render the cost stage
 #    measured and the render the exporter ships must be provably the same
 #    one, so the allocator will not infer them from the cost pickle.
 # 2. --pareto-targets was left at the default. See PARETO_TARGETS below.
@@ -342,6 +343,7 @@ python3 -m prismaquant.allocator \
   --cb-scale-coding two_tier \
   --cb-codebook-source lattice \
   --cb-scale-sweep 1 \
+  --cb-ldlq 0 \
   --cb-encode-tier balanced \
   --cb-col-weights ${WORK_DIR}/artifacts/cb_col_weights.pkl \
   --layer-config ${WORK_DIR}/artifacts/layer_config.json \

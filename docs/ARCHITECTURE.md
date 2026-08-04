@@ -1,7 +1,8 @@
 # PrismaQuant Architecture
 
-As of: 2026-08-03 · branch `feat/qwen-moe-profile` · verified against implementation
-baseline commit `142ee5b` plus the current unified Qwen3 profile changes, with the external Gridbook runtime pinned to
+As of: 2026-08-04 · branch `feat/ldlq-production-encoder` · verified against implementation
+baseline commit `0b476fc` plus the current flag-gated LDLQ production-encoder changes, with
+the external Gridbook runtime pinned to
 `9011a19228ddb96b8a49e11a20ac75c99c83998e` (v0.8.0). This branch ports the dated
 2026-08-01 DeepSeek-V4-Flash-0731 92 GB study record (§9.2) forward from its 0.5.1
 working tree; the study's Gridbook-candidate claims were **not** carried over, because
@@ -377,6 +378,7 @@ VALIDATED_SOURCE_PREFETCH=require   VALIDATED_FRONTIER_PICK=kneedle,
                                     or `budget` under a TARGET_DISK_GB card
 VALIDATED_FRONTIER_SKIP_CALIB=$NSAMPLES (held-out disjointness, ON)
 CB_EXPERT_EMPIRICAL=0  CB_SCALE_CODING=two_tier  (D15: shipped values)
+PRISMAQUANT_CB_LDLQ=0  (opt-in post-fit feedback assignment)
 AURA_ADDITIVITY_GATE=measure
 PRISMAQUANT_GGUF_IMATRIX=1  DEVICE=cuda  EXPORT_DEVICE=cuda
 ```
@@ -2026,8 +2028,17 @@ that full encode and require exact selected-scale and rendered-byte equality, fa
 transactional export closed on any difference. The quantization config provenance records
 `encoder_warm_start.{warm_used,cold_fallback,verified_n}`. This changes no format or encoding
 semantics; it only skips a repeated scale sweep whose result was already measured
-(`cb_warm_state.py`, `measure_quant_cost.py`, `export_nvfp4_cb_streaming.py`). There is no
-in-lane serving smoke — CB artifacts serve only through
+(`cb_warm_state.py`, `measure_quant_cost.py`, `export_nvfp4_cb_streaming.py`). The flag-gated
+`PRISMAQUANT_CB_LDLQ=1` encoder mode keeps that scale
+sweep and codebook fit intact, then performs deterministic fixed-codebook/fixed-scale
+assignment in 64-column Hessian-feedback blocks using the same cached activation rows and
+activation-weighted metric as cost measurement. Its validation history is 95% in-sample
+recovery, 84% held-out retention, and 78% fresh-text retention; the implementation's CPU
+mid-size timing check measured a 1.43x encoder-time multiplier. `ldlq` is part of the required
+CB serialization context and every render/provenance identity, so cost/export drift is
+refused and an opposite-mode warm record cold-falls back. The resulting artifact is still the
+ordinary grid-native CB layout: the mode is assignment-time only and adds no serving branch or
+runtime cost. There is no in-lane serving smoke — CB artifacts serve only through
 the out-of-tree plugin — but the gate set is now *declared* (`prismaquant/lane_specs/nvfp4_cb.json`,
 re-vet **R16**): same OpenAI endpoint, same endpoint-agnostic `validate_quantized_model`, plus
 the lane-specific prefill perf gate (INV-2). Gates are advisory; the shipcard refuses, and
