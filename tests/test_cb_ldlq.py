@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from prismaquant import format_registry as fr
+from prismaquant.cb_ldlq import fill_empty_expert_activation_rows
 from prismaquant import nvfp4_cb_formats as cb
 from prismaquant.cb_warm_state import CBWarmStateStore, build_warm_record
 from prismaquant.measure_quant_cost import (
@@ -44,6 +45,19 @@ def _set_context_env(monkeypatch, *, ldlq: bool) -> None:
     monkeypatch.setenv("CB_SCALE_SWEEP", "1")
     monkeypatch.setenv("PRISMAQUANT_CB_LDLQ", "1" if ldlq else "0")
     monkeypatch.setenv("PRISMAQUANT_CB_ENCODE_TIER", "fast")
+
+
+def test_empty_expert_rows_use_same_layer_routed_pool():
+    first = torch.tensor([[1.0, 2.0]])
+    third = torch.tensor([[3.0, 4.0], [5.0, 6.0]])
+    rows, missing = fill_empty_expert_activation_rows(
+        (first, torch.empty(0, 2), third),
+        qname="model.layers.0.mlp.experts.down_proj",
+    )
+    assert missing == (1,)
+    assert torch.equal(rows[0], first)
+    assert torch.equal(rows[2], third)
+    assert torch.equal(rows[1], torch.cat((first, third)))
 
 
 def test_flag_off_is_byte_identical_to_the_existing_encoder(monkeypatch):

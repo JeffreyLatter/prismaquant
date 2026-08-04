@@ -133,6 +133,10 @@ def cost_payload_provenance(specs: list[fr.FormatSpec]) -> dict:
         if has_cb else None
     )
     provenance = cb_cost_provenance(specs, context=context)
+    if context is not None and context.ldlq:
+        provenance["cb_ldlq_cold_expert_prior"] = (
+            "layer_routed_activation_pool.v1"
+        )
     raw_anchors = os.environ.get("PRISMAQUANT_CB_LADDER_ANCHORS", "").strip()
     raw_holdout = os.environ.get("PRISMAQUANT_CB_LADDER_HOLDOUT", "").strip()
     if raw_anchors or raw_holdout:
@@ -1461,6 +1465,20 @@ def _measure_packed_experts(
             )
             acts_key = "down" if param_name == "down_proj" else "gate_up"
             packed_ldlq_activation_rows = tuple(derived[acts_key])
+            from .cb_ldlq import fill_empty_expert_activation_rows
+            packed_ldlq_activation_rows, cold_experts = (
+                fill_empty_expert_activation_rows(
+                    packed_ldlq_activation_rows,
+                    qname=full_name,
+                )
+            )
+            if cold_experts:
+                print(
+                    f"[cost] {full_name}: LDLQ cold-expert routed-mean "
+                    f"prior for {len(cold_experts)}/{len(packed_ldlq_activation_rows)} "
+                    f"activation slices",
+                    flush=True,
+                )
 
         # Per-(expert, out-channel) Fisher row-sum h_em, shape [E, M]
         # (= Σ_n grad² over in-features; see the Δloss derivation below).

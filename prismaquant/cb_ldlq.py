@@ -16,6 +16,37 @@ import torch
 _ACT_FNAME_SUB = re.compile(r"[^A-Za-z0-9_-]")
 
 
+def fill_empty_expert_activation_rows(
+    rows: tuple[torch.Tensor, ...],
+    *,
+    qname: str,
+) -> tuple[tuple[torch.Tensor, ...], tuple[int, ...]]:
+    """Apply the declared cold-expert prior to sparse routed LDLQ rows.
+
+    A bounded module-level activation reservoir can legitimately miss experts
+    that the full calibration forward routed. Observed experts retain their
+    exact rows; empty slices receive the pooled routed rows from the same
+    layer/projection. This is the activation analogue of the imatrix
+    layer-routed-mean neutral prior and never fabricates a cross-layer sample.
+    """
+    missing = tuple(i for i, value in enumerate(rows) if not value.shape[0])
+    if not missing:
+        return rows, ()
+    observed = [value for value in rows if value.shape[0]]
+    if not observed:
+        raise ValueError(
+            f"{qname}: LDLQ routed replay has no observed expert rows"
+        )
+    widths = {int(value.shape[1]) for value in observed}
+    if len(widths) != 1:
+        raise ValueError(
+            f"{qname}: LDLQ routed expert rows disagree on input width"
+        )
+    pooled = torch.cat(observed, dim=0).contiguous()
+    filled = tuple(pooled if not value.shape[0] else value for value in rows)
+    return filled, missing
+
+
 class CBLDLQActivationLoader:
     """Load one target's Hessian rows lazily from the production act cache."""
 
@@ -115,12 +146,8 @@ class CBLDLQActivationLoader:
                 replayed.values[replayed.expert_indices == expert].contiguous()
                 for expert in range(int(stack_size))
             )
-            if any(int(value.shape[0]) == 0 for value in rows):
-                missing = [i for i, value in enumerate(rows) if not value.shape[0]]
-                raise ValueError(
-                    f"{qname}: routed LDLQ replay has no rows for experts "
-                    f"{missing[:8]}"
-                )
+            rows, _missing = fill_empty_expert_activation_rows(
+                rows, qname=str(qname))
             return rows
         if isinstance(replayed, torch.Tensor) and replayed.ndim == 2:
             return replayed.detach().to(torch.float32).contiguous()
@@ -130,4 +157,4 @@ class CBLDLQActivationLoader:
         )
 
 
-__all__ = ["CBLDLQActivationLoader"]
+__all__ = ["CBLDLQActivationLoader", "fill_empty_expert_activation_rows"]
