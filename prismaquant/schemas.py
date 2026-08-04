@@ -27,6 +27,8 @@ class CostEntry(TypedDict, total=False):
     fisher_output_mse: float
     output_mse_measured: bool
     cost_source: NotRequired[str]
+    weight_mse_per_expert: NotRequired[list[float]]
+    cost_source_per_expert: NotRequired[list[str]]
     error: str
 
 
@@ -191,6 +193,41 @@ def validate_cost_payload(payload, path: str | None = None):
                     f".costs[{name!r}][{fmt!r}].cost_source",
                     "must be a string when present",
                 )
+            if "weight_mse_per_expert" in entry:
+                values = entry["weight_mse_per_expert"]
+                if (not isinstance(values, Sequence)
+                        or isinstance(values, (str, bytes))):
+                    _fail(
+                        path,
+                        f".costs[{name!r}][{fmt!r}].weight_mse_per_expert",
+                        "must be a sequence when present",
+                    )
+                for idx, value in enumerate(values):
+                    _as_number(
+                        value,
+                        path,
+                        f".costs[{name!r}][{fmt!r}]"
+                        f".weight_mse_per_expert[{idx}]",
+                    )
+            if "cost_source_per_expert" in entry:
+                values = entry["cost_source_per_expert"]
+                if (not isinstance(values, Sequence)
+                        or isinstance(values, (str, bytes))
+                        or not all(isinstance(value, str) for value in values)):
+                    _fail(
+                        path,
+                        f".costs[{name!r}][{fmt!r}].cost_source_per_expert",
+                        "must be a sequence of strings when present",
+                    )
+                mse_values = entry.get("weight_mse_per_expert")
+                if (isinstance(mse_values, Sequence)
+                        and not isinstance(mse_values, (str, bytes))
+                        and len(values) != len(mse_values)):
+                    _fail(
+                        path,
+                        f".costs[{name!r}][{fmt!r}].cost_source_per_expert",
+                        "must match weight_mse_per_expert length",
+                    )
             if ("output_mse_measured" in entry
                     and not isinstance(entry["output_mse_measured"], bool)):
                 _fail(

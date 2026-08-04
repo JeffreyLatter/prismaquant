@@ -150,6 +150,61 @@ def test_synthesizes_gateup_and_down(ckpt):
     assert "model.layers.0.self_attn.q_proj.down_proj" not in cw
 
 
+def test_physically_packed_gateup_matches_split_checkpoint(ckpt, tmp_path):
+    """Qwen3.5/3.6 stores every expert in one gate_up rank-3 tensor."""
+    model_dir, act_dir = ckpt
+    split_cw: dict = {}
+    synthesize_packed_expert_col_weights(
+        model_dir,
+        act_dir,
+        split_cw,
+        profile=_IdentityProfile(),
+        device="cpu",
+    )
+
+    split = load_file(str(model_dir / "model.safetensors"))
+    packed_dir = tmp_path / "packed-model"
+    packed_dir.mkdir()
+    gate_up = torch.stack([
+        torch.cat([
+            split[f"model.layers.0.mlp.experts.{e}.gate_proj.weight"],
+            split[f"model.layers.0.mlp.experts.{e}.up_proj.weight"],
+        ])
+        for e in range(E)
+    ])
+    save_file({
+        "model.layers.0.mlp.gate.weight": split[
+            "model.layers.0.mlp.gate.weight"
+        ],
+        # Qwen's checkpoint parameter name deliberately has no `.weight`.
+        "model.layers.0.mlp.experts.gate_up_proj": gate_up,
+    }, str(packed_dir / "model.safetensors"))
+    (packed_dir / "config.json").write_text(
+        (model_dir / "config.json").read_text()
+    )
+
+    packed_cw: dict = {}
+    added = synthesize_packed_expert_col_weights(
+        packed_dir,
+        act_dir,
+        packed_cw,
+        profile=_IdentityProfile(),
+        device="cpu",
+    )
+    assert set(added) == {
+        "model.layers.0.mlp.experts.gate_up_proj",
+        "model.layers.0.mlp.experts.down_proj",
+    }
+    torch.testing.assert_close(
+        packed_cw["model.layers.0.mlp.experts.gate_up_proj"],
+        split_cw["model.layers.0.mlp.experts.gate_up_proj"],
+    )
+    torch.testing.assert_close(
+        packed_cw["model.layers.0.mlp.experts.down_proj"],
+        split_cw["model.layers.0.mlp.experts.down_proj"],
+    )
+
+
 def test_respects_existing_entries(ckpt):
     model_dir, act_dir = ckpt
     pre = torch.ones(E, 1, INTER)

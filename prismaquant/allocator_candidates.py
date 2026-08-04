@@ -643,6 +643,7 @@ def cost_entry_is_source_passthrough(
 
 
 BAND_INTERPOLATED_COST_SOURCE = "band_interpolated"
+MIXED_COST_SOURCE = "mixed"
 
 
 def cost_entry_is_band_interpolated(cost_entry: dict) -> bool:
@@ -655,7 +656,10 @@ def cost_entry_is_band_interpolated(cost_entry: dict) -> bool:
     measured instead — but it IS a prediction, and a shipped artifact must be
     able to say which of its selected prices were predictions.
     """
-    return cost_entry.get("cost_source") == BAND_INTERPOLATED_COST_SOURCE
+    return cost_entry.get("cost_source") in {
+        BAND_INTERPOLATED_COST_SOURCE,
+        MIXED_COST_SOURCE,
+    }
 
 
 def drop_interpolated_candidates_dominated_by_measured(

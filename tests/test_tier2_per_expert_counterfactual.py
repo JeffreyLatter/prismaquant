@@ -7,9 +7,65 @@ from prismaquant.tier2_per_expert_counterfactual import (
     UnitChoice,
     apply_unmeasured_floor,
     build_decision_units,
+    expand_packed_expert_rows,
     expand_solution,
     solve_lambda_bisection,
 )
+
+
+def test_packed_probe_and_cost_expand_to_w13_and_w2_rows():
+    stats = {
+        "model.layers.0.mlp.experts.gate_up_proj": {
+            "h_trace": 10.0,
+            "h_trace_per_expert": [4.0, 6.0],
+            "n_params": 64,
+            "in_features": 4,
+            "out_features": 8,
+            "num_experts": 2,
+            "_packed_experts_module": "model.layers.0.mlp.experts",
+            "_packed_param": "gate_up_proj",
+        },
+        "model.layers.0.mlp.experts.down_proj": {
+            "h_trace": 20.0,
+            "h_trace_per_expert": [8.0, 12.0],
+            "n_params": 32,
+            "in_features": 2,
+            "out_features": 4,
+            "num_experts": 2,
+            "_packed_experts_module": "model.layers.0.mlp.experts",
+            "_packed_param": "down_proj",
+        },
+    }
+    costs = {"costs": {
+        name: {"FP8_CB_K28": {
+            "weight_mse": 0.15,
+            "weight_mse_per_expert": [0.1, 0.2],
+            "output_mse": 0.3,
+            "output_mse_measured": True,
+        }}
+        for name in stats
+    }}
+    expanded_stats, expanded_costs, children = expand_packed_expert_rows(
+        stats, costs)
+
+    assert len(expanded_stats) == 6
+    assert len(children) == 2
+    assert expanded_stats[
+        "model.layers.0.mlp.experts.0.gate_proj"]["h_trace"] == 2.0
+    assert expanded_stats[
+        "model.layers.0.mlp.experts.0.up_proj"]["n_params"] == 16
+    assert expanded_stats[
+        "model.layers.0.mlp.experts.1.down_proj"]["h_trace"] == 12.0
+    entry = expanded_costs[
+        "model.layers.0.mlp.experts.1.down_proj"]["FP8_CB_K28"]
+    assert entry["weight_mse"] == 0.2
+    assert entry["output_mse_measured"] is False
+    assert "output_mse" not in entry
+    units = build_decision_units({
+        name: (_row("FP8_CB_K28", 1.0, 10),)
+        for name in expanded_stats
+    })
+    assert len(units) == 4  # two experts x (coupled w13 + w2)
 
 
 def _row(fmt, dloss, payload_bytes):

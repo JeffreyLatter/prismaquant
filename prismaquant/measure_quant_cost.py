@@ -132,7 +132,22 @@ def cost_payload_provenance(specs: list[fr.FormatSpec]) -> dict:
         )
         if has_cb else None
     )
-    return cb_cost_provenance(specs, context=context)
+    provenance = cb_cost_provenance(specs, context=context)
+    if context is not None and context.ldlq:
+        provenance["cb_ldlq_cold_expert_prior"] = (
+            "layer_routed_activation_pool.v1"
+        )
+    raw_anchors = os.environ.get("PRISMAQUANT_CB_LADDER_ANCHORS", "").strip()
+    raw_holdout = os.environ.get("PRISMAQUANT_CB_LADDER_HOLDOUT", "").strip()
+    if raw_anchors or raw_holdout:
+        provenance["cb_ladder_measurement_plan"] = {
+            "anchors": [
+                item.strip().upper() for item in raw_anchors.split(",")
+                if item.strip()
+            ],
+            "holdout": raw_holdout.upper(),
+        }
+    return provenance
 
 
 def cb_render_provenance_for_results(
@@ -384,6 +399,12 @@ def _extrapolate_expert_costs(
 # selected rung so a shipped artifact can say which of its chosen prices were
 # interpolated.
 BAND_INTERPOLATED_COST_SOURCE = "band_interpolated"
+# Packed-expert ladder rows may combine holdout-accepted interpolations with
+# exact encoder measurements for the rejected expert slices.  Keep this a
+# distinct row-level source so downstream reports do not mistake a partially
+# fitted vector for either a wholly measured or wholly interpolated tensor.
+MIXED_COST_SOURCE = "mixed"
+MEASURED_SLICE_COST_SOURCE = "measured"
 
 
 def _accumulate_result(bucket: dict, name: str, fmt: str,
@@ -393,7 +414,9 @@ def _accumulate_result(bucket: dict, name: str, fmt: str,
                        fisher_output_mse: float | None = None,
                        output_mse_measured: bool = True,
                        n_activation_rows: int | None = None,
-                       cost_source: str | None = None):
+                       cost_source: str | None = None,
+                       weight_mse_per_expert: list[float] | None = None,
+                       cost_source_per_expert: list[str] | None = None):
     per_name = bucket.setdefault(name, {})
     acc = per_name.setdefault(fmt, {
         "_count": 0,
@@ -407,6 +430,8 @@ def _accumulate_result(bucket: dict, name: str, fmt: str,
         "_output_mse_measured": True,
         "_n_activation_rows": None,
         "_cost_source": None,
+        "_weight_mse_per_expert": None,
+        "_cost_source_per_expert": None,
     })
     acc["_count"] += 1
     if cost_source is not None:
@@ -422,6 +447,22 @@ def _accumulate_result(bucket: dict, name: str, fmt: str,
         acc["_n_activation_rows"] = (
             int(n_activation_rows) if prev is None
             else min(int(prev), int(n_activation_rows)))
+    if weight_mse_per_expert is not None:
+        values = [float(value) for value in weight_mse_per_expert]
+        previous = acc.get("_weight_mse_per_expert")
+        if previous is not None and previous != values:
+            raise ValueError(
+                f"{name}/{fmt}: conflicting per-expert MSE vectors"
+            )
+        acc["_weight_mse_per_expert"] = values
+    if cost_source_per_expert is not None:
+        values = [str(value) for value in cost_source_per_expert]
+        previous = acc.get("_cost_source_per_expert")
+        if previous is not None and previous != values:
+            raise ValueError(
+                f"{name}/{fmt}: conflicting per-expert cost provenance"
+            )
+        acc["_cost_source_per_expert"] = values
     acc["_weight_mse_sum"] += weight_mse
     acc["_output_mse_sum"] += output_mse
     acc["_rel_output_mse_sum"] += rel_output_mse
@@ -452,6 +493,10 @@ def _finalize_results(bucket: dict[str, dict]) -> dict[str, dict]:
             output_mse_measured = bool(acc.pop("_output_mse_measured", True))
             n_act_rows = acc.pop("_n_activation_rows", None)
             cost_source = acc.pop("_cost_source", None)
+            weight_mse_per_expert = acc.pop(
+                "_weight_mse_per_expert", None)
+            cost_source_per_expert = acc.pop(
+                "_cost_source_per_expert", None)
             entry = {
                 "weight_mse": acc.pop("_weight_mse_sum") / n,
                 "output_mse": acc.pop("_output_mse_sum") / n,
@@ -461,6 +506,10 @@ def _finalize_results(bucket: dict[str, dict]) -> dict[str, dict]:
                 entry["output_mse_measured"] = False
             if cost_source is not None:
                 entry["cost_source"] = cost_source
+            if weight_mse_per_expert is not None:
+                entry["weight_mse_per_expert"] = weight_mse_per_expert
+            if cost_source_per_expert is not None:
+                entry["cost_source_per_expert"] = cost_source_per_expert
             if n_act_rows is not None:
                 # How many activation rows the output-side numbers rest on.
                 # The allocator/provenance needs this to tell a well-covered
@@ -1350,6 +1399,9 @@ def _measure_packed_experts(
         return
     measured = 0
     fallback = 0
+    ladder_plan = _cb_ladder_plan(specs)
+    ladder_accept = 0
+    ladder_reject = 0
     ldlq_enabled = (
         any(spec.family in _CB_COST_FAMILIES for spec in specs)
         and cb_serialization_context_from_env(
@@ -1433,6 +1485,20 @@ def _measure_packed_experts(
             )
             acts_key = "down" if param_name == "down_proj" else "gate_up"
             packed_ldlq_activation_rows = tuple(derived[acts_key])
+            from .cb_ldlq import fill_empty_expert_activation_rows
+            packed_ldlq_activation_rows, cold_experts = (
+                fill_empty_expert_activation_rows(
+                    packed_ldlq_activation_rows,
+                    qname=full_name,
+                )
+            )
+            if cold_experts:
+                print(
+                    f"[cost] {full_name}: LDLQ cold-expert routed-mean "
+                    f"prior for {len(cold_experts)}/{len(packed_ldlq_activation_rows)} "
+                    f"activation slices",
+                    flush=True,
+                )
 
         # Per-(expert, out-channel) Fisher row-sum h_em, shape [E, M]
         # (= Σ_n grad² over in-features; see the Δloss derivation below).
@@ -1467,7 +1533,14 @@ def _measure_packed_experts(
         # every expert exactly; this only affects the DP's cost estimates.
         sample_n = _expert_cost_sample_n()
         packed_cb_warm_identities = None
-        for spec in specs:
+        measured_specs = (
+            list(specs)
+            if ladder_plan is None
+            else [spec for spec in specs if spec.name not in ladder_plan[1]]
+        )
+        pending_ladders = list(ladder_plan[0]) if ladder_plan else []
+        specs_by_name = {spec.name: spec for spec in specs}
+        for spec in measured_specs:
             try:
                 # Family-agnostic: NVFP4/FP8 registry quantize on a full
                 # 2.4G-elem stack swap-kills a UMA box just like the gguf
@@ -1518,6 +1591,10 @@ def _measure_packed_experts(
                         ),
                     )
                 err = (w_in - w_hat).float()
+                per_expert_weight_mse = (
+                    err.pow(2).mean(dim=(1, 2)).detach().cpu().tolist()
+                    if not use_sample else None
+                )
                 weight_mse = float(err.pow(2).mean().item())
                 dloss_val = None
                 if h_em is not None:
@@ -1590,10 +1667,128 @@ def _measure_packed_experts(
                 _accumulate_result(accum, full_name, spec.name,
                                    weight_mse, output_mse, rel_mse,
                                    predicted_dloss=dloss_val,
-                                   output_mse_measured=output_mse_measured)
+                                   output_mse_measured=output_mse_measured,
+                                   weight_mse_per_expert=(
+                                       per_expert_weight_mse
+                                       if per_expert_weight_mse is not None
+                                       else None
+                                   ))
                 del w_hat, err
             except Exception as e:
                 accum.setdefault(full_name, {})[spec.name] = {"error": str(e)}
+
+            # Packed stacks contain heterogeneous expert RD curves.  Gate one
+            # fit per expert slice, then encode only rejected slices at the
+            # predicted rungs.  A tensor-wide fit both hides that heterogeneity
+            # and turns one honest rejection into a 256-expert measure-all.
+            for ladder in list(pending_ladders):
+                kmap, anchors, holdout, predicted = ladder
+                required = list(anchors) + [holdout]
+                if not all(name in accum.get(full_name, {}) for name in required):
+                    continue
+                vectors = {
+                    name: accum[full_name][name].get(
+                        "_weight_mse_per_expert")
+                    for name in required
+                }
+                slice_fit = _packed_ladder_slice_fits(
+                    kmap,
+                    anchors,
+                    holdout,
+                    predicted,
+                    vectors,
+                    int(w.shape[0]),
+                    _CB_LADDER_TOL,
+                )
+                accepted = list(slice_fit["accepted"])
+                rejected = list(slice_fit["rejected"])
+                per_expert_predictions = slice_fit["predictions"]
+                ladder_accept += len(accepted)
+                ladder_reject += len(rejected)
+
+                if rejected:
+                    print(
+                        f"[cost] {full_name}: packed ladder holdout rejected "
+                        f"{len(rejected)}/{w.shape[0]} expert slices; measuring "
+                        f"{sorted(predicted)} only for those slices",
+                        flush=True,
+                    )
+                reject_idx = torch.as_tensor(
+                    rejected, dtype=torch.long, device=w.device)
+                for target in predicted:
+                    mixed_values = list(per_expert_predictions[target])
+                    if rejected:
+                        target_spec = specs_by_name[target]
+                        w_rejected = w[reject_idx]
+                        cw_rejected = packed_gguf_qw
+                        if _cost_render_uses_imatrix(target_spec):
+                            ext_cw = _cb_col_weights_lookup(full_name)
+                            if ext_cw is not None:
+                                cw_rejected = ext_cw.to(
+                                    device=w.device, dtype=torch.float32)
+                        if (cw_rejected is not None
+                                and cw_rejected.ndim >= 3
+                                and cw_rejected.shape[0] == w.shape[0]):
+                            cw_rejected = cw_rejected[reject_idx]
+                        warm_identities = _cb_warm_record_identities(
+                            w_rejected, cw_rejected)
+                        activation_rows = (
+                            tuple(
+                                packed_ldlq_activation_rows[expert]
+                                for expert in rejected
+                            )
+                            if packed_ldlq_activation_rows is not None
+                            else None
+                        )
+                        w_hat_rejected = _cb_cost_quantize_dequantize(
+                            target_spec,
+                            w_rejected,
+                            col_weights=cw_rejected,
+                            qname=full_name,
+                            warm_identities=warm_identities,
+                            activation_rows=activation_rows,
+                        )
+                        measured_values = (
+                            (w_rejected - w_hat_rejected).float().pow(2)
+                            .mean(dim=(1, 2)).detach().cpu().tolist()
+                        )
+                        for expert, value in zip(rejected, measured_values):
+                            mixed_values[expert] = float(value)
+                        del w_rejected, w_hat_rejected
+
+                    if any(value is None for value in mixed_values):
+                        raise RuntimeError(
+                            f"{full_name}/{target}: incomplete packed-expert "
+                            "ladder vector after measured fallback"
+                        )
+                    final_values = [float(value) for value in mixed_values]
+                    slice_sources = [
+                        (
+                            BAND_INTERPOLATED_COST_SOURCE
+                            if expert in accepted
+                            else MEASURED_SLICE_COST_SOURCE
+                        )
+                        for expert in range(len(final_values))
+                    ]
+                    if accepted and rejected:
+                        row_source = MIXED_COST_SOURCE
+                    elif accepted:
+                        row_source = BAND_INTERPOLATED_COST_SOURCE
+                    else:
+                        row_source = None
+                    _accumulate_result(
+                        accum,
+                        full_name,
+                        target,
+                        sum(final_values) / max(len(final_values), 1),
+                        0.0,
+                        0.0,
+                        output_mse_measured=False,
+                        cost_source=row_source,
+                        weight_mse_per_expert=final_values,
+                        cost_source_per_expert=slice_sources,
+                    )
+                pending_ladders.remove(ladder)
         del w
         if X is not None:
             del X
@@ -1614,6 +1809,12 @@ def _measure_packed_experts(
     if measured or fallback:
         print(f"[cost] packed experts output_mse measured={measured} "
               f"fallback={fallback}", flush=True)
+    if ladder_plan is not None:
+        total = ladder_accept + ladder_reject
+        print(f"[cost] packed-expert CB ladder holdout gate: "
+              f"{ladder_accept}/{total} expert-slice fits accepted "
+              f"({ladder_accept / max(total, 1):.0%}), {ladder_reject} "
+              f"rejected -> measured", flush=True)
 
 
 def _batched_codebook_rtn(stacked_w: torch.Tensor, codebook: torch.Tensor,
@@ -2041,6 +2242,67 @@ def _ladder_metric_fit(kmap, anchors, fmt_values, target_fmt):
     if law is None:
         return None
     return law.predict(target_fmt)
+
+
+def _packed_ladder_slice_fits(
+    kmap: dict[str, int],
+    anchors: list[str] | tuple[str, ...],
+    holdout: str,
+    predicted: list[str] | tuple[str, ...],
+    vectors: dict[str, list[float] | None],
+    n_slices: int,
+    tolerance: float = _CB_LADDER_TOL,
+) -> dict[str, object]:
+    """Fit and holdout-gate one packed expert slice at a time.
+
+    The fit family and tolerance are exactly the shared CB ladder contract.
+    Missing/malformed vectors fail closed: every slice is returned in
+    ``rejected`` and must be measured by the caller.  Predictions are emitted
+    only for accepted slices; rejected positions remain ``None`` until the
+    existing encoder measures those sub-batches.
+    """
+    from prismaquant.expert_empirical_cost import _cb_ladder_gate
+
+    required = list(anchors) + [holdout]
+    complete = (
+        n_slices >= 0
+        and all(isinstance(vectors.get(name), list) for name in required)
+        and all(len(vectors[name]) == n_slices for name in required)
+    )
+    predictions: dict[str, list[float | None]] = {
+        target: [None] * n_slices for target in predicted
+    }
+    if not complete:
+        return {
+            "accepted": [],
+            "rejected": list(range(n_slices)),
+            "holdout_relative_error": [None] * n_slices,
+            "predictions": predictions,
+        }
+
+    accepted: list[int] = []
+    rejected: list[int] = []
+    relative_errors: list[float | None] = []
+    for expert in range(n_slices):
+        values = {name: float(vectors[name][expert]) for name in required}
+        law = None
+        rel = None
+        if not any(value <= 0.0 for value in values.values()):
+            law, rel, _tol = _cb_ladder_gate(
+                kmap, anchors, values, holdout, tolerance)
+        relative_errors.append(None if rel is None else float(rel))
+        if law is None:
+            rejected.append(expert)
+            continue
+        accepted.append(expert)
+        for target in predicted:
+            predictions[target][expert] = float(law.predict(target))
+    return {
+        "accepted": accepted,
+        "rejected": rejected,
+        "holdout_relative_error": relative_errors,
+        "predictions": predictions,
+    }
 
 
 def _chunk_metric(accum, name, fmt, key, count_key="_count"):

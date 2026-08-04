@@ -5,6 +5,15 @@ Covers:
   - Qwen3_5MoeForCausalLM (text-only MoE)
   - Qwen3_5MoeTextModel  (headless)
 
+The canonical ``Qwen/Qwen3.6-35B-A3B`` checkpoint deliberately belongs to
+this producer family: its outer config is ``qwen3_5_moe`` with architecture
+``Qwen3_5MoeForConditionalGeneration``.  Its routed experts are already
+packed as ``gate_up_proj`` / ``down_proj`` tensors (256 experts, top-8), while
+the one shared expert per layer remains split as gate/up/down Linears.  Keep
+the producer id ``qwen3_5``: that is the id declared by Gridbook's serving
+contract, and inventing a release-name ``qwen3_6`` id would make an otherwise
+supported checkpoint fail closed at the repository boundary.
+
 The two naming conventions PrismaQuant must juggle:
 
   | where                    | body                                         |

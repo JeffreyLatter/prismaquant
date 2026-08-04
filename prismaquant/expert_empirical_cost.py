@@ -414,20 +414,69 @@ def _cb_ladder_split(measured_fmts: Sequence[str]):
         if parsed is not None:
             family, k = parsed
             fams.setdefault(family.prefix, {})[f] = k
+    raw_anchors = os.environ.get("PRISMAQUANT_CB_LADDER_ANCHORS", "").strip()
+    raw_holdout = os.environ.get("PRISMAQUANT_CB_LADDER_HOLDOUT", "").strip()
+    if bool(raw_anchors) != bool(raw_holdout):
+        raise ValueError(
+            "explicit CB ladder planning requires both "
+            "PRISMAQUANT_CB_LADDER_ANCHORS and "
+            "PRISMAQUANT_CB_LADDER_HOLDOUT"
+        )
+    explicit_anchors = [
+        item.strip().upper() for item in raw_anchors.split(",") if item.strip()
+    ]
+    explicit_holdout = raw_holdout.upper() if raw_holdout else ""
+    explicit_family = ""
+    if explicit_anchors:
+        parsed_explicit = [parse_format_name(name) for name in
+                           explicit_anchors + [explicit_holdout]]
+        if any(item is None for item in parsed_explicit):
+            raise ValueError("explicit CB ladder plan contains a non-CB format")
+        families = {item[0].prefix for item in parsed_explicit}
+        if len(families) != 1:
+            raise ValueError("explicit CB ladder plan crosses format families")
+        if len(set(explicit_anchors)) != len(explicit_anchors):
+            raise ValueError("explicit CB ladder anchors contain duplicates")
+        if len(explicit_anchors) < 2 or explicit_holdout in explicit_anchors:
+            raise ValueError(
+                "explicit CB ladder needs at least two distinct anchors and "
+                "a separate holdout"
+            )
+        explicit_family = next(iter(families))
+
     ladders = []
-    for _fam, kmap in sorted(fams.items()):
+    explicit_applied = False
+    for fam, kmap in sorted(fams.items()):
         if len(kmap) < 4:
             continue
         by_k = sorted(kmap, key=kmap.get)
-        if len(by_k) == 4:
-            anchors = [by_k[0], by_k[-1]]
+        if explicit_family and fam == explicit_family:
+            required = set(explicit_anchors + [explicit_holdout])
+            missing = sorted(required - set(kmap))
+            if missing:
+                raise ValueError(
+                    f"explicit CB ladder plan is absent from the measured "
+                    f"menu: {missing}"
+                )
+            anchors = list(explicit_anchors)
+            holdout = explicit_holdout
+            explicit_applied = True
         else:
-            anchors = [by_k[0], by_k[len(by_k) // 2], by_k[-1]]
+            if len(by_k) == 4:
+                anchors = [by_k[0], by_k[-1]]
+            else:
+                anchors = [by_k[0], by_k[len(by_k) // 2], by_k[-1]]
+            rest = [f for f in by_k if f not in anchors]
+            holdout = rest[len(rest) // 2]
         rest = [f for f in by_k if f not in anchors]
-        holdout = rest[len(rest) // 2]
         predicted = [f for f in rest if f != holdout]
         if predicted:
             ladders.append((kmap, anchors, holdout, predicted))
+    if explicit_family and not explicit_applied:
+        raise ValueError(
+            f"explicit CB ladder family {explicit_family!r} is absent from "
+            "the measured menu"
+        )
     return ladders or None
 
 

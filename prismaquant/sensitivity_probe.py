@@ -1231,6 +1231,66 @@ def discover_moe_structure(
     return expert_info
 
 
+def discover_moe_routers(
+    model: nn.Module,
+    profile=None,
+) -> dict[str, int]:
+    """Return router module qnames and expert counts for all MoE blocks.
+
+    ``discover_moe_structure`` intentionally describes *per-expert Linear*
+    layouts.  Packed Qwen3.5/3.6 experts instead keep their projections as
+    3-D parameters, so that function has no Linear leaves to return even
+    though the sibling router is fully observable.  Coverage accounting only
+    needs the router module itself; discover it independently from either a
+    numbered expert container or a profile-declared packed 3-D parameter.
+    """
+    if profile is None:
+        try:
+            from .model_profiles import profile_from_model
+            profile = profile_from_model(model)
+        except Exception:
+            profile = None
+    packed_names = _packed_expert_param_name_set(profile)
+    routers: dict[str, int] = {}
+
+    def _matches(child: nn.Module, num_experts: int) -> bool:
+        if isinstance(child, nn.Linear) and child.out_features == num_experts:
+            return True
+        weight = getattr(child, "weight", None)
+        return bool(
+            isinstance(weight, torch.Tensor)
+            and weight.ndim >= 1
+            and int(weight.shape[0]) == num_experts
+        )
+
+    for parent_qname, parent in model.named_modules():
+        for attr in ("experts", "block_sparse_moe_experts",
+                     "moe_experts", "expert_layer"):
+            experts = getattr(parent, attr, None)
+            if not isinstance(experts, nn.Module):
+                continue
+            numeric = [name for name, _child in experts.named_children()
+                       if name.isdigit()]
+            num_experts = len(numeric)
+            if not num_experts:
+                for name, param in experts.named_parameters(recurse=False):
+                    if (name in packed_names and isinstance(param, torch.Tensor)
+                            and param.ndim == 3 and int(param.shape[0]) > 0):
+                        num_experts = int(param.shape[0])
+                        break
+            if not num_experts:
+                continue
+            for child_name, child in parent.named_children():
+                if child is experts:
+                    continue
+                if _matches(child, num_experts):
+                    qname = (f"{parent_qname}.{child_name}"
+                             if parent_qname else child_name)
+                    routers[qname] = num_experts
+                    break
+    return routers
+
+
 def read_top_k(model: nn.Module, default: int = 2) -> int:
     cfg = getattr(model, "config", None)
     if cfg is None:

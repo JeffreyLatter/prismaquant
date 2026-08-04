@@ -79,6 +79,7 @@ from .sensitivity_probe import (
     RouterTracker,
     SharedStateCotangents,
     discover_moe_structure,
+    discover_moe_routers,
     finalize_fisher_stats,
     h_detail_blob,
     install_packed_expert_hooks,
@@ -809,6 +810,7 @@ def _expected_probe_shard_meta(args, *,
         "h_detail_dir": str(Path(args.h_detail_dir)) if args.h_detail_dir else None,
         "activation_rows_limit": int(args.activation_rows_limit),
         "shard_idx": shard_idx,
+        "router_coverage_version": _ROUTER_COVERAGE_VERSION,
     }
 
 
@@ -842,6 +844,7 @@ _CONTENT_META_KEYS: tuple[str, ...] = (
     "requested_device", "requested_device_map",
     "importance_weighting", "activation_cache_dir",
     "linear_exclude", "h_detail_dir", "activation_rows_limit",
+    "router_coverage_version",
 )
 
 
@@ -1163,6 +1166,7 @@ def _compute_precompute_key(model_path: str, dataset_name: str,
         "device": device,
         "importance_weighting": importance_weighting,
         "resident_include_union": resident_include_union,
+        "router_coverage_version": _ROUTER_COVERAGE_VERSION,
     }
 
 
@@ -1189,6 +1193,7 @@ _PROBE_CTX_CACHE: dict = {}
 # probe run the weights are immutable, so the cache holds for the whole
 # multi-chunk driver lifetime.
 _W_STATS_CACHE: dict[tuple[str, int, tuple[int, ...]], tuple[float, float]] = {}
+_ROUTER_COVERAGE_VERSION = 2
 
 
 def _get_or_compute_w_stats(fqn: str, weight) -> tuple[float, float]:
@@ -1294,6 +1299,10 @@ def _compute_global_precompute(
 
     # ---- Phase 1: streaming forward, cache activations on CPU ----
     phase1_expert_info = discover_moe_structure(model, profile=_profile)
+    phase1_router_names = sorted(discover_moe_routers(
+        model, profile=_profile))
+    phase1_tracker = RouterTracker(
+        model, phase1_router_names, top_k=read_top_k(model))
 
     t_phase = time.time()
     with torch.no_grad():
@@ -1342,35 +1351,38 @@ def _compute_global_precompute(
         t_h2h_total += time.time() - t0
 
     _capture_act(hidden)
-    for L in range(num_layers):
-        load_t0 = time.time()
-        src = ctx.install(L)
-        ctx.schedule_prefetch(L + prefetch_depth)
-        load_s = time.time() - load_t0
-        if minimax_fast_moe:
-            _set_minimax_fast_moe(
-                layers[L], True,
-                chunk_size=minimax_fast_moe_chunk_size,
-                proj_names=tuple(_profile.unpacked_expert_projection_names()),
-                class_names=tuple(_profile.packed_expert_module_class_names()),
-            )
-        fwd_t0 = time.time()
-        with torch.no_grad():
-            out = _call_layer(
-                layers[L], hidden,
-                position_embeddings=position_embeddings,
-                attention_mask=causal_mask,
-                position_ids=position_ids,
-                **_profile.extra_layer_kwargs(input_ids=ids),
-                pass_state=pass_state,
-            )
-        fwd_s = time.time() - fwd_t0
-        hidden = out
-        _capture_act(hidden)
-        ctx.unload(L)
-        if L % 8 == 0 or L == num_layers - 1:
-            print(f"[incremental/global] fwd L{L:02d}  src={src}  "
-                  f"load={load_s:.2f}s  fwd={fwd_s:.2f}s", flush=True)
+    try:
+        for L in range(num_layers):
+            load_t0 = time.time()
+            src = ctx.install(L)
+            ctx.schedule_prefetch(L + prefetch_depth)
+            load_s = time.time() - load_t0
+            if minimax_fast_moe:
+                _set_minimax_fast_moe(
+                    layers[L], True,
+                    chunk_size=minimax_fast_moe_chunk_size,
+                    proj_names=tuple(_profile.unpacked_expert_projection_names()),
+                    class_names=tuple(_profile.packed_expert_module_class_names()),
+                )
+            fwd_t0 = time.time()
+            with torch.no_grad():
+                out = _call_layer(
+                    layers[L], hidden,
+                    position_embeddings=position_embeddings,
+                    attention_mask=causal_mask,
+                    position_ids=position_ids,
+                    **_profile.extra_layer_kwargs(input_ids=ids),
+                    pass_state=pass_state,
+                )
+            fwd_s = time.time() - fwd_t0
+            hidden = out
+            _capture_act(hidden)
+            ctx.unload(L)
+            if L % 8 == 0 or L == num_layers - 1:
+                print(f"[incremental/global] fwd L{L:02d}  src={src}  "
+                      f"load={load_s:.2f}s  fwd={fwd_s:.2f}s", flush=True)
+    finally:
+        phase1_tracker.remove_hooks()
     # Snapshot the cross-layer shared state (e.g. Gemma4 shared_kv_states)
     # now that the full sequential forward is done — it holds the K/V the
     # KV-sharing layers reuse. Captured to CPU for the pickled precompute so
@@ -1396,10 +1408,13 @@ def _compute_global_precompute(
           f"(host transfer {t_h2h_total:.1f}s)  "
           f"{ctx.layer_cache.summary()}", flush=True)
 
-    phase1_router_counts = {}
-    phase1_router_totals = {}
-    phase1_router_active_counts = {}
-    phase1_expert_route_stats = {}
+    phase1_router_counts = phase1_tracker.counts
+    phase1_router_totals = dict(phase1_tracker.total_tokens)
+    phase1_router_active_counts = phase1_tracker.active_counts
+    phase1_expert_route_stats = phase1_tracker.route_stats
+    print(f"[incremental/global] router coverage: "
+          f"{len(phase1_router_counts)}/{len(phase1_router_names)} routers "
+          f"recorded", flush=True)
 
     # ---- Phase 2: final norm + lm_head + CE loss; grad at final hidden ----
     ctx.layer_cache.clear()
@@ -2767,6 +2782,12 @@ def _run_body_streaming_shard(
     shard_routers_in_scope: set[str] = {
         rq for (rq, _eid) in shard_expert_info.values()
     }
+    # Packed Qwen3.5/3.6 experts have no per-expert nn.Linear leaves, so
+    # ``expert_info`` is empty even though Phase 1 records their sibling
+    # routers. Select those routers directly by this shard's layer regex.
+    shard_routers_in_scope.update(
+        rq for rq in precomputed.router_counts if inc.search(rq)
+    )
     shard_router_counts = {
         rq: per_expert_map
         for rq, per_expert_map in precomputed.router_counts.items()
@@ -3512,6 +3533,7 @@ def main():
         "h_detail_dir": (str(Path(args.h_detail_dir))
                          if args.h_detail_dir else None),
         "activation_rows_limit": int(args.activation_rows_limit),
+        "router_coverage_version": _ROUTER_COVERAGE_VERSION,
     }
     linear_cache = scan_cached_linear_stats(shard_dir, content_meta_anchor)
     if linear_cache:

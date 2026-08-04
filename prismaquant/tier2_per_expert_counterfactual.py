@@ -102,6 +102,104 @@ def _format_below_k14(format_name: str) -> bool:
     return bool(match and int(match.group(1)) < 14)
 
 
+def expand_packed_expert_rows(
+    stats: Mapping[str, Mapping[str, Any]],
+    costs: Mapping[str, Any],
+) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]],
+           dict[str, tuple[str, ...]]]:
+    """Expand packed ``[E, M, N]`` rows into per-expert Linear rows.
+
+    The probe records an exact Fisher trace per expert and the packed cost
+    writer records reconstruction MSE per expert from the same rendered
+    stack. Together those are sufficient for the established weight-space
+    surrogate without re-encoding each expert. Fused gate+up is split into
+    two equal surrogate members, which is loss-preserving because the tier-2
+    solver couples them as one ``w13`` decision.
+    """
+    cost_rows = (
+        costs.get("costs")
+        if isinstance(costs.get("costs"), Mapping)
+        else costs
+    )
+    expanded_stats: dict[str, dict[str, Any]] = {}
+    expanded_costs: dict[str, dict[str, Any]] = {}
+    children_by_parent: dict[str, tuple[str, ...]] = {}
+
+    for qname, raw_stat in stats.items():
+        stat = dict(raw_stat)
+        num_experts = int(stat.get("num_experts", 0) or 0)
+        packed_param = str(stat.get("_packed_param", ""))
+        traces = stat.get("h_trace_per_expert")
+        per_format = cost_rows.get(qname)
+        if not num_experts or packed_param not in {"gate_up_proj", "down_proj"}:
+            expanded_stats[qname] = stat
+            if isinstance(per_format, Mapping):
+                expanded_costs[qname] = {
+                    str(fmt): dict(entry)
+                    for fmt, entry in per_format.items()
+                    if isinstance(entry, Mapping)
+                }
+            continue
+        if not isinstance(traces, Sequence) or len(traces) != num_experts:
+            raise CounterfactualError(
+                f"{qname}: packed tier-2 expansion requires "
+                f"h_trace_per_expert[{num_experts}]"
+            )
+        if not isinstance(per_format, Mapping):
+            raise CounterfactualError(f"{qname}: missing packed cost row")
+
+        stem = qname[: -len(packed_param)].rstrip(".")
+        roles = ("gate_proj", "up_proj") if packed_param == "gate_up_proj" \
+            else ("down_proj",)
+        split = len(roles)
+        out_features = int(stat["out_features"]) // split
+        n_params = int(stat["n_params"]) // num_experts // split
+        children: list[str] = []
+        for expert in range(num_experts):
+            for role in roles:
+                child = f"{stem}.{expert}.{role}"
+                children.append(child)
+                child_stat = dict(stat)
+                child_stat.update({
+                    "h_trace": float(traces[expert]) / split,
+                    "n_params": n_params,
+                    "out_features": out_features,
+                    "num_experts": 0,
+                    "expert_id": expert,
+                    "_packed_parent": qname,
+                })
+                child_stat.pop("h_trace_per_expert", None)
+                child_stat.pop("h_trace_per_expert_raw", None)
+                child_stat.pop("_packed_experts_module", None)
+                child_stat.pop("_packed_param", None)
+                expanded_stats[child] = child_stat
+
+                child_formats: dict[str, dict[str, Any]] = {}
+                for fmt, raw_entry in per_format.items():
+                    if not isinstance(raw_entry, Mapping):
+                        continue
+                    vector = raw_entry.get("weight_mse_per_expert")
+                    if not isinstance(vector, Sequence) or len(vector) != num_experts:
+                        raise CounterfactualError(
+                            f"{qname}/{fmt}: packed tier-2 expansion requires "
+                            f"weight_mse_per_expert[{num_experts}]"
+                        )
+                    entry = dict(raw_entry)
+                    entry["weight_mse"] = float(vector[expert])
+                    entry["output_mse_measured"] = False
+                    entry["packed_per_expert_surrogate"] = True
+                    for field in (
+                        "weight_mse_per_expert", "output_mse",
+                        "rel_output_mse", "fisher_output_mse",
+                        "predicted_dloss",
+                    ):
+                        entry.pop(field, None)
+                    child_formats[str(fmt)] = entry
+                expanded_costs[child] = child_formats
+        children_by_parent[qname] = tuple(children)
+    return expanded_stats, expanded_costs, children_by_parent
+
+
 def _is_expert_row(qname: str) -> bool:
     return _EXPERT_RE.fullmatch(qname) is not None
 
@@ -581,6 +679,10 @@ def run_counterfactual(
     if not isinstance(stats, Mapping):
         raise CounterfactualError(f"{probe_path}: missing stats mapping")
     costs = _load_pickle(cost_path)
+    stats, expanded_cost_rows, children_by_parent = expand_packed_expert_rows(
+        stats, costs)
+    costs = dict(costs)
+    costs["costs"] = expanded_cost_rows
     recorded_menu = [str(item) for item in applicability.get("formats", ())]
     unknown = sorted(set(menu) - set(recorded_menu))
     if unknown:
@@ -595,6 +697,11 @@ def run_counterfactual(
         and "qname" in record
         and "format" in record
     }
+    denied_pairs.update(
+        (child, fmt)
+        for parent, fmt in tuple(denied_pairs)
+        for child in children_by_parent.get(parent, ())
+    )
     provenance = costs.get("provenance")
     stamp = (
         provenance.get("cb_serialized_payload")
@@ -690,6 +797,8 @@ def run_counterfactual(
         "exact_payload_tidy_changes": solution.tidy_changes,
         "decision_units": len(units),
         "rows": len(assignment),
+        "packed_rows_expanded": len(children_by_parent),
+        "packed_per_expert_surrogate": bool(children_by_parent),
         "expert_zero_evidence_rows": len(zero_rows),
         "expert_zero_evidence_experts": len({
             _EXPERT_RE.fullmatch(qname).group("stem") for qname in zero_rows
