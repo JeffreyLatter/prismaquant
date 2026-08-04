@@ -353,7 +353,6 @@ def test_dense_ladder_helpers(monkeypatch):
     kmap, anchors, holdout, pred = ladders[0]
     # 6-rung family -> 3 anchors, 1 holdout, 2 predicted.
     assert len(anchors) == 3 and len(pred) == 2
-
     # Exact recovery of the law's OWN model. Commit 5184892 replaced the
     # log-linear 2^(a - b*k) fit with a split-aware FLOORED LINEAR law
     # D = F + C*R(k), where R(k) = sum_i 2^(-2*b_i/d_i) is the exact
@@ -393,6 +392,28 @@ def test_dense_ladder_helpers(monkeypatch):
     assert _chunk_metric(
         accum, "t", "FP8_CB_K36", "fisher_output_mse") is None
     assert _chunk_metric(accum, "missing", "FP8_CB_K36", "output_mse") is None
+
+
+def test_cost_provenance_stamps_explicit_ladder_plan(monkeypatch):
+    from prismaquant.measure_quant_cost import cost_payload_provenance
+    import prismaquant.format_registry as fr
+
+    monkeypatch.setenv("CB_SCALE_CODING", "two_tier")
+    monkeypatch.setenv("CB_CODEBOOK_SOURCE", "lattice")
+    monkeypatch.setenv("CB_SCALE_SWEEP", "1")
+    monkeypatch.setenv("PRISMAQUANT_CB_LDLQ", "1")
+    monkeypatch.setenv("PRISMAQUANT_CB_ENCODE_TIER", "balanced")
+    monkeypatch.setenv(
+        "PRISMAQUANT_CB_LADDER_ANCHORS",
+        "FP8_CB_K28,FP8_CB_K38,FP8_CB_K48",
+    )
+    monkeypatch.setenv("PRISMAQUANT_CB_LADDER_HOLDOUT", "FP8_CB_K33")
+    provenance = cost_payload_provenance([fr.get_format("FP8_CB_K28")])
+    assert provenance["cb_ladder_measurement_plan"] == {
+        "anchors": ["FP8_CB_K28", "FP8_CB_K38", "FP8_CB_K48"],
+        "holdout": "FP8_CB_K33",
+    }
+    assert provenance["cb_serialized_payload"]["ldlq"] is True
 
 
 def test_cb_ladder_chain_is_shared_with_the_expert_path():

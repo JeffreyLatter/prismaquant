@@ -132,7 +132,18 @@ def cost_payload_provenance(specs: list[fr.FormatSpec]) -> dict:
         )
         if has_cb else None
     )
-    return cb_cost_provenance(specs, context=context)
+    provenance = cb_cost_provenance(specs, context=context)
+    raw_anchors = os.environ.get("PRISMAQUANT_CB_LADDER_ANCHORS", "").strip()
+    raw_holdout = os.environ.get("PRISMAQUANT_CB_LADDER_HOLDOUT", "").strip()
+    if raw_anchors or raw_holdout:
+        provenance["cb_ladder_measurement_plan"] = {
+            "anchors": [
+                item.strip().upper() for item in raw_anchors.split(",")
+                if item.strip()
+            ],
+            "holdout": raw_holdout.upper(),
+        }
+    return provenance
 
 
 def cb_render_provenance_for_results(

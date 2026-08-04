@@ -223,8 +223,19 @@ def synthesize_packed_expert_col_weights(
     for p in sorted(act_dir.glob("*.pt")):
         qn, X, source_row_indices = _load_act_entry(p)
         src = profile.source_tensor_name(qn)
-        if f"{src}.0.gate_proj.weight" not in wm:
-            continue                    # not a per-expert experts module
+        split_gate0 = f"{src}.0.gate_proj.weight"
+        packed_gate_up_key = next(
+            (
+                cand for cand in (
+                    f"{src}.gate_up_proj",
+                    f"{src}.gate_up_proj.weight",
+                )
+                if cand in wm
+            ),
+            None,
+        )
+        if split_gate0 not in wm and packed_gate_up_key is None:
+            continue                    # not a supported experts module
         gu_name, dn_name = f"{qn}.gate_up_proj", f"{qn}.down_proj"
         requested = None if target_names is None else set(target_names)
         need_gu_sample = (
@@ -285,17 +296,39 @@ def synthesize_packed_expert_col_weights(
                     f"{qn}: router weight not in checkpoint (tried "
                     f"{src_parent} .gate/.router.gate/.router .weight) — "
                     f"cannot replay routing for the down_proj imatrix")
-            E = 0
-            while f"{src}.{E}.gate_proj.weight" in wm:
-                E += 1
-            if E == 0:
-                raise ValueError(f"{qn}: no per-expert gate_proj tensors")
             keys = [gate_key]
-            for e in range(E):
-                keys += [f"{src}.{e}.gate_proj.weight",
-                         f"{src}.{e}.up_proj.weight"]
+            if packed_gate_up_key is not None:
+                keys.append(packed_gate_up_key)
+            else:
+                E = 0
+                while f"{src}.{E}.gate_proj.weight" in wm:
+                    E += 1
+                if E == 0:
+                    raise ValueError(f"{qn}: no per-expert gate_proj tensors")
+                for e in range(E):
+                    keys += [f"{src}.{e}.gate_proj.weight",
+                             f"{src}.{e}.up_proj.weight"]
             t = _load_tensors(model_path, wm, keys)
+            packed_gate_up = None
+            if packed_gate_up_key is not None:
+                packed_gate_up = t[packed_gate_up_key]
+                if packed_gate_up.ndim != 3:
+                    raise ValueError(
+                        f"{qn}: packed gate_up tensor must be rank 3, got "
+                        f"{tuple(packed_gate_up.shape)}"
+                    )
+                E = int(packed_gate_up.shape[0])
+                if int(packed_gate_up.shape[1]) % 2:
+                    raise ValueError(
+                        f"{qn}: packed gate_up output dimension must be even, "
+                        f"got {int(packed_gate_up.shape[1])}"
+                    )
             Wg = t[gate_key].to(dev)
+            if int(Wg.shape[0]) != E:
+                raise ValueError(
+                    f"{qn}: router has {int(Wg.shape[0])} experts but "
+                    f"expert weights have {E}"
+                )
             native_logits = X.to(Wg.dtype) @ Wg.t()
             logits = native_logits.float()
             if router_softcap > 0.0:
@@ -354,7 +387,11 @@ def synthesize_packed_expert_col_weights(
                     denominator = denominator.clamp_min(1e-12)
                 topv = topv / denominator
             topv = topv * route_weight_scale
-            inter = int(t[f"{src}.0.gate_proj.weight"].shape[0])
+            inter = (
+                int(packed_gate_up.shape[1]) // 2
+                if packed_gate_up is not None
+                else int(t[f"{src}.0.gate_proj.weight"].shape[0])
+            )
             out = torch.zeros(E, inter, dtype=torch.float32, device=dev)
             hit = torch.zeros(E, dtype=torch.bool)
             if need_dn_sample:
@@ -406,8 +443,12 @@ def synthesize_packed_expert_col_weights(
                 tok = (topi == e).any(dim=-1).nonzero(as_tuple=True)[0]
                 if tok.numel() == 0:
                     continue
-                gate_weight = t[f"{src}.{e}.gate_proj.weight"].to(dev)
-                up_weight = t[f"{src}.{e}.up_proj.weight"].to(dev)
+                if packed_gate_up is not None:
+                    gate_weight = packed_gate_up[e, :inter].to(dev)
+                    up_weight = packed_gate_up[e, inter:].to(dev)
+                else:
+                    gate_weight = t[f"{src}.{e}.gate_proj.weight"].to(dev)
+                    up_weight = t[f"{src}.{e}.up_proj.weight"].to(dev)
                 g = X[tok].to(gate_weight.dtype) @ gate_weight.t()
                 u = X[tok].to(up_weight.dtype) @ up_weight.t()
                 intermediate = F.silu(g) * u

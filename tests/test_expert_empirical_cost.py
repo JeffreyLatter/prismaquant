@@ -334,6 +334,31 @@ def test_ladder_split_too_short():
     assert _cb_ladder_split(["FP8_CB_K36", "FP8_CB_K44", "NVFP4"]) is None
 
 
+def test_ladder_split_explicit_campaign_plan(monkeypatch):
+    from prismaquant.expert_empirical_cost import _cb_ladder_split
+
+    fmts = [f"FP8_CB_K{k}" for k in range(28, 49)]
+    monkeypatch.setenv(
+        "PRISMAQUANT_CB_LADDER_ANCHORS",
+        "FP8_CB_K28,FP8_CB_K38,FP8_CB_K48",
+    )
+    monkeypatch.setenv("PRISMAQUANT_CB_LADDER_HOLDOUT", "FP8_CB_K33")
+    (kmap, anchors, holdout, predicted), = _cb_ladder_split(fmts)
+    assert set(kmap) == set(fmts)
+    assert anchors == ["FP8_CB_K28", "FP8_CB_K38", "FP8_CB_K48"]
+    assert holdout == "FP8_CB_K33"
+    assert set(predicted) == set(fmts) - set(anchors) - {holdout}
+
+
+def test_ladder_split_rejects_incomplete_explicit_plan(monkeypatch):
+    from prismaquant.expert_empirical_cost import _cb_ladder_split
+
+    monkeypatch.setenv("PRISMAQUANT_CB_LADDER_ANCHORS", "FP8_CB_K28,FP8_CB_K48")
+    monkeypatch.delenv("PRISMAQUANT_CB_LADDER_HOLDOUT", raising=False)
+    with pytest.raises(ValueError, match="requires both"):
+        _cb_ladder_split([f"FP8_CB_K{k}" for k in range(28, 49)])
+
+
 def test_imatrix_synthesis_for_cb_units():
     """CB menus self-synthesize missing packed-expert imatrix entries:
     gate_up = pooled module-input second moment; down_proj = the routed
