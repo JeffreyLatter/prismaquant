@@ -57,6 +57,9 @@ measured under v1 coding.
 from __future__ import annotations
 
 import os
+import threading
+import weakref
+from collections import OrderedDict
 from collections.abc import Sequence
 from functools import lru_cache
 from pathlib import Path
@@ -1616,6 +1619,60 @@ def nvfp4_cb_fields(w: torch.Tensor, k: int, *, grid: str = "fp4",
 
 LDLQ_BLOCK_SIZE = 64
 LDLQ_DAMPING_FRACTION = 0.01
+_LDLQ_FACTOR_CACHE_MAX = 512
+_LDLQ_FACTOR_CACHE: OrderedDict[tuple, tuple[weakref.ReferenceType, torch.Tensor]] = (
+    OrderedDict()
+)
+_LDLQ_FACTOR_CACHE_LOCK = threading.Lock()
+
+
+def _ldlq_inverse_factor_cached(
+    activation_rows: torch.Tensor,
+    *,
+    device: torch.device,
+    damping_fraction: float,
+) -> torch.Tensor:
+    """Reuse the exact format-independent factor across adjacent CB rungs."""
+    source = torch.as_tensor(activation_rows)
+    key = (
+        id(source),
+        source.data_ptr(),
+        source.storage_offset(),
+        tuple(source.shape),
+        tuple(source.stride()),
+        source.device,
+        source.dtype,
+        device,
+        float(damping_fraction),
+    )
+    with _LDLQ_FACTOR_CACHE_LOCK:
+        cached = _LDLQ_FACTOR_CACHE.get(key)
+        if cached is not None and cached[0]() is source:
+            _LDLQ_FACTOR_CACHE.move_to_end(key)
+            return cached[1]
+        if cached is not None:
+            del _LDLQ_FACTOR_CACHE[key]
+
+    from .rotation_ldlq_pilot import inverse_hessian_cholesky
+
+    x = source.to(device=device, dtype=torch.float32)
+    factor = inverse_hessian_cholesky(
+        x.T @ x,
+        damping_fraction=float(damping_fraction),
+    )[0]
+    with _LDLQ_FACTOR_CACHE_LOCK:
+        _LDLQ_FACTOR_CACHE[key] = (weakref.ref(source), factor)
+        _LDLQ_FACTOR_CACHE.move_to_end(key)
+        if len(_LDLQ_FACTOR_CACHE) > _LDLQ_FACTOR_CACHE_MAX:
+            dead = [
+                old_key for old_key, (reference, _value)
+                in _LDLQ_FACTOR_CACHE.items() if reference() is None
+            ]
+            for old_key in dead:
+                del _LDLQ_FACTOR_CACHE[old_key]
+        while len(_LDLQ_FACTOR_CACHE) > _LDLQ_FACTOR_CACHE_MAX:
+            _LDLQ_FACTOR_CACHE.popitem(last=False)
+    return factor
 
 
 def _ldlq_reassign_fields_2d(
@@ -1630,10 +1687,7 @@ def _ldlq_reassign_fields_2d(
     damping_fraction: float,
 ) -> dict:
     """Replace only fixed-codebook assignments using block Hessian feedback."""
-    from .rotation_ldlq_pilot import (
-        block_error_feedback,
-        inverse_hessian_cholesky,
-    )
+    from .rotation_ldlq_pilot import block_error_feedback
 
     if weight.ndim != 2:
         raise ValueError(f"LDLQ weight must be 2-D, got {tuple(weight.shape)}")
@@ -1652,13 +1706,11 @@ def _ldlq_reassign_fields_2d(
             f"and preserve group-{FP4_GROUP} scales"
         )
 
-    x = x.to(device=weight.device, dtype=torch.float32)
-    hessian = x.T @ x
-    upper, _damping = inverse_hessian_cholesky(
-        hessian,
+    upper = _ldlq_inverse_factor_cached(
+        x,
+        device=weight.device,
         damping_fraction=float(damping_fraction),
     )
-    del hessian
 
     scales = fields["scales"].to(weight.device, torch.float32)
     codebook = fields["codebook"]
@@ -1712,6 +1764,340 @@ def _ldlq_reassign_fields_2d(
     return updated
 
 
+def _ldlq_reassign_fields_3d_batched(
+    weight: torch.Tensor,
+    fields: dict,
+    col_weights: torch.Tensor,
+    activation_rows: Sequence[torch.Tensor],
+    *,
+    grid: str,
+    mode: str,
+    block_size: int,
+    damping_fraction: float,
+) -> dict:
+    """Vectorize independent expert LDLQ solves over a batch dimension.
+
+    Experts remain independent and the column-block loop retains the serial
+    path's exact within-expert order.  Fixed-codebook assignment, triangular
+    block solve, and feedback update are batched over the expert axis.  The
+    inverse-Hessian factors remain the serial bit-identity anchors: CUDA's
+    stacked Cholesky chooses a different numerical kernel and changes real
+    expert indices at exact VQ boundaries.  Repeated cold-prior inputs share
+    one exact factor, so identical work is still deduplicated.
+    """
+    if weight.ndim != 3:
+        raise ValueError(
+            f"batched LDLQ weight must be 3-D, got {tuple(weight.shape)}"
+        )
+    experts, rows, columns = map(int, weight.shape)
+    activations = tuple(activation_rows)
+    if len(activations) != experts:
+        raise ValueError(
+            f"LDLQ expert activation count {len(activations)} != "
+            f"stack size {experts}"
+        )
+    if columns % int(block_size) or int(block_size) % FP4_GROUP:
+        raise ValueError(
+            f"LDLQ block_size={block_size} must divide in_features={columns} "
+            f"and preserve group-{FP4_GROUP} scales"
+        )
+
+    raw_expert_batch = os.environ.get(
+        "PRISMAQUANT_CB_LDLQ_EXPERT_BATCH", "16"
+    ).strip()
+    try:
+        expert_batch = int(raw_expert_batch)
+    except ValueError as exc:
+        raise ValueError(
+            "PRISMAQUANT_CB_LDLQ_EXPERT_BATCH must be a positive integer"
+        ) from exc
+    if expert_batch <= 0:
+        raise ValueError(
+            "PRISMAQUANT_CB_LDLQ_EXPERT_BATCH must be a positive integer"
+        )
+    if experts > expert_batch:
+        # A single E=256 launch makes the tall assignment and feedback GEMMs
+        # slower on GB10 than several resident same-shape batches.  Chunking
+        # changes only the independent expert batch dimension; column blocks
+        # and every operation within one expert retain their original order.
+        indices = fields["indices"].reshape(experts * rows, -1)
+        signs = fields.get("signs")
+        if signs is not None:
+            signs = signs.reshape(experts * rows, -1)
+        scales = fields["scales"].reshape(experts * rows, -1)
+        chunk_ranges = [
+            (first, min(first + expert_batch, experts))
+            for first in range(0, experts, expert_batch)
+        ]
+
+        def encode_chunk(first: int, last: int) -> dict:
+            last = min(first + expert_batch, experts)
+            row_first, row_last = first * rows, last * rows
+            chunk_fields = dict(fields)
+            chunk_fields["indices"] = indices[row_first:row_last]
+            chunk_fields["scales"] = scales[row_first:row_last]
+            if signs is not None:
+                chunk_fields["signs"] = signs[row_first:row_last]
+            chunk_fields["shape"] = (last - first, rows, columns)
+            return _ldlq_reassign_fields_3d_batched(
+                weight[first:last],
+                chunk_fields,
+                torch.broadcast_to(
+                    torch.as_tensor(col_weights), weight.shape
+                )[first:last],
+                activations[first:last],
+                grid=grid,
+                mode=mode,
+                block_size=block_size,
+                damping_fraction=damping_fraction,
+            )
+
+        raw_streams = os.environ.get(
+            "PRISMAQUANT_CB_LDLQ_BATCH_STREAMS", "1"
+        ).strip()
+        try:
+            batch_streams = int(raw_streams)
+        except ValueError as exc:
+            raise ValueError(
+                "PRISMAQUANT_CB_LDLQ_BATCH_STREAMS must be a positive integer"
+            ) from exc
+        if batch_streams <= 0:
+            raise ValueError(
+                "PRISMAQUANT_CB_LDLQ_BATCH_STREAMS must be a positive integer"
+            )
+        chunk_results: list[dict | None] = [None] * len(chunk_ranges)
+        if batch_streams > 1 and weight.device.type == "cuda":
+            from concurrent.futures import ThreadPoolExecutor
+
+            stream_count = min(batch_streams, len(chunk_ranges))
+            streams = [
+                torch.cuda.Stream(device=weight.device)
+                for _ in range(stream_count)
+            ]
+
+            def encode_stream(stream_id: int) -> list[tuple[int, dict]]:
+                encoded: list[tuple[int, dict]] = []
+                with torch.cuda.device(weight.device), torch.cuda.stream(
+                    streams[stream_id]
+                ):
+                    for chunk_id in range(
+                        stream_id, len(chunk_ranges), stream_count
+                    ):
+                        first, last = chunk_ranges[chunk_id]
+                        encoded.append(
+                            (chunk_id, encode_chunk(first, last))
+                        )
+                return encoded
+
+            with ThreadPoolExecutor(max_workers=stream_count) as pool:
+                for encoded in pool.map(encode_stream, range(stream_count)):
+                    for chunk_id, result in encoded:
+                        chunk_results[chunk_id] = result
+            current = torch.cuda.current_stream(weight.device)
+            for stream in streams:
+                current.wait_stream(stream)
+        else:
+            for chunk_id, (first, last) in enumerate(chunk_ranges):
+                chunk_results[chunk_id] = encode_chunk(first, last)
+        ready = [result for result in chunk_results if result is not None]
+        if len(ready) != len(chunk_ranges):
+            raise RuntimeError("batched LDLQ stream lost an expert chunk")
+        updated = dict(fields)
+        updated["indices"] = torch.cat(
+            [result["indices"] for result in ready], dim=0
+        )
+        if signs is not None:
+            updated["signs"] = torch.cat(
+                [result["signs"] for result in ready], dim=0
+            )
+        return updated
+
+    xs: list[torch.Tensor] = []
+    for x in activations:
+        x = torch.as_tensor(x)
+        if x.ndim != 2 or int(x.shape[1]) != columns:
+            raise ValueError(
+                "LDLQ activation rows must have shape (rows, in_features), got "
+                f"{tuple(x.shape)} for expert weight {(rows, columns)}"
+            )
+        if int(x.shape[0]) == 0:
+            raise ValueError("LDLQ activation rows must be non-empty")
+        xs.append(x)
+
+    upper_parts = [
+        _ldlq_inverse_factor_cached(
+            x,
+            device=weight.device,
+            damping_fraction=float(damping_fraction),
+        )
+        for x in xs
+    ]
+    upper = torch.stack(upper_parts)
+    del xs, upper_parts
+
+    scales = fields["scales"].to(weight.device, torch.float32).reshape(
+        experts, rows, -1
+    )
+    codebook = fields["codebook"]
+    if isinstance(codebook, tuple):
+        codebook = tuple(
+            table.to(weight.device, torch.float32) for table in codebook
+        )
+    else:
+        codebook = codebook.to(weight.device, torch.float32)
+    cw = torch.broadcast_to(
+        torch.as_tensor(col_weights).to(weight.device, torch.float32),
+        weight.shape,
+    )
+    work = weight.to(torch.float32).clone()
+    assignment_parts: list[dict[str, torch.Tensor]] = []
+
+    for start in range(0, columns, int(block_size)):
+        end = start + int(block_size)
+        width = end - start
+        block = work[:, :, start:end]
+        block_scales = (
+            scales[:, :, start // FP4_GROUP:end // FP4_GROUP]
+            if grid == "fp4"
+            else scales
+        )
+        flat_block = block.reshape(experts * rows, width)
+        flat_scales = block_scales.reshape(experts * rows, -1)
+        wq = _col_weight_vectors(
+            cw[:, :, start:end].reshape(experts * rows, width)
+        )
+        _err, enc, decoded = _eval_candidate(
+            flat_block,
+            wq,
+            flat_scales,
+            grid,
+            mode,
+            codebook,
+        )
+        assignment_parts.append(
+            _enc_to_fields(
+                enc,
+                mode,
+                codebook,
+                experts * rows,
+                width,
+                width // VEC_DIM,
+            )
+        )
+        qblock = (
+            decoded
+            * _per_element_scale(flat_scales, grid, width)
+        ).reshape(experts, rows, width)
+        residual = block - qblock
+        diagonal_block = upper[:, start:end, start:end]
+        scaled_error = torch.linalg.solve_triangular(
+            diagonal_block.transpose(-2, -1),
+            residual.transpose(-2, -1),
+            upper=False,
+        ).transpose(-2, -1)
+        work[:, :, start:] -= torch.bmm(
+            scaled_error,
+            upper[:, start:end, start:],
+        )
+
+    updated = dict(fields)
+    updated["indices"] = torch.cat(
+        [part["indices"] for part in assignment_parts], dim=1
+    )
+    if mode == "signed":
+        updated["signs"] = torch.cat(
+            [part["signs"] for part in assignment_parts], dim=1
+        )
+    return updated
+
+
+def _ldlq_reassign_fields_3d_threaded(
+    weight: torch.Tensor,
+    fields: dict,
+    col_weights: torch.Tensor,
+    activation_rows: Sequence[torch.Tensor],
+    *,
+    grid: str,
+    mode: str,
+    block_size: int,
+    damping_fraction: float,
+    workers: int,
+) -> dict:
+    """Feed exact per-expert LDLQ streams from multiple host threads.
+
+    This is the secondary lever for rungs whose large fixed-codebook search
+    does not benefit from flattening experts into one assignment batch.  One
+    expert still executes the byte-pinned 2-D path, on one CUDA stream, in
+    exactly the legacy order; threads only make independent units resident
+    concurrently so a single Python core cannot starve the device.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    if weight.device.type != "cuda":
+        raise ValueError("threaded LDLQ feeder requires CUDA expert weights")
+    experts, rows, columns = map(int, weight.shape)
+    activations = tuple(activation_rows)
+    if len(activations) != experts:
+        raise ValueError(
+            f"LDLQ expert activation count {len(activations)} != "
+            f"stack size {experts}"
+        )
+    workers = min(max(1, int(workers)), experts)
+    indices = fields["indices"].reshape(experts * rows, -1)
+    scales = fields["scales"].reshape(experts * rows, -1)
+    signs = fields.get("signs")
+    if signs is not None:
+        signs = signs.reshape(experts * rows, -1)
+    cw = torch.broadcast_to(torch.as_tensor(col_weights), weight.shape)
+    streams = [torch.cuda.Stream(device=weight.device) for _ in range(workers)]
+
+    def encode_worker(worker: int) -> list[tuple[int, dict]]:
+        encoded: list[tuple[int, dict]] = []
+        stream = streams[worker]
+        with torch.cuda.device(weight.device), torch.cuda.stream(stream):
+            for expert in range(worker, experts, workers):
+                first, last = expert * rows, (expert + 1) * rows
+                expert_fields = dict(fields)
+                expert_fields["indices"] = indices[first:last]
+                expert_fields["scales"] = scales[first:last]
+                if signs is not None:
+                    expert_fields["signs"] = signs[first:last]
+                expert_fields["shape"] = (rows, columns)
+                result = _ldlq_reassign_fields_2d(
+                    weight[expert],
+                    expert_fields,
+                    cw[expert],
+                    activations[expert],
+                    grid=grid,
+                    mode=mode,
+                    block_size=block_size,
+                    damping_fraction=damping_fraction,
+                )
+                encoded.append((expert, result))
+        return encoded
+
+    results: list[dict | None] = [None] * experts
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for encoded in pool.map(encode_worker, range(workers)):
+            for expert, result in encoded:
+                results[expert] = result
+    current = torch.cuda.current_stream(weight.device)
+    for stream in streams:
+        current.wait_stream(stream)
+    ready = [result for result in results if result is not None]
+    if len(ready) != experts:
+        raise RuntimeError("threaded LDLQ feeder lost an expert result")
+    updated = dict(fields)
+    updated["indices"] = torch.cat(
+        [result["indices"] for result in ready], dim=0
+    )
+    if signs is not None:
+        updated["signs"] = torch.cat(
+            [result["signs"] for result in ready], dim=0
+        )
+    return updated
+
+
 def ldlq_reassign_cb_fields(
     weight: torch.Tensor,
     fields: dict,
@@ -1722,6 +2108,7 @@ def ldlq_reassign_cb_fields(
     mode: str,
     block_size: int = LDLQ_BLOCK_SIZE,
     damping_fraction: float = LDLQ_DAMPING_FRACTION,
+    batch_experts: bool | None = None,
 ) -> dict:
     """Run deterministic fixed-scale/codebook LDLQ assignment.
 
@@ -1729,6 +2116,15 @@ def ldlq_reassign_cb_fields(
     sequence supplies one activation matrix (and Hessian) per expert; a single
     matrix deliberately shares one Hessian across the stack.
     """
+    if batch_experts is None:
+        raw_batch = os.environ.get(
+            "PRISMAQUANT_CB_LDLQ_BATCH_EXPERTS", "1"
+        ).strip().lower()
+        if raw_batch not in {"0", "1", "false", "true", "no", "yes", "off", "on"}:
+            raise ValueError(
+                "PRISMAQUANT_CB_LDLQ_BATCH_EXPERTS must be 0 or 1"
+            )
+        batch_experts = raw_batch in {"1", "true", "yes", "on"}
     if weight.ndim == 2 or isinstance(activation_rows, torch.Tensor):
         flat = weight.reshape(-1, weight.shape[-1])
         flat_col_weights = torch.broadcast_to(
@@ -1755,6 +2151,47 @@ def ldlq_reassign_cb_fields(
             f"LDLQ expert activation count {len(activations)} != "
             f"stack size {weight.shape[0]}"
         )
+    if batch_experts:
+        raw_workers = os.environ.get(
+            "PRISMAQUANT_CB_LDLQ_FEEDER_THREADS", "0"
+        ).strip()
+        try:
+            feeder_workers = int(raw_workers)
+        except ValueError as exc:
+            raise ValueError(
+                "PRISMAQUANT_CB_LDLQ_FEEDER_THREADS must be a non-negative "
+                "integer"
+            ) from exc
+        if feeder_workers < 0:
+            raise ValueError(
+                "PRISMAQUANT_CB_LDLQ_FEEDER_THREADS must be a non-negative "
+                "integer"
+            )
+        if feeder_workers and weight.device.type == "cuda":
+            return _ldlq_reassign_fields_3d_threaded(
+                weight,
+                fields,
+                col_weights,
+                activations,
+                grid=grid,
+                mode=mode,
+                block_size=block_size,
+                damping_fraction=damping_fraction,
+                workers=feeder_workers,
+            )
+        return _ldlq_reassign_fields_3d_batched(
+            weight,
+            fields,
+            col_weights,
+            activations,
+            grid=grid,
+            mode=mode,
+            block_size=block_size,
+            damping_fraction=damping_fraction,
+        )
+
+    # Retained as the bit-identity reference.  Production takes the batched
+    # arm; tests and measurement gates exercise both on identical inputs.
     cw = torch.broadcast_to(torch.as_tensor(col_weights), weight.shape)
     rows_per_expert = int(weight.shape[1])
     assignment_parts: list[dict] = []
