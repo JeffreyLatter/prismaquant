@@ -236,3 +236,93 @@ def test_ldlq_beats_plain_on_correlated_known_better_case():
     ).square().sum()
 
     assert float(feedback_sse / plain_sse) < 0.5
+
+
+@pytest.mark.parametrize(
+    "device", ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
+)
+@pytest.mark.parametrize("format_name", ["NVFP4_CB_K12", "FP8_CB_K28"])
+@pytest.mark.parametrize("strategy", ["chunked", "threaded"])
+def test_batched_expert_ldlq_is_bit_identical_to_serial(
+    device, format_name, strategy, monkeypatch
+):
+    """The production expert batch may never change a per-unit encoding."""
+    # Force multiple expert chunks so this pins both vectorization and the
+    # chunk concatenation used by large packed-MoE stacks.
+    monkeypatch.setenv("PRISMAQUANT_CB_LDLQ_EXPERT_BATCH", "3")
+    monkeypatch.setenv(
+        "PRISMAQUANT_CB_LDLQ_FEEDER_THREADS",
+        "4" if strategy == "threaded" else "0",
+    )
+    monkeypatch.setenv(
+        "PRISMAQUANT_CB_LDLQ_BATCH_STREAMS",
+        "2" if strategy == "chunked" else "1",
+    )
+    generator = torch.Generator(device="cpu").manual_seed(19)
+    experts, rows, columns = 8, 8, 256
+    weight = (
+        torch.randn(experts, rows, columns, generator=generator) * 0.08
+    ).to(device=device, dtype=torch.bfloat16)
+    col_weights = (
+        torch.rand(experts, 1, columns, generator=generator) + 0.05
+    ).to(device)
+    activation_rows = tuple(
+        torch.randn(9 + expert % 4, columns, generator=generator).to(device)
+        for expert in range(experts)
+    )
+    spec = fr.get_format(format_name)
+    grid = "fp4" if format_name.startswith("NVFP4") else "fp8"
+    k = int(format_name.rsplit("K", 1)[1])
+    fields = cb_fields_for_context(
+        spec,
+        weight,
+        context=CBSerializationContext.production(encode_tier="fast"),
+        col_weights=col_weights,
+    )
+
+    serial = cb.ldlq_reassign_cb_fields(
+        weight,
+        fields,
+        col_weights,
+        activation_rows,
+        grid=grid,
+        mode="product",
+        batch_experts=False,
+    )
+    batched = cb.ldlq_reassign_cb_fields(
+        weight,
+        fields,
+        col_weights,
+        activation_rows,
+        grid=grid,
+        mode="product",
+        batch_experts=True,
+    )
+
+    for key in ("indices", "scales", "scale_super", "scale_sub"):
+        if key in serial:
+            assert torch.equal(serial[key], batched[key]), (
+                f"{format_name}/{device}: {key} differs"
+            )
+    serial_reconstruction = cb.nvfp4_cb_reconstruct(
+        serial, k, grid=grid, mode="product"
+    )
+    batched_reconstruction = cb.nvfp4_cb_reconstruct(
+        batched, k, grid=grid, mode="product"
+    )
+    assert torch.equal(serial_reconstruction, batched_reconstruction)
+    serial_mse = torch.stack([
+        (
+            activation_rows[expert]
+            @ (weight[expert].float() - serial_reconstruction[expert]).T
+        ).square().mean()
+        for expert in range(experts)
+    ])
+    batched_mse = torch.stack([
+        (
+            activation_rows[expert]
+            @ (weight[expert].float() - batched_reconstruction[expert]).T
+        ).square().mean()
+        for expert in range(experts)
+    ])
+    assert torch.equal(serial_mse, batched_mse)
