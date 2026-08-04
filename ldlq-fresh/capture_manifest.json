@@ -1,0 +1,71 @@
+{
+  "capture_path": "prismaquant.incremental_probe",
+  "device": "cuda",
+  "dtype": "bf16",
+  "fresh_calibration_data_hash": "7d62ff03e53f7a2b7b0bfe413bae3f0c",
+  "layer_runs": [
+    {
+      "activation_rows_limit": 64,
+      "calib_hash": "7d62ff03e53f7a2b7b0bfe413bae3f0c",
+      "dataset": "/w/ldlq-fresh/fresh-text.jsonl",
+      "layer": 20,
+      "linear_include": "layers\\.20\\.",
+      "nsamples": 16,
+      "phase1_forward_seconds": 275.7,
+      "phase3_reverse_seconds": 90.0,
+      "seqlen": 512
+    },
+    {
+      "activation_rows_limit": 64,
+      "calib_hash": "7d62ff03e53f7a2b7b0bfe413bae3f0c",
+      "dataset": "/w/ldlq-fresh/fresh-text.jsonl",
+      "layer": 40,
+      "linear_include": "layers\\.40\\.",
+      "nsamples": 16,
+      "phase1_forward_seconds": 142.8,
+      "phase3_reverse_seconds": 9.5,
+      "seqlen": 512
+    }
+  ],
+  "measured_probe_hot_seconds": 518.0,
+  "production_activation_caches_written": false,
+  "schema": "prismaquant.ldlq_fresh_capture.v1",
+  "targets": {
+    "layers.20.experts.63.up_proj": {
+      "bytes": 1051405,
+      "dtype": "torch.float32",
+      "live_name": "model.layers.20.mlp.experts.63.up_proj",
+      "path": "/w/ldlq-fresh/act/model__layers__20__mlp__experts__63__up_proj.pt",
+      "row_indices_sha256": "29c5b006592e24829ed7507316abb874814ac0648b309492254b232fa29a93b6",
+      "sha256": "20bcb02e6b4501cd3b3e3bcd46151f5eae41e18808aae04867071cb751bdf434",
+      "shape": [
+        64,
+        4096
+      ]
+    },
+    "layers.40.attn.wq_b": {
+      "bytes": 264893,
+      "dtype": "torch.float32",
+      "live_name": "model.layers.40.self_attn.wq_b",
+      "path": "/w/ldlq-fresh/act/model__layers__40__self_attn__wq_b.pt",
+      "row_indices_sha256": "c151ab397c454b5b5edc1f57a586644eea8ebba473b85f7e840fe6e97ec9d3d9",
+      "sha256": "36d889beae165392fe1ab21e7413799763eaca1bf2c49086f57eaadc877c0267",
+      "shape": [
+        64,
+        1024
+      ]
+    },
+    "layers.40.experts.81.up_proj": {
+      "bytes": 1051405,
+      "dtype": "torch.float32",
+      "live_name": "model.layers.40.mlp.experts.81.up_proj",
+      "path": "/w/ldlq-fresh/act/model__layers__40__mlp__experts__81__up_proj.pt",
+      "row_indices_sha256": "e150fb3f43ea9ef3ebbcbc1017f450bc2df5ef79aeea78518e29ddbb8e6c4103",
+      "sha256": "7dce8bbf9b2c6aea460c223c5dd8575670e929648cd1d4206d24f0d823d22bc1",
+      "shape": [
+        64,
+        4096
+      ]
+    }
+  }
+}

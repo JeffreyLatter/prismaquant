@@ -1,0 +1,215 @@
+{
+  "disjoint": true,
+  "exact_text_hash_overlap": [],
+  "fresh_corpus": "/w/ldlq-fresh/fresh-text.jsonl",
+  "fresh_corpus_sha256": "37daec89390d9a231eee28be7117e3793b693f42399e4583c26e4826749def45",
+  "fresh_records": [
+    {
+      "checkpoint_token_count": 4222,
+      "source_line": 18,
+      "text_index": 16,
+      "text_sha256": "c8cab00c92d9e1d257fe2341074c010d103fb5dd21222106d65906938af6bc76"
+    },
+    {
+      "checkpoint_token_count": 4918,
+      "source_line": 19,
+      "text_index": 17,
+      "text_sha256": "510c52da2b458a7595893255309b6f1874f39dba11514a0e102b1a1d94253500"
+    },
+    {
+      "checkpoint_token_count": 3865,
+      "source_line": 20,
+      "text_index": 18,
+      "text_sha256": "8022efedbbdb884959fc217dc068f8ca5f6fd83618ae0b6c8d7915c37d60120e"
+    },
+    {
+      "checkpoint_token_count": 3951,
+      "source_line": 21,
+      "text_index": 19,
+      "text_sha256": "0f9c1cecedb8110ef7bde027b24161c001a31de7eb098b0a32024e21d1c99dc2"
+    },
+    {
+      "checkpoint_token_count": 4203,
+      "source_line": 22,
+      "text_index": 20,
+      "text_sha256": "7a587be3578022e9ebccc46ae724c466660c3bda993fe431173b8d3bd3b20893"
+    },
+    {
+      "checkpoint_token_count": 3859,
+      "source_line": 23,
+      "text_index": 21,
+      "text_sha256": "94faf2224ae29426742a1a23966abd56cd683df273f70eb303318088a3b4c704"
+    },
+    {
+      "checkpoint_token_count": 3837,
+      "source_line": 24,
+      "text_index": 22,
+      "text_sha256": "4ba1ea5d0f96647fa79d60878c0d389fe8a4d55282882220b281e476618b3f7a"
+    },
+    {
+      "checkpoint_token_count": 3938,
+      "source_line": 25,
+      "text_index": 23,
+      "text_sha256": "de1761d2308eb99b6a737f3aa61d62e16e014e8bfe550e2dd4ea17700f31082b"
+    },
+    {
+      "checkpoint_token_count": 4029,
+      "source_line": 26,
+      "text_index": 24,
+      "text_sha256": "a939b84c8b9dc73ea5d3bbcf1b56fffe22ca5e9acab41f897d6db71ca70ae22d"
+    },
+    {
+      "checkpoint_token_count": 3872,
+      "source_line": 27,
+      "text_index": 25,
+      "text_sha256": "723cae0e8902ad3b242a170b4bec78cbbf0df7637d78563b9baaebb97fb64524"
+    },
+    {
+      "checkpoint_token_count": 4796,
+      "source_line": 28,
+      "text_index": 26,
+      "text_sha256": "9d87451060a57fed983084230182a02cca2a288bd03569b62148737c8742dd48"
+    },
+    {
+      "checkpoint_token_count": 4676,
+      "source_line": 29,
+      "text_index": 27,
+      "text_sha256": "07fcb0ea1bd5b4162b8f0de30fc939c5cc0e60433c3081b7e9bf484f559fc0f8"
+    },
+    {
+      "checkpoint_token_count": 4093,
+      "source_line": 30,
+      "text_index": 28,
+      "text_sha256": "f982bbcc6af18f1e017cd63cafcbea4ad6dda5a8c413c47f1354ff6c55f1c5c2"
+    },
+    {
+      "checkpoint_token_count": 3911,
+      "source_line": 31,
+      "text_index": 29,
+      "text_sha256": "b4bc68be5ef1c936560ed40c88675392ef6cc4b3b693670c9fd84aa899359688"
+    },
+    {
+      "checkpoint_token_count": 3981,
+      "source_line": 32,
+      "text_index": 30,
+      "text_sha256": "6f7d751570f05acecb860554e7fac9a533face970795836e298bdcdb5131d2b1"
+    },
+    {
+      "checkpoint_token_count": 4240,
+      "source_line": 33,
+      "text_index": 31,
+      "text_sha256": "b89c647625b8933109bc139c3cf8ec8d4164ff7df73da08ee50eae798d6ab504"
+    }
+  ],
+  "loader_contract": {
+    "calib_seed": 42,
+    "checkpoint_tokenizer_model": "/home/rob/dq-runs/dsv4-flash-0731/source",
+    "fresh_calibration_data_hash": "7d62ff03e53f7a2b7b0bfe413bae3f0c",
+    "nsamples": 16,
+    "production_calibration_data_hash": "2682b690de20c091568729be8f78baf7",
+    "production_calibration_data_hash_recomputed": "2682b690de20c091568729be8f78baf7",
+    "seed_42_local_jsonl_order": "preserved",
+    "seqlen": 512
+  },
+  "production_records": [
+    {
+      "checkpoint_token_count": 4137,
+      "source_line": 2,
+      "text_index": 0,
+      "text_sha256": "44314631057e72296cc56cb049b8514d3cc371c248127aa0cc514b837e0d50ee"
+    },
+    {
+      "checkpoint_token_count": 3961,
+      "source_line": 3,
+      "text_index": 1,
+      "text_sha256": "90d70a18c28b8fe2510f6cedabe9298c2b9db3c29089d51a7230aaafd3f52b15"
+    },
+    {
+      "checkpoint_token_count": 4699,
+      "source_line": 4,
+      "text_index": 2,
+      "text_sha256": "6d4e5af36d67aecb924882ff78f2bbca2570e64b5cb17305935d3d93e321cf66"
+    },
+    {
+      "checkpoint_token_count": 4823,
+      "source_line": 5,
+      "text_index": 3,
+      "text_sha256": "6fefd5b107dd526f0c6858d479bfbdd585ef08180e9445c9cc109d067cc5098b"
+    },
+    {
+      "checkpoint_token_count": 4061,
+      "source_line": 6,
+      "text_index": 4,
+      "text_sha256": "925d6e616632ca911dc9ac7a65db0a0e2846f162225785c39cad9566048a62c5"
+    },
+    {
+      "checkpoint_token_count": 4034,
+      "source_line": 7,
+      "text_index": 5,
+      "text_sha256": "21829ab0ec3cc7f1524dae13b2759086fb5bc7219ba3404b0fe73273ca344ff8"
+    },
+    {
+      "checkpoint_token_count": 4638,
+      "source_line": 8,
+      "text_index": 6,
+      "text_sha256": "b69ccd443e21cf96d3c20e95f0ed7bd55c1ad0e65deac6a45e40ccdbbc2b7887"
+    },
+    {
+      "checkpoint_token_count": 3937,
+      "source_line": 9,
+      "text_index": 7,
+      "text_sha256": "dea0701a1d9593195b82cb08cc587a47894beab83a9c16ddd4dd2b2c4e8751ab"
+    },
+    {
+      "checkpoint_token_count": 4011,
+      "source_line": 10,
+      "text_index": 8,
+      "text_sha256": "5f9232adb17b77ac21eb2f37afee2fa7ccb4262378000fc3207f403ae72d2989"
+    },
+    {
+      "checkpoint_token_count": 3826,
+      "source_line": 11,
+      "text_index": 9,
+      "text_sha256": "d2919af60121b50c3c165aa1ec873e8e7d4ac78a13605b6124dd3884b267faaf"
+    },
+    {
+      "checkpoint_token_count": 3932,
+      "source_line": 12,
+      "text_index": 10,
+      "text_sha256": "621942364d6b7e5b98601ea3a57b9b4723519fc0b636994162d1315984be9c9b"
+    },
+    {
+      "checkpoint_token_count": 4055,
+      "source_line": 13,
+      "text_index": 11,
+      "text_sha256": "f0a5de215d9d5e08129d0ebe9277d769114751b6f19961963b938afa8b6757bc"
+    },
+    {
+      "checkpoint_token_count": 4608,
+      "source_line": 14,
+      "text_index": 12,
+      "text_sha256": "74e3102063b64bdee3c90f9aa37377cb0fe8b867f729fc1af84aa6490216b1ad"
+    },
+    {
+      "checkpoint_token_count": 3867,
+      "source_line": 15,
+      "text_index": 13,
+      "text_sha256": "a9ff5c030457bd3c1a969b55c5c6a834a43b4b9171e2f390d3c7b20c51e96d2d"
+    },
+    {
+      "checkpoint_token_count": 3694,
+      "source_line": 16,
+      "text_index": 14,
+      "text_sha256": "330ac217852e2f5b679c62398558570966787c7efef11ab22e00ca68fc014ebb"
+    },
+    {
+      "checkpoint_token_count": 3912,
+      "source_line": 17,
+      "text_index": 15,
+      "text_sha256": "5e22a89db6ced953b2c989d6497079d270cdeb5d79a1926b477ba16444b1c85b"
+    }
+  ],
+  "schema": "prismaquant.ldlq_fresh_text.v1",
+  "source": "/home/rob/dq-runs/calibration/diverse-v1.jsonl",
+  "source_sha256": "e09a138a4903c4af66a3bf2f9367185f3432224391f1dfe8c94ccc29d99315ba"
+}
