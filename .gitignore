@@ -25,6 +25,7 @@ docs/handovers/*
 
 # Local model checkpoints downloaded into the repo root (e.g. Laguna FP8 source)
 fp8/
+/models/
 
 # Local sqlite + worktrees + scratch artifacts
 data/

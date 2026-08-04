@@ -167,7 +167,7 @@ Public artifact: [`rdtand/Hy3-295B-A21B-gridbook-2.9bit-vllm`](https://huggingfa
 
 First-class profiles in-tree:
 
-- **Qwen3 / 3.5 / 3.6** — dense + packed-3D MoE + MTP heads, Gated-DeltaNet hybrids
+- **Qwen3 / 3.5 / 3.6** — original Qwen3 dense + 30B-A3B routed MoE under Gridbook producer id `qwen3`; 3.5/3.6 packed-3D MoE + MTP heads and Gated-DeltaNet hybrids
 - **Tencent Hy3** (`hy_v3`) — 295B/21B-active, 192-expert MoE + MTP sidecar
 - **DeepSeek-V4-Flash** (vendored transformer + profile) — ~285B total by checkpoint arithmetic, 281,263,734,784 probe-measured quantizable parameters (166.9 GB on disk), per-expert-Linear MoE. The 671B headline belongs to the DeepSeek-V3 family and does not describe Flash; size claims here are per-checkpoint from the probe inventory, never the family headline.
 - **MiniMax M2 / M2.7** — nested per-expert MoE, native-FP8 source

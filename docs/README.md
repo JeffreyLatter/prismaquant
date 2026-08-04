@@ -82,6 +82,7 @@ before citing anything.
 
 | Path | What it is | Status / superseded by |
 |---|---|---|
+| `results/qwen3_30b_a3b_profile_census_2026-08-03.md` | Contract/vLLM-qualified Qwen3-30B-A3B selection, complete safetensors census, unified `qwen3` producer bridge, and verified probe capture points. | CURRENT profile-onboarding evidence; not a quantization or serving result |
 | `results/aura_4b_dense_frontier_2026-06-05.md` | Dense 4.5→8.0 bpp AURA RD sweep on Qwen3-4B, fp32 vs bf16; frontier clean and log-linear, kneedle unstable (fp32 5.00 in 454/1000 bootstraps). | HISTORICAL — its conclusion won: selection moved off kneedle to a byte-budget + saturation-B* rule |
 | `results/fp8_gptq_mx_scale_27b_results_2026-05-21.md` | 27B tail A/B, FP8_E4M3 GPTQ vs MXFP8 with E8M0 joint-scale search: FP8 won all 149 tail Linears and all 90 fused units; the allocator then selected zero MXFP8. Explicit "do not ship". | HISTORICAL — the primary 27B evidence for de-menuing MXFP8; the joint-scale search it used has since been removed (self-bannered) |
 | `results/production_render_staged_27b_results_2026-05-21.md` | Staged production-render allocator on 27B: improved the last-token-KL screen (0.0232 vs 0.0280) and regressed direct WikiText PPL (10.83 vs 8.33). "Do not ship". | HISTORICAL — the canonical citation for "a narrow KL screen can invert against direct PPL", and the measurement carried by the `COST_MODE=production-render-staged` `exit 2` gate (walled 2026-07-30, `archive/production_render_staged_2026-07-30/`, re-vet R17) |

@@ -38,7 +38,6 @@ PROFILE_CLASSES = list(_registry._REGISTERED)
 EXPECTED_ORDER = [
     "Qwen3_5DenseProfile",
     "Qwen3_5Profile",
-    "Qwen3MoeProfile",
     "Qwen3Profile",
     "Gemma4Profile",
     "Lfm2MoeProfile",
@@ -198,9 +197,9 @@ def test_priority_order_equals_registered_order():
 
 
 def test_every_profile_declares_its_own_priority():
-    """Inherited priorities are a trap: Qwen3MoeProfile subclasses
-    Qwen3Profile and Qwen3_5DenseProfile subclasses Qwen3_5Profile, so a
-    missing declaration silently ties a subset to its superset."""
+    """Inherited priorities are a trap: Qwen3_5DenseProfile subclasses
+    Qwen3_5Profile, so a missing declaration silently ties a subset to its
+    superset."""
     for cls in PROFILE_CLASSES:
         assert "priority" in vars(cls), (
             f"{cls.__name__} inherits its detection priority instead of "

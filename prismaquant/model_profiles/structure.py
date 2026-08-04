@@ -25,9 +25,9 @@ SCHEMA = "prismaquant.model_structure.v1"
 # ---------------------------------------------------------------------------
 #
 # `match` is the declarative form of `ModelProfile.matches()`.  It is
-# deliberately tiny: nine of the ten in-tree profiles were pure predicates over
-# `(model_type in set, arch startswith prefix)`, and the two that were not
-# (`qwen3.py`'s exact architecture and `qwen3_5_dense.py`'s "not a Moe" veto)
+# deliberately tiny: the nine in-tree profiles are predicates over
+# `(model_type in set, architecture glob)`, and the two non-prefix cases
+# (`qwen3.py`'s exact architectures and `qwen3_5_dense.py`'s "not a Moe" veto)
 # need exactly the glob and the negative list below.  Anything richer belongs
 # in Python, not in JSON.
 MATCH_KEYS = frozenset({

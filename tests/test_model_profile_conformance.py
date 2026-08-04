@@ -63,8 +63,10 @@ PROFILE_IDS = [c.__name__ for c in PROFILE_CLASSES]
 # resolution check run with no checkpoint on disk. Every entry below was
 # taken from a real config.json where one exists locally.
 REPRESENTATIVE_CONFIGS: dict[str, tuple[tuple[str, list[str]], ...]] = {
-    "Qwen3Profile": (("qwen3", ["Qwen3ForCausalLM"]),),
-    "Qwen3MoeProfile": (("qwen3_moe", ["Qwen3MoeForCausalLM"]),),
+    "Qwen3Profile": (
+        ("qwen3", ["Qwen3ForCausalLM"]),
+        ("qwen3_moe", ["Qwen3MoeForCausalLM"]),
+    ),
     "Qwen3_5DenseProfile": (("qwen3_5", ["Qwen3_5ForConditionalGeneration"]),),
     "Qwen3_5Profile": (
         ("qwen3_5_moe", ["Qwen3_5MoeForConditionalGeneration"]),
@@ -147,7 +149,7 @@ def test_registry_order_is_stable():
     groups)."""
     order = [c.__name__ for c in _registry._REGISTERED]
     assert order.index("Qwen3_5DenseProfile") < order.index("Qwen3_5Profile")
-    assert order.index("Qwen3MoeProfile") < order.index("Qwen3Profile")
+    assert order.index("Qwen3Profile") < order.index("Gemma4Profile")
 
 
 @pytest.mark.parametrize("cls_name,cfg", CONFIG_CASES, ids=CONFIG_IDS)

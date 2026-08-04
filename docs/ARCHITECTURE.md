@@ -1,7 +1,7 @@
 # PrismaQuant Architecture
 
-As of: 2026-08-03 · branch `feat/per-expert-export` · verified against implementation
-baseline commit `11c61b9`, with the external Gridbook runtime pinned to
+As of: 2026-08-03 · branch `feat/qwen-moe-profile` · verified against implementation
+baseline commit `142ee5b` plus the current unified Qwen3 profile changes, with the external Gridbook runtime pinned to
 `9011a19228ddb96b8a49e11a20ac75c99c83998e` (v0.8.0). This branch ports the dated
 2026-08-01 DeepSeek-V4-Flash-0731 92 GB study record (§9.2) forward from its 0.5.1
 working tree; the study's Gridbook-candidate claims were **not** carried over, because
@@ -1229,6 +1229,11 @@ comes from `_scan_source_dtype_manifest`, the same recipe-keyed map that gates t
 passthrough candidates, scanned lazily so a BF16-source export does no extra header IO
 (`:1530-1545`). Bogus rows went 4/4 → 0 on a synthetic fp8 checkpoint; the exemption is deleted,
 so a genuine passthrough mismatch inside a serving unit escalates like any other illegality.
+Per-expert 2-D checkpoints whose live Transformers module is packed additionally fold every
+leaf's header-derived kind onto the profile-declared packed recipe parent. Qwen3-30B-A3B's
+18,432 BF16 expert leaves therefore populate all 96 live w13/w2 source kinds instead of losing
+BF16 fallback because only the indexed checkpoint names were present
+(`allocator_candidates.py:_per_expert_packed_recipe_name`).
 
 transformers v5 does not instantiate MTP for Qwen3.5/3.6 MoE, so `_materialize_mtp_tensors`
 `:8939-9002` rebuilds a standalone MTP module under a parent named `mtp` and materialises it in
@@ -1581,9 +1586,9 @@ flowchart TD
 | Pipeline contract | `pipeline.py` | almost nothing — `target_profile` as a kwarg (`:644`), run metadata (`:688`), CLI passthrough (`:1115`, `:1151`), one `model.structure_graph` stage spec (`:877-884`). Zero architecture names, which is correct: the contract layer should not know models (§3.6) |
 
 Detection is **priority-ordered, not list-ordered** (R8, 2026-07-30). Subset profiles must
-still precede supersets — `Qwen3_5DenseProfile` before `Qwen3_5Profile`, `Qwen3MoeProfile`
-before `Qwen3Profile` — but that used to be encoded in `_REGISTERED`'s literal order plus two
-comments. It is now a `priority` int on each profile (**lower is consulted first**, like a sort
+still precede supersets — `Qwen3_5DenseProfile` before `Qwen3_5Profile` — but that used to be
+encoded in `_REGISTERED`'s literal order plus comments. Original Qwen3 dense and routed-MoE
+now share the contract-aligned `Qwen3Profile`. Priority is a class `int` (**lower is consulted first**, like a sort
 rank), declared both on the Python class and in its spec, so the ordering survives the Python
 body being deleted. Built-ins take 100–190 in the historical order; `ModelProfile.priority`
 defaults to **0**, which is what keeps `register_profile`'s documented insert-at-front override
@@ -1594,7 +1599,7 @@ order still reproduces the list literal exactly.
 
 `detection_order()` folds in a second kind of candidate: a **`SpecMatchProfile`**
 (`model_profiles/spec_profile.py`) per `specs/<id>.json` whose `id` no registered Python
-profile claims, matched by its declarative `match` block. All ten shipped specs are claimed by
+profile claims, matched by its declarative `match` block. All nine shipped specs are claimed by
 a Python profile, so today the live order contains none — landing the reader changed detection
 for exactly zero shipped models, which is the point (see §8.3 Tier A).
 
@@ -1627,13 +1632,13 @@ vLLM class metadata  →  declarative JSON spec  →  generic hardcoded default
 
 Only `matches()` (`base.py:57-61`) and `name` (`:63-66`) are abstract — and `matches()` is now
 also spec-expressible, via `SpecMatchProfile` (§8.1). The `match` vocabulary is deliberately
-tiny, because nine of the ten in-tree predicates were already pure `(model_type ∈ set, arch
-startswith prefix)` tests:
+tiny, because all nine in-tree predicates are expressible as `(model_type ∈ set, architecture
+glob)` tests:
 
 | key | form | why it exists |
 |---|---|---|
 | `model_type` | exact strings | the common case |
-| `architectures` | `fnmatch` globs (a bare class name is a valid exact glob) | `Qwen3Moe*` prefixes, and `qwen3.json`'s exact `Qwen3ForCausalLM` — the one predicate that is *not* a prefix |
+| `architectures` | `fnmatch` globs (a bare class name is a valid exact glob) | exact Qwen3 dense/MoE entrypoints and Qwen3.5/3.6 family prefixes |
 | `architectures_exclude` | globs; any hit **vetoes** the whole match | `qwen3_5_dense`'s `not any("Moe" in arch)` |
 | `priority` (top level) | int, lower first | replaces the comment-encoded `_REGISTERED` order |
 
@@ -1683,7 +1688,7 @@ abstract; `SpecMatchProfile` (§8.1–§8.2) removes it, so a spec file with a `
 `priority`, and declared `fused_groups`/`naming` resolves on its own with no Python. Tier A does
 **not** get vLLM tier-1 auto-derivation — that is keyed on a Python
 `vllm_architecture_class()` — so a spec-only architecture must declare its fused groups
-outright. Every one of the ten shipped specs is still claimed by a Python profile, which is
+outright. Every one of the nine shipped specs is still claimed by a Python profile, which is
 deliberate: the R8 mitigation lands the reader alongside the Python and deletes `matches()`
 bodies one architecture at a time, only after a release of green equivalence.
 
@@ -1721,8 +1726,7 @@ artifacts exported before the rename.
 
 | Arch | profile | prio | structure spec | `default_serving_profile` | `supported_lanes` (preferred) | gridbook opt-in | MTP |
 |---|---|---|---|---|---|---|---|
-| qwen3 (dense) | `qwen3.py` | 130 | ✅ | `vllm_packed_moe` | CT, **nvfp4_cb** (CT) | no special loader hook | none |
-| qwen3_moe | `qwen3_moe.py` | 120 | ✅ | `vllm_packed_moe` | CT | ⚠ none | none |
+| qwen3 (dense + routed MoE; smoke: Qwen3-30B-A3B) | `qwen3.py` | 120 | ✅ | `vllm_packed_moe` | CT, **nvfp4_cb** (CT) | producer id `qwen3` declared by pinned Gridbook contract; `Qwen3MoeForCausalLM` uses the generic per-layer FusedMoE loader | none |
 | qwen3_5 / 3.6 MoE | `qwen3_5.py` | 110 | ✅ | `vllm_packed_moe` | CT, **nvfp4_cb** (CT) | declared by pinned Gridbook contract | `build_mtp_module` → `MtpModule` (live; R12) |
 | qwen3_5_dense | `qwen3_5_dense.py` | 100 | ✅ | `vllm_packed_moe` | CT, **nvfp4_cb** (CT) | no expert-loader hook | inherits `Qwen3_5Profile.build_mtp_module` (dead copy removed, R12) |
 | gemma4 | `gemma4.py` | 140 | ✅ | `vllm_packed_moe` | CT | ⚠ none | none |
