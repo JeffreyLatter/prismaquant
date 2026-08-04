@@ -2,3 +2,6 @@
 tmp/
 *.log
 *.pkl
+act/
+*.pt
+results.json
