@@ -204,6 +204,78 @@ def test_packed_experts_measure_output_mse_from_expert_activation_cache(tmp_path
         )
 
 
+def test_packed_experts_use_holdout_gated_ladder_and_keep_expert_mse(
+    tmp_path, monkeypatch,
+):
+    """Packed Qwen stacks must not silently encode every ladder rung."""
+    import prismaquant.measure_quant_cost as mqc
+
+    torch.manual_seed(4321)
+    model = TinyModel().eval()
+    experts_qname = "mlp.experts"
+    target_names = {
+        "mlp.experts.gate_up_proj",
+        "mlp.experts.down_proj",
+    }
+    _write_activation_cache(tmp_path, experts_qname, torch.randn(16, 16))
+    act_cache = ActivationIndex(
+        tmp_path,
+        {
+            name: {"_packed_experts_module": experts_qname}
+            for name in target_names
+        },
+    )
+    monkeypatch.setenv("CB_SCALE_CODING", "two_tier")
+    monkeypatch.setenv("CB_CODEBOOK_SOURCE", "lattice")
+    monkeypatch.setenv("CB_SCALE_SWEEP", "1")
+    monkeypatch.setenv("PRISMAQUANT_CB_LDLQ", "0")
+    monkeypatch.setenv("PRISMAQUANT_CB_ENCODE_TIER", "balanced")
+    monkeypatch.setenv("PRISMAQUANT_CB_LADDER_INTERP", "1")
+    monkeypatch.setenv(
+        "PRISMAQUANT_CB_LADDER_ANCHORS", "FP8_CB_K28,FP8_CB_K48")
+    monkeypatch.setenv("PRISMAQUANT_CB_LADDER_HOLDOUT", "FP8_CB_K33")
+    monkeypatch.setattr(
+        mqc,
+        "_packed_expert_activation_quantizer",
+        lambda _spec: (lambda value: value),
+    )
+    calls: list[str] = []
+
+    def fake_render(spec, weight, **_kwargs):
+        calls.append(spec.name)
+        k = int(spec.name.rsplit("K", 1)[1])
+        distortion = mqc._ladder_rate_factor(spec.name, k)
+        return weight * (1.0 - distortion ** 0.5)
+
+    monkeypatch.setattr(mqc, "_cb_cost_quantize_dequantize", fake_render)
+    specs = [
+        fr.get_format(name)
+        for name in (
+            "FP8_CB_K28", "FP8_CB_K33", "FP8_CB_K34", "FP8_CB_K48",
+        )
+    ]
+    accum: dict = {}
+    _measure_packed_experts(
+        model,
+        target_names,
+        specs,
+        "cpu",
+        torch.float32,
+        accum,
+        act_cache=act_cache,
+    )
+    results = _finalize_results(accum)
+
+    assert calls.count("FP8_CB_K34") == 0
+    assert len(calls) == 3 * len(target_names)
+    for name in target_names:
+        assert set(results[name]) == {spec.name for spec in specs}
+        predicted = results[name]["FP8_CB_K34"]
+        assert predicted["cost_source"] == "band_interpolated"
+        assert predicted["output_mse_measured"] is False
+        assert len(predicted["weight_mse_per_expert"]) == 2
+
+
 def test_packed_experts_replay_matches_module_forward():
     torch.manual_seed(5678)
     model = TinyModel().eval()

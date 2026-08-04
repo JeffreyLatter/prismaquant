@@ -404,7 +404,8 @@ def _accumulate_result(bucket: dict, name: str, fmt: str,
                        fisher_output_mse: float | None = None,
                        output_mse_measured: bool = True,
                        n_activation_rows: int | None = None,
-                       cost_source: str | None = None):
+                       cost_source: str | None = None,
+                       weight_mse_per_expert: list[float] | None = None):
     per_name = bucket.setdefault(name, {})
     acc = per_name.setdefault(fmt, {
         "_count": 0,
@@ -418,6 +419,7 @@ def _accumulate_result(bucket: dict, name: str, fmt: str,
         "_output_mse_measured": True,
         "_n_activation_rows": None,
         "_cost_source": None,
+        "_weight_mse_per_expert": None,
     })
     acc["_count"] += 1
     if cost_source is not None:
@@ -433,6 +435,14 @@ def _accumulate_result(bucket: dict, name: str, fmt: str,
         acc["_n_activation_rows"] = (
             int(n_activation_rows) if prev is None
             else min(int(prev), int(n_activation_rows)))
+    if weight_mse_per_expert is not None:
+        values = [float(value) for value in weight_mse_per_expert]
+        previous = acc.get("_weight_mse_per_expert")
+        if previous is not None and previous != values:
+            raise ValueError(
+                f"{name}/{fmt}: conflicting per-expert MSE vectors"
+            )
+        acc["_weight_mse_per_expert"] = values
     acc["_weight_mse_sum"] += weight_mse
     acc["_output_mse_sum"] += output_mse
     acc["_rel_output_mse_sum"] += rel_output_mse
@@ -463,6 +473,8 @@ def _finalize_results(bucket: dict[str, dict]) -> dict[str, dict]:
             output_mse_measured = bool(acc.pop("_output_mse_measured", True))
             n_act_rows = acc.pop("_n_activation_rows", None)
             cost_source = acc.pop("_cost_source", None)
+            weight_mse_per_expert = acc.pop(
+                "_weight_mse_per_expert", None)
             entry = {
                 "weight_mse": acc.pop("_weight_mse_sum") / n,
                 "output_mse": acc.pop("_output_mse_sum") / n,
@@ -472,6 +484,8 @@ def _finalize_results(bucket: dict[str, dict]) -> dict[str, dict]:
                 entry["output_mse_measured"] = False
             if cost_source is not None:
                 entry["cost_source"] = cost_source
+            if weight_mse_per_expert is not None:
+                entry["weight_mse_per_expert"] = weight_mse_per_expert
             if n_act_rows is not None:
                 # How many activation rows the output-side numbers rest on.
                 # The allocator/provenance needs this to tell a well-covered
@@ -1361,6 +1375,9 @@ def _measure_packed_experts(
         return
     measured = 0
     fallback = 0
+    ladder_plan = _cb_ladder_plan(specs)
+    ladder_accept = 0
+    ladder_reject = 0
     ldlq_enabled = (
         any(spec.family in _CB_COST_FAMILIES for spec in specs)
         and cb_serialization_context_from_env(
@@ -1478,7 +1495,14 @@ def _measure_packed_experts(
         # every expert exactly; this only affects the DP's cost estimates.
         sample_n = _expert_cost_sample_n()
         packed_cb_warm_identities = None
-        for spec in specs:
+        measured_specs = (
+            list(specs)
+            if ladder_plan is None
+            else [spec for spec in specs if spec.name not in ladder_plan[1]]
+        )
+        pending_ladders = list(ladder_plan[0]) if ladder_plan else []
+        specs_by_name = {spec.name: spec for spec in specs}
+        for spec in measured_specs:
             try:
                 # Family-agnostic: NVFP4/FP8 registry quantize on a full
                 # 2.4G-elem stack swap-kills a UMA box just like the gguf
@@ -1529,6 +1553,10 @@ def _measure_packed_experts(
                         ),
                     )
                 err = (w_in - w_hat).float()
+                per_expert_weight_mse = (
+                    err.pow(2).mean(dim=(1, 2)).detach().cpu().tolist()
+                    if not use_sample else None
+                )
                 weight_mse = float(err.pow(2).mean().item())
                 dloss_val = None
                 if h_em is not None:
@@ -1601,10 +1629,104 @@ def _measure_packed_experts(
                 _accumulate_result(accum, full_name, spec.name,
                                    weight_mse, output_mse, rel_mse,
                                    predicted_dloss=dloss_val,
-                                   output_mse_measured=output_mse_measured)
+                                   output_mse_measured=output_mse_measured,
+                                   weight_mse_per_expert=(
+                                       per_expert_weight_mse
+                                       if per_expert_weight_mse is not None
+                                       else None
+                                   ))
                 del w_hat, err
             except Exception as e:
                 accum.setdefault(full_name, {})[spec.name] = {"error": str(e)}
+
+            # Packed stacks used to bypass the ladder entirely and encode all
+            # rungs. Once this entry has its anchors + holdout, run the same
+            # per-tensor gate as the dense path. Rejected ladders append their
+            # predicted specs to this live list, so the ordinary measured
+            # render above remains the single fallback implementation.
+            for ladder in list(pending_ladders):
+                kmap, anchors, holdout, predicted = ladder
+                required = list(anchors) + [holdout]
+                if not all(name in accum.get(full_name, {}) for name in required):
+                    continue
+                from prismaquant.expert_empirical_cost import _cb_ladder_gate
+                primary = "predicted_dloss" if h_em is not None else "output_mse"
+                vals = {
+                    name: _chunk_metric(accum, full_name, name, primary)
+                    for name in required
+                }
+                law = None
+                if not any(value is None or value <= 0 for value in vals.values()):
+                    law, _rel, _tol = _cb_ladder_gate(
+                        kmap, anchors, vals, holdout, _CB_LADDER_TOL)
+                if law is None:
+                    ladder_reject += 1
+                    measured_specs.extend(
+                        specs_by_name[name]
+                        for name in predicted
+                        if name not in {item.name for item in measured_specs}
+                    )
+                else:
+                    ladder_accept += 1
+                    anchor_vectors = {
+                        name: accum[full_name][name].get(
+                            "_weight_mse_per_expert")
+                        for name in anchors
+                    }
+                    per_expert_predictions: dict[str, list[float] | None] = {}
+                    vector_lengths = {
+                        len(value) for value in anchor_vectors.values()
+                        if isinstance(value, list)
+                    }
+                    if (len(vector_lengths) == 1
+                            and all(isinstance(value, list)
+                                    for value in anchor_vectors.values())):
+                        n_experts = next(iter(vector_lengths))
+                        for target in predicted:
+                            per_expert_predictions[target] = [
+                                float(_ladder_metric_fit(
+                                    kmap,
+                                    anchors,
+                                    {name: anchor_vectors[name][expert]
+                                     for name in anchors},
+                                    target,
+                                ))
+                                for expert in range(n_experts)
+                            ]
+                    for target in predicted:
+                        fills = {}
+                        for key in (
+                            "weight_mse", "output_mse", "rel_output_mse",
+                            "predicted_dloss", "fisher_output_mse",
+                        ):
+                            metric_values = {
+                                name: _chunk_metric(
+                                    accum, full_name, name, key)
+                                for name in anchors
+                            }
+                            fills[key] = (
+                                None
+                                if any(value is None or value <= 0
+                                       for value in metric_values.values())
+                                else _ladder_metric_fit(
+                                    kmap, anchors, metric_values, target)
+                            )
+                        _accumulate_result(
+                            accum,
+                            full_name,
+                            target,
+                            float(fills["weight_mse"] or 0.0),
+                            float(fills["output_mse"] or 0.0),
+                            float(fills["rel_output_mse"] or 0.0),
+                            predicted_dloss=fills["predicted_dloss"],
+                            fisher_output_mse=fills["fisher_output_mse"],
+                            output_mse_measured=False,
+                            cost_source=BAND_INTERPOLATED_COST_SOURCE,
+                            weight_mse_per_expert=(
+                                per_expert_predictions.get(target)
+                            ),
+                        )
+                pending_ladders.remove(ladder)
         del w
         if X is not None:
             del X
@@ -1625,6 +1747,12 @@ def _measure_packed_experts(
     if measured or fallback:
         print(f"[cost] packed experts output_mse measured={measured} "
               f"fallback={fallback}", flush=True)
+    if ladder_plan is not None:
+        total = ladder_accept + ladder_reject
+        print(f"[cost] packed-expert CB ladder holdout gate: "
+              f"{ladder_accept}/{total} tensor-fits accepted "
+              f"({ladder_accept / max(total, 1):.0%}), {ladder_reject} "
+              f"rejected -> measured", flush=True)
 
 
 def _batched_codebook_rtn(stacked_w: torch.Tensor, codebook: torch.Tensor,
