@@ -399,6 +399,12 @@ def _extrapolate_expert_costs(
 # selected rung so a shipped artifact can say which of its chosen prices were
 # interpolated.
 BAND_INTERPOLATED_COST_SOURCE = "band_interpolated"
+# Packed-expert ladder rows may combine holdout-accepted interpolations with
+# exact encoder measurements for the rejected expert slices.  Keep this a
+# distinct row-level source so downstream reports do not mistake a partially
+# fitted vector for either a wholly measured or wholly interpolated tensor.
+MIXED_COST_SOURCE = "mixed"
+MEASURED_SLICE_COST_SOURCE = "measured"
 
 
 def _accumulate_result(bucket: dict, name: str, fmt: str,
@@ -409,7 +415,8 @@ def _accumulate_result(bucket: dict, name: str, fmt: str,
                        output_mse_measured: bool = True,
                        n_activation_rows: int | None = None,
                        cost_source: str | None = None,
-                       weight_mse_per_expert: list[float] | None = None):
+                       weight_mse_per_expert: list[float] | None = None,
+                       cost_source_per_expert: list[str] | None = None):
     per_name = bucket.setdefault(name, {})
     acc = per_name.setdefault(fmt, {
         "_count": 0,
@@ -424,6 +431,7 @@ def _accumulate_result(bucket: dict, name: str, fmt: str,
         "_n_activation_rows": None,
         "_cost_source": None,
         "_weight_mse_per_expert": None,
+        "_cost_source_per_expert": None,
     })
     acc["_count"] += 1
     if cost_source is not None:
@@ -447,6 +455,14 @@ def _accumulate_result(bucket: dict, name: str, fmt: str,
                 f"{name}/{fmt}: conflicting per-expert MSE vectors"
             )
         acc["_weight_mse_per_expert"] = values
+    if cost_source_per_expert is not None:
+        values = [str(value) for value in cost_source_per_expert]
+        previous = acc.get("_cost_source_per_expert")
+        if previous is not None and previous != values:
+            raise ValueError(
+                f"{name}/{fmt}: conflicting per-expert cost provenance"
+            )
+        acc["_cost_source_per_expert"] = values
     acc["_weight_mse_sum"] += weight_mse
     acc["_output_mse_sum"] += output_mse
     acc["_rel_output_mse_sum"] += rel_output_mse
@@ -479,6 +495,8 @@ def _finalize_results(bucket: dict[str, dict]) -> dict[str, dict]:
             cost_source = acc.pop("_cost_source", None)
             weight_mse_per_expert = acc.pop(
                 "_weight_mse_per_expert", None)
+            cost_source_per_expert = acc.pop(
+                "_cost_source_per_expert", None)
             entry = {
                 "weight_mse": acc.pop("_weight_mse_sum") / n,
                 "output_mse": acc.pop("_output_mse_sum") / n,
@@ -490,6 +508,8 @@ def _finalize_results(bucket: dict[str, dict]) -> dict[str, dict]:
                 entry["cost_source"] = cost_source
             if weight_mse_per_expert is not None:
                 entry["weight_mse_per_expert"] = weight_mse_per_expert
+            if cost_source_per_expert is not None:
+                entry["cost_source_per_expert"] = cost_source_per_expert
             if n_act_rows is not None:
                 # How many activation rows the output-side numbers rest on.
                 # The allocator/provenance needs this to tell a well-covered
@@ -1657,93 +1677,117 @@ def _measure_packed_experts(
             except Exception as e:
                 accum.setdefault(full_name, {})[spec.name] = {"error": str(e)}
 
-            # Packed stacks used to bypass the ladder entirely and encode all
-            # rungs. Once this entry has its anchors + holdout, run the same
-            # per-tensor gate as the dense path. Rejected ladders append their
-            # predicted specs to this live list, so the ordinary measured
-            # render above remains the single fallback implementation.
+            # Packed stacks contain heterogeneous expert RD curves.  Gate one
+            # fit per expert slice, then encode only rejected slices at the
+            # predicted rungs.  A tensor-wide fit both hides that heterogeneity
+            # and turns one honest rejection into a 256-expert measure-all.
             for ladder in list(pending_ladders):
                 kmap, anchors, holdout, predicted = ladder
                 required = list(anchors) + [holdout]
                 if not all(name in accum.get(full_name, {}) for name in required):
                     continue
-                from prismaquant.expert_empirical_cost import _cb_ladder_gate
-                primary = "predicted_dloss" if h_em is not None else "output_mse"
-                vals = {
-                    name: _chunk_metric(accum, full_name, name, primary)
+                vectors = {
+                    name: accum[full_name][name].get(
+                        "_weight_mse_per_expert")
                     for name in required
                 }
-                law = None
-                if not any(value is None or value <= 0 for value in vals.values()):
-                    law, _rel, _tol = _cb_ladder_gate(
-                        kmap, anchors, vals, holdout, _CB_LADDER_TOL)
-                if law is None:
-                    ladder_reject += 1
-                    measured_specs.extend(
-                        specs_by_name[name]
-                        for name in predicted
-                        if name not in {item.name for item in measured_specs}
+                slice_fit = _packed_ladder_slice_fits(
+                    kmap,
+                    anchors,
+                    holdout,
+                    predicted,
+                    vectors,
+                    int(w.shape[0]),
+                    _CB_LADDER_TOL,
+                )
+                accepted = list(slice_fit["accepted"])
+                rejected = list(slice_fit["rejected"])
+                per_expert_predictions = slice_fit["predictions"]
+                ladder_accept += len(accepted)
+                ladder_reject += len(rejected)
+
+                if rejected:
+                    print(
+                        f"[cost] {full_name}: packed ladder holdout rejected "
+                        f"{len(rejected)}/{w.shape[0]} expert slices; measuring "
+                        f"{sorted(predicted)} only for those slices",
+                        flush=True,
                     )
-                else:
-                    ladder_accept += 1
-                    anchor_vectors = {
-                        name: accum[full_name][name].get(
-                            "_weight_mse_per_expert")
-                        for name in anchors
-                    }
-                    per_expert_predictions: dict[str, list[float] | None] = {}
-                    vector_lengths = {
-                        len(value) for value in anchor_vectors.values()
-                        if isinstance(value, list)
-                    }
-                    if (len(vector_lengths) == 1
-                            and all(isinstance(value, list)
-                                    for value in anchor_vectors.values())):
-                        n_experts = next(iter(vector_lengths))
-                        for target in predicted:
-                            per_expert_predictions[target] = [
-                                float(_ladder_metric_fit(
-                                    kmap,
-                                    anchors,
-                                    {name: anchor_vectors[name][expert]
-                                     for name in anchors},
-                                    target,
-                                ))
-                                for expert in range(n_experts)
-                            ]
-                    for target in predicted:
-                        fills = {}
-                        for key in (
-                            "weight_mse", "output_mse", "rel_output_mse",
-                            "predicted_dloss", "fisher_output_mse",
-                        ):
-                            metric_values = {
-                                name: _chunk_metric(
-                                    accum, full_name, name, key)
-                                for name in anchors
-                            }
-                            fills[key] = (
-                                None
-                                if any(value is None or value <= 0
-                                       for value in metric_values.values())
-                                else _ladder_metric_fit(
-                                    kmap, anchors, metric_values, target)
+                reject_idx = torch.as_tensor(
+                    rejected, dtype=torch.long, device=w.device)
+                for target in predicted:
+                    mixed_values = list(per_expert_predictions[target])
+                    if rejected:
+                        target_spec = specs_by_name[target]
+                        w_rejected = w[reject_idx]
+                        cw_rejected = packed_gguf_qw
+                        if _cost_render_uses_imatrix(target_spec):
+                            ext_cw = _cb_col_weights_lookup(full_name)
+                            if ext_cw is not None:
+                                cw_rejected = ext_cw.to(
+                                    device=w.device, dtype=torch.float32)
+                        if (cw_rejected is not None
+                                and cw_rejected.ndim >= 3
+                                and cw_rejected.shape[0] == w.shape[0]):
+                            cw_rejected = cw_rejected[reject_idx]
+                        warm_identities = _cb_warm_record_identities(
+                            w_rejected, cw_rejected)
+                        activation_rows = (
+                            tuple(
+                                packed_ldlq_activation_rows[expert]
+                                for expert in rejected
                             )
-                        _accumulate_result(
-                            accum,
-                            full_name,
-                            target,
-                            float(fills["weight_mse"] or 0.0),
-                            float(fills["output_mse"] or 0.0),
-                            float(fills["rel_output_mse"] or 0.0),
-                            predicted_dloss=fills["predicted_dloss"],
-                            fisher_output_mse=fills["fisher_output_mse"],
-                            output_mse_measured=False,
-                            cost_source=BAND_INTERPOLATED_COST_SOURCE,
-                            weight_mse_per_expert=(
-                                per_expert_predictions.get(target)
-                            ),
+                            if packed_ldlq_activation_rows is not None
+                            else None
                         )
+                        w_hat_rejected = _cb_cost_quantize_dequantize(
+                            target_spec,
+                            w_rejected,
+                            col_weights=cw_rejected,
+                            qname=full_name,
+                            warm_identities=warm_identities,
+                            activation_rows=activation_rows,
+                        )
+                        measured_values = (
+                            (w_rejected - w_hat_rejected).float().pow(2)
+                            .mean(dim=(1, 2)).detach().cpu().tolist()
+                        )
+                        for expert, value in zip(rejected, measured_values):
+                            mixed_values[expert] = float(value)
+                        del w_rejected, w_hat_rejected
+
+                    if any(value is None for value in mixed_values):
+                        raise RuntimeError(
+                            f"{full_name}/{target}: incomplete packed-expert "
+                            "ladder vector after measured fallback"
+                        )
+                    final_values = [float(value) for value in mixed_values]
+                    slice_sources = [
+                        (
+                            BAND_INTERPOLATED_COST_SOURCE
+                            if expert in accepted
+                            else MEASURED_SLICE_COST_SOURCE
+                        )
+                        for expert in range(len(final_values))
+                    ]
+                    if accepted and rejected:
+                        row_source = MIXED_COST_SOURCE
+                    elif accepted:
+                        row_source = BAND_INTERPOLATED_COST_SOURCE
+                    else:
+                        row_source = None
+                    _accumulate_result(
+                        accum,
+                        full_name,
+                        target,
+                        sum(final_values) / max(len(final_values), 1),
+                        0.0,
+                        0.0,
+                        output_mse_measured=False,
+                        cost_source=row_source,
+                        weight_mse_per_expert=final_values,
+                        cost_source_per_expert=slice_sources,
+                    )
                 pending_ladders.remove(ladder)
         del w
         if X is not None:
@@ -1768,7 +1812,7 @@ def _measure_packed_experts(
     if ladder_plan is not None:
         total = ladder_accept + ladder_reject
         print(f"[cost] packed-expert CB ladder holdout gate: "
-              f"{ladder_accept}/{total} tensor-fits accepted "
+              f"{ladder_accept}/{total} expert-slice fits accepted "
               f"({ladder_accept / max(total, 1):.0%}), {ladder_reject} "
               f"rejected -> measured", flush=True)
 
@@ -2198,6 +2242,67 @@ def _ladder_metric_fit(kmap, anchors, fmt_values, target_fmt):
     if law is None:
         return None
     return law.predict(target_fmt)
+
+
+def _packed_ladder_slice_fits(
+    kmap: dict[str, int],
+    anchors: list[str] | tuple[str, ...],
+    holdout: str,
+    predicted: list[str] | tuple[str, ...],
+    vectors: dict[str, list[float] | None],
+    n_slices: int,
+    tolerance: float = _CB_LADDER_TOL,
+) -> dict[str, object]:
+    """Fit and holdout-gate one packed expert slice at a time.
+
+    The fit family and tolerance are exactly the shared CB ladder contract.
+    Missing/malformed vectors fail closed: every slice is returned in
+    ``rejected`` and must be measured by the caller.  Predictions are emitted
+    only for accepted slices; rejected positions remain ``None`` until the
+    existing encoder measures those sub-batches.
+    """
+    from prismaquant.expert_empirical_cost import _cb_ladder_gate
+
+    required = list(anchors) + [holdout]
+    complete = (
+        n_slices >= 0
+        and all(isinstance(vectors.get(name), list) for name in required)
+        and all(len(vectors[name]) == n_slices for name in required)
+    )
+    predictions: dict[str, list[float | None]] = {
+        target: [None] * n_slices for target in predicted
+    }
+    if not complete:
+        return {
+            "accepted": [],
+            "rejected": list(range(n_slices)),
+            "holdout_relative_error": [None] * n_slices,
+            "predictions": predictions,
+        }
+
+    accepted: list[int] = []
+    rejected: list[int] = []
+    relative_errors: list[float | None] = []
+    for expert in range(n_slices):
+        values = {name: float(vectors[name][expert]) for name in required}
+        law = None
+        rel = None
+        if not any(value <= 0.0 for value in values.values()):
+            law, rel, _tol = _cb_ladder_gate(
+                kmap, anchors, values, holdout, tolerance)
+        relative_errors.append(None if rel is None else float(rel))
+        if law is None:
+            rejected.append(expert)
+            continue
+        accepted.append(expert)
+        for target in predicted:
+            predictions[target][expert] = float(law.predict(target))
+    return {
+        "accepted": accepted,
+        "rejected": rejected,
+        "holdout_relative_error": relative_errors,
+        "predictions": predictions,
+    }
 
 
 def _chunk_metric(accum, name, fmt, key, count_key="_count"):

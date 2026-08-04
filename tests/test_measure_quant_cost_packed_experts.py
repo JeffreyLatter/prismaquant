@@ -274,6 +274,95 @@ def test_packed_experts_use_holdout_gated_ladder_and_keep_expert_mse(
         assert predicted["cost_source"] == "band_interpolated"
         assert predicted["output_mse_measured"] is False
         assert len(predicted["weight_mse_per_expert"]) == 2
+        assert predicted["cost_source_per_expert"] == [
+            "band_interpolated", "band_interpolated",
+        ]
+
+
+def test_packed_experts_gate_per_slice_and_measure_only_rejects(
+    tmp_path, monkeypatch,
+):
+    """One non-monotone expert must not force a whole-stack fallback."""
+    import prismaquant.measure_quant_cost as mqc
+
+    torch.manual_seed(8765)
+    model = TinyModel().eval()
+    experts_qname = "mlp.experts"
+    target_names = {
+        "mlp.experts.gate_up_proj",
+        "mlp.experts.down_proj",
+    }
+    _write_activation_cache(tmp_path, experts_qname, torch.randn(16, 16))
+    act_cache = ActivationIndex(
+        tmp_path,
+        {
+            name: {"_packed_experts_module": experts_qname}
+            for name in target_names
+        },
+    )
+    monkeypatch.setenv("CB_SCALE_CODING", "two_tier")
+    monkeypatch.setenv("CB_CODEBOOK_SOURCE", "lattice")
+    monkeypatch.setenv("CB_SCALE_SWEEP", "1")
+    monkeypatch.setenv("PRISMAQUANT_CB_LDLQ", "0")
+    monkeypatch.setenv("PRISMAQUANT_CB_ENCODE_TIER", "balanced")
+    monkeypatch.setenv("PRISMAQUANT_CB_LADDER_INTERP", "1")
+    monkeypatch.setenv(
+        "PRISMAQUANT_CB_LADDER_ANCHORS",
+        "FP8_CB_K28,FP8_CB_K38,FP8_CB_K48",
+    )
+    monkeypatch.setenv("PRISMAQUANT_CB_LADDER_HOLDOUT", "FP8_CB_K33")
+    monkeypatch.setattr(
+        mqc,
+        "_packed_expert_activation_quantizer",
+        lambda _spec: (lambda value: value),
+    )
+    calls: list[tuple[str, int]] = []
+
+    def fake_render(spec, weight, **_kwargs):
+        calls.append((spec.name, int(weight.shape[0])))
+        k = int(spec.name.rsplit("K", 1)[1])
+        distortion = mqc._ladder_rate_factor(spec.name, k)
+        factors = torch.ones(
+            weight.shape[0], 1, 1, dtype=weight.dtype, device=weight.device,
+        )
+        # Full-stack K33 is the holdout: expert 1 is deliberately off-law.
+        # The K34 fallback arrives as a one-expert sub-batch and stays exact.
+        if spec.name == "FP8_CB_K33" and weight.shape[0] == 2:
+            factors[1] = 2.0
+        return weight * (1.0 - (distortion * factors).sqrt())
+
+    monkeypatch.setattr(mqc, "_cb_cost_quantize_dequantize", fake_render)
+    specs = [
+        fr.get_format(name)
+        for name in (
+            "FP8_CB_K28", "FP8_CB_K33", "FP8_CB_K34",
+            "FP8_CB_K38", "FP8_CB_K48",
+        )
+    ]
+    accum: dict = {}
+    _measure_packed_experts(
+        model,
+        target_names,
+        specs,
+        "cpu",
+        torch.float32,
+        accum,
+        act_cache=act_cache,
+    )
+    results = _finalize_results(accum)
+
+    # One K34 call per packed tensor, each containing only expert slice 1.
+    assert [batch for name, batch in calls if name == "FP8_CB_K34"] == [1, 1]
+    for name in target_names:
+        row = results[name]["FP8_CB_K34"]
+        assert row["cost_source"] == "mixed"
+        assert row["cost_source_per_expert"] == [
+            "band_interpolated", "measured",
+        ]
+        assert row["weight_mse"] == pytest.approx(
+            sum(row["weight_mse_per_expert"]) / 2.0,
+        )
+        assert row["output_mse_measured"] is False
 
 
 def test_packed_experts_replay_matches_module_forward():

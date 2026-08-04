@@ -153,6 +153,16 @@ Helper: `nvfp4_cb_formats.predict_cb_ladder_costs` (measured anchors + holdout g
 
 The §B rule above is now **implemented, not just stated**: `_cb_ladder_holdout_tol` derives the gate threshold from the *paired* between-calibration-window spread of the measured rungs (refit per window, take the standard error of the holdout residual — the pairing removes the common-mode draw error and a standard deviation removes the law's systematic misfit). That datum is free on the expert path, which already measures every unit KL window by window. The bare `0.10` survives **only** where the datum is genuinely absent: the dense path measures each `(tensor, format)` exactly once, and a *fit residual* is not a substitute — it cannot separate measurement noise from law misfit, so a systematically wrong law would inflate its own tolerance and open the gate exactly where it must close (measured: 252% tolerance against a 127% miss on free-rate exponential anchors). Both paths now print the holdout accept/reject rate.
 
+**Packed-stack granularity, 2026-08-04.** A physical expert stack is not one
+RD population: LDLQ can make individual expert rows non-monotone even when the
+256-slice aggregate looks smooth. The local packed path therefore applies the
+same fit family and unchanged `0.10` holdout tolerance independently to every
+expert slice. Accepted slices interpolate; rejected slices are sub-batched
+through the encoder only for target rungs they lack. Existing tensor metrics
+remain the aggregation of the resulting mixed per-slice vector. Mixed rows are
+identified by `cost_source=mixed`, with `cost_source_per_expert` preserving the
+interpolated/measured decision for each slice.
+
 ## Recommendation
 
 **Default = balanced.** Measured across configs it is ×3.9 vs max with recon deltas within noise of max (and BETTER than max on fp4-v1, whose exhaustive clip sweep is candidate-starved in the subnormal band), and the whole-model emu-KL spot checks hold. fast is the 300B-class bulk-encode tier; max is the regression anchor and the final-artifact belt-and-braces option.
