@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.9.0 (2026-08-05)
+
+- **Monotone Min-Chain encoder mode** (`PRISMAQUANT_CB_MINCHAIN=1`): per-rung min over the free LDLQ fit and the previous rung's embedded solution — error curves monotone non-increasing by construction at zero representational tax. Winning-arm/solution/predecessor digests enter the serialization context; mismatches refused at export. Validated: pilot-2 PASS on pre-declared DSV4 layer (zero violations, PCHIP held-out 2.7-2.9% median / <14% p95, 1.003x overhead). (#76)
+- **Per-expert-slice ladder gating** with sliced measured fallback for packed-expert cost measurement; per-slice cost provenance (`cost_source_per_expert`). (#74)
+- **Batched LDLQ encode** across identical-shape expert units (bit-identical to serial; ~5x on 256-expert stacks). (#73)
+- **Pipelined export** (`PRISMAQUANT_EXPORT_PIPELINE=1`): read/encode/write three-stage overlap, byte-identical artifacts (GPU-verified). (#75)
+- Qwen3.6-35B-A3B model profile + campaign machinery; amendment-v2 interpolation semantic (5-anchor monotone PCHIP, accept-all + CV outlier backstop + per-layer audit rung). (#74, #76)
+
 ## 0.8.0 — 2026-08-03
 
 This release advances the immutable runtime boundary to Gridbook **0.8.0** at
