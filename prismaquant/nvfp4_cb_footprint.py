@@ -845,6 +845,7 @@ def cb_fields_for_context(
     col_weights=None,
     codebook=None,
     activation_rows=None,
+    warm_scale_state=None,
 ):
     """Encode CB fields under the exact artifact serialization context.
 
@@ -876,6 +877,7 @@ def cb_fields_for_context(
         scale_sweep=context.scale_sweep,
         scale_coding=coding,
         encode_tier=context.encode_tier,
+        warm_scale_state=warm_scale_state,
     )
     if context.ldlq:
         if col_weights is None:
