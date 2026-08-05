@@ -145,7 +145,9 @@ def test_cb_defaults_match_the_shipped_drivers():
     assert _shell_default(script, "CB_EXPERT_EMPIRICAL") == "0"
     assert _shell_default(script, "CB_SCALE_CODING") == "two_tier"
     assert _shell_default(script, "PRISMAQUANT_CB_LDLQ") == "0"
+    assert _shell_default(script, "PRISMAQUANT_CB_MINCHAIN") == "0"
     assert "PRISMAQUANT_CB_LDLQ=0" in _doc()
+    assert "PRISMAQUANT_CB_MINCHAIN=0" in _doc()
     drivers = [
         ROOT / "scripts" / name for name in (
             "run_hy3_prod_nvfp4cb.sh",
