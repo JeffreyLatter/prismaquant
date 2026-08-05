@@ -69,6 +69,29 @@ record is accepted through exact provenance matching and its seeded encoder is
 audited by full recomputation; it is never trusted merely because a sidecar is
 present.
 
+## Streaming export execution pipeline
+
+`PRISMAQUANT_EXPORT_PIPELINE=1` changes the `[export-cb-stream]` execution
+strategy from the serial read → encode → write loop to three overlapping
+stages. A reader prefetches dense source tensors in canonical plan order
+(`PRISMAQUANT_EXPORT_PREFETCH_DEPTH`, default `1`) and pins those host tensors
+when the encode device is CUDA. The existing single ordered encoder consumes
+that queue without changing codec math or batched intra-tensor work. A writer
+thread drains encoded results in the original safetensors order. Output bytes
+are reserved before encode against `PRISMAQUANT_EXPORT_WRITE_QUEUE_BYTES`
+(default `2147483648`, 2 GiB), so completed results apply backpressure instead
+of accumulating without a bound; one tensor larger than the bound is admitted
+only while it owns the budget exclusively.
+
+This flag is **not a serialization-context or render-identity dimension**.
+Pipeline on and off must produce byte-identical files, including the same
+header and canonical tensor order. The serial path remains the default while
+the real-GPU end-to-end identity test is deferred. Any reader, encoder, or
+writer exception aborts the same transactional temporary output used by the
+serial path, so no finalized artifact is left behind. Successful pipelined
+exports log wall time plus read/encode/write busy and stall totals and the
+number of write-budget backpressure stalls.
+
 ## 27B-scale launch/volume fix (2026-07-17)
 
 The balanced/fast v1 encoders originally did the scale search as a SEQUENTIAL greedy hill-climb (micro-sweep + accept-if-better steps), and `_moment_eval`/refits REBUILT the (m, K) moment matrices every call. On 0.6B tensors (small chunk×candidate counts) this measured fast, but on a real 27B MLP Linear (5120×17408 = 89M elem, fp8 K44) it took **76.7s** — a super-linear blowup that made the cost stage a ~19-hour job. Fix (`_sweep_encode_moment`):

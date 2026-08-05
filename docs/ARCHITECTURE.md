@@ -1,7 +1,7 @@
 # PrismaQuant Architecture
 
-As of: 2026-08-04 · branch `feat/ldlq-production-encoder` · verified against implementation
-baseline commit `0b476fc` plus the current flag-gated LDLQ production-encoder changes, with
+As of: 2026-08-04 · branch `feat/pipelined-export` · verified against implementation
+baseline commit `e0ee08e` plus the current flag-gated CB streaming-export pipeline changes, with
 the external Gridbook runtime pinned to
 `9011a19228ddb96b8a49e11a20ac75c99c83998e` (v0.8.0). This branch ports the dated
 2026-08-01 DeepSeek-V4-Flash-0731 92 GB study record (§9.2) forward from its 0.5.1
@@ -256,7 +256,7 @@ flowchart TD
   ALLOC -->|"SELECTION_MODE=surrogate"| PCACHE
 
   EXPCT["export_native_compressed -- :1665-1699"]
-  EXPCB["export_nvfp4_cb or export_nvfp4_cb_streaming<br/>auto-switch above 80 GB source (:1585-1641)"]
+  EXPCB["export_nvfp4_cb or export_nvfp4_cb_streaming<br/>auto-switch above 80 GB source (:1585-1641)<br/>optional read → ordered encode → bounded ordered write"]
   EXPGG["convert_hf_to_gguf.py skeleton -> export_gguf<br/>(:1461-1493)"]
 
   PCACHE --> EXPCT
@@ -2029,6 +2029,17 @@ transactional export closed on any difference. The quantization config provenanc
 `encoder_warm_start.{warm_used,cold_fallback,verified_n}`. This changes no format or encoding
 semantics; it only skips a repeated scale sweep whose result was already measured
 (`cb_warm_state.py`, `measure_quant_cost.py`, `export_nvfp4_cb_streaming.py`). The flag-gated
+`PRISMAQUANT_EXPORT_PIPELINE=1` execution strategy separates dense-source read-ahead, the
+unchanged single ordered encode stream, and a canonical-order writer thread. Reader lookahead is
+bounded by `PRISMAQUANT_EXPORT_PREFETCH_DEPTH` (default 1), with CUDA-target host tensors pinned;
+the writer reserves encoded outputs before encode against
+`PRISMAQUANT_EXPORT_WRITE_QUEUE_BYTES` (default 2 GiB), admitting an oversize tensor only
+exclusively. Every stage shares one first-error latch and the existing temporary-file/directory
+transaction, so failure publishes nothing. The flag defaults off pending the skip-marked
+real-GPU identity gate. It is an execution knob, **not** a serialization-context or render-
+identity dimension: on/off artifacts must be byte-identical. Successful runs log wall time plus
+read/encode/write busy and stall totals and write-budget stall count
+(`export_nvfp4_cb_streaming._StreamWriter`). The flag-gated
 `PRISMAQUANT_CB_LDLQ=1` encoder mode keeps that scale
 sweep and codebook fit intact, then performs deterministic fixed-codebook/fixed-scale
 assignment in 64-column Hessian-feedback blocks using the same cached activation rows and
