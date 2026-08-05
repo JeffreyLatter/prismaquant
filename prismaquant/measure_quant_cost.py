@@ -39,10 +39,18 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from . import format_registry as fr
+from .cb_layout import parse_format_name
+from .cb_minchain import (
+    MINCHAIN_CONTEXT_VERSION,
+    MinChainInterpolationConfig,
+    interpolation_acceptance_v2,
+    select_reconstruction_slices,
+)
 from .nvfp4_cb_footprint import (
     cb_fields_for_context,
     cb_cost_provenance,
     cb_serialization_context_from_env,
+    cb_serialization_context_stamp,
 )
 
 
@@ -137,6 +145,38 @@ def cost_payload_provenance(specs: list[fr.FormatSpec]) -> dict:
         provenance["cb_ldlq_cold_expert_prior"] = (
             "layer_routed_activation_pool.v1"
         )
+    if context is not None and context.minchain:
+        families: dict[str, list[int]] = {}
+        for spec in specs:
+            parsed = parse_format_name(spec.name)
+            if parsed is None:
+                continue
+            family, rung = parsed
+            families.setdefault(family.prefix, []).append(int(rung))
+        interpolation: dict[str, dict[str, object]] = {}
+        for family, rungs in sorted(families.items()):
+            if len(set(rungs)) < 6:
+                continue
+            config = MinChainInterpolationConfig.from_rungs(rungs)
+            interpolation[family] = {
+                "anchors": list(config.anchors),
+                "holdbacks": list(config.holdbacks),
+                "audit_seed": config.audit_seed,
+                "gross_outlier_backstop": config.backstop_tolerance,
+                "audit_median_gate": config.audit_median_tolerance,
+                "audit_p95_gate": config.audit_p95_tolerance,
+            }
+        provenance["cb_minchain"] = {
+            "chain_version": MINCHAIN_CONTEXT_VERSION,
+            "selection_metric": "per-slice_weight_mse",
+            "epsilon": "a <= b + 1e-12*max(abs(a),abs(b))",
+            "tie_priority": ["free", "embed"],
+            "interpolation_semantic": (
+                "v2_five_anchor_monotone_pchip_accept_all_with_"
+                "gross_outlier_backstop_and_layer_audit"
+            ),
+            "families": interpolation,
+        }
     raw_anchors = os.environ.get("PRISMAQUANT_CB_LADDER_ANCHORS", "").strip()
     raw_holdout = os.environ.get("PRISMAQUANT_CB_LADDER_HOLDOUT", "").strip()
     if raw_anchors or raw_holdout:
@@ -240,6 +280,26 @@ def cb_render_provenance_for_results(
         require_complete=True,
         where=where,
     )
+    if context.minchain:
+        minchain_cells: dict[str, dict[str, list[dict[str, object]]]] = {}
+        missing_cells: list[str] = []
+        for qname, formats in scope.items():
+            for fmt in formats:
+                raw = results[qname][fmt].get(
+                    "cb_minchain_identity_per_expert"
+                )
+                if not isinstance(raw, list) or not raw:
+                    missing_cells.append(f"{qname}/{fmt}")
+                    continue
+                minchain_cells.setdefault(qname, {})[fmt] = [
+                    dict(cell) for cell in raw
+                ]
+        if missing_cells:
+            raise ValueError(
+                f"{where}: min-chain render is missing per-cell arm/digest "
+                f"identity; sample={missing_cells[:8]}"
+            )
+        identity["cb_minchain_cells"] = minchain_cells
     base["cb_serialized_payload"] = dict(
         identity["cb_serialized_payload"]
     )
@@ -416,7 +476,9 @@ def _accumulate_result(bucket: dict, name: str, fmt: str,
                        n_activation_rows: int | None = None,
                        cost_source: str | None = None,
                        weight_mse_per_expert: list[float] | None = None,
-                       cost_source_per_expert: list[str] | None = None):
+                       cost_source_per_expert: list[str] | None = None,
+                       minchain_identity_per_expert: list[dict] | None = None,
+                       minchain_interpolation: dict | None = None):
     per_name = bucket.setdefault(name, {})
     acc = per_name.setdefault(fmt, {
         "_count": 0,
@@ -432,6 +494,8 @@ def _accumulate_result(bucket: dict, name: str, fmt: str,
         "_cost_source": None,
         "_weight_mse_per_expert": None,
         "_cost_source_per_expert": None,
+        "_minchain_identity_per_expert": None,
+        "_minchain_interpolation": None,
     })
     acc["_count"] += 1
     if cost_source is not None:
@@ -463,6 +527,22 @@ def _accumulate_result(bucket: dict, name: str, fmt: str,
                 f"{name}/{fmt}: conflicting per-expert cost provenance"
             )
         acc["_cost_source_per_expert"] = values
+    if minchain_identity_per_expert is not None:
+        values = [dict(value) for value in minchain_identity_per_expert]
+        previous = acc.get("_minchain_identity_per_expert")
+        if previous is not None and previous != values:
+            raise ValueError(
+                f"{name}/{fmt}: conflicting per-expert min-chain identity"
+            )
+        acc["_minchain_identity_per_expert"] = values
+    if minchain_interpolation is not None:
+        value = dict(minchain_interpolation)
+        previous = acc.get("_minchain_interpolation")
+        if previous is not None and previous != value:
+            raise ValueError(
+                f"{name}/{fmt}: conflicting min-chain interpolation metadata"
+            )
+        acc["_minchain_interpolation"] = value
     acc["_weight_mse_sum"] += weight_mse
     acc["_output_mse_sum"] += output_mse
     acc["_rel_output_mse_sum"] += rel_output_mse
@@ -497,6 +577,10 @@ def _finalize_results(bucket: dict[str, dict]) -> dict[str, dict]:
                 "_weight_mse_per_expert", None)
             cost_source_per_expert = acc.pop(
                 "_cost_source_per_expert", None)
+            minchain_identity_per_expert = acc.pop(
+                "_minchain_identity_per_expert", None)
+            minchain_interpolation = acc.pop(
+                "_minchain_interpolation", None)
             entry = {
                 "weight_mse": acc.pop("_weight_mse_sum") / n,
                 "output_mse": acc.pop("_output_mse_sum") / n,
@@ -510,6 +594,12 @@ def _finalize_results(bucket: dict[str, dict]) -> dict[str, dict]:
                 entry["weight_mse_per_expert"] = weight_mse_per_expert
             if cost_source_per_expert is not None:
                 entry["cost_source_per_expert"] = cost_source_per_expert
+            if minchain_identity_per_expert is not None:
+                entry["cb_minchain_identity_per_expert"] = (
+                    minchain_identity_per_expert
+                )
+            if minchain_interpolation is not None:
+                entry["cb_minchain_interpolation"] = minchain_interpolation
             if n_act_rows is not None:
                 # How many activation rows the output-side numbers rest on.
                 # The allocator/provenance needs this to tell a well-covered
@@ -1402,13 +1492,19 @@ def _measure_packed_experts(
     ladder_plan = _cb_ladder_plan(specs)
     ladder_accept = 0
     ladder_reject = 0
-    ldlq_enabled = (
-        any(spec.family in _CB_COST_FAMILIES for spec in specs)
-        and cb_serialization_context_from_env(
+    _has_cb_specs = any(spec.family in _CB_COST_FAMILIES for spec in specs)
+    _packed_cb_context = (
+        cb_serialization_context_from_env(
             require_explicit=True,
             where="packed-expert CB local cost render",
-        ).ldlq
+        ) if _has_cb_specs else None
     )
+    ldlq_enabled = bool(_packed_cb_context and _packed_cb_context.ldlq)
+    minchain_enabled = bool(_packed_cb_context and _packed_cb_context.minchain)
+    if minchain_enabled:
+        # Amendment v2 owns interpolation in this mode.  The incumbent RD-law
+        # switch must not silently remove chain anchors or its audit rung.
+        ladder_plan = None
     for full_name, packed_param, experts_qname, experts_mod in entries:
         w = packed_param.detach().to(device=dev, dtype=dtype)
         param_name = full_name.rsplit(".", 1)[-1]
@@ -1533,11 +1629,22 @@ def _measure_packed_experts(
         # every expert exactly; this only affects the DP's cost estimates.
         sample_n = _expert_cost_sample_n()
         packed_cb_warm_identities = None
+        packed_minchain_content_guard = None
+        minchain_state: dict[str, dict[str, object]] = {}
         measured_specs = (
             list(specs)
             if ladder_plan is None
             else [spec for spec in specs if spec.name not in ladder_plan[1]]
         )
+        if minchain_enabled:
+            def _minchain_spec_order(item: fr.FormatSpec):
+                parsed = parse_format_name(item.name)
+                if parsed is None:
+                    return (1, item.name, 0)
+                family, rung = parsed
+                return (0, family.prefix, int(rung))
+
+            measured_specs.sort(key=_minchain_spec_order)
         pending_ladders = list(ladder_plan[0]) if ladder_plan else []
         specs_by_name = {spec.name: spec for spec in specs}
         for spec in measured_specs:
@@ -1582,7 +1689,62 @@ def _measure_packed_experts(
                             else packed_ldlq_activation_rows
                         ),
                     )
+                    minchain_result = None
+                    if minchain_enabled:
+                        if use_sample:
+                            raise RuntimeError(
+                                f"{full_name}: min-chain requires full expert "
+                                "coverage; disable PRISMAQUANT_EXPERT_COST_SAMPLE"
+                            )
+                        parsed = parse_format_name(spec.name)
+                        if parsed is None:
+                            raise AssertionError(
+                                f"{spec.name}: CB family has no rung identity"
+                            )
+                        family, rung = parsed
+                        if packed_minchain_content_guard is None:
+                            from .cb_warm_state import tensor_value_identity
+
+                            packed_minchain_content_guard = {
+                                "source_shape": list(w_in.shape),
+                                "source_digest": tensor_value_identity(w_in)[1],
+                                "col_weights_shape": list(cw_use.shape),
+                                "col_weights_digest": tensor_value_identity(
+                                    cw_use
+                                )[1],
+                                "serialization_context": (
+                                    cb_serialization_context_stamp(_packed_cb_context)
+                                ),
+                            }
+                        predecessor = minchain_state.get(family.prefix)
+                        minchain_result = select_reconstruction_slices(
+                            weight=w_in,
+                            free_reconstruction=w_hat,
+                            qname=full_name,
+                            rung=int(rung),
+                            format_name=spec.name,
+                            content_guard=packed_minchain_content_guard,
+                            predecessor_reconstruction=(
+                                predecessor["reconstruction"]
+                                if predecessor is not None else None
+                            ),
+                            predecessor_errors=(
+                                predecessor["errors"]
+                                if predecessor is not None else None
+                            ),
+                            predecessor_identities=(
+                                predecessor["identities"]
+                                if predecessor is not None else None
+                            ),
+                        )
+                        w_hat = minchain_result["reconstruction"]
+                        minchain_state[family.prefix] = {
+                            "reconstruction": w_hat,
+                            "errors": minchain_result["selected_errors"],
+                            "identities": minchain_result["identities"],
+                        }
                 else:
+                    minchain_result = None
                     w_hat = _batched_quantize(
                         spec, w_in,
                         col_weights=(
@@ -1592,8 +1754,12 @@ def _measure_packed_experts(
                     )
                 err = (w_in - w_hat).float()
                 per_expert_weight_mse = (
-                    err.pow(2).mean(dim=(1, 2)).detach().cpu().tolist()
-                    if not use_sample else None
+                    list(minchain_result["selected_errors"])
+                    if minchain_result is not None
+                    else (
+                        err.pow(2).mean(dim=(1, 2)).detach().cpu().tolist()
+                        if not use_sample else None
+                    )
                 )
                 weight_mse = float(err.pow(2).mean().item())
                 dloss_val = None
@@ -1672,9 +1838,15 @@ def _measure_packed_experts(
                                        per_expert_weight_mse
                                        if per_expert_weight_mse is not None
                                        else None
+                                   ),
+                                   minchain_identity_per_expert=(
+                                       minchain_result["identities"]
+                                       if minchain_result is not None else None
                                    ))
                 del w_hat, err
             except Exception as e:
+                if minchain_enabled and spec.family in _CB_COST_FAMILIES:
+                    raise
                 accum.setdefault(full_name, {})[spec.name] = {"error": str(e)}
 
             # Packed stacks contain heterogeneous expert RD curves.  Gate one
@@ -1806,6 +1978,8 @@ def _measure_packed_experts(
             del h_em
         if dev.type == "cuda":
             torch.cuda.empty_cache()
+    if minchain_enabled:
+        _apply_minchain_interpolation_v2(accum, specs)
     if measured or fallback:
         print(f"[cost] packed experts output_mse measured={measured} "
               f"fallback={fallback}", flush=True)
@@ -1815,6 +1989,151 @@ def _measure_packed_experts(
               f"{ladder_accept}/{total} expert-slice fits accepted "
               f"({ladder_accept / max(total, 1):.0%}), {ladder_reject} "
               f"rejected -> measured", flush=True)
+
+
+def _minchain_layer_number(qname: str) -> int:
+    match = re.search(r"(?:^|\.)layers\.(\d+)(?:\.|$)", str(qname))
+    if match is None:
+        # Non-layer synthetic/profile targets still need a deterministic audit
+        # draw.  Keep them isolated so one unrelated qname cannot trip another.
+        return int.from_bytes(
+            str(qname).encode("utf-8")[:8].ljust(8, b"\0"), "little"
+        )
+    return int(match.group(1))
+
+
+def _apply_minchain_interpolation_v2(
+    accum: dict,
+    specs: list[fr.FormatSpec],
+) -> None:
+    """Apply amendment-v2 decisions after exact chain measurements.
+
+    The production integration deliberately adjudicates after all free/embed
+    cells have durable identities.  Accepted cells publish PCHIP costs;
+    backstop cells retain their exact measured values, and one failed
+    projection audit leaves every projection in that layer fully measured.
+    Keeping the exact rows resident also lets export validate a selected
+    interpolated rung against a materialized arm/digest identity.
+    """
+    families: dict[str, dict[int, str]] = {}
+    for spec in specs:
+        parsed = parse_format_name(spec.name)
+        if parsed is None or spec.family not in _CB_COST_FAMILIES:
+            continue
+        family, rung = parsed
+        families.setdefault(family.prefix, {})[int(rung)] = spec.name
+
+    decisions: list[dict[str, object]] = []
+    for qname, per_format in accum.items():
+        layer = _minchain_layer_number(qname)
+        for family, names_by_rung in families.items():
+            if len(names_by_rung) < 6:
+                continue
+            config = MinChainInterpolationConfig.from_rungs(
+                tuple(names_by_rung)
+            )
+            audit_rung = config.audit_rung(layer, tuple(names_by_rung))
+            required = (*config.anchors, audit_rung)
+            if any(
+                names_by_rung[rung] not in per_format
+                or per_format[names_by_rung[rung]].get(
+                    "_weight_mse_per_expert"
+                ) is None
+                for rung in required
+            ):
+                raise RuntimeError(
+                    f"{qname}/{family}: min-chain interpolation lacks its "
+                    "five anchors or deterministic audit rung"
+                )
+            anchors = {
+                rung: per_format[names_by_rung[rung]][
+                    "_weight_mse_per_expert"
+                ]
+                for rung in config.anchors
+            }
+            targets = tuple(
+                rung for rung in sorted(names_by_rung)
+                if rung not in config.anchors and rung != audit_rung
+            )
+            result = interpolation_acceptance_v2(
+                anchors,
+                config=config,
+                target_rungs=targets,
+                audit_rung=audit_rung,
+                audit_errors=per_format[names_by_rung[audit_rung]][
+                    "_weight_mse_per_expert"
+                ],
+            )
+            decisions.append({
+                "qname": qname,
+                "layer": layer,
+                "family": family,
+                "names_by_rung": names_by_rung,
+                "config": config,
+                "audit_rung": audit_rung,
+                "targets": targets,
+                "result": result,
+            })
+
+    layer_pass = {
+        layer: all(
+            not bool(decision["result"]["full_measure_layer"])
+            for decision in decisions
+            if decision["layer"] == layer
+        )
+        for layer in {decision["layer"] for decision in decisions}
+    }
+    for decision in decisions:
+        qname = decision["qname"]
+        layer = decision["layer"]
+        family = decision["family"]
+        names_by_rung = decision["names_by_rung"]
+        audit_rung = decision["audit_rung"]
+        result = decision["result"]
+        audit = result["audit"]
+        if not layer_pass[layer]:
+            print(
+                f"[cost] layer {layer} min-chain audit FAIL; retaining full "
+                f"measured {family} ladder",
+                flush=True,
+            )
+            continue
+        failed = set(result["backstop_failed"])
+        for rung in decision["targets"]:
+            fmt = names_by_rung[rung]
+            acc = accum[qname][fmt]
+            measured_values = list(acc["_weight_mse_per_expert"])
+            predicted_values = result["predictions"][rung]
+            final_values = [
+                float(measured if expert in failed else predicted)
+                for expert, (measured, predicted) in enumerate(zip(
+                    measured_values, predicted_values
+                ))
+            ]
+            sources = [
+                (
+                    MEASURED_SLICE_COST_SOURCE
+                    if expert in failed else BAND_INTERPOLATED_COST_SOURCE
+                )
+                for expert in range(len(final_values))
+            ]
+            acc["_weight_mse_per_expert"] = final_values
+            acc["_weight_mse_sum"] = (
+                sum(final_values) / max(len(final_values), 1)
+            ) * int(acc["_count"])
+            acc["_cost_source_per_expert"] = sources
+            acc["_cost_source"] = (
+                MIXED_COST_SOURCE if failed else BAND_INTERPOLATED_COST_SOURCE
+            )
+            acc["_output_mse_measured"] = False
+            acc["_minchain_interpolation"] = {
+                "semantic": "v2_accept_all_plus_per_layer_audit",
+                "audit_rung": int(audit_rung),
+                "audit_median": float(audit["median"]),
+                "audit_p95": float(audit["p95"]),
+                "layer_audit_pass": True,
+                "backstop_failed": sorted(failed),
+            }
 
 
 def _batched_codebook_rtn(stacked_w: torch.Tensor, codebook: torch.Tensor,

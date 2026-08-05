@@ -2685,11 +2685,14 @@ def export_nvfp4_cb_streaming(
         ).hexdigest()
         for name, tensor in materialized_codebook_tensors.items()
     }
+    _env_cb_context = cb_serialization_context_from_env()
     serialization_context = CBSerializationContext(
         scale_coding=scale_coding,
         codebook_source=source,
         scale_sweep=bool(scale_sweep),
-        ldlq=cb_serialization_context_from_env().ldlq,
+        ldlq=_env_cb_context.ldlq,
+        minchain=_env_cb_context.minchain,
+        minchain_version=_env_cb_context.minchain_version,
         encode_tier=resolve_cb_encode_tier(),
         activation_contract=_claimed_activation_contract,
         activation_execution=(
@@ -2737,6 +2740,7 @@ def export_nvfp4_cb_streaming(
                 for member in _identity_scope(qname)
             },
             col_weights=col_weights,
+            require_minchain_cells=serialization_context.minchain,
             where="export_nvfp4_cb_streaming assignment render identity",
         )
     elif (
