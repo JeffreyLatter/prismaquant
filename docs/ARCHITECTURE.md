@@ -1,7 +1,7 @@
 # PrismaQuant Architecture
 
-As of: 2026-08-04 · branch `feat/pipelined-export` · verified against implementation
-baseline commit `e0ee08e` plus the current flag-gated CB streaming-export pipeline changes, with
+As of: 2026-08-05 · branch `feat/minchain-production` · verified against implementation
+baseline commit `222b456` plus the current flag-gated monotone min-chain changes, with
 the external Gridbook runtime pinned to
 `9011a19228ddb96b8a49e11a20ac75c99c83998e` (v0.8.0). This branch ports the dated
 2026-08-01 DeepSeek-V4-Flash-0731 92 GB study record (§9.2) forward from its 0.5.1
@@ -379,6 +379,7 @@ VALIDATED_SOURCE_PREFETCH=require   VALIDATED_FRONTIER_PICK=kneedle,
 VALIDATED_FRONTIER_SKIP_CALIB=$NSAMPLES (held-out disjointness, ON)
 CB_EXPERT_EMPIRICAL=0  CB_SCALE_CODING=two_tier  (D15: shipped values)
 PRISMAQUANT_CB_LDLQ=0  (opt-in post-fit feedback assignment)
+PRISMAQUANT_CB_MINCHAIN=0  (opt-in monotone packed-expert rung chain)
 AURA_ADDITIVITY_GATE=measure
 PRISMAQUANT_GGUF_IMATRIX=1  DEVICE=cuda  EXPORT_DEVICE=cuda
 ```
@@ -2049,7 +2050,36 @@ mid-size timing check measured a 1.43x encoder-time multiplier. `ldlq` is part o
 CB serialization context and every render/provenance identity, so cost/export drift is
 refused and an opposite-mode warm record cold-falls back. The resulting artifact is still the
 ordinary grid-native CB layout: the mode is assignment-time only and adds no serving branch or
-runtime cost. There is no in-lane serving smoke — CB artifacts serve only through
+runtime cost.
+
+The independently gated `PRISMAQUANT_CB_MINCHAIN=1` mode orders packed-expert
+CB rungs ascending and, per expert slice, chooses between the unchanged free
+fit and the selected predecessor reconstruction using weight MSE. Its exact
+comparison is `a <= b + 1e-12*max(abs(a),abs(b))`; epsilon and exact ties choose
+free. Therefore `selected(K) <= embed(K) = selected(K-1)` proves monotonicity,
+and `selected(K) <= free(K)` proves zero representational tax. Only the winner
+is replayed through activation QDQ. The earlier nested-book pilot is explicit
+NO-GO lineage: it proved reuse (0/960 predecessor violations, +0.456% encode)
+but imposed median tax up to 16.616%. Pilot 1 then had partial coverage; the
+anchor study resolved epsilon ties. Pilot 2 on DSV4 layer 14 passed full
+coverage with zero P1/P2 violations, P3 at 2.7–2.9% median / 12.9–13.8% p95,
+and P4 overhead 1.003x.
+
+Acceptance amendment v2 uses five-anchor monotone PCHIP (FP8 defaults
+K28/K33/K38/K43/K48), independent K33/K43 four-anchor cross-validation, and
+accept-all except a 25% gross-outlier backstop. A deterministic non-anchor
+audit rung is drawn per layer with seed `42 + layer`; each projection must
+pass 5% median / 15% p95 or the whole layer is fully measured. Anchors,
+holdbacks, seed, and all three tolerances have explicit
+`PRISMAQUANT_CB_MINCHAIN_*` settings and are stamped in cost provenance
+(`cb_minchain.py`, `measure_quant_cost.cost_payload_provenance`). The global
+mode/version enters `CBSerializationContext`; each materialized cell carries
+its arm, solution digest, and predecessor digest in `cb_render_identity`.
+Export refuses a context or per-cell stamp mismatch. Warm records inherit the
+same context dimension. Selected outputs remain ordinary flat per-rung books;
+the config/tensor wire format and Gridbook serving kernels are unchanged.
+
+There is no in-lane serving smoke — CB artifacts serve only through
 the out-of-tree plugin — but the gate set is now *declared* (`prismaquant/lane_specs/nvfp4_cb.json`,
 re-vet **R16**): same OpenAI endpoint, same endpoint-agnostic `validate_quantized_model`, plus
 the lane-specific prefill perf gate (INV-2). Gates are advisory; the shipcard refuses, and

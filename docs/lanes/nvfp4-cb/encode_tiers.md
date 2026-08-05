@@ -44,6 +44,56 @@ runs after warm-up) measured 0.2176 s plain versus 0.3117 s LDLQ, or
 **1.43x encoder time**, consistent with the pilot's 1.10–1.43x GPU range at
 the intended coarse precision of this check.
 
+## Monotone min-chain (opt-in encoder mode)
+
+Set `PRISMAQUANT_CB_MINCHAIN=1` to chain the measured packed-expert rungs;
+the default is `0`. At each rung, in ascending order and independently for
+each expert slice, the production path compares today's unchanged free fit
+with the selected predecessor reconstruction embedded at the new rung. The
+selection metric is unweighted weight MSE. It uses the registered symmetric
+epsilon
+`a <= b + 1e-12*max(abs(a),abs(b))`; epsilon and exact ties choose `free`.
+Only the winning reconstruction receives activation-QDQ replay.
+
+The two guarantees are immediate:
+
+- `selected(K) <= embed(K) = selected(K-1)`, so measured error is monotone
+  non-increasing.
+- `selected(K) <= free(K)`, because the unchanged encoder result is always an
+  arm, so representational tax is zero.
+
+The production interpolation policy is acceptance amendment v2. It fits a
+monotone PCHIP to five anchors (default K28/K33/K38/K43/K48 for the FP8
+ladder). K33 and K43 are each predicted from the other four anchors; a slice
+whose cross-validation error exceeds 25% measures its missing rungs. All other
+slices are accepted. One non-anchor audit rung per layer is drawn with
+`random.Random(42 + layer)` and fully measured. Each projection must meet
+median relative error <=5% and p95 <=15%; any projection failure triggers
+full measurement for the layer. Configure the plan with
+`PRISMAQUANT_CB_MINCHAIN_ANCHORS`, `_HOLDBACKS`, `_AUDIT_SEED`, `_BACKSTOP`,
+`_AUDIT_MEDIAN`, and `_AUDIT_P95`. The resolved plan and thresholds are
+stamped in cost provenance.
+
+Lineage matters. The earlier nested-book pilot was a **NO-GO** despite 0/960
+predecessor violations and only +0.456% encode time, because constraining the
+free book imposed median representational tax as high as 16.616%. Min-chain
+keeps that proven reuse arm but leaves the free arm unconstrained. Pilot 1 was
+then incomplete because it had only partial expert coverage and exposed the
+epsilon adjudication ambiguity. The anchor study pinned the symmetric epsilon
+and free-on-tie rule. Pilot 2 on DeepSeek-V4 layer 14 passed: P1/P2 had zero
+monotonicity and zero-tax violations at full coverage; P3's three projection
+fits were 2.7–2.9% median and 12.9–13.8% p95; P4 measured 1.003x two-arm
+overhead.
+
+Min-chain is an encoder/cost identity, not a serving feature. The global mode
+and chain version are in the CB serialization context. Every materialized
+`(tensor, rung, slice-group)` records `winning_arm`, `solution_digest`, and,
+for embed/refine, `predecessor_digest` in the value-bearing render identity.
+Cost/export context drift is refused, and a warm record from the other mode is
+a cold fallback. Each selected solution is still emitted as one ordinary flat
+per-rung book; the packed tensor/config wire format and Gridbook serving path
+are unchanged.
+
 ## Encoder warm start
 
 The expensive scale search performed while measuring each `(unit, rung)` can

@@ -53,6 +53,7 @@ from .cb_layout import (
 )
 
 CB_SERIALIZED_PAYLOAD_SCHEMA = "prismaquant.cb_serialized_payload.v3"
+MINCHAIN_CB_SERIALIZED_PAYLOAD_SCHEMA = "prismaquant.cb_serialized_payload.v4"
 PREVIOUS_CB_SERIALIZED_PAYLOAD_SCHEMA = "prismaquant.cb_serialized_payload.v2"
 LEGACY_CB_SERIALIZED_PAYLOAD_SCHEMA = "prismaquant.cb_serialized_payload.v1"
 CB_EXPORT_ARTIFACT_INVENTORY_SCHEMA = (
@@ -77,10 +78,15 @@ _VEC_DIM = VEC_DIM
 
 def _serialized_payload_schema(context: "CBSerializationContext") -> str:
     return (
-        CB_SERIALIZED_PAYLOAD_SCHEMA
-        if context.activation_contract is not None
-        else PREVIOUS_CB_SERIALIZED_PAYLOAD_SCHEMA
+        MINCHAIN_CB_SERIALIZED_PAYLOAD_SCHEMA
+        if context.minchain
+        else (
+            CB_SERIALIZED_PAYLOAD_SCHEMA
+            if context.activation_contract is not None
+            else PREVIOUS_CB_SERIALIZED_PAYLOAD_SCHEMA
+        )
     )
+
 
 _SAFETENSORS_DTYPE_BITS = {
     "BOOL": 8,
@@ -125,6 +131,8 @@ class CBSerializationContext:
     layout_version: int | None = None
     scale_sweep: bool = True
     ldlq: bool = False
+    minchain: bool = False
+    minchain_version: str | None = None
     encode_tier: str = CB_ENCODE_TIER_DEFAULT
     renderer_abi: str = CB_RENDERER_ABI
     activation_contract: str | None = None
@@ -166,6 +174,25 @@ class CBSerializationContext:
             raise TypeError(
                 "CB ldlq identity must be an explicit bool, got "
                 f"{self.ldlq!r}"
+            )
+        if not isinstance(self.minchain, bool):
+            raise TypeError(
+                "CB minchain identity must be an explicit bool, got "
+                f"{self.minchain!r}"
+            )
+        if self.minchain:
+            from .cb_minchain import MINCHAIN_CONTEXT_VERSION
+
+            version = str(self.minchain_version or "").strip()
+            if version != MINCHAIN_CONTEXT_VERSION:
+                raise ValueError(
+                    f"min-chain context requires minchain_version="
+                    f"{MINCHAIN_CONTEXT_VERSION!r}, got {self.minchain_version!r}"
+                )
+            object.__setattr__(self, "minchain_version", version)
+        elif self.minchain_version is not None:
+            raise ValueError(
+                "CB minchain_version cannot be set when minchain is disabled"
             )
         if coding == PRODUCTION_FP4_SCALE_CODING and not self.scale_sweep:
             raise ValueError(
@@ -249,6 +276,7 @@ class CBSerializationContext:
         *,
         scale_sweep: bool = True,
         ldlq: bool = False,
+        minchain: bool = False,
         encode_tier: str = CB_ENCODE_TIER_DEFAULT,
         codebook_source: str = "lattice",
         codebook_refs: Mapping[str, str | Sequence[str]] | None = None,
@@ -258,12 +286,15 @@ class CBSerializationContext:
             NVFP4_ACTIVATION_CONTRACT_SCHEMA,
             NVFP4_ACTIVATION_EXECUTION,
         )
+        from .cb_minchain import MINCHAIN_CONTEXT_VERSION
 
         return cls(
             scale_coding=PRODUCTION_FP4_SCALE_CODING,
             layout_version=2,
             scale_sweep=scale_sweep,
             ldlq=ldlq,
+            minchain=minchain,
+            minchain_version=(MINCHAIN_CONTEXT_VERSION if minchain else None),
             encode_tier=encode_tier,
             codebook_source=codebook_source,
             activation_contract=NVFP4_ACTIVATION_CONTRACT_SCHEMA,
@@ -278,12 +309,15 @@ class CBSerializationContext:
         *,
         scale_sweep: bool = True,
         ldlq: bool = False,
+        minchain: bool = False,
         encode_tier: str = CB_ENCODE_TIER_DEFAULT,
         codebook_source: str = "lattice",
         codebook_refs: Mapping[str, str | Sequence[str]] | None = None,
         codebook_content_digests: Mapping[str, str] | None = None,
     ) -> CBSerializationContext:
         """Explicit legacy writer context; old artifacts remain readable."""
+        if minchain:
+            raise ValueError("min-chain has no legacy-v1 serialization contract")
         return cls(
             scale_coding=LEGACY_FP4_SCALE_CODING,
             layout_version=1,
@@ -322,6 +356,10 @@ def cb_serialization_context_stamp(
         "codebook_source": context.codebook_source,
         "scale_sweep": context.scale_sweep,
         "ldlq": context.ldlq,
+        **({
+            "minchain": True,
+            "minchain_version": context.minchain_version,
+        } if context.minchain else {}),
         "encode_tier": context.encode_tier,
         "renderer_abi": context.renderer_abi,
         **({
@@ -389,6 +427,7 @@ def cb_serialization_context_from_stamp(
     if schema not in {
         PREVIOUS_CB_SERIALIZED_PAYLOAD_SCHEMA,
         CB_SERIALIZED_PAYLOAD_SCHEMA,
+        MINCHAIN_CB_SERIALIZED_PAYLOAD_SCHEMA,
     }:
         raise ValueError(
             f"{where}: unsupported CB serialized-payload schema "
@@ -412,14 +451,18 @@ def cb_serialization_context_from_stamp(
         )
     activation_contract = stamp.get("activation_contract")
     activation_execution = stamp.get("activation_execution")
-    if schema == CB_SERIALIZED_PAYLOAD_SCHEMA and activation_contract is None:
+    current_schemas = {
+        CB_SERIALIZED_PAYLOAD_SCHEMA,
+        MINCHAIN_CB_SERIALIZED_PAYLOAD_SCHEMA,
+    }
+    if schema in current_schemas and activation_contract is None:
         raise ValueError(
-            f"{where}: CB serialized-payload v3 stamp is missing its "
+            f"{where}: current CB serialized-payload stamp is missing its "
             "activation_contract"
         )
-    if schema == CB_SERIALIZED_PAYLOAD_SCHEMA and activation_execution is None:
+    if schema in current_schemas and activation_execution is None:
         raise ValueError(
-            f"{where}: CB serialized-payload v3 stamp is missing its "
+            f"{where}: current CB serialized-payload stamp is missing its "
             "activation_execution"
         )
     if (
@@ -465,12 +508,30 @@ def cb_serialization_context_from_stamp(
     raw_refs = stamp.get("codebook_refs")
     if raw_refs is not None and not isinstance(raw_refs, Mapping):
         raise ValueError(f"{where}: CB codebook_refs stamp is not an object")
+    minchain = schema == MINCHAIN_CB_SERIALIZED_PAYLOAD_SCHEMA
+    if minchain and stamp.get("minchain") is not True:
+        raise ValueError(
+            f"{where}: min-chain v4 stamp is missing minchain=true"
+        )
+    if minchain and stamp.get("minchain_version") is None:
+        raise ValueError(
+            f"{where}: min-chain v4 stamp is missing minchain_version"
+        )
+    if not minchain and (
+        stamp.get("minchain") is not None
+        or stamp.get("minchain_version") is not None
+    ):
+        raise ValueError(
+            f"{where}: pre-min-chain stamp cannot claim min-chain fields"
+        )
     return CBSerializationContext(
         scale_coding=str(stamp["scale_coding"]),
         layout_version=int(stamp["layout_version"]),
         codebook_source=str(stamp["codebook_source"]),
         scale_sweep=stamp["scale_sweep"],
         ldlq=stamp["ldlq"],
+        minchain=minchain,
+        minchain_version=(str(stamp["minchain_version"]) if minchain else None),
         encode_tier=str(stamp["encode_tier"]),
         renderer_abi=str(stamp["renderer_abi"]),
         activation_contract=(
@@ -519,6 +580,7 @@ def cb_serialization_context_from_env(
     source = environ.get("CB_CODEBOOK_SOURCE")
     raw_sweep = environ.get("CB_SCALE_SWEEP")
     raw_ldlq = environ.get("PRISMAQUANT_CB_LDLQ")
+    raw_minchain = environ.get("PRISMAQUANT_CB_MINCHAIN")
     raw_tier = environ.get("PRISMAQUANT_CB_ENCODE_TIER")
     if require_explicit and (
         not scale or not source or raw_sweep is None or raw_ldlq is None
@@ -554,6 +616,13 @@ def cb_serialization_context_from_env(
         name="PRISMAQUANT_CB_LDLQ",
         where=where,
     )
+    minchain = _parse_bool_setting(
+        raw_minchain,
+        default=False,
+        name="PRISMAQUANT_CB_MINCHAIN",
+        where=where,
+    )
+    from .cb_minchain import MINCHAIN_CONTEXT_VERSION
     from .nvfp4_activation_contract import (
         NVFP4_ACTIVATION_CONTRACT_SCHEMA,
         NVFP4_ACTIVATION_EXECUTION,
@@ -564,6 +633,8 @@ def cb_serialization_context_from_env(
         codebook_source=source or "lattice",
         scale_sweep=scale_sweep,
         ldlq=ldlq,
+        minchain=minchain,
+        minchain_version=(MINCHAIN_CONTEXT_VERSION if minchain else None),
         encode_tier=resolve_cb_encode_tier(raw_tier, environ=environ),
         activation_contract=NVFP4_ACTIVATION_CONTRACT_SCHEMA,
         activation_execution=NVFP4_ACTIVATION_EXECUTION,
@@ -663,6 +734,8 @@ def validate_cb_serialization_context_stamp(
         "activation_contract",
         "activation_execution",
     )
+    if context.minchain:
+        base_keys += ("minchain", "minchain_version")
     observed = {key: stamp.get(key) for key in base_keys}
     expected_base = {key: expected.get(key) for key in base_keys}
     if observed != expected_base:
@@ -1377,6 +1450,10 @@ def cb_tensor_payload_breakdown(
         "layout_version": context.layout_version,
         "scale_sweep": context.scale_sweep,
         "ldlq": context.ldlq,
+        **({
+            "minchain": True,
+            "minchain_version": context.minchain_version,
+        } if context.minchain else {}),
         "encode_tier": context.encode_tier,
         "renderer_abi": context.renderer_abi,
         "activation_contract": context.activation_contract,
@@ -1499,6 +1576,10 @@ def cb_assignment_payload_breakdown(
             "codebook_source": context.codebook_source,
             "scale_sweep": context.scale_sweep,
             "ldlq": context.ldlq,
+            **({
+                "minchain": True,
+                "minchain_version": context.minchain_version,
+            } if context.minchain else {}),
             "encode_tier": context.encode_tier,
             "renderer_abi": context.renderer_abi,
             **({

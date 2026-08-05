@@ -136,6 +136,7 @@ from .nvfp4_cb_footprint import (
     validate_cb_cost_provenance,
     whole_artifact_budget_stamp,
 )
+from .cb_minchain import MINCHAIN_CONTEXT_VERSION
 from .production_weight_cache import (
     project_cb_render_identity,
     validate_cb_render_provenance,
@@ -1738,6 +1739,15 @@ def main():
         help="Exact CB feedback-assignment contract; required with CB formats.",
     )
     ap.add_argument(
+        "--cb-minchain",
+        choices=("0", "1"),
+        default="0",
+        help=(
+            "Exact CB monotone min-chain encoder contract (default: 0). "
+            "The production pipeline passes this explicitly."
+        ),
+    )
+    ap.add_argument(
         "--cb-encode-tier",
         choices=("fast", "balanced", "max"),
         default=None,
@@ -2239,7 +2249,8 @@ def main():
                 "[alloc] ERROR: a CB format is present in the body or fixed "
                 "auxiliary assignment but exact serialized "
                 "and renderer context is missing. Pass --cb-scale-coding, "
-                "--cb-codebook-source, --cb-scale-sweep, --cb-ldlq, and "
+                "--cb-codebook-source, --cb-scale-sweep, --cb-ldlq, "
+                "--cb-minchain, and "
                 "--cb-encode-tier; refusing implicit render defaults."
             )
         codebook_digests = None
@@ -2279,6 +2290,10 @@ def main():
                 codebook_source=args.cb_codebook_source,
                 scale_sweep=args.cb_scale_sweep == "1",
                 ldlq=args.cb_ldlq == "1",
+                minchain=args.cb_minchain == "1",
+                minchain_version=(
+                    MINCHAIN_CONTEXT_VERSION if args.cb_minchain == "1" else None
+                ),
                 encode_tier=args.cb_encode_tier,
                 activation_contract=NVFP4_ACTIVATION_CONTRACT_SCHEMA,
                 activation_execution=NVFP4_ACTIVATION_EXECUTION,

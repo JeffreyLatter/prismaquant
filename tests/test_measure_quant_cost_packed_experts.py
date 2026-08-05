@@ -10,12 +10,15 @@ import torch.nn.functional as F
 from prismaquant import format_registry as fr
 from prismaquant.measure_quant_cost import (
     ActivationIndex,
+    _accumulate_result,
+    _apply_minchain_interpolation_v2,
     _batched_quantize,
     _finalize_results,
     _measure_packed_experts,
     _packed_experts_forward_with_weights,
     _packed_router_topk,
 )
+from prismaquant.cb_minchain import MinChainInterpolationConfig
 
 
 class _StubHDetail:
@@ -202,6 +205,129 @@ def test_packed_experts_measure_output_mse_from_expert_activation_cache(tmp_path
             {"_packed_experts_module": experts_qname},
             results[name]["NVFP4"],
         )
+
+
+def test_packed_minchain_selects_per_expert_and_records_digests(monkeypatch):
+    import prismaquant.measure_quant_cost as mqc
+
+    torch.manual_seed(341)
+    model = TinyModel().eval()
+    targets = {"mlp.experts.down_proj"}
+    monkeypatch.setenv("CB_SCALE_CODING", "two_tier")
+    monkeypatch.setenv("CB_CODEBOOK_SOURCE", "lattice")
+    monkeypatch.setenv("CB_SCALE_SWEEP", "1")
+    monkeypatch.setenv("PRISMAQUANT_CB_LDLQ", "0")
+    monkeypatch.setenv("PRISMAQUANT_CB_MINCHAIN", "1")
+    monkeypatch.setenv("PRISMAQUANT_CB_ENCODE_TIER", "balanced")
+    monkeypatch.delenv("PRISMAQUANT_CB_LADDER_INTERP", raising=False)
+    monkeypatch.setattr(
+        mqc,
+        "_cb_col_weights_lookup",
+        lambda _name: torch.ones(16),
+    )
+
+    def fake_render(spec, weight, **_kwargs):
+        # K29 is worse than its predecessor and must embed. K30 is exactly
+        # tied with that embedded reconstruction and therefore selects free.
+        factor = {28: 0.90, 29: 0.75, 30: 0.90}[
+            int(spec.name.rsplit("K", 1)[1])
+        ]
+        return weight * factor
+
+    monkeypatch.setattr(mqc, "_cb_cost_quantize_dequantize", fake_render)
+    specs = [
+        fr.get_format(f"FP8_CB_K{rung}") for rung in (30, 28, 29)
+    ]
+    accum: dict = {}
+    _measure_packed_experts(
+        model, targets, specs, "cpu", torch.float32, accum, act_cache=None
+    )
+    results = _finalize_results(accum)["mlp.experts.down_proj"]
+
+    assert [
+        cell["winning_arm"]
+        for cell in results["FP8_CB_K29"][
+            "cb_minchain_identity_per_expert"
+        ]
+    ] == ["embed", "embed"]
+    assert [
+        cell["winning_arm"]
+        for cell in results["FP8_CB_K30"][
+            "cb_minchain_identity_per_expert"
+        ]
+    ] == ["free", "free"]
+    for expert in range(2):
+        errors = [
+            results[f"FP8_CB_K{rung}"]["weight_mse_per_expert"][expert]
+            for rung in (28, 29, 30)
+        ]
+        assert errors[0] >= errors[1] >= errors[2]
+
+
+def test_minchain_v2_audit_failure_full_measures_every_projection():
+    specs = [fr.get_format(f"FP8_CB_K{rung}") for rung in range(28, 49)]
+    config = MinChainInterpolationConfig.from_rungs(tuple(range(28, 49)))
+    audit_rung = config.audit_rung(14, tuple(range(28, 49)))
+    accum: dict = {}
+    qnames = (
+        "model.layers.14.mlp.experts.gate_up_proj",
+        "model.layers.14.mlp.experts.down_proj",
+    )
+    for qname in qnames:
+        for rung in range(28, 49):
+            value = float(100 - rung)
+            if qname.endswith("down_proj") and rung == audit_rung:
+                value = 1.0
+            _accumulate_result(
+                accum,
+                qname,
+                f"FP8_CB_K{rung}",
+                value,
+                0.0,
+                0.0,
+                weight_mse_per_expert=[value, value],
+            )
+
+    _apply_minchain_interpolation_v2(accum, specs)
+    predicted_rung = next(
+        rung for rung in range(28, 49)
+        if rung not in config.anchors and rung != audit_rung
+    )
+    for qname in qnames:
+        row = accum[qname][f"FP8_CB_K{predicted_rung}"]
+        assert row["_cost_source"] is None
+        assert row["_output_mse_measured"] is True
+
+
+def test_minchain_v2_accept_all_marks_predicted_cells():
+    specs = [fr.get_format(f"FP8_CB_K{rung}") for rung in range(28, 49)]
+    config = MinChainInterpolationConfig.from_rungs(tuple(range(28, 49)))
+    audit_rung = config.audit_rung(14, tuple(range(28, 49)))
+    accum: dict = {}
+    qname = "model.layers.14.mlp.experts.down_proj"
+    for rung in range(28, 49):
+        value = float(100 - rung)
+        _accumulate_result(
+            accum,
+            qname,
+            f"FP8_CB_K{rung}",
+            value,
+            0.0,
+            0.0,
+            weight_mse_per_expert=[value, value],
+        )
+
+    _apply_minchain_interpolation_v2(accum, specs)
+    for rung in range(28, 49):
+        row = accum[qname][f"FP8_CB_K{rung}"]
+        if rung in config.anchors or rung == audit_rung:
+            assert row["_cost_source"] is None
+        else:
+            assert row["_cost_source"] == "band_interpolated"
+            assert row["_cost_source_per_expert"] == [
+                "band_interpolated",
+                "band_interpolated",
+            ]
 
 
 def test_packed_experts_use_holdout_gated_ladder_and_keep_expert_mse(
