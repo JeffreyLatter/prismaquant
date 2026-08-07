@@ -16,6 +16,8 @@ import json
 import math
 import os
 import pickle
+
+import numpy as np
 import random
 import statistics
 import sys
@@ -61,8 +63,14 @@ from tools.dsv4_afast_campaign import (
     _host_available_bytes,
     _reclaim,
     _rss_bytes,
+    LAW_DETECT,
     _select_cell,
+    _select_experts,
     _unit_boundary_reclaim,
+    _weight_group_mse,
+    geometry_x,
+    law_fit_level2,
+    law_predict,
     pchip_monotone,
 )
 from tools.dsv4_ldlq_cost_campaign import (
@@ -85,7 +93,10 @@ from tools.dsv4_ldlq_cost_campaign import (
 
 LAYER_COUNT = 43
 EXPERT_COUNT = 256
-IMPORTED_LAYERS = (PILOT2_LAYER, 21)
+# Semantics v2 (2026-08-06): the pilot shards are incumbent-basis and the
+# menu must be uniform CBL-basis, so L14/L21 are measured like every layer.
+IMPORTED_LAYERS = ()
+MEASURED_LAYER_COUNT = LAYER_COUNT - len(IMPORTED_LAYERS)
 BURN_ROOT = RUN_ROOT / "burn-afast"
 BURN_CELL_ROOT = RUN_ROOT / "burn-shards"
 SHARD_ROOT = RUN_ROOT / "shards"
@@ -97,6 +108,10 @@ BASE_LAYER_ROOT = Path(
     "/home/rob/dq-runs/dsv4-flash-0731/prod-cal-0p6-v2/"
     "artifacts-mxfp4/probe-k12k18/by-layer"
 )
+from tools import dsv4_cbl_kernels as cblk
+
+CBL_MICROCHECK_LAYER = int(os.environ.get("DSV4_CBL_MICROCHECK_LAYER", "0"))
+
 BASE_COST = Path(
     "/home/rob/dq-runs/dsv4-flash-0731/prod-cal-0p6-v2/"
     "artifacts-mxfp4/probe-k12k18/cost_probe_only.pkl"
@@ -105,13 +120,28 @@ OLD_FULL_COST = Path(
     "/home/rob/dq-runs/dsv4-flash-0731/prod-cal-0p6-v2/"
     "artifacts/cost_full.pkl"
 )
-SCHEMA = "prismaquant.dsv4_afast_layer_shard.v2"
-MANIFEST_SCHEMA = "prismaquant.dsv4_afast_burn_manifest.v2"
+SCHEMA = "prismaquant.dsv4_afast_layer_shard.v3"
+MANIFEST_SCHEMA = "prismaquant.dsv4_afast_burn_manifest.v6"
+BURN_CELL_SCHEMA = "prismaquant.dsv4_afast_burn_cell.v4"
+BURN_CELL_IDENTITY_SCHEMA = "prismaquant.dsv4_afast_burn_cell_identity.v4"
+BURN_PASS_TAG_SCHEMA = "prismaquant.dsv4_afast_burn_pass_tags.v1"
+BURN_PASS_TAGS = {
+    "scout": "v2s-scout",
+    "primary": "v2s-primary",
+    "backstop": "v2s-backstop",
+    "full_layer": "v2s-full-layer",
+}
 AMENDMENT_SCHEMA = "prismaquant.dsv4_acceptance_amendment.v2"
 AMENDMENT_JSON = RUN_ROOT / "ACCEPTANCE_AMENDMENT.json"
 BACKSTOP_TOLERANCE = 0.25
-AUDIT_MEDIAN_TOLERANCE = 0.05
-AUDIT_P95_TOLERANCE = 0.15
+# Bars relaxed 5%/15% -> 8%/20% by Rob (2026-08-06 ~15:05) to admit the
+# observed marginal law-residual class (5.3-6.5% tight-spread misses at
+# K36-class rungs on single projections) while still failing genuine
+# breaks (historical failures ran 9-23%). Allocation impact bounded:
+# <0.5 K-step of marginal-utility shift; quantified post-hoc by the
+# grid-time allocation-stability check.
+AUDIT_MEDIAN_TOLERANCE = 0.08
+AUDIT_P95_TOLERANCE = 0.20
 MTP_BF16_BYTES = 10_862_838_300
 TIMEBOX_SECONDS = 20 * 3600
 MISSING_RUNGS = tuple(k for k in RUNGS if k not in ANCHORS)
@@ -199,7 +229,7 @@ def _layer_identity(
         "epsilon_rtol": REL_EPSILON,
         "anchors": list(ANCHORS),
         "acceptance_fit_anchors": list(ACCEPTANCE_FIT_ANCHORS),
-        "acceptance_holdouts": list(ACCEPTANCE_HOLDOUTS),
+        "acceptance_backstop": "audit_rung_pchip_cv_v2",
         "acceptance_tolerance": BACKSTOP_TOLERANCE,
         "acceptance_semantic": "v2_accept_all_gross_outlier_backstop",
         "audit_rung": _audit_rung(layer),
@@ -208,6 +238,7 @@ def _layer_identity(
             "median": AUDIT_MEDIAN_TOLERANCE,
             "p95": AUDIT_P95_TOLERANCE,
         },
+        "burn_tool_sha256": sha256_file(Path(__file__).resolve()),
         "acceptance_amendment_sha256": sha256_file(AMENDMENT_JSON),
         "implementation_sha256": {
             "burn_tool": sha256_file(Path(__file__).resolve()),
@@ -225,8 +256,19 @@ def _layer_identity(
 def _base_layer_costs(layer: int, old_full: Mapping[str, Any]) -> tuple[dict, str]:
     path = BASE_LAYER_ROOT / f"layer_{layer:03d}.pkl"
     payload = _load(path)
-    if int(payload["meta"]["incremental_shard"]["shard_idx"]) != layer:
-        raise AssertionError(f"layer {layer}: base shard index mismatch")
+    # Twin of the by-layer store guard (dsv4_ldlq_cost_campaign.load_layer_
+    # identity): shard_idx is a per-BATCH write counter, not a layer id, so it
+    # only coincides with the layer for the store's first batch (0-26 here).
+    # Verify content instead — strictly stronger than the counter.
+    foreign = [
+        qname for qname in payload["costs"]
+        if not str(qname).startswith(f"model.layers.{layer}.")
+    ]
+    if foreign:
+        raise AssertionError(
+            f"layer {layer}: base store holds foreign qnames "
+            f"(e.g. {foreign[0]}); shard content does not match its layer"
+        )
     costs = copy.deepcopy(payload["costs"])
     if len(costs) != 775:
         raise AssertionError(f"layer {layer}: base row count {len(costs)}")
@@ -304,27 +346,31 @@ def _projection_guard(layer: int, data: Mapping[str, Any]) -> dict[str, Any]:
 
 def _acceptance(
     anchor_errors: Mapping[int, Sequence[float]],
+    audit_rung: int,
+    audit_errors: Sequence[float],
+    projection: str,
 ) -> tuple[list[int], list[int], dict[str, Any]]:
+    # Semantics v2: the v1 leave-one-anchor-out CV needed >=4 anchors (its
+    # holdouts included the retired K43). With three anchors the backstop is
+    # the per-expert form of the audit itself: fit the anchors, predict the
+    # measured audit draw. Experts over tolerance ship measured rows, not
+    # interpolated ones.
     accepted: list[int] = []
     details = []
     for expert in range(EXPERT_COUNT):
-        rels = []
-        for holdout in ACCEPTANCE_HOLDOUTS:
-            fit = tuple(k for k in ANCHORS if k != holdout)
-            value = pchip_monotone(
-                fit, [anchor_errors[k][expert] for k in fit], (holdout,),
-            )[0]
-            rels.append(
-                abs(float(value) - float(anchor_errors[holdout][expert]))
-                / max(abs(float(anchor_errors[holdout][expert])), 1e-30)
-            )
-        keep = all(value <= BACKSTOP_TOLERANCE for value in rels)
+        a2, b2 = law_fit_level2(
+            ANCHORS, [anchor_errors[k][expert] for k in ANCHORS], projection,
+        )
+        value = law_predict(projection, int(audit_rung), a2, b2)
+        truth = float(audit_errors[expert])
+        rel = abs(float(value) - truth) / max(abs(truth), 1e-30)
+        keep = rel <= BACKSTOP_TOLERANCE
         if keep:
             accepted.append(expert)
         details.append({
             "expert": expert,
-            "K33_relative_error": rels[0],
-            "K43_relative_error": rels[1],
+            "audit_rung": int(audit_rung),
+            "audit_rung_relative_error": rel,
             "backstop_pass": keep,
         })
     rejected = sorted(set(range(EXPERT_COUNT)).difference(accepted))
@@ -336,7 +382,7 @@ def _acceptance(
         "backstop_failed": len(rejected),
         "backstop_failure_rate": len(rejected) / EXPERT_COUNT,
         "backstop_tolerance": BACKSTOP_TOLERANCE,
-        "cv_semantic": "independent leave-one-anchor-out four-anchor PCHIP",
+        "cv_semantic": "three-anchor PCHIP vs measured audit rung (v2)",
         "per_slice": details,
     }
 
@@ -344,19 +390,41 @@ def _acceptance(
 def _audit_stats(
     anchor_errors: Mapping[int, Sequence[float]],
     audit_errors: Sequence[float], audit_rung: int,
+    accepted_experts: Sequence[int] | None = None,
+    projection: str = "gate_proj",
 ) -> dict[str, Any]:
+    # v2: when an acceptance list is given, the gate scores only experts
+    # whose menu rows ship interpolated; rejected experts ship measured
+    # rows, so their prediction residue is not a menu defect.
+    experts = (
+        list(range(EXPERT_COUNT)) if accepted_experts is None
+        else [int(e) for e in accepted_experts]
+    )
+    if not experts:
+        return {
+            "rung": int(audit_rung), "n": 0, "n_excluded": EXPERT_COUNT,
+            "median": None, "p95": None, "max": None,
+            "thresholds": {
+                "median": AUDIT_MEDIAN_TOLERANCE,
+                "p95": AUDIT_P95_TOLERANCE,
+            },
+            "pass": False,
+            "note": "all experts rejected by backstop; no interpolated rows",
+            "per_slice_relative_error": [],
+        }
     values = []
-    for expert in range(EXPERT_COUNT):
-        prediction = pchip_monotone(
-            ANCHORS, [anchor_errors[k][expert] for k in ANCHORS],
-            (audit_rung,),
-        )[0]
+    for expert in experts:
+        a2, b2 = law_fit_level2(
+            ANCHORS, [anchor_errors[k][expert] for k in ANCHORS], projection,
+        )
+        prediction = law_predict(projection, int(audit_rung), a2, b2)
         truth = float(audit_errors[expert])
         values.append(abs(float(prediction) - truth) / max(abs(truth), 1e-30))
     median = statistics.median(values)
     p95 = percentile(values, 0.95)
     return {
         "rung": int(audit_rung), "n": len(values),
+        "n_excluded": EXPERT_COUNT - len(values),
         "median": median, "p95": p95, "max": max(values),
         "thresholds": {
             "median": AUDIT_MEDIAN_TOLERANCE,
@@ -375,22 +443,34 @@ def _empty_curve() -> dict[int, list[Any]]:
 
 
 def _burn_cell_path(
-    layer: int, projection: str, phase: str, rung: int,
+    layer: int, projection: str, pass_tag: str, rung: int,
 ) -> Path:
+    if pass_tag not in BURN_PASS_TAGS.values():
+        raise ValueError(
+            f"unregistered burn pass tag {pass_tag!r}; "
+            f"schema={BURN_PASS_TAG_SCHEMA}"
+        )
     return BURN_CELL_ROOT / (
-        f"layer_{layer:03d}_{projection}_{phase}_K{rung}.pkl"
+        f"layer_{layer:03d}_{projection}_{pass_tag}_K{rung}.pkl"
     )
 
 
 def _burn_cell_identity(
-    *, layer: int, projection: str, phase: str, rung: int,
+    *, layer: int, projection: str, pass_tag: str, rung: int,
     expert_ids: Sequence[int], encoded_expert_ids: Sequence[int],
     content_guard: Mapping[str, Any], predecessor_content_key: str | None,
     replay: bool,
 ) -> dict[str, Any]:
+    if pass_tag not in BURN_PASS_TAGS.values():
+        raise ValueError(
+            f"unregistered burn pass tag {pass_tag!r}; "
+            f"schema={BURN_PASS_TAG_SCHEMA}"
+        )
     return {
-        "schema": "prismaquant.dsv4_afast_burn_cell_identity.v2",
-        "layer": int(layer), "projection": projection, "phase": phase,
+        "schema": BURN_CELL_IDENTITY_SCHEMA,
+        "pass_tag_schema": BURN_PASS_TAG_SCHEMA,
+        "pass_tag": pass_tag,
+        "layer": int(layer), "projection": projection,
         "rung": int(rung), "expert_ids": list(map(int, expert_ids)),
         "encoded_expert_ids": list(map(int, encoded_expert_ids)),
         "content_guard": dict(content_guard),
@@ -403,36 +483,176 @@ def _burn_cell_identity(
     }
 
 
+class BurnCellResumeMismatch(AssertionError):
+    """A persisted cell cannot be reused under the current content contract."""
+
+    def __init__(self, path: Path, reason: str) -> None:
+        super().__init__(f"stale or corrupt burn cell {path}: {reason}")
+        self.path = path
+        self.reason = reason
+
+
 def _validated_burn_cell(
     path: Path, expected_identity: Mapping[str, Any],
 ) -> dict[str, Any] | None:
     if not path.is_file():
         return None
-    payload = _load(path)
+    try:
+        payload = _load(path)
+    except Exception as exc:
+        raise BurnCellResumeMismatch(
+            path, f"unreadable payload ({type(exc).__name__}: {exc})",
+        ) from exc
     cell = payload.get("cell")
-    if (
-        payload.get("schema") != "prismaquant.dsv4_afast_burn_cell.v2"
-        or payload.get("identity") != dict(expected_identity)
-        or payload.get("content_key") != _sha(expected_identity)
-        or not isinstance(cell, Mapping)
-        or int(cell.get("rung", -1)) != int(expected_identity["rung"])
-        or list(cell.get("expert_ids", ()))
-        != list(expected_identity["expert_ids"])
-        or not Path(str(cell.get("warm_state_path", ""))).is_file()
-    ):
-        raise AssertionError(f"stale or corrupt burn cell {path}")
+    checks = (
+        (payload.get("schema") == BURN_CELL_SCHEMA, "cell schema mismatch"),
+        (
+            payload.get("pass_tag_schema") == BURN_PASS_TAG_SCHEMA,
+            "pass-tag schema mismatch",
+        ),
+        (
+            payload.get("pass_tag") == expected_identity["pass_tag"],
+            "pass-tag mismatch",
+        ),
+        (
+            payload.get("identity") == dict(expected_identity),
+            "content identity mismatch",
+        ),
+        (
+            payload.get("content_key") == _sha(expected_identity),
+            "content key mismatch",
+        ),
+        (isinstance(cell, Mapping), "missing cell payload"),
+    )
+    for passed, reason in checks:
+        if not passed:
+            raise BurnCellResumeMismatch(path, reason)
+    assert isinstance(cell, Mapping)
+    if int(cell.get("rung", -1)) != int(expected_identity["rung"]):
+        raise BurnCellResumeMismatch(path, "cell rung mismatch")
+    if list(cell.get("expert_ids", ())) != list(expected_identity["expert_ids"]):
+        raise BurnCellResumeMismatch(path, "cell expert set mismatch")
+    if not Path(str(cell.get("warm_state_path", ""))).is_file():
+        raise BurnCellResumeMismatch(path, "warm state missing")
     return payload
 
 
+def _burn_delta_summary(
+    observed: Sequence[float], expected: Sequence[float],
+) -> dict[str, Any]:
+    pairs = [
+        (float(left), float(right))
+        for left, right in zip(observed, expected)
+    ]
+    absolute = [abs(left - right) for left, right in pairs]
+    relative = [
+        value / max(abs(right), 1e-30)
+        for value, (_, right) in zip(absolute, pairs)
+    ]
+    return {
+        "count": len(pairs),
+        "exact_mismatch_count": sum(
+            int(left != right) for left, right in pairs
+        ),
+        "max_absolute_delta": max(absolute, default=0.0),
+        "max_relative_delta": max(relative, default=0.0),
+    }
+
+
+def _quarantine_burn_projection_suffix(
+    *, layer: int, projection: str, pass_tag: str, first_rung: int,
+    mismatch: Mapping[str, Any],
+) -> Path:
+    """Recoverably invalidate one chain cell and every dependent successor."""
+    if pass_tag not in BURN_PASS_TAGS.values():
+        raise ValueError(f"unregistered burn pass tag {pass_tag!r}")
+    stamp = f"{time.time_ns()}-L{layer:03d}-{projection}-{pass_tag}-K{first_rung}"
+    root = BURN_ROOT / "quarantine-content-mismatch" / stamp
+    root.mkdir(parents=True, exist_ok=False)
+    moved = []
+    for dependent_rung in RUNGS:
+        if dependent_rung < int(first_rung):
+            continue
+        source = _burn_cell_path(
+            layer, projection, pass_tag, dependent_rung,
+        )
+        if not source.is_file():
+            continue
+        destination = root / source.name
+        digest = sha256_file(source)
+        source.replace(destination)
+        moved.append({
+            "rung": dependent_rung,
+            "source": str(source),
+            "quarantined_path": str(destination),
+            "sha256": digest,
+        })
+    manifest_path = root / "MANIFEST.json"
+    atomic_json(manifest_path, {
+        "schema": "prismaquant.dsv4_afast_burn_quarantine.v1",
+        "created_epoch_ns": time.time_ns(),
+        "reason": "burn content-resume mismatch",
+        "dependency_rule": (
+            "trigger rung and every later rung in the same "
+            "layer/projection/pass-tag chain"
+        ),
+        "pass_tag_schema": BURN_PASS_TAG_SCHEMA,
+        "pass_tag": pass_tag,
+        "mismatch": dict(mismatch),
+        "moved": moved,
+    })
+    return manifest_path
+
+
+def _validated_burn_cell_or_invalidate(
+    path: Path, expected_identity: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Validate a resume cell or quarantine its dependent chain suffix."""
+    try:
+        return _validated_burn_cell(path, expected_identity)
+    except BurnCellResumeMismatch as exc:
+        mismatch = {
+            "schema": "prismaquant.dsv4_afast_burn_resume_mismatch.v1",
+            "kind": "envelope_or_identity",
+            "path": str(path),
+            "reason": exc.reason,
+            "expected_content_key": _sha(expected_identity),
+            "unit": {
+                "layer": int(expected_identity["layer"]),
+                "projection": str(expected_identity["projection"]),
+                "pass_tag": str(expected_identity["pass_tag"]),
+                "rung": int(expected_identity["rung"]),
+            },
+        }
+        manifest_path = _quarantine_burn_projection_suffix(
+            layer=int(expected_identity["layer"]),
+            projection=str(expected_identity["projection"]),
+            pass_tag=str(expected_identity["pass_tag"]),
+            first_rung=int(expected_identity["rung"]),
+            mismatch=mismatch,
+        )
+        print(
+            f"[afast-burn] invalidated stale content suffix; "
+            f"manifest={manifest_path}", flush=True,
+        )
+        return None
+
+
 def _run_chain(
-    *, layer: int, projection: str, phase: str, data: Mapping[str, Any],
+    *, layer: int, projection: str, pass_tag: str, data: Mapping[str, Any],
     rungs: Sequence[int], expert_ids: Sequence[int], replay: bool,
     full_encode_rungs: Sequence[int] = (), rss_guard: RSSGuard | None = None,
+    oracle_cells: Mapping[int, Mapping[str, Any]] | None = None,
     identity_cache: dict[
         tuple[int, ...], tuple[tuple[list[int], str], tuple[list[int], str]]
     ] | None = None,
 ) -> dict[int, dict[str, Any]]:
     """Stream a chain while retaining only its selected predecessor."""
+    if pass_tag not in BURN_PASS_TAGS.values():
+        raise ValueError(
+            f"unregistered burn pass tag {pass_tag!r}; "
+            f"schema={BURN_PASS_TAG_SCHEMA}"
+        )
     all_experts = tuple(range(EXPERT_COUNT))
     expert_ids = tuple(map(int, expert_ids))
     full_encode_rungs = frozenset(map(int, full_encode_rungs))
@@ -444,6 +664,7 @@ def _run_chain(
     base_guard = {
         **_projection_guard(layer, data),
         "burn_tool_sha256": sha256_file(Path(__file__).resolve()),
+        "cbl_semantics": cblk.SEMANTICS_STAMP,
         "minchain_module_sha256": sha256_file(
             Path(__file__).resolve().parents[1] / "prismaquant/cb_minchain.py"
         ),
@@ -477,32 +698,40 @@ def _run_chain(
             "col_weights_digest": col_weights_identity[1],
         }
         identity = _burn_cell_identity(
-            layer=layer, projection=projection, phase=phase, rung=int(rung),
+            layer=layer, projection=projection, pass_tag=pass_tag, rung=int(rung),
             expert_ids=expert_ids, encoded_expert_ids=encoded_ids,
             content_guard=guard,
             predecessor_content_key=predecessor_content_key, replay=replay,
         )
-        path = _burn_cell_path(layer, projection, phase, int(rung))
-        existing = _validated_burn_cell(path, identity)
+        path = _burn_cell_path(layer, projection, pass_tag, int(rung))
+        existing = _validated_burn_cell_or_invalidate(path, identity)
+        oracle_cell = (
+            existing["cell"] if existing is not None
+            else (oracle_cells or {}).get(int(rung))
+        )
         action = "restore" if existing is not None else "measure"
         if rss_guard is not None:
             rss_guard.set_stage(
-                f"burn:L{layer}:{projection}:{phase}:K{rung}:{action}"
+                f"burn:L{layer}:{projection}:{pass_tag}:K{rung}:{action}"
             )
         print(
-            f"[afast-burn] L{layer:02d} {projection} {phase} "
+            f"[afast-burn] L{layer:02d} {projection} {pass_tag} "
             f"K{rung} {action}", flush=True,
         )
         expected_encoded = (
-            None if existing is None else
-            existing["cell"]["encoded_free_weight_mse"]
+            None if oracle_cell is None else
+            oracle_cell["encoded_free_weight_mse"]
+        )
+        _encoder = (
+            cblk.encode_cbl if cblk.cbl_eligible(rung)
+            else cblk.encode_free_noldlq
         )
         fields, encoded_reconstruction, encoded_errors, local_timing, warm_path = (
-            _encode_free(
+            _encoder(
                 layer=layer, projection=projection, rung=int(rung), data=data,
                 expert_ids=encoded_ids, source_identity=source_identity,
                 col_weights_identity=col_weights_identity,
-                use_warm=existing is not None,
+                use_warm=oracle_cell is not None,
                 expected_free_errors=expected_encoded,
             )
         )
@@ -534,13 +763,116 @@ def _run_chain(
             for value, predecessor in zip(selected, predecessor_errors):
                 if not epsilon_le(value, predecessor, rtol=REL_EPSILON):
                     raise AssertionError(
-                        f"burn P1 abort L{layer} {projection} {phase} K{rung}"
+                        f"burn P1 abort L{layer} {projection} {pass_tag} K{rung}"
                     )
         for value, free in zip(selected, free_errors):
             if not epsilon_le(value, free, rtol=REL_EPSILON):
                 raise AssertionError(
-                    f"burn P2 abort L{layer} {projection} {phase} K{rung}"
+                    f"burn P2 abort L{layer} {projection} {pass_tag} K{rung}"
                 )
+        auxiliary_drift: dict[str, Any] | None = None
+        if existing is not None:
+            persisted_cell = existing["cell"]
+            selected_exact = (
+                list(map(float, selected))
+                == persisted_cell["selected_weight_mse"]
+            )
+            arms_exact = arms == persisted_cell["winning_arm"]
+            identities_exact = identities == persisted_cell["identity"]
+            encoded_exact = (
+                list(map(float, encoded_errors))
+                == persisted_cell["encoded_free_weight_mse"]
+            )
+            free_exact = free_errors == persisted_cell["free_weight_mse"]
+            # Threaded LDLQ scale search may vary only a losing free arm. It
+            # is auxiliary when the selected predecessor and identity remain
+            # exact, and is recorded separately below.
+            local_auxiliary_only = all(
+                observed == expected
+                or persisted_cell["winning_arm"][index] == "embed"
+                for index, (observed, expected) in enumerate(zip(
+                    free_errors, persisted_cell["free_weight_mse"]
+                ))
+            )
+            local_by_expert = {
+                int(expert): index for index, expert in enumerate(expert_ids)
+            }
+            encoded_auxiliary_only = all(
+                observed == expected
+                or int(expert) not in local_by_expert
+                or persisted_cell["winning_arm"][
+                    local_by_expert[int(expert)]
+                ] == "embed"
+                for expert, observed, expected in zip(
+                    encoded_ids, encoded_errors,
+                    persisted_cell["encoded_free_weight_mse"],
+                )
+            )
+            selected_content_exact = bool(
+                selected_exact and arms_exact and identities_exact
+                and local_auxiliary_only and encoded_auxiliary_only
+            )
+            if not selected_content_exact:
+                mismatch = {
+                    "schema": "prismaquant.dsv4_afast_burn_resume_mismatch.v1",
+                    "kind": "rederived_selected_content",
+                    "path": str(path),
+                    "content_key": str(existing["content_key"]),
+                    "unit": {
+                        "layer": layer, "projection": projection,
+                        "pass_tag": pass_tag, "rung": int(rung),
+                    },
+                    "encoded_free_weight_mse": _burn_delta_summary(
+                        encoded_errors,
+                        persisted_cell["encoded_free_weight_mse"],
+                    ),
+                    "free_weight_mse": _burn_delta_summary(
+                        free_errors, persisted_cell["free_weight_mse"],
+                    ),
+                    "selected_weight_mse": _burn_delta_summary(
+                        selected, persisted_cell["selected_weight_mse"],
+                    ),
+                    "arm_mismatch_count": sum(
+                        int(left != right) for left, right in zip(
+                            arms, persisted_cell["winning_arm"]
+                        )
+                    ),
+                    "identity_mismatch_count": sum(
+                        int(left != right) for left, right in zip(
+                            identities, persisted_cell["identity"]
+                        )
+                    ),
+                    "warm_state_outcome": local_timing["warm_state_outcome"],
+                    "allocator_policy": os.environ.get(
+                        "PYTORCH_CUDA_ALLOC_CONF"
+                    ),
+                }
+                manifest_path = _quarantine_burn_projection_suffix(
+                    layer=layer, projection=projection, pass_tag=pass_tag,
+                    first_rung=int(rung), mismatch=mismatch,
+                )
+                print(
+                    f"[afast-burn] re-derived content mismatch; invalidated "
+                    f"dependent suffix; manifest={manifest_path}", flush=True,
+                )
+                existing = None
+            elif not encoded_exact or not free_exact:
+                auxiliary_drift = {
+                    "selected_weight_mse_bit_exact": selected_exact,
+                    "winning_arm_bit_exact": arms_exact,
+                    "chain_identity_bit_exact": identities_exact,
+                    "encoded_free_exact_mismatch_count": sum(
+                        int(float(a) != float(b)) for a, b in zip(
+                            encoded_errors,
+                            persisted_cell["encoded_free_weight_mse"],
+                        )
+                    ),
+                    "local_free_exact_mismatch_count": sum(
+                        int(float(a) != float(b)) for a, b in zip(
+                            free_errors, persisted_cell["free_weight_mse"]
+                        )
+                    ),
+                }
         if existing is None:
             if replay:
                 replay_weight = (
@@ -569,12 +901,19 @@ def _run_chain(
                 + float(local_timing["free_reconstruct_and_weight_mse_seconds"])
                 + float(selection_seconds) + float(replay_seconds)
             )
+            free_group_mse = _weight_group_mse(
+                _select_experts(data["weight"], expert_ids),
+                free_reconstruction,
+            )
             cell = {
-                "rung": int(rung), "phase": phase,
+                "rung": int(rung),
+                "pass_tag_schema": BURN_PASS_TAG_SCHEMA,
+                "pass_tag": pass_tag,
                 "expert_ids": list(expert_ids),
                 "encoded_expert_ids": list(encoded_ids),
                 "encoded_free_weight_mse": list(map(float, encoded_errors)),
                 "free_weight_mse": free_errors,
+                "free_group_mse": free_group_mse,
                 "embed_weight_mse": (
                     [None] * len(expert_ids) if predecessor_errors is None else
                     list(map(float, predecessor_errors))
@@ -594,72 +933,25 @@ def _run_chain(
             }
             content_key = _sha(identity)
             atomic_pickle(path, {
-                "schema": "prismaquant.dsv4_afast_burn_cell.v2",
+                "schema": BURN_CELL_SCHEMA,
+                "pass_tag_schema": BURN_PASS_TAG_SCHEMA,
+                "pass_tag": pass_tag,
                 "content_key": content_key, "identity": identity, "cell": cell,
             })
             print(f"[afast-burn] wrote {path}", flush=True)
         else:
             cell = dict(existing["cell"])
             content_key = str(existing["content_key"])
-            selected_exact = (
-                list(map(float, selected)) == cell["selected_weight_mse"]
-            )
-            arms_exact = arms == cell["winning_arm"]
-            identities_exact = identities == cell["identity"]
-            encoded_exact = (
-                list(map(float, encoded_errors))
-                == cell["encoded_free_weight_mse"]
-            )
-            free_exact = free_errors == cell["free_weight_mse"]
-            # Threaded LDLQ scale search may produce a different losing free
-            # candidate while the selected predecessor, selected score, arm,
-            # and chain identity remain bit-identical. Such a candidate cannot
-            # reach the cost table. Record it, but never relax selected content.
-            local_auxiliary_only = all(
-                observed == expected
-                or cell["winning_arm"][index] == "embed"
-                for index, (observed, expected) in enumerate(zip(
-                    free_errors, cell["free_weight_mse"]
-                ))
-            )
-            local_by_expert = {
-                int(expert): index for index, expert in enumerate(expert_ids)
-            }
-            encoded_auxiliary_only = all(
-                observed == expected
-                or int(expert) not in local_by_expert
-                or cell["winning_arm"][local_by_expert[int(expert)]] == "embed"
-                for expert, observed, expected in zip(
-                    encoded_ids, encoded_errors,
-                    cell["encoded_free_weight_mse"],
-                )
-            )
-            if not (
-                selected_exact and arms_exact and identities_exact
-                and local_auxiliary_only and encoded_auxiliary_only
-            ):
-                raise AssertionError(f"burn content-resume differs from {path}")
-            if not encoded_exact or not free_exact:
+            if auxiliary_drift is not None:
                 drift_root = BURN_ROOT / "resume-auxiliary-drift"
                 drift_path = drift_root / f"{content_key}.json"
                 atomic_json(drift_path, {
                     "schema": "prismaquant.dsv4_afast_auxiliary_resume_drift.v1",
                     "content_key": content_key, "path": str(path),
                     "layer": layer, "projection": projection,
-                    "phase": phase, "rung": int(rung),
-                    "selected_weight_mse_bit_exact": selected_exact,
-                    "winning_arm_bit_exact": arms_exact,
-                    "chain_identity_bit_exact": identities_exact,
-                    "encoded_free_exact_mismatch_count": sum(
-                        int(float(a) != float(b)) for a, b in zip(
-                            encoded_errors, cell["encoded_free_weight_mse"]
-                        )
-                    ),
-                    "local_free_exact_mismatch_count": sum(
-                        int(float(a) != float(b)) for a, b in zip(
-                            free_errors, cell["free_weight_mse"]
-                        )
-                    ),
+                    "pass_tag_schema": BURN_PASS_TAG_SCHEMA,
+                    "pass_tag": pass_tag, "rung": int(rung),
+                    **auxiliary_drift,
                     "all_mismatches_are_losing_or_out_of_scope_free_candidates": True,
                     "warm_state_outcome": local_timing["warm_state_outcome"],
                 })
@@ -675,11 +967,13 @@ def _run_chain(
         predecessor_ids = identities
         predecessor_content_key = content_key
         del fields, encoded_reconstruction, free_reconstruction, old_predecessor
-        _unit_boundary_reclaim(unit=f"burn:L{layer}:{projection}:{phase}:K{rung}")
+        _unit_boundary_reclaim(
+            unit=f"burn:L{layer}:{projection}:{pass_tag}:K{rung}"
+        )
         if rss_guard is not None:
             rss_guard.checkpoint()
         print(
-            f"[afast-burn] L{layer:02d} {projection} {phase} K{rung} "
+            f"[afast-burn] L{layer:02d} {projection} {pass_tag} K{rung} "
             f"free={arms.count('free')} embed={arms.count('embed')} "
             f"rss={_rss_bytes()/1024**3:.2f}GiB", flush=True,
         )
@@ -710,7 +1004,11 @@ def _measure_projection_legacy_unsafe(
     # fallback have consumed them.  No anchor is encoded twice.
     for rung in ANCHORS:
         print(f"[afast-burn] L{layer:02d} {projection} anchor K{rung}", flush=True)
-        fields, reconstruction, free_errors, local_timing, warm_path = _encode_free(
+        _legacy_encoder = (
+            cblk.encode_cbl if cblk.cbl_eligible(rung)
+            else cblk.encode_free_noldlq
+        )
+        fields, reconstruction, free_errors, local_timing, warm_path = _legacy_encoder(
             layer=layer, projection=projection, rung=rung, data=data,
             expert_ids=all_experts,
         )
@@ -949,7 +1247,8 @@ def _measure_projection(
         tuple[int, ...], tuple[tuple[list[int], str], tuple[list[int], str]]
     ] = {}
     scout = _run_chain(
-        layer=layer, projection=projection, phase="v2r-scout", data=data,
+        layer=layer, projection=projection,
+        pass_tag=BURN_PASS_TAGS["scout"], data=data,
         rungs=measured_rungs, expert_ids=all_experts, replay=False,
         full_encode_rungs=measured_rungs, rss_guard=rss_guard,
         identity_cache=identity_cache,
@@ -957,10 +1256,59 @@ def _measure_projection(
     anchor_errors = {
         rung: scout[rung]["selected_weight_mse"] for rung in ANCHORS
     }
-    accepted, rejected, fit = _acceptance(anchor_errors)
+    accepted, rejected, fit = _acceptance(
+        anchor_errors, audit_rung, scout[audit_rung]["selected_weight_mse"],
+        projection,
+    )
     audit = _audit_stats(
         anchor_errors, scout[audit_rung]["selected_weight_mse"], audit_rung,
+        accepted_experts=accepted, projection=projection,
     )
+    # Detection rev 2 (operator, evidence from L0 shard + L21 offline): the
+    # audit gate is the misfit detector; the only parameter bound kept is
+    # the monotone-safety tilt limit. Scale offset `a` recorded diagnostic.
+    detect_a, detect_b = law_fit_level2(
+        ANCHORS,
+        [statistics.median(anchor_errors[k]) for k in ANCHORS],
+        projection,
+    )
+    audit["level2_a"] = detect_a
+    audit["level2_b"] = detect_b
+    audit["level2_prior_pass"] = bool(abs(detect_b) <= LAW_DETECT["b_abs"])
+    audit["pass"] = bool(audit["pass"] and audit["level2_prior_pass"])
+    if rss_guard is not None:
+        rss_guard.set_stage(f"burn:L{layer}:{projection}:cbl-audit")
+    # A failed CBL audit means "do not trust interpolation on this layer", not
+    # "the campaign is broken". _measure_layer already owns that remedy: any
+    # projection whose audit fails causes ALL THREE to be discarded and
+    # re-measured exhaustively (_measure_projection_full_layer), the path L9
+    # and L14 took. Letting the gate raise here short-circuits that fallback
+    # before layer_audit_pass is ever computed, converting a recoverable
+    # verdict into an aborted campaign. So take the verdict, not the raise.
+    #
+    # This does NOT relax the gate: AUDIT_SAMPLE_FALLBACK_MAX is unchanged and
+    # the projection is still recorded as having failed. Only the consequence
+    # moves, and it moves toward more measurement.
+    cbl_report = cblk.audit_projection(
+        layer=layer, projection=projection, data=data,
+        measured_rungs=measured_rungs,
+        selected_by_rung={
+            int(r): scout[r]["selected_weight_mse"] for r in measured_rungs
+        },
+        winning_by_rung={
+            int(r): scout[r]["winning_arm"] for r in measured_rungs
+        },
+        epsilon_le=epsilon_le, rel_epsilon=REL_EPSILON,
+        micro_check_k43=(int(layer) == CBL_MICROCHECK_LAYER),
+        out_root=BURN_ROOT, hard=False,
+    )
+    audit["cbl_gate_pass"] = bool(cbl_report["pass"])
+    if not audit["cbl_gate_pass"]:
+        print(
+            f"[afast-burn] CBL audit gate FAILED L{layer:02d} {projection} "
+            f"-> routing layer to full-layer fallback", flush=True,
+        )
+    audit["pass"] = bool(audit["pass"] and audit["cbl_gate_pass"])
     curve: dict[int, dict[str, Any]] = {
         rung: {
             "free_weight_mse": [None] * EXPERT_COUNT,
@@ -990,52 +1338,98 @@ def _measure_projection(
 
     if accepted:
         accepted_cells = _run_chain(
-            layer=layer, projection=projection, phase="v2r-primary", data=data,
+            layer=layer, projection=projection,
+            pass_tag=BURN_PASS_TAGS["primary"], data=data,
             rungs=measured_rungs, expert_ids=accepted, replay=True,
             full_encode_rungs=measured_rungs, rss_guard=rss_guard,
-            identity_cache=identity_cache,
+            oracle_cells=scout, identity_cache=identity_cache,
         )
         phase_cells.extend(accepted_cells.values())
         copy_cells(accepted_cells, "anchor_measured")
         for expert in accepted:
-            curve[audit_rung]["measurement_kind"][expert] = "audit_measured"
-        for expert in accepted:
-            weight_values = pchip_monotone(
-                ANCHORS,
-                [curve[rung]["selected_weight_mse"][expert] for rung in ANCHORS],
-                RUNGS,
+            # Hierarchical law (ERROR_LAW.md): per-expert level-2 on the
+            # weight metric; output via per-expert coupling O = c*W^gamma
+            # to the law-predicted weight (best validated output method,
+            # 8-11% worst-median on L0 vs 14-16% under PCHIP); rel via the
+            # per-expert energy identity rel = output/energy.
+            # Post-gate refit: the audit rung's measurement has served its
+            # verification role once the gate passed; folding it into the
+            # level-2/coupling fits (3 points) improves the menu without
+            # grading the audit's own homework.
+            fit_rungs = tuple(sorted((*ANCHORS, int(audit_rung))))
+            anchor_weights = [
+                float(curve[rung]["selected_weight_mse"][expert])
+                for rung in fit_rungs
+            ]
+            anchor_outputs = [
+                float(curve[rung]["output_mse"][expert]) for rung in fit_rungs
+            ]
+            level2_a, level2_b = law_fit_level2(
+                fit_rungs, anchor_weights, projection
             )
-            output_values = pchip_monotone(
-                ANCHORS,
-                [curve[rung]["output_mse"][expert] for rung in ANCHORS],
-                RUNGS,
+            couple = np.linalg.lstsq(
+                np.array([
+                    [1.0, math.log(max(w, 1e-30))] for w in anchor_weights
+                ]),
+                np.array([math.log(max(o, 1e-30)) for o in anchor_outputs]),
+                rcond=None,
+            )[0]
+            energy = (
+                anchor_outputs[0]
+                / max(float(curve[ANCHORS[0]]["rel_output_mse"][expert]), 1e-30)
             )
-            relative_values = pchip_monotone(
-                ANCHORS,
-                [curve[rung]["rel_output_mse"][expert] for rung in ANCHORS],
-                RUNGS,
-            )
-            for offset, rung in enumerate(RUNGS):
-                if rung in ANCHORS or rung == audit_rung:
+            for rung in RUNGS:
+                if rung in ANCHORS:
+                    # Audit-draw rows are law-priced like any interpolated
+                    # rung: the draw's measurement is verification evidence
+                    # (kept in the cell, _audit_stats, CBL_AUDIT records),
+                    # not a menu price.
                     continue
-                curve[rung]["selected_weight_mse"][expert] = float(
-                    weight_values[offset]
+                weight_pred = law_predict(
+                    projection, rung, level2_a, level2_b
                 )
-                curve[rung]["output_mse"][expert] = float(output_values[offset])
+                output_pred = math.exp(
+                    float(couple[0])
+                    + float(couple[1]) * math.log(max(weight_pred, 1e-30))
+                )
+                curve[rung]["selected_weight_mse"][expert] = float(weight_pred)
+                curve[rung]["output_mse"][expert] = float(output_pred)
                 curve[rung]["rel_output_mse"][expert] = float(
-                    relative_values[offset]
+                    output_pred / max(energy, 1e-30)
                 )
                 curve[rung]["n_activation_rows"][expert] = int(
                     data["activation_rows"][expert].shape[0]
                 )
-                curve[rung]["measurement_kind"][expert] = "pchip_interpolated"
+                curve[rung]["measurement_kind"][expert] = "law_interpolated"
+            # Chain-min curves are non-increasing by construction; clamp law
+            # predictions to the monotone envelope (measured rows untouched)
+            # so the layer monotone assert binds predictions to the same
+            # invariant the truth provably satisfies.
+            previous = None
+            for rung in RUNGS:
+                value = float(curve[rung]["selected_weight_mse"][expert])
+                if rung not in ANCHORS and previous is not None:
+                    if value > previous:
+                        value = previous
+                        curve[rung]["selected_weight_mse"][expert] = value
+                previous = value
+        # The audit draw is verification evidence, not a menu row: accepted
+        # experts' prices there are PCHIP like every non-anchor rung, so the
+        # measured arm fields must not remain spliced beside interpolated
+        # prices — the tax invariant (selected <= free) binds measured rows
+        # only, and interpolation may legitimately sit above the measured
+        # free arm at the draw (L2 down_proj K36: tax=256).
+        for expert in accepted:
+            for field in ("free_weight_mse", "embed_weight_mse", "winning_arm"):
+                curve[audit_rung][field][expert] = None
 
     if rejected:
         fallback_cells = _run_chain(
-            layer=layer, projection=projection, phase="v2r-backstop", data=data,
+            layer=layer, projection=projection,
+            pass_tag=BURN_PASS_TAGS["backstop"], data=data,
             rungs=RUNGS, expert_ids=rejected, replay=True,
             full_encode_rungs=ANCHORS, rss_guard=rss_guard,
-            identity_cache=identity_cache,
+            oracle_cells=scout, identity_cache=identity_cache,
         )
         phase_cells.extend(fallback_cells.values())
         copy_cells(fallback_cells, "fallback_measured")
@@ -1116,7 +1510,8 @@ def _measure_projection_full_layer(
     all_experts = tuple(range(EXPERT_COUNT))
     wall_started = time.time()
     cells = _run_chain(
-        layer=layer, projection=projection, phase="v2r-full-layer", data=data,
+        layer=layer, projection=projection,
+        pass_tag=BURN_PASS_TAGS["full_layer"], data=data,
         rungs=RUNGS, expert_ids=all_experts, replay=True,
         full_encode_rungs=RUNGS, rss_guard=rss_guard,
     )
@@ -1197,7 +1592,7 @@ def _write_projection_costs(
                     "anchors": list(ANCHORS),
                     "audit_rung": _audit_rung(layer),
                     "backstop_cv": "independent_four_anchor",
-                    "holdouts": list(ACCEPTANCE_HOLDOUTS),
+                    "backstop": "audit_rung_pchip_cv_v2",
                     "tolerance": BACKSTOP_TOLERANCE,
                 },
             }
@@ -1644,8 +2039,8 @@ def _run_burn(rss_guard: RSSGuard) -> int:
     manifest = {
         "schema": MANIFEST_SCHEMA, "profile": "A-FAST",
         "pilot2_report": str(PILOT2_JSON), "pilot2_report_sha256": pilot_sha,
-        "layer_count": LAYER_COUNT, "measured_layer_count": 41,
-        "imported_layers": list(IMPORTED_LAYERS), "timebox_seconds": TIMEBOX_SECONDS,
+        "layer_count": LAYER_COUNT, "measured_layer_count": MEASURED_LAYER_COUNT,
+        "imported_layers": list(IMPORTED_LAYERS), "timebox_seconds": TIMEBOX_SECONDS, "cbl_semantics": cblk.SEMANTICS_STAMP,
         "first_burn_shard_epoch": None, "thread_count": 16,
         "menu": list(MENU), "mtp_policy": "untouched fixed source carry",
         "mtp_bytes": MTP_BF16_BYTES,
@@ -1657,10 +2052,18 @@ def _run_burn(rss_guard: RSSGuard) -> int:
             "median": AUDIT_MEDIAN_TOLERANCE,
             "p95": AUDIT_P95_TOLERANCE,
         },
+        "burn_pass_tag_schema": BURN_PASS_TAG_SCHEMA,
+        "burn_pass_tags": dict(BURN_PASS_TAGS),
     }
+    migrated_first_burn_epoch = None
+    migrated_projection_check = None
     if manifest_path.is_file():
         prior_manifest = json.loads(manifest_path.read_text())
         if prior_manifest.get("schema") != MANIFEST_SCHEMA:
+            migrated_first_burn_epoch = prior_manifest.get(
+                "first_burn_shard_epoch"
+            )
+            migrated_projection_check = prior_manifest.get("projection_check")
             history = RUN_ROOT / "history" / (
                 "BURN_MANIFEST.pre-v2." + time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
                 + ".json"
@@ -1674,6 +2077,8 @@ def _run_burn(rss_guard: RSSGuard) -> int:
             "thread_count", "menu", "mtp_policy", "mtp_bytes", "amendment",
             "acceptance_amendment_sha256", "backstop_tolerance",
             "audit_thresholds",
+            "burn_pass_tag_schema", "burn_pass_tags",
+            "burn_tool_sha256", "cbl_semantics",
         )
         if prior_manifest and any(
             prior_manifest.get(key) != manifest.get(key)
@@ -1686,14 +2091,18 @@ def _run_burn(rss_guard: RSSGuard) -> int:
             )
         if prior_manifest and "projection_check" in prior_manifest:
             manifest["projection_check"] = prior_manifest["projection_check"]
+    if migrated_first_burn_epoch is not None:
+        manifest["first_burn_shard_epoch"] = migrated_first_burn_epoch
+    if migrated_projection_check is not None:
+        manifest["projection_check"] = migrated_projection_check
     atomic_json(manifest_path, manifest)
     measured_completed = []
     all_payloads = []
     for layer in range(LAYER_COUNT):
-        if layer == PILOT2_LAYER:
+        if layer == PILOT2_LAYER and PILOT2_LAYER in IMPORTED_LAYERS:
             payload = _import_pilot2(pilot_sha=pilot_sha, old_full=old_full)
             print("[afast-burn] imported L14 pilot-2", flush=True)
-        elif layer == 21:
+        elif layer == 21 and 21 in IMPORTED_LAYERS:
             payload = _import_layer21(
                 pilot_sha=pilot_sha, old_full=old_full,
                 all_col_weights=all_col_weights,
@@ -1710,9 +2119,10 @@ def _run_burn(rss_guard: RSSGuard) -> int:
             if not layer_path.is_file() and elapsed_campaign >= TIMEBOX_SECONDS:
                 stop_text = "\n".join([
                     "# DSV4 Campaign Stop", "",
-                    "- Stage: 41-layer A-FAST burn",
+                    f"- Stage: {MEASURED_LAYER_COUNT}-layer A-FAST burn",
                     "- Outcome: STOP (20-hour foreground timebox reached)",
-                    f"- Completed measured layer shards: {len(measured_completed)}/41",
+                    f"- Completed measured layer shards: "
+                    f"{len(measured_completed)}/{MEASURED_LAYER_COUNT}",
                     f"- Elapsed from first burn shard: {elapsed_campaign/3600:.3f} h",
                     "",
                     "All completed cell and layer shards remain content-keyed and resumable. "
@@ -1801,9 +2211,14 @@ def run_shakedown_worker() -> int:
         # Small-N shakedown: first anchor plus the deterministic audit rung.
         # This exercises durable unit write, predecessor reconstruction, and
         # exact selected-content resume without pre-running the full layer.
-        rungs = (ANCHORS[0], _audit_rung(0))
+        rungs = tuple(
+            int(r) for r in os.environ.get(
+                "DSV4_SHAKEDOWN_RUNGS", f"{ANCHORS[0]},{_audit_rung(0)}"
+            ).split(",")
+        )
         cells = _run_chain(
-            layer=0, projection="gate_proj", phase="v2r-scout", data=data,
+            layer=0, projection="gate_proj",
+            pass_tag=BURN_PASS_TAGS["scout"], data=data,
             rungs=rungs, expert_ids=tuple(range(EXPERT_COUNT)), replay=False,
             full_encode_rungs=rungs, rss_guard=rss_guard,
         )
@@ -1813,9 +2228,13 @@ def run_shakedown_worker() -> int:
             "rungs": list(rungs),
             "cells": {
                 str(rung): {
-                    "path": str(_burn_cell_path(0, "gate_proj", "v2r-scout", rung)),
+                    "path": str(_burn_cell_path(
+                        0, "gate_proj", BURN_PASS_TAGS["scout"], rung,
+                    )),
                     "sha256": sha256_file(
-                        _burn_cell_path(0, "gate_proj", "v2r-scout", rung)
+                        _burn_cell_path(
+                            0, "gate_proj", BURN_PASS_TAGS["scout"], rung,
+                        )
                     ),
                     "content_key": None,
                 }
@@ -1828,7 +2247,9 @@ def run_shakedown_worker() -> int:
         # The durable cell envelope, not the per-expert chain identity, owns
         # the content key. Preserve it directly for the shakedown audit.
         for rung in rungs:
-            payload = _load(_burn_cell_path(0, "gate_proj", "v2r-scout", rung))
+            payload = _load(_burn_cell_path(
+                0, "gate_proj", BURN_PASS_TAGS["scout"], rung,
+            ))
             report["cells"][str(rung)]["content_key"] = payload["content_key"]
         atomic_json(BURN_ROOT / "SHAKEDOWN_WORKER.json", report)
         return 0

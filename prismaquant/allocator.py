@@ -3652,15 +3652,30 @@ def main():
                 ),
                 "target_profile": target_profile,
                 "assignment": dict(sorted(assignment.items())),
+                # Two independent facts, so two independent guards. A CB
+                # assignment always carries per-tensor serialized identities,
+                # but it carries a render identity only when the cost table had
+                # a validated one to project from: under
+                # ``--accept-research-cost-table``
+                # ``_cb_render_identity_for_assignment`` deliberately returns
+                # None rather than fabricate one (see its comment), and
+                # ``cb_cost_render_identity`` is never assigned on that path at
+                # all. Gating the render-identity fields on the *identities*
+                # field therefore KeyErrors on every research-cost run that
+                # writes a Pareto point with any CB format. The final-assignment
+                # writer already guards on the render identity itself; this
+                # makes the Pareto writer agree with it.
+                **({
+                    CB_ASSIGNMENT_IDENTITIES_FIELD: dict(sorted(
+                        record.get(CB_ASSIGNMENT_IDENTITIES_FIELD, {}).items()
+                    )),
+                } if record.get(CB_ASSIGNMENT_IDENTITIES_FIELD) else {}),
                 **({
                     "cb_serialized_payload": record[
                         "cb_render_identity"
                     ]["cb_serialized_payload"],
-                    CB_ASSIGNMENT_IDENTITIES_FIELD: dict(sorted(
-                        record.get(CB_ASSIGNMENT_IDENTITIES_FIELD, {}).items()
-                    )),
                     "cb_render_identity": record["cb_render_identity"],
-                } if record.get(CB_ASSIGNMENT_IDENTITIES_FIELD) else {}),
+                } if record.get("cb_render_identity") is not None else {}),
                 **({
                     "whole_artifact_budget": record_budget_stamp,
                 } if record_budget_stamp is not None else {}),

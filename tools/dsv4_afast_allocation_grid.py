@@ -29,6 +29,16 @@ from tools.dsv4_afast_burn import (
 
 
 GRID_ROOT = BURN_ROOT / "allocation-grid"
+# The menu the allocator consumes is `cost_merged.pkl` PLUS the dense FP8
+# completion: the 301 dense tensors carried only FP8_CB_K36, and that lone row
+# was pre-LDLQ (ldlq=False) while every routed-expert FP8_CB row and this
+# tool's own --cb-ldlq 1 stamp are ldlq=True. `cost_merged_dense_complete.pkl`
+# adds K28-K38 at ldlq=1 and supersedes the off-basis K36, closing 3010
+# coverage holes the allocator refuses to run with. It is a separate file, not
+# a patch, because `dsv4_afast_burn.py merge` regenerates cost_merged.pkl from
+# the shards and would silently revert an in-place edit.
+# See DENSE_COVERAGE_GAP.md / DENSE_FP8_COMPOSITION.json.
+COST_TABLE = BURN_ROOT / "cost_merged_dense_complete.pkl"
 PROBE = Path(
     "/home/rob/dq-runs/dsv4-flash-0731/prod-cal-0p6-v2/"
     "artifacts-mxfp4/probe.pkl"
@@ -64,7 +74,7 @@ def _cell_identity(
         "menu": list(MENU),
         "pareto_targets": PARETO_TARGETS,
         "overhead_reserve_bytes": OVERHEAD_RESERVE_BYTES,
-        "cost_sha256": sha256_file(BURN_ROOT / "cost_merged.pkl"),
+        "cost_sha256": sha256_file(COST_TABLE),
         "probe_sha256": sha256_file(PROBE),
         "source_index_sha256": sha256_file(
             SOURCE / "model.safetensors.index.json"
@@ -141,7 +151,7 @@ def _allocator_command(out: Path, solver_budget: int) -> list[str]:
     return [
         sys.executable, "-m", "prismaquant.allocator",
         "--probe", str(PROBE),
-        "--costs", str(BURN_ROOT / "cost_merged.pkl"),
+        "--costs", str(COST_TABLE),
         "--accept-research-cost-table",
         "--model-override", str(SOURCE),
         "--target-profile", "nvfp4_cb",
@@ -272,7 +282,7 @@ def _per_expert(
         )
         result = run_counterfactual(
             baseline_dir=baseline, probe_path=PROBE,
-            cost_path=BURN_ROOT / "cost_merged.pkl",
+            cost_path=COST_TABLE,
             budget_bytes=solver_budget, menu=MENU, floor_unmeasured=False,
         )
         next_sidecar = _unique_fp8_sidecar_bytes(result["assignment"])
