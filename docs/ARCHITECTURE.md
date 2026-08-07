@@ -1,8 +1,8 @@
 # PrismaQuant Architecture
 
-As of: 2026-08-05 · branch `feat/minchain-production` · verified against implementation
-baseline commit `222b456` plus the current flag-gated monotone min-chain changes, with
-the external Gridbook runtime pinned to
+As of: 2026-08-07 · branch `orchestrator/dsv4-ldlq-reexport` · verified against implementation
+baseline commit `0c14957` plus the priced-interpolated-output fix and gated LDLQ
+post-allocation refinement, with the external Gridbook runtime pinned to
 `9011a19228ddb96b8a49e11a20ac75c99c83998e` (v0.8.0). This branch ports the dated
 2026-08-01 DeepSeek-V4-Flash-0731 92 GB study record (§9.2) forward from its 0.5.1
 working tree; the study's Gridbook-candidate claims were **not** carried over, because
@@ -379,6 +379,7 @@ VALIDATED_SOURCE_PREFETCH=require   VALIDATED_FRONTIER_PICK=kneedle,
 VALIDATED_FRONTIER_SKIP_CALIB=$NSAMPLES (held-out disjointness, ON)
 CB_EXPERT_EMPIRICAL=0  CB_SCALE_CODING=two_tier  (D15: shipped values)
 PRISMAQUANT_CB_LDLQ=0  (opt-in post-fit feedback assignment)
+PRISMAQUANT_CB_LDLQ_GATE=1  (do-no-harm col-weighted MSE gate; per-Linear and per-expert fallback to raw when LDLQ regresses; byte-neutral)
 PRISMAQUANT_CB_MINCHAIN=0  (opt-in monotone packed-expert rung chain)
 AURA_ADDITIVITY_GATE=measure
 PRISMAQUANT_GGUF_IMATRIX=1  DEVICE=cuda  EXPORT_DEVICE=cuda
@@ -1279,6 +1280,46 @@ silently corrupts.
 | Passthrough integrity (BF16/FP8_SOURCE only if the source already is) | `allocator_candidates.py:24-27`, `:112-120`; export judges it against the *same* `_scan_source_dtype_manifest` vocabulary (§6.3) | synthesising BF16 from a dequantised FP8 source burns 8 bpp for nothing |
 | Every format in the assignment must have an emit path | `EXPORTABLE_FORMATS` `:7517`, checked `:1548`; the serving profile's `export_lane.codec_formats_from` bounds the allocator's menu by that same constant (`serving_profiles.py:252-330`) | a format with no `config_groups` scheme used to be silently rewritten to BF16 at 16 bpp, blowing the selected byte budget (#27) |
 | Registry ↔ served metadata agree on bits/group | **not enforced** — `FormatSpec` (`format_registry.py:44-168`) and the export `*_SCHEME` constants (`:7247-7336`) are independent sources of truth with no reconciling test | a divergence mis-prices bpp or mis-declares the served scheme; §12 D17 |
+
+### 6.5 Post-allocation LDLQ refinement (DSv4 A-FAST re-export, 2026-08-07)
+
+The A-FAST burn's cost table was measured **without** LDLQ (`cbl_semantics.ldlq_in_measurement=false`
+on every burn cell) but the per-tensor `cb_serialized_identity` already claimed `ldlq:true`
+for the intended export bytes.  The cost and the bytes therefore disagreed, and the
+`cb_render_identity` that would have made the mismatch fail-closed was absent from the
+research-assembled `cost_merged` path (the Pareto writer then KeyErrored before it could
+even stamp one).
+
+The honest fix is **not** to relabel the raw cost as LDLQ and not to weaken any guard.
+Instead the allocator's assignment (2.53 bpw, `c525f4025eac7061`, `predicted_dloss 619.71`)
+stays on its raw cost, and the exporter applies a **byte-neutral, per-unit gated LDLQ
+reassignment** on top of the already-chosen codebooks/scales:
+
+* `nvfp4_cb_formats.ldlq_reassign_cb_fields_gated` (`PRISMAQUANT_CB_LDLQ_GATE=1`, default-on)
+  scores the raw and LDLQ reconstructions with the same col-weighted MSE the cost's
+  `BRANCH_INTERPOLATED_OUTPUT` / `BRANCH_MEASURED` branch uses, and keeps the raw
+  indices per Linear (2-D) or per expert slice (3-D, mixing only the winning slices)
+  when LDLQ would regress.  `ldlq_reassign_cb_fields` without the gate remains the
+  verbatim assignment for cost-measurement parity.
+* The gate is byte-neutral by construction (fixed codebook, fixed scales, only the
+  `k`-bit indices move), so `cb_tensor_payload_breakdown` and `whole_artifact_budget`
+  are unchanged and no re-allocation is required.  Assignment sensitivity was checked:
+  LDLQ's saving `mse_ldlq/mse_raw` is largest at the low-K rungs already selected
+  (`NVFP4_CB_K12` dominates the body), so a true LDLQ cost would only reinforce the
+  current choice.
+* Truthful provenance is `prismaquant.cb_ldlq_refinement.v1`
+  (`cb_ldlq_refinement.py:build_refinement_provenance`): `cost_ldlq=false`,
+  `export_ldlq=true`, `gate=col_weighted_mse`, `byte_neutral=true`, plus the
+  creation timestamp.  The derived `layer_config.json` carries it under
+  `__prismaquant__.post_allocation_refinement`, and both CB exporters copy it
+  into `quant_config.json/provenance.post_allocation_refinement` after
+  `validate_refinement_provenance`.  A forged context stamp (claiming the cost
+  was LDLQ) is never written; a missing refinement record on an LDLQ export is
+  refused only when the caller explicitly asserts the old raw-cost identity.
+
+`cb_fields_for_context` consults the gate (`_ldlq_gate_enabled`) so every
+production render — cost or export — shares the same fixed-codebook LDLQ math,
+but only the export's refinement record makes the raw→LDLQ bridge explicit.
 
 ## 7. Validation & ship gates
 

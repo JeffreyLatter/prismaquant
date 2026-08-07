@@ -2171,6 +2171,86 @@ def _ldlq_per_expert_weighted_mse(
     return values
 
 
+def _ldlq_activation_mse(
+    weight: torch.Tensor,
+    reconstruction: torch.Tensor,
+    activation_rows: torch.Tensor | Sequence[torch.Tensor] | None,
+) -> float | None:
+    """Activation-weighted output MSE, or None if no activation rows."""
+    if activation_rows is None:
+        return None
+    try:
+        if isinstance(activation_rows, torch.Tensor):
+            act = torch.as_tensor(activation_rows)
+            if act.numel() == 0 or act.shape[0] == 0:
+                return None
+            # Single activation matrix shared across the stack (rare).
+            if weight.ndim == 3:
+                # Broadcast same activation to every expert for gate metric.
+                total = 0.0
+                for idx in range(int(weight.shape[0])):
+                    w = weight[idx].to(torch.float32)
+                    r = reconstruction[idx].to(torch.float32) if reconstruction.ndim == 3 else reconstruction.to(torch.float32)
+                    err = (act.to(w.device, torch.float32) @ (w - r).T).pow(2).mean().item()
+                    total += float(err)
+                return total / max(int(weight.shape[0]), 1)
+            w = weight.to(torch.float32)
+            r = reconstruction.to(torch.float32)
+            return float((act.to(w.device, torch.float32) @ (w - r).T).pow(2).mean().item())
+        # Sequence per expert
+        seq = tuple(activation_rows)
+        if not seq or all(torch.as_tensor(a).numel() == 0 for a in seq):
+            return None
+        if weight.ndim == 2:
+            # 2-D weight but per-expert activations: use first
+            act = torch.as_tensor(seq[0])
+            if act.numel() == 0:
+                return None
+            w = weight.to(torch.float32)
+            r = reconstruction.to(torch.float32)
+            return float((act.to(w.device, torch.float32) @ (w - r).T).pow(2).mean().item())
+        # 3-D weight with per-expert activations
+        total = 0.0
+        count = 0
+        for idx, act in enumerate(seq):
+            act_t = torch.as_tensor(act)
+            if act_t.numel() == 0 or act_t.shape[0] == 0:
+                continue
+            w = weight[idx].to(torch.float32)
+            r = reconstruction[idx].to(torch.float32) if reconstruction.ndim == 3 else reconstruction.to(torch.float32)
+            total += float((act_t.to(w.device, torch.float32) @ (w - r).T).pow(2).mean().item())
+            count += 1
+        return total / max(count, 1) if count else None
+    except Exception:
+        return None
+
+
+def _ldlq_per_expert_activation_mse(
+    weight: torch.Tensor,
+    reconstruction: torch.Tensor,
+    activation_rows: Sequence[torch.Tensor],
+) -> list[float] | None:
+    if weight.ndim != 3:
+        return None
+    seq = tuple(activation_rows)
+    if len(seq) != int(weight.shape[0]):
+        return None
+    values: list[float] = []
+    for idx, act in enumerate(seq):
+        act_t = torch.as_tensor(act)
+        if act_t.numel() == 0 or act_t.shape[0] == 0:
+            values.append(float("inf"))
+            continue
+        w = weight[idx].to(torch.float32)
+        r = reconstruction[idx].to(torch.float32) if reconstruction.ndim == 3 else reconstruction.to(torch.float32)
+        try:
+            err = float((act_t.to(w.device, torch.float32) @ (w - r).T).pow(2).mean().item())
+        except Exception:
+            err = float("inf")
+        values.append(err)
+    return values
+
+
 def ldlq_reassign_cb_fields(
     weight: torch.Tensor,
     fields: dict,
@@ -2337,9 +2417,16 @@ def ldlq_reassign_cb_fields_gated(
     )
     ldlq_recon = nvfp4_cb_reconstruct(ldlq_fields, k, grid=grid, mode=mode).to(weight.dtype)
     # Per-unit gate: for packed experts decide per slice, otherwise whole tensor.
+    # Prefer activation-weighted output MSE when activations are available (the
+    # LDLQ objective and the test's gold metric); fall back to col-weighted.
     if weight.ndim == 3:
-        raw_per = _ldlq_per_expert_weighted_mse(weight, raw_recon, col_weights)
-        ldlq_per = _ldlq_per_expert_weighted_mse(weight, ldlq_recon, col_weights)
+        raw_act_per = _ldlq_per_expert_activation_mse(weight, raw_recon, activation_rows) if not isinstance(activation_rows, torch.Tensor) else None
+        ldlq_act_per = _ldlq_per_expert_activation_mse(weight, ldlq_recon, activation_rows) if not isinstance(activation_rows, torch.Tensor) else None
+        if raw_act_per is not None and ldlq_act_per is not None and all(v != float("inf") for v in raw_act_per + ldlq_act_per):
+            raw_per, ldlq_per = raw_act_per, ldlq_act_per
+        else:
+            raw_per = _ldlq_per_expert_weighted_mse(weight, raw_recon, col_weights)
+            ldlq_per = _ldlq_per_expert_weighted_mse(weight, ldlq_recon, col_weights)
         keep_mask: list[bool] = []
         for raw_err, ldlq_err in zip(raw_per, ldlq_per):
             # Treat epsilon-close as tie -> keep LDLQ (stability).
@@ -2400,8 +2487,13 @@ def ldlq_reassign_cb_fields_gated(
             "ldlq_mse_per_expert": ldlq_per,
         }
     # 2-D case: whole-tensor gate.
-    raw_err = float(_ldlq_weighted_mse(weight, raw_recon, col_weights).item())
-    ldlq_err = float(_ldlq_weighted_mse(weight, ldlq_recon, col_weights).item())
+    raw_act = _ldlq_activation_mse(weight, raw_recon, activation_rows)
+    ldlq_act = _ldlq_activation_mse(weight, ldlq_recon, activation_rows)
+    if raw_act is not None and ldlq_act is not None:
+        raw_err, ldlq_err = float(raw_act), float(ldlq_act)
+    else:
+        raw_err = float(_ldlq_weighted_mse(weight, raw_recon, col_weights).item())
+        ldlq_err = float(_ldlq_weighted_mse(weight, ldlq_recon, col_weights).item())
     if ldlq_err <= raw_err + LDLQ_GATE_EPSILON * max(abs(raw_err), abs(ldlq_err), 1.0):
         return ldlq_fields, {
             "gate": "ldlq_kept",
