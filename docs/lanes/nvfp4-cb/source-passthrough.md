@@ -149,6 +149,15 @@ the shipped artifact:
 | `source_passthrough` | never measured, because the exporter copies the bytes |
 | `bit_exact` | a *measured* lossless re-encode (`weight_mse == 0`) |
 
+A `band_interpolated` rung is *priced* from its own banked `output_mse` (the
+ladder fit is already in output space, so the per-family activation constant
+would be double-counting — and applying it to only some rungs of a ladder
+reorders the ladder, which is the 2026-08-07 defect `runtime_flags.md`
+§`PRISMAQUANT_ACTIVATION_FAIR_PRICING` records). It keeps its `cost_source`
+and its `output_mse_measured: false` regardless: the candidate carries the
+distinct P5a branch label `interpolated_output_mse`, so "this selected price
+was predicted, not measured" survives into the artifact.
+
 `bit_exact` and `source_passthrough` are both free but are not the same claim:
 one ran an encoder and found the output identical, the other never ran one.
 `cost_entry_is_exact_by_construction` is the union, and it is what pricing and

@@ -53,14 +53,54 @@ order they bind:
   MLE of a multiplicative factor under log-normal residuals, and it is the
   same log-space least squares the CB ladder law already uses
   (``expert_empirical_cost._cb_ladder_law``).
-* **It cannot corrupt what is already validated.** A per-family constant
-  cannot reorder rungs *inside* a family, so the holdout-gated ladder shape
-  survives untouched; it re-levels families against each other, which is
-  exactly the audit's complaint. And because it is multiplicative it cannot
-  turn a 0.0 price into a nonzero one, so
-  ``allocator_candidates.cost_entry_prices_unmeasured_activation_at_zero``
+* **It cannot corrupt what is already validated** — *provided every rung of
+  the family takes the same pricing branch* (see the correction below). A
+  per-family constant applied uniformly cannot reorder rungs *inside* a
+  family, so the holdout-gated ladder shape survives untouched; it re-levels
+  families against each other, which is exactly the audit's complaint. And
+  because it is multiplicative it cannot turn a 0.0 price into a nonzero one,
+  so ``allocator_candidates.cost_entry_prices_unmeasured_activation_at_zero``
   — the existing candidate-removal gate — keeps precisely its current
   strength.
+
+**Correction (2026-08-07), and the reason ``BRANCH_INTERPOLATED_OUTPUT``
+exists.** That last bullet's premise did not hold as shipped. A family whose
+rungs are priced on a MIX of branches — some from a measured ``output_mse``,
+some weight-only — has the constant applied to only some of its rungs, and a
+constant applied non-uniformly *does* reorder rungs inside the family. On
+DSv4-Flash's ``nvfp4_cb`` menu the band-interpolated rungs (K13/K14/K17, stamped
+``output_mse_measured=False``) fell to the weight-only branch while their
+measured neighbours (K12/K15/K16/K18) did not, so the ladder was priced on two
+scales at once. The applied constant is the family geometric mean — 2^6.81 =
+112.5 on the bank it was diagnosed against — over a family whose true
+``output_mse/weight_mse`` ratio runs 187–320 on gate/up_proj but only 9.4–22 on
+down_proj: a ~20x spread inside one family, so no constant can serve it. That
+over-priced down_proj rungs ~12x (the higher rung cost MORE than the lower one
+on 85% of experts, so it could never be selected) and under-priced gate/up_proj
+rungs ~1.6x. The menu was wrong in both directions at once, direction depending
+on the projection.
+
+The fix is not a better constant: a band-interpolated row is priced from its
+OWN banked ``output_mse``, which is the tensor's holdout-gated ladder
+interpolation *in output space* and therefore strictly better information than
+any family aggregate. That restores one basis per family. Measured on the 32
+banked DSv4-Flash layers, K13/K14/K17 against their neighbours: rung-order
+violations fall from 84.8%/0%/84.6% (down_proj) and 2.5%/0%/3.5% (gate/up_proj)
+to 0.014%/0.014%/0.043% on down_proj and exactly zero elsewhere, and the
+price-vs-neighbour-geometric-mean ratio moves from 2.39x/2.34x/5.75x and
+0.67x/0.65x/0.44x to within 1.5% of unity on every projection. The 5 residual
+inversions in 63,459 comparisons are adjacent-rung ties of 0.02–0.53%, inside
+the interpolator's own validated holdout error, which is the regime
+``allocator_candidates.drop_interpolated_candidates_dominated_by_measured``
+already owns. It does not make the row a measurement: the row keeps
+``cost_source: band_interpolated`` and ``output_mse_measured: false``, it is
+still barred from the calibration sample below (its ``output_mse`` is derived,
+so admitting it would be circular), and it is stamped
+``BRANCH_INTERPOLATED_OUTPUT`` rather than ``BRANCH_MEASURED``. The general
+lesson is recorded here rather than in the NVFP4 code: ANY family that mixes
+the measured and weight-only branches and has a heterogeneous ratio has this
+defect. ``fp8_cb`` escaped it only because its interpolated rows happen to be
+stamped ``output_mse_measured=True``, so its whole ladder took one branch.
 
 What the factor actually measures, stated honestly: it is an
 **estimator-transfer calibration**, not an isolated A-side term. The measured
@@ -122,6 +162,20 @@ BRANCH_BIT_EXACT = "bit_exact"
 # to say which one it got.
 BRANCH_SOURCE_PASSTHROUGH = "source_passthrough"
 BRANCH_MEASURED = "measured_output_mse"
+# Priced from the row's OWN ``output_mse``, which for this row is the tensor's
+# holdout-gated ladder interpolation rather than a measurement
+# (``cost_source: band_interpolated``/``mixed``; ``output_mse_measured:
+# false``). It shares the output-space branch with ``BRANCH_MEASURED`` because
+# the number is already in output space and already carries the activation
+# contract — the anchors it interpolates between were measured with
+# ``activation_quantize_dequantize(X)`` applied — so the per-family penalty
+# must NOT be layered on top of it. It gets a label of its own because it is a
+# PREDICTION: ``cost_entry_is_band_interpolated`` stays the provenance guard,
+# and a shipped artifact must still be able to say which of its selected prices
+# were predicted. Distinct from ``BRANCH_CALIBRATED``, which is a WEIGHT-space
+# number converted to the output scale by a family constant; this is the row's
+# own output-space number, which is strictly better information.
+BRANCH_INTERPOLATED_OUTPUT = "interpolated_output_mse"
 BRANCH_ACTIVATION_IDENTITY = "activation_identity"
 BRANCH_CALIBRATED = "weight_only_activation_calibrated"
 BRANCH_UNCALIBRATED = "weight_only_uncalibrated"
