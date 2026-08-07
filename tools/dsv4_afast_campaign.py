@@ -79,7 +79,81 @@ SCHEMA = "prismaquant.dsv4_afast_minchain.v1"
 PILOT2_SCHEMA = "prismaquant.dsv4_afast_pilot2.v1"
 CHAIN_VERSION = "dsv4-afast-5anchor-pchip-minchain-v1"
 PILOT2_LAYER = 14
-ANCHORS = (28, 33, 38, 43, 48)
+ANCHORS = (29, 35)  # hierarchical-law rev, two-probe form (Rob + operator
+# 2026-08-06 evening): level-2 is 2-DoF, so two probes determine it; the
+# sweep over all pairs on L14+L0 per-expert truth picks (29,35) — worst
+# medians L14 1.2-2.5%, L0 gate/up 4.7/4.8% (pass), L0 down 5.3% (gated to
+# fallback, correctly). The audit draw is measured anyway; after the gate
+# passes, level-2 refits on anchors+audit (3 points) for the menu fill.
+# interpolation is no longer PCHIP. error(K) follows the hierarchical
+# rate-distortion law log y = a0 + a1*K + phi_{K%4} (level-1, fitted once
+# on the L14 21-rung pilot ladder) plus a per-expert affine log correction
+# a + b*K (level-2, fitted from that expert's own anchors). Validated
+# out-of-sample per-expert on L0's full CBL ladder: gate 3.1%, up 4.7%
+# worst medians at n=3; deviants (L0 down K36-class) are caught fail-closed
+# by the detection rule below and ship measured. ERROR_LAW.md /
+# CAMPAIGN_V2_PROTOCOL.md in cost-ldlq/interp-diagnosis; muse-spark study,
+# independently re-derived by operator before adoption.
+
+LAW_COEF = {
+    # a0, a1, phi1, phi2, phi3  (phi0 = 0), fitted on L14 medians K28-38
+    "gate_proj": (-6.8249, -0.15897, 0.03594, 0.05849, 0.06637),
+    "up_proj": (-6.7873, -0.15964, 0.04179, 0.06700, 0.06039),
+    "down_proj": (-6.4734, -0.16092, 0.04078, 0.06231, 0.05702),
+}
+LAW_DETECT = {"b_abs": 0.09}  # level-2 tilt bound. Evidence (L0 shard +
+# L21 offline, 2026-08-06): the scale offset `a` varies legitimately by
+# layer (L21 down a=-1.03 with 3.1% interiors; L0 a=+1.4 with ~2% audit
+# medians) — flagging on |a| is flagging what level-2 exists to absorb.
+# |b| <= 0.09 is the monotone-safety bound (a1 + b + max dphi < 0); actual
+# misfit detection is the audit gate, which measures prediction error.
+
+
+def law_log_G(projection: str, rung: int) -> float:
+    a0, a1, p1, p2, p3 = LAW_COEF[str(projection)]
+    phi = (0.0, p1, p2, p3)[int(rung) % 4]
+    return a0 + a1 * float(rung) + phi
+
+
+def law_fit_level2(
+    anchors: Sequence[int], values: Sequence[float], projection: str,
+) -> tuple[float, float]:
+    """Per-unit affine log correction (a, b) from anchor measurements."""
+    rhs = np.array([
+        math.log(max(float(v), 1e-30)) - law_log_G(projection, k)
+        for k, v in zip(anchors, values)
+    ])
+    design = np.array([[1.0, float(k)] for k in anchors])
+    (a, b), *_ = np.linalg.lstsq(design, rhs, rcond=None)
+    return float(a), float(b)
+
+
+def law_predict(projection: str, rung: int, a: float, b: float) -> float:
+    return math.exp(law_log_G(projection, rung) + a + b * float(rung))
+
+GEOMETRY_OMEGA = {
+    # per-projection sub-table weights, estimated from pilot average
+    # per-family drops; holdout medians robust to +-20% perturbation.
+    "gate_proj": (0.18, 0.22, 0.26, 0.34),
+    "up_proj": (0.19, 0.21, 0.25, 0.35),
+    "down_proj": (0.20, 0.22, 0.25, 0.33),
+}
+
+
+def geometry_x(rungs: Sequence[int], projection: str) -> list[float]:
+    """Map rungs to the coordinate where the error staircase is smooth."""
+    from prismaquant.cb_layout import subtable_bit_widths
+
+    weights = GEOMETRY_OMEGA[str(projection)]
+    return [
+        sum(
+            weight * bits
+            for weight, bits in zip(
+                weights, subtable_bit_widths(int(rung), "product", 4)
+            )
+        )
+        for rung in rungs
+    ]
 ACCEPTANCE_FIT_ANCHORS = (28, 38, 48)
 ACCEPTANCE_HOLDOUTS = (33, 43)
 FIT_TOLERANCE = 0.10
@@ -380,6 +454,32 @@ def _weight_mse(weight: torch.Tensor, reconstruction: torch.Tensor) -> list[floa
         (weight - reconstruction).float().square().mean(dim=(1, 2))
         .detach().cpu().tolist()
     )
+
+
+TIER3_GROUP_COUNTS = (2, 4, 8)  # tier-3 side-band (Rob, 2026-08-06):
+# contiguous input-dim blocks, superblock-aligned for every projection shape.
+
+
+def _weight_group_mse(
+    weight: torch.Tensor, reconstruction: torch.Tensor,
+    group_counts: Sequence[int] = TIER3_GROUP_COUNTS,
+) -> dict[int, list[list[float]]]:
+    """Per-column-group MSE decomposition of the same reconstruction.
+
+    Equal-width groups over the input dim, so the mean of a unit's group
+    means equals its whole-unit mean — the additivity identity the tier-3
+    study verifies. Study-grade side-band: banked in burn cells only, never
+    a menu row."""
+    squared = (weight - reconstruction).float().square()
+    result: dict[int, list[list[float]]] = {}
+    for count in group_counts:
+        width = int(squared.shape[2]) // int(count)
+        result[int(count)] = torch.stack(
+            [view.mean(dim=(1, 2)) for view in squared.split(width, dim=2)],
+            dim=1,
+        ).detach().cpu().tolist()
+    del squared
+    return result
 
 
 def _select_experts(value: torch.Tensor, expert_ids: Sequence[int]) -> torch.Tensor:

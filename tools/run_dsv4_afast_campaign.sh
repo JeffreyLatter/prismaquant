@@ -94,7 +94,9 @@ else
     python3 /w/tools/dsv4_afast_burn.py shakedown-worker \
         >>"$kill_log" 2>&1 &
     shake_pid=$!
-    first_cell="$run_root/burn-shards/layer_000_gate_proj_v2r-scout_K28.pkl"
+    scout_pass_tag=$(python3 -c \
+        'from tools.dsv4_afast_burn import BURN_PASS_TAGS; print(BURN_PASS_TAGS["scout"])')
+    first_cell="$run_root/burn-shards/layer_000_gate_proj_${scout_pass_tag}_K28.pkl"
     for _ in $(seq 1 1800); do
         if [[ -f "$first_cell" ]]; then
             break

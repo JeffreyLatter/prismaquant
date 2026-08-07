@@ -59,7 +59,8 @@ ACT_ROOT = PRIOR / "act"
 PILOT_LAYER = 21
 EXPERTS = tuple(range(256))
 PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
-RUNGS = tuple(range(28, 49))
+RUNGS = tuple(range(28, 39))  # demand-driven rev: priced domain K28-K38 (operator 2026-08-06);
+# K39-K48 are demand-extension/native-fallback rungs, never interpolated blind.
 ANCHORS = (28, 38, 48)
 HOLDOUTS = (33, 43)
 TOLERANCE = 0.10
@@ -141,8 +142,21 @@ def load_layer_identity(layer: int) -> tuple[dict, dict]:
         require_source_complete=True,
         where=f"DSV4 verified by-layer store layer {layer}",
     )
-    if int(payload["meta"]["incremental_shard"]["shard_idx"]) != layer:
-        raise AssertionError(f"layer {layer}: shard index mismatch")
+    # The store's shard_idx is a per-BATCH write counter, not a layer id: this
+    # store was built in two batches (2026-08-03), so layers 0-26 happen to
+    # satisfy shard_idx == layer while 27+ restart from 0. Verifying the
+    # counter therefore rejects correct shards from the second batch. Verify
+    # the content instead — every cost qname must belong to this layer, which
+    # is strictly stronger provenance than the counter ever was.
+    foreign = [
+        qname for qname in payload["costs"]
+        if not str(qname).startswith(f"model.layers.{layer}.")
+    ]
+    if foreign:
+        raise AssertionError(
+            f"layer {layer}: by-layer store holds foreign qnames "
+            f"(e.g. {foreign[0]}); shard content does not match its layer"
+        )
     if Path(payload["meta"]["model"]).resolve() != SOURCE.resolve():
         raise AssertionError(f"layer {layer}: source path mismatch")
     if (
