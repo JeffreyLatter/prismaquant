@@ -2448,21 +2448,73 @@ def ldlq_reassign_cb_fields_gated(
     )
     ldlq_recon = nvfp4_cb_reconstruct(ldlq_fields, k, grid=grid, mode=mode).to(weight.dtype)
     # Per-unit gate: for packed experts decide per slice, otherwise whole tensor.
-    # Prefer activation-weighted output MSE when activations are available (the
-    # LDLQ objective and the test's gold metric); fall back to col-weighted.
+    # Declared metric is activation_output_mse when activation rows were supplied;
+    # missing or malformed rows select raw with an explicit reason, never silently
+    # changing metric.
     if weight.ndim == 3:
-        raw_act_per = _ldlq_per_expert_activation_mse(weight, raw_recon, activation_rows) if not isinstance(activation_rows, torch.Tensor) else None
-        ldlq_act_per = _ldlq_per_expert_activation_mse(weight, ldlq_recon, activation_rows) if not isinstance(activation_rows, torch.Tensor) else None
-        if raw_act_per is not None and ldlq_act_per is not None and all(v != float("inf") for v in raw_act_per + ldlq_act_per):
+        # Activation rows must be a per-expert sequence for 3-D; a single tensor
+        # is not a valid per-expert activation for the gate - treat as missing.
+        if activation_rows is None:
+            # No activation supplied: fail closed to raw with explicit reason.
+            return fields, {
+                "gate": "raw_fallback_no_activation",
+                "kept_ldlq": False,
+                "reason": "activation_rows is None but LDLQ gate requires activation_output_mse",
+                "metric": "activation_output_mse",
+            }
+        if isinstance(activation_rows, torch.Tensor):
+            # Single tensor for 3-D is ambiguous: it would be shared across experts,
+            # but the declared per-expert gate requires per-expert rows. Fall back
+            # to raw with explicit reason.
+            return fields, {
+                "gate": "raw_fallback_shared_activation_for_packed",
+                "kept_ldlq": False,
+                "reason": "3-D weight requires per-expert activation sequence, got single tensor",
+                "metric": "activation_output_mse",
+            }
+        try:
+            raw_act_per = _ldlq_per_expert_activation_mse(weight, raw_recon, activation_rows)
+            ldlq_act_per = _ldlq_per_expert_activation_mse(weight, ldlq_recon, activation_rows)
+        except ValueError as exc:
+            return fields, {
+                "gate": "raw_fallback_malformed_activation",
+                "kept_ldlq": False,
+                "reason": str(exc),
+                "metric": "activation_output_mse",
+            }
+        # Check for missing per-expert rows (inf sentinel)
+        if any(v == float("inf") for v in raw_act_per + ldlq_act_per):
+            # Missing rows for some experts: per-expert fallback for those, keep
+            # LDLQ for others where data exists. Record explicit per-expert reason.
+            missing = [i for i, v in enumerate(raw_act_per) if v == float("inf") or ldlq_act_per[i] == float("inf")]
+            keep_mask_missing: list[bool] = []
+            for idx, (raw_err, ldlq_err) in enumerate(zip(raw_act_per, ldlq_act_per)):
+                if idx in missing:
+                    keep_mask_missing.append(False)
+                else:
+                    keep = ldlq_err <= raw_err + LDLQ_GATE_EPSILON * max(abs(raw_err), abs(ldlq_err), 1.0)
+                    keep_mask_missing.append(bool(keep))
+            if all(not k for k in keep_mask_missing):
+                return fields, {
+                    "gate": "raw_kept_all_missing_activation",
+                    "kept_ldlq": False,
+                    "per_expert_kept": keep_mask_missing,
+                    "missing_experts": missing,
+                    "raw_mse_per_expert": raw_act_per,
+                    "ldlq_mse_per_expert": ldlq_act_per,
+                    "metric": "activation_output_mse",
+                    "reason": f"missing activation for experts {missing}",
+                }
+            # For mixed missing case, use the already computed keep_mask and
+            # raw/ldlq per-expert values for the mixed construction below.
             raw_per, ldlq_per = raw_act_per, ldlq_act_per
+            keep_mask = keep_mask_missing
         else:
-            raw_per = _ldlq_per_expert_weighted_mse(weight, raw_recon, col_weights)
-            ldlq_per = _ldlq_per_expert_weighted_mse(weight, ldlq_recon, col_weights)
-        keep_mask: list[bool] = []
-        for raw_err, ldlq_err in zip(raw_per, ldlq_per):
-            # Treat epsilon-close as tie -> keep LDLQ (stability).
-            keep = ldlq_err <= raw_err + LDLQ_GATE_EPSILON * max(abs(raw_err), abs(ldlq_err), 1.0)
-            keep_mask.append(bool(keep))
+            raw_per, ldlq_per = raw_act_per, ldlq_act_per
+            keep_mask = []
+            for raw_err, ldlq_err in zip(raw_per, ldlq_per):
+                keep = ldlq_err <= raw_err + LDLQ_GATE_EPSILON * max(abs(raw_err), abs(ldlq_err), 1.0)
+                keep_mask.append(bool(keep))
         if all(keep_mask):
             return ldlq_fields, {
                 "gate": "ldlq_kept_all",
@@ -2517,14 +2569,33 @@ def ldlq_reassign_cb_fields_gated(
             "raw_mse_per_expert": raw_per,
             "ldlq_mse_per_expert": ldlq_per,
         }
-    # 2-D case: whole-tensor gate.
-    raw_act = _ldlq_activation_mse(weight, raw_recon, activation_rows)
-    ldlq_act = _ldlq_activation_mse(weight, ldlq_recon, activation_rows)
-    if raw_act is not None and ldlq_act is not None:
-        raw_err, ldlq_err = float(raw_act), float(ldlq_act)
-    else:
-        raw_err = float(_ldlq_weighted_mse(weight, raw_recon, col_weights).item())
-        ldlq_err = float(_ldlq_weighted_mse(weight, ldlq_recon, col_weights).item())
+    # 2-D case: whole-tensor gate. Activation is required; missing selects raw
+    # with explicit reason, never silently changes metric.
+    if activation_rows is None:
+        return fields, {
+            "gate": "raw_fallback_no_activation",
+            "kept_ldlq": False,
+            "reason": "activation_rows is None but LDLQ gate requires activation_output_mse",
+            "metric": "activation_output_mse",
+        }
+    try:
+        raw_act = _ldlq_activation_mse(weight, raw_recon, activation_rows)
+        ldlq_act = _ldlq_activation_mse(weight, ldlq_recon, activation_rows)
+    except ValueError as exc:
+        return fields, {
+            "gate": "raw_fallback_malformed_activation",
+            "kept_ldlq": False,
+            "reason": str(exc),
+            "metric": "activation_output_mse",
+        }
+    if raw_act is None or ldlq_act is None:
+        return fields, {
+            "gate": "raw_fallback_missing_activation",
+            "kept_ldlq": False,
+            "reason": "activation rows empty or missing for 2-D gate",
+            "metric": "activation_output_mse",
+        }
+    raw_err, ldlq_err = float(raw_act), float(ldlq_act)
     if ldlq_err <= raw_err + LDLQ_GATE_EPSILON * max(abs(raw_err), abs(ldlq_err), 1.0):
         return ldlq_fields, {
             "gate": "ldlq_kept",

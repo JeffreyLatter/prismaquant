@@ -1303,23 +1303,71 @@ reassignment** on top of the already-chosen codebooks/scales:
   verbatim assignment for cost-measurement parity.
 * The gate is byte-neutral by construction (fixed codebook, fixed scales, only the
   `k`-bit indices move), so `cb_tensor_payload_breakdown` and `whole_artifact_budget`
-  are unchanged and no re-allocation is required.  Assignment sensitivity was checked:
-  LDLQ's saving `mse_ldlq/mse_raw` is largest at the low-K rungs already selected
-  (`NVFP4_CB_K12` dominates the body), so a true LDLQ cost would only reinforce the
-  current choice.
+  are unchanged for the post-allocation refinement path.  Allocator optimality for
+  that path is claimed only for the raw cost basis it actually optimized; LDLQ-cost
+  optimality is not implied and requires the dual-basis reallocation below.
 * Truthful provenance is `prismaquant.cb_ldlq_refinement.v1`
   (`cb_ldlq_refinement.py:build_refinement_provenance`): `cost_ldlq=false`,
-  `export_ldlq=true`, `gate=col_weighted_mse`, `byte_neutral=true`, plus the
+  `export_ldlq=true`, `gate=activation_output_mse`, `byte_neutral=true`, plus the
   creation timestamp.  The derived `layer_config.json` carries it under
   `__prismaquant__.post_allocation_refinement`, and both CB exporters copy it
   into `quant_config.json/provenance.post_allocation_refinement` after
-  `validate_refinement_provenance`.  A forged context stamp (claiming the cost
-  was LDLQ) is never written; a missing refinement record on an LDLQ export is
-  refused only when the caller explicitly asserts the old raw-cost identity.
+  `validate_refinement_provenance` (invalid provenance aborts, it is never
+  silently dropped).  A forged context stamp (claiming the cost was LDLQ) is
+  never written.
+* The **dual-basis** production recipe (scope `nvfp4`, §6.5.1) keeps the raw NVFP4
+  bank as the immutable interpolation basis for FP8_CB, while the allocator-facing
+  NVFP4 cost plane, the allocator itself, and the exporter all use the gated LDLQ
+  NVFP4 plane.  Per-tensor identities therefore stamp `ldlq:true` for NVFP4_CB
+  and `ldlq:false` for FP8_CB, and the global recipe stamps `ldlq_scope:nvfp4`.
 
-`cb_fields_for_context` consults the gate (`_ldlq_gate_enabled`) so every
-production render — cost or export — shares the same fixed-codebook LDLQ math,
-but only the export's refinement record makes the raw→LDLQ bridge explicit.
+`cb_fields_for_context` consults the gate (`_ldlq_gate_enabled`) and the scope
+(`_ldlq_for_format`) so every production render — cost or export — shares the
+same fixed-codebook LDLQ math under the declared scope, but only the dual-basis
+reallocation makes the raw→LDLQ bridge an allocator-plane change rather than a
+post-hoc polish.
+
+#### 6.5.1 Dual-basis cost construction (scope `nvfp4`)
+
+The production recipe keeps **three planes** in memory and on disk, never
+re-labeling one as the other:
+
+1. **NVFP4_CB raw** — immutable interpolation basis only. The burn's raw bank
+   (`cbl_semantics.ldlq_in_measurement=false`) is preserved byte-for-byte for
+   FP8_CB interpolation; it is never overwritten and its `cost_merged.pkl` is
+   never patched in place.
+2. **NVFP4_CB LDLQ** — the measured cost / allocator / export plane.  Each
+   NVFP4 entry is re-measured with the fixed-codebook, fixed-scale LDLQ encoder
+   (`PRISMAQUANT_CB_LDLQ_SCOPE=nvfp4`, `activation_output_mse` gate) and carries
+   its own provenance (`raw_source_digest`, `ldlq_context`, `gate_metric`,
+   `measured_vs_interpolated`, `output_metric`).  Direct measurement is preferred
+   for the allocator-critical rungs (`K12/K15/K18` plus an independent `K16`
+   holdout); if a saving law `saving(K)=mse_ldlq/mse_raw` is used to fill
+   `K13/K14/K17`, it must pass a held-out composition gate
+   `raw_interpolation × saving_interpolation` vs direct LDLQ at `K16` within the
+   stated tolerance, otherwise all seven rungs are direct-measured.  The law is
+   fit per-projection at minimum and tested for per-tensor/per-expert residuals.
+3. **FP8_CB raw** — raw/interpolated plane.  All FP8_CB costs remain
+   `ldlq:false` and are interpolated/projected from the **raw** NVFP4 bank
+   (1), even after (2) replaces the NVFP4 cost plane.  Ordering and provenance
+   are explicit: FP8 interpolation reads the raw bank, not the LDLQ bank, and
+   each FP8 entry records `interpolation_source:raw`.
+
+Gated LDLQ is used identically in cost and export for the NVFP4 plane: if a
+unit falls back to raw, its allocator cost is the gated (raw) result and the
+exporter makes the same deterministic decision from identical activation
+evidence.  Aggregate and per-unit gate decisions are recorded durably
+(`ldlq_gate_telemetry.json` plus per-tensor `gate` fields) and the final report
+is based on observed counts, not a declared flag.  The raw interpolation plane
+is always ungated raw by definition.
+
+Re-allocation from the derived dual-basis table emits a fresh `layer_config`
+with freshly computed, exact per-tensor identities under scope `nvfp4`
+(`ldlq:true` for NVFP4_CB, `ldlq:false` for FP8_CB, global `ldlq_scope:nvfp4`);
+the old identity map is preserved as the raw-cost optimum and a diff (bytes,
+`predicted_dloss`, and assignment histogram) is published.  Allocator optimality
+is claimed only for the cost plane actually measured — the raw plane for the
+old artifact, the dual-basis LDLQ plane for the new one.
 
 ## 7. Validation & ship gates
 
