@@ -1277,17 +1277,14 @@ def export_nvfp4_cb(
         return qname
 
     post_allocation_refinement = None
-    try:
-        _meta_ref = _recipe_payload.get("__prismaquant__", {})
-        if isinstance(_meta_ref, dict) and "post_allocation_refinement" in _meta_ref:
-            from prismaquant.cb_ldlq_refinement import validate_refinement_provenance
+    _meta_ref = _recipe_payload.get("__prismaquant__", {})
+    if isinstance(_meta_ref, dict) and "post_allocation_refinement" in _meta_ref:
+        from prismaquant.cb_ldlq_refinement import validate_refinement_provenance
 
-            post_allocation_refinement = validate_refinement_provenance(
-                _meta_ref.get("post_allocation_refinement"),
-                where="export_nvfp4_cb post_allocation_refinement",
-            )
-    except Exception:
-        post_allocation_refinement = None
+        post_allocation_refinement = validate_refinement_provenance(
+            _meta_ref.get("post_allocation_refinement"),
+            where="export_nvfp4_cb post_allocation_refinement",
+        )
     quant_config = build_quant_config(
         assignment=assignment,
         cb_targets=cb_targets,

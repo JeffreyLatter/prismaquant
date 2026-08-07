@@ -2176,53 +2176,75 @@ def _ldlq_activation_mse(
     reconstruction: torch.Tensor,
     activation_rows: torch.Tensor | Sequence[torch.Tensor] | None,
 ) -> float | None:
-    """Activation-weighted output MSE, or None if no activation rows."""
+    """Activation-weighted output MSE, or None if no activation rows.
+
+    This is the declared gate metric ``activation_output_mse``.  It is fail-
+    closed on malformed rows: a non-2-D tensor, a width mismatch, or any
+    other structural error raises immediately so the caller can record an
+    explicit fallback reason or abort, rather than silently falling back to
+    a different metric.
+    """
     if activation_rows is None:
         return None
-    try:
-        if isinstance(activation_rows, torch.Tensor):
-            act = torch.as_tensor(activation_rows)
-            if act.numel() == 0 or act.shape[0] == 0:
-                return None
-            # Single activation matrix shared across the stack (rare).
-            if weight.ndim == 3:
-                # Broadcast same activation to every expert for gate metric.
-                total = 0.0
-                for idx in range(int(weight.shape[0])):
-                    w = weight[idx].to(torch.float32)
-                    r = reconstruction[idx].to(torch.float32) if reconstruction.ndim == 3 else reconstruction.to(torch.float32)
-                    err = (act.to(w.device, torch.float32) @ (w - r).T).pow(2).mean().item()
-                    total += float(err)
-                return total / max(int(weight.shape[0]), 1)
-            w = weight.to(torch.float32)
-            r = reconstruction.to(torch.float32)
-            return float((act.to(w.device, torch.float32) @ (w - r).T).pow(2).mean().item())
-        # Sequence per expert
-        seq = tuple(activation_rows)
-        if not seq or all(torch.as_tensor(a).numel() == 0 for a in seq):
+    if isinstance(activation_rows, torch.Tensor):
+        act = torch.as_tensor(activation_rows)
+        if act.numel() == 0 or act.shape[0] == 0:
             return None
-        if weight.ndim == 2:
-            # 2-D weight but per-expert activations: use first
-            act = torch.as_tensor(seq[0])
-            if act.numel() == 0:
-                return None
-            w = weight.to(torch.float32)
-            r = reconstruction.to(torch.float32)
-            return float((act.to(w.device, torch.float32) @ (w - r).T).pow(2).mean().item())
-        # 3-D weight with per-expert activations
-        total = 0.0
-        count = 0
-        for idx, act in enumerate(seq):
-            act_t = torch.as_tensor(act)
-            if act_t.numel() == 0 or act_t.shape[0] == 0:
-                continue
-            w = weight[idx].to(torch.float32)
-            r = reconstruction[idx].to(torch.float32) if reconstruction.ndim == 3 else reconstruction.to(torch.float32)
-            total += float((act_t.to(w.device, torch.float32) @ (w - r).T).pow(2).mean().item())
-            count += 1
-        return total / max(count, 1) if count else None
-    except Exception:
+        if act.ndim != 2:
+            raise ValueError(f"activation rows must be rank-2, got shape {tuple(act.shape)}")
+        if int(act.shape[1]) != int(weight.shape[-1]):
+            raise ValueError(
+                f"activation width {act.shape[1]} != weight in_features {weight.shape[-1]}"
+            )
+        if weight.ndim == 3:
+            total = 0.0
+            for idx in range(int(weight.shape[0])):
+                w = weight[idx].to(torch.float32)
+                r = reconstruction[idx].to(torch.float32) if reconstruction.ndim == 3 else reconstruction.to(torch.float32)
+                err = (act.to(w.device, torch.float32) @ (w - r).T).pow(2).mean().item()
+                total += float(err)
+            return total / max(int(weight.shape[0]), 1)
+        w = weight.to(torch.float32)
+        r = reconstruction.to(torch.float32)
+        return float((act.to(w.device, torch.float32) @ (w - r).T).pow(2).mean().item())
+    # Sequence per expert
+    seq = tuple(activation_rows)
+    if not seq:
         return None
+    # Check for any empty or malformed entry; empty is not an error but a
+    # missing-data signal that the caller must handle explicitly.
+    has_data = False
+    for act in seq:
+        act_t = torch.as_tensor(act)
+        if act_t.numel() == 0 or act_t.shape[0] == 0:
+            continue
+        has_data = True
+        if act_t.ndim != 2:
+            raise ValueError(f"per-expert activation rows must be rank-2, got {tuple(act_t.shape)}")
+        if int(act_t.shape[1]) != int(weight.shape[-1]):
+            raise ValueError(
+                f"per-expert activation width {act_t.shape[1]} != weight in_features {weight.shape[-1]}"
+            )
+    if not has_data:
+        return None
+    if weight.ndim == 2:
+        act = torch.as_tensor(seq[0])
+        if act.numel() == 0:
+            return None
+        w = weight.to(torch.float32)
+        r = reconstruction.to(torch.float32)
+        return float((act.to(w.device, torch.float32) @ (w - r).T).pow(2).mean().item())
+    total = 0.0
+    count = 0
+    for idx, act in enumerate(seq):
+        act_t = torch.as_tensor(act)
+        if act_t.numel() == 0 or act_t.shape[0] == 0:
+            continue
+        w = weight[idx].to(torch.float32)
+        r = reconstruction[idx].to(torch.float32) if reconstruction.ndim == 3 else reconstruction.to(torch.float32)
+        total += float((act_t.to(w.device, torch.float32) @ (w - r).T).pow(2).mean().item())
+        count += 1
+    return total / max(count, 1) if count else None
 
 
 def _ldlq_per_expert_activation_mse(
@@ -2234,19 +2256,28 @@ def _ldlq_per_expert_activation_mse(
         return None
     seq = tuple(activation_rows)
     if len(seq) != int(weight.shape[0]):
-        return None
+        raise ValueError(
+            f"per-expert activation count {len(seq)} != stack size {weight.shape[0]}"
+        )
     values: list[float] = []
     for idx, act in enumerate(seq):
         act_t = torch.as_tensor(act)
         if act_t.numel() == 0 or act_t.shape[0] == 0:
+            # Missing rows for this expert is not silently inf; the caller
+            # must decide to fallback per expert with an explicit reason.
+            # We return inf as a sentinel that the caller will interpret as
+            # missing, but we do not swallow malformed shapes.
             values.append(float("inf"))
             continue
+        if act_t.ndim != 2:
+            raise ValueError(f"per-expert activation rows must be rank-2, got {tuple(act_t.shape)} for expert {idx}")
+        if int(act_t.shape[1]) != int(weight.shape[-1]):
+            raise ValueError(
+                f"per-expert activation width {act_t.shape[1]} != weight in_features {weight.shape[-1]} for expert {idx}"
+            )
         w = weight[idx].to(torch.float32)
         r = reconstruction[idx].to(torch.float32) if reconstruction.ndim == 3 else reconstruction.to(torch.float32)
-        try:
-            err = float((act_t.to(w.device, torch.float32) @ (w - r).T).pow(2).mean().item())
-        except Exception:
-            err = float("inf")
+        err = float((act_t.to(w.device, torch.float32) @ (w - r).T).pow(2).mean().item())
         values.append(err)
     return values
 

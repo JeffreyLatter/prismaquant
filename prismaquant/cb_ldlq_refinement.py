@@ -26,6 +26,9 @@ REFINEMENT_SCHEMA = "prismaquant.cb_ldlq_refinement.v1"
 REFINEMENT_KIND = "fixed_codebook_ldlq_gated"
 
 
+ALLOWED_GATES = frozenset({"activation_output_mse", "col_weighted_mse"})
+
+
 def build_refinement_provenance(
     *,
     cost_ldlq: bool,
@@ -39,7 +42,7 @@ def build_refinement_provenance(
 
     ``cost_ldlq`` is what the cost table measured (False for the A-FAST burn);
     ``export_ldlq`` is what the exporter rendered (True for the LDLQ re-export).
-    ``gate`` names the local metric (``col_weighted_mse``).  The record is
+    ``gate`` names the local metric (``activation_output_mse``).  The record is
     stamped with a monotonic timestamp so a re-export of the same assignment
     is distinguishable.
     """
@@ -47,12 +50,15 @@ def build_refinement_provenance(
         raise TypeError("cost_ldlq and export_ldlq must be bool")
     if cost_ldlq and not export_ldlq:
         raise ValueError("refinement cannot downgrade LDLQ: cost true but export false")
+    gate = str(gate).strip()
+    if gate not in ALLOWED_GATES:
+        raise ValueError(f"gate must be one of {sorted(ALLOWED_GATES)}, got {gate!r}")
     payload: dict[str, Any] = {
         "schema": REFINEMENT_SCHEMA,
         "kind": REFINEMENT_KIND,
         "cost_ldlq": bool(cost_ldlq),
         "export_ldlq": bool(export_ldlq),
-        "gate": str(gate),
+        "gate": gate,
         "gate_enabled": bool(gate_enabled),
         "byte_neutral": bool(byte_neutral),
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -75,9 +81,11 @@ def validate_refinement_provenance(
         raise ValueError(f"{where}: unsupported refinement schema {value.get('schema')!r}")
     if value.get("kind") != REFINEMENT_KIND:
         raise ValueError(f"{where}: unexpected refinement kind {value.get('kind')!r}")
-    for key in ("cost_ldlq", "export_ldlq", "gate_enabled", "byte_neutral"):
+    for key in ("cost_ldlq", "export_ldlq", "gate_enabled", "byte_neutral", "gate"):
         if key not in value:
             raise ValueError(f"{where}: refinement record missing {key!r}")
+    if str(value.get("gate")) not in ALLOWED_GATES:
+        raise ValueError(f"{where}: refinement gate must be one of {sorted(ALLOWED_GATES)}, got {value.get('gate')!r}")
     return dict(value)
 
 
@@ -87,7 +95,7 @@ def attach_refinement_to_layer_config(
     *,
     cost_ldlq: bool = False,
     export_ldlq: bool = True,
-    gate: str = "col_weighted_mse",
+    gate: str = "activation_output_mse",
     gate_enabled: bool = True,
     note: str | None = None,
 ) -> dict[str, Any]:
