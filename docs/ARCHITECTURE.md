@@ -1,8 +1,8 @@
 # PrismaQuant Architecture
 
-As of: 2026-08-04 · branch `feat/ldlq-production-encoder` · verified against implementation
-baseline commit `0b476fc` plus the current flag-gated LDLQ production-encoder changes, with
-the external Gridbook runtime pinned to
+As of: 2026-08-07 · branch `orchestrator/dsv4-ldlq-reexport` · verified against implementation
+baseline commit `0c14957` plus the priced-interpolated-output fix and gated LDLQ
+post-allocation refinement, with the external Gridbook runtime pinned to
 `9011a19228ddb96b8a49e11a20ac75c99c83998e` (v0.8.0). This branch ports the dated
 2026-08-01 DeepSeek-V4-Flash-0731 92 GB study record (§9.2) forward from its 0.5.1
 working tree; the study's Gridbook-candidate claims were **not** carried over, because
@@ -256,7 +256,7 @@ flowchart TD
   ALLOC -->|"SELECTION_MODE=surrogate"| PCACHE
 
   EXPCT["export_native_compressed -- :1665-1699"]
-  EXPCB["export_nvfp4_cb or export_nvfp4_cb_streaming<br/>auto-switch above 80 GB source (:1585-1641)"]
+  EXPCB["export_nvfp4_cb or export_nvfp4_cb_streaming<br/>auto-switch above 80 GB source (:1585-1641)<br/>optional read → ordered encode → bounded ordered write"]
   EXPGG["convert_hf_to_gguf.py skeleton -> export_gguf<br/>(:1461-1493)"]
 
   PCACHE --> EXPCT
@@ -379,6 +379,8 @@ VALIDATED_SOURCE_PREFETCH=require   VALIDATED_FRONTIER_PICK=kneedle,
 VALIDATED_FRONTIER_SKIP_CALIB=$NSAMPLES (held-out disjointness, ON)
 CB_EXPERT_EMPIRICAL=0  CB_SCALE_CODING=two_tier  (D15: shipped values)
 PRISMAQUANT_CB_LDLQ=0  (opt-in post-fit feedback assignment)
+PRISMAQUANT_CB_LDLQ_GATE=1  (do-no-harm col-weighted MSE gate; per-Linear and per-expert fallback to raw when LDLQ regresses; byte-neutral)
+PRISMAQUANT_CB_MINCHAIN=0  (opt-in monotone packed-expert rung chain)
 AURA_ADDITIVITY_GATE=measure
 PRISMAQUANT_GGUF_IMATRIX=1  DEVICE=cuda  EXPORT_DEVICE=cuda
 ```
@@ -1279,6 +1281,94 @@ silently corrupts.
 | Every format in the assignment must have an emit path | `EXPORTABLE_FORMATS` `:7517`, checked `:1548`; the serving profile's `export_lane.codec_formats_from` bounds the allocator's menu by that same constant (`serving_profiles.py:252-330`) | a format with no `config_groups` scheme used to be silently rewritten to BF16 at 16 bpp, blowing the selected byte budget (#27) |
 | Registry ↔ served metadata agree on bits/group | **not enforced** — `FormatSpec` (`format_registry.py:44-168`) and the export `*_SCHEME` constants (`:7247-7336`) are independent sources of truth with no reconciling test | a divergence mis-prices bpp or mis-declares the served scheme; §12 D17 |
 
+### 6.5 Post-allocation LDLQ refinement (DSv4 A-FAST re-export, 2026-08-07)
+
+The A-FAST burn's cost table was measured **without** LDLQ (`cbl_semantics.ldlq_in_measurement=false`
+on every burn cell) but the per-tensor `cb_serialized_identity` already claimed `ldlq:true`
+for the intended export bytes.  The cost and the bytes therefore disagreed, and the
+`cb_render_identity` that would have made the mismatch fail-closed was absent from the
+research-assembled `cost_merged` path (the Pareto writer then KeyErrored before it could
+even stamp one).
+
+The honest fix is **not** to relabel the raw cost as LDLQ and not to weaken any guard.
+Instead the allocator's assignment (2.53 bpw, `c525f4025eac7061`, `predicted_dloss 619.71`)
+stays on its raw cost, and the exporter applies a **byte-neutral, per-unit gated LDLQ
+reassignment** on top of the already-chosen codebooks/scales:
+
+* `nvfp4_cb_formats.ldlq_reassign_cb_fields_gated` (`PRISMAQUANT_CB_LDLQ_GATE=1`, default-on)
+  scores the raw and LDLQ reconstructions with the same col-weighted MSE the cost's
+  `BRANCH_INTERPOLATED_OUTPUT` / `BRANCH_MEASURED` branch uses, and keeps the raw
+  indices per Linear (2-D) or per expert slice (3-D, mixing only the winning slices)
+  when LDLQ would regress.  `ldlq_reassign_cb_fields` without the gate remains the
+  verbatim assignment for cost-measurement parity.
+* The gate is byte-neutral by construction (fixed codebook, fixed scales, only the
+  `k`-bit indices move), so `cb_tensor_payload_breakdown` and `whole_artifact_budget`
+  are unchanged for the post-allocation refinement path.  Allocator optimality for
+  that path is claimed only for the raw cost basis it actually optimized; LDLQ-cost
+  optimality is not implied and requires the dual-basis reallocation below.
+* Truthful provenance is `prismaquant.cb_ldlq_refinement.v1`
+  (`cb_ldlq_refinement.py:build_refinement_provenance`): `cost_ldlq=false`,
+  `export_ldlq=true`, `gate=activation_output_mse`, `byte_neutral=true`, plus the
+  creation timestamp.  The derived `layer_config.json` carries it under
+  `__prismaquant__.post_allocation_refinement`, and both CB exporters copy it
+  into `quant_config.json/provenance.post_allocation_refinement` after
+  `validate_refinement_provenance` (invalid provenance aborts, it is never
+  silently dropped).  A forged context stamp (claiming the cost was LDLQ) is
+  never written.
+* The **dual-basis** production recipe (scope `nvfp4`, §6.5.1) keeps the raw NVFP4
+  bank as the immutable interpolation basis for FP8_CB, while the allocator-facing
+  NVFP4 cost plane, the allocator itself, and the exporter all use the gated LDLQ
+  NVFP4 plane.  Per-tensor identities therefore stamp `ldlq:true` for NVFP4_CB
+  and `ldlq:false` for FP8_CB, and the global recipe stamps `ldlq_scope:nvfp4`.
+
+`cb_fields_for_context` consults the gate (`_ldlq_gate_enabled`) and the scope
+(`_ldlq_for_format`) so every production render — cost or export — shares the
+same fixed-codebook LDLQ math under the declared scope, but only the dual-basis
+reallocation makes the raw→LDLQ bridge an allocator-plane change rather than a
+post-hoc polish.
+
+#### 6.5.1 Dual-basis cost construction (scope `nvfp4`)
+
+The production recipe keeps **three planes** in memory and on disk, never
+re-labeling one as the other:
+
+1. **NVFP4_CB raw** — immutable interpolation basis only. The burn's raw bank
+   (`cbl_semantics.ldlq_in_measurement=false`) is preserved byte-for-byte for
+   FP8_CB interpolation; it is never overwritten and its `cost_merged.pkl` is
+   never patched in place.
+2. **NVFP4_CB LDLQ** — the measured cost / allocator / export plane.  Each
+   NVFP4 entry is re-measured with the fixed-codebook, fixed-scale LDLQ encoder
+   (`PRISMAQUANT_CB_LDLQ_SCOPE=nvfp4`, `activation_output_mse` gate) and carries
+   its own provenance (`raw_source_digest`, `ldlq_context`, `gate_metric`,
+   `measured_vs_interpolated`, `output_metric`).  Direct measurement is preferred
+   for the allocator-critical rungs (`K12/K15/K18` plus an independent `K16`
+   holdout); if a saving law `saving(K)=mse_ldlq/mse_raw` is used to fill
+   `K13/K14/K17`, it must pass a held-out composition gate
+   `raw_interpolation × saving_interpolation` vs direct LDLQ at `K16` within the
+   stated tolerance, otherwise all seven rungs are direct-measured.  The law is
+   fit per-projection at minimum and tested for per-tensor/per-expert residuals.
+3. **FP8_CB raw** — raw/interpolated plane.  All FP8_CB costs remain
+   `ldlq:false` and are interpolated/projected from the **raw** NVFP4 bank
+   (1), even after (2) replaces the NVFP4 cost plane.  Ordering and provenance
+   are explicit: FP8 interpolation reads the raw bank, not the LDLQ bank, and
+   each FP8 entry records `interpolation_source:raw`.
+
+Gated LDLQ is used identically in cost and export for the NVFP4 plane: if a
+unit falls back to raw, its allocator cost is the gated (raw) result and the
+exporter makes the same deterministic decision from identical activation
+evidence.  Aggregate and per-unit gate decisions are recorded durably
+(`ldlq_gate_telemetry.json` plus per-tensor `gate` fields) and the final report
+is based on observed counts, not a declared flag.  The raw interpolation plane
+is always ungated raw by definition.
+
+Re-allocation from the derived dual-basis table emits a fresh `layer_config`
+with freshly computed, exact per-tensor identities under scope `nvfp4`
+(`ldlq:true` for NVFP4_CB, `ldlq:false` for FP8_CB, global `ldlq_scope:nvfp4`);
+the old identity map is preserved as the raw-cost optimum and a diff (bytes,
+`predicted_dloss`, and assignment histogram) is published.  Allocator optimality
+is claimed only for the cost plane actually measured — the raw plane for the
+old artifact, the dual-basis LDLQ plane for the new one.
+
 ## 7. Validation & ship gates
 
 ### 7.1 What runs where
@@ -2029,6 +2119,17 @@ transactional export closed on any difference. The quantization config provenanc
 `encoder_warm_start.{warm_used,cold_fallback,verified_n}`. This changes no format or encoding
 semantics; it only skips a repeated scale sweep whose result was already measured
 (`cb_warm_state.py`, `measure_quant_cost.py`, `export_nvfp4_cb_streaming.py`). The flag-gated
+`PRISMAQUANT_EXPORT_PIPELINE=1` execution strategy separates dense-source read-ahead, the
+unchanged single ordered encode stream, and a canonical-order writer thread. Reader lookahead is
+bounded by `PRISMAQUANT_EXPORT_PREFETCH_DEPTH` (default 1), with CUDA-target host tensors pinned;
+the writer reserves encoded outputs before encode against
+`PRISMAQUANT_EXPORT_WRITE_QUEUE_BYTES` (default 2 GiB), admitting an oversize tensor only
+exclusively. Every stage shares one first-error latch and the existing temporary-file/directory
+transaction, so failure publishes nothing. The flag defaults off pending the skip-marked
+real-GPU identity gate. It is an execution knob, **not** a serialization-context or render-
+identity dimension: on/off artifacts must be byte-identical. Successful runs log wall time plus
+read/encode/write busy and stall totals and write-budget stall count
+(`export_nvfp4_cb_streaming._StreamWriter`). The flag-gated
 `PRISMAQUANT_CB_LDLQ=1` encoder mode keeps that scale
 sweep and codebook fit intact, then performs deterministic fixed-codebook/fixed-scale
 assignment in 64-column Hessian-feedback blocks using the same cached activation rows and
@@ -2038,7 +2139,36 @@ mid-size timing check measured a 1.43x encoder-time multiplier. `ldlq` is part o
 CB serialization context and every render/provenance identity, so cost/export drift is
 refused and an opposite-mode warm record cold-falls back. The resulting artifact is still the
 ordinary grid-native CB layout: the mode is assignment-time only and adds no serving branch or
-runtime cost. There is no in-lane serving smoke — CB artifacts serve only through
+runtime cost.
+
+The independently gated `PRISMAQUANT_CB_MINCHAIN=1` mode orders packed-expert
+CB rungs ascending and, per expert slice, chooses between the unchanged free
+fit and the selected predecessor reconstruction using weight MSE. Its exact
+comparison is `a <= b + 1e-12*max(abs(a),abs(b))`; epsilon and exact ties choose
+free. Therefore `selected(K) <= embed(K) = selected(K-1)` proves monotonicity,
+and `selected(K) <= free(K)` proves zero representational tax. Only the winner
+is replayed through activation QDQ. The earlier nested-book pilot is explicit
+NO-GO lineage: it proved reuse (0/960 predecessor violations, +0.456% encode)
+but imposed median tax up to 16.616%. Pilot 1 then had partial coverage; the
+anchor study resolved epsilon ties. Pilot 2 on DSV4 layer 14 passed full
+coverage with zero P1/P2 violations, P3 at 2.7–2.9% median / 12.9–13.8% p95,
+and P4 overhead 1.003x.
+
+Acceptance amendment v2 uses five-anchor monotone PCHIP (FP8 defaults
+K28/K33/K38/K43/K48), independent K33/K43 four-anchor cross-validation, and
+accept-all except a 25% gross-outlier backstop. A deterministic non-anchor
+audit rung is drawn per layer with seed `42 + layer`; each projection must
+pass 5% median / 15% p95 or the whole layer is fully measured. Anchors,
+holdbacks, seed, and all three tolerances have explicit
+`PRISMAQUANT_CB_MINCHAIN_*` settings and are stamped in cost provenance
+(`cb_minchain.py`, `measure_quant_cost.cost_payload_provenance`). The global
+mode/version enters `CBSerializationContext`; each materialized cell carries
+its arm, solution digest, and predecessor digest in `cb_render_identity`.
+Export refuses a context or per-cell stamp mismatch. Warm records inherit the
+same context dimension. Selected outputs remain ordinary flat per-rung books;
+the config/tensor wire format and Gridbook serving kernels are unchanged.
+
+There is no in-lane serving smoke — CB artifacts serve only through
 the out-of-tree plugin — but the gate set is now *declared* (`prismaquant/lane_specs/nvfp4_cb.json`,
 re-vet **R16**): same OpenAI endpoint, same endpoint-agnostic `validate_quantized_model`, plus
 the lane-specific prefill perf gate (INV-2). Gates are advisory; the shipcard refuses, and

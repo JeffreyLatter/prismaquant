@@ -51,15 +51,20 @@ them to CompressedTensorsConfig.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import hashlib
 import inspect
 import json
 import os
 import pickle
+import queue
 import re
 import struct
 import sys
+import threading
+import time
 from collections import Counter
+from dataclasses import dataclass
 from functools import wraps
 from pathlib import Path
 
@@ -363,6 +368,149 @@ def _nbytes(dtype: torch.dtype, shape) -> int:
     return n * torch.empty((), dtype=dtype).element_size()
 
 
+_EXPORT_PIPELINE_ENV = "PRISMAQUANT_EXPORT_PIPELINE"
+_EXPORT_PREFETCH_DEPTH_ENV = "PRISMAQUANT_EXPORT_PREFETCH_DEPTH"
+_EXPORT_WRITE_QUEUE_BYTES_ENV = "PRISMAQUANT_EXPORT_WRITE_QUEUE_BYTES"
+_DEFAULT_EXPORT_PREFETCH_DEPTH = 1
+_DEFAULT_EXPORT_WRITE_QUEUE_BYTES = 2 * (1 << 30)
+_NO_SOURCE = object()
+
+
+def _positive_env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw in (None, ""):
+        return int(default)
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a positive integer, got {raw!r}") from exc
+    if value <= 0:
+        raise ValueError(f"{name} must be positive, got {value}")
+    return value
+
+
+def _export_pipeline_enabled() -> bool:
+    """Execution-strategy gate; deliberately absent from render identity."""
+
+    return os.environ.get(_EXPORT_PIPELINE_ENV, "0") == "1"
+
+
+@dataclass(frozen=True)
+class _StreamEntry:
+    name: str
+    dtype: torch.dtype
+    shape: tuple[int, ...]
+    producer: object
+    copy_src: object
+    reader: object = None
+    encoder: object = None
+
+    @property
+    def nbytes(self) -> int:
+        return _nbytes(self.dtype, self.shape)
+
+
+@dataclass(frozen=True)
+class _CopyPayload:
+    source: tuple[Path, int, int]
+
+
+class _PipelineFailure:
+    """First-error latch shared by all three pipeline stages."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._error: BaseException | None = None
+        self.stop = threading.Event()
+
+    def fail(self, error: BaseException) -> None:
+        with self._lock:
+            if self._error is None:
+                self._error = error
+        self.stop.set()
+
+    def error(self) -> BaseException | None:
+        with self._lock:
+            return self._error
+
+    def raise_if_failed(self) -> None:
+        error = self.error()
+        if error is not None:
+            raise error
+
+
+class _ByteBudget:
+    """Reserve encoded bytes before encode, bounding queued/in-flight output.
+
+    A single tensor larger than the configured limit is admitted only while it
+    owns the budget exclusively. This is necessary for real tensors larger
+    than the default queue while still preventing multiple oversize outputs
+    from accumulating.
+    """
+
+    def __init__(self, limit: int, failure: _PipelineFailure):
+        self.limit = int(limit)
+        self.failure = failure
+        self.used = 0
+        self._condition = threading.Condition()
+
+    def acquire(self, amount: int) -> tuple[float, bool]:
+        amount = int(amount)
+        start = time.perf_counter()
+        stalled = False
+        with self._condition:
+            if self.failure.stop.is_set():
+                self.failure.raise_if_failed()
+                raise RuntimeError("export pipeline stopped")
+            while self.used and self.used + amount > self.limit:
+                stalled = True
+                if self.failure.stop.is_set():
+                    self.failure.raise_if_failed()
+                    raise RuntimeError("export pipeline stopped")
+                self._condition.wait(timeout=0.05)
+            self.used += amount
+        return time.perf_counter() - start, stalled
+
+    def release(self, amount: int) -> None:
+        with self._condition:
+            self.used -= int(amount)
+            if self.used < 0:
+                raise AssertionError("export pipeline byte budget underflow")
+            self._condition.notify_all()
+
+    def wake(self) -> None:
+        with self._condition:
+            self._condition.notify_all()
+
+
+class _OrderedResults:
+    """Completion-order buffer whose consumer drains canonical entry order."""
+
+    def __init__(self, failure: _PipelineFailure):
+        self.failure = failure
+        self._condition = threading.Condition()
+        self._ready: dict[int, object] = {}
+
+    def put(self, index: int, payload: object) -> None:
+        with self._condition:
+            self._ready[int(index)] = payload
+            self._condition.notify_all()
+
+    def get(self, index: int) -> tuple[object, float]:
+        start = time.perf_counter()
+        with self._condition:
+            while index not in self._ready:
+                if self.failure.stop.is_set():
+                    self.failure.raise_if_failed()
+                    raise RuntimeError("export pipeline stopped")
+                self._condition.wait(timeout=0.05)
+            return self._ready.pop(index), time.perf_counter() - start
+
+    def wake(self) -> None:
+        with self._condition:
+            self._condition.notify_all()
+
+
 # On-disk dtypes each FormatSpec element/scale name can legally appear as.
 # Sourced from the decode side (`layer_streaming._E8M0_SCALE_DTYPES` accepts
 # all three E8M0 spellings) so a checkpoint the loader would decode is a
@@ -518,24 +666,39 @@ class _StreamWriter:
     bytes in order — one output tensor resident at a time."""
 
     def __init__(self):
-        self._entries: list[tuple[str, torch.dtype, tuple, object, object]] = []
+        self._entries: list[_StreamEntry] = []
 
-    def add(self, name, dtype, shape, producer, copy_src=None):
+    def add(self, name, dtype, shape, producer, copy_src=None, *, reader=None,
+            encoder=None):
         """Record an output tensor. ``producer`` yields it at write time; when
         ``copy_src=(path, file_offset, nbytes)`` is given (DELTA-EXPORT reuse)
         those raw bytes are streamed straight from a prior artifact's shard file
-        instead — ``producer`` is then unused (may be None)."""
-        self._entries.append((name, dtype, tuple(int(d) for d in shape),
-                              producer, copy_src))
+        instead — ``producer`` is then unused (may be None).
+
+        ``reader`` + ``encoder`` are an optional execution-only split of the
+        same producer. The serial path ignores them and calls ``producer``
+        verbatim; the flag-gated pipeline reads ahead with ``reader`` and feeds
+        its value to ``encoder``. Both must be supplied together.
+        """
+        if (reader is None) != (encoder is None):
+            raise ValueError(f"{name}: reader and encoder must be paired")
+        if copy_src is not None and (reader is not None or encoder is not None):
+            raise ValueError(f"{name}: raw-copy and read/encode paths conflict")
+        self._entries.append(_StreamEntry(
+            str(name), dtype, tuple(int(d) for d in shape), producer, copy_src,
+            reader, encoder,
+        ))
 
     def names(self) -> list[str]:
-        return [e[0] for e in self._entries]
+        return [entry.name for entry in self._entries]
 
-    def write(self, path: Path, *, before_publish=None) -> None:
+    def write(self, path: Path, *, before_publish=None,
+              _pipeline_encode_workers: int = 1) -> dict[str, float] | None:
         header: dict[str, dict] = {}
         off = 0
-        for name, dtype, shape, _, _ in self._entries:
-            nb = _nbytes(dtype, shape)
+        for entry in self._entries:
+            name, dtype, shape = entry.name, entry.dtype, entry.shape
+            nb = entry.nbytes
             if name in header:
                 # The header is a dict but the data stream is not: a duplicate
                 # name keeps only the LAST span while both blobs are still
@@ -578,61 +741,275 @@ class _StreamWriter:
                 owns_temp = True
                 f.write(struct.pack("<Q", len(hjson)))
                 f.write(hjson)
-                for i, (name, dtype, shape, producer, copy_src) in enumerate(
-                        self._entries):
-                    if copy_src is not None:
-                        # DELTA-EXPORT: stream raw bytes from a prior artifact.
-                        src_path, foff, nb = copy_src
-                        if nb != _nbytes(dtype, shape):
-                            raise AssertionError(
-                                f"{name}: copy_src {nb}B != declared "
-                                f"{_nbytes(dtype, shape)}B")
-                        with open(src_path, "rb") as sf:
-                            sf.seek(foff)
-                            remaining = nb
-                            while remaining:
-                                chunk = sf.read(min(remaining, 1 << 24))
-                                if not chunk:
-                                    raise AssertionError(
-                                        f"{name}: prior artifact truncated at "
-                                        f"offset {foff} (needed {nb}B)")
-                                f.write(chunk)
-                                remaining -= len(chunk)
-                        if i % 50 == 0 or nb > (1 << 30):
-                            print(f"[export-cb-stream] {i + 1}/"
-                                  f"{len(self._entries)} {name} copied "
-                                  f"{nb / 2**30:.2f}G from prior", flush=True)
-                        continue
-                    t = producer()
-                    if t.dtype != dtype or tuple(t.shape) != shape:
-                        raise AssertionError(
-                            f"{name}: produced {t.dtype}{tuple(t.shape)} != "
-                            f"declared {dtype}{shape}")
-                    b = _raw_bytes(t)
-                    if len(b) != _nbytes(dtype, shape):
-                        raise AssertionError(f"{name}: byte count mismatch")
-                    f.write(b)
-                    del t, b
-                    if cuda:
-                        # Unified-memory hygiene: differently-shaped 10GB-class
-                        # pack transients must not accumulate as cached segments.
-                        torch.cuda.empty_cache()
-                        if i % 20 == 0 or _nbytes(dtype, shape) > (1 << 30):
-                            print(f"[export-cb-stream] {i + 1}/"
-                                  f"{len(self._entries)} {name} "
-                                  f"cuda alloc "
-                                  f"{torch.cuda.memory_allocated() / 2**30:.1f}G "
-                                  f"reserved "
-                                  f"{torch.cuda.memory_reserved() / 2**30:.1f}G",
-                                  flush=True)
+                if _export_pipeline_enabled():
+                    timings = self._write_pipeline(
+                        f,
+                        cuda=cuda,
+                        encode_workers=int(_pipeline_encode_workers),
+                    )
+                else:
+                    timings = None
+                    self._write_serial(f, cuda=cuda)
             if before_publish is not None:
                 before_publish()
             os.replace(temp_path, path)
             owns_temp = False
-        except Exception:
+            return timings
+        except BaseException:
             if owns_temp and os.path.lexists(temp_path):
                 temp_path.unlink()
             raise
+
+    def _write_serial(self, f, *, cuda: bool) -> None:
+        """The pre-pipeline loop, kept as the exact flag-off implementation."""
+
+        for i, entry in enumerate(self._entries):
+            name, dtype, shape = entry.name, entry.dtype, entry.shape
+            if entry.copy_src is not None:
+                self._write_copy(f, i, entry)
+                continue
+            t = entry.producer()
+            if t.dtype != dtype or tuple(t.shape) != shape:
+                raise AssertionError(
+                    f"{name}: produced {t.dtype}{tuple(t.shape)} != "
+                    f"declared {dtype}{shape}")
+            b = _raw_bytes(t)
+            if len(b) != entry.nbytes:
+                raise AssertionError(f"{name}: byte count mismatch")
+            f.write(b)
+            del t, b
+            self._cuda_hygiene(i, entry, cuda=cuda)
+
+    def _write_copy(self, f, index: int, entry: _StreamEntry) -> None:
+        # DELTA-EXPORT/source passthrough: sequential large reads from a prior
+        # artifact or source checkpoint. Chunking bounds the writer working set.
+        src_path, foff, nb = entry.copy_src
+        if nb != entry.nbytes:
+            raise AssertionError(
+                f"{entry.name}: copy_src {nb}B != declared {entry.nbytes}B")
+        with open(src_path, "rb") as sf:
+            sf.seek(foff)
+            remaining = nb
+            while remaining:
+                chunk = sf.read(min(remaining, 1 << 24))
+                if not chunk:
+                    raise AssertionError(
+                        f"{entry.name}: prior artifact truncated at offset "
+                        f"{foff} (needed {nb}B)")
+                f.write(chunk)
+                remaining -= len(chunk)
+        if index % 50 == 0 or nb > (1 << 30):
+            print(f"[export-cb-stream] {index + 1}/"
+                  f"{len(self._entries)} {entry.name} copied "
+                  f"{nb / 2**30:.2f}G from prior", flush=True)
+
+    def _cuda_hygiene(self, index: int, entry: _StreamEntry, *, cuda: bool) -> None:
+        if not cuda:
+            return
+        # Unified-memory hygiene: differently-shaped 10GB-class pack
+        # transients must not accumulate as cached segments.
+        torch.cuda.empty_cache()
+        if index % 20 == 0 or entry.nbytes > (1 << 30):
+            print(f"[export-cb-stream] {index + 1}/"
+                  f"{len(self._entries)} {entry.name} cuda alloc "
+                  f"{torch.cuda.memory_allocated() / 2**30:.1f}G reserved "
+                  f"{torch.cuda.memory_reserved() / 2**30:.1f}G", flush=True)
+
+    def _write_pipeline(self, f, *, cuda: bool,
+                        encode_workers: int = 1) -> dict[str, float]:
+        """Read -> encode -> bounded ordered-write execution strategy.
+
+        Production uses one encode worker, preserving the existing ordered
+        encode stream. ``encode_workers`` exists only as a test seam that can
+        force completion reordering and prove the writer's ordering contract.
+        """
+
+        if encode_workers <= 0:
+            raise ValueError("pipeline encode_workers must be positive")
+        depth = _positive_env_int(
+            _EXPORT_PREFETCH_DEPTH_ENV, _DEFAULT_EXPORT_PREFETCH_DEPTH)
+        write_bytes = _positive_env_int(
+            _EXPORT_WRITE_QUEUE_BYTES_ENV,
+            _DEFAULT_EXPORT_WRITE_QUEUE_BYTES,
+        )
+        failure = _PipelineFailure()
+        budget = _ByteBudget(write_bytes, failure)
+        results = _OrderedResults(failure)
+        read_queue: queue.Queue = queue.Queue()
+        prefetch_slots = threading.BoundedSemaphore(depth)
+        sentinel = object()
+        timings = {
+            "read_busy": 0.0,
+            "read_stall": 0.0,
+            "encode_busy": 0.0,
+            "encode_stall": 0.0,
+            "write_busy": 0.0,
+            "write_stall": 0.0,
+            "backpressure_stalls": 0,
+        }
+        timing_lock = threading.Lock()
+        wall_start = time.perf_counter()
+
+        def add_timing(key: str, value: float) -> None:
+            with timing_lock:
+                timings[key] += value
+
+        def queue_put(item) -> float:
+            start = time.perf_counter()
+            read_queue.put(item)
+            return time.perf_counter() - start
+
+        def acquire_prefetch_slot() -> float:
+            start = time.perf_counter()
+            while not failure.stop.is_set():
+                if prefetch_slots.acquire(timeout=0.05):
+                    return time.perf_counter() - start
+            failure.raise_if_failed()
+            raise RuntimeError("export pipeline stopped")
+
+        def read_stage() -> None:
+            try:
+                for index, entry in enumerate(self._entries):
+                    if failure.stop.is_set():
+                        break
+                    owns_prefetch_slot = False
+                    if entry.copy_src is not None or entry.reader is None:
+                        started = time.perf_counter()
+                        source = _NO_SOURCE
+                    else:
+                        add_timing("read_stall", acquire_prefetch_slot())
+                        owns_prefetch_slot = True
+                        started = time.perf_counter()
+                        try:
+                            source = entry.reader()
+                        except BaseException:
+                            prefetch_slots.release()
+                            raise
+                    add_timing("read_busy", time.perf_counter() - started)
+                    add_timing("read_stall", queue_put(
+                        (index, entry, source, owns_prefetch_slot)))
+            except BaseException as exc:
+                failure.fail(exc)
+                budget.wake()
+                results.wake()
+            finally:
+                try:
+                    queue_put(sentinel)
+                except BaseException:
+                    pass
+
+        def encode_one(index: int, entry: _StreamEntry, source: object) -> None:
+            try:
+                started = time.perf_counter()
+                if entry.copy_src is not None:
+                    payload = _CopyPayload(entry.copy_src)
+                else:
+                    t = (entry.encoder(source) if entry.encoder is not None
+                         else entry.producer())
+                    if t.dtype != entry.dtype or tuple(t.shape) != entry.shape:
+                        raise AssertionError(
+                            f"{entry.name}: produced {t.dtype}{tuple(t.shape)} "
+                            f"!= declared {entry.dtype}{entry.shape}")
+                    payload = _raw_bytes(t)
+                    if len(payload) != entry.nbytes:
+                        raise AssertionError(
+                            f"{entry.name}: byte count mismatch")
+                    del t
+                add_timing("encode_busy", time.perf_counter() - started)
+                results.put(index, payload)
+            except BaseException as exc:
+                budget.release(entry.nbytes)
+                failure.fail(exc)
+                budget.wake()
+                results.wake()
+
+        def write_stage() -> None:
+            try:
+                for index, entry in enumerate(self._entries):
+                    payload, stalled = results.get(index)
+                    add_timing("write_stall", stalled)
+                    started = time.perf_counter()
+                    if isinstance(payload, _CopyPayload):
+                        self._write_copy(f, index, entry)
+                    else:
+                        f.write(payload)
+                    add_timing("write_busy", time.perf_counter() - started)
+                    budget.release(entry.nbytes)
+                    self._cuda_hygiene(index, entry, cuda=cuda)
+            except BaseException as exc:
+                failure.fail(exc)
+                budget.wake()
+                results.wake()
+
+        reader = threading.Thread(
+            target=read_stage, name="pq-export-reader", daemon=True)
+        writer = threading.Thread(
+            target=write_stage, name="pq-export-writer", daemon=True)
+        reader.start()
+        writer.start()
+        try:
+            with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=encode_workers,
+                    thread_name_prefix="pq-export-encode") as pool:
+                pending: set[concurrent.futures.Future] = set()
+                while True:
+                    if len(pending) >= encode_workers:
+                        done, pending = concurrent.futures.wait(
+                            pending,
+                            return_when=concurrent.futures.FIRST_COMPLETED,
+                        )
+                        for future in done:
+                            future.result()
+                        failure.raise_if_failed()
+                    started = time.perf_counter()
+                    try:
+                        item = read_queue.get(timeout=0.05)
+                    except queue.Empty:
+                        add_timing("encode_stall", time.perf_counter() - started)
+                        failure.raise_if_failed()
+                        continue
+                    add_timing("encode_stall", time.perf_counter() - started)
+                    failure.raise_if_failed()
+                    if item is sentinel:
+                        break
+                    index, entry, source, owns_prefetch_slot = item
+                    if owns_prefetch_slot:
+                        prefetch_slots.release()
+                    stall, did_stall = budget.acquire(entry.nbytes)
+                    add_timing("encode_stall", stall)
+                    if did_stall:
+                        add_timing("backpressure_stalls", 1)
+                    try:
+                        pending.add(pool.submit(
+                            encode_one, index, entry, source))
+                    except BaseException:
+                        budget.release(entry.nbytes)
+                        raise
+                for future in pending:
+                    future.result()
+        except BaseException as exc:
+            failure.fail(exc)
+            budget.wake()
+            results.wake()
+        finally:
+            reader.join()
+            writer.join()
+        failure.raise_if_failed()
+        timings["wall"] = time.perf_counter() - wall_start
+        print(
+            "[export-cb-stream] pipeline timings "
+            f"wall={timings['wall']:.3f}s "
+            f"read_busy={timings['read_busy']:.3f}s "
+            f"read_stall={timings['read_stall']:.3f}s "
+            f"encode_busy={timings['encode_busy']:.3f}s "
+            f"encode_stall={timings['encode_stall']:.3f}s "
+            f"write_busy={timings['write_busy']:.3f}s "
+            f"write_stall={timings['write_stall']:.3f}s "
+            f"backpressure_stalls={int(timings['backpressure_stalls'])} "
+            f"prefetch_depth={depth} write_queue_bytes={write_bytes}",
+            flush=True,
+        )
+        return timings
 
 
 # ---------------------------------------------------------------------------
@@ -2308,11 +2685,15 @@ def export_nvfp4_cb_streaming(
         ).hexdigest()
         for name, tensor in materialized_codebook_tensors.items()
     }
+    _env_cb_context = cb_serialization_context_from_env()
     serialization_context = CBSerializationContext(
         scale_coding=scale_coding,
         codebook_source=source,
         scale_sweep=bool(scale_sweep),
-        ldlq=cb_serialization_context_from_env().ldlq,
+        ldlq=_env_cb_context.ldlq,
+        ldlq_scope=getattr(_env_cb_context, "ldlq_scope", "all" if _env_cb_context.ldlq else "none"),
+        minchain=_env_cb_context.minchain,
+        minchain_version=_env_cb_context.minchain_version,
         encode_tier=resolve_cb_encode_tier(),
         activation_contract=_claimed_activation_contract,
         activation_execution=(
@@ -2360,6 +2741,7 @@ def export_nvfp4_cb_streaming(
                 for member in _identity_scope(qname)
             },
             col_weights=col_weights,
+            require_minchain_cells=serialization_context.minchain,
             where="export_nvfp4_cb_streaming assignment render identity",
         )
     elif (
@@ -2572,11 +2954,18 @@ def export_nvfp4_cb_streaming(
             wsh = skeleton.get_shape(wkey)
             ssh = skeleton.get_shape(skey)
             writer.add(export_base + ".weight", torch.float8_e4m3fn, wsh,
-                       (lambda k=wkey: skeleton.load(k).contiguous()))
+                       (lambda k=wkey: skeleton.load(k).contiguous()),
+                       reader=(lambda k=wkey: _pin_prefetched_tensor(
+                           skeleton.load(k), device)),
+                       encoder=(lambda value: value.contiguous()))
             writer.add(
                 export_base + ".weight_scale", torch.float32, ssh,
                 (lambda k=skey: skeleton.load(k).to(torch.float32)
-                 .contiguous()))
+                 .contiguous()),
+                reader=(lambda k=skey: _pin_prefetched_tensor(
+                    skeleton.load(k), device)),
+                encoder=(lambda value: value.to(torch.float32).contiguous()),
+            )
             counts[canonical_format_name(assignment[qname])] += 1
             continue
         grid, mode, k = cb_targets[qname]
@@ -2610,6 +2999,9 @@ def export_nvfp4_cb_streaming(
         def _pack(qname=qname, h=(kind, h), grid=grid, mode=mode, k=k,
                   codebook=codebook, coding=coding, shape=shape,
                   packed_shape=packed_shape, state=state):
+            from prismaquant.nvfp4_cb_footprint import _ldlq_for_format
+
+            ldlq_for_this = _ldlq_for_format(assignment[qname], serialization_context)
             packed, scale = _stream_pack_target(
                 skeleton, profile, h, qname, grid, mode, k, codebook,
                 col_weights[qname], scale_sweep, coding, shape, device,
@@ -2619,7 +3011,7 @@ def export_nvfp4_cb_streaming(
                 expert_stack_members.get(qname),
                 warm_session=warm_session,
                 format_name=assignment[qname],
-                ldlq_activation_loader=ldlq_activation_loader)
+                ldlq_activation_loader=ldlq_activation_loader if ldlq_for_this else None)
             state["scale"] = scale
             return packed.reshape(packed_shape)
 
@@ -2706,6 +3098,9 @@ def export_nvfp4_cb_streaming(
                        qw_name=qw_name, scale_name=scale_name,
                        input_scale_name=input_scale_name,
                        export_base=export_base):
+                from prismaquant.nvfp4_cb_footprint import _ldlq_for_format
+
+                ldlq_for_this = _ldlq_for_format(assignment[qname], serialization_context)
                 packed, scale = _stream_pack_target(
                     skeleton, profile, h, qname, grid, mode, k, codebook,
                     col_weights[qname], scale_sweep, coding, shape, device,
@@ -2715,7 +3110,7 @@ def export_nvfp4_cb_streaming(
                     expert_stack_members.get(qname),
                     warm_session=warm_session,
                     format_name=assignment[qname],
-                    ldlq_activation_loader=ldlq_activation_loader)
+                    ldlq_activation_loader=ldlq_activation_loader if ldlq_for_this else None)
                 out = {qw_name: packed.reshape(packed_shape)}
                 if scale is not None:
                     out[scale_name] = scale.reshape(scale_shape).to(
@@ -2728,7 +3123,59 @@ def export_nvfp4_cb_streaming(
             reuse["verify_pool"].append(
                 {"base": export_base, "specs": expected, "fresh": _fresh})
         else:
-            writer.add(qw_name, torch.uint8, packed_shape, _pack)
+            if kind == "tensor":
+                def _read_cb(h=h):
+                    return _prefetch_source_weight(skeleton, h, device)
+
+                def _encode_cb(
+                    weight,
+                    qname=qname,
+                    grid=grid,
+                    mode=mode,
+                    k=k,
+                    codebook=codebook,
+                    coding=coding,
+                    packed_shape=packed_shape,
+                    state=state,
+                ):
+                    from prismaquant.nvfp4_cb_footprint import _ldlq_for_format
+
+                    ldlq_for_dense = _ldlq_for_format(assignment[qname], serialization_context)
+                    packed, scale = _encode_prefetched_cb_tensor(
+                        weight,
+                        qname=qname,
+                        grid=grid,
+                        mode=mode,
+                        k=k,
+                        codebook=codebook,
+                        cw=col_weights[qname],
+                        scale_sweep=scale_sweep,
+                        coding=coding,
+                        device=device,
+                        encode_tier=serialization_context.encode_tier,
+                        cb_render_identity=_recipe_cb_render_identity,
+                        verified_source_qnames=verified_cb_source_qnames,
+                        warm_session=warm_session,
+                        format_name=assignment[qname],
+                        ldlq_activation_loader=ldlq_activation_loader if ldlq_for_dense else None,
+                    )
+                    state["scale"] = scale
+                    return packed.reshape(packed_shape)
+
+                writer.add(
+                    qw_name,
+                    torch.uint8,
+                    packed_shape,
+                    _pack,
+                    reader=_read_cb,
+                    encoder=_encode_cb,
+                )
+            else:
+                # Expert stacks retain their existing one-device-buffer
+                # producer. Prefetching an entire next stack into pinned host
+                # memory would duplicate a 10GB-class working set on the GB10
+                # unified pool and violate the bounded-residency contract.
+                writer.add(qw_name, torch.uint8, packed_shape, _pack)
             if grid == "fp8":
                 def _scale(state=state, scale_shape=scale_shape):
                     return state["scale"].reshape(scale_shape).to(
@@ -2864,6 +3311,37 @@ def export_nvfp4_cb_streaming(
                 del w
             return state["out"]
 
+        def _render_prefetched(
+            w,
+            canon_fmt=canon_fmt,
+            override=override,
+            state=state,
+            export_base=export_base,
+        ):
+            if "out" not in state:
+                w = w.to(
+                    device,
+                    non_blocking=bool(
+                        w.device.type == "cpu" and w.is_pinned()
+                    ),
+                )
+                packed = _ct_quantize_2d(
+                    w,
+                    canon_fmt,
+                    nvfp4_global_real_override=override,
+                    input_global_scale_override=(
+                        activation_scales_by_physical_target.get(export_base)
+                        if canon_fmt == "NVFP4"
+                        else None
+                    ),
+                )
+                state["out"] = {
+                    suffix: tensor.cpu().contiguous()
+                    for suffix, tensor in packed.items()
+                }
+                del w
+            return state["out"]
+
         specs = [
             spec
             for spec in _stock_output_specs(canon_fmt, shape)
@@ -2888,11 +3366,25 @@ def export_nvfp4_cb_streaming(
                            copy_src=prior.raw_slice(name))
             reuse["copied"] += 1
         else:
-            for (name, dtype, out_shape), (suffix, _d, _o) in zip(
-                    expected, specs):
+            for output_index, ((name, dtype, out_shape),
+                               (suffix, _d, _o)) in enumerate(zip(
+                                   expected, specs)):
                 def _prod(suffix=suffix, _render=_render):
                     return _render()[suffix]
-                writer.add(name, dtype, out_shape, _prod)
+                if output_index == 0:
+                    writer.add(
+                        name,
+                        dtype,
+                        out_shape,
+                        _prod,
+                        reader=(lambda h=h: _prefetch_source_weight(
+                            skeleton, h, device)),
+                        encoder=(lambda weight, suffix=suffix,
+                                 render=_render_prefetched:
+                                 render(weight)[suffix]),
+                    )
+                else:
+                    writer.add(name, dtype, out_shape, _prod)
             if prior is not None:
                 reuse["encoded"] += 1
                 reuse["reasons"][
@@ -2923,6 +3415,22 @@ def export_nvfp4_cb_streaming(
                 del w
             return state["out"]
 
+        def _render_prefetched(w, canon_fmt=canon_fmt, state=state):
+            if "out" not in state:
+                w = w.to(
+                    device,
+                    non_blocking=bool(
+                        w.device.type == "cpu" and w.is_pinned()
+                    ),
+                )
+                packed = _requant_pack(canon_fmt, w)
+                state["out"] = {
+                    suffix: tensor.cpu().contiguous()
+                    for suffix, tensor in packed.items()
+                }
+                del w
+            return state["out"]
+
         specs = _requant_output_specs(canon_fmt, shape)
         expected = [(export_base + "." + s, d, o) for s, d, o in specs]
         requant_ok = prior is not None and all(
@@ -2933,11 +3441,25 @@ def export_nvfp4_cb_streaming(
                            copy_src=prior.raw_slice(name))
             reuse["copied"] += 1
         else:
-            for (name, dtype, out_shape), (suffix, _d, _o) in zip(
-                    expected, specs):
+            for output_index, ((name, dtype, out_shape),
+                               (suffix, _d, _o)) in enumerate(zip(
+                                   expected, specs)):
                 def _prod(suffix=suffix, _render=_render):
                     return _render()[suffix]
-                writer.add(name, dtype, out_shape, _prod)
+                if output_index == 0:
+                    writer.add(
+                        name,
+                        dtype,
+                        out_shape,
+                        _prod,
+                        reader=(lambda h=h: _prefetch_source_weight(
+                            skeleton, h, device)),
+                        encoder=(lambda weight, suffix=suffix,
+                                 render=_render_prefetched:
+                                 render(weight)[suffix]),
+                    )
+                else:
+                    writer.add(name, dtype, out_shape, _prod)
             if prior is not None:
                 reuse["encoded"] += 1
                 reuse["reasons"][
@@ -3041,8 +3563,15 @@ def export_nvfp4_cb_streaming(
             continue
         shape = skeleton.get_shape(name)
         dtype = skeleton.get_dtype(name)
-        writer.add(name, dtype, shape, (lambda k=name: skeleton.load(k)
-                                        .contiguous()))
+        writer.add(
+            name,
+            dtype,
+            shape,
+            (lambda k=name: skeleton.load(k).contiguous()),
+            reader=(lambda k=name: _pin_prefetched_tensor(
+                skeleton.load(k), device)),
+            encoder=(lambda value: value.contiguous()),
+        )
         # A declared floor block-FP8 unit must NOT land in `ignore`: the two
         # statements contradict each other, and `ignore` is the one that
         # silently loses the scale.  Its scale plane rides this same loop (it
@@ -3266,8 +3795,8 @@ def export_nvfp4_cb_streaming(
         if not per_expert_plans:
             return None, None
         entry_bytes = {
-            name: _nbytes(dtype, shape)
-            for name, dtype, shape, _producer, _copy_src in writer._entries
+            entry.name: entry.nbytes
+            for entry in writer._entries
         }
         declaration_layers: dict[str, dict[str, list[dict[str, object]]]] = {}
         payload_groups: dict[str, dict[str, object]] = {}
@@ -3413,6 +3942,15 @@ def export_nvfp4_cb_streaming(
     assert_routes_reconcile(
         **_route_reconciliation_sets(_declared_passthrough_units))
 
+    post_allocation_refinement = None
+    _meta_ref_stream = _recipe_payload.get("__prismaquant__", {})
+    if isinstance(_meta_ref_stream, dict) and "post_allocation_refinement" in _meta_ref_stream:
+        from prismaquant.cb_ldlq_refinement import validate_refinement_provenance
+
+        post_allocation_refinement = validate_refinement_provenance(
+            _meta_ref_stream.get("post_allocation_refinement"),
+            where="export_nvfp4_cb_streaming post_allocation_refinement",
+        )
     quant_config = build_quant_config(
         assignment=assignment,
         cb_targets=cb_targets,
@@ -3432,6 +3970,7 @@ def export_nvfp4_cb_streaming(
         serialization_context=serialization_context,
         cb_render_identity=_recipe_cb_render_identity,
         research_cost_selection=_research_cost_selection,
+        post_allocation_refinement=post_allocation_refinement,
         activation_execution_contract=activation_execution_contract,
         git_commit=_git_commit(),
         cb_target_name=_cb_target_name,
@@ -3564,33 +4103,24 @@ def _stream_pack_target(skeleton, profile, resolved, qname, grid, mode, k,
     cbook = _to_device(codebook, device)
     if kind == "tensor":
         w = skeleton.dequant_weight(h).to(device)
-        if cb_render_identity is not None:
-            from prismaquant.production_weight_cache import (
-                validate_cb_render_source_weight,
-            )
-            validate_cb_render_source_weight(
-                cb_render_identity,
-                qname,
-                w,
-                where="export_nvfp4_cb_streaming source tensor",
-            )
-            verified_source_qnames.add(qname)
-        packed, fields = _pack_with_optional_warm_state(
-            w, qname=qname, format_name=format_name, grid=grid, mode=mode,
-            k=k, col_weights=cw.to(device), codebook=cbook,
-            scale_sweep=scale_sweep, scale_coding=coding,
-            encode_tier=encode_tier, warm_session=warm_session,
-            ldlq_activation_rows=(
-                ldlq_activation_loader.load(
-                    qname,
-                    stack_size=(int(w.shape[0]) if w.dim() == 3 else None),
-                ) if ldlq_activation_loader is not None else None
-            ))
-        if w.dim() == 3:
-            packed = packed.reshape(w.shape[0], w.shape[1], -1)
-        scale = (fields["scales"].reshape(*w.shape[:-1]).cpu()
-                 if grid == "fp8" else None)
-        return packed.to(torch.uint8).cpu().contiguous(), scale
+        return _encode_prefetched_cb_tensor(
+            w,
+            qname=qname,
+            grid=grid,
+            mode=mode,
+            k=k,
+            codebook=cbook,
+            cw=cw,
+            scale_sweep=scale_sweep,
+            coding=coding,
+            device=device,
+            encode_tier=encode_tier,
+            cb_render_identity=cb_render_identity,
+            verified_source_qnames=verified_source_qnames,
+            warm_session=warm_session,
+            format_name=format_name,
+            ldlq_activation_loader=ldlq_activation_loader,
+        )
     # Experts: build ONE layer's stack (fp4 derives a single per-tensor global
     # over the whole stack, so per-expert packing would diverge — the stack is
     # the byte-identity working set) and pack it whole, exactly as the
@@ -3667,6 +4197,89 @@ def _stream_pack_target(skeleton, profile, resolved, qname, grid, mode, k,
     packed = packed.reshape(w.shape[0], w.shape[1], -1)
     scale = (fields["scales"].reshape(*w.shape[:-1]).cpu()
              if grid == "fp8" else None)
+    return packed.to(torch.uint8).cpu().contiguous(), scale
+
+
+def _prefetch_source_weight(skeleton, weight_key: str, device) -> torch.Tensor:
+    """Read one dense source tensor ahead, pinning host storage for CUDA H2D."""
+
+    return _pin_prefetched_tensor(skeleton.dequant_weight(weight_key), device)
+
+
+def _pin_prefetched_tensor(weight: torch.Tensor, device) -> torch.Tensor:
+    """Pin a reader result only when the encode target is CUDA-backed."""
+
+    target = torch.device(device)
+    if target.type == "cuda" and torch.cuda.is_available() \
+            and weight.device.type == "cpu" and not weight.is_pinned():
+        weight = weight.pin_memory()
+    return weight
+
+
+def _encode_prefetched_cb_tensor(
+    weight: torch.Tensor,
+    *,
+    qname,
+    grid,
+    mode,
+    k,
+    codebook,
+    cw,
+    scale_sweep,
+    coding,
+    device,
+    encode_tier,
+    cb_render_identity,
+    verified_source_qnames,
+    warm_session=None,
+    format_name=None,
+    ldlq_activation_loader=None,
+):
+    """Encode the same dense tensor math from a reader-prefetched host value."""
+
+    w = weight.to(
+        device,
+        non_blocking=bool(weight.device.type == "cpu" and weight.is_pinned()),
+    )
+    cbook = _to_device(codebook, device)
+    if cb_render_identity is not None:
+        from prismaquant.production_weight_cache import (
+            validate_cb_render_source_weight,
+        )
+        validate_cb_render_source_weight(
+            cb_render_identity,
+            qname,
+            w,
+            where="export_nvfp4_cb_streaming source tensor",
+        )
+        verified_source_qnames.add(qname)
+    packed, fields = _pack_with_optional_warm_state(
+        w,
+        qname=qname,
+        format_name=format_name,
+        grid=grid,
+        mode=mode,
+        k=k,
+        col_weights=cw.to(device),
+        codebook=cbook,
+        scale_sweep=scale_sweep,
+        scale_coding=coding,
+        encode_tier=encode_tier,
+        warm_session=warm_session,
+        ldlq_activation_rows=(
+            ldlq_activation_loader.load(
+                qname,
+                stack_size=(int(w.shape[0]) if w.dim() == 3 else None),
+            ) if ldlq_activation_loader is not None else None
+        ),
+    )
+    if w.dim() == 3:
+        packed = packed.reshape(w.shape[0], w.shape[1], -1)
+    scale = (
+        fields["scales"].reshape(*w.shape[:-1]).cpu()
+        if grid == "fp8"
+        else None
+    )
     return packed.to(torch.uint8).cpu().contiguous(), scale
 
 

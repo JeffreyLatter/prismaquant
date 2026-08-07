@@ -735,6 +735,7 @@ def build_quant_config(
     weight_only_stock_targets: Iterable[str] = (),
     streaming_provenance: bool | None = None,
     include_tensor_formats: bool = False,
+    post_allocation_refinement: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the complete producer-owned ``quant_config.json`` payload.
 
@@ -872,6 +873,10 @@ def build_quant_config(
         "codebook_source": codebook_source,
         "scale_sweep": bool(getattr(serialization_context, "scale_sweep")),
         "ldlq": bool(getattr(serialization_context, "ldlq")),
+        **({
+            "minchain": True,
+            "minchain_version": getattr(serialization_context, "minchain_version"),
+        } if bool(getattr(serialization_context, "minchain", False)) else {}),
         "encode_tier": getattr(serialization_context, "encode_tier"),
         "renderer_abi": getattr(serialization_context, "renderer_abi"),
         "scale_coding": scale_coding,
@@ -904,6 +909,13 @@ def build_quant_config(
     if research_cost_selection is not None:
         provenance["research_cost_selection"] = dict(research_cost_selection)
         provenance["research_cost_selection_acknowledged"] = True
+    if post_allocation_refinement is not None:
+        from .cb_ldlq_refinement import validate_refinement_provenance
+
+        validated = validate_refinement_provenance(
+            post_allocation_refinement, where="build_quant_config post_allocation_refinement"
+        )
+        provenance["post_allocation_refinement"] = validated
     excluded = sorted(set(str(prefix) for prefix in excluded_namespaces))
     if excluded:
         # An artifact that is MISSING a namespace has to say so. Otherwise

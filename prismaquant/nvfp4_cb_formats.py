@@ -2098,6 +2098,190 @@ def _ldlq_reassign_fields_3d_threaded(
     return updated
 
 
+LDLQ_GATE_ENV = "PRISMAQUANT_CB_LDLQ_GATE"
+LDLQ_GATE_EPSILON = 1e-12
+
+
+def _ldlq_gate_enabled(environ: Mapping[str, str] | None = None) -> bool:
+    values = os.environ if environ is None else environ
+    raw = str(values.get(LDLQ_GATE_ENV, "1")).strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{LDLQ_GATE_ENV} must be a boolean 0/1 setting, got {raw!r}")
+
+
+def _ldlq_weighted_mse(
+    weight: torch.Tensor,
+    reconstruction: torch.Tensor,
+    col_weights: torch.Tensor,
+) -> torch.Tensor:
+    """Per-row col-weighted MSE, matching the cost's activation-aware branch."""
+    err = (weight.to(torch.float32) - reconstruction.to(torch.float32)).pow(2)
+    if col_weights is not None:
+        cw = torch.broadcast_to(
+            torch.as_tensor(col_weights).to(weight.device, torch.float32),
+            weight.shape,
+        ).to(torch.float32)
+        # Match _col_weight_vectors dead-vector guard: zero-mass -> unweighted.
+        if err.dim() == 2:
+            mass = cw.sum(dim=-1, keepdim=True)
+            cw = torch.where(mass == 0, torch.ones_like(cw), cw)
+        elif err.dim() == 3:
+            mass = cw.sum(dim=-1, keepdim=True)
+            cw = torch.where(mass == 0, torch.ones_like(cw), cw)
+        err = err * cw
+        denom = cw.sum(dim=-1).clamp_min(1e-30).mean().clamp_min(1e-30)
+        # Use mean over all elements weighted by cw; denom above keeps scale
+        # stable when some rows have zero mass. For per-expert gating we need
+        # per-slice value, so caller handles slicing.
+        return err.mean()
+    return err.mean()
+
+
+def _ldlq_per_expert_weighted_mse(
+    weight: torch.Tensor,
+    reconstruction: torch.Tensor,
+    col_weights: torch.Tensor,
+) -> list[float]:
+    """Return per-expert col-weighted MSE for a 3-D stack or single Linear."""
+    if weight.ndim == 2:
+        return [_ldlq_weighted_mse(weight, reconstruction, col_weights).item()]
+    # 3-D: (E, R, C)
+    values: list[float] = []
+    for idx in range(int(weight.shape[0])):
+        w = weight[idx]
+        r = reconstruction[idx] if reconstruction.ndim == 3 else reconstruction
+        cw = col_weights[idx] if col_weights.ndim == 3 else col_weights
+        # col_weights for experts is (E,1,C) broadcast; slice matches.
+        if cw is not None and cw.ndim == 3:
+            cw_slice = cw[idx] if cw.shape[0] == weight.shape[0] else cw
+        else:
+            cw_slice = cw
+        err = (w.to(torch.float32) - r.to(torch.float32)).pow(2)
+        if cw_slice is not None:
+            cw_b = torch.broadcast_to(
+                torch.as_tensor(cw_slice).to(w.device, torch.float32), w.shape
+            ).to(torch.float32)
+            mass = cw_b.sum(dim=-1, keepdim=True)
+            cw_b = torch.where(mass == 0, torch.ones_like(cw_b), cw_b)
+            err = err * cw_b
+        values.append(float(err.mean().item()))
+    return values
+
+
+def _ldlq_activation_mse(
+    weight: torch.Tensor,
+    reconstruction: torch.Tensor,
+    activation_rows: torch.Tensor | Sequence[torch.Tensor] | None,
+) -> float | None:
+    """Activation-weighted output MSE, or None if no activation rows.
+
+    This is the declared gate metric ``activation_output_mse``.  It is fail-
+    closed on malformed rows: a non-2-D tensor, a width mismatch, or any
+    other structural error raises immediately so the caller can record an
+    explicit fallback reason or abort, rather than silently falling back to
+    a different metric.
+    """
+    if activation_rows is None:
+        return None
+    if isinstance(activation_rows, torch.Tensor):
+        act = torch.as_tensor(activation_rows)
+        if act.numel() == 0 or act.shape[0] == 0:
+            return None
+        if act.ndim != 2:
+            raise ValueError(f"activation rows must be rank-2, got shape {tuple(act.shape)}")
+        if int(act.shape[1]) != int(weight.shape[-1]):
+            raise ValueError(
+                f"activation width {act.shape[1]} != weight in_features {weight.shape[-1]}"
+            )
+        if weight.ndim == 3:
+            total = 0.0
+            for idx in range(int(weight.shape[0])):
+                w = weight[idx].to(torch.float32)
+                r = reconstruction[idx].to(torch.float32) if reconstruction.ndim == 3 else reconstruction.to(torch.float32)
+                err = (act.to(w.device, torch.float32) @ (w - r).T).pow(2).mean().item()
+                total += float(err)
+            return total / max(int(weight.shape[0]), 1)
+        w = weight.to(torch.float32)
+        r = reconstruction.to(torch.float32)
+        return float((act.to(w.device, torch.float32) @ (w - r).T).pow(2).mean().item())
+    # Sequence per expert
+    seq = tuple(activation_rows)
+    if not seq:
+        return None
+    # Check for any empty or malformed entry; empty is not an error but a
+    # missing-data signal that the caller must handle explicitly.
+    has_data = False
+    for act in seq:
+        act_t = torch.as_tensor(act)
+        if act_t.numel() == 0 or act_t.shape[0] == 0:
+            continue
+        has_data = True
+        if act_t.ndim != 2:
+            raise ValueError(f"per-expert activation rows must be rank-2, got {tuple(act_t.shape)}")
+        if int(act_t.shape[1]) != int(weight.shape[-1]):
+            raise ValueError(
+                f"per-expert activation width {act_t.shape[1]} != weight in_features {weight.shape[-1]}"
+            )
+    if not has_data:
+        return None
+    if weight.ndim == 2:
+        act = torch.as_tensor(seq[0])
+        if act.numel() == 0:
+            return None
+        w = weight.to(torch.float32)
+        r = reconstruction.to(torch.float32)
+        return float((act.to(w.device, torch.float32) @ (w - r).T).pow(2).mean().item())
+    total = 0.0
+    count = 0
+    for idx, act in enumerate(seq):
+        act_t = torch.as_tensor(act)
+        if act_t.numel() == 0 or act_t.shape[0] == 0:
+            continue
+        w = weight[idx].to(torch.float32)
+        r = reconstruction[idx].to(torch.float32) if reconstruction.ndim == 3 else reconstruction.to(torch.float32)
+        total += float((act_t.to(w.device, torch.float32) @ (w - r).T).pow(2).mean().item())
+        count += 1
+    return total / max(count, 1) if count else None
+
+
+def _ldlq_per_expert_activation_mse(
+    weight: torch.Tensor,
+    reconstruction: torch.Tensor,
+    activation_rows: Sequence[torch.Tensor],
+) -> list[float] | None:
+    if weight.ndim != 3:
+        return None
+    seq = tuple(activation_rows)
+    if len(seq) != int(weight.shape[0]):
+        raise ValueError(
+            f"per-expert activation count {len(seq)} != stack size {weight.shape[0]}"
+        )
+    values: list[float] = []
+    for idx, act in enumerate(seq):
+        act_t = torch.as_tensor(act)
+        if act_t.numel() == 0 or act_t.shape[0] == 0:
+            # Missing rows for this expert is not silently inf; the caller
+            # must decide to fallback per expert with an explicit reason.
+            # We return inf as a sentinel that the caller will interpret as
+            # missing, but we do not swallow malformed shapes.
+            values.append(float("inf"))
+            continue
+        if act_t.ndim != 2:
+            raise ValueError(f"per-expert activation rows must be rank-2, got {tuple(act_t.shape)} for expert {idx}")
+        if int(act_t.shape[1]) != int(weight.shape[-1]):
+            raise ValueError(
+                f"per-expert activation width {act_t.shape[1]} != weight in_features {weight.shape[-1]} for expert {idx}"
+            )
+        w = weight[idx].to(torch.float32)
+        r = reconstruction[idx].to(torch.float32) if reconstruction.ndim == 3 else reconstruction.to(torch.float32)
+        err = float((act_t.to(w.device, torch.float32) @ (w - r).T).pow(2).mean().item())
+        values.append(err)
+    return values
+
+
 def ldlq_reassign_cb_fields(
     weight: torch.Tensor,
     fields: dict,
@@ -2223,6 +2407,208 @@ def ldlq_reassign_cb_fields(
             [part["signs"] for part in assignment_parts], dim=0
         )
     return updated
+
+
+def ldlq_reassign_cb_fields_gated(
+    weight: torch.Tensor,
+    fields: dict,
+    col_weights: torch.Tensor,
+    activation_rows: torch.Tensor | Sequence[torch.Tensor],
+    *,
+    grid: str,
+    mode: str,
+    k: int,
+    block_size: int = LDLQ_BLOCK_SIZE,
+    damping_fraction: float = LDLQ_DAMPING_FRACTION,
+    batch_experts: bool | None = None,
+    gate: bool | None = None,
+) -> tuple[dict, dict]:
+    """Fixed-codebook LDLQ with per-unit do-no-harm fallback.
+
+    Returns ``(fields, gate_info)`` where ``gate_info`` records whether the
+    LDLQ arm was kept per Linear / per expert slice.  The byte payload is
+    identical in either arm, so this is a pure quality gate.  When ``gate``
+    is False the raw LDLQ result is returned verbatim (no comparison).
+    """
+    if gate is None:
+        gate = _ldlq_gate_enabled()
+    if not gate:
+        ldlq_fields = ldlq_reassign_cb_fields(
+            weight, fields, col_weights, activation_rows,
+            grid=grid, mode=mode, block_size=block_size,
+            damping_fraction=damping_fraction, batch_experts=batch_experts,
+        )
+        return ldlq_fields, {"gate": "disabled", "kept_ldlq": True}
+    # Raw reconstruction (no LDLQ) for comparison.
+    raw_recon = nvfp4_cb_reconstruct(fields, k, grid=grid, mode=mode).to(weight.dtype)
+    ldlq_fields = ldlq_reassign_cb_fields(
+        weight, fields, col_weights, activation_rows,
+        grid=grid, mode=mode, block_size=block_size,
+        damping_fraction=damping_fraction, batch_experts=batch_experts,
+    )
+    ldlq_recon = nvfp4_cb_reconstruct(ldlq_fields, k, grid=grid, mode=mode).to(weight.dtype)
+    # Per-unit gate: for packed experts decide per slice, otherwise whole tensor.
+    # Declared metric is activation_output_mse when activation rows were supplied;
+    # missing or malformed rows select raw with an explicit reason, never silently
+    # changing metric.
+    if weight.ndim == 3:
+        # Activation rows must be a per-expert sequence for 3-D; a single tensor
+        # is not a valid per-expert activation for the gate - treat as missing.
+        if activation_rows is None:
+            # No activation supplied: fail closed to raw with explicit reason.
+            return fields, {
+                "gate": "raw_fallback_no_activation",
+                "kept_ldlq": False,
+                "reason": "activation_rows is None but LDLQ gate requires activation_output_mse",
+                "metric": "activation_output_mse",
+            }
+        if isinstance(activation_rows, torch.Tensor):
+            # Single tensor for 3-D is ambiguous: it would be shared across experts,
+            # but the declared per-expert gate requires per-expert rows. Fall back
+            # to raw with explicit reason.
+            return fields, {
+                "gate": "raw_fallback_shared_activation_for_packed",
+                "kept_ldlq": False,
+                "reason": "3-D weight requires per-expert activation sequence, got single tensor",
+                "metric": "activation_output_mse",
+            }
+        try:
+            raw_act_per = _ldlq_per_expert_activation_mse(weight, raw_recon, activation_rows)
+            ldlq_act_per = _ldlq_per_expert_activation_mse(weight, ldlq_recon, activation_rows)
+        except ValueError as exc:
+            return fields, {
+                "gate": "raw_fallback_malformed_activation",
+                "kept_ldlq": False,
+                "reason": str(exc),
+                "metric": "activation_output_mse",
+            }
+        # Check for missing per-expert rows (inf sentinel)
+        if any(v == float("inf") for v in raw_act_per + ldlq_act_per):
+            # Missing rows for some experts: per-expert fallback for those, keep
+            # LDLQ for others where data exists. Record explicit per-expert reason.
+            missing = [i for i, v in enumerate(raw_act_per) if v == float("inf") or ldlq_act_per[i] == float("inf")]
+            keep_mask_missing: list[bool] = []
+            for idx, (raw_err, ldlq_err) in enumerate(zip(raw_act_per, ldlq_act_per)):
+                if idx in missing:
+                    keep_mask_missing.append(False)
+                else:
+                    keep = ldlq_err <= raw_err + LDLQ_GATE_EPSILON * max(abs(raw_err), abs(ldlq_err), 1.0)
+                    keep_mask_missing.append(bool(keep))
+            if all(not k for k in keep_mask_missing):
+                return fields, {
+                    "gate": "raw_kept_all_missing_activation",
+                    "kept_ldlq": False,
+                    "per_expert_kept": keep_mask_missing,
+                    "missing_experts": missing,
+                    "raw_mse_per_expert": raw_act_per,
+                    "ldlq_mse_per_expert": ldlq_act_per,
+                    "metric": "activation_output_mse",
+                    "reason": f"missing activation for experts {missing}",
+                }
+            # For mixed missing case, use the already computed keep_mask and
+            # raw/ldlq per-expert values for the mixed construction below.
+            raw_per, ldlq_per = raw_act_per, ldlq_act_per
+            keep_mask = keep_mask_missing
+        else:
+            raw_per, ldlq_per = raw_act_per, ldlq_act_per
+            keep_mask = []
+            for raw_err, ldlq_err in zip(raw_per, ldlq_per):
+                keep = ldlq_err <= raw_err + LDLQ_GATE_EPSILON * max(abs(raw_err), abs(ldlq_err), 1.0)
+                keep_mask.append(bool(keep))
+        if all(keep_mask):
+            return ldlq_fields, {
+                "gate": "ldlq_kept_all",
+                "kept_ldlq": True,
+                "per_expert_kept": keep_mask,
+                "raw_mse_per_expert": raw_per,
+                "ldlq_mse_per_expert": ldlq_per,
+            }
+        if not any(keep_mask):
+            return fields, {
+                "gate": "raw_kept_all",
+                "kept_ldlq": False,
+                "per_expert_kept": keep_mask,
+                "raw_mse_per_expert": raw_per,
+                "ldlq_mse_per_expert": ldlq_per,
+            }
+        # Mixed: keep LDLQ slices where it wins, raw elsewhere.  We must
+        # splice indices/scales per expert from the winning arm.  The simplest
+        # byte-correct splice is to rebuild fields per expert from the two
+        # sources.
+        # ``fields`` and ``ldlq_fields`` share scales/codebook (LDLQ is
+        # fixed-codebook, fixed-scale), only indices/signs differ, so splicing
+        # indices is sufficient and byte-identical to re-encoding the winner.
+        # For 3-D, indices are (E*R, nvec) flattened; slice per expert.
+        rows_per_expert = int(weight.shape[1])
+        # Indices are (E*R, ...) flattened; recover per-expert blocks.
+        def _slice_indices(src: dict) -> list[torch.Tensor]:
+            idx = src["indices"]
+            # idx shape (E*R, ...) -> per expert (R, ...)
+            return [idx[e*rows_per_expert:(e+1)*rows_per_expert] for e in range(int(weight.shape[0]))]
+        raw_slices = _slice_indices(fields)
+        ldlq_slices = _slice_indices(ldlq_fields)
+        mixed_slices = [
+            ldlq_slices[e] if keep_mask[e] else raw_slices[e]
+            for e in range(len(keep_mask))
+        ]
+        mixed_indices = torch.cat(mixed_slices, dim=0)
+        updated = dict(ldlq_fields if any(keep_mask) else fields)
+        updated["indices"] = mixed_indices
+        if mode == "signed":
+            raw_sign_slices = [fields["signs"][e*rows_per_expert:(e+1)*rows_per_expert] for e in range(len(keep_mask))]
+            ldlq_sign_slices = [ldlq_fields["signs"][e*rows_per_expert:(e+1)*rows_per_expert] for e in range(len(keep_mask))]
+            mixed_signs = [
+                ldlq_sign_slices[e] if keep_mask[e] else raw_sign_slices[e]
+                for e in range(len(keep_mask))
+            ]
+            updated["signs"] = torch.cat(mixed_signs, dim=0)
+        return updated, {
+            "gate": "mixed_per_expert",
+            "kept_ldlq": keep_mask,
+            "per_expert_kept": keep_mask,
+            "raw_mse_per_expert": raw_per,
+            "ldlq_mse_per_expert": ldlq_per,
+        }
+    # 2-D case: whole-tensor gate. Activation is required; missing selects raw
+    # with explicit reason, never silently changes metric.
+    if activation_rows is None:
+        return fields, {
+            "gate": "raw_fallback_no_activation",
+            "kept_ldlq": False,
+            "reason": "activation_rows is None but LDLQ gate requires activation_output_mse",
+            "metric": "activation_output_mse",
+        }
+    try:
+        raw_act = _ldlq_activation_mse(weight, raw_recon, activation_rows)
+        ldlq_act = _ldlq_activation_mse(weight, ldlq_recon, activation_rows)
+    except ValueError as exc:
+        return fields, {
+            "gate": "raw_fallback_malformed_activation",
+            "kept_ldlq": False,
+            "reason": str(exc),
+            "metric": "activation_output_mse",
+        }
+    if raw_act is None or ldlq_act is None:
+        return fields, {
+            "gate": "raw_fallback_missing_activation",
+            "kept_ldlq": False,
+            "reason": "activation rows empty or missing for 2-D gate",
+            "metric": "activation_output_mse",
+        }
+    raw_err, ldlq_err = float(raw_act), float(ldlq_act)
+    if ldlq_err <= raw_err + LDLQ_GATE_EPSILON * max(abs(raw_err), abs(ldlq_err), 1.0):
+        return ldlq_fields, {
+            "gate": "ldlq_kept",
+            "kept_ldlq": True,
+            "raw_mse": raw_err,
+            "ldlq_mse": ldlq_err,
+        }
+    return fields, {
+        "gate": "raw_kept",
+        "kept_ldlq": False,
+        "raw_mse": raw_err,
+        "ldlq_mse": ldlq_err,
+    }
 
 
 def nvfp4_cb_reconstruct(fields: dict, k: int, *, grid: str = "fp4",

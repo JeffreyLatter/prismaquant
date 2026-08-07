@@ -846,11 +846,15 @@ def export_nvfp4_cb(
         ).hexdigest()
         for name, tensor in materialized_codebook_tensors.items()
     }
+    _env_cb_context = cb_serialization_context_from_env()
     serialization_context = CBSerializationContext(
         scale_coding=scale_coding,
         codebook_source=source,
         scale_sweep=bool(scale_sweep),
-        ldlq=cb_serialization_context_from_env().ldlq,
+        ldlq=_env_cb_context.ldlq,
+        ldlq_scope=getattr(_env_cb_context, "ldlq_scope", "all" if _env_cb_context.ldlq else "none"),
+        minchain=_env_cb_context.minchain,
+        minchain_version=_env_cb_context.minchain_version,
         encode_tier=resolve_cb_encode_tier(),
         activation_contract=_claimed_activation_contract,
         activation_execution=(
@@ -908,6 +912,7 @@ def export_nvfp4_cb(
                 qname: (assignment[qname],) for qname in sorted(cb_targets)
             },
             col_weights=col_weights,
+            require_minchain_cells=serialization_context.minchain,
             where="export_nvfp4_cb assignment render identity",
         )
     elif (
@@ -1072,6 +1077,9 @@ def export_nvfp4_cb(
                     where="export_nvfp4_cb source tensor",
                 )
                 verified_cb_source_qnames.add(canon)
+            from prismaquant.nvfp4_cb_footprint import _ldlq_for_format
+
+            ldlq_for_this = _ldlq_for_format(fmt, serialization_context)
             packed, fields = cb.nvfp4_cb_pack(
                 w, k, grid=grid, mode=mode,
                 col_weights=col_weights[canon].to(device),
@@ -1079,13 +1087,13 @@ def export_nvfp4_cb(
                 scale_coding=(scale_coding if grid == "fp4"
                               else cb.SCALE_CODING_V1),
                 encode_tier=serialization_context.encode_tier,
-                ldlq=serialization_context.ldlq,
+                ldlq=ldlq_for_this,
                 activation_rows=(
                     ldlq_activation_loader.load(
                         canon,
                         stack_size=(int(w.shape[0]) if w.dim() == 3 else None),
                     )
-                    if ldlq_activation_loader is not None else None
+                    if ldlq_for_this and ldlq_activation_loader is not None else None
                 ))
             if w.dim() == 3:
                 # Stacked packed experts: keep the expert axis explicit —
@@ -1272,6 +1280,15 @@ def export_nvfp4_cb(
             return qname[len("model."):]
         return qname
 
+    post_allocation_refinement = None
+    _meta_ref = _recipe_payload.get("__prismaquant__", {})
+    if isinstance(_meta_ref, dict) and "post_allocation_refinement" in _meta_ref:
+        from prismaquant.cb_ldlq_refinement import validate_refinement_provenance
+
+        post_allocation_refinement = validate_refinement_provenance(
+            _meta_ref.get("post_allocation_refinement"),
+            where="export_nvfp4_cb post_allocation_refinement",
+        )
     quant_config = build_quant_config(
         assignment=assignment,
         cb_targets=cb_targets,
@@ -1289,6 +1306,7 @@ def export_nvfp4_cb(
         serialization_context=serialization_context,
         cb_render_identity=_recipe_cb_render_identity,
         research_cost_selection=_research_cost_selection,
+        post_allocation_refinement=post_allocation_refinement,
         activation_execution_contract=activation_execution_contract,
         git_commit=_git_commit(),
         cb_target_name=_resident_export_target,

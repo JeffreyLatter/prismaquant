@@ -1849,6 +1849,7 @@ def validate_cb_render_identity_metadata(
     col_weights: Mapping[str, torch.Tensor] | None = None,
     source_weights: Mapping[str, torch.Tensor] | None = None,
     require_source_complete: bool = True,
+    require_minchain_cells: bool = False,
     where: str = "CB render identity",
 ):
     """Validate a value-bearing CB render identity independent of a cache.
@@ -2087,6 +2088,67 @@ def validate_cb_render_identity_metadata(
                 "codebook content digests"
             )
 
+    raw_minchain_cells = identity.get("cb_minchain_cells")
+    if not context.minchain:
+        if raw_minchain_cells is not None:
+            raise ValueError(
+                f"{where}: non-chain render claims per-cell min-chain identity"
+            )
+    elif raw_minchain_cells is None:
+        if require_minchain_cells:
+            raise ValueError(
+                f"{where}: min-chain render is missing per-cell arm/digest "
+                "identity"
+            )
+    else:
+        if not isinstance(raw_minchain_cells, Mapping):
+            raise ValueError(f"{where}: min-chain cell identity is malformed")
+        from prismaquant.cb_minchain import validate_chain_identity
+
+        normalized_cells: dict[str, dict[str, list[dict[str, object]]]] = {}
+        for raw_qname, raw_formats in raw_minchain_cells.items():
+            qname = str(raw_qname)
+            if qname not in scope or not isinstance(raw_formats, Mapping):
+                raise ValueError(
+                    f"{where}: min-chain cell identity has an out-of-scope qname"
+                )
+            normalized_cells[qname] = {}
+            for raw_fmt, raw_cells in raw_formats.items():
+                fmt = str(raw_fmt)
+                if (
+                    fmt not in scope[qname]
+                    or not isinstance(raw_cells, Sequence)
+                    or isinstance(raw_cells, str)
+                    or not raw_cells
+                ):
+                    raise ValueError(
+                        f"{where}: min-chain cell identity has an invalid "
+                        f"scope at {qname}/{fmt}"
+                    )
+                normalized_cells[qname][fmt] = [
+                    validate_chain_identity(
+                        cell,
+                        where=f"{where} {qname}/{fmt}[{index}]",
+                    )
+                    for index, cell in enumerate(raw_cells)
+                ]
+        if normalized_cells != raw_minchain_cells:
+            raise ValueError(
+                f"{where}: min-chain cell identity is not canonical"
+            )
+        if require_minchain_cells:
+            missing = sorted(
+                f"{qname}/{fmt}"
+                for qname, formats in scope.items()
+                for fmt in formats
+                if fmt not in normalized_cells.get(qname, {})
+            )
+            if missing:
+                raise ValueError(
+                    f"{where}: min-chain cell identity does not cover the "
+                    f"selected scope; sample={missing[:8]}"
+                )
+
     if col_weights is not None:
         expected_digest, expected_shapes, expected_content = (
             _canonical_cb_col_weights_identity(
@@ -2259,6 +2321,15 @@ def project_cb_render_identity(
         projected_shapes,
         projected_content,
     )
+    if context.minchain and "cb_minchain_cells" in identity:
+        original_cells = identity["cb_minchain_cells"]
+        projected["cb_minchain_cells"] = {
+            qname: {
+                fmt: copy.deepcopy(original_cells[qname][fmt])
+                for fmt in formats
+            }
+            for qname, formats in selected_scope.items()
+        }
     validate_cb_render_identity_metadata(
         projected,
         col_weights=col_weights,
@@ -2289,6 +2360,7 @@ def merge_cb_render_identities(
     scope: dict[str, list[str]] = {}
     source_shapes: dict[str, list[int]] = {}
     source_content: dict[str, str] = {}
+    minchain_cells: dict[str, dict[str, list[dict[str, object]]]] = {}
     for index, identity in enumerate(identities):
         if identity["render_contract"] != contract:
             raise ValueError(
@@ -2314,6 +2386,13 @@ def merge_cb_render_identities(
         source_content.update(copy.deepcopy(
             identity["source_weights_content_sha256"]
         ))
+        if contexts[0].minchain:
+            shard_cells = identity.get("cb_minchain_cells")
+            if not isinstance(shard_cells, Mapping):
+                raise ValueError(
+                    f"{where}: min-chain shard {index} has no per-cell identity"
+                )
+            minchain_cells.update(copy.deepcopy(shard_cells))
     merged = build_production_cache_cb_render_identity(
         scope,
         cb_serialization_context=contexts[0],
@@ -2330,6 +2409,8 @@ def merge_cb_render_identities(
         source_shapes,
         source_content,
     )
+    if contexts[0].minchain:
+        merged["cb_minchain_cells"] = dict(sorted(minchain_cells.items()))
     validate_cb_render_identity_metadata(
         merged,
         col_weights=col_weights,

@@ -163,6 +163,13 @@ def test_late_override_resolves_a_missing_key(tmp_path):
                     PRODUCTION_CACHE_LEVERS="gptq", PRODUCTION_CACHE_DISABLE_LEVERS="",
                     CB_SCALE_CODING="", CB_CODEBOOK_SOURCE="",
                     CB_SCALE_SWEEP="1", PRISMAQUANT_CB_LDLQ="0",
+                    PRISMAQUANT_CB_MINCHAIN="0",
+                    PRISMAQUANT_CB_MINCHAIN_ANCHORS="",
+                    PRISMAQUANT_CB_MINCHAIN_HOLDBACKS="",
+                    PRISMAQUANT_CB_MINCHAIN_AUDIT_SEED="42",
+                    PRISMAQUANT_CB_MINCHAIN_BACKSTOP="0.25",
+                    PRISMAQUANT_CB_MINCHAIN_AUDIT_MEDIAN="0.05",
+                    PRISMAQUANT_CB_MINCHAIN_AUDIT_P95="0.15",
                     PRISMAQUANT_CB_ENCODE_TIER="balanced")
     artifact = tmp_path / "recached.pkl"
     assert doc["unresolved"]["production-cache-recached"] == ["ASSIGNMENT_DIGEST"]

@@ -29,6 +29,8 @@ class CostEntry(TypedDict, total=False):
     cost_source: NotRequired[str]
     weight_mse_per_expert: NotRequired[list[float]]
     cost_source_per_expert: NotRequired[list[str]]
+    cb_minchain_identity_per_expert: NotRequired[list[dict]]
+    cb_minchain_interpolation: NotRequired[dict]
     error: str
 
 
@@ -227,6 +229,64 @@ def validate_cost_payload(payload, path: str | None = None):
                         path,
                         f".costs[{name!r}][{fmt!r}].cost_source_per_expert",
                         "must match weight_mse_per_expert length",
+                    )
+            if "cb_minchain_identity_per_expert" in entry:
+                identities = entry["cb_minchain_identity_per_expert"]
+                if (not isinstance(identities, Sequence)
+                        or isinstance(identities, (str, bytes))):
+                    _fail(
+                        path,
+                        f".costs[{name!r}][{fmt!r}]"
+                        ".cb_minchain_identity_per_expert",
+                        "must be a sequence when present",
+                    )
+                from .cb_minchain import validate_chain_identity
+
+                for idx, identity in enumerate(identities):
+                    try:
+                        validate_chain_identity(
+                            identity,
+                            where=(
+                                f".costs[{name!r}][{fmt!r}]"
+                                f".cb_minchain_identity_per_expert[{idx}]"
+                            ),
+                        )
+                    except ValueError as exc:
+                        _fail(path, "", str(exc))
+                mse_values = entry.get("weight_mse_per_expert")
+                if (isinstance(mse_values, Sequence)
+                        and not isinstance(mse_values, (str, bytes))
+                        and len(identities) != len(mse_values)):
+                    _fail(
+                        path,
+                        f".costs[{name!r}][{fmt!r}]"
+                        ".cb_minchain_identity_per_expert",
+                        "must match weight_mse_per_expert length",
+                    )
+            if "cb_minchain_interpolation" in entry:
+                interpolation = entry["cb_minchain_interpolation"]
+                if not _is_mapping(interpolation):
+                    _fail(
+                        path,
+                        f".costs[{name!r}][{fmt!r}]"
+                        ".cb_minchain_interpolation",
+                        "must be an object when present",
+                    )
+                if interpolation.get("semantic") != (
+                    "v2_accept_all_plus_per_layer_audit"
+                ):
+                    _fail(
+                        path,
+                        f".costs[{name!r}][{fmt!r}]"
+                        ".cb_minchain_interpolation.semantic",
+                        "has an unsupported interpolation semantic",
+                    )
+                if interpolation.get("layer_audit_pass") is not True:
+                    _fail(
+                        path,
+                        f".costs[{name!r}][{fmt!r}]"
+                        ".cb_minchain_interpolation.layer_audit_pass",
+                        "must be true for an interpolated row",
                     )
             if ("output_mse_measured" in entry
                     and not isinstance(entry["output_mse_measured"], bool)):
