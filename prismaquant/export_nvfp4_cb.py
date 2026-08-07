@@ -852,6 +852,7 @@ def export_nvfp4_cb(
         codebook_source=source,
         scale_sweep=bool(scale_sweep),
         ldlq=_env_cb_context.ldlq,
+        ldlq_scope=getattr(_env_cb_context, "ldlq_scope", "all" if _env_cb_context.ldlq else "none"),
         minchain=_env_cb_context.minchain,
         minchain_version=_env_cb_context.minchain_version,
         encode_tier=resolve_cb_encode_tier(),
@@ -1076,6 +1077,9 @@ def export_nvfp4_cb(
                     where="export_nvfp4_cb source tensor",
                 )
                 verified_cb_source_qnames.add(canon)
+            from prismaquant.nvfp4_cb_footprint import _ldlq_for_format
+
+            ldlq_for_this = _ldlq_for_format(fmt, serialization_context)
             packed, fields = cb.nvfp4_cb_pack(
                 w, k, grid=grid, mode=mode,
                 col_weights=col_weights[canon].to(device),
@@ -1083,13 +1087,13 @@ def export_nvfp4_cb(
                 scale_coding=(scale_coding if grid == "fp4"
                               else cb.SCALE_CODING_V1),
                 encode_tier=serialization_context.encode_tier,
-                ldlq=serialization_context.ldlq,
+                ldlq=ldlq_for_this,
                 activation_rows=(
                     ldlq_activation_loader.load(
                         canon,
                         stack_size=(int(w.shape[0]) if w.dim() == 3 else None),
                     )
-                    if ldlq_activation_loader is not None else None
+                    if ldlq_for_this and ldlq_activation_loader is not None else None
                 ))
             if w.dim() == 3:
                 # Stacked packed experts: keep the expert axis explicit —

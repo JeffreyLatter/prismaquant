@@ -2691,6 +2691,7 @@ def export_nvfp4_cb_streaming(
         codebook_source=source,
         scale_sweep=bool(scale_sweep),
         ldlq=_env_cb_context.ldlq,
+        ldlq_scope=getattr(_env_cb_context, "ldlq_scope", "all" if _env_cb_context.ldlq else "none"),
         minchain=_env_cb_context.minchain,
         minchain_version=_env_cb_context.minchain_version,
         encode_tier=resolve_cb_encode_tier(),
@@ -2998,6 +2999,9 @@ def export_nvfp4_cb_streaming(
         def _pack(qname=qname, h=(kind, h), grid=grid, mode=mode, k=k,
                   codebook=codebook, coding=coding, shape=shape,
                   packed_shape=packed_shape, state=state):
+            from prismaquant.nvfp4_cb_footprint import _ldlq_for_format
+
+            ldlq_for_this = _ldlq_for_format(assignment[qname], serialization_context)
             packed, scale = _stream_pack_target(
                 skeleton, profile, h, qname, grid, mode, k, codebook,
                 col_weights[qname], scale_sweep, coding, shape, device,
@@ -3007,7 +3011,7 @@ def export_nvfp4_cb_streaming(
                 expert_stack_members.get(qname),
                 warm_session=warm_session,
                 format_name=assignment[qname],
-                ldlq_activation_loader=ldlq_activation_loader)
+                ldlq_activation_loader=ldlq_activation_loader if ldlq_for_this else None)
             state["scale"] = scale
             return packed.reshape(packed_shape)
 
@@ -3094,6 +3098,9 @@ def export_nvfp4_cb_streaming(
                        qw_name=qw_name, scale_name=scale_name,
                        input_scale_name=input_scale_name,
                        export_base=export_base):
+                from prismaquant.nvfp4_cb_footprint import _ldlq_for_format
+
+                ldlq_for_this = _ldlq_for_format(assignment[qname], serialization_context)
                 packed, scale = _stream_pack_target(
                     skeleton, profile, h, qname, grid, mode, k, codebook,
                     col_weights[qname], scale_sweep, coding, shape, device,
@@ -3103,7 +3110,7 @@ def export_nvfp4_cb_streaming(
                     expert_stack_members.get(qname),
                     warm_session=warm_session,
                     format_name=assignment[qname],
-                    ldlq_activation_loader=ldlq_activation_loader)
+                    ldlq_activation_loader=ldlq_activation_loader if ldlq_for_this else None)
                 out = {qw_name: packed.reshape(packed_shape)}
                 if scale is not None:
                     out[scale_name] = scale.reshape(scale_shape).to(
@@ -3131,6 +3138,9 @@ def export_nvfp4_cb_streaming(
                     packed_shape=packed_shape,
                     state=state,
                 ):
+                    from prismaquant.nvfp4_cb_footprint import _ldlq_for_format
+
+                    ldlq_for_dense = _ldlq_for_format(assignment[qname], serialization_context)
                     packed, scale = _encode_prefetched_cb_tensor(
                         weight,
                         qname=qname,
@@ -3147,7 +3157,7 @@ def export_nvfp4_cb_streaming(
                         verified_source_qnames=verified_cb_source_qnames,
                         warm_session=warm_session,
                         format_name=assignment[qname],
-                        ldlq_activation_loader=ldlq_activation_loader,
+                        ldlq_activation_loader=ldlq_activation_loader if ldlq_for_dense else None,
                     )
                     state["scale"] = scale
                     return packed.reshape(packed_shape)
