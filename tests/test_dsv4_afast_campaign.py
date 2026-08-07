@@ -18,11 +18,20 @@ from tools.dsv4_afast_campaign import (
 )
 from tools.dsv4_ldlq_cost_campaign import atomic_pickle
 from tools.dsv4_afast_burn import (
+    ANCHORS,
+    BACKSTOP_TOLERANCE,
+    BURN_CELL_IDENTITY_SCHEMA,
+    BURN_CELL_SCHEMA,
+    BURN_PASS_TAG_SCHEMA,
+    BURN_PASS_TAGS,
     EXPERT_COUNT,
     _acceptance,
+    _audit_rung,
     _burn_cell_identity,
+    _burn_cell_path,
     _sha,
     _validated_burn_cell,
+    _validated_burn_cell_or_invalidate,
 )
 from tools.dsv4_afast_allocation_grid import (
     _complete as complete_grid_cell,
@@ -49,22 +58,48 @@ def test_pchip_isotonicizes_epsilon_jittered_anchors():
     assert np.all(np.diff(prediction) <= 1e-12)
 
 
-def test_afast_dual_holdout_acceptance_and_rejection():
-    errors = {
-        rung: [3.0 * 2.0 ** (-rung / 5.0)] * EXPERT_COUNT
-        for rung in (28, 33, 38, 43, 48)
-    }
-    accepted, rejected, report = _acceptance(errors)
+def test_afast_backstop_accepts_smooth_curve_and_rejects_gross_outlier():
+    # A smooth exponential decay is *not* law-exact: the per-expert level-2
+    # fit absorbs its slope but not the level-1 phi staircase, so this
+    # exercises the backstop's headroom over ordinary law residue rather
+    # than over a synthetic perfect fit.  Rungs come from the live anchor
+    # set plus a real audit draw, so a domain move carries through.
+    audit_rung = _audit_rung(0)
+    assert audit_rung not in ANCHORS
+
+    def curve(rung: int) -> float:
+        return 3.0 * 2.0 ** (-rung / 5.0)
+
+    anchor_errors = {rung: [curve(rung)] * EXPERT_COUNT for rung in ANCHORS}
+    audit_errors = [curve(audit_rung)] * EXPERT_COUNT
+
+    accepted, rejected, report = _acceptance(
+        anchor_errors, audit_rung, audit_errors, "gate_proj",
+    )
     assert len(accepted) == EXPERT_COUNT
     assert not rejected
     assert report["accepted"] == EXPERT_COUNT
+    assert report["rejected"] == 0
+    assert max(
+        row["audit_rung_relative_error"] for row in report["per_slice"]
+    ) <= BACKSTOP_TOLERANCE
 
-    errors[43] = list(errors[43])
-    errors[43][17] *= 1.5
-    accepted, rejected, report = _acceptance(errors)
-    assert 17 in rejected
+    # Miss the audit rung by a margin midway between the bar and a total
+    # miss -- gross under any tolerance the operator may register.
+    gross = (1.0 + BACKSTOP_TOLERANCE) / 2.0
+    audit_errors = list(audit_errors)
+    audit_errors[17] /= 1.0 - gross
+
+    accepted, rejected, report = _acceptance(
+        anchor_errors, audit_rung, audit_errors, "gate_proj",
+    )
+    assert rejected == [17]
     assert 17 not in accepted
     assert report["rejected"] == 1
+    assert report["accepted"] == EXPERT_COUNT - 1
+    assert sorted(accepted + rejected) == list(range(EXPERT_COUNT))
+    outlier = next(row for row in report["per_slice"] if row["expert"] == 17)
+    assert outlier["audit_rung_relative_error"] > BACKSTOP_TOLERANCE
 
 
 def test_cell_shard_resume_is_content_keyed(tmp_path):
@@ -131,14 +166,17 @@ def test_burn_cell_resume_binds_phase_encoded_set_and_predecessor(tmp_path):
     warm = tmp_path / "warm.safetensors"
     warm.write_bytes(b"warm")
     identity = _burn_cell_identity(
-        layer=0, projection="down_proj", phase="fallback", rung=37,
+        layer=0, projection="down_proj",
+        pass_tag=BURN_PASS_TAGS["backstop"], rung=37,
         expert_ids=(3, 9), encoded_expert_ids=(3, 9),
         content_guard={"source_digest": "a" * 64},
         predecessor_content_key="b" * 64, replay=True,
     )
     path = tmp_path / "burn.pkl"
     atomic_pickle(path, {
-        "schema": "prismaquant.dsv4_afast_burn_cell.v1",
+        "schema": BURN_CELL_SCHEMA,
+        "pass_tag_schema": BURN_PASS_TAG_SCHEMA,
+        "pass_tag": BURN_PASS_TAGS["backstop"],
         "content_key": _sha(identity), "identity": identity,
         "cell": {
             "rung": 37, "expert_ids": [3, 9],
@@ -147,12 +185,73 @@ def test_burn_cell_resume_binds_phase_encoded_set_and_predecessor(tmp_path):
     })
     assert _validated_burn_cell(path, identity) is not None
     for stale in (
-        dict(identity, phase="accepted"),
+        dict(identity, pass_tag=BURN_PASS_TAGS["primary"]),
         dict(identity, encoded_expert_ids=list(range(EXPERT_COUNT))),
         dict(identity, predecessor_content_key="c" * 64),
     ):
         with pytest.raises(AssertionError, match="stale or corrupt"):
             _validated_burn_cell(path, stale)
+
+
+def test_burn_pass_tags_are_pinned_in_cell_identity_and_filename():
+    identity = _burn_cell_identity(
+        layer=0, projection="gate_proj",
+        pass_tag=BURN_PASS_TAGS["scout"], rung=28,
+        expert_ids=(0,), encoded_expert_ids=(0,),
+        content_guard={"source_digest": "a" * 64},
+        predecessor_content_key=None, replay=False,
+    )
+    assert identity["schema"] == BURN_CELL_IDENTITY_SCHEMA
+    assert identity["pass_tag_schema"] == BURN_PASS_TAG_SCHEMA
+    assert identity["pass_tag"] == "v2s-scout"
+    with pytest.raises(ValueError, match="unregistered burn pass tag"):
+        _burn_cell_path(0, "gate_proj", "v2-scout", 28)
+
+
+def test_burn_resume_identity_mismatch_invalidates_dependent_suffix(
+    tmp_path, monkeypatch,
+):
+    cells = tmp_path / "cells"
+    burn = tmp_path / "burn"
+    cells.mkdir()
+    monkeypatch.setattr("tools.dsv4_afast_burn.BURN_CELL_ROOT", cells)
+    monkeypatch.setattr("tools.dsv4_afast_burn.BURN_ROOT", burn)
+    pass_tag = BURN_PASS_TAGS["scout"]
+    expected = _burn_cell_identity(
+        layer=0, projection="gate_proj", pass_tag=pass_tag, rung=32,
+        expert_ids=(0,), encoded_expert_ids=(0,),
+        content_guard={"source_digest": "b" * 64},
+        predecessor_content_key="c" * 64, replay=False,
+    )
+    stale = dict(expected)
+    stale["content_guard"] = {"source_digest": "a" * 64}
+    for rung in (28, 32, 33, 38):
+        path = _burn_cell_path(0, "gate_proj", pass_tag, rung)
+        atomic_pickle(path, {
+            "schema": BURN_CELL_SCHEMA,
+            "pass_tag_schema": BURN_PASS_TAG_SCHEMA,
+            "pass_tag": pass_tag,
+            "content_key": _sha(stale),
+            "identity": stale,
+            "cell": {
+                "rung": rung, "expert_ids": [0],
+                "warm_state_path": str(tmp_path / "unused"),
+            },
+        })
+    result = _validated_burn_cell_or_invalidate(
+        _burn_cell_path(0, "gate_proj", pass_tag, 32), expected,
+    )
+    assert result is None
+    assert _burn_cell_path(0, "gate_proj", pass_tag, 28).is_file()
+    for rung in (32, 33, 38):
+        assert not _burn_cell_path(0, "gate_proj", pass_tag, rung).exists()
+    manifests = list(
+        (burn / "quarantine-content-mismatch").glob("*/MANIFEST.json")
+    )
+    assert len(manifests) == 1
+    evidence = json.loads(manifests[0].read_text())
+    assert evidence["pass_tag_schema"] == BURN_PASS_TAG_SCHEMA
+    assert [item["rung"] for item in evidence["moved"]] == [32, 33, 38]
 
 
 def test_grid_cell_resume_is_content_keyed_and_requires_outputs(tmp_path):
