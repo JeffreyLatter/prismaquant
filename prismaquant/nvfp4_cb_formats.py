@@ -2098,6 +2098,79 @@ def _ldlq_reassign_fields_3d_threaded(
     return updated
 
 
+LDLQ_GATE_ENV = "PRISMAQUANT_CB_LDLQ_GATE"
+LDLQ_GATE_EPSILON = 1e-12
+
+
+def _ldlq_gate_enabled(environ: Mapping[str, str] | None = None) -> bool:
+    values = os.environ if environ is None else environ
+    raw = str(values.get(LDLQ_GATE_ENV, "1")).strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{LDLQ_GATE_ENV} must be a boolean 0/1 setting, got {raw!r}")
+
+
+def _ldlq_weighted_mse(
+    weight: torch.Tensor,
+    reconstruction: torch.Tensor,
+    col_weights: torch.Tensor,
+) -> torch.Tensor:
+    """Per-row col-weighted MSE, matching the cost's activation-aware branch."""
+    err = (weight.to(torch.float32) - reconstruction.to(torch.float32)).pow(2)
+    if col_weights is not None:
+        cw = torch.broadcast_to(
+            torch.as_tensor(col_weights).to(weight.device, torch.float32),
+            weight.shape,
+        ).to(torch.float32)
+        # Match _col_weight_vectors dead-vector guard: zero-mass -> unweighted.
+        if err.dim() == 2:
+            mass = cw.sum(dim=-1, keepdim=True)
+            cw = torch.where(mass == 0, torch.ones_like(cw), cw)
+        elif err.dim() == 3:
+            mass = cw.sum(dim=-1, keepdim=True)
+            cw = torch.where(mass == 0, torch.ones_like(cw), cw)
+        err = err * cw
+        denom = cw.sum(dim=-1).clamp_min(1e-30).mean().clamp_min(1e-30)
+        # Use mean over all elements weighted by cw; denom above keeps scale
+        # stable when some rows have zero mass. For per-expert gating we need
+        # per-slice value, so caller handles slicing.
+        return err.mean()
+    return err.mean()
+
+
+def _ldlq_per_expert_weighted_mse(
+    weight: torch.Tensor,
+    reconstruction: torch.Tensor,
+    col_weights: torch.Tensor,
+) -> list[float]:
+    """Return per-expert col-weighted MSE for a 3-D stack or single Linear."""
+    if weight.ndim == 2:
+        return [_ldlq_weighted_mse(weight, reconstruction, col_weights).item()]
+    # 3-D: (E, R, C)
+    values: list[float] = []
+    for idx in range(int(weight.shape[0])):
+        w = weight[idx]
+        r = reconstruction[idx] if reconstruction.ndim == 3 else reconstruction
+        cw = col_weights[idx] if col_weights.ndim == 3 else col_weights
+        # col_weights for experts is (E,1,C) broadcast; slice matches.
+        if cw is not None and cw.ndim == 3:
+            cw_slice = cw[idx] if cw.shape[0] == weight.shape[0] else cw
+        else:
+            cw_slice = cw
+        err = (w.to(torch.float32) - r.to(torch.float32)).pow(2)
+        if cw_slice is not None:
+            cw_b = torch.broadcast_to(
+                torch.as_tensor(cw_slice).to(w.device, torch.float32), w.shape
+            ).to(torch.float32)
+            mass = cw_b.sum(dim=-1, keepdim=True)
+            cw_b = torch.where(mass == 0, torch.ones_like(cw_b), cw_b)
+            err = err * cw_b
+        values.append(float(err.mean().item()))
+    return values
+
+
 def ldlq_reassign_cb_fields(
     weight: torch.Tensor,
     fields: dict,
@@ -2223,6 +2296,125 @@ def ldlq_reassign_cb_fields(
             [part["signs"] for part in assignment_parts], dim=0
         )
     return updated
+
+
+def ldlq_reassign_cb_fields_gated(
+    weight: torch.Tensor,
+    fields: dict,
+    col_weights: torch.Tensor,
+    activation_rows: torch.Tensor | Sequence[torch.Tensor],
+    *,
+    grid: str,
+    mode: str,
+    k: int,
+    block_size: int = LDLQ_BLOCK_SIZE,
+    damping_fraction: float = LDLQ_DAMPING_FRACTION,
+    batch_experts: bool | None = None,
+    gate: bool | None = None,
+) -> tuple[dict, dict]:
+    """Fixed-codebook LDLQ with per-unit do-no-harm fallback.
+
+    Returns ``(fields, gate_info)`` where ``gate_info`` records whether the
+    LDLQ arm was kept per Linear / per expert slice.  The byte payload is
+    identical in either arm, so this is a pure quality gate.  When ``gate``
+    is False the raw LDLQ result is returned verbatim (no comparison).
+    """
+    if gate is None:
+        gate = _ldlq_gate_enabled()
+    if not gate:
+        ldlq_fields = ldlq_reassign_cb_fields(
+            weight, fields, col_weights, activation_rows,
+            grid=grid, mode=mode, block_size=block_size,
+            damping_fraction=damping_fraction, batch_experts=batch_experts,
+        )
+        return ldlq_fields, {"gate": "disabled", "kept_ldlq": True}
+    # Raw reconstruction (no LDLQ) for comparison.
+    raw_recon = nvfp4_cb_reconstruct(fields, k, grid=grid, mode=mode).to(weight.dtype)
+    ldlq_fields = ldlq_reassign_cb_fields(
+        weight, fields, col_weights, activation_rows,
+        grid=grid, mode=mode, block_size=block_size,
+        damping_fraction=damping_fraction, batch_experts=batch_experts,
+    )
+    ldlq_recon = nvfp4_cb_reconstruct(ldlq_fields, k, grid=grid, mode=mode).to(weight.dtype)
+    # Per-unit gate: for packed experts decide per slice, otherwise whole tensor.
+    if weight.ndim == 3:
+        raw_per = _ldlq_per_expert_weighted_mse(weight, raw_recon, col_weights)
+        ldlq_per = _ldlq_per_expert_weighted_mse(weight, ldlq_recon, col_weights)
+        keep_mask: list[bool] = []
+        for raw_err, ldlq_err in zip(raw_per, ldlq_per):
+            # Treat epsilon-close as tie -> keep LDLQ (stability).
+            keep = ldlq_err <= raw_err + LDLQ_GATE_EPSILON * max(abs(raw_err), abs(ldlq_err), 1.0)
+            keep_mask.append(bool(keep))
+        if all(keep_mask):
+            return ldlq_fields, {
+                "gate": "ldlq_kept_all",
+                "kept_ldlq": True,
+                "per_expert_kept": keep_mask,
+                "raw_mse_per_expert": raw_per,
+                "ldlq_mse_per_expert": ldlq_per,
+            }
+        if not any(keep_mask):
+            return fields, {
+                "gate": "raw_kept_all",
+                "kept_ldlq": False,
+                "per_expert_kept": keep_mask,
+                "raw_mse_per_expert": raw_per,
+                "ldlq_mse_per_expert": ldlq_per,
+            }
+        # Mixed: keep LDLQ slices where it wins, raw elsewhere.  We must
+        # splice indices/scales per expert from the winning arm.  The simplest
+        # byte-correct splice is to rebuild fields per expert from the two
+        # sources.
+        # ``fields`` and ``ldlq_fields`` share scales/codebook (LDLQ is
+        # fixed-codebook, fixed-scale), only indices/signs differ, so splicing
+        # indices is sufficient and byte-identical to re-encoding the winner.
+        # For 3-D, indices are (E*R, nvec) flattened; slice per expert.
+        rows_per_expert = int(weight.shape[1])
+        # Indices are (E*R, ...) flattened; recover per-expert blocks.
+        def _slice_indices(src: dict) -> list[torch.Tensor]:
+            idx = src["indices"]
+            # idx shape (E*R, ...) -> per expert (R, ...)
+            return [idx[e*rows_per_expert:(e+1)*rows_per_expert] for e in range(int(weight.shape[0]))]
+        raw_slices = _slice_indices(fields)
+        ldlq_slices = _slice_indices(ldlq_fields)
+        mixed_slices = [
+            ldlq_slices[e] if keep_mask[e] else raw_slices[e]
+            for e in range(len(keep_mask))
+        ]
+        mixed_indices = torch.cat(mixed_slices, dim=0)
+        updated = dict(ldlq_fields if any(keep_mask) else fields)
+        updated["indices"] = mixed_indices
+        if mode == "signed":
+            raw_sign_slices = [fields["signs"][e*rows_per_expert:(e+1)*rows_per_expert] for e in range(len(keep_mask))]
+            ldlq_sign_slices = [ldlq_fields["signs"][e*rows_per_expert:(e+1)*rows_per_expert] for e in range(len(keep_mask))]
+            mixed_signs = [
+                ldlq_sign_slices[e] if keep_mask[e] else raw_sign_slices[e]
+                for e in range(len(keep_mask))
+            ]
+            updated["signs"] = torch.cat(mixed_signs, dim=0)
+        return updated, {
+            "gate": "mixed_per_expert",
+            "kept_ldlq": keep_mask,
+            "per_expert_kept": keep_mask,
+            "raw_mse_per_expert": raw_per,
+            "ldlq_mse_per_expert": ldlq_per,
+        }
+    # 2-D case: whole-tensor gate.
+    raw_err = float(_ldlq_weighted_mse(weight, raw_recon, col_weights).item())
+    ldlq_err = float(_ldlq_weighted_mse(weight, ldlq_recon, col_weights).item())
+    if ldlq_err <= raw_err + LDLQ_GATE_EPSILON * max(abs(raw_err), abs(ldlq_err), 1.0):
+        return ldlq_fields, {
+            "gate": "ldlq_kept",
+            "kept_ldlq": True,
+            "raw_mse": raw_err,
+            "ldlq_mse": ldlq_err,
+        }
+    return fields, {
+        "gate": "raw_kept",
+        "kept_ldlq": False,
+        "raw_mse": raw_err,
+        "ldlq_mse": ldlq_err,
+    }
 
 
 def nvfp4_cb_reconstruct(fields: dict, k: int, *, grid: str = "fp4",

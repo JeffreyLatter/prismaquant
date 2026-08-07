@@ -955,16 +955,40 @@ def cb_fields_for_context(
             raise ValueError(f"{spec.name}: LDLQ requires activation-weighted col_weights")
         if activation_rows is None:
             raise ValueError(f"{spec.name}: LDLQ requires calibration activation rows")
-        from .nvfp4_cb_formats import ldlq_reassign_cb_fields
-
-        fields = ldlq_reassign_cb_fields(
-            weight,
-            fields,
-            col_weights,
-            activation_rows,
-            grid=grid,
-            mode=mode,
+        from .nvfp4_cb_formats import (
+            ldlq_reassign_cb_fields,
+            ldlq_reassign_cb_fields_gated,
         )
+
+        # Post-allocation LDLQ refinement is byte-neutral but must be
+        # do-no-harm on the established col-weighted MSE.  The gate keeps the
+        # raw assignment per Linear / per expert slice when LDLQ would regress.
+        # When the gate env is disabled (cost-measurement parity) the verbatim
+        # LDLQ assignment is returned.
+        from .nvfp4_cb_formats import _ldlq_gate_enabled
+
+        if _ldlq_gate_enabled():
+            info = _cb_info(spec.name)
+            assert info is not None
+            _grid, _mode, _k = info
+            fields, _gate_info = ldlq_reassign_cb_fields_gated(
+                weight,
+                fields,
+                col_weights,
+                activation_rows,
+                grid=grid,
+                mode=mode,
+                k=_k,
+            )
+        else:
+            fields = ldlq_reassign_cb_fields(
+                weight,
+                fields,
+                col_weights,
+                activation_rows,
+                grid=grid,
+                mode=mode,
+            )
     return fields
 
 
