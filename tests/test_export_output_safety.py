@@ -241,7 +241,13 @@ def test_directory_transaction_rolls_back_post_model_failure_and_preserves_empty
             (staged / "model.safetensors").write_bytes(b"partial")
             raise RuntimeError("post-model validation failed")
     assert not new_output.exists()
-    assert not _transaction_temps(new_output)
+    # Failure now PRESERVES the partial temp root so a late gate (metadata-only
+    # completeness failures run after every tensor is written) does not discard
+    # byte-identical work; --reuse-prior resumes from it. The load-bearing
+    # invariant is unchanged and asserted above: the publish path is untouched.
+    preserved = _transaction_temps(new_output)
+    assert len(preserved) == 1, preserved
+    assert preserved[0].name.startswith(".new-artifact.tmp-")
 
     empty_output = tmp_path / "empty-artifact"
     empty_output.mkdir()
@@ -257,7 +263,9 @@ def test_directory_transaction_rolls_back_post_model_failure_and_preserves_empty
     after = empty_output.stat()
     assert (after.st_dev, after.st_ino) == (before.st_dev, before.st_ino)
     assert not any(empty_output.iterdir())
-    assert not _transaction_temps(empty_output)
+    preserved_empty = _transaction_temps(empty_output)
+    assert len(preserved_empty) == 1, preserved_empty
+    assert preserved_empty[0].name.startswith(".empty-artifact.tmp-")
 
 
 def test_directory_transaction_does_not_clobber_concurrent_destination(tmp_path):
@@ -276,7 +284,9 @@ def test_directory_transaction_does_not_clobber_concurrent_destination(tmp_path)
             (output / "concurrent.txt").write_text("theirs")
 
     assert (output / "concurrent.txt").read_text() == "theirs"
-    assert not _transaction_temps(output)
+    preserved = _transaction_temps(output)
+    assert len(preserved) == 1, preserved
+    assert preserved[0].name.startswith(".artifact.tmp-")
 
 
 def test_directory_transaction_rejects_replaced_owned_temp_root(tmp_path):
