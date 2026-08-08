@@ -135,9 +135,15 @@ class CBLDLQActivationLoader:
                       for name in by_expert[expert]]
             loaded = [value for value in loaded if value is not None]
             if not loaded:
-                raise ValueError(
-                    f"{qname}: expert {expert} has no LDLQ activation rows"
-                )
+                # Never-routed expert: the calibration forward sent it no
+                # tokens, so there is no capture to read. That is legitimate
+                # and common here -- this export reports 3984 never-routed
+                # expert projections across 60 stacks. Emit an empty slice and
+                # let the declared cold-expert prior fill it below, exactly as
+                # the routed-replay path already does. Raising instead would
+                # make LDLQ unusable on any MoE with cold experts.
+                rows.append(None)
+                continue
             if len(loaded) == 1:
                 rows.append(loaded[0][0])
                 continue
@@ -183,7 +189,29 @@ class CBLDLQActivationLoader:
             rows.append(
                 torch.stack([merged[key] for key in sorted(merged)]).contiguous()
             )
-        return tuple(rows)
+        observed = [value for value in rows if value is not None]
+        if not observed:
+            raise ValueError(
+                f"{qname}: no expert in the stack has LDLQ activation rows"
+            )
+        width = int(observed[0].shape[1])
+        filled, missing = fill_empty_expert_activation_rows(
+            tuple(
+                value if value is not None else torch.empty(
+                    (0, width), dtype=observed[0].dtype)
+                for value in rows
+            ),
+            qname=str(qname),
+        )
+        if missing:
+            print(
+                f"[cb-ldlq] {qname}: {len(missing)} never-routed expert(s) "
+                f"took the pooled cold-expert prior (layer/projection routed "
+                f"rows); indices {list(missing)[:8]}"
+                + ("..." if len(missing) > 8 else ""),
+                flush=True,
+            )
+        return filled
 
     def load(
         self,
