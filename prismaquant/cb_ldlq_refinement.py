@@ -26,7 +26,17 @@ REFINEMENT_SCHEMA = "prismaquant.cb_ldlq_refinement.v1"
 REFINEMENT_KIND = "fixed_codebook_ldlq_gated"
 
 
-ALLOWED_GATES = frozenset({"activation_output_mse", "col_weighted_mse"})
+# ``holdout_activation_output_mse`` is the 2026-08-08 default: LDLQ is certified
+# on rows its Hessian never saw. ``activation_output_mse`` is the legacy
+# in-sample scoring, retained only to reproduce pre-2026-08-08 artifacts — it
+# scores on the rows that fitted the Hessian, so it cannot fail, and its error
+# was measured to be ANTI-correlated with the true benefit (20x overstatement at
+# 64 rows, 48.5x at 1-3 rows). Do not select it for new artifacts.
+ALLOWED_GATES = frozenset({
+    "holdout_activation_output_mse",
+    "activation_output_mse",
+    "col_weighted_mse",
+})
 
 
 def build_refinement_provenance(
@@ -95,7 +105,11 @@ def attach_refinement_to_layer_config(
     *,
     cost_ldlq: bool = False,
     export_ldlq: bool = True,
-    gate: str = "activation_output_mse",
+    # Must name the gate the RENDER actually used. The renderer's default is
+    # the held-out certificate since 2026-08-08; a record still claiming the
+    # legacy in-sample gate would be a provenance lie of exactly the kind this
+    # module exists to prevent.
+    gate: str = "holdout_activation_output_mse",
     gate_enabled: bool = True,
     note: str | None = None,
 ) -> dict[str, Any]:

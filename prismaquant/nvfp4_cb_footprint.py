@@ -1079,7 +1079,10 @@ def cb_fields_for_context(
         )
 
         # Post-allocation LDLQ refinement is byte-neutral but must be
-        # do-no-harm on the declared gate metric (activation_output_mse).
+        # do-no-harm on the declared gate metric — since 2026-08-08 that is
+        # holdout_activation_output_mse: LDLQ is certified on rows its Hessian
+        # never saw, because the previous in-sample scoring could not fail and
+        # its error was measured ANTI-correlated with the true benefit.
         # The gate keeps the raw assignment per Linear / per expert slice when
         # LDLQ would regress.  When the gate env is disabled (cost-measurement
         # parity) the verbatim LDLQ assignment is returned.

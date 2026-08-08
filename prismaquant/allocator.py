@@ -1739,6 +1739,18 @@ def main():
         help="Exact CB feedback-assignment contract; required with CB formats.",
     )
     ap.add_argument(
+        "--cb-ldlq-scope",
+        choices=("none", "nvfp4", "all"),
+        default=None,
+        help=(
+            "Which CB family the exporter will LDLQ. Authoritative over "
+            "--cb-ldlq when given. The stamp must match what the export "
+            "actually renders, or the per-tensor identity preflight fails: "
+            "'nvfp4' means NVFP4_CB is LDLQ and FP8_CB stays raw. LDLQ is "
+            "byte-neutral, so this changes the recorded contract, not bytes."
+        ),
+    )
+    ap.add_argument(
         "--cb-minchain",
         choices=("0", "1"),
         default="0",
@@ -2290,6 +2302,7 @@ def main():
                 codebook_source=args.cb_codebook_source,
                 scale_sweep=args.cb_scale_sweep == "1",
                 ldlq=args.cb_ldlq == "1",
+                ldlq_scope=args.cb_ldlq_scope,
                 minchain=args.cb_minchain == "1",
                 minchain_version=(
                     MINCHAIN_CONTEXT_VERSION if args.cb_minchain == "1" else None

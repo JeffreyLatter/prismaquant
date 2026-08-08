@@ -56,6 +56,7 @@ measured under v1 coding.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import threading
 import weakref
@@ -2101,15 +2102,69 @@ def _ldlq_reassign_fields_3d_threaded(
 LDLQ_GATE_ENV = "PRISMAQUANT_CB_LDLQ_GATE"
 LDLQ_GATE_EPSILON = 1e-12
 
+# A certificate needs at least one fitting row AND one held-out row. Below that
+# there is no evidence LDLQ helps this tensor, so it keeps raw. This floor is
+# derived from the existence of the certificate, not chosen: it is the smallest
+# row count for which the out-of-sample question can be asked at all.
+LDLQ_GATE_MIN_ROWS = 2
 
-def _ldlq_gate_enabled(environ: Mapping[str, str] | None = None) -> bool:
+LDLQ_GATE_MODE_HOLDOUT = "holdout"
+LDLQ_GATE_MODE_IN_SAMPLE = "in_sample"
+LDLQ_GATE_MODE_DISABLED = "disabled"
+
+
+def _ldlq_gate_mode(environ: Mapping[str, str] | None = None) -> str:
+    """Resolve the gate mode.
+
+    ``holdout`` (default) certifies LDLQ on rows the Hessian never saw.
+    ``in_sample`` is the legacy scoring that reproduces pre-2026-08-08
+    artifacts; it scores on the same rows that fitted the Hessian and therefore
+    cannot fail — retained only for reproduction, never for new artifacts.
+    """
     values = os.environ if environ is None else environ
     raw = str(values.get(LDLQ_GATE_ENV, "1")).strip().lower()
-    if raw in {"1", "true", "yes", "on"}:
-        return True
+    if raw in {"1", "true", "yes", "on", "holdout"}:
+        return LDLQ_GATE_MODE_HOLDOUT
+    if raw in {"in_sample", "insample", "legacy"}:
+        return LDLQ_GATE_MODE_IN_SAMPLE
     if raw in {"0", "false", "no", "off"}:
-        return False
-    raise ValueError(f"{LDLQ_GATE_ENV} must be a boolean 0/1 setting, got {raw!r}")
+        return LDLQ_GATE_MODE_DISABLED
+    raise ValueError(
+        f"{LDLQ_GATE_ENV} must be one of 0/1/holdout/in_sample, got {raw!r}"
+    )
+
+
+def _ldlq_gate_enabled(environ: Mapping[str, str] | None = None) -> bool:
+    return _ldlq_gate_mode(environ) != LDLQ_GATE_MODE_DISABLED
+
+
+def _ldlq_holdout_split(
+    rows: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Deterministic content-keyed fit/hold split for the LDLQ certificate.
+
+    The seed is the sha256 of the row bytes, so the split — and therefore the
+    shipped assignment — is reproducible across processes and machines. (It is
+    deliberately NOT keyed on identity/``data_ptr`` the way the inverse-factor
+    cache is: that keying is correct for a cache and unusable for anything that
+    affects exported bytes.)
+
+    Returns ``None`` when the tensor has fewer than ``LDLQ_GATE_MIN_ROWS`` rows,
+    i.e. when no out-of-sample question can be asked.
+    """
+    x = torch.as_tensor(rows)
+    n = int(x.shape[0])
+    if n < LDLQ_GATE_MIN_ROWS:
+        return None
+    digest = hashlib.sha256(
+        x.detach().to(torch.float32).cpu().numpy().tobytes()
+    ).digest()
+    generator = torch.Generator().manual_seed(
+        int.from_bytes(digest[:8], "big") % (2**31 - 1)
+    )
+    perm = torch.randperm(n, generator=generator).to(x.device)
+    n_fit = (n + 1) // 2
+    return x[perm[:n_fit]].contiguous(), x[perm[n_fit:]].contiguous()
 
 
 def _ldlq_weighted_mse(
@@ -2422,6 +2477,7 @@ def ldlq_reassign_cb_fields_gated(
     damping_fraction: float = LDLQ_DAMPING_FRACTION,
     batch_experts: bool | None = None,
     gate: bool | None = None,
+    gate_mode: str | None = None,
 ) -> tuple[dict, dict]:
     """Fixed-codebook LDLQ with per-unit do-no-harm fallback.
 
@@ -2431,8 +2487,16 @@ def ldlq_reassign_cb_fields_gated(
     is False the raw LDLQ result is returned verbatim (no comparison).
     """
     if gate is None:
-        gate = _ldlq_gate_enabled()
-    if not gate:
+        resolved_mode = _ldlq_gate_mode()
+    elif not gate:
+        resolved_mode = LDLQ_GATE_MODE_DISABLED
+    else:
+        resolved_mode = gate_mode or _ldlq_gate_mode()
+        if resolved_mode == LDLQ_GATE_MODE_DISABLED:
+            resolved_mode = LDLQ_GATE_MODE_HOLDOUT
+    if gate_mode is not None:
+        resolved_mode = gate_mode
+    if resolved_mode == LDLQ_GATE_MODE_DISABLED:
         ldlq_fields = ldlq_reassign_cb_fields(
             weight, fields, col_weights, activation_rows,
             grid=grid, mode=mode, block_size=block_size,
@@ -2447,6 +2511,67 @@ def ldlq_reassign_cb_fields_gated(
         damping_fraction=damping_fraction, batch_experts=batch_experts,
     )
     ldlq_recon = nvfp4_cb_reconstruct(ldlq_fields, k, grid=grid, mode=mode).to(weight.dtype)
+
+    # ---- scoring arm -------------------------------------------------------
+    # ``holdout`` (default): the DECISION comes from an LDLQ fitted on a
+    # deterministic half of the rows and scored on the half it never saw. The
+    # SHIPPED assignment is still the all-rows fit above, which sees strictly
+    # more data than the arm that earned the certificate.
+    #
+    # ``in_sample`` (legacy): the decision reuses the all-rows fit and the very
+    # rows that fitted its Hessian, so it cannot fail. Measured 2026-08-08, its
+    # error is ANTI-correlated with the truth — 20x overstatement at 64 rows
+    # rising to 48.5x at 1-3 rows — so it must not be used for new artifacts.
+    score_recon = ldlq_recon
+    score_rows = activation_rows
+    uncertifiable: list[int] = []
+    if resolved_mode == LDLQ_GATE_MODE_HOLDOUT and activation_rows is not None:
+        if weight.ndim == 3 and not isinstance(activation_rows, torch.Tensor):
+            activations = tuple(activation_rows)
+            splits = [_ldlq_holdout_split(rows) for rows in activations]
+            uncertifiable = [i for i, s in enumerate(splits) if s is None]
+            fit_rows = tuple(
+                (split[0] if split is not None else torch.as_tensor(rows))
+                for split, rows in zip(splits, activations)
+            )
+            score_rows = tuple(
+                (split[1] if split is not None else torch.as_tensor(rows))
+                for split, rows in zip(splits, activations)
+            )
+            certificate_fields = ldlq_reassign_cb_fields(
+                weight, fields, col_weights, fit_rows,
+                grid=grid, mode=mode, block_size=block_size,
+                damping_fraction=damping_fraction, batch_experts=batch_experts,
+            )
+            score_recon = nvfp4_cb_reconstruct(
+                certificate_fields, k, grid=grid, mode=mode).to(weight.dtype)
+        elif weight.ndim == 2 and isinstance(activation_rows, torch.Tensor):
+            split = _ldlq_holdout_split(activation_rows)
+            if split is None:
+                return fields, {
+                    "gate": "raw_uncertifiable_too_few_rows",
+                    "kept_ldlq": False,
+                    "metric": "holdout_activation_output_mse",
+                    "n_activation_rows": int(
+                        torch.as_tensor(activation_rows).shape[0]),
+                    "reason": (
+                        f"fewer than {LDLQ_GATE_MIN_ROWS} activation rows: no "
+                        "held-out row exists, so LDLQ cannot be certified"
+                    ),
+                }
+            fit_rows, score_rows = split
+            certificate_fields = ldlq_reassign_cb_fields(
+                weight, fields, col_weights, fit_rows,
+                grid=grid, mode=mode, block_size=block_size,
+                damping_fraction=damping_fraction, batch_experts=batch_experts,
+            )
+            score_recon = nvfp4_cb_reconstruct(
+                certificate_fields, k, grid=grid, mode=mode).to(weight.dtype)
+    gate_metric = (
+        "holdout_activation_output_mse"
+        if resolved_mode == LDLQ_GATE_MODE_HOLDOUT
+        else "activation_output_mse"
+    )
     # Per-unit gate: for packed experts decide per slice, otherwise whole tensor.
     # Declared metric is activation_output_mse when activation rows were supplied;
     # missing or malformed rows select raw with an explicit reason, never silently
@@ -2460,7 +2585,7 @@ def ldlq_reassign_cb_fields_gated(
                 "gate": "raw_fallback_no_activation",
                 "kept_ldlq": False,
                 "reason": "activation_rows is None but LDLQ gate requires activation_output_mse",
-                "metric": "activation_output_mse",
+                "metric": gate_metric,
             }
         if isinstance(activation_rows, torch.Tensor):
             # Single tensor for 3-D is ambiguous: it would be shared across experts,
@@ -2470,18 +2595,35 @@ def ldlq_reassign_cb_fields_gated(
                 "gate": "raw_fallback_shared_activation_for_packed",
                 "kept_ldlq": False,
                 "reason": "3-D weight requires per-expert activation sequence, got single tensor",
-                "metric": "activation_output_mse",
+                "metric": gate_metric,
             }
         try:
-            raw_act_per = _ldlq_per_expert_activation_mse(weight, raw_recon, activation_rows)
-            ldlq_act_per = _ldlq_per_expert_activation_mse(weight, ldlq_recon, activation_rows)
+            raw_act_per = _ldlq_per_expert_activation_mse(weight, raw_recon, score_rows)
+            ldlq_act_per = _ldlq_per_expert_activation_mse(weight, score_recon, score_rows)
         except ValueError as exc:
             return fields, {
                 "gate": "raw_fallback_malformed_activation",
                 "kept_ldlq": False,
                 "reason": str(exc),
-                "metric": "activation_output_mse",
+                "metric": gate_metric,
             }
+
+        uncertifiable_set = set(uncertifiable)
+
+        def _certified(idx: int, raw_err: float, ldlq_err: float) -> bool:
+            """Keep LDLQ for this slice only on positive out-of-sample evidence."""
+            if idx in uncertifiable_set:
+                # Fewer than LDLQ_GATE_MIN_ROWS rows: no held-out row exists,
+                # so no certificate is possible and raw stands.
+                return False
+            if resolved_mode == LDLQ_GATE_MODE_HOLDOUT:
+                # Strict improvement on rows the fit never saw; ties keep raw.
+                return bool(ldlq_err < raw_err)
+            return bool(
+                ldlq_err <= raw_err
+                + LDLQ_GATE_EPSILON * max(abs(raw_err), abs(ldlq_err), 1.0)
+            )
+
         # Check for missing per-expert rows (inf sentinel)
         if any(v == float("inf") for v in raw_act_per + ldlq_act_per):
             # Missing rows for some experts: per-expert fallback for those, keep
@@ -2492,8 +2634,7 @@ def ldlq_reassign_cb_fields_gated(
                 if idx in missing:
                     keep_mask_missing.append(False)
                 else:
-                    keep = ldlq_err <= raw_err + LDLQ_GATE_EPSILON * max(abs(raw_err), abs(ldlq_err), 1.0)
-                    keep_mask_missing.append(bool(keep))
+                    keep_mask_missing.append(_certified(idx, raw_err, ldlq_err))
             if all(not k for k in keep_mask_missing):
                 return fields, {
                     "gate": "raw_kept_all_missing_activation",
@@ -2502,7 +2643,7 @@ def ldlq_reassign_cb_fields_gated(
                     "missing_experts": missing,
                     "raw_mse_per_expert": raw_act_per,
                     "ldlq_mse_per_expert": ldlq_act_per,
-                    "metric": "activation_output_mse",
+                    "metric": gate_metric,
                     "reason": f"missing activation for experts {missing}",
                 }
             # For mixed missing case, use the already computed keep_mask and
@@ -2511,25 +2652,36 @@ def ldlq_reassign_cb_fields_gated(
             keep_mask = keep_mask_missing
         else:
             raw_per, ldlq_per = raw_act_per, ldlq_act_per
-            keep_mask = []
-            for raw_err, ldlq_err in zip(raw_per, ldlq_per):
-                keep = ldlq_err <= raw_err + LDLQ_GATE_EPSILON * max(abs(raw_err), abs(ldlq_err), 1.0)
-                keep_mask.append(bool(keep))
+            keep_mask = [
+                _certified(idx, raw_err, ldlq_err)
+                for idx, (raw_err, ldlq_err) in enumerate(zip(raw_per, ldlq_per))
+            ]
+        # ``holdout_ratio_per_expert`` is the honest per-tensor s_output: the
+        # out-of-sample LDLQ/raw output-MSE ratio. Emitting it here means the
+        # gate produces the pricing input as a by-product of the decision it
+        # already has to make, instead of a separate measurement campaign.
+        telemetry = {
+            "metric": gate_metric,
+            "gate_mode": resolved_mode,
+            "per_expert_kept": keep_mask,
+            "raw_mse_per_expert": raw_per,
+            "ldlq_mse_per_expert": ldlq_per,
+            "holdout_ratio_per_expert": [
+                (float(ldlq_err) / float(raw_err))
+                if (raw_err not in (0.0, float("inf"))
+                    and ldlq_err != float("inf"))
+                else None
+                for raw_err, ldlq_err in zip(raw_per, ldlq_per)
+            ],
+            "uncertifiable_experts": sorted(uncertifiable_set),
+        }
         if all(keep_mask):
             return ldlq_fields, {
-                "gate": "ldlq_kept_all",
-                "kept_ldlq": True,
-                "per_expert_kept": keep_mask,
-                "raw_mse_per_expert": raw_per,
-                "ldlq_mse_per_expert": ldlq_per,
+                "gate": "ldlq_kept_all", "kept_ldlq": True, **telemetry,
             }
         if not any(keep_mask):
             return fields, {
-                "gate": "raw_kept_all",
-                "kept_ldlq": False,
-                "per_expert_kept": keep_mask,
-                "raw_mse_per_expert": raw_per,
-                "ldlq_mse_per_expert": ldlq_per,
+                "gate": "raw_kept_all", "kept_ldlq": False, **telemetry,
             }
         # Mixed: keep LDLQ slices where it wins, raw elsewhere.  We must
         # splice indices/scales per expert from the winning arm.  The simplest
@@ -2563,11 +2715,7 @@ def ldlq_reassign_cb_fields_gated(
             ]
             updated["signs"] = torch.cat(mixed_signs, dim=0)
         return updated, {
-            "gate": "mixed_per_expert",
-            "kept_ldlq": keep_mask,
-            "per_expert_kept": keep_mask,
-            "raw_mse_per_expert": raw_per,
-            "ldlq_mse_per_expert": ldlq_per,
+            "gate": "mixed_per_expert", "kept_ldlq": keep_mask, **telemetry,
         }
     # 2-D case: whole-tensor gate. Activation is required; missing selects raw
     # with explicit reason, never silently changes metric.
@@ -2576,38 +2724,53 @@ def ldlq_reassign_cb_fields_gated(
             "gate": "raw_fallback_no_activation",
             "kept_ldlq": False,
             "reason": "activation_rows is None but LDLQ gate requires activation_output_mse",
-            "metric": "activation_output_mse",
+            "metric": gate_metric,
         }
     try:
-        raw_act = _ldlq_activation_mse(weight, raw_recon, activation_rows)
-        ldlq_act = _ldlq_activation_mse(weight, ldlq_recon, activation_rows)
+        raw_act = _ldlq_activation_mse(weight, raw_recon, score_rows)
+        ldlq_act = _ldlq_activation_mse(weight, score_recon, score_rows)
     except ValueError as exc:
         return fields, {
             "gate": "raw_fallback_malformed_activation",
             "kept_ldlq": False,
             "reason": str(exc),
-            "metric": "activation_output_mse",
+            "metric": gate_metric,
         }
     if raw_act is None or ldlq_act is None:
         return fields, {
             "gate": "raw_fallback_missing_activation",
             "kept_ldlq": False,
             "reason": "activation rows empty or missing for 2-D gate",
-            "metric": "activation_output_mse",
+            "metric": gate_metric,
         }
     raw_err, ldlq_err = float(raw_act), float(ldlq_act)
-    if ldlq_err <= raw_err + LDLQ_GATE_EPSILON * max(abs(raw_err), abs(ldlq_err), 1.0):
+    if resolved_mode == LDLQ_GATE_MODE_HOLDOUT:
+        # Strict improvement on rows the certificate fit never saw; ties keep raw.
+        certified = ldlq_err < raw_err
+    else:
+        certified = ldlq_err <= raw_err + LDLQ_GATE_EPSILON * max(
+            abs(raw_err), abs(ldlq_err), 1.0)
+    holdout_ratio = (
+        ldlq_err / raw_err if raw_err not in (0.0, float("inf")) else None
+    )
+    if certified:
         return ldlq_fields, {
             "gate": "ldlq_kept",
             "kept_ldlq": True,
+            "metric": gate_metric,
+            "gate_mode": resolved_mode,
             "raw_mse": raw_err,
             "ldlq_mse": ldlq_err,
+            "holdout_ratio": holdout_ratio,
         }
     return fields, {
         "gate": "raw_kept",
         "kept_ldlq": False,
+        "metric": gate_metric,
+        "gate_mode": resolved_mode,
         "raw_mse": raw_err,
         "ldlq_mse": ldlq_err,
+        "holdout_ratio": holdout_ratio,
     }
 
 

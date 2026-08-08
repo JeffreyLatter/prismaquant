@@ -1,6 +1,6 @@
 # PrismaQuant Architecture
 
-As of: 2026-08-07 · branch `orchestrator/dsv4-ldlq-reexport` · verified against implementation
+As of: 2026-08-08 · branch `integration/dsv4-ldlq-merge` · verified against implementation
 baseline commit `0c14957` plus the priced-interpolated-output fix and gated LDLQ
 post-allocation refinement, with the external Gridbook runtime pinned to
 `9011a19228ddb96b8a49e11a20ac75c99c83998e` (v0.8.0). This branch ports the dated
@@ -379,7 +379,7 @@ VALIDATED_SOURCE_PREFETCH=require   VALIDATED_FRONTIER_PICK=kneedle,
 VALIDATED_FRONTIER_SKIP_CALIB=$NSAMPLES (held-out disjointness, ON)
 CB_EXPERT_EMPIRICAL=0  CB_SCALE_CODING=two_tier  (D15: shipped values)
 PRISMAQUANT_CB_LDLQ=0  (opt-in post-fit feedback assignment)
-PRISMAQUANT_CB_LDLQ_GATE=1  (do-no-harm col-weighted MSE gate; per-Linear and per-expert fallback to raw when LDLQ regresses; byte-neutral)
+PRISMAQUANT_CB_LDLQ_GATE=holdout|in_sample|0  (default holdout: do-no-harm certified on rows the LDLQ fit never saw; per-Linear and per-expert fallback to raw; byte-neutral. `in_sample` is the pre-2026-08-08 legacy scoring, reproduction only)
 PRISMAQUANT_CB_MINCHAIN=0  (opt-in monotone packed-expert rung chain)
 AURA_ADDITIVITY_GATE=measure
 PRISMAQUANT_GGUF_IMATRIX=1  DEVICE=cuda  EXPORT_DEVICE=cuda
@@ -1295,12 +1295,33 @@ Instead the allocator's assignment (2.53 bpw, `c525f4025eac7061`, `predicted_dlo
 stays on its raw cost, and the exporter applies a **byte-neutral, per-unit gated LDLQ
 reassignment** on top of the already-chosen codebooks/scales:
 
-* `nvfp4_cb_formats.ldlq_reassign_cb_fields_gated` (`PRISMAQUANT_CB_LDLQ_GATE=1`, default-on)
-  scores the raw and LDLQ reconstructions with the same col-weighted MSE the cost's
-  `BRANCH_INTERPOLATED_OUTPUT` / `BRANCH_MEASURED` branch uses, and keeps the raw
-  indices per Linear (2-D) or per expert slice (3-D, mixing only the winning slices)
-  when LDLQ would regress.  `ldlq_reassign_cb_fields` without the gate remains the
-  verbatim assignment for cost-measurement parity.
+* `nvfp4_cb_formats.ldlq_reassign_cb_fields_gated`
+  (`PRISMAQUANT_CB_LDLQ_GATE=holdout`, default-on) keeps the raw indices per Linear
+  (2-D) or per expert slice (3-D, mixing only the winning slices) unless LDLQ earns
+  a **held-out certificate**: the decision comes from an LDLQ fitted on a
+  deterministic, content-keyed half of the calibration rows and scored on the half
+  it never saw, requiring strict improvement (ties keep raw). The **shipped**
+  assignment remains the all-rows fit, which sees strictly more data than the arm
+  that earned the certificate. Tensors with fewer than `LDLQ_GATE_MIN_ROWS = 2`
+  rows are *uncertifiable* — no held-out row exists — and keep raw.
+  `ldlq_reassign_cb_fields` without the gate remains the verbatim assignment for
+  cost-measurement parity.
+* **Why held-out, not in-sample (2026-08-08).** The previous gate scored on the
+  same rows that fitted the Hessian, so it could not fail. Measured across four
+  support bands (L17 gate_proj, K12), its error was *anti-correlated* with the true
+  benefit — 20× overstatement at 64 activation rows rising to 48.5× at 1–3 rows —
+  because fewer rows are easier to fit exactly. Pricing from it would have inverted
+  the allocator's ranking, not merely inflated it. Acceptance on held-out rows the
+  gate never saw: degeneration **7/96 → 1/96**, and on full-support `down_proj` the
+  new gate rejected exactly the one regressing expert. Evidence:
+  `dq-runs/dsv4-flash-0731/ldlq-delta/{LDLQ_DIAGNOSIS,GATE_FIX}.md`. Legacy
+  behaviour remains reachable as `PRISMAQUANT_CB_LDLQ_GATE=in_sample` for artifact
+  reproduction only.
+* `gate_info["holdout_ratio_per_expert"]` is the honest per-tensor out-of-sample
+  LDLQ/raw output-MSE ratio, emitted as a by-product of the decision the gate must
+  make anyway — so LDLQ pricing needs no separate measurement campaign. The ratio
+  is constant in `K` (0.4692 / 0.4798 / 0.4770 at K12/K15/K18, certified across
+  parity), but varies by support level and projection.
 * The gate is byte-neutral by construction (fixed codebook, fixed scales, only the
   `k`-bit indices move), so `cb_tensor_payload_breakdown` and `whole_artifact_budget`
   are unchanged for the post-allocation refinement path.  Allocator optimality for
@@ -1308,7 +1329,8 @@ reassignment** on top of the already-chosen codebooks/scales:
   optimality is not implied and requires the dual-basis reallocation below.
 * Truthful provenance is `prismaquant.cb_ldlq_refinement.v1`
   (`cb_ldlq_refinement.py:build_refinement_provenance`): `cost_ldlq=false`,
-  `export_ldlq=true`, `gate=activation_output_mse`, `byte_neutral=true`, plus the
+  `export_ldlq=true`, `gate=holdout_activation_output_mse` (default since 2026-08-08;
+  `activation_output_mse` remains accepted for pre-existing artifacts), `byte_neutral=true`, plus the
   creation timestamp.  The derived `layer_config.json` carries it under
   `__prismaquant__.post_allocation_refinement`, and both CB exporters copy it
   into `quant_config.json/provenance.post_allocation_refinement` after
