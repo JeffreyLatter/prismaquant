@@ -2036,8 +2036,23 @@ def _floor_block_fp8_units(
     verbatim_prefixes = tuple(_verbatim()) if callable(_verbatim) else ()
 
     units: dict[str, str] = {}
-    for _live, entry in scale_map.items():
-        scale_key = entry[1]
+    # Scan the CHECKPOINT, not `scale_map`. The map is keyed by LIVE MODEL
+    # NAME, and a profile may legitimately map a shipped checkpoint tensor to
+    # no model name at all: DSv4 returns None for `attn.compressor.*` and
+    # `attn.indexer.*` because probe mode disables those modules
+    # (model_profiles/deepseek_v4.py). Those tensors still ship, so a
+    # probe-time graph decision must not decide how their bytes are DECLARED.
+    #
+    # Iterating the map silently skipped every indexer unit -- measured
+    # 2026-08-08 on DSv4-Flash: `wo_a` 43 entries in the map, `indexer` 0 of
+    # 33368 -- so 21 `attn.indexer.wq_b` weights fell to the verbatim loop and
+    # were declared `ignore`, which is exactly the silent corruption this
+    # function exists to prevent. That is why the docstring above already
+    # listed indexer.wq_b as covered when it was not: the intent was right and
+    # the iteration source was wrong. Scanning the checkpoint makes the
+    # docstring's stated contract ("the checkpoint pairs an F8_E4M3 weight
+    # with an F8_E8M0 scale") literally what the code does.
+    for scale_key in sorted(skeleton.keys()):
         if not scale_key.endswith(".scale"):
             # Legacy `.weight_scale_inv` checkpoints normalize through the
             # FP8_SOURCE lane and never reach this fallback.
