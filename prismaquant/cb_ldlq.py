@@ -81,7 +81,48 @@ class CBLDLQActivationLoader:
             )
         return value.detach().to(torch.float32).contiguous()
 
+    def _direct_with_indices(
+        self, qname: str
+    ) -> tuple[torch.Tensor, torch.Tensor | None] | None:
+        """Rows plus the global calibration row index each was sampled from."""
+        path = self.activation_cache_dir / (
+            _ACT_FNAME_SUB.sub("__", str(qname)) + ".pt"
+        )
+        if not path.is_file():
+            return None
+        blob = torch.load(path, map_location="cpu", weights_only=False)
+        value = blob.get("inputs") if isinstance(blob, dict) else None
+        if not isinstance(value, torch.Tensor) or value.ndim != 2:
+            raise ValueError(
+                f"{qname}: LDLQ activation cache entry has no rank-2 inputs"
+            )
+        indices = blob.get("row_indices") if isinstance(blob, dict) else None
+        if not isinstance(indices, torch.Tensor):
+            indices = None
+        return value.detach().to(torch.float32).contiguous(), indices
+
     def _per_expert(self, qname: str) -> tuple[torch.Tensor, ...] | None:
+        """One activation matrix per expert, unioned across fused members.
+
+        Fused siblings (gate_proj/up_proj) consume the SAME input, so the fused
+        serving unit needs one Hessian. But the activation reservoir samples
+        each projection independently, so their captured matrices are different
+        subsets of the same stream -- measured on DSv4 L0/expert 0: 64 rows
+        each, intersection 15, union 113, and rows at shared indices are
+        bit-identical. Requiring the matrices to be equal (as this did before)
+        therefore fails on correct data.
+
+        Union by global ``row_indices`` instead. That satisfies the fused-unit
+        contract, and because the members sampled different tokens it also
+        RAISES Hessian support for fused units (64 -> ~113 rows here), which
+        matters: support is the binding constraint on whether LDLQ generalises
+        at all (see dq-runs/dsv4-flash-0731/ldlq-delta/LDLQ_DIAGNOSIS.md).
+
+        The shared-input assumption is still enforced, and more sharply than
+        before: any global row index contributed by two members must carry the
+        SAME vector. Absent ``row_indices`` the loader cannot align samples and
+        falls back to the strict equality check, fail-closed.
+        """
         members = self.expert_stack_members.get(qname)
         if not members:
             return None
@@ -90,23 +131,58 @@ class CBLDLQActivationLoader:
             by_expert.setdefault(int(expert), []).append(str(member))
         rows: list[torch.Tensor] = []
         for expert in sorted(by_expert):
-            candidates = [self._direct(name) for name in by_expert[expert]]
-            candidates = [value for value in candidates if value is not None]
-            if not candidates:
+            loaded = [self._direct_with_indices(name)
+                      for name in by_expert[expert]]
+            loaded = [value for value in loaded if value is not None]
+            if not loaded:
                 raise ValueError(
                     f"{qname}: expert {expert} has no LDLQ activation rows"
                 )
-            reference = candidates[0]
-            if any(
-                tuple(value.shape) != tuple(reference.shape)
-                or not torch.equal(value, reference)
-                for value in candidates[1:]
-            ):
+            if len(loaded) == 1:
+                rows.append(loaded[0][0])
+                continue
+            widths = {int(values.shape[1]) for values, _ in loaded}
+            if len(widths) != 1:
                 raise ValueError(
                     f"{qname}: fused expert {expert} members disagree on "
-                    "their captured LDLQ input rows"
+                    "their captured LDLQ input width"
                 )
-            rows.append(reference)
+            if any(indices is None for _values, indices in loaded):
+                reference = loaded[0][0]
+                if any(
+                    tuple(values.shape) != tuple(reference.shape)
+                    or not torch.equal(values, reference)
+                    for values, _ in loaded[1:]
+                ):
+                    raise ValueError(
+                        f"{qname}: fused expert {expert} members disagree on "
+                        "their captured LDLQ input rows, and carry no "
+                        "row_indices to align them"
+                    )
+                rows.append(reference)
+                continue
+            merged: dict[int, torch.Tensor] = {}
+            for values, indices in loaded:
+                if int(indices.shape[0]) != int(values.shape[0]):
+                    raise ValueError(
+                        f"{qname}: expert {expert} row_indices length "
+                        f"{int(indices.shape[0])} != rows "
+                        f"{int(values.shape[0])}"
+                    )
+                for position, raw_index in enumerate(indices.tolist()):
+                    index = int(raw_index)
+                    row = values[position]
+                    seen = merged.get(index)
+                    if seen is not None and not torch.equal(seen, row):
+                        raise ValueError(
+                            f"{qname}: fused expert {expert} members captured "
+                            f"DIFFERENT vectors for global calibration row "
+                            f"{index}; fused siblings must share one input"
+                        )
+                    merged[index] = row
+            rows.append(
+                torch.stack([merged[key] for key in sorted(merged)]).contiguous()
+            )
         return tuple(rows)
 
     def load(
