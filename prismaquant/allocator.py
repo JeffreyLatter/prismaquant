@@ -4772,6 +4772,24 @@ def main():
             "additive_candidate_proposal_then_exact_assignment_filter"
         ),
         "global_optimality_claimed": False,
+        # The artifact-wide CB context the per-tensor identities above were
+        # computed under. Without it the exporter cannot know which contract
+        # produced them: it reads this key
+        # (`cb_serialization_metadata_from_assignment_payload`) to decide
+        # whether to claim the W4A4 activation contract. Absent, it falls back
+        # to no-contract/payload-v2, drops the 4-byte input_global_scale, and
+        # EVERY per-tensor stamp mismatches -- measured 2026-08-08 on DSv4:
+        # 24851/24851 mismatched, which is the root cause of the four earlier
+        # "CB per-layer serialization identity mismatch" export failures.
+        **({"cb_serialized_payload": cb_serialization_context_stamp(
+                cb_serialization_context,
+                formats=sorted({
+                    str(fmt) for fmt in assignment_expanded.values()
+                    if is_cb_format(str(fmt))
+                }) or None,
+            )}
+           if cb_serialization_context is not None
+           and final_cb_serialization_stamps else {}),
         **propagated_cost_provenance(research_cost_provenance),
         "assignment_payload_bits_total": (
             float(final_assignment_payload["bits_total"])
