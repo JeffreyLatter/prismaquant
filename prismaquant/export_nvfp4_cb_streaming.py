@@ -2727,6 +2727,22 @@ def export_nvfp4_cb_streaming(
         serialization_context,
         where="export_nvfp4_cb_streaming",
     )
+    from prismaquant.nvfp4_cb_footprint import _ldlq_for_format
+
+    _ldlq_telemetry_qnames = {
+        qname for qname in cb_targets
+        if _ldlq_for_format(assignment[qname], serialization_context)
+    }
+    ldlq_telemetry = None
+    if _ldlq_telemetry_qnames:
+        from prismaquant.cb_ldlq_gate_telemetry import (
+            LDLQGateTelemetryCollector,
+        )
+
+        ldlq_telemetry = LDLQGateTelemetryCollector(
+            expected_qnames=_ldlq_telemetry_qnames,
+            kernel_stamp=cb.canonical_ldlq_kernel_stamp(),
+        )
     ldlq_activation_loader = None
     if serialization_context.ldlq:
         if activation_cache_dir is None:
@@ -3026,7 +3042,9 @@ def export_nvfp4_cb_streaming(
                 expert_stack_members.get(qname),
                 warm_session=warm_session,
                 format_name=assignment[qname],
-                ldlq_activation_loader=ldlq_activation_loader if ldlq_for_this else None)
+                ldlq_activation_loader=ldlq_activation_loader if ldlq_for_this else None,
+                ldlq_telemetry=ldlq_telemetry if ldlq_for_this else None,
+            )
             state["scale"] = scale
             return packed.reshape(packed_shape)
 
@@ -3125,7 +3143,9 @@ def export_nvfp4_cb_streaming(
                     expert_stack_members.get(qname),
                     warm_session=warm_session,
                     format_name=assignment[qname],
-                    ldlq_activation_loader=ldlq_activation_loader if ldlq_for_this else None)
+                    ldlq_activation_loader=ldlq_activation_loader if ldlq_for_this else None,
+                    ldlq_telemetry=ldlq_telemetry if ldlq_for_this else None,
+                )
                 out = {qw_name: packed.reshape(packed_shape)}
                 if scale is not None:
                     out[scale_name] = scale.reshape(scale_shape).to(
@@ -3173,6 +3193,7 @@ def export_nvfp4_cb_streaming(
                         warm_session=warm_session,
                         format_name=assignment[qname],
                         ldlq_activation_loader=ldlq_activation_loader if ldlq_for_dense else None,
+                        ldlq_telemetry=ldlq_telemetry if ldlq_for_dense else None,
                     )
                     state["scale"] = scale
                     return packed.reshape(packed_shape)
@@ -4036,6 +4057,8 @@ def export_nvfp4_cb_streaming(
                 "extra="
                 f"{sorted(verified_cb_source_qnames - expected_scope)[:8]}"
             )
+        if ldlq_telemetry is not None:
+            ldlq_telemetry.payload()
 
     writer.write(
         out_dir / "model.safetensors",
@@ -4066,6 +4089,8 @@ def export_nvfp4_cb_streaming(
         p = model_dir / aux
         if p.exists():
             (out_dir / aux).write_bytes(p.read_bytes())
+    if ldlq_telemetry is not None:
+        ldlq_telemetry.publish(out_dir, quant_config)
     # Persist and assert a final filesystem inventory distinct from the CB
     # tensor-data payload contract.  This includes both safetensors headers,
     # JSON configs, tokenizer assets, and all other regular output files.
@@ -4110,7 +4135,8 @@ def _stream_pack_target(skeleton, profile, resolved, qname, grid, mode, k,
                         encode_tier, cb_render_identity,
                         verified_source_qnames, member_qnames=None, *,
                         warm_session=None, format_name=None,
-                        ldlq_activation_loader=None):
+                        ldlq_activation_loader=None,
+                        ldlq_telemetry=None):
     """Pack ONE target, streaming experts. Returns (packed uint8 (rows,bytes)
     or (E,out,bytes), scale-plane fp32 or None). Per-expert scales make
     per-expert packing byte-identical to whole-stack packing."""
@@ -4135,6 +4161,7 @@ def _stream_pack_target(skeleton, profile, resolved, qname, grid, mode, k,
             warm_session=warm_session,
             format_name=format_name,
             ldlq_activation_loader=ldlq_activation_loader,
+            ldlq_telemetry=ldlq_telemetry,
         )
     # Experts: build ONE layer's stack (fp4 derives a single per-tensor global
     # over the whole stack, so per-expert packing would diverge — the stack is
@@ -4208,7 +4235,9 @@ def _stream_pack_target(skeleton, profile, resolved, qname, grid, mode, k,
         ldlq_activation_rows=(
             ldlq_activation_loader.load(qname, stack_size=int(w.shape[0]))
             if ldlq_activation_loader is not None else None
-        ))
+        ),
+        ldlq_telemetry=ldlq_telemetry,
+    )
     packed = packed.reshape(w.shape[0], w.shape[1], -1)
     scale = (fields["scales"].reshape(*w.shape[:-1]).cpu()
              if grid == "fp8" else None)
@@ -4249,6 +4278,7 @@ def _encode_prefetched_cb_tensor(
     warm_session=None,
     format_name=None,
     ldlq_activation_loader=None,
+    ldlq_telemetry=None,
 ):
     """Encode the same dense tensor math from a reader-prefetched host value."""
 
@@ -4287,6 +4317,7 @@ def _encode_prefetched_cb_tensor(
                 stack_size=(int(w.shape[0]) if w.dim() == 3 else None),
             ) if ldlq_activation_loader is not None else None
         ),
+        ldlq_telemetry=ldlq_telemetry,
     )
     if w.dim() == 3:
         packed = packed.reshape(w.shape[0], w.shape[1], -1)
@@ -4302,6 +4333,7 @@ def _pack_with_optional_warm_state(
     weight, *, qname, format_name, grid, mode, k, col_weights, codebook,
     scale_sweep, scale_coding, encode_tier, warm_session,
     ldlq_activation_rows=None,
+    ldlq_telemetry=None,
 ):
     """Run normal assignment/packing, optionally seeded by a stored argmin."""
     from prismaquant.cb_warm_state import (
@@ -4310,6 +4342,9 @@ def _pack_with_optional_warm_state(
     )
 
     def encode(warm_scale_state=None):
+        gate_info: dict[str, object] | None = (
+            {} if ldlq_activation_rows is not None else None
+        )
         packed, fields = cb.nvfp4_cb_pack(
             weight,
             k,
@@ -4323,25 +4358,40 @@ def _pack_with_optional_warm_state(
             warm_scale_state=warm_scale_state,
             ldlq=ldlq_activation_rows is not None,
             activation_rows=ldlq_activation_rows,
+            ldlq_gate_info_out=gate_info,
         )
         rendered = {"packed": packed}
         if grid == "fp8":
             rendered["weight_scale"] = fields["scales"]
         return CBEncodedPayload(
-            value=(packed, fields),
+            value=(packed, fields, gate_info),
             selected_scale=selected_scale_state(fields),
             rendered=rendered,
         )
 
     if warm_session is None:
-        return encode().value
-    payload = warm_session.encode(
-        qname,
-        format_name,
-        full_encode=lambda: encode(),
-        seeded_encode=lambda state: encode(state),
-    )
-    return payload.value
+        selected = encode().value
+    else:
+        payload = warm_session.encode(
+            qname,
+            format_name,
+            full_encode=lambda: encode(),
+            seeded_encode=lambda state: encode(state),
+        )
+        selected = payload.value
+    packed, fields, gate_info = selected
+    if ldlq_telemetry is not None:
+        if gate_info is None:
+            raise AssertionError(f"{qname}: LDLQ telemetry has no gate result")
+        ldlq_telemetry.record(
+            qname=qname,
+            shape=tuple(int(dim) for dim in weight.shape),
+            grid=grid,
+            mode=mode,
+            k=k,
+            gate_info=gate_info,
+        )
+    return packed, fields
 
 
 def _train_shared_codebook_streaming(skeleton, profile, expert_groups,

@@ -22,6 +22,7 @@ from safetensors.torch import load_file, save_file
 
 os.environ["PRISMAQUANT_CB_ENCODE_COMPILE"] = "0"
 
+from prismaquant import nvfp4_cb_formats as cb  # noqa: E402
 from prismaquant.export_nvfp4_cb import (  # noqa: E402
     export_nvfp4_cb as _export_nvfp4_cb,
 )
@@ -326,6 +327,67 @@ def test_streaming_byte_identical_dense_and_stacked(workdir):
         cb_s = load_file(str(workdir / "s" / qs["codebook_file"]))
         cb_m = load_file(str(workdir / "m" / qm["codebook_file"]))
         assert _tensors_equal(cb_m, cb_s)
+
+
+@pytest.mark.parametrize(
+    "exporter",
+    [export_nvfp4_cb, export_nvfp4_cb_streaming],
+    ids=["batch", "streaming"],
+)
+def test_cb_exporters_emit_gated_ldlq_bytes(
+    workdir, exporter, monkeypatch,
+):
+    """Both final exporters must ship the gate's arm, not bare LDLQ."""
+    monkeypatch.setenv("PRISMAQUANT_CB_LDLQ", "1")
+    monkeypatch.delenv("PRISMAQUANT_CB_LDLQ_SCOPE", raising=False)
+    monkeypatch.setenv("PRISMAQUANT_CB_LDLQ_GATE", "holdout")
+    monkeypatch.setenv("PRISMAQUANT_CB_ENCODE_TIER", "balanced")
+    monkeypatch.setenv("CB_CODEBOOK_SOURCE", "lattice")
+    monkeypatch.setenv("CB_SCALE_CODING", "two_tier")
+    monkeypatch.setenv("CB_SCALE_SWEEP", "1")
+
+    generator = torch.Generator().manual_seed(0)
+    qname = "model.layers.0.self_attn.q_proj"
+    weight = (torch.randn(8, 256, generator=generator) * 0.25).to(
+        torch.bfloat16
+    )
+    col_weights = torch.rand(256, generator=generator) + 0.05
+    activation_rows = torch.randn(1, 256, generator=generator)
+    model = workdir / "model"
+    _write_model(model, {f"{qname}.weight": weight})
+    assignment = workdir / "assignment.json"
+    _assign(assignment, {qname: {"data_type": "nvfp4_cb", "cb_k": 12}})
+    activation_cache = workdir / "activation-cache"
+    activation_cache.mkdir()
+    torch.save(
+        {"inputs": activation_rows, "name": qname},
+        activation_cache / "model__layers__0__self_attn__q_proj.pt",
+    )
+
+    # One activation row is uncertifiable under the holdout gate, hence the
+    # expected artifact bytes are the ordinary same-format assignment.
+    expected, _ = cb.nvfp4_cb_pack(
+        weight,
+        12,
+        grid="fp4",
+        mode="product",
+        col_weights=col_weights,
+        scale_coding="two_tier",
+        encode_tier="balanced",
+    )
+    out = workdir / exporter.__name__
+    exporter(
+        model,
+        assignment,
+        out,
+        {qname: col_weights},
+        device="cpu",
+        activation_cache_dir=activation_cache,
+    )
+    shipped = load_file(str(out / "model.safetensors"))[
+        f"{qname}.cb_qweight"
+    ]
+    assert torch.equal(shipped, expected)
 
 
 def test_streaming_warm_fallback_counts_are_artifact_provenance(workdir):
