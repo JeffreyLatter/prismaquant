@@ -2516,6 +2516,138 @@ def _ldlq_per_expert_activation_mse(
     return values
 
 
+# Per-row payload keys of a packed CB encode.  ``nvfp4_cb_fields`` stores a
+# 3-D (E, R, C) stack flattened row-major as (E*R, ...), so expert ``e`` owns
+# rows [e*R, (e+1)*R) of each of these; everything else in the fields dict
+# (codebook tables, shape, scale_coding tag) is shared read-only metadata.
+_PACKED_CB_PER_ROW_FIELD_KEYS = (
+    "indices", "scales", "signs", "scale_super", "scale_sub",
+)
+
+
+def _slice_packed_cb_fields(
+    fields: dict, expert: int, rows_per_expert: int, in_features: int,
+) -> dict:
+    """Exact single-expert view of packed CB ``fields``.
+
+    Reconstruction is row-local (a codebook gather plus a per-row scale
+    multiply, no cross-expert reduction), so reconstructing this slice is
+    bitwise-identical to slicing a full-stack reconstruction.  The shared
+    ``codebook`` is a read-only lookup table, not per-expert data, and passes
+    through untouched.
+    """
+    first = int(expert) * int(rows_per_expert)
+    last = first + int(rows_per_expert)
+    out = {
+        key: value
+        for key, value in fields.items()
+        if key not in _PACKED_CB_PER_ROW_FIELD_KEYS and key != "shape"
+    }
+    for key in _PACKED_CB_PER_ROW_FIELD_KEYS:
+        value = fields.get(key)
+        if value is not None:
+            out[key] = value[first:last]
+    out["shape"] = (int(rows_per_expert), int(in_features))
+    return out
+
+
+def reconstruct_packed_cb_expert(
+    fields: dict,
+    expert: int,
+    rows_per_expert: int,
+    in_features: int,
+    *,
+    k: int,
+    grid: str,
+    mode: str,
+) -> torch.Tensor:
+    """Reconstruct one expert slice of a packed CB encode.
+
+    Bitwise-identical to ``nvfp4_cb_reconstruct(fields, ...)[expert]`` while
+    materializing only one (R, C) slice instead of the full (E, R, C) stack.
+    """
+    sliced = _slice_packed_cb_fields(fields, expert, rows_per_expert,
+                                     in_features)
+    return nvfp4_cb_reconstruct(sliced, k, grid=grid, mode=mode)
+
+
+def _ldlq_packed_gate_activation_mses(
+    weight: torch.Tensor,
+    raw_fields: dict,
+    candidate_fields: dict,
+    activation_rows: Sequence[torch.Tensor],
+    *,
+    k: int,
+    grid: str,
+    mode: str,
+    candidate_is_raw: bool = False,
+) -> tuple[list[float], list[float]]:
+    """Per-expert (raw, ldlq) activation MSEs without a full-stack recon.
+
+    Bitwise-identical to reconstructing the full (E, R, C) stack for each arm
+    and scoring with :func:`_ldlq_per_expert_activation_mse` — reconstruction
+    is elementwise per row and the gate MSE is a within-expert reduction — but
+    holds at most one (R, C) fp32 slice per arm resident.  The monolithic
+    scoring held two full fp32 stacks (2 x 16 GiB on the DSv4 fused gate_up
+    256x4096x4096 stack), which OOM'd the GB10 production-shape canary with
+    107 GiB already committed.
+
+    ``candidate_is_raw`` covers the fallback arms where the candidate IS the
+    raw fields (e.g. no certifiable holdout split exists): the monolithic path
+    evaluated the identical deterministic reduction on identical inputs twice,
+    so reusing the raw value is bitwise-identical.
+    """
+    if weight.ndim != 3:
+        raise ValueError(
+            f"packed gate scoring requires a 3-D stack, got {tuple(weight.shape)}"
+        )
+    seq = tuple(activation_rows)
+    if len(seq) != int(weight.shape[0]):
+        raise ValueError(
+            f"per-expert activation count {len(seq)} != stack size {weight.shape[0]}"
+        )
+    rows_per_expert = int(weight.shape[1])
+    in_features = int(weight.shape[-1])
+    raw_values: list[float] = []
+    ldlq_values: list[float] = []
+    for idx, act in enumerate(seq):
+        act_t = torch.as_tensor(act)
+        if act_t.numel() == 0 or act_t.shape[0] == 0:
+            # Same missing-rows sentinel as _ldlq_per_expert_activation_mse.
+            raw_values.append(float("inf"))
+            ldlq_values.append(float("inf"))
+            continue
+        if act_t.ndim != 2:
+            raise ValueError(
+                f"per-expert activation rows must be rank-2, got {tuple(act_t.shape)} for expert {idx}"
+            )
+        if int(act_t.shape[1]) != in_features:
+            raise ValueError(
+                f"per-expert activation width {act_t.shape[1]} != weight in_features {weight.shape[-1]} for expert {idx}"
+            )
+        w = weight[idx].to(torch.float32)
+        act32 = act_t.to(w.device, torch.float32)
+        raw_recon = reconstruct_packed_cb_expert(
+            raw_fields, idx, rows_per_expert, in_features,
+            k=k, grid=grid, mode=mode,
+        ).to(weight.dtype).to(torch.float32)
+        raw_err = float((act32 @ (w - raw_recon).T).pow(2).mean().item())
+        raw_values.append(raw_err)
+        del raw_recon
+        if candidate_is_raw:
+            ldlq_values.append(raw_err)
+            continue
+        cand_recon = reconstruct_packed_cb_expert(
+            candidate_fields, idx, rows_per_expert, in_features,
+            k=k, grid=grid, mode=mode,
+        ).to(weight.dtype).to(torch.float32)
+        ldlq_values.append(
+            float((act32 @ (w - cand_recon).T).pow(2).mean().item())
+        )
+        del cand_recon
+    return raw_values, ldlq_values
+
+
 def ldlq_reassign_cb_fields(
     weight: torch.Tensor,
     fields: dict,
@@ -2775,13 +2907,27 @@ def ldlq_reassign_cb_fields_gated(
             "reason": f"LDLQ weight must be rank 2 or 3, got {tuple(weight.shape)}",
             "metric": gate_metric,
         }
-    # Raw reconstruction (no LDLQ) for comparison.  ``candidate_fields`` is
-    # always the exact assignment scored by the gate; a discrete all-row
-    # refit is not licensed by a different half-fit candidate's certificate.
-    raw_recon = nvfp4_cb_reconstruct(
-        fields, k, grid=grid, mode=mode
-    ).to(weight.dtype)
+    # ``candidate_fields`` is always the exact assignment scored by the gate;
+    # a discrete all-row refit is not licensed by a different half-fit
+    # candidate's certificate.
+    #
+    # Raw reconstruction (no LDLQ) for comparison is materialized ONLY on the
+    # 2-D path.  A packed stack is scored expert-slice-by-expert-slice via
+    # _ldlq_packed_gate_activation_mses: a full-stack fp32 reconstruction is
+    # ~16 GiB per arm on the DSv4 fused gate_up stack (256 x 4096 x 4096 x
+    # 4 bytes) and the monolithic gate needed two of them, which OOM'd the
+    # GB10 production-shape canary at 107 GiB committed.
+    raw_recon = None
+    score_recon = None
+    if weight.ndim == 2:
+        raw_recon = nvfp4_cb_reconstruct(
+            fields, k, grid=grid, mode=mode
+        ).to(weight.dtype)
     candidate_fields = None
+    # True when the scored candidate IS the raw fields (fallback arms); the
+    # packed scorer then reuses the raw per-expert value instead of
+    # reconstructing an identical second arm.
+    candidate_is_raw = False
 
     # ---- scoring arm -------------------------------------------------------
     # ``holdout`` (default): the candidate is fitted on a deterministic half
@@ -2812,7 +2958,7 @@ def ldlq_reassign_cb_fields_gated(
             certified_splits = [split for split in splits if split is not None]
             if not certified_splits:
                 candidate_fields = fields
-                score_recon = raw_recon
+                candidate_is_raw = True
             else:
                 # Keep the exact E16 geometry.  Uncertifiable slices borrow one
                 # valid fit only for an independent throwaway slot and are
@@ -2829,9 +2975,6 @@ def ldlq_reassign_cb_fields_gated(
                     batch_experts=batch_experts,
                     _diagnostics=diagnostics,
                 )
-                score_recon = nvfp4_cb_reconstruct(
-                    candidate_fields, k, grid=grid, mode=mode
-                ).to(weight.dtype)
         elif weight.ndim == 2 and isinstance(activation_rows, torch.Tensor):
             split = _ldlq_holdout_split(activation_rows)
             if split is None:
@@ -2863,7 +3006,7 @@ def ldlq_reassign_cb_fields_gated(
             ]
             if not present:
                 candidate_fields = fields
-                score_recon = raw_recon
+                candidate_is_raw = True
             else:
                 placeholder = present[0]
                 candidate_rows = tuple(
@@ -2878,9 +3021,10 @@ def ldlq_reassign_cb_fields_gated(
                 batch_experts=batch_experts,
                 _diagnostics=diagnostics,
             )
-            score_recon = nvfp4_cb_reconstruct(
-                candidate_fields, k, grid=grid, mode=mode
-            ).to(weight.dtype)
+            if weight.ndim == 2:
+                score_recon = nvfp4_cb_reconstruct(
+                    candidate_fields, k, grid=grid, mode=mode
+                ).to(weight.dtype)
     assert candidate_fields is not None
     # Per-unit gate: for packed experts decide per slice, otherwise whole tensor.
     # Declared metric is activation_output_mse when activation rows were supplied;
@@ -2908,8 +3052,11 @@ def ldlq_reassign_cb_fields_gated(
                 "metric": gate_metric,
             }
         try:
-            raw_act_per = _ldlq_per_expert_activation_mse(weight, raw_recon, score_rows)
-            ldlq_act_per = _ldlq_per_expert_activation_mse(weight, score_recon, score_rows)
+            raw_act_per, ldlq_act_per = _ldlq_packed_gate_activation_mses(
+                weight, fields, candidate_fields, score_rows,
+                k=k, grid=grid, mode=mode,
+                candidate_is_raw=candidate_is_raw,
+            )
         except ValueError as exc:
             return fields, {
                 "gate": "raw_fallback_malformed_activation",

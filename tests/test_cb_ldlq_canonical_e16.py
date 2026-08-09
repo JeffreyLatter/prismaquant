@@ -187,10 +187,17 @@ def test_empty_expert_stays_raw_without_blocking_e16_candidate(
     )
 
     def fake_reconstruct(source, _k, *, grid, mode):
-        view = source["indices"].reshape(16, 2, 1, 4)
+        # The gate now scores expert-slice-by-expert-slice, so this fake
+        # serves both the full (16*2)-row stack and a single-expert 2-row
+        # slice of it (shape carried by the sliced fields dict).
+        idx = source["indices"]
+        experts = idx.shape[0] // 2
+        view = idx.reshape(experts, 2, 1, 4)
         changed = view[:, 0, 0, 0] != 99
-        result = torch.zeros_like(weight)
-        result[changed] = weight[changed]
+        result = torch.zeros(experts, 2, 8, dtype=weight.dtype)
+        result[changed] = 1.0
+        if len(source["shape"]) == 2:
+            return result[0]
         return result
 
     monkeypatch.setattr(cb, "nvfp4_cb_reconstruct", fake_reconstruct)
