@@ -252,6 +252,12 @@ DOCKER_COMMON=(
   # so an unbiased per-layer mean matches decision granularity. The
   # exact-vs-sampled choice is the launch wrapper's, per invocation.
   -e PRISMAQUANT_EXPERT_COST_SAMPLE
+  # RD-ladder interpolation plan (anchors+holdout measured, remaining
+  # rungs fitted per tensor, holdout-gated with measured fallback) —
+  # value-less forwards; the launch wrapper opts in per invocation.
+  -e PRISMAQUANT_CB_LADDER_INTERP
+  -e PRISMAQUANT_CB_LADDER_ANCHORS
+  -e PRISMAQUANT_CB_LADDER_HOLDOUT
   -e PRISMAQUANT_CB_LDLQ_SCOPE
   -e PRISMAQUANT_CB_LDLQ_GATE
   -e PRISMAQUANT_CB_MINCHAIN
