@@ -31,7 +31,7 @@ import json
 import math
 import re
 import struct
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping, MutableMapping, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -1064,6 +1064,7 @@ def cb_fields_for_context(
     codebook=None,
     activation_rows=None,
     warm_scale_state=None,
+    raw_fields_out: MutableMapping[str, object] | None = None,
 ):
     """Encode CB fields under the exact artifact serialization context.
 
@@ -1071,6 +1072,15 @@ def cb_fields_for_context(
     a correctness contract, not merely a byte-pricing option.  FP8-CB has no
     FP4 scale plane; it still requires the context so the measured result is
     stamped with the same codebook-sharing identity as allocation/export.
+
+    ``raw_fields_out``: optional sidecar capture.  When LDLQ applies to this
+    format under ``context``, the mapping receives the pre-gate raw encode —
+    the EXACT no-LDLQ render (same env, codebook, scale sweep/coding) that the
+    gated reassignment starts from — under keys ``{"ldlq_applied": True,
+    "fields", "grid", "mode", "k"}``.  When LDLQ does not apply the mapping is
+    left untouched, so callers can key sidecar emission on its population.
+    The captured fields are the same (never-mutated) dict the gate consumed;
+    no extra encode or reconstruction happens here.
     """
     info = _cb_info(spec.name)
     if info is None:
@@ -1115,6 +1125,15 @@ def cb_fields_for_context(
         info = _cb_info(spec.name)
         assert info is not None
         _grid, _mode, _k = info
+        if raw_fields_out is not None:
+            # The pre-gate fields ARE the identical-env no-LDLQ render; the
+            # gate never mutates them (it builds new dicts), so keeping the
+            # reference costs no extra encode and no extra residency.
+            raw_fields_out["ldlq_applied"] = True
+            raw_fields_out["fields"] = fields
+            raw_fields_out["grid"] = grid
+            raw_fields_out["mode"] = mode
+            raw_fields_out["k"] = _k
         fields, _gate_info = ldlq_reassign_cb_fields_gated(
             weight,
             fields,
