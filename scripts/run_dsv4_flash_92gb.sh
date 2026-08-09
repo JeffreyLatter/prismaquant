@@ -236,6 +236,18 @@ DOCKER_COMMON=(
   #                                   (e.g. `mtp.`); empty/unset changes nothing
   -e PQ_ALLOW_ROUTE_PENDING
   -e PQ_EXPORT_EXCLUDE_NAMESPACES
+  # LDLQ render identity (value-less forwards, same contract as above):
+  # the launch wrapper decides per invocation. A cost/alloc/export chain
+  # must run under ONE consistent setting of these — the allocator's
+  # explicit --cb-ldlq assignment identity and the exporter's stamp
+  # re-validation refuse a mismatch. PRISMAQUANT_CB_ENCODE_COMPILE is
+  # part of the byte identity (compiled != eager, each internally
+  # deterministic — GB10 canaries 2026-08-08); pin it explicitly.
+  -e PRISMAQUANT_CB_LDLQ
+  -e PRISMAQUANT_CB_LDLQ_SCOPE
+  -e PRISMAQUANT_CB_LDLQ_GATE
+  -e PRISMAQUANT_CB_MINCHAIN
+  -e PRISMAQUANT_CB_ENCODE_COMPILE
 )
 
 run_probe() {
