@@ -65,11 +65,26 @@ def test_meta_skeleton_materializes_all_rotary_buffers():
 
     _init_rotary_inplace(model, torch.device("cpu"), torch.bfloat16)
 
-    stale = [
-        f"{n}.{bn}"
-        for n, m in model.named_modules()
-        if type(m).__name__ == "DeepseekV4RotaryEmbedding"
-        for bn, b in m.named_buffers(recurse=False)
-        if b.is_meta and bn.endswith("inv_freq")
-    ]
-    assert not stale, f"rotary buffers left on meta: {stale}"
+    def _stale():
+        return [
+            f"{n}.{bn}"
+            for n, m in model.named_modules()
+            if type(m).__name__ == "DeepseekV4RotaryEmbedding"
+            for bn, b in m.named_buffers(recurse=False)
+            if b.is_meta and bn.endswith("inv_freq")
+        ]
+
+    assert not _stale(), f"rotary buffers left on meta: {_stale()}"
+
+    # Eviction symmetry: _unload must NOT meta-ize derived non-persistent
+    # buffers — install can never restore them (they are not in the
+    # checkpoint), so an evicted-then-reinstalled layer would crash at
+    # its first rotary use (probe attempt 5, phase-3 reverse sweep).
+    from prismaquant.layer_streaming import _unload
+
+    _unload(model, ["layers.2."])
+    assert not _stale(), (
+        f"_unload meta-ized derived rotary buffers: {_stale()}"
+    )
+    # ...while checkpoint-backed parameters under the prefix DO go meta.
+    assert model.layers[2].self_attn.wq_a.weight.is_meta
