@@ -1065,6 +1065,7 @@ def cb_fields_for_context(
     activation_rows=None,
     warm_scale_state=None,
     raw_fields_out: MutableMapping[str, object] | None = None,
+    ldlq_missing_activation_ok: bool = False,
 ):
     """Encode CB fields under the exact artifact serialization context.
 
@@ -1111,6 +1112,22 @@ def cb_fields_for_context(
         if col_weights is None:
             raise ValueError(f"{spec.name}: LDLQ requires activation-weighted col_weights")
         if activation_rows is None:
+            if ldlq_missing_activation_ok:
+                # Explicit call-site opt-in for cells that PROVABLY have no
+                # calibration activations (declared never-routed experts).
+                # The holdout gate fail-closes such cells to the raw render
+                # at export (raw_uncertifiable_too_few_rows), so the raw
+                # fields ARE the shipping render — returning them here keeps
+                # cost/export identity without weakening the guard for every
+                # other caller (a broken activation loader must still raise,
+                # never silently produce an all-raw table stamped as LDLQ).
+                if raw_fields_out is not None:
+                    raw_fields_out["ldlq_applied"] = True
+                    raw_fields_out["fields"] = fields
+                    raw_fields_out["grid"] = grid
+                    raw_fields_out["mode"] = mode
+                    raw_fields_out["k"] = k
+                return fields
             raise ValueError(f"{spec.name}: LDLQ requires calibration activation rows")
         from .nvfp4_cb_formats import ldlq_reassign_cb_fields_gated
 

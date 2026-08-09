@@ -57,6 +57,7 @@ def _cb_cost_quantize_dequantize(
     ] | None = None,
     activation_rows: torch.Tensor | Sequence[torch.Tensor] | None = None,
     raw_render_out: dict | None = None,
+    ldlq_missing_activation_ok: bool = False,
 ) -> torch.Tensor:
     """Render CB weights under the producer context stamped on cost.pkl.
 
@@ -82,6 +83,7 @@ def _cb_cost_quantize_dequantize(
         col_weights=col_weights,
         activation_rows=activation_rows,
         raw_fields_out=raw_render_out,
+        ldlq_missing_activation_ok=ldlq_missing_activation_ok,
     )
     warm_dir = os.environ.get("PRISMAQUANT_CB_WARM_STATE_DIR", "").strip()
     if warm_dir:
@@ -2167,20 +2169,35 @@ def _emit_weight_only_rows(accum: dict, entries, specs, device, dtype) -> list[s
                 cb_warm_identities = cb_warm_identities or [
                     _cb_warm_record_identities(W, item_cw.reshape(-1))
                 ]
+            # Declared never-routed experts have NO calibration activations
+            # by construction, so under an LDLQ context the holdout gate
+            # would fail-close them to the raw render at export
+            # (raw_uncertifiable_too_few_rows). Opting into the raw render
+            # here is therefore the IDENTITY-CORRECT cost row for these
+            # cells, not a shortcut — and the guard against silently-raw
+            # tables stays armed for every measured row.
+            raw_outs: list = []
             W_hat = _batched_quantize(
                 spec, W.unsqueeze(0),
                 col_weights=item_cw,
                 qnames=[name],
                 warm_identities=cb_warm_identities,
+                raw_render_out=raw_outs,
+                ldlq_missing_activation_ok=True,
             )[0]
             wmse = float((W - W_hat).float().pow(2).mean().item())
+            raw_out = raw_outs[0] if raw_outs else None
             # _finalize_results always writes output_mse, so the row carries
             # output_mse=0.0 — the honest marker is output_mse_measured=False,
             # which _has_measured_output_mse short-circuits on before ever
             # reading the value. predicted_dloss stays absent so the allocator
             # derives it from the probe's own (exactly zero) sensitivity.
+            # The raw sidecar equals the primary trivially (fail-closed to
+            # raw); recorded so the raw-table extractor's completeness
+            # check accepts these rows.
             _accumulate_result(accum, name, spec.name, wmse, 0.0, 0.0,
-                               output_mse_measured=False)
+                               output_mse_measured=False,
+                               raw_render=_cb_raw_sidecar_metrics(W, raw_out))
         emitted.append(name)
     return emitted
 
@@ -2220,6 +2237,7 @@ def _batched_quantize(
     ] | None = None,
     activation_rows: list[torch.Tensor | None] | None = None,
     raw_render_out: list | None = None,
+    ldlq_missing_activation_ok: bool = False,
 ) -> torch.Tensor:
     """``raw_render_out``: CB-family only — receives one raw-fields capture
     dict (or None) per slice, in slice order, when LDLQ ran on that slice."""
@@ -2323,6 +2341,7 @@ def _batched_quantize(
                     activation_rows[i] if activation_rows is not None else None
                 ),
                 raw_render_out=raw_out,
+                ldlq_missing_activation_ok=ldlq_missing_activation_ok,
             ))
             if raw_render_out is not None:
                 raw_render_out.append(raw_out if raw_out else None)
