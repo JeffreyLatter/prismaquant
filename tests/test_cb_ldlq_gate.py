@@ -2,13 +2,19 @@
 
 import os
 
+import pytest
 import torch
 
+from prismaquant import format_registry as fr
 from prismaquant import nvfp4_cb_formats as cb
 from prismaquant.cb_ldlq_refinement import (
     REFINEMENT_SCHEMA,
     build_refinement_provenance,
     validate_refinement_provenance,
+)
+from prismaquant.nvfp4_cb_footprint import (
+    CBSerializationContext,
+    cb_fields_for_context,
 )
 
 
@@ -54,9 +60,55 @@ def test_ldlq_gate_disabled_returns_ldlq():
         os.environ["PRISMAQUANT_CB_LDLQ_GATE"] = "1"
 
 
+def test_pack_emits_same_bytes_as_gated_footprint(monkeypatch):
+    """The byte producer must apply the same gate the allocator prices."""
+    monkeypatch.setenv("PRISMAQUANT_CB_LDLQ_GATE", "holdout")
+    generator = torch.Generator().manual_seed(0)
+    weight = torch.randn(8, 256, generator=generator) * 0.25
+    col_weights = torch.rand(256, generator=generator) + 0.05
+    # One row cannot provide a held-out certificate, so the declared gate
+    # must keep raw.  The old packer bypassed the gate and changed 25 indices
+    # for this construction, making this a direct regression for shipped
+    # bytes rather than merely a call-count assertion.
+    activation_rows = torch.randn(1, 256, generator=generator)
+    spec = fr.get_format("NVFP4_CB_K12")
+    context = CBSerializationContext.production(
+        encode_tier="balanced",
+        ldlq=True,
+    )
+    footprint_fields = cb_fields_for_context(
+        spec,
+        weight,
+        context=context,
+        col_weights=col_weights,
+        activation_rows=activation_rows,
+    )
+    expected = cb.nvfp4_cb_assemble_bytes(
+        footprint_fields,
+        12,
+        grid="fp4",
+        mode="product",
+    )
+
+    packed, packed_fields = cb.nvfp4_cb_pack(
+        weight,
+        12,
+        grid="fp4",
+        mode="product",
+        col_weights=col_weights,
+        scale_coding="two_tier",
+        encode_tier="balanced",
+        ldlq=True,
+        activation_rows=activation_rows,
+    )
+
+    assert torch.equal(packed, expected)
+    assert torch.equal(packed_fields["indices"], footprint_fields["indices"])
+
+
 def test_ldlq_gate_per_expert_mixed():
     torch.manual_seed(2)
-    E, R, C = 4, 16, 2048
+    E, R, C = 16, 2, 256
     w = torch.randn(E, R, C)
     cw = torch.ones(E, 1, C)
     # Make one expert pathological: its activation rows are tiny, so LDLQ may not help
@@ -87,19 +139,22 @@ def test_refinement_provenance_roundtrip():
 
 
 def test_batch_vs_serial_ldlq_bit_identical():
-    # Batched and serial LDLQ should be bit-identical when gate disabled,
-    # and gated per-expert should be consistent.
+    # Artifact production has one canonical E16 regime; serial is an oracle.
     os.environ["PRISMAQUANT_CB_LDLQ_GATE"] = "0"
     torch.manual_seed(3)
-    E, R, C = 2, 8, 1024
+    E, R, C = 16, 2, 256
     w = torch.randn(E, R, C)
     cw = torch.ones(E, 1, C)
     acts = [torch.randn(32, C) for _ in range(E)]
     fields = cb.nvfp4_cb_fields(w, 12, grid="fp4", mode="product", col_weights=cw)
-    # Serial path: batch_experts=False
-    serial = cb.ldlq_reassign_cb_fields(w, fields, cw, acts, grid="fp4", mode="product", batch_experts=False)
+    with pytest.raises(RuntimeError, match="canonical E16 batching"):
+        cb.ldlq_reassign_cb_fields(
+            w, fields, cw, acts, grid="fp4", mode="product",
+            batch_experts=False,
+        )
     batched = cb.ldlq_reassign_cb_fields(w, fields, cw, acts, grid="fp4", mode="product", batch_experts=True)
-    assert torch.equal(serial["indices"], batched["indices"])
+    repeated = cb.ldlq_reassign_cb_fields(w, fields, cw, acts, grid="fp4", mode="product", batch_experts=True)
+    assert torch.equal(repeated["indices"], batched["indices"])
     os.environ["PRISMAQUANT_CB_LDLQ_GATE"] = "1"
 
 
@@ -137,9 +192,10 @@ def test_holdout_split_is_content_keyed_and_deterministic():
 
 
 def test_holdout_split_refuses_below_min_rows():
-    assert cb.LDLQ_GATE_MIN_ROWS == 2
+    assert cb.LDLQ_GATE_MIN_ROWS == 16
     assert cb._ldlq_holdout_split(torch.randn(1, 64)) is None
-    assert cb._ldlq_holdout_split(torch.randn(2, 64)) is not None
+    assert cb._ldlq_holdout_split(torch.randn(15, 64)) is None
+    assert cb._ldlq_holdout_split(torch.randn(16, 64)) is not None
 
 
 def test_single_row_tensor_is_uncertifiable_and_keeps_raw():
@@ -176,9 +232,40 @@ def test_holdout_gate_scores_out_of_sample_not_in_sample():
     assert info_h["ldlq_mse"] != info_i["ldlq_mse"]
 
 
+def test_holdout_gate_ships_the_exact_candidate_it_scores(monkeypatch):
+    """A half-fit certificate must never authorize a different all-row refit."""
+    generator = torch.Generator().manual_seed(20260808)
+    w = torch.randn(4, 256, generator=generator)
+    cw = torch.ones(256)
+    act = torch.randn(16, 256, generator=generator)
+    fields = cb.nvfp4_cb_fields(
+        w, 12, grid="fp4", mode="product", col_weights=cw
+    )
+    candidate = dict(fields)
+    candidate["indices"] = torch.ones_like(fields["indices"])
+    fit_row_counts = []
+
+    def fake_reassign(_weight, _fields, _cw, rows, **_kwargs):
+        fit_row_counts.append(int(torch.as_tensor(rows).shape[0]))
+        return candidate
+
+    scores = iter((2.0, 1.0))  # raw, then the exact candidate
+    monkeypatch.setattr(cb, "ldlq_reassign_cb_fields", fake_reassign)
+    monkeypatch.setattr(cb, "_ldlq_activation_mse", lambda *_args: next(scores))
+
+    gated, info = cb.ldlq_reassign_cb_fields_gated(
+        w, fields, cw, act, grid="fp4", mode="product", k=12,
+        gate_mode=cb.LDLQ_GATE_MODE_HOLDOUT,
+    )
+
+    assert fit_row_counts == [8]
+    assert info["gate"] == "ldlq_kept"
+    assert torch.equal(gated["indices"], candidate["indices"])
+
+
 def test_holdout_gate_emits_per_tensor_ratio_telemetry():
     """The certificate ratio IS the honest per-tensor s_output; it must surface."""
-    E, R, C = 4, 16, 2048
+    E, R, C = 16, 2, 256
     torch.manual_seed(3)
     w = torch.randn(E, R, C)
     cw = (torch.randn(E, 1, C).abs() + 0.1)

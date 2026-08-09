@@ -410,6 +410,14 @@ def cb_serialization_context_stamp(
             "codebook_content_digests; a logical role/ref does not identify "
             "the bytes that cost, KL, and export must share"
         )
+    ldlq_scope = getattr(
+        context, "ldlq_scope", "all" if context.ldlq else "none"
+    )
+    ldlq_kernel = None
+    if ldlq_scope != "none":
+        from .nvfp4_cb_formats import packed_ldlq_artifact_stamp
+
+        ldlq_kernel = packed_ldlq_artifact_stamp()
     return {
         "schema": _serialized_payload_schema(context),
         "scale_coding": context.scale_coding,
@@ -417,7 +425,8 @@ def cb_serialization_context_stamp(
         "codebook_source": context.codebook_source,
         "scale_sweep": context.scale_sweep,
         "ldlq": context.ldlq,
-        "ldlq_scope": getattr(context, "ldlq_scope", "all" if context.ldlq else "none"),
+        "ldlq_scope": ldlq_scope,
+        **({"ldlq_packed_kernel": ldlq_kernel} if ldlq_kernel is not None else {}),
         **({
             "minchain": True,
             "minchain_version": context.minchain_version,
@@ -594,6 +603,26 @@ def cb_serialization_context_from_stamp(
         ldlq_scope = str(raw_scope).strip().lower()
         if ldlq_scope not in {"none", "nvfp4", "all"}:
             raise ValueError(f"{where}: CB ldlq_scope must be one of none/nvfp4/all, got {raw_scope!r}")
+    observed_ldlq_kernel = stamp.get("ldlq_packed_kernel")
+    if ldlq_scope == "none":
+        if observed_ldlq_kernel is not None:
+            raise ValueError(
+                f"{where}: non-LDLQ payload cannot claim an LDLQ packed kernel"
+            )
+    else:
+        from .nvfp4_cb_formats import packed_ldlq_artifact_stamp
+
+        expected_ldlq_kernel = packed_ldlq_artifact_stamp()
+        if not isinstance(observed_ldlq_kernel, Mapping):
+            raise ValueError(
+                f"{where}: LDLQ payload is missing its packed-kernel ABI"
+            )
+        if dict(observed_ldlq_kernel) != expected_ldlq_kernel:
+            raise ValueError(
+                f"{where}: LDLQ packed-kernel ABI mismatch: "
+                f"recipe={dict(observed_ldlq_kernel)}, "
+                f"producer={expected_ldlq_kernel}"
+            )
     return CBSerializationContext(
         scale_coding=str(stamp["scale_coding"]),
         layout_version=int(stamp["layout_version"]),
@@ -1073,43 +1102,28 @@ def cb_fields_for_context(
             raise ValueError(f"{spec.name}: LDLQ requires activation-weighted col_weights")
         if activation_rows is None:
             raise ValueError(f"{spec.name}: LDLQ requires calibration activation rows")
-        from .nvfp4_cb_formats import (
-            ldlq_reassign_cb_fields,
-            ldlq_reassign_cb_fields_gated,
-        )
+        from .nvfp4_cb_formats import ldlq_reassign_cb_fields_gated
 
         # Post-allocation LDLQ refinement is byte-neutral but must be
         # do-no-harm on the declared gate metric — since 2026-08-08 that is
         # holdout_activation_output_mse: LDLQ is certified on rows its Hessian
         # never saw, because the previous in-sample scoring could not fail and
         # its error was measured ANTI-correlated with the true benefit.
-        # The gate keeps the raw assignment per Linear / per expert slice when
-        # LDLQ would regress.  When the gate env is disabled (cost-measurement
-        # parity) the verbatim LDLQ assignment is returned.
-        from .nvfp4_cb_formats import _ldlq_gate_enabled
-
-        if _ldlq_gate_enabled():
-            info = _cb_info(spec.name)
-            assert info is not None
-            _grid, _mode, _k = info
-            fields, _gate_info = ldlq_reassign_cb_fields_gated(
-                weight,
-                fields,
-                col_weights,
-                activation_rows,
-                grid=grid,
-                mode=mode,
-                k=_k,
-            )
-        else:
-            fields = ldlq_reassign_cb_fields(
-                weight,
-                fields,
-                col_weights,
-                activation_rows,
-                grid=grid,
-                mode=mode,
-            )
+        # The wrapper is also the canonical-route refusal boundary.  In
+        # disabled gate mode it returns unconditional LDLQ on successful
+        # experts while preserving typed Hessian failures as raw.
+        info = _cb_info(spec.name)
+        assert info is not None
+        _grid, _mode, _k = info
+        fields, _gate_info = ldlq_reassign_cb_fields_gated(
+            weight,
+            fields,
+            col_weights,
+            activation_rows,
+            grid=grid,
+            mode=mode,
+            k=_k,
+        )
     return fields
 
 
