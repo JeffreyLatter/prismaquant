@@ -92,6 +92,11 @@ def test_compressor_and_indexer_keep_faithful_mapping():
       (`DeepseekV4CSACompressor.indexer`), not on the attention module,
       and its checkpoint `indexer.compressor.*` tensors live FLAT on the
       Indexer (it pools inline; no inner compressor submodule).
+
+    NAME resolution is necessary but NOT sufficient — see
+    `test_indexer_pooling_carries_the_coff_overlap_widening` below, which
+    pins the SHAPES.  Every mapping asserted here already resolved while
+    three of these tensors were unloadable.
     """
     cases = [
         ("layers.5.attn.compressor.wkv.weight",
@@ -117,6 +122,110 @@ def test_compressor_and_indexer_keep_faithful_mapping():
     ]
     for ck, live in cases:
         assert _rename(ck) == live, f"{ck} ↦ {_rename(ck)}, expected {live}"
+
+
+def test_indexer_pooling_carries_the_coff_overlap_widening():
+    """The Lightning Indexer pools at ``coff * index_head_dim``, not ``index_head_dim``.
+
+    model.py:404 builds the Indexer's pooling from the *same* ``Compressor``
+    class as the outer compressor, so it inherits ``coff = 1 + (ratio == 4)``
+    (model.py:296-304).  The DSv4-Flash checkpoint agrees:
+
+        layers.N.attn.indexer.compressor.wkv.weight   [256, 4096]
+        layers.N.attn.indexer.compressor.wgate.weight [256, 4096]
+        layers.N.attn.indexer.compressor.ape          [4, 256]
+
+    i.e. ``compress_rate(4)`` rows x ``coff(2) * index_head_dim(128)``.
+
+    This is a SHAPE test on purpose.  The rename assertions above all passed
+    while the vendored Indexer was sized at a bare ``index_head_dim``, so those
+    three tensors resolved to a live parameter of the WRONG shape and could not
+    be loaded at all — a name-only census cannot see it.  ``kv_norm`` stays at
+    ``index_head_dim`` because pooling reduces the doubled width back down
+    before the norm (checkpoint ``indexer.compressor.norm.weight`` is [128]).
+    """
+    torch = pytest.importorskip("torch")
+    from prismaquant.vendored import register_deepseek_v4
+
+    register_deepseek_v4()
+    import transformers.models.deepseek_v4.modeling_deepseek_v4 as vmod
+    from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
+
+    cfg = DeepseekV4Config(num_hidden_layers=4, compress_ratios=[0, 0, 4, 128])
+    orig_reset = torch.nn.Linear.reset_parameters
+    torch.nn.Linear.reset_parameters = lambda self: None  # allocate, don't initialise
+    try:
+        indexer = vmod.DeepseekV4Indexer(cfg)
+        compressor = vmod.DeepseekV4CSACompressor(cfg, cfg.compress_rate_csa)
+    finally:
+        torch.nn.Linear.reset_parameters = orig_reset
+
+    coff = 2  # compress_rate_csa == 4 -> overlapping windows
+    assert indexer.coff == coff and indexer.overlap
+    assert tuple(indexer.wkv.weight.shape) == (coff * cfg.index_head_dim, cfg.hidden_size)
+    assert tuple(indexer.wgate.weight.shape) == (coff * cfg.index_head_dim, cfg.hidden_size)
+    assert tuple(indexer.position_bias.shape) == (cfg.compress_rate_csa, coff * cfg.index_head_dim)
+    assert tuple(indexer.kv_norm.weight.shape) == (cfg.index_head_dim,)
+    assert tuple(indexer.wq_b.weight.shape) == (cfg.index_n_heads * cfg.index_head_dim, cfg.q_lora_rank)
+    assert tuple(indexer.weights_proj.weight.shape) == (cfg.index_n_heads, cfg.hidden_size)
+    # The outer compressor carries the same widening at the attention head_dim.
+    assert tuple(compressor.wkv.weight.shape) == (coff * cfg.head_dim, cfg.hidden_size)
+    assert tuple(compressor.position_bias.shape) == (cfg.compress_rate_csa, coff * cfg.head_dim)
+
+
+def test_csa_compressor_returns_indices_not_a_gather():
+    """CSA must hand its top-k out as indices, never gather with them.
+
+    The indexer's output carries the reference's ``-1`` sentinel (model.py:436)
+    and a ``+offset`` rebasing indices onto the concatenated
+    ``[window_kv ; pool]`` sequence (model.py:515-520).  Using it as a
+    ``torch.gather`` index raised on CPU and silently read out of bounds on
+    CUDA.  Pin the contract: ``(pool, topk)`` for CSA, ``(pool, None)`` for HCA.
+    """
+    torch = pytest.importorskip("torch")
+    from prismaquant.vendored import register_deepseek_v4
+
+    register_deepseek_v4()
+    import transformers.models.deepseek_v4.modeling_deepseek_v4 as vmod
+    from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
+
+    # Small but structurally faithful: ratio 4 -> overlap, and seq_len 8 closes
+    # two windows so the pool is non-empty and sentinels are actually produced.
+    cfg = DeepseekV4Config(
+        hidden_size=64, head_dim=16, qk_rope_head_dim=8, num_attention_heads=2,
+        index_head_dim=8, index_n_heads=2, q_lora_rank=16, index_topk=4,
+        sliding_window=8, num_hidden_layers=4, compress_ratios=[0, 0, 4, 128],
+    )
+    torch.manual_seed(0)
+    comp = vmod.DeepseekV4CSACompressor(cfg, cfg.compress_rate_csa)
+    for p in comp.parameters():
+        p.data.normal_(0, 0.02)
+
+    batch, seq_len = 1, 8
+    hidden = torch.randn(batch, seq_len, cfg.hidden_size) * 0.02
+    q_residual = torch.randn(batch, seq_len, cfg.q_lora_rank) * 0.02
+    position_ids = torch.arange(seq_len).unsqueeze(0)
+    cache_layer = vmod.DeepseekV4CSALayer(cfg.sliding_window, cfg.compress_rate_csa)
+
+    # Must NOT raise: the -1 sentinels used to reach torch.gather.
+    out = comp(hidden, q_residual, position_ids, cache_layer, offset=seq_len, start_pos=0)
+    assert isinstance(out, tuple) and len(out) == 2
+    pooled, topk = out
+    assert pooled.shape == (batch, seq_len // cfg.compress_rate_csa, cfg.head_dim)
+    # Sentinels survive as -1 (they are mask instructions, not indices), and no
+    # index may address the pool block before its `offset` rebasing.
+    assert (topk == -1).any(), "expected -1 sentinels for non-causal pooled slots"
+    real = topk[topk >= 0]
+    assert real.numel() and int(real.min()) >= seq_len
+    assert int(real.max()) < seq_len + pooled.shape[1]
+
+    # HCA has no indexer, so it reports no index list and the caller derives one.
+    hca = vmod.DeepseekV4HCACompressor(cfg, cfg.compress_rate_hca)
+    for p in hca.parameters():
+        p.data.normal_(0, 0.02)
+    hca_cache = vmod.DeepseekV4HCALayer(cfg.sliding_window, cfg.compress_rate_hca)
+    hca_pooled, hca_topk = hca(hidden, q_residual, position_ids, hca_cache, offset=seq_len, start_pos=0)
+    assert hca_topk is None and hca_pooled.shape[-1] == cfg.head_dim
 
 
 def test_routed_experts_per_expert_rename():
