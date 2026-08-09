@@ -925,15 +925,14 @@ class DeepseekV4HyperConnection(nn.Module):
         # These are not Parameters/Buffers, just Python property proxies via __getattr__ below.
 
     def __getattr__(self, name):
-        # Alias fallback for legacy checkpoint loaders / debug helpers.
-        # Maps hc_fn → fn, hc_base → base, hc_scale → scale.
-        if name in ("hc_fn", "hc_base", "hc_scale"):
-            alias = {"hc_fn": "fn", "hc_base": "base", "hc_scale": "scale"}[name]
-            try:
-                return super().__getattr__(alias) if hasattr(super(), "__getattr__") else object.__getattribute__(self, alias)
-            except AttributeError:
-                return object.__getattribute__(self, alias)
-        raise AttributeError(f"{type(self).__name__!r} has no attribute {name!r}")
+        # Alias fallback for legacy checkpoint loaders / debug helpers:
+        # hc_fn → fn, hc_base → base, hc_scale → scale. Everything else
+        # (including the canonical fn/base/scale Parameters, which live
+        # in nn.Module._parameters) MUST delegate to nn.Module.__getattr__
+        # — an earlier version raised for non-alias names and broke every
+        # `self.fn` access in forward.
+        name = {"hc_fn": "fn", "hc_base": "base", "hc_scale": "scale"}.get(name, name)
+        return super().__getattr__(name)
 
     def forward(self, hidden_streams: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         r"""
