@@ -220,7 +220,12 @@ class DeepseekV4HCALayer(DynamicSlidingWindowLayer):
     """
 
     def __init__(self, sliding_window: int, compress_rate: int):
-        super().__init__(sliding_window)
+        # KEYWORD call — transformers drifted the base signature:
+        # 5.6.0 has DynamicSlidingWindowLayer(self, sliding_window);
+        # 5.12.1 has (self, config=None, sliding_window=None). A
+        # positional int lands in `config` on 5.12 and leaves
+        # sliding_window None (torch.tensor(None) crash at first use).
+        super().__init__(sliding_window=sliding_window)
         self.compress_rate = compress_rate
         self.compressor_buffer_kv: torch.Tensor | None = None
         self.compressor_buffer_gate: torch.Tensor | None = None
@@ -318,7 +323,11 @@ class DeepseekV4Cache(DynamicCache):
             if layer_type == "compressed_sparse_attention":
                 self.layers.append(DeepseekV4CSALayer(config.sliding_window, config.compress_rate_csa))
             elif layer_type == "sliding_attention":
-                self.layers.append(DynamicSlidingWindowLayer(config.sliding_window))
+                # Keyword for the same signature-drift reason as
+                # DeepseekV4HCALayer.__init__ above.
+                self.layers.append(
+                    DynamicSlidingWindowLayer(sliding_window=config.sliding_window)
+                )
             else:
                 self.layers.append(DeepseekV4HCALayer(config.sliding_window, config.compress_rate_hca))
 
