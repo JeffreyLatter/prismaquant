@@ -16,7 +16,7 @@ and required CI checks the independent producer and consumer at one immutable co
 release advances that boundary to Gridbook 0.6.0 and lands the producer half of the cross-repo
 performance ultraplan (P5a–P5d, K0.2): candidates are priced and described differently and gain
 a second hard constraint axis, while the producer ABI, format menu, export defaults, and
-quality-promotion status are unchanged and DSv4 remains gated. The three behavioural facts a
+quality-promotion status are unchanged. The three behavioural facts a
 returning reader must know are that **`COST_MODE` defaults to `aura`** (§3.3), Gridbook serving
 is native CUDA/CUTLASS-only and fails closed (§9.2), and fused native-NVFP4 remains default-off
 after its teacher-backed quality gate (§9.2).
@@ -1894,7 +1894,7 @@ artifacts exported before the rename.
 `prio` = detection priority, lower first (§8.1); the same number is declared on the Python class
 and in the spec, and a test asserts they agree. **CT** = `compressed-tensors`. The lane column is
 the *declared* set (R6, spec `supported_lanes`/`preferred_lane`), and required CI compares the
-five CB producer profiles with Gridbook's packaged contract; GGUF has one. Over-declaring is the exact
+six CB producer profiles with Gridbook's packaged contract; GGUF has one. Over-declaring is the exact
 failure the field exists to prevent: an undeclared lane does not fail loudly, it serves
 uninitialised expert memory. `require_lane_supported(profile, EXPORT_CONTAINER)`
 (`serving_profiles.py`) runs in `run-pipeline.sh` before profile resolution and export.
@@ -1973,9 +1973,12 @@ Check 5 (MTP) is deliberately absent: `build_mtp_module()` materialises a full d
 a multi-GB CPU allocation — use the manual CLI for it. Its cheap declarative half IS automated
 since 2026-07-30 (R12): `test_has_mtp_implies_a_buildable_mtp_module` fails any profile that
 answers `has_mtp()` without a real `build_mtp_module` override or `mtp_source_prefix()`, which
-is the L2/D2 defect class. Known gaps (`minimax_m2` has no spec; `deepseek_v4` returns `None` from
-`vllm_architecture_class()`) are encoded as *ratchets*: each asserts the gap is still real and
-only then xfails, so closing one turns the test red with an instruction to shrink the list.
+is the L2/D2 defect class. The old no-spec xfail ratchet is empty. The fused-
+source check carries one named, passing exception: DeepSeek still returns
+`None` from `vllm_architecture_class()`, and its Gridbook lane is role-composite
+rather than uniform-format. Direct profile coverage asserts the spec stays
+empty so a native-lane assumption cannot silently constrain the Gridbook
+allocation.
 And there is CI to run it — `.github/workflows/ci.yml` (#18, `1cc7b90`) executes the suite on
 every push and PR, on py3.11 and 3.12 with CPU torch. §12 D11.
 

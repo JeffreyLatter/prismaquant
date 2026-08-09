@@ -245,7 +245,7 @@ def test_cb_exporters_reject_symlink_alias_and_stale_aux(
     ],
     ids=["batch", "streaming"],
 )
-def test_cb_export_transaction_cleans_post_model_budget_failure(
+def test_cb_export_transaction_preserves_post_model_budget_failure(
     workdir,
     monkeypatch,
     module_name,
@@ -273,7 +273,13 @@ def test_cb_export_transaction_cleans_post_model_budget_failure(
         exporter(mdl, assignment, output, {}, device="cpu")
 
     assert not output.exists()
-    assert not list(workdir.glob(f".{output.name}.tmp-*"))
+    # A late inventory/budget gate runs after the model payload has been
+    # written.  Preserve that transaction root so a subsequent export can use
+    # it as a verified --reuse-prior instead of discarding hours of work.  The
+    # final destination must remain unpublished.
+    preserved = list(workdir.glob(f".{output.name}.tmp-*"))
+    assert len(preserved) == 1, preserved
+    assert (preserved[0] / "model.safetensors").is_file()
 
 
 # --- byte-identity: dense CB + BF16 + stacked-3D experts + fp8_cb -----------
