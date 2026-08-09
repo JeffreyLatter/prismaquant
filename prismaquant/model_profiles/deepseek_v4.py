@@ -300,10 +300,12 @@ class DeepseekV4Profile(ModelProfile):
             return ["hc_head."]
         return []
 
-    def init_rotaries(self, rotary, cfg, device, dtype) -> bool:
-        """DSv4 uses Gemma3's multi-layer-type rotary pattern: separate
-        `main_inv_freq` and `compress_inv_freq` buffers + matching
-        `<name>_attention_scaling` attributes."""
+    @staticmethod
+    def _init_one_rotary(rotary, cfg, device) -> bool:
+        """Register per-layer-type `<name>_inv_freq` buffers on ONE
+        DeepseekV4RotaryEmbedding instance (Gemma3's multi-layer-type
+        pattern: `main_inv_freq` / `compress_inv_freq` + matching
+        `<name>_attention_scaling`)."""
         import torch as _torch
         layer_types = getattr(rotary, "layer_types", None)
         if not (layer_types and getattr(cfg, "rope_parameters", None) is not None):
@@ -332,6 +334,28 @@ class DeepseekV4Profile(ModelProfile):
                 persistent=False,
             )
             setattr(rotary, f"{layer_type}_attention_scaling", scaling_lt)
+        return True
+
+    def init_rotaries(self, rotary, cfg, device, dtype,
+                      base_model=None) -> bool:
+        """DSv4 multi-layer-type rotary init — for the MODEL-level
+        rotary AND every nested instance. The faithful forward gives
+        each compressor and indexer its own `rotary_emb` (they RoPE
+        pool keys / queries at the compress theta with per-call
+        positions), and a meta-built skeleton leaves their inv_freq
+        buffers on meta: "Cannot copy out of meta tensor" at the first
+        CSA forward (probe attempt 4, 2026-08-09). Walk the skeleton
+        and materialize them all."""
+        handled = self._init_one_rotary(rotary, cfg, device)
+        if not handled:
+            return False
+        if base_model is not None:
+            rotary_cls_name = type(rotary).__name__
+            for _name, mod in base_model.named_modules():
+                if mod is rotary:
+                    continue
+                if type(mod).__name__ == rotary_cls_name:
+                    self._init_one_rotary(mod, cfg, device)
         return True
 
     def expand_hidden_for_layers(self, hidden, base_model):

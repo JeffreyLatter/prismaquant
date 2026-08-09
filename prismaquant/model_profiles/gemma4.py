@@ -57,7 +57,8 @@ class Gemma4Profile(ModelProfile):
     # Overriding to inject `.moe.` ourselves produces a double `.moe.`
     # after vLLM's remap runs — verified experimentally.
 
-    def init_rotaries(self, rotary, cfg, device, dtype) -> bool:
+    def init_rotaries(self, rotary, cfg, device, dtype,
+                      base_model=None) -> bool:
         """Gemma 4's text rotary is multi-layer-type: it registers one
         ``<layer_type>_inv_freq`` buffer per entry in ``config.layer_types``,
         with *mixed* rope types (e.g. ``sliding_attention``=default,

@@ -1089,7 +1089,8 @@ class ModelProfile(ABC):
         Default: empty."""
         return []
 
-    def init_rotaries(self, rotary, cfg, device, dtype) -> bool:
+    def init_rotaries(self, rotary, cfg, device, dtype,
+                      base_model=None) -> bool:
         """Optionally populate rotary buffers on a meta-built skeleton.
         Return True if the profile fully handled init (the caller skips
         its default path), or False to fall through to the standard
@@ -1098,6 +1099,12 @@ class ModelProfile(ABC):
         DSv4 / Gemma3 return True after registering per-layer-type
         `<name>_inv_freq` buffers (the rotary has a `layer_types` tuple
         like `("main", "compress")`).
+
+        ``base_model`` is the whole skeleton, for architectures whose
+        submodules own additional rotary instances (DSv4's faithful
+        compressor/indexer each carry a ``rotary_emb`` — they RoPE at
+        the compress theta with per-call positions, so the buffers
+        cannot live on the model-level rotary alone).
 
         Default: False (single-rope path)."""
         return False
