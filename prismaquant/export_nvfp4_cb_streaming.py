@@ -110,6 +110,11 @@ from prismaquant.export_output_safety import (
     prepare_fresh_export_directory,
     transactional_directory_output,
 )
+from prismaquant.dspark_source_metadata import (
+    apply_dspark_overlay_to_model_config,
+    apply_dspark_overlay_to_quant_config,
+    discover_dspark_source_overlay,
+)
 from prismaquant.nvfp4_cb_footprint import (
     CBSerializationContext,
     cb_assignment_payload_breakdown,
@@ -2257,6 +2262,15 @@ def export_nvfp4_cb_streaming(
         profile = detect_profile(str(model_dir))
     except Exception:
         profile = None
+    source_config_path = model_dir / "config.json"
+    source_config = (
+        json.loads(source_config_path.read_text())
+        if source_config_path.exists() else {}
+    )
+    discovered_dspark_source_overlay = discover_dspark_source_overlay(
+        skeleton, source_config
+    )
+    dspark_source_overlay = discovered_dspark_source_overlay
     expert_groups = _plan_expert_stacks(skeleton, profile)
     # The allocator writes its layer_config EXPANDED per tensor even though it
     # decided each expert group atomically, so a per-expert checkpoint arrives
@@ -2289,6 +2303,50 @@ def export_nvfp4_cb_streaming(
         else _exclude_namespaces_from_env(),
         assignment=assignment,
         profile=profile,
+    )
+    if dspark_source_overlay is not None:
+        mtp_names = {
+            name for name in skeleton.keys() if str(name).startswith("mtp.")
+        }
+        included_mtp_names = (
+            mtp_names if subset_prefixes is None else {
+                name for name in mtp_names
+                if any(name.startswith(prefix) for prefix in subset_prefixes)
+            }
+        )
+        if not included_mtp_names:
+            # A body-only subset contains no physical draft tensors, so it
+            # must not promise a draft construction overlay.
+            dspark_source_overlay = None
+        elif included_mtp_names != mtp_names:
+            raise ValueError(
+                "refusing a partial DSpark subset: the source overlay is an "
+                f"atomic three-stage contract, but {len(included_mtp_names)} "
+                f"of {len(mtp_names)} mtp.* tensors would be emitted"
+            )
+    if dspark_source_overlay is not None:
+        mtp_names = {
+            name for name in skeleton.keys() if str(name).startswith("mtp.")
+        }
+        excluded_mtp_names = {
+            name for name in mtp_names
+            if any(name.startswith(prefix) for prefix in excluded_namespaces)
+        }
+        if excluded_mtp_names == mtp_names:
+            # A deliberate whole-namespace body-only export carries no draft
+            # routing promise or stale draft-layer count.
+            dspark_source_overlay = None
+        elif excluded_mtp_names:
+            raise ValueError(
+                "refusing a partial DSpark namespace exclusion: the source "
+                f"overlay is an atomic three-stage contract, but "
+                f"{len(excluded_mtp_names)} of {len(mtp_names)} mtp.* "
+                "tensors would be omitted. Exclude the whole `mtp.` "
+                "namespace for a body-only artifact or keep all three stages."
+            )
+    dspark_body_only = (
+        discovered_dspark_source_overlay is not None
+        and dspark_source_overlay is None
     )
     if expert_stack_members:
         col_weights = _packed_expert_col_weights(
@@ -2447,6 +2505,12 @@ def export_nvfp4_cb_streaming(
         + [canonical_format_name(assignment[q]) for q in source_targets]
         if fmt in ROUTE_PENDING_PASSTHROUGH_FORMATS
     )
+    if dspark_source_overlay is not None:
+        route_pending.update(
+            format_name
+            for format_name in dspark_source_overlay.construction_units.values()
+            if format_name in ROUTE_PENDING_PASSTHROUGH_FORMATS
+        )
     if route_pending and not allow_route_pending_passthrough:
         lanes = ", ".join(
             f"{fmt} -> lane {SOURCE_PASSTHROUGH_CONTRACTS[fmt].serving_route} "
@@ -4026,6 +4090,14 @@ def export_nvfp4_cb_streaming(
         streaming_provenance=True,
         include_tensor_formats=False,
     )
+    # DSpark is a metadata-only source overlay.  The ordinary copy loop above
+    # emitted its physical mtp.* weight/scale pairs byte-verbatim; now remove
+    # exactly those scale-bearing bases from `ignore`, extend the two existing
+    # source-layout groups, and declare the construction-time vLLM units.  No
+    # allocation target or tensor writer branch is changed by this step.
+    quant_config = apply_dspark_overlay_to_quant_config(
+        quant_config, dspark_source_overlay
+    )
     if _per_expert_group_payload is not None:
         quant_config["provenance"]["per_expert_format_group_payload"] = (
             _per_expert_group_payload
@@ -4080,6 +4152,15 @@ def export_nvfp4_cb_streaming(
     config["quantization_config"] = {
         "quant_method": "gridbook", "format": "nvfp4_cb",
         "config_file": "quant_config.json"}
+    config = apply_dspark_overlay_to_model_config(
+        config, dspark_source_overlay
+    )
+    if dspark_body_only:
+        # A source artifact may already carry a stamp from a prior full DSpark
+        # export.  Subset/exclude is allowed to produce a body-only artifact,
+        # but that artifact must not promise draft modules whose bytes were
+        # deliberately omitted.
+        config.pop("n_mtp_layers", None)
     (out_dir / "config.json").write_text(json.dumps(config, indent=2))
     for aux in ("tokenizer.json", "tokenizer_config.json", "tokenizer.model",
                 "special_tokens_map.json", "generation_config.json",
@@ -4115,7 +4196,10 @@ def export_nvfp4_cb_streaming(
     from prismaquant.artifact_completeness import assert_artifact_complete
 
     _verbatim = getattr(profile, "source_passthrough_prefixes", None)
-    verbatim_prefixes = tuple(_verbatim()) if callable(_verbatim) else ("mtp.",)
+    verbatim_prefixes = (
+        () if dspark_source_overlay is not None else
+        (tuple(_verbatim()) if callable(_verbatim) else ("mtp.",))
+    )
     completeness = assert_artifact_complete(
         out_dir, verbatim_prefixes=verbatim_prefixes)
     if excluded_namespaces:

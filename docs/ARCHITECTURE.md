@@ -1,9 +1,10 @@
 # PrismaQuant Architecture
 
-As of: 2026-08-08 · branch `integration/dsv4-ldlq-merge` · verified against implementation
-baseline commit `0c14957` plus the priced-interpolated-output fix and gated LDLQ
-post-allocation refinement, with the external Gridbook runtime pinned to
-`9011a19228ddb96b8a49e11a20ac75c99c83998e` (v0.8.0). This branch ports the dated
+As of: 2026-08-08 · branch `integration/dsv4-ldlq-export` · verified against implementation
+baseline commit `c740e98` plus the DeepSeek DSpark source-overlay contract,
+with the external Gridbook runtime pinned to release commit
+`c9c1265` (v0.8.1). The active DeepSeek deployment packages local integration
+commit `b159bb8` on top of that release. This branch ports the dated
 2026-08-01 DeepSeek-V4-Flash-0731 92 GB study record (§9.2) forward from its 0.5.1
 working tree; the study's Gridbook-candidate claims were **not** carried over, because
 the candidate they described has since been reviewed, cut, and pinned as Gridbook 0.6.0.
@@ -1251,6 +1252,45 @@ which is why the recipe filter here stays `mtp.` regardless of the source prefix
 `validate_mtp_assignment_coverage` `:9195-9222` **hard-fails** when the source has tensors under
 `mtp_source_prefix()`, the profile `has_mtp()`, and the recipe has no `mtp.*` entries.
 
+**DeepSeek-V4 DSpark is a source-format metadata overlay, not a second
+quantization pass.** The released Flash checkpoint already carries three complete
+`mtp.{0,1,2}` stages: 2,304 routed-expert projection bases as packed MXFP4
+E2M1 + E8M0 and 25 dense/shared/attention bases as block-FP8 E4M3 + E8M0.
+`dspark_source_metadata.py` derives the released layout from model config and
+validates all 4,705 MTP tensors from safetensors headers before it emits
+anything: exact dtype and shape for all 2,329 weight/scale pairs (including
+group-32 / block-128 scale grids), six 2-D BF16 router/confidence/Markov
+matrices, fourteen BF16 norms, and twenty-seven F32 sink/router/hyper-connection/
+head tensors. Missing or unfamiliar glue is a refusal, as are duplicate or
+out-of-range `dspark_target_layer_ids`. The streaming exporter's ordinary copy
+loop keeps those bytes unchanged; the overlay removes exactly the quantized
+bases from `ignore`, extends the source-layout config groups under their
+physical `mtp.*` names, and leaves the six unscaled 2-D Linears in `ignore`.
+Norms and F32 parameters are loader glue rather than quantization targets, but
+their exact presence, dtype, and shape are still part of the closed layout.
+
+Routing uses vLLM's *construction* namespace, which is intentionally different
+from both the physical checkpoint and registered module names. For a body with
+`L` decoder layers the declaration names seven units at each of
+`model.layers.{L,L+1,L+2}` plus `model.main_proj` (22 total); fused `wq_a/wkv`
+and shared `w1/w3` pairs map to their constructed fused modules, and each routed
+expert stage maps once to its whole `ffn.experts` unit. Only an artifact carrying
+this fully validated declaration gets `config.json:n_mtp_layers = 3`. Existing
+artifacts can receive the identical contract with
+`python -m prismaquant.dspark_source_metadata ARTIFACT --output-artifact
+ARTIFACT-dspark`: it hardlinks the immutable model/container files into a
+hidden sibling staging tree, writes only new `config.json` and
+`quant_config.json` sidecars, recomputes the self-sized artifact inventory,
+validates completeness with no `mtp.` exemption, and publishes the complete
+new directory with one `renameat2(RENAME_NOREPLACE)`. A launcher therefore sees
+either no output path or both new sidecars, never a half-applied pair; the
+source artifact remains unchanged. Provenance schema
+`prismaquant.dspark_source_overlay.v1` records `tensor_bytes_rewritten: 0`;
+tests additionally pin the model container's SHA-256, inode, size, and mtime.
+All non-MTP config groups, ignores, and pre-existing delegated routes must remain
+identical, and a route-pending source format still requires the artifact's prior
+ship acknowledgement.
+
 `_bf16_upgrade_audit` `:1965-2087` (emitted `:8622`) classifies each BF16 Linear as
 passthrough/immutable, runtime-coerced, or a genuine budget choice — a manifest, not a policy;
 serving-unit coercions are reported as such (`serving_group` key), because a whole FusedMoE
@@ -1269,10 +1309,10 @@ silently corrupts.
 
 | Invariant | Enforced at | Failure mode |
 |---|---|---|
-| Fused siblings (q/k/v, gate/up) share **one** format | DP aggregation over the intersection of member candidates; legality-aware union-find `promote_serving_units` `allocator_solver.py:302-327` + `_choose_group_format` `:192-231`; hard assert `promote_fused` `:362-406`; export re-check `:7896-7944` | ≥2 quantized schemes → load crash (merged-column scale-shape assert). Quantized + BF16 → **loads and silently corrupts**: measured 4.3× worse served KL on Qwen3.x DeltaNet `in_proj_ba` (0.106 vs 0.025 at matched bpp) |
+| Native compressed-tensors fused siblings (q/k/v, gate/up) share **one** format; Gridbook role composites may use different storage formats | Native-lane DP aggregation over the intersection of member candidates; legality-aware union-find `promote_serving_units` `allocator_solver.py:302-327` + `_choose_group_format` `:192-231`; hard assert `promote_fused` `:362-406`; export re-check `:7896-7944`. DeepSeek-V4 intentionally declares no global dense `fused_groups`: Gridbook decodes each owned role independently to the common FP8 execution type before concatenation, so a native-only constraint must not couple its CB allocation. | On a native merged method, ≥2 schemes can crash at load and quantized + BF16 can silently corrupt (measured 4.3× worse served KL on Qwen3.x DeltaNet `in_proj_ba`, 0.106 vs 0.025). Applying that rule globally to Gridbook instead destroys legal per-role choices. |
 | Packed MoE experts uniform per FusedMoE on released consumer contracts (mix across layers, never within) | pre-DP `aggregate_packed_serving_groups` (§4.5) + the same union-find pass via `profile.packed_expert_format_group`; native export raise `:7780-7792`; streaming CB legacy mode collapses uniformly | released Gridbook versions cannot consume a mixed bank; the opt-in PROPOSED per-expert v1 producer record above is the explicit exception under consumer reconciliation, not a relaxation of released serving invariants |
 | PROPOSED per-expert sub-stacks partition each w13/w2 family exactly | streaming producer split planner + `artifact_completeness.py`; allocator-side bytes via `footprint.per_expert_format_group_payload_breakdown` | a missing/duplicate expert, undeclared tensor, or subgroup-byte mismatch is refused with layer/family/expert ids before the artifact can be treated as complete |
-| A serving-atomic unit is never left **mixed** by promotion or by export coercion | promotion picks the cheapest legal-for-all format ≥ max rank and writes **every** member unconditionally (`allocator_solver.py:192-299`); export coercion resolves whole unioned components, raising when a quantized format is legal for all and coercing the *whole* unit to BF16 only when none is (`:1452-1756`) | previously reachable via the un-aggregated solve path and, silently, via Pareto seed-JSON promotion (which `compute_achieved` never prices); the fused-coherence gate reported it only at the very END of export, and as a wrong-model-profile problem it is not |
+| A single-method serving unit is never left **mixed** by promotion or by export coercion | promotion picks the cheapest legal-for-all format ≥ max rank and writes **every** member unconditionally (`allocator_solver.py:192-299`); export coercion resolves whole unioned components, raising when a quantized format is legal for all and coercing the *whole* unit to BF16 only when none is (`:1452-1756`). An explicit Gridbook role composite is several role-owned methods under one vLLM module and is not a mixed single-method unit. | previously reachable via the un-aggregated solve path and, silently, via Pareto seed-JSON promotion (which `compute_achieved` never prices); the fused-coherence gate reported it only at the very END of export, and as a wrong-model-profile problem it is not |
 | Incomplete fused groups → BF16 + `ignore` | `allocator.py:1482`; ignore back-fill `:7643-7700` | the fused loader expects all siblings; a missing `v_proj` breaks the merged Linear |
 | Packed `config_groups` use vLLM **canonical** scheme names | `:7980-7994` | no scheme binds to FusedMoE; `w2_input_global_scale` never registers; `load_weights` KeyError |
 | Multi-format menu must not resolve to `DefaultProfile` | `validate_default_profile_format_menu` `allocator.py:961-988`, called `:1550-1554` | silently produces the fused-coherence bug class above |
@@ -1846,7 +1886,7 @@ artifacts exported before the rename.
 | gemma4 | `gemma4.py` | 140 | ✅ | `vllm_packed_moe` | CT | ⚠ none | none |
 | lfm2_moe (LFM2.5) | `lfm2_moe.py` | 150 | ✅ | `vllm_packed_moe` | CT | ⚠ none | `has_mtp → False` |
 | minimax_m2 | `minimax_m2.py` | 160 | ✅ **added R22** — all 8 overrides declared | `vllm_packed_moe` **(added R22)** | CT | ⚠ none | `has_mtp → False` |
-| deepseek_v4 | `deepseek_v4.py` | 170 | ✅ | `vllm_packed_moe` **(added R22)** | CT | ❌ absent from the pinned Gridbook contract; loader/delegation unimplemented and lane gated | `has_mtp → False` + `mtp.` passthrough (hy_v3 route, R12) |
+| deepseek_v4 | `deepseek_v4.py` | 170 | ✅ | `vllm_packed_moe` **(added R22)** | CT, **nvfp4_cb** (CT) | declared by Gridbook v0.8.1; streaming CB export, source-format passthrough, and top-level loader are wired | `has_mtp → False`; three source-quantized DSpark stages are declared by the header-validated physical→construction overlay (§6.3), with no tensor rewrite |
 | hy_v3 | `hy_v3.py` | 180 | ✅ | `gguf` (overridden, L1) | CT, nvfp4_cb, **gguf** (gguf) | declared by pinned Gridbook contract | `has_mtp → False`; MTP passthrough + out-of-band CB scripts |
 | laguna (poolside S/XS 2.x) | `laguna.py` | 190 | ✅ | `nvfp4_cb` (overridden, L1) | CT, **nvfp4_cb** (nvfp4_cb) | declared by pinned Gridbook contract; drafter still separate | `has_mtp → False` |
 | default | `default.py` | — (terminal) | n/a by design | — | CT (default) | n/a | none |
@@ -1871,8 +1911,13 @@ before the Python comes out. It closed a latent bug on the way: without a spec,
 `(gate_up_proj, down_proj)`, so MiniMax's `down_proj` got a *different* coupling key than its
 `gate_proj`/`up_proj` — one expert bank in two format groups, which violates §6.4 and would
 have been unservable. **`deepseek_v4.json` now declares `default_serving_profile:
-vllm_packed_moe`** (R22) — the conservative, provably-tighter choice while its lane is
-undecided; `research` carries no format allow-list at all. The
+vllm_packed_moe`** (R22) — the conservative, provably-tighter choice for both its native and
+Gridbook lanes; `research` carries no format allow-list at all. Its dense
+`fused_groups` remain empty deliberately: Gridbook's constructed merged Linear
+owns independent role decoders and can consume a different codebook format or
+physical activation scalar per role before the common FP8 execution path. A
+compressed-tensors-only uniformity rule must therefore live in that lane rather
+than globally coupling the producer assignment. The
 spec did gain `_verified_source_layout` (`2b5b937`, closing #26): the real
 DeepSeek-V4-Flash-Base headers say routed experts are I8 nibble-packed MXFP4 with F8_E8M0
 scales while **shared experts are block-FP8 E4M3, not fp4** — settled against the checkpoint

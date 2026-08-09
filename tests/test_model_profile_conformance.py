@@ -101,12 +101,12 @@ SPEC_EXEMPT_BY_DESIGN = {"DefaultProfile"}
 # `tests/test_minimax_m2_spec.py` is the equivalence gate that had to be green
 # before the Python bodies may be deleted.
 NO_SPEC_XFAIL: set[str] = set()
-NO_FUSED_SOURCE_XFAIL = {
-    # deepseek_v4 returns None from vllm_architecture_class() (deliberate,
-    # probe-only) AND declares `fused_groups: []`, so fused_sibling_group()
-    # is a constant None: its dense-MLP gate/up siblings would never be
-    # promoted to one format. Check 3 cannot see this — it returns a green
-    # "no vLLM class to cross-check against" (validate.py:191-193).
+ROLE_COMPOSITE_FUSED_SOURCE_EXEMPT = {
+    # Intentional, lane-aware exception. DeepSeek-V4's Gridbook consumer can
+    # construct a merged Linear as independent role decoders, so its producer
+    # spec must not globally force those roles to one format. A native
+    # compressed-tensors constraint belongs to that lane's exporter, not this
+    # architecture-wide accessor.
     "DeepseekV4Profile",
 }
 
@@ -204,21 +204,27 @@ def test_profile_has_structure_spec(profile):
 
 
 def test_profile_has_a_fused_sibling_source(profile):
-    """De-vacuums check 3 on CPU. Check 3 green-lights any profile with no
-    vLLM class, so it cannot catch one whose fused_sibling_group() is a
-    constant None — which breaks the hard serving invariant that a fused
-    group carries exactly one format."""
+    """De-vacuums check 3 for lanes requiring uniform fused siblings.
+
+    Gridbook role-composite architectures are explicit exceptions: each role
+    may have a different storage scheme because it is decoded independently
+    into the common execution type. The ratchet below keeps that exception
+    named instead of silently weakening this check for every profile.
+    """
     name = type(profile).__name__
     has_vllm_cls = profile.vllm_architecture_class() is not None
     spec = profile.structure_spec()
     has_spec_groups = bool(spec is not None and spec.fused_groups)
     overrides = "fused_sibling_group" in vars(type(profile))
     has_source = has_vllm_cls or has_spec_groups or overrides
-    if name in NO_FUSED_SOURCE_XFAIL:
+    if name in ROLE_COMPOSITE_FUSED_SOURCE_EXEMPT:
         assert not has_source, (
-            f"{name} now has a fused-sibling source — remove it from "
-            "NO_FUSED_SOURCE_XFAIL")
-        pytest.xfail(f"{name}: no vLLM class and empty spec.fused_groups")
+            f"{name} now has a fused-sibling source — either remove it from "
+            "ROLE_COMPOSITE_FUSED_SOURCE_EXEMPT or explain why a global "
+            "producer coupling is now lane-correct"
+        )
+        assert "nvfp4_cb" in profile.supported_export_lanes()
+        return
     assert has_source
 
 
@@ -335,8 +341,9 @@ STRUCTURE_DOC_ONLY_KEYS = frozenset({
     # packing, the byte-accounting caveat). Prose for the next reader;
     # nothing derives behaviour from it.
     "_verified_source_layout",
-    # deepseek_v4.json — why DSv4 pins `vllm_packed_moe` while its lane is
-    # undecided. Explains a sibling key that IS parsed and IS enforced.
+    # deepseek_v4.json — why both DSv4 export lanes pin the conservative
+    # `vllm_packed_moe` allocation contract. Explains a sibling key that IS
+    # parsed and enforced.
     "_default_serving_profile_rationale",
     # minimax_m2.json — three notes on why the declarative form of the
     # profile's ex-Python overrides looks the way it does (the

@@ -5,7 +5,7 @@ architecture is wired for that lane. Nothing stops `EXPORT_CONTAINER=nvfp4_cb`
 on an arch whose gridbook CB expert loader is a TODO: the run completes, the
 artifact serves, and the FusedMoE reads uninitialised memory — coherent-looking
 garbage, not a crash (commit `9a79963`, Laguna, 93% of parameters). The honest
-CB-eligible set is five producer profiles and until now nothing in the tree said
+CB-eligible set is six producer profiles and until now nothing in the tree said
 so.
 
 This file pins the spec fields, profile accessors, and the preflight helper now
@@ -100,22 +100,24 @@ def test_the_two_script_driven_lanes_are_declared():
 
 
 def test_require_lane_supported_accepts_declared_lanes():
+    from prismaquant.model_profiles.deepseek_v4 import DeepseekV4Profile
     from prismaquant.model_profiles.laguna import LagunaProfile
     from prismaquant.model_profiles.qwen3_5 import Qwen3_5Profile
 
     assert require_lane_supported(Qwen3_5Profile(), "nvfp4_cb") == "nvfp4_cb"
+    assert require_lane_supported(DeepseekV4Profile(), "nvfp4_cb") == "nvfp4_cb"
     assert require_lane_supported(LagunaProfile(), None) == "compressed-tensors"
     assert require_lane_supported(
         Qwen3_5Profile(), "compressed_tensors") == "compressed-tensors"
 
 
 def test_require_lane_supported_refuses_an_undeclared_lane():
-    from prismaquant.model_profiles.deepseek_v4 import DeepseekV4Profile
+    from prismaquant.model_profiles.gemma4 import Gemma4Profile
 
     with pytest.raises(SystemExit) as excinfo:
-        require_lane_supported(DeepseekV4Profile(), "nvfp4_cb")
+        require_lane_supported(Gemma4Profile(), "nvfp4_cb")
     message = str(excinfo.value)
-    assert "deepseek_v4" in message
+    assert "gemma4" in message
     assert "compressed-tensors" in message      # names the declared set
     assert "garbage" in message                 # names the failure mode
 
@@ -150,6 +152,7 @@ def test_no_shipped_lane_run_becomes_illegal():
         ("lfm2_moe", "compressed-tensors"),
         ("minimax_m2", "compressed-tensors"),
         ("deepseek_v4", "compressed-tensors"),
+        ("deepseek_v4", "nvfp4_cb"),
     ]
     by_name = {c().name: c() for c in PROFILE_CLASSES}
     for name, lane in cases:

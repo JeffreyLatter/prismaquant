@@ -175,8 +175,24 @@ def test_mtp_layer_count(profile):
     assert profile.mtp_layer_count({}) == 0
 
 
-def test_no_fused_siblings(profile):
-    """DSv4-Flash has no Q/K/V or gate/up fused siblings on the live side."""
+def test_gridbook_dense_role_composites_are_not_allocator_fused(profile):
+    """Gridbook may decode merged Linear roles from different formats.
+
+    The consumer constructs one semantic composite for a merged vLLM Linear,
+    decodes each role independently to the common FP8 execution type, and then
+    concatenates the outputs.  A global producer fused group would incorrectly
+    force the same codebook format onto those independent roles.
+    """
     assert profile.fused_sibling_group("model.layers.0.self_attn.wq_a") is None
     assert profile.fused_sibling_group("model.layers.0.self_attn.wkv") is None
-    assert profile.fused_sibling_group("model.layers.0.mlp.shared_experts.gate_proj") is None
+    for leaf in ("gate_proj", "up_proj", "down_proj"):
+        assert profile.fused_sibling_group(
+            f"model.layers.0.mlp.shared_experts.{leaf}"
+        ) is None
+
+
+def test_gridbook_cb_export_lane_is_declared(profile):
+    assert profile.supported_export_lanes() == (
+        "compressed-tensors", "nvfp4_cb"
+    )
+    assert profile.preferred_export_lane() == "compressed-tensors"
