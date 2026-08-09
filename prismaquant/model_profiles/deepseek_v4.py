@@ -112,6 +112,22 @@ class DeepseekV4Profile(ModelProfile):
     # scattered across layer_streaming / streaming_model / incremental_probe.
     # ------------------------------------------------------------
 
+    def probe_linear_exclude_extra(self) -> str:
+        # The faithful vendored forward (2026-08-09) instantiates and
+        # loads the compressor + indexer, so their `nn.Linear` leaves
+        # (`self_attn.compressor.{wkv,wgate}`,
+        # `self_attn.indexer.{wkv,wgate,wq_b,weights_proj}` and the
+        # indexer's inner compressor) are now visible to the probe's
+        # enumeration. They stay OUT of the inventory: the gridbook D0.1
+        # serve contract keeps them source-format (weights_proj is read
+        # via `.weight` directly; no CB loader exists for these leaves),
+        # the exporter charges them to the immutable floor, and on this
+        # FP8-source checkpoint BF16 is masked model-wide, so an
+        # inventory row here would carry zero legal candidates and trip
+        # the allocator's coverage refusal. This restores the 33,325
+        # selectable-Linear inventory the byte accounting assumes.
+        return r"self_attn\.(?:compressor|indexer)\."
+
     def checkpoint_to_live_name(self, k: str, *,
                                 multimodal: bool = False) -> str | None:
         """DSv4-Flash checkpoint → transformers live qname.

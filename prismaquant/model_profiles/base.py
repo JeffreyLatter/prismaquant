@@ -205,6 +205,18 @@ class ModelProfile(ABC):
             return tuple(spec.pinned_names)
         return ("lm_head",)
 
+    def probe_linear_exclude_extra(self) -> str:
+        """Extra regex fragment OR'd into the probe's Linear exclusion.
+
+        For ``nn.Linear`` leaves that exist in the live model but are
+        outside the serving contract's quantizable set (the exporter
+        ships their source bytes on the immutable floor), the probe must
+        not put them in its inventory: on a source-dtype-masked menu
+        they would carry zero legal candidates and trip the allocator's
+        coverage refusal. Empty string means no extra exclusion.
+        """
+        return ""
+
     def is_pinned_name(self, qname: str) -> bool:
         """Return True when ``qname`` is covered by this profile's pins."""
         name = str(qname)

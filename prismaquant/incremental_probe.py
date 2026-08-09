@@ -414,6 +414,29 @@ def _detect_profile_for_shards(model_path: str):
         return DefaultProfile()
 
 
+# Router/gate Linears carry routing logits, not quantizable weights.
+_BASE_LINEAR_EXCLUDE = (
+    r"(?:mlp\.gate$|mlp\..*gate$|\.router(?:$|\.)|block_sparse_moe\.gate$)"
+)
+
+
+def resolve_linear_exclude(model_path: str) -> str:
+    """The probe's Linear exclusion: the router baseline OR'd with any
+    profile-declared extra (`ModelProfile.probe_linear_exclude_extra`),
+    for live Linears outside the serving contract's quantizable set.
+    All meta stamps and hook installs must use this one resolver so
+    shard-reuse keys stay consistent."""
+    profile = _detect_profile_for_shards(model_path)
+    extra = ""
+    try:
+        extra = str(profile.probe_linear_exclude_extra() or "")
+    except AttributeError:
+        pass
+    if extra:
+        return f"(?:{_BASE_LINEAR_EXCLUDE}|{extra})"
+    return _BASE_LINEAR_EXCLUDE
+
+
 def build_extended_shard_regexes(
     model_path: str,
     layers_per_shard: int,
@@ -804,9 +827,7 @@ def _expected_probe_shard_meta(args, *,
         "importance_weighting": args.importance_weighting,
         "activation_cache_dir": str(Path(activation_cache_dir)),
         "linear_include": linear_include,
-        "linear_exclude": (
-            r"(?:mlp\.gate$|mlp\..*gate$|\.router(?:$|\.)|block_sparse_moe\.gate$)"
-        ),
+        "linear_exclude": resolve_linear_exclude(args.model),
         "h_detail_dir": str(Path(args.h_detail_dir)) if args.h_detail_dir else None,
         "activation_rows_limit": int(args.activation_rows_limit),
         "shard_idx": shard_idx,
@@ -3450,10 +3471,7 @@ def main():
     # Fisher hooks. We install hooks on every resident linear that ANY
     # shard's include regex would match; each per-shard runner filters
     # the captured dicts down to its own scope.
-    linear_exclude = (
-        r"(?:mlp\.gate$|mlp\..*gate$|\.router(?:$|\.)|"
-        r"block_sparse_moe\.gate$)"
-    )
+    linear_exclude = resolve_linear_exclude(args.model)
     resident_include_union = (
         "(?:" + "|".join(f"(?:{r})" for r in shard_regexes) + ")"
         if shard_regexes else r"(?!x)x"  # never-match fallback
@@ -3526,10 +3544,7 @@ def main():
         "requested_device_map": str(args.device_map),
         "importance_weighting": args.importance_weighting,
         "activation_cache_dir": str(Path(args.activation_cache_dir)),
-        "linear_exclude": (
-            r"(?:mlp\.gate$|mlp\..*gate$|\.router(?:$|\.)|"
-            r"block_sparse_moe\.gate$)"
-        ),
+        "linear_exclude": resolve_linear_exclude(args.model),
         "h_detail_dir": (str(Path(args.h_detail_dir))
                          if args.h_detail_dir else None),
         "activation_rows_limit": int(args.activation_rows_limit),
@@ -3707,10 +3722,7 @@ def main():
                             "importance_weighting": args.importance_weighting,
                             "activation_cache_dir": args.activation_cache_dir,
                             "linear_include": linear_include,
-                            "linear_exclude": (
-                                r"(?:mlp\.gate$|mlp\..*gate$|"
-                                r"\.router(?:$|\.)|block_sparse_moe\.gate$)"
-                            ),
+                            "linear_exclude": resolve_linear_exclude(args.model),
                             "shard_kind": kind,
                         },
                     }, f)
