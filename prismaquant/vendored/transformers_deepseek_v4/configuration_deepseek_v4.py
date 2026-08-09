@@ -189,15 +189,63 @@ class DeepseekV4Config(PreTrainedConfig):
             self.partial_rotary_factor = self.qk_rope_head_dim / self.head_dim
         # Normalize rope_parameters into a per-layer-type dict ``{"main": {...}, "compress": {...}}``
         # (Gemma3 pattern). Idempotent across save/load: round-tripping preserves structure.
+        # --- PATCH 01b: YARN propagation for compress branch (model.py:205-235,481-488) ---
+        # Source config.json has rope_scaling: {type:"yarn", factor:16, beta_fast:32, beta_slow:1, original_max:65536}
+        # and top-level compress_rope_theta=160000 vs rope_theta=10000.
+        # Upstream DeepseekV4Config.__post_init__ only copied rope_theta/partial factor, dropping YaRN.
+        # This caused DeepseekV4RotaryEmbedding to build inv_freq without YaRN correction
+        # (FINDINGS §1 divergence 1c 2.886e-01). Proven port reads yarn via config.rope_scaling at
+        # port:936-940 and builds per-layer freqs via freqs_for_layer (port:943-948).
+        # We propagate rope_scaling into both main/compress dicts so ROPE_INIT_FUNCTIONS["yarn"]
+        # and compute_default_rope_parameters can see factor/beta/original.
+        _yarn_src = getattr(self, "rope_scaling", None) or {}
+        if isinstance(_yarn_src, dict) and _yarn_src.get("type") == "yarn":
+            _yarn_factor = _yarn_src.get("factor", 16)
+            _yarn_beta_fast = _yarn_src.get("beta_fast", 32)
+            _yarn_beta_slow = _yarn_src.get("beta_slow", 1)
+            _yarn_orig = _yarn_src.get("original_max_position_embeddings", _yarn_src.get("original_seq_len", 65536))
+        else:
+            _yarn_factor = None
+            _yarn_beta_fast = None
+            _yarn_beta_slow = None
+            _yarn_orig = None
         rp = self.rope_parameters or {}
         if isinstance(rp.get("main"), dict) and isinstance(rp.get("compress"), dict):
+            # Already structured as {"main":..., "compress":...} — inject YaRN if missing
+            for k in ("main", "compress"):
+                d = rp[k]
+                if _yarn_factor is not None and "factor" not in d:
+                    d["factor"] = _yarn_factor
+                    d["beta_fast"] = _yarn_beta_fast
+                    d["beta_slow"] = _yarn_beta_slow
+                # compress branch keeps YaRN, main branch must have no YaRN (orig=0) per model.py:485
+                if k == "main" and _yarn_orig is not None:
+                    # Do not set orig for main — disable YaRN there (window layers no yarn)
+                    d.setdefault("original_max_position_embeddings", 0)
+                    d.setdefault("original_seq_len", 0)
+                elif k == "compress" and _yarn_orig is not None:
+                    d.setdefault("original_max_position_embeddings", _yarn_orig)
+                    d.setdefault("original_seq_len", _yarn_orig)
             self.rope_parameters = {"main": rp["main"], "compress": rp["compress"]}
         else:
             main = {k: v for k, v in rp.items() if k not in ("main", "compress")}
             main.setdefault("rope_type", "default")
             main.setdefault("rope_theta", self.rope_theta)
             main["partial_rotary_factor"] = self.partial_rotary_factor
+            # Main (window-only layers 0/1) — YaRN disabled per model.py:485
+            main.setdefault("original_max_position_embeddings", 0)
+            main.setdefault("original_seq_len", 0)
             compress = {**main, "rope_theta": self.compress_rope_theta}
+            # Compress (CSA/HCA layers 2-42) — YaRN enabled per model.py:482
+            if _yarn_factor is not None:
+                compress["factor"] = _yarn_factor
+                compress["beta_fast"] = _yarn_beta_fast
+                compress["beta_slow"] = _yarn_beta_slow
+                compress["original_max_position_embeddings"] = _yarn_orig
+                compress["original_seq_len"] = _yarn_orig
+                # Mark as yarn so RotaryEmbedding picks yarn init (Patch 01)
+                if compress.get("rope_type", "default") == "default":
+                    compress["rope_type"] = "yarn"
             self.rope_parameters = {"main": main, "compress": compress}
 
 

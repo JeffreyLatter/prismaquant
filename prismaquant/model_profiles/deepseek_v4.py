@@ -172,10 +172,30 @@ class DeepseekV4Profile(ModelProfile):
                 leaf_proj = {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}[leaf_w]
                 return f"model.layers.{layer_idx}.mlp.experts.{exp_idx}.{leaf_proj}{suffix}"
 
-            # Compressor + indexer: drop entirely (modeling patch sets
-            # self.compressor = None for all layers in probe mode).
-            if leaf.startswith("attn.compressor.") or leaf.startswith("attn.indexer."):
-                return None
+            # --- PATCH 02: Compressor + indexer — KEEP (faithful) ---
+            # Prior drop (return None) was tied to modeling:608-625 probe_mode skip.
+            # Faithful forward needs these weights live (model.py:285-440).
+            # Proven mapping per port: local_checkpoint_to_live_name (port:138-148):
+            #   layers.N.attn.compressor.{wkv,wgate,ape,norm.weight}
+            #     → model.layers.N.self_attn.compressor.{wkv,wgate,position_bias,kv_norm.weight}
+            #   layers.N.attn.indexer.{wqb,weights_proj} + inner compressor
+            # This mirrors DESIGN_NOTES §9 weight-map variant.
+            if leaf.startswith("attn.compressor."):
+                # ape in checkpoint is position_bias in live (modeling:428)
+                rest = leaf[len("attn.compressor."):]
+                rest = rest.replace("ape", "position_bias").replace("norm.weight", "kv_norm.weight")
+                return f"model.layers.{layer_idx}.self_attn.compressor." + rest
+            if leaf.startswith("attn.indexer."):
+                sub = leaf[len("attn.indexer."):]
+                if sub.startswith("compressor."):
+                    rest = sub[len("compressor."):]
+                    rest = rest.replace("ape", "position_bias").replace("norm.weight", "kv_norm.weight")
+                    return f"model.layers.{layer_idx}.self_attn.indexer.compressor." + rest
+                # top-level indexer: wq_b, weights_proj etc
+                # checkpoint: layers.N.attn.indexer.wq_b.weight → live: model.layers.N.self_attn.indexer.wq_b.weight
+                # but vendored Indexer expects .wq_b / .weights_proj under indexer
+                # Also handle legacy compressor.indexer_compressor alias (port:1038)
+                return f"model.layers.{layer_idx}.self_attn.indexer." + sub
 
             # `attn.attn_sink` → `self_attn.sinks` (PR #45643's per-head
             # bias buffer attribute name).
