@@ -81,22 +81,42 @@ def test_ffn_rename():
         assert _rename(ck) == live, f"{ck} ↦ {_rename(ck)}, expected {live}"
 
 
-def test_compressor_and_indexer_drop():
-    """Probe-mode drops compressor + indexer keys (modeling patch
-    skips the long-range branch; weights pass through at export)."""
-    drops = [
-        "layers.0.attn.compressor.wkv.weight",
-        "layers.5.attn.compressor.ape",
-        "layers.5.attn.compressor.norm.weight",
-        "layers.5.attn.compressor.wgate.weight",
-        "layers.2.attn.indexer.compressor.wkv.weight",
-        "layers.2.attn.indexer.compressor.norm.weight",
-        "layers.2.attn.indexer.compressor.ape",
-        "layers.2.attn.indexer.wq_b.weight",
-        "layers.2.attn.indexer.weights_proj.weight",
+def test_compressor_and_indexer_keep_faithful_mapping():
+    """The faithful forward (87ca027 + census fix) KEEPS compressor and
+    indexer weights. Live targets, census-verified against the vendored
+    meta-init model (72,317 checkpoint keys, 0 missing):
+
+    - `attn.compressor.*` → `self_attn.compressor.*` with the ape →
+      position_bias and norm.weight → kv_norm.weight renames.
+    - The indexer lives ON the CSA compressor
+      (`DeepseekV4CSACompressor.indexer`), not on the attention module,
+      and its checkpoint `indexer.compressor.*` tensors live FLAT on the
+      Indexer (it pools inline; no inner compressor submodule).
+    """
+    cases = [
+        ("layers.5.attn.compressor.wkv.weight",
+         "model.layers.5.self_attn.compressor.wkv.weight"),
+        ("layers.5.attn.compressor.wgate.weight",
+         "model.layers.5.self_attn.compressor.wgate.weight"),
+        ("layers.5.attn.compressor.ape",
+         "model.layers.5.self_attn.compressor.position_bias"),
+        ("layers.5.attn.compressor.norm.weight",
+         "model.layers.5.self_attn.compressor.kv_norm.weight"),
+        ("layers.2.attn.indexer.wq_b.weight",
+         "model.layers.2.self_attn.compressor.indexer.wq_b.weight"),
+        ("layers.2.attn.indexer.weights_proj.weight",
+         "model.layers.2.self_attn.compressor.indexer.weights_proj.weight"),
+        ("layers.2.attn.indexer.compressor.wkv.weight",
+         "model.layers.2.self_attn.compressor.indexer.wkv.weight"),
+        ("layers.2.attn.indexer.compressor.wgate.weight",
+         "model.layers.2.self_attn.compressor.indexer.wgate.weight"),
+        ("layers.2.attn.indexer.compressor.ape",
+         "model.layers.2.self_attn.compressor.indexer.position_bias"),
+        ("layers.2.attn.indexer.compressor.norm.weight",
+         "model.layers.2.self_attn.compressor.indexer.kv_norm.weight"),
     ]
-    for k in drops:
-        assert _rename(k) is None, f"{k} should drop, got {_rename(k)}"
+    for ck, live in cases:
+        assert _rename(ck) == live, f"{ck} ↦ {_rename(ck)}, expected {live}"
 
 
 def test_routed_experts_per_expert_rename():
