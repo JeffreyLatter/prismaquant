@@ -852,6 +852,7 @@ def export_nvfp4_cb(
         codebook_source=source,
         scale_sweep=bool(scale_sweep),
         ldlq=_env_cb_context.ldlq,
+        ldlq_scope=getattr(_env_cb_context, "ldlq_scope", "all" if _env_cb_context.ldlq else "none"),
         minchain=_env_cb_context.minchain,
         minchain_version=_env_cb_context.minchain_version,
         encode_tier=resolve_cb_encode_tier(),
@@ -872,6 +873,22 @@ def export_nvfp4_cb(
         serialization_context,
         where="export_nvfp4_cb",
     )
+    from prismaquant.nvfp4_cb_footprint import _ldlq_for_format
+
+    _ldlq_telemetry_qnames = {
+        qname for qname in cb_targets
+        if _ldlq_for_format(assignment[qname], serialization_context)
+    }
+    ldlq_telemetry = None
+    if _ldlq_telemetry_qnames:
+        from prismaquant.cb_ldlq_gate_telemetry import (
+            LDLQGateTelemetryCollector,
+        )
+
+        ldlq_telemetry = LDLQGateTelemetryCollector(
+            expected_qnames=_ldlq_telemetry_qnames,
+            kernel_stamp=cb.canonical_ldlq_kernel_stamp(),
+        )
     ldlq_activation_loader = None
     if serialization_context.ldlq:
         if activation_cache_dir is None:
@@ -1076,6 +1093,12 @@ def export_nvfp4_cb(
                     where="export_nvfp4_cb source tensor",
                 )
                 verified_cb_source_qnames.add(canon)
+            from prismaquant.nvfp4_cb_footprint import _ldlq_for_format
+
+            ldlq_for_this = _ldlq_for_format(fmt, serialization_context)
+            ldlq_gate_info: dict[str, object] | None = (
+                {} if ldlq_for_this else None
+            )
             packed, fields = cb.nvfp4_cb_pack(
                 w, k, grid=grid, mode=mode,
                 col_weights=col_weights[canon].to(device),
@@ -1083,14 +1106,27 @@ def export_nvfp4_cb(
                 scale_coding=(scale_coding if grid == "fp4"
                               else cb.SCALE_CODING_V1),
                 encode_tier=serialization_context.encode_tier,
-                ldlq=serialization_context.ldlq,
+                ldlq=ldlq_for_this,
                 activation_rows=(
                     ldlq_activation_loader.load(
                         canon,
                         stack_size=(int(w.shape[0]) if w.dim() == 3 else None),
                     )
-                    if ldlq_activation_loader is not None else None
-                ))
+                    if ldlq_for_this and ldlq_activation_loader is not None else None
+                ),
+                ldlq_gate_info_out=ldlq_gate_info,
+            )
+            if ldlq_for_this:
+                assert ldlq_telemetry is not None
+                assert ldlq_gate_info is not None
+                ldlq_telemetry.record(
+                    qname=canon,
+                    shape=tuple(int(dim) for dim in w.shape),
+                    grid=grid,
+                    mode=mode,
+                    k=k,
+                    gate_info=ldlq_gate_info,
+                )
             if w.dim() == 3:
                 # Stacked packed experts: keep the expert axis explicit —
                 # uint8 (E, out, bytes_per_row); fp8 per-channel scales
@@ -1276,6 +1312,15 @@ def export_nvfp4_cb(
             return qname[len("model."):]
         return qname
 
+    post_allocation_refinement = None
+    _meta_ref = _recipe_payload.get("__prismaquant__", {})
+    if isinstance(_meta_ref, dict) and "post_allocation_refinement" in _meta_ref:
+        from prismaquant.cb_ldlq_refinement import validate_refinement_provenance
+
+        post_allocation_refinement = validate_refinement_provenance(
+            _meta_ref.get("post_allocation_refinement"),
+            where="export_nvfp4_cb post_allocation_refinement",
+        )
     quant_config = build_quant_config(
         assignment=assignment,
         cb_targets=cb_targets,
@@ -1293,6 +1338,7 @@ def export_nvfp4_cb(
         serialization_context=serialization_context,
         cb_render_identity=_recipe_cb_render_identity,
         research_cost_selection=_research_cost_selection,
+        post_allocation_refinement=post_allocation_refinement,
         activation_execution_contract=activation_execution_contract,
         git_commit=_git_commit(),
         cb_target_name=_resident_export_target,
@@ -1336,6 +1382,8 @@ def export_nvfp4_cb(
         p = model_dir / aux
         if p.exists():
             (out_dir / aux).write_bytes(p.read_bytes())
+    if ldlq_telemetry is not None:
+        ldlq_telemetry.publish(out_dir, quant_config)
     # Final measured bytes are a separate scope from CB tensor-data pricing:
     # include safetensors headers, JSON, tokenizer files, and every other
     # regular file.  The helper embeds a self-consistent inventory in

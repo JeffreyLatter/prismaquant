@@ -64,7 +64,8 @@ class Candidate:
     serialized_sidecar_identity: str | None = None
     # WHICH estimator priced this candidate's activation contract (ultraplan
     # P5a). One of activation_fair_pricing.BRANCH_*: measured_output_mse,
-    # bit_exact, activation_identity, weight_only_activation_calibrated,
+    # interpolated_output_mse, bit_exact, source_passthrough,
+    # activation_identity, weight_only_activation_calibrated,
     # weight_only_uncalibrated, weight_only_kill_switch. Kept out of solver
     # logic — like serialized_identity it is provenance, not an input to the
     # DP — so that "was this row's A side ever priced" is recoverable from the

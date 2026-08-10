@@ -377,19 +377,43 @@ def transactional_export_directory(
         primary_error = exc
         raise
     finally:
-        try:
-            _remove_owned_temp_root(
-                temp_root,
-                temp_identity,
-                where=where,
+        if primary_error is not None:
+            # PRESERVE the partial temp root on failure.
+            #
+            # Gates run at very different depths. `assert_artifact_complete`
+            # runs AFTER every tensor is written, and can fail on METADATA
+            # alone: measured 2026-08-08 on DSv4-Flash, a 21-tensor `ignore`
+            # mis-declaration (`attn.indexer.wq_b`) discarded ~6 hours of
+            # byte-identical tensor writes, because this `finally` deleted them
+            # unconditionally and `--reuse-prior` therefore had nothing to
+            # reuse. Deleting work that the retry will reproduce bit-for-bit is
+            # pure waste.
+            #
+            # This cannot be mistaken for a finished artifact: the publish path
+            # is untouched, the name is dot-prefixed `.tmp-<token>`, and it
+            # carries no completeness stamp — `--reuse-prior` still re-verifies
+            # what it adopts. Size is proportional to work actually done, so an
+            # early preflight failure preserves ~nothing.
+            print(
+                f"{where}: PRESERVED partial export at {temp_root}\n"
+                f"{where}:   resume:  --reuse-prior {temp_root} --reuse-verify\n"
+                f"{where}:   discard: rm -rf {temp_root}",
+                flush=True,
             )
-        except BaseException as cleanup_exc:
-            if primary_error is None:
-                raise
-            if hasattr(primary_error, "add_note"):
-                primary_error.add_note(
-                    f"transaction cleanup also failed: {cleanup_exc}"
+        else:
+            try:
+                _remove_owned_temp_root(
+                    temp_root,
+                    temp_identity,
+                    where=where,
                 )
+            except BaseException as cleanup_exc:
+                if primary_error is None:
+                    raise
+                if hasattr(primary_error, "add_note"):
+                    primary_error.add_note(
+                        f"transaction cleanup also failed: {cleanup_exc}"
+                    )
 
 
 @contextmanager

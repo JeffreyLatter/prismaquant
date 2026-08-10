@@ -104,14 +104,11 @@ def test_declared_cb_lanes_are_a_subset_of_gridbook_supported():
     state, since a serving contract has to exist before any artifact can be
     produced against it.
 
-    This asserted strict EQUALITY until Gridbook 0.7.0, whose D0.1 registered
-    `deepseek_v4` in the packaged `runtime_contract.json` while the DSV4 CB
-    export lane remains unlanded here (`docs/lanes/nvfp4-cb/dsv4_readiness.md`
-    gaps 1-3: `export_nvfp4_cb.py`'s `_load_skeleton` still reads the whole
-    model, there is no fp8-block dequant-on-read, and no per-expert to packed
-    expert stacking). Equality made the intended landing order — serving
-    contract first, exporter second — unrepresentable, so it was the assertion
-    that was wrong, not the pin.
+    This asserted strict EQUALITY until Gridbook 0.7.0 registered
+    `deepseek_v4` before PrismaQuant's streaming CB exporter, source-format
+    passthrough, and packed-expert path were complete. The producer lane is now
+    declared, but containment remains the right invariant: consumer-first
+    additions must remain representable without weakening this safety gate.
     """
     _assert_declared_cb_lanes_are_servable()
 

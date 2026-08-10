@@ -1739,6 +1739,18 @@ def main():
         help="Exact CB feedback-assignment contract; required with CB formats.",
     )
     ap.add_argument(
+        "--cb-ldlq-scope",
+        choices=("none", "nvfp4", "all"),
+        default=None,
+        help=(
+            "Which CB family the exporter will LDLQ. Authoritative over "
+            "--cb-ldlq when given. The stamp must match what the export "
+            "actually renders, or the per-tensor identity preflight fails: "
+            "'nvfp4' means NVFP4_CB is LDLQ and FP8_CB stays raw. LDLQ is "
+            "byte-neutral, so this changes the recorded contract, not bytes."
+        ),
+    )
+    ap.add_argument(
         "--cb-minchain",
         choices=("0", "1"),
         default="0",
@@ -2290,6 +2302,7 @@ def main():
                 codebook_source=args.cb_codebook_source,
                 scale_sweep=args.cb_scale_sweep == "1",
                 ldlq=args.cb_ldlq == "1",
+                ldlq_scope=args.cb_ldlq_scope,
                 minchain=args.cb_minchain == "1",
                 minchain_version=(
                     MINCHAIN_CONTEXT_VERSION if args.cb_minchain == "1" else None
@@ -3667,15 +3680,30 @@ def main():
                 ),
                 "target_profile": target_profile,
                 "assignment": dict(sorted(assignment.items())),
+                # Two independent facts, so two independent guards. A CB
+                # assignment always carries per-tensor serialized identities,
+                # but it carries a render identity only when the cost table had
+                # a validated one to project from: under
+                # ``--accept-research-cost-table``
+                # ``_cb_render_identity_for_assignment`` deliberately returns
+                # None rather than fabricate one (see its comment), and
+                # ``cb_cost_render_identity`` is never assigned on that path at
+                # all. Gating the render-identity fields on the *identities*
+                # field therefore KeyErrors on every research-cost run that
+                # writes a Pareto point with any CB format. The final-assignment
+                # writer already guards on the render identity itself; this
+                # makes the Pareto writer agree with it.
+                **({
+                    CB_ASSIGNMENT_IDENTITIES_FIELD: dict(sorted(
+                        record.get(CB_ASSIGNMENT_IDENTITIES_FIELD, {}).items()
+                    )),
+                } if record.get(CB_ASSIGNMENT_IDENTITIES_FIELD) else {}),
                 **({
                     "cb_serialized_payload": record[
                         "cb_render_identity"
                     ]["cb_serialized_payload"],
-                    CB_ASSIGNMENT_IDENTITIES_FIELD: dict(sorted(
-                        record.get(CB_ASSIGNMENT_IDENTITIES_FIELD, {}).items()
-                    )),
                     "cb_render_identity": record["cb_render_identity"],
-                } if record.get(CB_ASSIGNMENT_IDENTITIES_FIELD) else {}),
+                } if record.get("cb_render_identity") is not None else {}),
                 **({
                     "whole_artifact_budget": record_budget_stamp,
                 } if record_budget_stamp is not None else {}),
@@ -4744,6 +4772,24 @@ def main():
             "additive_candidate_proposal_then_exact_assignment_filter"
         ),
         "global_optimality_claimed": False,
+        # The artifact-wide CB context the per-tensor identities above were
+        # computed under. Without it the exporter cannot know which contract
+        # produced them: it reads this key
+        # (`cb_serialization_metadata_from_assignment_payload`) to decide
+        # whether to claim the W4A4 activation contract. Absent, it falls back
+        # to no-contract/payload-v2, drops the 4-byte input_global_scale, and
+        # EVERY per-tensor stamp mismatches -- measured 2026-08-08 on DSv4:
+        # 24851/24851 mismatched, which is the root cause of the four earlier
+        # "CB per-layer serialization identity mismatch" export failures.
+        **({"cb_serialized_payload": cb_serialization_context_stamp(
+                cb_serialization_context,
+                formats=sorted({
+                    str(fmt) for fmt in assignment_expanded.values()
+                    if is_cb_format(str(fmt))
+                }) or None,
+            )}
+           if cb_serialization_context is not None
+           and final_cb_serialization_stamps else {}),
         **propagated_cost_provenance(research_cost_provenance),
         "assignment_payload_bits_total": (
             float(final_assignment_payload["bits_total"])

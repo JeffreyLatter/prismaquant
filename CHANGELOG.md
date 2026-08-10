@@ -1,5 +1,276 @@
 # Changelog
 
+## 0.10.0 — 2026-08-09
+
+The DeepSeek-V4-Flash campaign release: LDLQ becomes a *certified* encoder path,
+the vendored DSV4 forward becomes faithful to the reference, and four silent
+correctness defects in the export path are closed.
+
+MINOR, not patch: `layer_config.json` gains a required key, exported CB weight
+bytes move for any artifact built with LDLQ on, and DSV4-class exports change
+which units they declare quantized. Published artifacts already on disk are
+unaffected — nothing here rewrites them — but they cannot be re-produced
+byte-for-byte without the reproduction switches named below.
+
+**The LDLQ quality claim is not yet a result.** Everything below is a screen:
+local render/activation MSE, holdout-gated cost-table statistics, and block
+parity against the reference implementation. There is no served vLLM
+KL-vs-BF16 or WikiText-PPL number for LDLQ in this release. The served A/B is
+pending.
+
+### LDLQ certified out of sample — and the in-sample gate was anti-correlated
+
+- **The do-no-harm gate was measuring the objective LDLQ had just been
+  optimised against.** It built each expert's Hessian from the captured
+  activation rows and then scored keep/revert on those same rows, so it could
+  not fail — and its error was not a constant. On `L17 gate_proj, K12` the gate
+  figure and the truth on held-out rows run in **opposite** directions: at full
+  64-row support the gate posted 0.0325 against a true 0.6517 (20x
+  overstatement); at 1–3 rows it posted its *best* figure of the study, 0.0196,
+  where the true gain was 0.9504 — i.e. 5% — a 48.5x overstatement. Pricing
+  from it would have **inverted** the allocator's ranking, not merely inflated
+  it. Support is thin and layer-dependent: the median tensor has 21 activation
+  rows against 2048–4096 columns, and 8.2% of tensors have exactly one.
+- **The replacement certifies on rows no arm of the gate saw.** Scored with the
+  gate handed only half of each expert's rows to keep the evaluation
+  non-circular, degeneration falls **7/96 → 1/96**; on full-support `down_proj`
+  the new gate rejected exactly the one regressing expert and nothing else.
+  It is not literally never — at 4 rows the certificate splits 2/2 and has
+  little power. Production hands the gate all rows, so 1/96 is an upper bound.
+  Two honest limits: the *shipped* assignment is still the all-rows fit, which
+  sees strictly more data than the arm that earned the certificate; and the
+  authoritative check remains a model-level disjoint-corpus A/B, which is the
+  pending served work.
+- `PRISMAQUANT_CB_LDLQ_GATE` selects `holdout` (default), `in_sample`
+  (reproduction of pre-2026-08-08 artifacts only, never for new ones), or `0`.
+  The certifiability floor `LDLQ_GATE_MIN_ROWS` rises **2 → 16** — eight fit and
+  eight decision rows, an evidence floor and explicitly *not* a claim that
+  sixteen rows give a population-level guarantee. Tensors below it keep raw.
+- **`PRISMAQUANT_CB_LDLQ_SCOPE`** (`none|nvfp4|all`, matching the allocator's
+  `--cb-ldlq-scope`) replaces the legacy boolean as the authoritative
+  per-family switch and is stamped into the serialization context; an
+  inconsistent legacy/scope pair refuses. Per-tensor identities now record the
+  LDLQ that actually applied to each format, which fixes mismatched identities
+  on mixed NVFP4/FP8 assignments.
+- **Both CB exporters resolve LDLQ per format rather than from one global
+  boolean, and the activation loader is handed over per format with it.** In
+  the non-streaming exporter each format resolves through `_ldlq_for_format`
+  and an activation is loaded only when that format's family is LDLQ-eligible
+  under the active scope. The streaming exporter had two further scope leaks:
+  a single global boolean decided the warm path, the recorded identity and the
+  loader requirement for every format alike. The actual per-format family scope
+  now controls all four — encoding, warm path, identity and loader — so an
+  FP8 tensor under `scope=nvfp4` is neither encoded as LDLQ nor charged an
+  activation-loader requirement it cannot satisfy.
+- **Product-atom E16 LDLQ** (`cb_ldlq_atoms.py`): exact FP8 atom-2 / FP4 atom-4
+  exhaustive Mahalanobis assignment, with typed Hessian failures so dead
+  channels refuse rather than fabricate an identity. The canonical packed route
+  is ABI-fixed — serial, feeder-thread, non-16 expert-batch, shared-Hessian and
+  non-divisible routes are now **refused**, where some were previously legal.
+  Two concurrency defects are closed with them: a missing caller→worker
+  `wait_stream` in both multi-stream arms, and a factor-cache cross-stream race
+  (the cache is now event-backed, bounded at 8 GiB, and keyed on
+  `Tensor._version`).
+- **The gate no longer materializes the whole stack.** Each fp32 reconstruction
+  at DSV4 shape is 16 GiB and the gate transiently held two of them; scoring is
+  now chunked per expert slice, holding **64 MiB instead of 16 GiB**. This is
+  bitwise identical, not approximately equal — reconstruction is row-local and
+  the gate MSE is a within-expert reduction, so slicing commutes, and the tests
+  assert exact float equality across both scale codings.
+- **Fused siblings union their activation rows by global row index**, raising
+  Hessian support rather than intersecting it: on DSV4 L0 expert 0, gate and up
+  contribute 64 rows each with an intersection of 15 and a union of 113. Rows at
+  shared indices must be bit-identical or it raises.
+- Never-routed experts take the cold-expert prior on the direct per-expert path
+  too — the DSV4 export reports 3,984 never-routed expert projections across 60
+  stacks, so raising there would make LDLQ unusable on any MoE with cold
+  experts. The substitution is logged, not silent.
+- New additive artifact sidecar **`cb_ldlq_gate_telemetry.json`** (schema
+  `prismaquant.cb_ldlq_gate_telemetry.v1`) with exact-qname coverage
+  enforcement and a validated kernel stamp; and a post-allocation refinement
+  contract `cb_ldlq_refinement.v1` recorded in `quant_config` provenance and in
+  `layer_config`. Raw exports are unchanged.
+
+### A no-LDLQ cost table from the LDLQ burn, without a second burn
+
+- The CB fields encoded *before* the gated reassignment are the identical-env
+  raw render — same encode, codebook, scale sweep and coding, same
+  `col_weights`. A gated cost run therefore now also emits
+  `weight_mse_raw_render`, `predicted_dloss_raw_render` and
+  `weight_mse_per_expert_raw_render` under provenance
+  `prismaquant.cb_ldlq_raw_render_sidecar.v1`, which is what makes the
+  LDLQ-contribution A/B affordable at all: the isolate would otherwise cost a
+  second multi-hour burn. Output-side metrics are **not** re-measured for the
+  raw arm — the allocator prices `predicted_dloss`/`weight_mse`, and a raw
+  output measurement would need the full-stack forward the sidecar exists to
+  avoid. Ladder-rejected slices deliberately record no sidecar.
+- **`tools/extract_raw_cost_table.py`** derives the no-LDLQ allocator cost table
+  from it, re-stamping the CB context as `ldlq=false, scope=none` and recording
+  the source stamp under `derived_from_ldlq_gated_cost`. It fail-closes on error
+  rows, missing or partial sidecars, and already-raw input, and its output must
+  pass `validate_cb_cost_provenance` before it is written.
+- When LDLQ is off this is a strict no-op: no sidecar keys are emitted and cost
+  pickles stay byte-identical, asserted key-for-key against the legacy row
+  schema. Banked pickles are never rewritten.
+- Never-routed experts have no calibration activations by construction (51 on
+  the production capture), which crashed the weight-only row path under an LDLQ
+  context. The fix is an explicit call-site opt-in used *only* by that path; the
+  default still raises, so a broken activation loader can never silently produce
+  an all-raw table stamped as LDLQ.
+
+### Band-interpolated rungs are priced from their own `output_mse`
+
+- A row stamped `band_interpolated`/`mixed` carries `output_mse_measured:
+  false`, so it fell to the weight-only branch and was priced as `weight_mse ×`
+  a per-family activation constant while its measured neighbours on the same
+  ladder were priced from `output_mse` directly — one family, two bases. The
+  true output/weight ratio is **not** family-wide: 187–320 on gate/up_proj
+  against 9.4–22 on down_proj, a ~20x spread. The constant over-priced
+  interpolated down_proj rungs ~12x and under-priced gate/up_proj ones ~1.6x,
+  **breaking rung order inside the family**: the higher rung cost more than the
+  one below it on ~85% of down_proj experts, so K13/K17 could never be selected.
+- This retracts a design claim of `activation_fair_pricing`: "a per-family
+  constant cannot reorder rungs inside a family" holds only while every rung of
+  the family takes the same branch, and these did not. On the 32 banked layers
+  down_proj violations fall from **84.8%/0%/84.6% to 0.014%/0.014%/0.043%**.
+  `cost_source` and `output_mse_measured` keep their meanings and no banked
+  pickle is rewritten; a new branch label `interpolated_output_mse` records in
+  the shipped artifact which selected prices were predictions.
+- Ladder interpolation was separately checked to survive the LDLQ identity, on
+  the layer-9 pilot (18 exact rungs, 103 cells): gated `output_mse` is
+  log-linear in K per family, LOO median 0.9–2.3% and p99 3–7.6%, and the gate
+  branch is a cell property (~28% raw across all rungs) rather than a
+  K-crossover — so the per-tensor anchors+holdout law applies unchanged.
+
+### The vendored DeepSeek-V4 forward is now faithful to the reference
+
+- The vendored forward carried a half-split `rotate_half` RoPE instead of the
+  release's interleaved complex rotation, and an **amputated compressor/indexer
+  branch**. Both are restored, with per-layer YaRN tables and the HCA/CSA path
+  per the reference, and probe mode becomes an explicit flag with a loud
+  one-time warning — the silent architectural degradation is gone.
+- **Recorded for honesty: every prior DSV4 probe output — `h_trace`, the
+  KL-adjoint, the activation cache, and every cost derived from them — was
+  measured through the defective forward, and is scheduled for re-derivation
+  before the next allocation.**
+- **The first certification was itself wrong, and is retracted.** The "29/29
+  parity, zero divergence" claim never executed the vendored module: its
+  HyperConnection check was a source-text search and its block check compared
+  the reference against itself. `HyperConnection.__getattr__` in fact raised for
+  every non-alias name, so the `fn`/`base`/`scale` Parameters were unreachable
+  and every `self.fn` access crashed.
+- True block parity is now certified by executing the *vendored*
+  `DecoderLayer.forward` against the vendor's own Block on real DSV4-Flash-Base
+  weights, with forward-hook counters proving execution rather than source-text
+  inspection: `max|diff|` **1.0133e-06** (sliding), **1.5348e-06** (CSA),
+  **1.6689e-06** (HCA), every intermediate boundary ≤ 6.2e-06 and the mHC
+  boundaries exactly 0.0. Six further defects fell out of it, two of them
+  silent: the CSA top-k was used as a `torch.gather` index still carrying the
+  reference's `-1` sentinel — which CUDA does not bounds-check, so it **read out
+  of bounds on every CSA layer** — and pooled-entry mask columns were padded
+  visible, a causality break on every compressed layer. The compressor was also
+  skipped whenever no cache was passed, so the Fisher probe silently got
+  window-only attention with no error.
+- Profile fixes: the indexer lives on the CSA compressor, not on attention, and
+  its checkpoint tensors sit flat on it — the corrected mapping resolves **all
+  72,317 checkpoint keys** with zero misses. A new plugin accessor
+  `ModelProfile.probe_linear_exclude_extra()` makes the probe's Linear-exclusion
+  regex profile-owned; DSV4 excludes `self_attn.{compressor,indexer}`, restoring
+  the 33,325-selectable-Linear inventory the byte accounting assumes.
+  `transformers` signature drift between 5.6.0 and 5.12.1 is bound by keyword.
+
+### Streaming
+
+- Nested rotary instances are materialized on meta skeletons.
+  `ModelProfile.init_rotaries` gains an optional `base_model` kwarg (the Gemma4
+  override is updated in step) and the DSV4 override walks the skeleton, so no
+  `inv_freq` buffer is left on meta.
+- Eviction no longer meta-izes non-persistent buffers, which `_fast_install`
+  deliberately skips and therefore could not restore. Harmless while all rotary
+  state lived at the model root; fatal once the faithful forward puts
+  compressor/indexer caches inside the layers.
+
+### Export and allocator correctness
+
+- **`layer_config.json` now records `cb_serialized_payload`.** The allocator
+  wrote per-tensor CB identities but never the context they were written under,
+  so on DSV4-Flash **24,851 of 24,851 CB tensors mismatched** at export. This is
+  the root cause of four earlier "CB per-layer serialization identity mismatch"
+  failures, and it **retracts** the earlier attribution of those to a
+  packed-expert/LDLQ-scope mismatch. The assignment itself is unchanged. A
+  `layer_config.json` produced before this release lacks the key and must be
+  re-produced by the allocator.
+- **21 `attn.indexer.wq_b` units were being shipped as unquantized floats.** The
+  floor block-FP8 scan iterated a live-model-name map in which the indexer had
+  0 of 33,368 entries, so those units fell through to the verbatim-copy loop and
+  were declared `ignore`. A consumer honouring that allocates bf16, the element
+  counts match, and the FP8 bytes are cast **with no scale applied** — every
+  block wrong by its own power of two, and nothing raised. The scan now reads
+  the checkpoint. Pre-existing and LDLQ-independent.
+- A failed export **preserves** its partial `.tmp-<token>` root and prints
+  resume/discard commands instead of deleting it; a 21-tensor mis-declaration
+  threw away ~6 hours of tensor writes that the retry reproduced bit-for-bit.
+  The destination is still never created on failure and never clobbered, and the
+  preserved root carries no completeness stamp.
+- New `dspark_source_metadata.py` bridges the released three-stage DSpark
+  topology (4,705 tensors) into the exporter — MXFP4/FP8-block source unit
+  classification, physical-to-construction MTP layer mapping, refusal of partial
+  stages, and an atomic hardlink-sibling sidecar publisher that provably
+  rewrites zero tensor bytes.
+- Gridbook runtime pin advances **0.8.0 → 0.8.1 → 0.8.2** (`9011a19` →
+  `c9c1265` → `9f915dd`), each with its matching backed-rung key
+  `[28,32,36,40,44,48]`. The 0.8.1 bump had landed without its key, which
+  emptied the fail-closed resolver's backed set and silently degraded every
+  `k%4==0` rung to the expand+GEMM fallback.
+  The advance to **0.8.2** is what makes the released pin describe the runtime
+  that actually serves: the DSV4-Flash serving images are built from Gridbook
+  0.8.2, so shipping a pin that declares `0.8.1` with `version_is_release: true`
+  would have asserted a released runtime the artifact does not run on — the
+  exact confusion `tests/test_gridbook_runtime_boundary.py` exists to prevent.
+  The rung set carries over verbatim, verified more strongly than by reading the
+  constant: `gridbook/codec.py` is **byte-unchanged** across the entire
+  v0.8.1..v0.8.2 range, so `FP8_FUSED_KBITS` cannot have moved; 0.8.2's content
+  is loader and dispatch work above the codec. **This release therefore depends
+  on Gridbook v0.8.2 being tagged and its commit pushed** — CI installs the
+  runtime from the pinned git commit and asserts the reported version matches.
+
+### Campaign tooling
+
+- Thirteen DSV4 A-FAST campaign tools under `tools/`, plus the burn runner. The
+  CBL audit gate no longer escapes `_measure_projection` as an `AssertionError`
+  before the layer-wide fallback can run — that turned a recoverable verdict
+  into an aborted campaign at 42/43 layers. Per-expert uplifts are now recorded,
+  because the aggregate hides the spread: one expert 8.51% worse and one 0.93%
+  worse in a sample whose median *gained* 8.45%.
+- A Pareto-point writer `KeyError` on every research-cost run emitting a CB
+  format is fixed (it dereferenced `cb_render_identity` while guarding on a
+  different field).
+
+### Known state at release
+
+- Suite: **3123 passed, 0 failed, 86 skipped, 3 xfailed, 151 subtests passed.**
+- **One piece of disclosed debt.**
+  `tests/test_dsv4_campaign_tools.py::test_dual_holdout_fit*` is
+  `xfail(strict=True, raises=KeyError)`. These two tests were *introduced in
+  this cycle* by 41b5c62 and have failed since — they did not exist at v0.9.0,
+  so they are not pre-existing debt inherited from an earlier release. The
+  cause is a live defect in the campaign tool rather than in the tests: the
+  2026-08-06 demand-driven revision narrowed the priced domain to `RUNGS =
+  K28–K38` without moving `ANCHORS = (28, 38, 48)` or `HOLDOUTS = (33, 43)`
+  with it, so `_fit_slices` indexes its rung-name map with K48 and raises
+  before evaluating anything. A real dual-holdout fit takes the same path.
+  It is marked rather than repaired because choosing the replacement anchor and
+  holdout rungs changes which rungs are measured and which are predicted — a
+  campaign-design decision — and the 43-layer burn in flight was launched
+  against these exact constants. The marker is conditional on the
+  inconsistency and strict, so the suite fails the moment the domain is made
+  consistent and the marker must then be deleted.
+- `docs/ARCHITECTURE.md` §0 conformance for this range was checked and closed in
+  the same release: the LDLQ certifiability floor (documented as 2, actually
+  16), the raw-render sidecar and its extractor, three omitted defaults, and the
+  two new profile-plugin accessors. `docs/design/runtime_flags.md` gains rows for
+  `PRISMAQUANT_CB_LDLQ_SCOPE` and `PRISMAQUANT_CB_LDLQ_GATE`.
+
 ## 0.9.0 (2026-08-05)
 
 - **Monotone Min-Chain encoder mode** (`PRISMAQUANT_CB_MINCHAIN=1`): per-rung min over the free LDLQ fit and the previous rung's embedded solution — error curves monotone non-increasing by construction at zero representational tax. Winning-arm/solution/predecessor digests enter the serialization context; mismatches refused at export. Validated: pilot-2 PASS on pre-declared DSV4 layer (zero violations, PCHIP held-out 2.7-2.9% median / <14% p95, 1.003x overhead). (#76)

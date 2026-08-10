@@ -39,18 +39,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from . import format_registry as fr
-from .cb_layout import parse_format_name
-from .cb_minchain import (
-    MINCHAIN_CONTEXT_VERSION,
-    MinChainInterpolationConfig,
-    interpolation_acceptance_v2,
-    select_reconstruction_slices,
-)
 from .nvfp4_cb_footprint import (
     cb_fields_for_context,
     cb_cost_provenance,
     cb_serialization_context_from_env,
-    cb_serialization_context_stamp,
 )
 
 
@@ -64,8 +56,16 @@ def _cb_cost_quantize_dequantize(
         tuple[list[int], str], tuple[list[int], str]
     ] | None = None,
     activation_rows: torch.Tensor | Sequence[torch.Tensor] | None = None,
+    raw_render_out: dict | None = None,
+    ldlq_missing_activation_ok: bool = False,
 ) -> torch.Tensor:
-    """Render CB weights under the producer context stamped on cost.pkl."""
+    """Render CB weights under the producer context stamped on cost.pkl.
+
+    ``raw_render_out``: when the context applies LDLQ to this format, the dict
+    receives the pre-gate raw fields (the identical-env no-LDLQ render) from
+    ``cb_fields_for_context`` so the caller can emit the ``*_raw_render`` cost
+    sidecar without a second encode.  Left untouched when LDLQ is off.
+    """
     if col_weights is None:
         raise RuntimeError(
             f"{spec.name}: production CB cost render has no col_weights; "
@@ -82,6 +82,8 @@ def _cb_cost_quantize_dequantize(
         context=context,
         col_weights=col_weights,
         activation_rows=activation_rows,
+        raw_fields_out=raw_render_out,
+        ldlq_missing_activation_ok=ldlq_missing_activation_ok,
     )
     warm_dir = os.environ.get("PRISMAQUANT_CB_WARM_STATE_DIR", "").strip()
     if warm_dir:
@@ -130,6 +132,101 @@ def _cb_warm_record_identities(
     )
 
 
+# Row-level ``cost_source`` stamped by tools/extract_raw_cost_table.py on rows
+# whose metrics were swapped to the raw (no-LDLQ) sidecar values.
+LDLQ_RAW_SIDECAR_COST_SOURCE = "ldlq_raw_render_sidecar"
+# Sidecar keys emitted next to the primary metrics on LDLQ-gated CB rows.
+LDLQ_RAW_SIDECAR_SCHEMA = "prismaquant.cb_ldlq_raw_render_sidecar.v1"
+LDLQ_RAW_SIDECAR_KEYS = (
+    "weight_mse_raw_render",
+    "predicted_dloss_raw_render",
+    "weight_mse_per_expert_raw_render",
+)
+
+
+def _cb_raw_sidecar_metrics(
+    weight: torch.Tensor,
+    raw_info: dict | None,
+    *,
+    h_full: torch.Tensor | None = None,
+    h_em: torch.Tensor | None = None,
+    full_expert_count: int | None = None,
+    want_per_expert: bool = False,
+) -> dict | None:
+    """Raw (no-LDLQ) sidecar metrics from the pre-gate fields capture.
+
+    ``raw_info`` is the ``raw_render_out`` mapping populated by
+    ``_cb_cost_quantize_dequantize`` when LDLQ ran; ``None``/empty means LDLQ
+    was off and NO sidecar is emitted (the no-op guarantee).  The raw fields
+    were encoded in the very same call that produced the primary render, so
+    this reconstructs — never re-encodes — and for packed stacks it
+    reconstructs expert-slice-by-expert-slice (one (R, C) fp32 slice resident
+    at a time), mirroring the holdout gate's chunked scoring: a full-stack
+    fp32 reconstruction is ~16 GiB on the DSv4 fused gate_up stack.
+
+    ``h_full`` is the dense per-weight Fisher diagonal (matches the primary
+    ``predicted_dloss`` math); ``h_em`` the packed per-(expert, out-channel)
+    row-sum, already row-aligned with ``weight`` (callers pass ``h_em[s_idx]``
+    under expert sampling) with ``full_expert_count`` supplying the same E/S
+    unbiased-scaling the primary applies.  Output-side metrics are
+    deliberately NOT re-measured for the raw arm: the allocator consumes
+    ``predicted_dloss``/``weight_mse``, and a raw output measurement would
+    need the full-stack forward this sidecar exists to avoid.
+    """
+    if not raw_info or not raw_info.get("ldlq_applied"):
+        return None
+    from .nvfp4_cb_formats import (
+        nvfp4_cb_reconstruct,
+        reconstruct_packed_cb_expert,
+    )
+
+    fields = raw_info["fields"]
+    grid = str(raw_info["grid"])
+    mode = str(raw_info["mode"])
+    k = int(raw_info["k"])
+    out: dict = {}
+    if weight.ndim == 3:
+        experts, rows, cols = map(int, weight.shape)
+        per_expert_mse: list[torch.Tensor] = []
+        dloss_terms: list[torch.Tensor] = []
+        for expert in range(experts):
+            recon = reconstruct_packed_cb_expert(
+                fields, expert, rows, cols, k=k, grid=grid, mode=mode,
+            ).to(weight.dtype)
+            err2 = (weight[expert] - recon).float().pow(2)
+            per_expert_mse.append(err2.mean())
+            if h_em is not None:
+                # Same mean-field estimate as the primary packed dloss:
+                # 0.5 * sum_e,m h_em[e,m] * mean_n(err^2) — summed here
+                # per expert, totalled below in a fixed order.
+                dloss_terms.append((h_em[expert] * err2.mean(dim=-1)).sum())
+            del recon, err2
+        stacked = torch.stack(per_expert_mse)
+        out["weight_mse_raw_render"] = float(stacked.mean().item())
+        if want_per_expert:
+            out["weight_mse_per_expert_raw_render"] = [
+                float(value.item()) for value in per_expert_mse
+            ]
+        if h_em is not None:
+            dloss = 0.5 * torch.stack(dloss_terms).sum()
+            if full_expert_count is not None and full_expert_count != experts:
+                # Unbiased estimate of the full-stack sum from the
+                # stratified sample (identical scaling to the primary).
+                dloss = dloss * (float(full_expert_count) / float(experts))
+            out["predicted_dloss_raw_render"] = float(dloss.item())
+        return out
+    recon = nvfp4_cb_reconstruct(
+        fields, k, grid=grid, mode=mode
+    ).to(weight.dtype)
+    err2 = (weight - recon).float().pow(2)
+    out["weight_mse_raw_render"] = float(err2.mean().item())
+    if h_full is not None:
+        out["predicted_dloss_raw_render"] = float(
+            0.5 * (h_full * err2).sum().item()
+        )
+    return out
+
+
 def cost_payload_provenance(specs: list[fr.FormatSpec]) -> dict:
     """Identity fields shared by monolithic and incremental cost writers."""
     has_cb = any(spec.family in _CB_COST_FAMILIES for spec in specs)
@@ -145,37 +242,18 @@ def cost_payload_provenance(specs: list[fr.FormatSpec]) -> dict:
         provenance["cb_ldlq_cold_expert_prior"] = (
             "layer_routed_activation_pool.v1"
         )
-    if context is not None and context.minchain:
-        families: dict[str, list[int]] = {}
-        for spec in specs:
-            parsed = parse_format_name(spec.name)
-            if parsed is None:
-                continue
-            family, rung = parsed
-            families.setdefault(family.prefix, []).append(int(rung))
-        interpolation: dict[str, dict[str, object]] = {}
-        for family, rungs in sorted(families.items()):
-            if len(set(rungs)) < 6:
-                continue
-            config = MinChainInterpolationConfig.from_rungs(rungs)
-            interpolation[family] = {
-                "anchors": list(config.anchors),
-                "holdbacks": list(config.holdbacks),
-                "audit_seed": config.audit_seed,
-                "gross_outlier_backstop": config.backstop_tolerance,
-                "audit_median_gate": config.audit_median_tolerance,
-                "audit_p95_gate": config.audit_p95_tolerance,
-            }
-        provenance["cb_minchain"] = {
-            "chain_version": MINCHAIN_CONTEXT_VERSION,
-            "selection_metric": "per-slice_weight_mse",
-            "epsilon": "a <= b + 1e-12*max(abs(a),abs(b))",
-            "tie_priority": ["free", "embed"],
-            "interpolation_semantic": (
-                "v2_five_anchor_monotone_pchip_accept_all_with_"
-                "gross_outlier_backstop_and_layer_audit"
+        provenance["cb_ldlq_raw_render_sidecar"] = {
+            "schema": LDLQ_RAW_SIDECAR_SCHEMA,
+            "fields": list(LDLQ_RAW_SIDECAR_KEYS),
+            "note": (
+                "LDLQ-gated CB rows also carry *_raw_render sidecar metrics "
+                "measured on the pre-gate raw assignment — the identical-env "
+                "no-LDLQ render (same encode, codebook, scale sweep/coding, "
+                "col_weights) captured before LDLQ reassignment — so a "
+                "no-LDLQ allocation can be derived from this one cost run "
+                "via tools/extract_raw_cost_table.py. Output-side metrics "
+                "are not re-measured for the raw arm."
             ),
-            "families": interpolation,
         }
     raw_anchors = os.environ.get("PRISMAQUANT_CB_LADDER_ANCHORS", "").strip()
     raw_holdout = os.environ.get("PRISMAQUANT_CB_LADDER_HOLDOUT", "").strip()
@@ -280,26 +358,6 @@ def cb_render_provenance_for_results(
         require_complete=True,
         where=where,
     )
-    if context.minchain:
-        minchain_cells: dict[str, dict[str, list[dict[str, object]]]] = {}
-        missing_cells: list[str] = []
-        for qname, formats in scope.items():
-            for fmt in formats:
-                raw = results[qname][fmt].get(
-                    "cb_minchain_identity_per_expert"
-                )
-                if not isinstance(raw, list) or not raw:
-                    missing_cells.append(f"{qname}/{fmt}")
-                    continue
-                minchain_cells.setdefault(qname, {})[fmt] = [
-                    dict(cell) for cell in raw
-                ]
-        if missing_cells:
-            raise ValueError(
-                f"{where}: min-chain render is missing per-cell arm/digest "
-                f"identity; sample={missing_cells[:8]}"
-            )
-        identity["cb_minchain_cells"] = minchain_cells
     base["cb_serialized_payload"] = dict(
         identity["cb_serialized_payload"]
     )
@@ -440,7 +498,12 @@ def _extrapolate_expert_costs(
                 continue
             out: dict[str, object] = {"expert_cost_extrapolated": True}
             for key in ("weight_mse", "output_mse", "rel_output_mse",
-                        "predicted_dloss", "fisher_output_mse"):
+                        "predicted_dloss", "fisher_output_mse",
+                        # Raw (no-LDLQ) sidecar scalars extrapolate exactly
+                        # like the primaries they mirror, so a sampled
+                        # expert group stays extractable as a raw table.
+                        "weight_mse_raw_render",
+                        "predicted_dloss_raw_render"):
                 vals = [float(e[key]) for e in entries if key in e]
                 if vals:
                     out[key] = sum(vals) / len(vals)
@@ -477,8 +540,7 @@ def _accumulate_result(bucket: dict, name: str, fmt: str,
                        cost_source: str | None = None,
                        weight_mse_per_expert: list[float] | None = None,
                        cost_source_per_expert: list[str] | None = None,
-                       minchain_identity_per_expert: list[dict] | None = None,
-                       minchain_interpolation: dict | None = None):
+                       raw_render: dict | None = None):
     per_name = bucket.setdefault(name, {})
     acc = per_name.setdefault(fmt, {
         "_count": 0,
@@ -494,8 +556,11 @@ def _accumulate_result(bucket: dict, name: str, fmt: str,
         "_cost_source": None,
         "_weight_mse_per_expert": None,
         "_cost_source_per_expert": None,
-        "_minchain_identity_per_expert": None,
-        "_minchain_interpolation": None,
+        "_weight_mse_raw_render_sum": 0.0,
+        "_weight_mse_raw_render_count": 0,
+        "_predicted_dloss_raw_render_sum": 0.0,
+        "_predicted_dloss_raw_render_count": 0,
+        "_weight_mse_per_expert_raw_render": None,
     })
     acc["_count"] += 1
     if cost_source is not None:
@@ -527,22 +592,26 @@ def _accumulate_result(bucket: dict, name: str, fmt: str,
                 f"{name}/{fmt}: conflicting per-expert cost provenance"
             )
         acc["_cost_source_per_expert"] = values
-    if minchain_identity_per_expert is not None:
-        values = [dict(value) for value in minchain_identity_per_expert]
-        previous = acc.get("_minchain_identity_per_expert")
-        if previous is not None and previous != values:
-            raise ValueError(
-                f"{name}/{fmt}: conflicting per-expert min-chain identity"
-            )
-        acc["_minchain_identity_per_expert"] = values
-    if minchain_interpolation is not None:
-        value = dict(minchain_interpolation)
-        previous = acc.get("_minchain_interpolation")
-        if previous is not None and previous != value:
-            raise ValueError(
-                f"{name}/{fmt}: conflicting min-chain interpolation metadata"
-            )
-        acc["_minchain_interpolation"] = value
+    if raw_render:
+        # Raw (no-LDLQ) sidecar: same sum/count accumulation as the primary
+        # metrics it mirrors. Absent entirely when LDLQ is off (no-op).
+        acc["_weight_mse_raw_render_sum"] += float(
+            raw_render["weight_mse_raw_render"])
+        acc["_weight_mse_raw_render_count"] += 1
+        if raw_render.get("predicted_dloss_raw_render") is not None:
+            acc["_predicted_dloss_raw_render_sum"] += float(
+                raw_render["predicted_dloss_raw_render"])
+            acc["_predicted_dloss_raw_render_count"] += 1
+        raw_vector = raw_render.get("weight_mse_per_expert_raw_render")
+        if raw_vector is not None:
+            values = [float(value) for value in raw_vector]
+            previous = acc.get("_weight_mse_per_expert_raw_render")
+            if previous is not None and previous != values:
+                raise ValueError(
+                    f"{name}/{fmt}: conflicting per-expert raw-render "
+                    "MSE vectors"
+                )
+            acc["_weight_mse_per_expert_raw_render"] = values
     acc["_weight_mse_sum"] += weight_mse
     acc["_output_mse_sum"] += output_mse
     acc["_rel_output_mse_sum"] += rel_output_mse
@@ -577,10 +646,13 @@ def _finalize_results(bucket: dict[str, dict]) -> dict[str, dict]:
                 "_weight_mse_per_expert", None)
             cost_source_per_expert = acc.pop(
                 "_cost_source_per_expert", None)
-            minchain_identity_per_expert = acc.pop(
-                "_minchain_identity_per_expert", None)
-            minchain_interpolation = acc.pop(
-                "_minchain_interpolation", None)
+            raw_wmse_n = int(acc.pop("_weight_mse_raw_render_count", 0) or 0)
+            raw_wmse_sum = acc.pop("_weight_mse_raw_render_sum", 0.0)
+            raw_dloss_n = int(
+                acc.pop("_predicted_dloss_raw_render_count", 0) or 0)
+            raw_dloss_sum = acc.pop("_predicted_dloss_raw_render_sum", 0.0)
+            raw_per_expert = acc.pop(
+                "_weight_mse_per_expert_raw_render", None)
             entry = {
                 "weight_mse": acc.pop("_weight_mse_sum") / n,
                 "output_mse": acc.pop("_output_mse_sum") / n,
@@ -594,12 +666,6 @@ def _finalize_results(bucket: dict[str, dict]) -> dict[str, dict]:
                 entry["weight_mse_per_expert"] = weight_mse_per_expert
             if cost_source_per_expert is not None:
                 entry["cost_source_per_expert"] = cost_source_per_expert
-            if minchain_identity_per_expert is not None:
-                entry["cb_minchain_identity_per_expert"] = (
-                    minchain_identity_per_expert
-                )
-            if minchain_interpolation is not None:
-                entry["cb_minchain_interpolation"] = minchain_interpolation
             if n_act_rows is not None:
                 # How many activation rows the output-side numbers rest on.
                 # The allocator/provenance needs this to tell a well-covered
@@ -615,6 +681,17 @@ def _finalize_results(bucket: dict[str, dict]) -> dict[str, dict]:
                 # local output MSE with rows weighted by end-loss
                 # gradient² from the probe's h-detail.
                 entry["fisher_output_mse"] = fisher_sum / fisher_n
+            if raw_wmse_n > 0:
+                # Raw (no-LDLQ) sidecar from the same gated render pass;
+                # see LDLQ_RAW_SIDECAR_SCHEMA in the payload provenance.
+                # Absent when LDLQ is off, keeping those pickles unchanged.
+                entry["weight_mse_raw_render"] = raw_wmse_sum / raw_wmse_n
+            if raw_dloss_n > 0:
+                entry["predicted_dloss_raw_render"] = (
+                    raw_dloss_sum / raw_dloss_n
+                )
+            if raw_per_expert is not None:
+                entry["weight_mse_per_expert_raw_render"] = raw_per_expert
             out[name][fmt] = entry
     return out
 
@@ -1077,6 +1154,7 @@ def measure_unbatched(model: nn.Module, act_cache: "ActivationIndex",
 
         for spec in specs:
             try:
+                raw_out: dict = {}
                 if (spec.family == "gguf" and gguf_qw is not None
                         and _gguf_imatrix_enabled()):
                     from prismaquant.gguf_formats import (
@@ -1098,6 +1176,7 @@ def measure_unbatched(model: nn.Module, act_cache: "ActivationIndex",
                         qname=canonical_name,
                         warm_identities=cb_warm_identities,
                         activation_rows=X_cpu,
+                        raw_render_out=raw_out,
                     )
                 else:
                     W_hat = spec.quantize_dequantize(W.clone())
@@ -1124,6 +1203,9 @@ def measure_unbatched(model: nn.Module, act_cache: "ActivationIndex",
                     output_mse / max(ref_energy, 1e-12),
                     predicted_dloss=predicted_dloss,
                     fisher_output_mse=fisher_output_mse,
+                    raw_render=_cb_raw_sidecar_metrics(
+                        W, raw_out, h_full=h_full,
+                    ),
                 )
             except Exception as e:
                 accum.setdefault(canonical_name, {})[spec.name] = {"error": str(e)}
@@ -1492,19 +1574,13 @@ def _measure_packed_experts(
     ladder_plan = _cb_ladder_plan(specs)
     ladder_accept = 0
     ladder_reject = 0
-    _has_cb_specs = any(spec.family in _CB_COST_FAMILIES for spec in specs)
-    _packed_cb_context = (
-        cb_serialization_context_from_env(
+    ldlq_enabled = (
+        any(spec.family in _CB_COST_FAMILIES for spec in specs)
+        and cb_serialization_context_from_env(
             require_explicit=True,
             where="packed-expert CB local cost render",
-        ) if _has_cb_specs else None
+        ).ldlq
     )
-    ldlq_enabled = bool(_packed_cb_context and _packed_cb_context.ldlq)
-    minchain_enabled = bool(_packed_cb_context and _packed_cb_context.minchain)
-    if minchain_enabled:
-        # Amendment v2 owns interpolation in this mode.  The incumbent RD-law
-        # switch must not silently remove chain anchors or its audit rung.
-        ladder_plan = None
     for full_name, packed_param, experts_qname, experts_mod in entries:
         w = packed_param.detach().to(device=dev, dtype=dtype)
         param_name = full_name.rsplit(".", 1)[-1]
@@ -1629,22 +1705,11 @@ def _measure_packed_experts(
         # every expert exactly; this only affects the DP's cost estimates.
         sample_n = _expert_cost_sample_n()
         packed_cb_warm_identities = None
-        packed_minchain_content_guard = None
-        minchain_state: dict[str, dict[str, object]] = {}
         measured_specs = (
             list(specs)
             if ladder_plan is None
             else [spec for spec in specs if spec.name not in ladder_plan[1]]
         )
-        if minchain_enabled:
-            def _minchain_spec_order(item: fr.FormatSpec):
-                parsed = parse_format_name(item.name)
-                if parsed is None:
-                    return (1, item.name, 0)
-                family, rung = parsed
-                return (0, family.prefix, int(rung))
-
-            measured_specs.sort(key=_minchain_spec_order)
         pending_ladders = list(ladder_plan[0]) if ladder_plan else []
         specs_by_name = {spec.name: spec for spec in specs}
         for spec in measured_specs:
@@ -1672,6 +1737,7 @@ def _measure_packed_experts(
                         if (use_sample and cw_use.ndim >= 3
                                 and cw_use.shape[0] == w.shape[0]):
                             cw_use = cw_use[s_idx]
+                raw_out: dict = {}
                 if spec.family in _CB_COST_FAMILIES:
                     if packed_cb_warm_identities is None:
                         packed_cb_warm_identities = (
@@ -1688,63 +1754,9 @@ def _measure_packed_experts(
                             if use_sample and packed_ldlq_activation_rows is not None
                             else packed_ldlq_activation_rows
                         ),
+                        raw_render_out=raw_out,
                     )
-                    minchain_result = None
-                    if minchain_enabled:
-                        if use_sample:
-                            raise RuntimeError(
-                                f"{full_name}: min-chain requires full expert "
-                                "coverage; disable PRISMAQUANT_EXPERT_COST_SAMPLE"
-                            )
-                        parsed = parse_format_name(spec.name)
-                        if parsed is None:
-                            raise AssertionError(
-                                f"{spec.name}: CB family has no rung identity"
-                            )
-                        family, rung = parsed
-                        if packed_minchain_content_guard is None:
-                            from .cb_warm_state import tensor_value_identity
-
-                            packed_minchain_content_guard = {
-                                "source_shape": list(w_in.shape),
-                                "source_digest": tensor_value_identity(w_in)[1],
-                                "col_weights_shape": list(cw_use.shape),
-                                "col_weights_digest": tensor_value_identity(
-                                    cw_use
-                                )[1],
-                                "serialization_context": (
-                                    cb_serialization_context_stamp(_packed_cb_context)
-                                ),
-                            }
-                        predecessor = minchain_state.get(family.prefix)
-                        minchain_result = select_reconstruction_slices(
-                            weight=w_in,
-                            free_reconstruction=w_hat,
-                            qname=full_name,
-                            rung=int(rung),
-                            format_name=spec.name,
-                            content_guard=packed_minchain_content_guard,
-                            predecessor_reconstruction=(
-                                predecessor["reconstruction"]
-                                if predecessor is not None else None
-                            ),
-                            predecessor_errors=(
-                                predecessor["errors"]
-                                if predecessor is not None else None
-                            ),
-                            predecessor_identities=(
-                                predecessor["identities"]
-                                if predecessor is not None else None
-                            ),
-                        )
-                        w_hat = minchain_result["reconstruction"]
-                        minchain_state[family.prefix] = {
-                            "reconstruction": w_hat,
-                            "errors": minchain_result["selected_errors"],
-                            "identities": minchain_result["identities"],
-                        }
                 else:
-                    minchain_result = None
                     w_hat = _batched_quantize(
                         spec, w_in,
                         col_weights=(
@@ -1754,12 +1766,8 @@ def _measure_packed_experts(
                     )
                 err = (w_in - w_hat).float()
                 per_expert_weight_mse = (
-                    list(minchain_result["selected_errors"])
-                    if minchain_result is not None
-                    else (
-                        err.pow(2).mean(dim=(1, 2)).detach().cpu().tolist()
-                        if not use_sample else None
-                    )
+                    err.pow(2).mean(dim=(1, 2)).detach().cpu().tolist()
+                    if not use_sample else None
                 )
                 weight_mse = float(err.pow(2).mean().item())
                 dloss_val = None
@@ -1839,14 +1847,23 @@ def _measure_packed_experts(
                                        if per_expert_weight_mse is not None
                                        else None
                                    ),
-                                   minchain_identity_per_expert=(
-                                       minchain_result["identities"]
-                                       if minchain_result is not None else None
+                                   raw_render=_cb_raw_sidecar_metrics(
+                                       w_in,
+                                       raw_out,
+                                       h_em=(
+                                           h_em[s_idx]
+                                           if (use_sample
+                                               and h_em is not None)
+                                           else h_em
+                                       ),
+                                       full_expert_count=(
+                                           int(w.shape[0])
+                                           if use_sample else None
+                                       ),
+                                       want_per_expert=not use_sample,
                                    ))
                 del w_hat, err
             except Exception as e:
-                if minchain_enabled and spec.family in _CB_COST_FAMILIES:
-                    raise
                 accum.setdefault(full_name, {})[spec.name] = {"error": str(e)}
 
             # Packed stacks contain heterogeneous expert RD curves.  Gate one
@@ -1978,8 +1995,6 @@ def _measure_packed_experts(
             del h_em
         if dev.type == "cuda":
             torch.cuda.empty_cache()
-    if minchain_enabled:
-        _apply_minchain_interpolation_v2(accum, specs)
     if measured or fallback:
         print(f"[cost] packed experts output_mse measured={measured} "
               f"fallback={fallback}", flush=True)
@@ -1989,151 +2004,6 @@ def _measure_packed_experts(
               f"{ladder_accept}/{total} expert-slice fits accepted "
               f"({ladder_accept / max(total, 1):.0%}), {ladder_reject} "
               f"rejected -> measured", flush=True)
-
-
-def _minchain_layer_number(qname: str) -> int:
-    match = re.search(r"(?:^|\.)layers\.(\d+)(?:\.|$)", str(qname))
-    if match is None:
-        # Non-layer synthetic/profile targets still need a deterministic audit
-        # draw.  Keep them isolated so one unrelated qname cannot trip another.
-        return int.from_bytes(
-            str(qname).encode("utf-8")[:8].ljust(8, b"\0"), "little"
-        )
-    return int(match.group(1))
-
-
-def _apply_minchain_interpolation_v2(
-    accum: dict,
-    specs: list[fr.FormatSpec],
-) -> None:
-    """Apply amendment-v2 decisions after exact chain measurements.
-
-    The production integration deliberately adjudicates after all free/embed
-    cells have durable identities.  Accepted cells publish PCHIP costs;
-    backstop cells retain their exact measured values, and one failed
-    projection audit leaves every projection in that layer fully measured.
-    Keeping the exact rows resident also lets export validate a selected
-    interpolated rung against a materialized arm/digest identity.
-    """
-    families: dict[str, dict[int, str]] = {}
-    for spec in specs:
-        parsed = parse_format_name(spec.name)
-        if parsed is None or spec.family not in _CB_COST_FAMILIES:
-            continue
-        family, rung = parsed
-        families.setdefault(family.prefix, {})[int(rung)] = spec.name
-
-    decisions: list[dict[str, object]] = []
-    for qname, per_format in accum.items():
-        layer = _minchain_layer_number(qname)
-        for family, names_by_rung in families.items():
-            if len(names_by_rung) < 6:
-                continue
-            config = MinChainInterpolationConfig.from_rungs(
-                tuple(names_by_rung)
-            )
-            audit_rung = config.audit_rung(layer, tuple(names_by_rung))
-            required = (*config.anchors, audit_rung)
-            if any(
-                names_by_rung[rung] not in per_format
-                or per_format[names_by_rung[rung]].get(
-                    "_weight_mse_per_expert"
-                ) is None
-                for rung in required
-            ):
-                raise RuntimeError(
-                    f"{qname}/{family}: min-chain interpolation lacks its "
-                    "five anchors or deterministic audit rung"
-                )
-            anchors = {
-                rung: per_format[names_by_rung[rung]][
-                    "_weight_mse_per_expert"
-                ]
-                for rung in config.anchors
-            }
-            targets = tuple(
-                rung for rung in sorted(names_by_rung)
-                if rung not in config.anchors and rung != audit_rung
-            )
-            result = interpolation_acceptance_v2(
-                anchors,
-                config=config,
-                target_rungs=targets,
-                audit_rung=audit_rung,
-                audit_errors=per_format[names_by_rung[audit_rung]][
-                    "_weight_mse_per_expert"
-                ],
-            )
-            decisions.append({
-                "qname": qname,
-                "layer": layer,
-                "family": family,
-                "names_by_rung": names_by_rung,
-                "config": config,
-                "audit_rung": audit_rung,
-                "targets": targets,
-                "result": result,
-            })
-
-    layer_pass = {
-        layer: all(
-            not bool(decision["result"]["full_measure_layer"])
-            for decision in decisions
-            if decision["layer"] == layer
-        )
-        for layer in {decision["layer"] for decision in decisions}
-    }
-    for decision in decisions:
-        qname = decision["qname"]
-        layer = decision["layer"]
-        family = decision["family"]
-        names_by_rung = decision["names_by_rung"]
-        audit_rung = decision["audit_rung"]
-        result = decision["result"]
-        audit = result["audit"]
-        if not layer_pass[layer]:
-            print(
-                f"[cost] layer {layer} min-chain audit FAIL; retaining full "
-                f"measured {family} ladder",
-                flush=True,
-            )
-            continue
-        failed = set(result["backstop_failed"])
-        for rung in decision["targets"]:
-            fmt = names_by_rung[rung]
-            acc = accum[qname][fmt]
-            measured_values = list(acc["_weight_mse_per_expert"])
-            predicted_values = result["predictions"][rung]
-            final_values = [
-                float(measured if expert in failed else predicted)
-                for expert, (measured, predicted) in enumerate(zip(
-                    measured_values, predicted_values
-                ))
-            ]
-            sources = [
-                (
-                    MEASURED_SLICE_COST_SOURCE
-                    if expert in failed else BAND_INTERPOLATED_COST_SOURCE
-                )
-                for expert in range(len(final_values))
-            ]
-            acc["_weight_mse_per_expert"] = final_values
-            acc["_weight_mse_sum"] = (
-                sum(final_values) / max(len(final_values), 1)
-            ) * int(acc["_count"])
-            acc["_cost_source_per_expert"] = sources
-            acc["_cost_source"] = (
-                MIXED_COST_SOURCE if failed else BAND_INTERPOLATED_COST_SOURCE
-            )
-            acc["_output_mse_measured"] = False
-            acc["_minchain_interpolation"] = {
-                "semantic": "v2_accept_all_plus_per_layer_audit",
-                "audit_rung": int(audit_rung),
-                "audit_median": float(audit["median"]),
-                "audit_p95": float(audit["p95"]),
-                "layer_audit_pass": True,
-                "backstop_failed": sorted(failed),
-            }
 
 
 def _batched_codebook_rtn(stacked_w: torch.Tensor, codebook: torch.Tensor,
@@ -2299,20 +2169,35 @@ def _emit_weight_only_rows(accum: dict, entries, specs, device, dtype) -> list[s
                 cb_warm_identities = cb_warm_identities or [
                     _cb_warm_record_identities(W, item_cw.reshape(-1))
                 ]
+            # Declared never-routed experts have NO calibration activations
+            # by construction, so under an LDLQ context the holdout gate
+            # would fail-close them to the raw render at export
+            # (raw_uncertifiable_too_few_rows). Opting into the raw render
+            # here is therefore the IDENTITY-CORRECT cost row for these
+            # cells, not a shortcut — and the guard against silently-raw
+            # tables stays armed for every measured row.
+            raw_outs: list = []
             W_hat = _batched_quantize(
                 spec, W.unsqueeze(0),
                 col_weights=item_cw,
                 qnames=[name],
                 warm_identities=cb_warm_identities,
+                raw_render_out=raw_outs,
+                ldlq_missing_activation_ok=True,
             )[0]
             wmse = float((W - W_hat).float().pow(2).mean().item())
+            raw_out = raw_outs[0] if raw_outs else None
             # _finalize_results always writes output_mse, so the row carries
             # output_mse=0.0 — the honest marker is output_mse_measured=False,
             # which _has_measured_output_mse short-circuits on before ever
             # reading the value. predicted_dloss stays absent so the allocator
             # derives it from the probe's own (exactly zero) sensitivity.
+            # The raw sidecar equals the primary trivially (fail-closed to
+            # raw); recorded so the raw-table extractor's completeness
+            # check accepts these rows.
             _accumulate_result(accum, name, spec.name, wmse, 0.0, 0.0,
-                               output_mse_measured=False)
+                               output_mse_measured=False,
+                               raw_render=_cb_raw_sidecar_metrics(W, raw_out))
         emitted.append(name)
     return emitted
 
@@ -2351,7 +2236,11 @@ def _batched_quantize(
         tuple[tuple[list[int], str], tuple[list[int], str]] | None
     ] | None = None,
     activation_rows: list[torch.Tensor | None] | None = None,
+    raw_render_out: list | None = None,
+    ldlq_missing_activation_ok: bool = False,
 ) -> torch.Tensor:
+    """``raw_render_out``: CB-family only — receives one raw-fields capture
+    dict (or None) per slice, in slice order, when LDLQ ran on that slice."""
     elt = spec.weight_element_dtype
     if spec.name in _EXPORT_ALIGNED_BATCH_FORMATS:
         # Formats whose REGISTRY closure is the authoritative codec, not a
@@ -2436,8 +2325,10 @@ def _batched_quantize(
                 f"{spec.name}: got {len(activation_rows)} activation matrices "
                 f"for {n} CB slices"
             )
-        return torch.stack([
-            _cb_cost_quantize_dequantize(
+        rendered = []
+        for i in range(n):
+            raw_out: dict = {}
+            rendered.append(_cb_cost_quantize_dequantize(
                 spec,
                 stacked_w[i].clone(),
                 col_weights=_item_col_weights(col_weights, i, n),
@@ -2449,9 +2340,12 @@ def _batched_quantize(
                 activation_rows=(
                     activation_rows[i] if activation_rows is not None else None
                 ),
-            )
-            for i in range(n)
-        ])
+                raw_render_out=raw_out,
+                ldlq_missing_activation_ok=ldlq_missing_activation_ok,
+            ))
+            if raw_render_out is not None:
+                raw_render_out.append(raw_out if raw_out else None)
+        return torch.stack(rendered)
     if col_weights is not None:
         raise ValueError(
             f"col_weights is only supported for gguf-family and CB codebook "
@@ -2903,6 +2797,7 @@ def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
                             warm_identities.append(
                                 cb_warm_identity_by_name[item_name]
                             )
+                    raw_infos: list = []
                     W_hat = _batched_quantize(
                         spec, Ws,
                         col_weights=(
@@ -2915,6 +2810,10 @@ def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
                                 X_by_rows[rows_used[c]][slot_in_bucket[c]]
                                 for c in sel
                             ]
+                            if spec.family in _CB_COST_FAMILIES else None
+                        ),
+                        raw_render_out=(
+                            raw_infos
                             if spec.family in _CB_COST_FAMILIES else None
                         ),
                     )
@@ -2966,10 +2865,14 @@ def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
                         dloss_values = [None] * n_sub
 
                     # Unpack per-item into results dict after the single sync.
-                    for name, row, dloss_val, cpos in zip(
-                            sub_names, metrics, dloss_values, sel):
+                    for item_i, (name, row, dloss_val, cpos) in enumerate(zip(
+                            sub_names, metrics, dloss_values, sel)):
                         w_mse, out_mse, rel = row[:3]
                         fisher_val = row[3] if len(row) > 3 else None
+                        raw_info = (
+                            raw_infos[item_i]
+                            if item_i < len(raw_infos) else None
+                        )
                         _accumulate_result(
                             accum,
                             name,
@@ -2988,6 +2891,13 @@ def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
                                 else None
                             ),
                             n_activation_rows=rows_used[cpos],
+                            raw_render=_cb_raw_sidecar_metrics(
+                                Ws[item_i],
+                                raw_info,
+                                h_full=(
+                                    hs[item_i] if hs is not None else None
+                                ),
+                            ),
                         )
                     del W_hat, err
                     del weight_mse, output_mse, rel_mse

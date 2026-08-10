@@ -509,7 +509,7 @@ class TestNativeExportOutputSafety(unittest.TestCase):
             self.assertEqual(nested_payload.read_bytes(), b"source-two")
             self.assertEqual(set(outer_output.iterdir()), {nested_model})
 
-    def test_main_transaction_cleans_post_model_budget_failure(self):
+    def test_main_transaction_preserves_post_model_budget_failure(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             model = root / "model"
@@ -549,7 +549,16 @@ class TestNativeExportOutputSafety(unittest.TestCase):
                 (before.st_dev, before.st_ino),
             )
             self.assertEqual(list(output.iterdir()), [])
-            self.assertEqual(list(root.glob(".output.tmp-*")), [])
+            # c740e98: a post-model-write failure preserves exactly one
+            # unpublished transaction root so a multi-hour render can be
+            # resumed with --reuse-prior; it is dot-prefixed and carries no
+            # completeness stamp, so it cannot be mistaken for output.
+            preserved = list(root.glob(".output.tmp-*"))
+            self.assertEqual(len(preserved), 1)
+            self.assertEqual(
+                (preserved[0] / "model.safetensors").read_bytes(),
+                b"over-budget",
+            )
             self.assertEqual(
                 (export_cache / "layer_000.pt").read_bytes(),
                 b"resume",

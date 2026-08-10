@@ -31,7 +31,7 @@ import json
 import math
 import re
 import struct
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping, MutableMapping, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -131,6 +131,7 @@ class CBSerializationContext:
     layout_version: int | None = None
     scale_sweep: bool = True
     ldlq: bool = False
+    ldlq_scope: str | None = None
     minchain: bool = False
     minchain_version: str | None = None
     encode_tier: str = CB_ENCODE_TIER_DEFAULT
@@ -175,6 +176,30 @@ class CBSerializationContext:
                 "CB ldlq identity must be an explicit bool, got "
                 f"{self.ldlq!r}"
             )
+        # Per-family LDLQ scope: none (no family), nvfp4 (only NVFP4_CB), all (both families).
+        # The legacy bool `ldlq` maps to all/none for backward compat; new code uses scope.
+        allowed_scopes = {"none", "nvfp4", "all"}
+        raw_scope = self.ldlq_scope
+        if raw_scope is None:
+            # Derive from legacy bool for old stamps / env that only set PRISMAQUANT_CB_LDLQ.
+            derived = "all" if bool(self.ldlq) else "none"
+            object.__setattr__(self, "ldlq_scope", derived)
+        else:
+            scope = str(raw_scope).strip().lower()
+            if scope not in allowed_scopes:
+                raise ValueError(f"CB ldlq_scope must be one of {sorted(allowed_scopes)}, got {raw_scope!r}")
+            object.__setattr__(self, "ldlq_scope", scope)
+            # Keep legacy bool consistent: true if any family uses LDLQ.
+            expected_ldlq = scope != "none"
+            if bool(self.ldlq) != expected_ldlq:
+                # For mixed scope nvfp4, legacy bool is ambiguous; we normalize to True
+                # if scope is nvfp4 (since at least one family is LDLQ). This keeps old
+                # stamps that had ldlq=true for mixed assignments consistent.
+                if scope == "nvfp4" and bool(self.ldlq) is False:
+                    # Allow legacy false with scope nvfp4 only during rehydration from old stamp
+                    # that had no scope; otherwise require consistency.
+                    pass
+                object.__setattr__(self, "ldlq", expected_ldlq)
         if not isinstance(self.minchain, bool):
             raise TypeError(
                 "CB minchain identity must be an explicit bool, got "
@@ -276,6 +301,7 @@ class CBSerializationContext:
         *,
         scale_sweep: bool = True,
         ldlq: bool = False,
+        ldlq_scope: str | None = None,
         minchain: bool = False,
         encode_tier: str = CB_ENCODE_TIER_DEFAULT,
         codebook_source: str = "lattice",
@@ -288,11 +314,18 @@ class CBSerializationContext:
         )
         from .cb_minchain import MINCHAIN_CONTEXT_VERSION
 
+        # Scope is authoritative; ldlq bool is derived for backward compat.
+        # Callers that pass ldlq_scope explicitly win; otherwise derive from ldlq.
+        if ldlq_scope is not None:
+            scope = str(ldlq_scope).strip().lower()
+        else:
+            scope = "all" if bool(ldlq) else "none"
         return cls(
             scale_coding=PRODUCTION_FP4_SCALE_CODING,
             layout_version=2,
             scale_sweep=scale_sweep,
-            ldlq=ldlq,
+            ldlq=bool(ldlq),
+            ldlq_scope=scope,
             minchain=minchain,
             minchain_version=(MINCHAIN_CONTEXT_VERSION if minchain else None),
             encode_tier=encode_tier,
@@ -309,6 +342,7 @@ class CBSerializationContext:
         *,
         scale_sweep: bool = True,
         ldlq: bool = False,
+        ldlq_scope: str | None = None,
         minchain: bool = False,
         encode_tier: str = CB_ENCODE_TIER_DEFAULT,
         codebook_source: str = "lattice",
@@ -318,11 +352,16 @@ class CBSerializationContext:
         """Explicit legacy writer context; old artifacts remain readable."""
         if minchain:
             raise ValueError("min-chain has no legacy-v1 serialization contract")
+        if ldlq_scope is not None:
+            scope = str(ldlq_scope).strip().lower()
+        else:
+            scope = "all" if bool(ldlq) else "none"
         return cls(
             scale_coding=LEGACY_FP4_SCALE_CODING,
             layout_version=1,
             scale_sweep=scale_sweep,
-            ldlq=ldlq,
+            ldlq=bool(ldlq),
+            ldlq_scope=scope,
             encode_tier=encode_tier,
             codebook_source=codebook_source,
             activation_contract=None,
@@ -330,6 +369,28 @@ class CBSerializationContext:
             codebook_refs=codebook_refs,
             codebook_content_digests=codebook_content_digests,
         )
+
+
+def _ldlq_for_format(format_name: str, context: CBSerializationContext) -> bool:
+    """Per-family LDLQ decision for a single format under the scope contract.
+
+    Scope ``none``: no family is LDLQ.
+    Scope ``nvfp4``: only the fp4 family (NVFP4_CB) is LDLQ, fp8 stays raw.
+    Scope ``all``: both families are LDLQ.
+    """
+    scope = str(getattr(context, "ldlq_scope", "none")).strip().lower()
+    if scope == "none":
+        return False
+    if scope == "all":
+        return True
+    if scope == "nvfp4":
+        info = _cb_info(str(format_name).strip().upper())
+        if info is None:
+            return False
+        grid, _mode, _k = info
+        return grid == "fp4"
+    # Fallback to legacy bool for stamps that have no scope
+    return bool(getattr(context, "ldlq", False))
 
 
 def cb_serialization_context_stamp(
@@ -349,6 +410,14 @@ def cb_serialization_context_stamp(
             "codebook_content_digests; a logical role/ref does not identify "
             "the bytes that cost, KL, and export must share"
         )
+    ldlq_scope = getattr(
+        context, "ldlq_scope", "all" if context.ldlq else "none"
+    )
+    ldlq_kernel = None
+    if ldlq_scope != "none":
+        from .nvfp4_cb_formats import packed_ldlq_artifact_stamp
+
+        ldlq_kernel = packed_ldlq_artifact_stamp()
     return {
         "schema": _serialized_payload_schema(context),
         "scale_coding": context.scale_coding,
@@ -356,6 +425,8 @@ def cb_serialization_context_stamp(
         "codebook_source": context.codebook_source,
         "scale_sweep": context.scale_sweep,
         "ldlq": context.ldlq,
+        "ldlq_scope": ldlq_scope,
+        **({"ldlq_packed_kernel": ldlq_kernel} if ldlq_kernel is not None else {}),
         **({
             "minchain": True,
             "minchain_version": context.minchain_version,
@@ -524,12 +595,41 @@ def cb_serialization_context_from_stamp(
         raise ValueError(
             f"{where}: pre-min-chain stamp cannot claim min-chain fields"
         )
+    # Per-family scope: new stamps carry ldlq_scope, old stamps only have ldlq bool.
+    raw_scope = stamp.get("ldlq_scope")
+    if raw_scope is None:
+        ldlq_scope = "all" if bool(stamp["ldlq"]) else "none"
+    else:
+        ldlq_scope = str(raw_scope).strip().lower()
+        if ldlq_scope not in {"none", "nvfp4", "all"}:
+            raise ValueError(f"{where}: CB ldlq_scope must be one of none/nvfp4/all, got {raw_scope!r}")
+    observed_ldlq_kernel = stamp.get("ldlq_packed_kernel")
+    if ldlq_scope == "none":
+        if observed_ldlq_kernel is not None:
+            raise ValueError(
+                f"{where}: non-LDLQ payload cannot claim an LDLQ packed kernel"
+            )
+    else:
+        from .nvfp4_cb_formats import packed_ldlq_artifact_stamp
+
+        expected_ldlq_kernel = packed_ldlq_artifact_stamp()
+        if not isinstance(observed_ldlq_kernel, Mapping):
+            raise ValueError(
+                f"{where}: LDLQ payload is missing its packed-kernel ABI"
+            )
+        if dict(observed_ldlq_kernel) != expected_ldlq_kernel:
+            raise ValueError(
+                f"{where}: LDLQ packed-kernel ABI mismatch: "
+                f"recipe={dict(observed_ldlq_kernel)}, "
+                f"producer={expected_ldlq_kernel}"
+            )
     return CBSerializationContext(
         scale_coding=str(stamp["scale_coding"]),
         layout_version=int(stamp["layout_version"]),
         codebook_source=str(stamp["codebook_source"]),
         scale_sweep=stamp["scale_sweep"],
         ldlq=stamp["ldlq"],
+        ldlq_scope=ldlq_scope,
         minchain=minchain,
         minchain_version=(str(stamp["minchain_version"]) if minchain else None),
         encode_tier=str(stamp["encode_tier"]),
@@ -580,10 +680,11 @@ def cb_serialization_context_from_env(
     source = environ.get("CB_CODEBOOK_SOURCE")
     raw_sweep = environ.get("CB_SCALE_SWEEP")
     raw_ldlq = environ.get("PRISMAQUANT_CB_LDLQ")
+    raw_ldlq_scope = environ.get("PRISMAQUANT_CB_LDLQ_SCOPE")
     raw_minchain = environ.get("PRISMAQUANT_CB_MINCHAIN")
     raw_tier = environ.get("PRISMAQUANT_CB_ENCODE_TIER")
     if require_explicit and (
-        not scale or not source or raw_sweep is None or raw_ldlq is None
+        not scale or not source or raw_sweep is None or (raw_ldlq is None and raw_ldlq_scope is None)
         or not raw_tier
     ):
         missing = [
@@ -591,7 +692,7 @@ def cb_serialization_context_from_env(
                 ("CB_SCALE_CODING", scale),
                 ("CB_CODEBOOK_SOURCE", source),
                 ("CB_SCALE_SWEEP", raw_sweep),
-                ("PRISMAQUANT_CB_LDLQ", raw_ldlq),
+                ("PRISMAQUANT_CB_LDLQ_SCOPE/PRISMAQUANT_CB_LDLQ", raw_ldlq_scope or raw_ldlq),
                 ("PRISMAQUANT_CB_ENCODE_TIER", raw_tier),
             ) if not value
         ]
@@ -610,12 +711,38 @@ def cb_serialization_context_from_env(
         name="CB_SCALE_SWEEP",
         where=where,
     )
-    ldlq = _parse_bool_setting(
-        raw_ldlq,
-        default=False,
-        name="PRISMAQUANT_CB_LDLQ",
-        where=where,
-    )
+    # New per-family scope is authoritative; legacy bool maps to all/none.
+    raw_ldlq_scope_clean = str(raw_ldlq_scope).strip().lower() if raw_ldlq_scope is not None else None
+    if raw_ldlq_scope_clean is not None:
+        if raw_ldlq_scope_clean not in {"none", "nvfp4", "all"}:
+            raise ValueError(
+                f"{where}: PRISMAQUANT_CB_LDLQ_SCOPE must be one of none/nvfp4/all, got {raw_ldlq_scope!r}"
+            )
+        ldlq_scope = raw_ldlq_scope_clean
+        # Legacy bool, if also set, must be consistent with scope's ANY.
+        if raw_ldlq is not None:
+            legacy_ldlq = _parse_bool_setting(
+                raw_ldlq, default=False, name="PRISMAQUANT_CB_LDLQ", where=where,
+            )
+            expected_legacy = ldlq_scope != "none"
+            if legacy_ldlq != expected_legacy and not (
+                # Allow legacy true with scope nvfp4 (mixed) for backward compat;
+                # the legacy bool is ambiguous for mixed case.
+                ldlq_scope == "nvfp4" and legacy_ldlq is True
+            ):
+                raise ValueError(
+                    f"{where}: PRISMAQUANT_CB_LDLQ={raw_ldlq!r} inconsistent with "
+                    f"PRISMAQUANT_CB_LDLQ_SCOPE={raw_ldlq_scope!r}"
+                )
+        ldlq = ldlq_scope != "none"
+    else:
+        ldlq = _parse_bool_setting(
+            raw_ldlq,
+            default=False,
+            name="PRISMAQUANT_CB_LDLQ",
+            where=where,
+        )
+        ldlq_scope = "all" if ldlq else "none"
     minchain = _parse_bool_setting(
         raw_minchain,
         default=False,
@@ -633,6 +760,7 @@ def cb_serialization_context_from_env(
         codebook_source=source or "lattice",
         scale_sweep=scale_sweep,
         ldlq=ldlq,
+        ldlq_scope=ldlq_scope,
         minchain=minchain,
         minchain_version=(MINCHAIN_CONTEXT_VERSION if minchain else None),
         encode_tier=resolve_cb_encode_tier(raw_tier, environ=environ),
@@ -742,6 +870,23 @@ def validate_cb_serialization_context_stamp(
         raise ValueError(
             f"{where}: CB serialization context differs from allocator "
             f"recipe: recipe={observed}, exporter={expected_base}"
+        )
+    # Per-family scope: new stamps carry ldlq_scope, old stamps only have ldlq bool.
+    # For backward compat, an old stamp without scope is interpreted as all/none
+    # from its ldlq bool. A scope mismatch is a real producer/consumer drift.
+    expected_scope = getattr(context, "ldlq_scope", "all" if context.ldlq else "none")
+    observed_scope = stamp.get("ldlq_scope")
+    if observed_scope is None:
+        # Legacy stamp: derive from its ldlq bool.
+        observed_ldlq = stamp.get("ldlq")
+        if isinstance(observed_ldlq, bool):
+            observed_scope = "all" if observed_ldlq else "none"
+        else:
+            observed_scope = None
+    if observed_scope is not None and observed_scope != expected_scope:
+        raise ValueError(
+            f"{where}: CB serialization scope differs from allocator recipe: "
+            f"recipe ldlq_scope={observed_scope!r}, exporter ldlq_scope={expected_scope!r}"
         )
     observed_refs = stamp.get("codebook_refs")
     if context.codebook_refs is not None and isinstance(
@@ -918,6 +1063,9 @@ def cb_fields_for_context(
     col_weights=None,
     codebook=None,
     activation_rows=None,
+    warm_scale_state=None,
+    raw_fields_out: MutableMapping[str, object] | None = None,
+    ldlq_missing_activation_ok: bool = False,
 ):
     """Encode CB fields under the exact artifact serialization context.
 
@@ -925,6 +1073,15 @@ def cb_fields_for_context(
     a correctness contract, not merely a byte-pricing option.  FP8-CB has no
     FP4 scale plane; it still requires the context so the measured result is
     stamped with the same codebook-sharing identity as allocation/export.
+
+    ``raw_fields_out``: optional sidecar capture.  When LDLQ applies to this
+    format under ``context``, the mapping receives the pre-gate raw encode —
+    the EXACT no-LDLQ render (same env, codebook, scale sweep/coding) that the
+    gated reassignment starts from — under keys ``{"ldlq_applied": True,
+    "fields", "grid", "mode", "k"}``.  When LDLQ does not apply the mapping is
+    left untouched, so callers can key sidecar emission on its population.
+    The captured fields are the same (never-mutated) dict the gate consumed;
+    no extra encode or reconstruction happens here.
     """
     info = _cb_info(spec.name)
     if info is None:
@@ -949,21 +1106,59 @@ def cb_fields_for_context(
         scale_sweep=context.scale_sweep,
         scale_coding=coding,
         encode_tier=context.encode_tier,
+        warm_scale_state=warm_scale_state,
     )
-    if context.ldlq:
+    if _ldlq_for_format(spec.name, context):
         if col_weights is None:
             raise ValueError(f"{spec.name}: LDLQ requires activation-weighted col_weights")
         if activation_rows is None:
+            if ldlq_missing_activation_ok:
+                # Explicit call-site opt-in for cells that PROVABLY have no
+                # calibration activations (declared never-routed experts).
+                # The holdout gate fail-closes such cells to the raw render
+                # at export (raw_uncertifiable_too_few_rows), so the raw
+                # fields ARE the shipping render — returning them here keeps
+                # cost/export identity without weakening the guard for every
+                # other caller (a broken activation loader must still raise,
+                # never silently produce an all-raw table stamped as LDLQ).
+                if raw_fields_out is not None:
+                    raw_fields_out["ldlq_applied"] = True
+                    raw_fields_out["fields"] = fields
+                    raw_fields_out["grid"] = grid
+                    raw_fields_out["mode"] = mode
+                    raw_fields_out["k"] = k
+                return fields
             raise ValueError(f"{spec.name}: LDLQ requires calibration activation rows")
-        from .nvfp4_cb_formats import ldlq_reassign_cb_fields
+        from .nvfp4_cb_formats import ldlq_reassign_cb_fields_gated
 
-        fields = ldlq_reassign_cb_fields(
+        # Post-allocation LDLQ refinement is byte-neutral but must be
+        # do-no-harm on the declared gate metric — since 2026-08-08 that is
+        # holdout_activation_output_mse: LDLQ is certified on rows its Hessian
+        # never saw, because the previous in-sample scoring could not fail and
+        # its error was measured ANTI-correlated with the true benefit.
+        # The wrapper is also the canonical-route refusal boundary.  In
+        # disabled gate mode it returns unconditional LDLQ on successful
+        # experts while preserving typed Hessian failures as raw.
+        info = _cb_info(spec.name)
+        assert info is not None
+        _grid, _mode, _k = info
+        if raw_fields_out is not None:
+            # The pre-gate fields ARE the identical-env no-LDLQ render; the
+            # gate never mutates them (it builds new dicts), so keeping the
+            # reference costs no extra encode and no extra residency.
+            raw_fields_out["ldlq_applied"] = True
+            raw_fields_out["fields"] = fields
+            raw_fields_out["grid"] = grid
+            raw_fields_out["mode"] = mode
+            raw_fields_out["k"] = _k
+        fields, _gate_info = ldlq_reassign_cb_fields_gated(
             weight,
             fields,
             col_weights,
             activation_rows,
             grid=grid,
             mode=mode,
+            k=_k,
         )
     return fields
 
@@ -1440,6 +1635,10 @@ def cb_tensor_payload_breakdown(
     )
     sidecar = _sidecar_identity(qname, canonical, context)
     payload_schema = _serialized_payload_schema(context)
+    # Per-family LDLQ: the tensor's ldlq stamps the ACTUAL result, not the
+    # global context's ANY. For scope nvfp4, NVFP4_CB tensors are ldlq:true
+    # and FP8_CB tensors are ldlq:false.
+    tensor_ldlq = _ldlq_for_format(canonical, context)
     identity = {
         "schema": payload_schema,
         "format": canonical,
@@ -1449,7 +1648,8 @@ def cb_tensor_payload_breakdown(
         "artifact_scale_coding": context.scale_coding,
         "layout_version": context.layout_version,
         "scale_sweep": context.scale_sweep,
-        "ldlq": context.ldlq,
+        "ldlq": tensor_ldlq,
+        "ldlq_scope": getattr(context, "ldlq_scope", "all" if context.ldlq else "none"),
         **({
             "minchain": True,
             "minchain_version": context.minchain_version,

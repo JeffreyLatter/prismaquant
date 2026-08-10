@@ -112,6 +112,22 @@ class DeepseekV4Profile(ModelProfile):
     # scattered across layer_streaming / streaming_model / incremental_probe.
     # ------------------------------------------------------------
 
+    def probe_linear_exclude_extra(self) -> str:
+        # The faithful vendored forward (2026-08-09) instantiates and
+        # loads the compressor + indexer, so their `nn.Linear` leaves
+        # (`self_attn.compressor.{wkv,wgate}`,
+        # `self_attn.indexer.{wkv,wgate,wq_b,weights_proj}` and the
+        # indexer's inner compressor) are now visible to the probe's
+        # enumeration. They stay OUT of the inventory: the gridbook D0.1
+        # serve contract keeps them source-format (weights_proj is read
+        # via `.weight` directly; no CB loader exists for these leaves),
+        # the exporter charges them to the immutable floor, and on this
+        # FP8-source checkpoint BF16 is masked model-wide, so an
+        # inventory row here would carry zero legal candidates and trip
+        # the allocator's coverage refusal. This restores the 33,325
+        # selectable-Linear inventory the byte accounting assumes.
+        return r"self_attn\.(?:compressor|indexer)\."
+
     def checkpoint_to_live_name(self, k: str, *,
                                 multimodal: bool = False) -> str | None:
         """DSv4-Flash checkpoint → transformers live qname.
@@ -172,10 +188,36 @@ class DeepseekV4Profile(ModelProfile):
                 leaf_proj = {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}[leaf_w]
                 return f"model.layers.{layer_idx}.mlp.experts.{exp_idx}.{leaf_proj}{suffix}"
 
-            # Compressor + indexer: drop entirely (modeling patch sets
-            # self.compressor = None for all layers in probe mode).
-            if leaf.startswith("attn.compressor.") or leaf.startswith("attn.indexer."):
-                return None
+            # --- PATCH 02: Compressor + indexer — KEEP (faithful) ---
+            # Prior drop (return None) was tied to modeling:608-625 probe_mode skip.
+            # Faithful forward needs these weights live (model.py:285-440).
+            # Proven mapping per port: local_checkpoint_to_live_name (port:138-148):
+            #   layers.N.attn.compressor.{wkv,wgate,ape,norm.weight}
+            #     → model.layers.N.self_attn.compressor.{wkv,wgate,position_bias,kv_norm.weight}
+            #   layers.N.attn.indexer.{wqb,weights_proj} + inner compressor
+            # This mirrors DESIGN_NOTES §9 weight-map variant.
+            if leaf.startswith("attn.compressor."):
+                # ape in checkpoint is position_bias in live (modeling:428)
+                rest = leaf[len("attn.compressor."):]
+                rest = rest.replace("ape", "position_bias").replace("norm.weight", "kv_norm.weight")
+                return f"model.layers.{layer_idx}.self_attn.compressor." + rest
+            if leaf.startswith("attn.indexer."):
+                # The vendored DeepseekV4Indexer lives on the CSA
+                # compressor (`DeepseekV4CSACompressor.__init__`:
+                # `self.indexer = DeepseekV4Indexer(config)`), NOT on
+                # the attention module — checkpoint indexer keys exist
+                # only for CSA layers. And the checkpoint's
+                # `indexer.compressor.{wkv,wgate,ape,norm.weight}`
+                # tensors live FLAT on the Indexer as
+                # `{wkv,wgate,position_bias,kv_norm.weight}` (the
+                # indexer runs its own scaled-down pooling inline; it
+                # has no inner compressor submodule).
+                sub = leaf[len("attn.indexer."):]
+                if sub.startswith("compressor."):
+                    sub = sub[len("compressor."):]
+                    sub = sub.replace("ape", "position_bias").replace("norm.weight", "kv_norm.weight")
+                return (f"model.layers.{layer_idx}"
+                        f".self_attn.compressor.indexer." + sub)
 
             # `attn.attn_sink` → `self_attn.sinks` (PR #45643's per-head
             # bias buffer attribute name).
@@ -258,10 +300,12 @@ class DeepseekV4Profile(ModelProfile):
             return ["hc_head."]
         return []
 
-    def init_rotaries(self, rotary, cfg, device, dtype) -> bool:
-        """DSv4 uses Gemma3's multi-layer-type rotary pattern: separate
-        `main_inv_freq` and `compress_inv_freq` buffers + matching
-        `<name>_attention_scaling` attributes."""
+    @staticmethod
+    def _init_one_rotary(rotary, cfg, device) -> bool:
+        """Register per-layer-type `<name>_inv_freq` buffers on ONE
+        DeepseekV4RotaryEmbedding instance (Gemma3's multi-layer-type
+        pattern: `main_inv_freq` / `compress_inv_freq` + matching
+        `<name>_attention_scaling`)."""
         import torch as _torch
         layer_types = getattr(rotary, "layer_types", None)
         if not (layer_types and getattr(cfg, "rope_parameters", None) is not None):
@@ -290,6 +334,28 @@ class DeepseekV4Profile(ModelProfile):
                 persistent=False,
             )
             setattr(rotary, f"{layer_type}_attention_scaling", scaling_lt)
+        return True
+
+    def init_rotaries(self, rotary, cfg, device, dtype,
+                      base_model=None) -> bool:
+        """DSv4 multi-layer-type rotary init — for the MODEL-level
+        rotary AND every nested instance. The faithful forward gives
+        each compressor and indexer its own `rotary_emb` (they RoPE
+        pool keys / queries at the compress theta with per-call
+        positions), and a meta-built skeleton leaves their inv_freq
+        buffers on meta: "Cannot copy out of meta tensor" at the first
+        CSA forward (probe attempt 4, 2026-08-09). Walk the skeleton
+        and materialize them all."""
+        handled = self._init_one_rotary(rotary, cfg, device)
+        if not handled:
+            return False
+        if base_model is not None:
+            rotary_cls_name = type(rotary).__name__
+            for _name, mod in base_model.named_modules():
+                if mod is rotary:
+                    continue
+                if type(mod).__name__ == rotary_cls_name:
+                    self._init_one_rotary(mod, cfg, device)
         return True
 
     def expand_hidden_for_layers(self, hidden, base_model):

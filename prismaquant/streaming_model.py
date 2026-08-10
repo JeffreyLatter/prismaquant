@@ -214,7 +214,8 @@ def _init_rotary_inplace(base_model: nn.Module, device: torch.device,
     # init (DSv4 multi-layer-type pattern), exit. Otherwise fall through.
     try:
         from .model_profiles import profile_from_model
-        if profile_from_model(base_model).init_rotaries(rotary, cfg, device, dtype):
+        if profile_from_model(base_model).init_rotaries(
+                rotary, cfg, device, dtype, base_model=base_model):
             return
     except Exception:
         # Defensive: fall through to default if profile dispatch breaks.

@@ -236,6 +236,32 @@ DOCKER_COMMON=(
   #                                   (e.g. `mtp.`); empty/unset changes nothing
   -e PQ_ALLOW_ROUTE_PENDING
   -e PQ_EXPORT_EXCLUDE_NAMESPACES
+  # LDLQ render identity (value-less forwards, same contract as above):
+  # the launch wrapper decides per invocation. A cost/alloc/export chain
+  # must run under ONE consistent setting of these — the allocator's
+  # explicit --cb-ldlq assignment identity and the exporter's stamp
+  # re-validation refuse a mismatch. PRISMAQUANT_CB_ENCODE_COMPILE is
+  # part of the byte identity (compiled != eager, each internally
+  # deterministic — GB10 canaries 2026-08-08); pin it explicitly.
+  -e PRISMAQUANT_CB_LDLQ
+  # Stratified experts-per-(layer,projection) subsample for the cost
+  # stage (value-less forward). The 2026-08-02 header objection
+  # (fabricated rows lacking col-weights) applied to a 36%-coverage
+  # capture; with full 33,325-entry col-weight coverage the sampled
+  # rows price cleanly, and the DP decides whole expert-layer units,
+  # so an unbiased per-layer mean matches decision granularity. The
+  # exact-vs-sampled choice is the launch wrapper's, per invocation.
+  -e PRISMAQUANT_EXPERT_COST_SAMPLE
+  # RD-ladder interpolation plan (anchors+holdout measured, remaining
+  # rungs fitted per tensor, holdout-gated with measured fallback) —
+  # value-less forwards; the launch wrapper opts in per invocation.
+  -e PRISMAQUANT_CB_LADDER_INTERP
+  -e PRISMAQUANT_CB_LADDER_ANCHORS
+  -e PRISMAQUANT_CB_LADDER_HOLDOUT
+  -e PRISMAQUANT_CB_LDLQ_SCOPE
+  -e PRISMAQUANT_CB_LDLQ_GATE
+  -e PRISMAQUANT_CB_MINCHAIN
+  -e PRISMAQUANT_CB_ENCODE_COMPILE
 )
 
 run_probe() {

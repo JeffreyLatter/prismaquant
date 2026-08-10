@@ -14,6 +14,7 @@ from .activation_fair_pricing import (
     BRANCH_ACTIVATION_IDENTITY,
     BRANCH_BIT_EXACT,
     BRANCH_CALIBRATED,
+    BRANCH_INTERPOLATED_OUTPUT,
     BRANCH_MEASURED,
     BRANCH_SOURCE_PASSTHROUGH,
     BRANCH_UNCALIBRATED,
@@ -528,11 +529,15 @@ def _stats_indicates_packed_expert(stats_entry: dict) -> bool:
 
 
 def _has_measured_output_mse(stats_entry: dict, cost_entry: dict) -> bool:
-    """Whether ``output_mse`` is a real joint-output measurement.
+    """Whether ``output_mse`` is a real joint-output MEASUREMENT.
 
     Packed experts historically stored ``output_mse=0.0`` as a placeholder
     because the routed expert forward was not reconstructed offline. That
     placeholder must not outrank the scalar predicted_dloss / weight_mse path.
+
+    This answers the PROVENANCE question — "was this number observed?" — and
+    is deliberately NOT the question pricing asks. See
+    ``_prices_from_output_mse``.
     """
     if "output_mse" not in cost_entry:
         return False
@@ -543,6 +548,87 @@ def _has_measured_output_mse(stats_entry: dict, cost_entry: dict) -> bool:
             and ("predicted_dloss" in cost_entry or "weight_mse" in cost_entry)):
         return False
     return True
+
+
+def _has_interpolated_output_mse(cost_entry: dict) -> bool:
+    """Whether this row carries a USABLE band-interpolated ``output_mse``.
+
+    A band-interpolated row (``cost_source: band_interpolated``/``mixed``) is
+    stamped ``output_mse_measured=False`` and its ``output_mse`` is the
+    tensor's own holdout-gated ladder fit rather than an observation. It is
+    still an output-space number, which is what makes it usable as a price.
+
+    Strict positivity is load-bearing, not a defensive nicety — it is what
+    keeps the two placeholder classes on the weight-only branch, where they
+    belong:
+
+      * the PACKED-expert ladder path (``measure_quant_cost``, the mixed
+        accepted/rejected slice fallback) accumulates
+        ``output_mse=0.0, rel_output_mse=0.0`` alongside
+        ``cost_source=band_interpolated``/``mixed``, because that path fits in
+        WEIGHT space only and never produced an output number at all;
+      * the dense ladder path writes ``float(fills["output_mse"] or 0.0)``, so
+        a row whose output_mse fit could not be made (a non-positive anchor)
+        also lands at exactly 0.0.
+
+    In both cases there is no output-space information in the row, and a 0.0
+    price would be the DP's global optimum — precisely what
+    ``cost_entry_prices_unmeasured_activation_at_zero`` exists to catch. A
+    non-finite value is rejected for the same reason: it is not a price.
+    """
+    if not cost_entry_is_band_interpolated(cost_entry):
+        return False
+    try:
+        value = float(cost_entry.get("output_mse", 0.0))
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(value) and value > 0.0
+
+
+def _prices_from_output_mse(stats_entry: dict, cost_entry: dict) -> bool:
+    """Whether PRICING should read this row's ``output_mse``.
+
+    Deliberately a different question from ``_has_measured_output_mse``, and
+    the two must not be collapsed back together:
+
+      * *"Is this ``output_mse`` an observation?"* decides whether the row may
+        enter the P5a calibration SAMPLE
+        (``collect_activation_calibration_rows``). A band-interpolated row's
+        output_mse is derived from the family's own measured anchors, so
+        admitting it would fit the transfer constant partly on its own output
+        — circular. It stays out.
+      * *"Is this ``output_mse`` the best price available for this row?"*
+        decides which branch prices it. Here the answer for a band-interpolated
+        row is yes: its value is the tensor's OWN holdout-gated interpolation
+        in output space, while the alternative is its weight_mse scaled by a
+        family-wide geometric-mean constant. The row's own output-space number
+        beats a family aggregate — and, decisively, mixing the two bases
+        WITHIN one family reorders that family's rungs, which is the failure
+        ``activation_fair_pricing``'s design explicitly ruled out and which
+        shipped anyway (see that module's 2026-08-07 correction: NVFP4-CB
+        K13/K14/K17 priced 12x high on down_proj and 1.6x low on gate/up_proj,
+        because the family constant 112.5 spans a per-projection ratio range
+        of 9.4-320).
+
+    Nothing about the row's own claims changes: ``cost_source`` and
+    ``output_mse_measured`` keep their values and their meanings, the
+    candidate is stamped ``BRANCH_INTERPOLATED_OUTPUT`` rather than
+    ``BRANCH_MEASURED``, and ``cost_entry_is_band_interpolated`` /
+    ``drop_interpolated_candidates_dominated_by_measured`` keep full strength
+    as the provenance and noise-band guards. Only the number's USE changes.
+
+    Not gated on ``act_quant_changes_input``: the measured branch is not
+    gated either, and gating this one would re-create exactly the same
+    measured/weight-only basis mix inside an identity-activation family (at
+    penalty 1.0, but weight-space vs output-space all the same). No such row
+    exists today — only the two CB-ladder sites stamp ``band_interpolated``,
+    and every format of ``nvfp4_cb`` and ``fp8_cb`` quantizes activations — so
+    this is a statement about the rule, not a live code path.
+    """
+    return (
+        _has_measured_output_mse(stats_entry, cost_entry)
+        or _has_interpolated_output_mse(cost_entry)
+    )
 
 
 def cost_entry_is_bit_exact(
@@ -764,7 +850,15 @@ def cost_entry_uses_measured_output_mse(
     cost_entry: dict,
     format_name: str | None = None,
 ) -> bool:
-    """Whether ``cost_entry_predicted_dloss`` will read ``output_mse``."""
+    """Whether ``cost_entry_predicted_dloss`` will read a MEASURED
+    ``output_mse``.
+
+    Not the same as "will read ``output_mse``": the band-interpolated branch
+    (``_prices_from_output_mse``) reads it too, from a row whose value is a
+    ladder fit rather than an observation. This predicate keeps the narrower,
+    measurement-only meaning its name states — it is what callers asking "does
+    a real output-side observation back this row" want.
+    """
     if cost_entry_is_exact_by_construction(cost_entry, format_name):
         return False
     return _has_measured_output_mse(stats_entry, cost_entry)
@@ -815,6 +909,13 @@ def cost_entry_measured_activation_dloss(
     ``measure_quant_cost`` applies ``activation_quantize_dequantize(X)``
     before measuring ``output_mse``, which is why this branch — and only this
     branch — carries the A side.
+
+    Both output-space provenances go through here — a measured row and a
+    band-interpolated one (whose fit interpolates between activation-inclusive
+    measured anchors, so it carries the A side too) — so gain, Fisher-variant
+    selection and the ½·h_trace algebra stay in one place. WHICH rows qualify
+    is ``_prices_from_output_mse``'s decision, not this function's; the
+    calibration still admits only measured ones.
     """
     if (
         _fisher_output_mse_allocator_enabled()
@@ -888,6 +989,15 @@ def cost_entry_activation_pricing_branch(
         return BRANCH_BIT_EXACT
     if _has_measured_output_mse(stats_entry, cost_entry):
         return BRANCH_MEASURED
+    if _has_interpolated_output_mse(cost_entry):
+        # Same output-space branch as BRANCH_MEASURED, different label: the
+        # price is real information in the right units, but it is a PREDICTION,
+        # and "which of the selected prices were predicted" has to survive into
+        # the artifact. Ordered after the measured test, and after the two
+        # exact-by-construction tests above it, so this label is only ever
+        # claimed by a row that nothing stronger already explained — the same
+        # precedence ``cost_entry_predicted_dloss`` applies.
+        return BRANCH_INTERPOLATED_OUTPUT
     if cost_entry.get(APPLIED_MARKER_KEY) is True:
         # An aggregated super-item entry: the members' penalties are already
         # folded into its predicted_dloss (aggregate_* below).
@@ -951,7 +1061,14 @@ def cost_entry_predicted_dloss(
         # (``cost_entry_is_source_passthrough``). Either way the answer does
         # not depend on a measurement, so it outranks any noisy output_mse.
         return 0.0
-    if _has_measured_output_mse(stats_entry, cost_entry):
+    if _prices_from_output_mse(stats_entry, cost_entry):
+        # The row's own OUTPUT-space number, whether measured or the tensor's
+        # band-interpolated fit (``_prices_from_output_mse`` explains why those
+        # two provenances share one branch while only the first may calibrate).
+        # The per-family penalty is NOT applied here: it exists to move a
+        # WEIGHT-space number onto the output scale, and this number is already
+        # on it. Applying it would double-count, and applying it to only some
+        # rungs of a family is the mispricing this branch was split out to fix.
         return cost_entry_measured_activation_dloss(
             stats_entry, cost_entry, gain=gain)
     base = cost_entry_weight_only_dloss(stats_entry, cost_entry, gain=gain)
@@ -1052,6 +1169,25 @@ def collect_activation_calibration_rows(
     measured price is the lossless-re-encode case the bit-exact
     short-circuit and ``cost_entry_prices_unmeasured_activation_at_zero``
     already own.
+
+    The membership test here is ``_has_measured_output_mse`` and must STAY
+    that, even though pricing now asks the broader ``_prices_from_output_mse``.
+    The two questions genuinely differ: a band-interpolated row's
+    ``output_mse`` is a fit THROUGH this family's own measured anchors, so
+    letting it into the sample would fit the measured-over-weight-only
+    transfer constant partly on its own output — circular, and it would pull
+    the constant toward whatever the interpolator already assumed. It is good
+    enough to price the row it belongs to and not good enough to define the
+    constant other rows are priced by; those are different bars, and this is
+    the one place that has to hold the higher one.
+
+    Consequence worth naming: ``weight_only_rows_by_family`` now counts some
+    rows that pricing sends down the output-space branch, so it slightly
+    OVER-counts the population the family penalty is actually applied to. That
+    count only feeds ``calibrate``'s fail-closed refusal, where over-counting
+    can make the run refuse more eagerly but never less — the safe direction —
+    so it is left alone rather than split into a third census that would have
+    to be kept in sync with the pricing precedence.
 
     Everything is computed at ``gain=1.0`` (the ratio is gain-invariant) and
     the iteration order is the sorted cost table, so the sample — and its
@@ -1177,8 +1313,12 @@ def _super_item_ucb_hedge(member_terms, ucb_z: float) -> tuple[float, float]:
         if cost_entry is None or "error" in cost_entry:
             continue
         # Mirror cost_entry_predicted_dloss: the stderr hedge is only applied
-        # on the explicit predicted_dloss branch.
-        if _has_measured_output_mse(stats_entry, cost_entry):
+        # on the explicit predicted_dloss branch. This must track the PRICING
+        # predicate, not the provenance one — a band-interpolated member priced
+        # from its own output_mse never had a hedge added to its dloss, so
+        # subtracting one here would over-subtract the linear hedge this
+        # conversion exists to undo.
+        if _prices_from_output_mse(stats_entry, cost_entry):
             continue
         if "predicted_dloss" not in cost_entry:
             continue

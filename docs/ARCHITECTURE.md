@@ -1,9 +1,14 @@
 # PrismaQuant Architecture
 
-As of: 2026-08-05 · branch `feat/minchain-production` · verified against implementation
-baseline commit `222b456` plus the current flag-gated monotone min-chain changes, with
-the external Gridbook runtime pinned to
-`9011a19228ddb96b8a49e11a20ac75c99c83998e` (v0.8.0). This branch ports the dated
+As of: 2026-08-09 · branch `integration/dsv4-ldlq-export` · verified against implementation
+baseline commit `cf0420e` plus the DeepSeek DSpark source-overlay contract,
+with the external Gridbook runtime pinned to release commit
+`9f915dd` (v0.8.2). The pin advanced 0.8.1 → 0.8.2 in this release because the
+DSV4-Flash serving images are built from that runtime, not from 0.8.1: declaring
+0.8.1 would have described a runtime the artifact does not serve on. The backed
+fused mid-M rung set is unchanged, and for a stronger reason than reading the
+constant — `gridbook/codec.py` is byte-unchanged across the whole v0.8.1..v0.8.2
+range, so `FP8_FUSED_KBITS` cannot have moved (§ serving lanes). This branch ports the dated
 2026-08-01 DeepSeek-V4-Flash-0731 92 GB study record (§9.2) forward from its 0.5.1
 working tree; the study's Gridbook-candidate claims were **not** carried over, because
 the candidate they described has since been reviewed, cut, and pinned as Gridbook 0.6.0.
@@ -15,7 +20,7 @@ and required CI checks the independent producer and consumer at one immutable co
 release advances that boundary to Gridbook 0.6.0 and lands the producer half of the cross-repo
 performance ultraplan (P5a–P5d, K0.2): candidates are priced and described differently and gain
 a second hard constraint axis, while the producer ABI, format menu, export defaults, and
-quality-promotion status are unchanged and DSv4 remains gated. The three behavioural facts a
+quality-promotion status are unchanged. The three behavioural facts a
 returning reader must know are that **`COST_MODE` defaults to `aura`** (§3.3), Gridbook serving
 is native CUDA/CUTLASS-only and fails closed (§9.2), and fused native-NVFP4 remains default-off
 after its teacher-backed quality gate (§9.2).
@@ -350,13 +355,16 @@ echoing a suggested command is **print the open ship record**: the closing block
 close it. Both the numeric ship gate and the gold-lane KL/PPL contracts remain manual; §7
 owns that.
 
-### 3.3 Defaults at HEAD (`8f14400` + the 2026-07-30 re-vet waves)
+### 3.3 Defaults at HEAD (+ the 2026-07-30 re-vet waves)
 
 This table is the single source of truth for pipeline defaults; other sections reference it
 rather than restate it. `tests/test_architecture_doc.py` pins the enumerable half against
 `run-pipeline.sh`, so a default change that skips this table fails the suite. (Line numbers
 were dropped from this block: the re-vet waves shifted them, and a stale `file:line` is worse
-than none — `grep ': "${NAME:='` is exact and never decays.)
+than none — `grep ': "${NAME:='` is exact and never decays. The heading's HEAD hash was dropped
+2026-08-09 by the same argument: it had decayed to `8f14400`, a commit not in this branch's
+history at all. The provenance stamp at the top of this file is the one place a commit id is
+maintained.)
 
 ```
 FORMATS=NVFP4,FP8_DYNAMIC,BF16   TARGET_BITS=4.75
@@ -378,11 +386,30 @@ VALIDATED_SOURCE_PREFETCH=require   VALIDATED_FRONTIER_PICK=kneedle,
                                     or `budget` under a TARGET_DISK_GB card
 VALIDATED_FRONTIER_SKIP_CALIB=$NSAMPLES (held-out disjointness, ON)
 CB_EXPERT_EMPIRICAL=0  CB_SCALE_CODING=two_tier  (D15: shipped values)
+CB_LADDER_INTERP=0  (`1` exports PRISMAQUANT_CB_LADDER_INTERP=1 to the cost
+                     stage and gates the empirical expert stage's flag)
+ACTIVATION_FAIR_PRICING=1  (exported as PRISMAQUANT_ACTIVATION_FAIR_PRICING)
 PRISMAQUANT_CB_LDLQ=0  (opt-in post-fit feedback assignment)
+PRISMAQUANT_CB_LDLQ_SCOPE=<unset>  (legal none|nvfp4|all; AUTHORITATIVE over the
+                     legacy bool above — unset scope derives from it, `all` when
+                     the bool is true and `none` otherwise; an inconsistent pair
+                     refuses. `nvfp4` is the dual-basis production recipe, §6.5.1)
+PRISMAQUANT_CB_LDLQ_GATE=holdout|in_sample|0  (default holdout: do-no-harm certified on rows the LDLQ fit never saw; per-Linear and per-expert fallback to raw; byte-neutral. `in_sample` is the pre-2026-08-08 legacy scoring, reproduction only)
 PRISMAQUANT_CB_MINCHAIN=0  (opt-in monotone packed-expert rung chain)
 AURA_ADDITIVITY_GATE=measure
 PRISMAQUANT_GGUF_IMATRIX=1  DEVICE=cuda  EXPORT_DEVICE=cuda
 ```
+
+**`PRISMAQUANT_CB_LDLQ_SCOPE` is the authoritative LDLQ selector**; the older boolean
+`PRISMAQUANT_CB_LDLQ` survives only as its degenerate spelling. `cb_serialization_context_from_env`
+(`nvfp4_cb_footprint.py:660`, scope read `:683`) validates the scope against
+`{none, nvfp4, all}` (`:717-720`) and, when the scope is set, requires the legacy bool to
+agree with `scope != "none"` (`:726-737`) — with exactly one back-compat exemption, legacy
+`true` paired with `scope=nvfp4`, because the bool cannot express a mixed per-family scope.
+With the scope unset the bool decides and the scope is *derived* from it: `all` when true,
+`none` when false or absent (`:739-745`). Under `require_explicit` at least one of the two
+must be present (`:691-701`) — the CB producer settings are never defaulted silently. Neither
+name has a `run-pipeline.sh` shell default; the CB drivers export them directly.
 
 `EXPORT_CONTAINER` ∈ {`compressed-tensors`, `gguf`, `nvfp4_cb`} selects the lane, and the
 preflight now **refuses a lane the architecture has not declared** (`supported_lanes`,
@@ -564,7 +591,9 @@ Sizing discipline — a 27B cache is ~90 GB — is §10.
 The allocator needs one number per `(Linear, format)`: `predicted_dloss`, the estimated
 end-loss damage of that rendering. Below, the machinery that produces it and spends a bit
 budget against it. Paths are repo-root-relative; the orchestrator is
-`prismaquant/run-pipeline.sh`.
+`prismaquant/run-pipeline.sh`. One lane exception to "one cost run, one cost table": on the CB
+lane under an LDLQ scope the same run also emits a raw (no-LDLQ) render sidecar, so a second
+allocator-consumable cost table falls out of it for free — §6.5.2.
 
 ### 4.1 Stages that always run
 
@@ -1250,6 +1279,45 @@ which is why the recipe filter here stays `mtp.` regardless of the source prefix
 `validate_mtp_assignment_coverage` `:9195-9222` **hard-fails** when the source has tensors under
 `mtp_source_prefix()`, the profile `has_mtp()`, and the recipe has no `mtp.*` entries.
 
+**DeepSeek-V4 DSpark is a source-format metadata overlay, not a second
+quantization pass.** The released Flash checkpoint already carries three complete
+`mtp.{0,1,2}` stages: 2,304 routed-expert projection bases as packed MXFP4
+E2M1 + E8M0 and 25 dense/shared/attention bases as block-FP8 E4M3 + E8M0.
+`dspark_source_metadata.py` derives the released layout from model config and
+validates all 4,705 MTP tensors from safetensors headers before it emits
+anything: exact dtype and shape for all 2,329 weight/scale pairs (including
+group-32 / block-128 scale grids), six 2-D BF16 router/confidence/Markov
+matrices, fourteen BF16 norms, and twenty-seven F32 sink/router/hyper-connection/
+head tensors. Missing or unfamiliar glue is a refusal, as are duplicate or
+out-of-range `dspark_target_layer_ids`. The streaming exporter's ordinary copy
+loop keeps those bytes unchanged; the overlay removes exactly the quantized
+bases from `ignore`, extends the source-layout config groups under their
+physical `mtp.*` names, and leaves the six unscaled 2-D Linears in `ignore`.
+Norms and F32 parameters are loader glue rather than quantization targets, but
+their exact presence, dtype, and shape are still part of the closed layout.
+
+Routing uses vLLM's *construction* namespace, which is intentionally different
+from both the physical checkpoint and registered module names. For a body with
+`L` decoder layers the declaration names seven units at each of
+`model.layers.{L,L+1,L+2}` plus `model.main_proj` (22 total); fused `wq_a/wkv`
+and shared `w1/w3` pairs map to their constructed fused modules, and each routed
+expert stage maps once to its whole `ffn.experts` unit. Only an artifact carrying
+this fully validated declaration gets `config.json:n_mtp_layers = 3`. Existing
+artifacts can receive the identical contract with
+`python -m prismaquant.dspark_source_metadata ARTIFACT --output-artifact
+ARTIFACT-dspark`: it hardlinks the immutable model/container files into a
+hidden sibling staging tree, writes only new `config.json` and
+`quant_config.json` sidecars, recomputes the self-sized artifact inventory,
+validates completeness with no `mtp.` exemption, and publishes the complete
+new directory with one `renameat2(RENAME_NOREPLACE)`. A launcher therefore sees
+either no output path or both new sidecars, never a half-applied pair; the
+source artifact remains unchanged. Provenance schema
+`prismaquant.dspark_source_overlay.v1` records `tensor_bytes_rewritten: 0`;
+tests additionally pin the model container's SHA-256, inode, size, and mtime.
+All non-MTP config groups, ignores, and pre-existing delegated routes must remain
+identical, and a route-pending source format still requires the artifact's prior
+ship acknowledgement.
+
 `_bf16_upgrade_audit` `:1965-2087` (emitted `:8622`) classifies each BF16 Linear as
 passthrough/immutable, runtime-coerced, or a genuine budget choice — a manifest, not a policy;
 serving-unit coercions are reported as such (`serving_group` key), because a whole FusedMoE
@@ -1268,10 +1336,10 @@ silently corrupts.
 
 | Invariant | Enforced at | Failure mode |
 |---|---|---|
-| Fused siblings (q/k/v, gate/up) share **one** format | DP aggregation over the intersection of member candidates; legality-aware union-find `promote_serving_units` `allocator_solver.py:302-327` + `_choose_group_format` `:192-231`; hard assert `promote_fused` `:362-406`; export re-check `:7896-7944` | ≥2 quantized schemes → load crash (merged-column scale-shape assert). Quantized + BF16 → **loads and silently corrupts**: measured 4.3× worse served KL on Qwen3.x DeltaNet `in_proj_ba` (0.106 vs 0.025 at matched bpp) |
+| Native compressed-tensors fused siblings (q/k/v, gate/up) share **one** format; Gridbook role composites may use different storage formats | Native-lane DP aggregation over the intersection of member candidates; legality-aware union-find `promote_serving_units` `allocator_solver.py:302-327` + `_choose_group_format` `:192-231`; hard assert `promote_fused` `:362-406`; export re-check `:7896-7944`. DeepSeek-V4 intentionally declares no global dense `fused_groups`: Gridbook decodes each owned role independently to the common FP8 execution type before concatenation, so a native-only constraint must not couple its CB allocation. | On a native merged method, ≥2 schemes can crash at load and quantized + BF16 can silently corrupt (measured 4.3× worse served KL on Qwen3.x DeltaNet `in_proj_ba`, 0.106 vs 0.025). Applying that rule globally to Gridbook instead destroys legal per-role choices. |
 | Packed MoE experts uniform per FusedMoE on released consumer contracts (mix across layers, never within) | pre-DP `aggregate_packed_serving_groups` (§4.5) + the same union-find pass via `profile.packed_expert_format_group`; native export raise `:7780-7792`; streaming CB legacy mode collapses uniformly | released Gridbook versions cannot consume a mixed bank; the opt-in PROPOSED per-expert v1 producer record above is the explicit exception under consumer reconciliation, not a relaxation of released serving invariants |
 | PROPOSED per-expert sub-stacks partition each w13/w2 family exactly | streaming producer split planner + `artifact_completeness.py`; allocator-side bytes via `footprint.per_expert_format_group_payload_breakdown` | a missing/duplicate expert, undeclared tensor, or subgroup-byte mismatch is refused with layer/family/expert ids before the artifact can be treated as complete |
-| A serving-atomic unit is never left **mixed** by promotion or by export coercion | promotion picks the cheapest legal-for-all format ≥ max rank and writes **every** member unconditionally (`allocator_solver.py:192-299`); export coercion resolves whole unioned components, raising when a quantized format is legal for all and coercing the *whole* unit to BF16 only when none is (`:1452-1756`) | previously reachable via the un-aggregated solve path and, silently, via Pareto seed-JSON promotion (which `compute_achieved` never prices); the fused-coherence gate reported it only at the very END of export, and as a wrong-model-profile problem it is not |
+| A single-method serving unit is never left **mixed** by promotion or by export coercion | promotion picks the cheapest legal-for-all format ≥ max rank and writes **every** member unconditionally (`allocator_solver.py:192-299`); export coercion resolves whole unioned components, raising when a quantized format is legal for all and coercing the *whole* unit to BF16 only when none is (`:1452-1756`). An explicit Gridbook role composite is several role-owned methods under one vLLM module and is not a mixed single-method unit. | previously reachable via the un-aggregated solve path and, silently, via Pareto seed-JSON promotion (which `compute_achieved` never prices); the fused-coherence gate reported it only at the very END of export, and as a wrong-model-profile problem it is not |
 | Incomplete fused groups → BF16 + `ignore` | `allocator.py:1482`; ignore back-fill `:7643-7700` | the fused loader expects all siblings; a missing `v_proj` breaks the merged Linear |
 | Packed `config_groups` use vLLM **canonical** scheme names | `:7980-7994` | no scheme binds to FusedMoE; `w2_input_global_scale` never registers; `load_weights` KeyError |
 | Multi-format menu must not resolve to `DefaultProfile` | `validate_default_profile_format_menu` `allocator.py:961-988`, called `:1550-1554` | silently produces the fused-coherence bug class above |
@@ -1279,6 +1347,185 @@ silently corrupts.
 | Passthrough integrity (BF16/FP8_SOURCE only if the source already is) | `allocator_candidates.py:24-27`, `:112-120`; export judges it against the *same* `_scan_source_dtype_manifest` vocabulary (§6.3) | synthesising BF16 from a dequantised FP8 source burns 8 bpp for nothing |
 | Every format in the assignment must have an emit path | `EXPORTABLE_FORMATS` `:7517`, checked `:1548`; the serving profile's `export_lane.codec_formats_from` bounds the allocator's menu by that same constant (`serving_profiles.py:252-330`) | a format with no `config_groups` scheme used to be silently rewritten to BF16 at 16 bpp, blowing the selected byte budget (#27) |
 | Registry ↔ served metadata agree on bits/group | **not enforced** — `FormatSpec` (`format_registry.py:44-168`) and the export `*_SCHEME` constants (`:7247-7336`) are independent sources of truth with no reconciling test | a divergence mis-prices bpp or mis-declares the served scheme; §12 D17 |
+
+### 6.5 Post-allocation LDLQ refinement (DSv4 A-FAST re-export, 2026-08-07)
+
+The A-FAST burn's cost table was measured **without** LDLQ (`cbl_semantics.ldlq_in_measurement=false`
+on every burn cell) but the per-tensor `cb_serialized_identity` already claimed `ldlq:true`
+for the intended export bytes.  The cost and the bytes therefore disagreed, and the
+`cb_render_identity` that would have made the mismatch fail-closed was absent from the
+research-assembled `cost_merged` path (the Pareto writer then KeyErrored before it could
+even stamp one).
+
+The honest fix is **not** to relabel the raw cost as LDLQ and not to weaken any guard.
+Instead the allocator's assignment (2.53 bpw, `c525f4025eac7061`, `predicted_dloss 619.71`)
+stays on its raw cost, and the exporter applies a **byte-neutral, per-unit gated LDLQ
+reassignment** on top of the already-chosen codebooks/scales:
+
+* `nvfp4_cb_formats.ldlq_reassign_cb_fields_gated`
+  (`PRISMAQUANT_CB_LDLQ_GATE=holdout`, default-on) keeps the raw indices per Linear
+  (2-D) or per expert slice (3-D, mixing only the winning slices) unless LDLQ earns
+  a **held-out certificate**: the decision comes from an LDLQ fitted on a
+  deterministic, content-keyed half of the calibration rows and scored on the half
+  it never saw, requiring strict improvement (ties keep raw). The **shipped**
+  assignment remains the all-rows fit, which sees strictly more data than the arm
+  that earned the certificate. Tensors with fewer than
+  `LDLQ_GATE_MIN_ROWS = 16` rows are *uncertifiable* and keep raw
+  (`nvfp4_cb_formats.py:2261`, enforced in `_ldlq_holdout_split` `:2309` and at the
+  two decision sites `:2988`/`:3073`). The constant is the code's own evidence floor
+  — at least eight fit and eight decision rows after the even split (`:2318-2319`) —
+  and it is explicitly **not** a claim that sixteen rows deliver a population-level
+  guarantee; the later model-level disjoint-corpus A/B remains the authority on
+  whether LDLQ helps at all. This document previously said `= 2`, which was never
+  the code.
+  `ldlq_reassign_cb_fields` without the gate remains the verbatim assignment for
+  cost-measurement parity.
+* **Why held-out, not in-sample (2026-08-08).** The previous gate scored on the
+  same rows that fitted the Hessian, so it could not fail. Measured across four
+  support bands (L17 gate_proj, K12), its error was *anti-correlated* with the true
+  benefit — 20× overstatement at 64 activation rows rising to 48.5× at 1–3 rows —
+  because fewer rows are easier to fit exactly. Pricing from it would have inverted
+  the allocator's ranking, not merely inflated it. Acceptance on held-out rows the
+  gate never saw: degeneration **7/96 → 1/96**, and on full-support `down_proj` the
+  new gate rejected exactly the one regressing expert. Evidence:
+  `dq-runs/dsv4-flash-0731/ldlq-delta/{LDLQ_DIAGNOSIS,GATE_FIX}.md`. Legacy
+  behaviour remains reachable as `PRISMAQUANT_CB_LDLQ_GATE=in_sample` for artifact
+  reproduction only.
+* `gate_info["holdout_ratio_per_expert"]` is the honest per-tensor out-of-sample
+  LDLQ/raw output-MSE ratio, emitted as a by-product of the decision the gate must
+  make anyway — so LDLQ pricing needs no separate measurement campaign. The ratio
+  is constant in `K` (0.4692 / 0.4798 / 0.4770 at K12/K15/K18, certified across
+  parity), but varies by support level and projection.
+* The gate is byte-neutral by construction (fixed codebook, fixed scales, only the
+  `k`-bit indices move), so `cb_tensor_payload_breakdown` and `whole_artifact_budget`
+  are unchanged for the post-allocation refinement path.  Allocator optimality for
+  that path is claimed only for the raw cost basis it actually optimized; LDLQ-cost
+  optimality is not implied and requires the dual-basis reallocation below.
+* Truthful provenance is `prismaquant.cb_ldlq_refinement.v1`
+  (`cb_ldlq_refinement.py:build_refinement_provenance`): `cost_ldlq=false`,
+  `export_ldlq=true`, `gate=holdout_activation_output_mse` (default since 2026-08-08;
+  `activation_output_mse` remains accepted for pre-existing artifacts), `byte_neutral=true`, plus the
+  creation timestamp.  The derived `layer_config.json` carries it under
+  `__prismaquant__.post_allocation_refinement`, and both CB exporters copy it
+  into `quant_config.json/provenance.post_allocation_refinement` after
+  `validate_refinement_provenance` (invalid provenance aborts, it is never
+  silently dropped).  A forged context stamp (claiming the cost was LDLQ) is
+  never written.
+* The **dual-basis** production recipe (scope `nvfp4`, §6.5.1) keeps the raw NVFP4
+  bank as the immutable interpolation basis for FP8_CB, while the allocator-facing
+  NVFP4 cost plane, the allocator itself, and the exporter all use the gated LDLQ
+  NVFP4 plane.  Per-tensor identities therefore stamp `ldlq:true` for NVFP4_CB
+  and `ldlq:false` for FP8_CB, and the global recipe stamps `ldlq_scope:nvfp4`.
+
+`cb_fields_for_context` consults the gate (`_ldlq_gate_enabled`) and the scope
+(`_ldlq_for_format`) so every production render — cost or export — shares the
+same fixed-codebook LDLQ math under the declared scope, but only the dual-basis
+reallocation makes the raw→LDLQ bridge an allocator-plane change rather than a
+post-hoc polish.
+
+#### 6.5.1 Dual-basis cost construction (scope `nvfp4`)
+
+The production recipe keeps **three planes** in memory and on disk, never
+re-labeling one as the other:
+
+1. **NVFP4_CB raw** — immutable interpolation basis only. The burn's raw bank
+   (`cbl_semantics.ldlq_in_measurement=false`) is preserved byte-for-byte for
+   FP8_CB interpolation; it is never overwritten and its `cost_merged.pkl` is
+   never patched in place.
+2. **NVFP4_CB LDLQ** — the measured cost / allocator / export plane.  Each
+   NVFP4 entry is re-measured with the fixed-codebook, fixed-scale LDLQ encoder
+   (`PRISMAQUANT_CB_LDLQ_SCOPE=nvfp4`, `activation_output_mse` gate) and carries
+   its own provenance (`raw_source_digest`, `ldlq_context`, `gate_metric`,
+   `measured_vs_interpolated`, `output_metric`).  Direct measurement is preferred
+   for the allocator-critical rungs (`K12/K15/K18` plus an independent `K16`
+   holdout); if a saving law `saving(K)=mse_ldlq/mse_raw` is used to fill
+   `K13/K14/K17`, it must pass a held-out composition gate
+   `raw_interpolation × saving_interpolation` vs direct LDLQ at `K16` within the
+   stated tolerance, otherwise all seven rungs are direct-measured.  The law is
+   fit per-projection at minimum and tested for per-tensor/per-expert residuals.
+3. **FP8_CB raw** — raw/interpolated plane.  All FP8_CB costs remain
+   `ldlq:false` and are interpolated/projected from the **raw** NVFP4 bank
+   (1), even after (2) replaces the NVFP4 cost plane.  Ordering and provenance
+   are explicit: FP8 interpolation reads the raw bank, not the LDLQ bank, and
+   each FP8 entry records `interpolation_source:raw`.
+
+Gated LDLQ is used identically in cost and export for the NVFP4 plane: if a
+unit falls back to raw, its allocator cost is the gated (raw) result and the
+exporter makes the same deterministic decision from identical activation
+evidence.  Aggregate and per-unit gate decisions are recorded durably
+(`ldlq_gate_telemetry.json` plus per-tensor `gate` fields) and the final report
+is based on observed counts, not a declared flag.  The raw interpolation plane
+is always ungated raw by definition.
+
+Re-allocation from the derived dual-basis table emits a fresh `layer_config`
+with freshly computed, exact per-tensor identities under scope `nvfp4`
+(`ldlq:true` for NVFP4_CB, `ldlq:false` for FP8_CB, global `ldlq_scope:nvfp4`);
+the old identity map is preserved as the raw-cost optimum and a diff (bytes,
+`predicted_dloss`, and assignment histogram) is published.  Allocator optimality
+is claimed only for the cost plane actually measured — the raw plane for the
+old artifact, the dual-basis LDLQ plane for the new one.
+
+#### 6.5.2 The raw (no-LDLQ) render sidecar — one burn, two cost tables
+
+An LDLQ-gated CB cost run already computes the exact no-LDLQ assignment internally, so
+it costs nothing to keep it. Since `96bbf09` it does: the fields `cb_fields_for_context`
+encodes **before** the gated reassignment ARE the identical-env raw render — same encode
+tier, same codebook, same scale sweep and scale coding, same `col_weights` — and that
+pre-gate assignment is captured through a caller-supplied `raw_fields_out` mapping
+(`nvfp4_cb_footprint.py:1067`, populated `:1124-1129`/`:1145-1153`) and priced alongside
+the primary. This is why the sidecar is sound rather than an approximation: it is not a
+re-render, it is the render the gate declined to keep.
+
+* **Row fields.** An LDLQ-covered CB row additionally carries
+  `weight_mse_raw_render`, `predicted_dloss_raw_render` and — exactly where the primary
+  has its per-expert vector — `weight_mse_per_expert_raw_render`
+  (`measure_quant_cost.py:141-143`, emitted `:205-224`). The raw `predicted_dloss` runs
+  the **same** Fisher math as the primary, including the sampled-expert `E/S` scaling, and
+  `_extrapolate_expert_costs` carries the raw scalars so `PRISMAQUANT_EXPERT_COST_SAMPLE`
+  groups stay extractable. Raw metrics **reconstruct**, never re-encode, and packed stacks
+  are priced expert-slice-by-expert-slice through the holdout gate's chunked helper
+  (`reconstruct_packed_cb_expert`) — a second full-stack fp32 residency is 16 GiB on the
+  DSv4 fused `gate_up` 256×4096×4096 stack.
+* **Output-side metrics are NOT re-measured for the raw arm.** The allocator prices
+  `predicted_dloss`/`weight_mse`; a raw `output_mse` would require exactly the full-stack
+  forward the sidecar exists to avoid. The extractor therefore stamps
+  `output_mse=0.0`/`output_mse_measured=false` on every swapped row rather than inventing
+  a number.
+* **Provenance.** `prismaquant.cb_ldlq_raw_render_sidecar.v1`
+  (`measure_quant_cost.py:139`, stamped into the payload at `:245-249`) states the
+  identical-env no-LDLQ derivation.
+* **Strict no-op when LDLQ is off.** `raw_fields_out` stays untouched, no sidecar keys are
+  emitted, and cost pickles are byte-identical to the pre-`96bbf09` schema
+  (`tests/test_cb_ldlq_raw_cost_sidecar.py` asserts the legacy row schema key-for-key).
+  Nothing in the gated table's serialized identity moves either: scoring internals and
+  additive sidecar fields are not part of the byte contract, and
+  `packed_ldlq_artifact_stamp` / `cb_serialization_context_stamp` are untouched.
+* **Ladder-rejected slices record no sidecar** — their rows mix interpolated values — and
+  the extractor refuses them rather than silently averaging two bases.
+* **`tools/extract_raw_cost_table.py`** turns a gated cost pickle into an
+  allocator-consumable raw one: it swaps LDLQ-covered CB rows' metrics for the sidecar
+  values (`cost_source="ldlq_raw_render_sidecar"`), copies rows LDLQ never touched
+  (non-CB rows; the fp8 family under `scope=nvfp4`) verbatim, and re-stamps
+  `cb_serialized_payload`/`cb_render_identity` as `ldlq=false, scope=none` — a model-free
+  rebuild, because the col-weights and source-weights digests are LDLQ-independent. The
+  source stamp is recorded under `derived_from_ldlq_gated_cost` (`:186`), and the result
+  must pass `validate_cb_cost_provenance` under the no-LDLQ context before it is written
+  (`:208-217`). It fail-closes on error rows, on a missing or partial sidecar, and on an
+  already-raw input (`:89`, `:110`).
+* **Why it exists.** It makes the LDLQ-contribution A/B — the isolate that says what LDLQ
+  is actually worth on the serving metric — reachable from ONE cost run instead of a
+  second multi-hour burn.
+* **The never-routed hole is closed explicitly, not silently** (`cf0420e`). Declared
+  never-routed experts (51 on the DSv4 capture) have no calibration activations by
+  construction, so `cb_fields_for_context`'s pre-gate guard refused to render them under an
+  LDLQ context and `_emit_weight_only_rows` crashed. The identity-correct row for those
+  cells IS the raw render — the export-time holdout gate fail-closes them to raw
+  (`raw_uncertifiable_too_few_rows`) — so the weight-only unrouted path passes an explicit
+  `ldlq_missing_activation_ok` opt-in (`nvfp4_cb_footprint.py:1068`, honoured `:1115`;
+  call-site `measure_quant_cost.py:60`), which returns the pre-gate raw fields and populates
+  the sidecar capture with `raw == primary`, keeping the extractor's completeness check
+  satisfied. **The default path still raises**, so a broken activation loader can never
+  silently produce an all-raw table stamped as LDLQ.
 
 ## 7. Validation & ship gates
 
@@ -1680,6 +1927,31 @@ KV-cotangent path now grafts through — §7.5), `register_vendored_modeling()` 
 `vllm_fused_moe_scheme_projection_names` (`:443-468`) is intentionally hardcoded to vLLM's
 canonical names — §6.2.
 
+**Two plugin-contract additions landed on this branch.**
+
+`ModelProfile.probe_linear_exclude_extra()` (`base.py:208`, default `""`) makes the probe's
+Linear-exclusion regex **profile-owned**. `incremental_probe.resolve_linear_exclude()`
+(`:423-437`) ORs the profile's fragment into the router baseline and replaced four literal
+regex sites, so hook installs and the shard-reuse meta stamp (`:830`) can no longer disagree —
+a mismatch there silently invalidates shard reuse. `DeepseekV4Profile` overrides it
+(`deepseek_v4.py:115`) to exclude `self_attn.{compressor,indexer}`. The reason is a contract
+fact, not a preference: the faithful vendored forward (`87ca027`) instantiates and loads the
+compressor and indexer, so their `nn.Linear` leaves became visible to the probe's enumeration,
+but they sit **outside the gridbook D0.1 serving contract's quantizable set** — served
+source-format, charged to the immutable floor — and on this FP8-source checkpoint BF16 is
+masked model-wide. An inventory row for them therefore carries **zero legal candidates** and
+trips the allocator's coverage refusal *after* the cost run has already been paid for. The
+override restores the 33,325-selectable-Linear inventory the DSv4 byte accounting assumes
+(`deepseek_v4.py:6`, `:127`; commit `d62bace`; `tests/test_probe_linear_exclude.py`).
+
+`ModelProfile.init_rotaries` gained an optional `base_model` kwarg (`base.py:1092`, commit
+`9cee20d`) — a profile-plugin **signature** change, so the in-tree overrides moved in step
+(`gemma4.py:60`, `deepseek_v4.py:339`). It exists because the DSv4 faithful forward gives every
+compressor and indexer its **own** `rotary_emb`, and a meta-built skeleton leaves those nested
+`inv_freq` buffers on meta — "Cannot copy out of meta tensor" at the first CSA forward. The
+DSV4 override now walks the skeleton from `base_model` and materializes every nested rotary,
+not just the model-level one; the caller passes it at `streaming_model.py:217`.
+
 `structure.py`'s `build_model_graph` (five parallel name spaces per tensor) is a declared
 contract, not an executor — `base.py:999-1008`, "intentionally not called from hot paths yet";
 production reads the accessors.
@@ -1735,7 +2007,7 @@ artifacts exported before the rename.
 | gemma4 | `gemma4.py` | 140 | ✅ | `vllm_packed_moe` | CT | ⚠ none | none |
 | lfm2_moe (LFM2.5) | `lfm2_moe.py` | 150 | ✅ | `vllm_packed_moe` | CT | ⚠ none | `has_mtp → False` |
 | minimax_m2 | `minimax_m2.py` | 160 | ✅ **added R22** — all 8 overrides declared | `vllm_packed_moe` **(added R22)** | CT | ⚠ none | `has_mtp → False` |
-| deepseek_v4 | `deepseek_v4.py` | 170 | ✅ | `vllm_packed_moe` **(added R22)** | CT | ❌ absent from the pinned Gridbook contract; loader/delegation unimplemented and lane gated | `has_mtp → False` + `mtp.` passthrough (hy_v3 route, R12) |
+| deepseek_v4 | `deepseek_v4.py` | 170 | ✅ | `vllm_packed_moe` **(added R22)** | CT, **nvfp4_cb** (CT) | declared by Gridbook v0.8.2; streaming CB export, source-format passthrough, and top-level loader are wired | `has_mtp → False`; three source-quantized DSpark stages are declared by the header-validated physical→construction overlay (§6.3), with no tensor rewrite |
 | hy_v3 | `hy_v3.py` | 180 | ✅ | `gguf` (overridden, L1) | CT, nvfp4_cb, **gguf** (gguf) | declared by pinned Gridbook contract | `has_mtp → False`; MTP passthrough + out-of-band CB scripts |
 | laguna (poolside S/XS 2.x) | `laguna.py` | 190 | ✅ | `nvfp4_cb` (overridden, L1) | CT, **nvfp4_cb** (nvfp4_cb) | declared by pinned Gridbook contract; drafter still separate | `has_mtp → False` |
 | default | `default.py` | — (terminal) | n/a by design | — | CT (default) | n/a | none |
@@ -1743,7 +2015,7 @@ artifacts exported before the rename.
 `prio` = detection priority, lower first (§8.1); the same number is declared on the Python class
 and in the spec, and a test asserts they agree. **CT** = `compressed-tensors`. The lane column is
 the *declared* set (R6, spec `supported_lanes`/`preferred_lane`), and required CI compares the
-five CB producer profiles with Gridbook's packaged contract; GGUF has one. Over-declaring is the exact
+six CB producer profiles with Gridbook's packaged contract; GGUF has one. Over-declaring is the exact
 failure the field exists to prevent: an undeclared lane does not fail loudly, it serves
 uninitialised expert memory. `require_lane_supported(profile, EXPORT_CONTAINER)`
 (`serving_profiles.py`) runs in `run-pipeline.sh` before profile resolution and export.
@@ -1760,8 +2032,13 @@ before the Python comes out. It closed a latent bug on the way: without a spec,
 `(gate_up_proj, down_proj)`, so MiniMax's `down_proj` got a *different* coupling key than its
 `gate_proj`/`up_proj` — one expert bank in two format groups, which violates §6.4 and would
 have been unservable. **`deepseek_v4.json` now declares `default_serving_profile:
-vllm_packed_moe`** (R22) — the conservative, provably-tighter choice while its lane is
-undecided; `research` carries no format allow-list at all. The
+vllm_packed_moe`** (R22) — the conservative, provably-tighter choice for both its native and
+Gridbook lanes; `research` carries no format allow-list at all. Its dense
+`fused_groups` remain empty deliberately: Gridbook's constructed merged Linear
+owns independent role decoders and can consume a different codebook format or
+physical activation scalar per role before the common FP8 execution path. A
+compressed-tensors-only uniformity rule must therefore live in that lane rather
+than globally coupling the producer assignment. The
 spec did gain `_verified_source_layout` (`2b5b937`, closing #26): the real
 DeepSeek-V4-Flash-Base headers say routed experts are I8 nibble-packed MXFP4 with F8_E8M0
 scales while **shared experts are block-FP8 E4M3, not fp4** — settled against the checkpoint
@@ -1817,9 +2094,12 @@ Check 5 (MTP) is deliberately absent: `build_mtp_module()` materialises a full d
 a multi-GB CPU allocation — use the manual CLI for it. Its cheap declarative half IS automated
 since 2026-07-30 (R12): `test_has_mtp_implies_a_buildable_mtp_module` fails any profile that
 answers `has_mtp()` without a real `build_mtp_module` override or `mtp_source_prefix()`, which
-is the L2/D2 defect class. Known gaps (`minimax_m2` has no spec; `deepseek_v4` returns `None` from
-`vllm_architecture_class()`) are encoded as *ratchets*: each asserts the gap is still real and
-only then xfails, so closing one turns the test red with an instruction to shrink the list.
+is the L2/D2 defect class. The old no-spec xfail ratchet is empty. The fused-
+source check carries one named, passing exception: DeepSeek still returns
+`None` from `vllm_architecture_class()`, and its Gridbook lane is role-composite
+rather than uniform-format. Direct profile coverage asserts the spec stays
+empty so a native-lane assumption cannot silently constrain the Gridbook
+allocation.
 And there is CI to run it — `.github/workflows/ci.yml` (#18, `1cc7b90`) executes the suite on
 every push and PR, on py3.11 and 3.12 with CPU torch. §12 D11.
 

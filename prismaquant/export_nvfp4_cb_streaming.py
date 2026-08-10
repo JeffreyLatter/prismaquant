@@ -110,6 +110,11 @@ from prismaquant.export_output_safety import (
     prepare_fresh_export_directory,
     transactional_directory_output,
 )
+from prismaquant.dspark_source_metadata import (
+    apply_dspark_overlay_to_model_config,
+    apply_dspark_overlay_to_quant_config,
+    discover_dspark_source_overlay,
+)
 from prismaquant.nvfp4_cb_footprint import (
     CBSerializationContext,
     cb_assignment_payload_breakdown,
@@ -2036,8 +2041,23 @@ def _floor_block_fp8_units(
     verbatim_prefixes = tuple(_verbatim()) if callable(_verbatim) else ()
 
     units: dict[str, str] = {}
-    for _live, entry in scale_map.items():
-        scale_key = entry[1]
+    # Scan the CHECKPOINT, not `scale_map`. The map is keyed by LIVE MODEL
+    # NAME, and a profile may legitimately map a shipped checkpoint tensor to
+    # no model name at all: DSv4 returns None for `attn.compressor.*` and
+    # `attn.indexer.*` because probe mode disables those modules
+    # (model_profiles/deepseek_v4.py). Those tensors still ship, so a
+    # probe-time graph decision must not decide how their bytes are DECLARED.
+    #
+    # Iterating the map silently skipped every indexer unit -- measured
+    # 2026-08-08 on DSv4-Flash: `wo_a` 43 entries in the map, `indexer` 0 of
+    # 33368 -- so 21 `attn.indexer.wq_b` weights fell to the verbatim loop and
+    # were declared `ignore`, which is exactly the silent corruption this
+    # function exists to prevent. That is why the docstring above already
+    # listed indexer.wq_b as covered when it was not: the intent was right and
+    # the iteration source was wrong. Scanning the checkpoint makes the
+    # docstring's stated contract ("the checkpoint pairs an F8_E4M3 weight
+    # with an F8_E8M0 scale") literally what the code does.
+    for scale_key in sorted(skeleton.keys()):
         if not scale_key.endswith(".scale"):
             # Legacy `.weight_scale_inv` checkpoints normalize through the
             # FP8_SOURCE lane and never reach this fallback.
@@ -2242,6 +2262,15 @@ def export_nvfp4_cb_streaming(
         profile = detect_profile(str(model_dir))
     except Exception:
         profile = None
+    source_config_path = model_dir / "config.json"
+    source_config = (
+        json.loads(source_config_path.read_text())
+        if source_config_path.exists() else {}
+    )
+    discovered_dspark_source_overlay = discover_dspark_source_overlay(
+        skeleton, source_config
+    )
+    dspark_source_overlay = discovered_dspark_source_overlay
     expert_groups = _plan_expert_stacks(skeleton, profile)
     # The allocator writes its layer_config EXPANDED per tensor even though it
     # decided each expert group atomically, so a per-expert checkpoint arrives
@@ -2274,6 +2303,50 @@ def export_nvfp4_cb_streaming(
         else _exclude_namespaces_from_env(),
         assignment=assignment,
         profile=profile,
+    )
+    if dspark_source_overlay is not None:
+        mtp_names = {
+            name for name in skeleton.keys() if str(name).startswith("mtp.")
+        }
+        included_mtp_names = (
+            mtp_names if subset_prefixes is None else {
+                name for name in mtp_names
+                if any(name.startswith(prefix) for prefix in subset_prefixes)
+            }
+        )
+        if not included_mtp_names:
+            # A body-only subset contains no physical draft tensors, so it
+            # must not promise a draft construction overlay.
+            dspark_source_overlay = None
+        elif included_mtp_names != mtp_names:
+            raise ValueError(
+                "refusing a partial DSpark subset: the source overlay is an "
+                f"atomic three-stage contract, but {len(included_mtp_names)} "
+                f"of {len(mtp_names)} mtp.* tensors would be emitted"
+            )
+    if dspark_source_overlay is not None:
+        mtp_names = {
+            name for name in skeleton.keys() if str(name).startswith("mtp.")
+        }
+        excluded_mtp_names = {
+            name for name in mtp_names
+            if any(name.startswith(prefix) for prefix in excluded_namespaces)
+        }
+        if excluded_mtp_names == mtp_names:
+            # A deliberate whole-namespace body-only export carries no draft
+            # routing promise or stale draft-layer count.
+            dspark_source_overlay = None
+        elif excluded_mtp_names:
+            raise ValueError(
+                "refusing a partial DSpark namespace exclusion: the source "
+                f"overlay is an atomic three-stage contract, but "
+                f"{len(excluded_mtp_names)} of {len(mtp_names)} mtp.* "
+                "tensors would be omitted. Exclude the whole `mtp.` "
+                "namespace for a body-only artifact or keep all three stages."
+            )
+    dspark_body_only = (
+        discovered_dspark_source_overlay is not None
+        and dspark_source_overlay is None
     )
     if expert_stack_members:
         col_weights = _packed_expert_col_weights(
@@ -2432,6 +2505,12 @@ def export_nvfp4_cb_streaming(
         + [canonical_format_name(assignment[q]) for q in source_targets]
         if fmt in ROUTE_PENDING_PASSTHROUGH_FORMATS
     )
+    if dspark_source_overlay is not None:
+        route_pending.update(
+            format_name
+            for format_name in dspark_source_overlay.construction_units.values()
+            if format_name in ROUTE_PENDING_PASSTHROUGH_FORMATS
+        )
     if route_pending and not allow_route_pending_passthrough:
         lanes = ", ".join(
             f"{fmt} -> lane {SOURCE_PASSTHROUGH_CONTRACTS[fmt].serving_route} "
@@ -2691,6 +2770,7 @@ def export_nvfp4_cb_streaming(
         codebook_source=source,
         scale_sweep=bool(scale_sweep),
         ldlq=_env_cb_context.ldlq,
+        ldlq_scope=getattr(_env_cb_context, "ldlq_scope", "all" if _env_cb_context.ldlq else "none"),
         minchain=_env_cb_context.minchain,
         minchain_version=_env_cb_context.minchain_version,
         encode_tier=resolve_cb_encode_tier(),
@@ -2711,6 +2791,22 @@ def export_nvfp4_cb_streaming(
         serialization_context,
         where="export_nvfp4_cb_streaming",
     )
+    from prismaquant.nvfp4_cb_footprint import _ldlq_for_format
+
+    _ldlq_telemetry_qnames = {
+        qname for qname in cb_targets
+        if _ldlq_for_format(assignment[qname], serialization_context)
+    }
+    ldlq_telemetry = None
+    if _ldlq_telemetry_qnames:
+        from prismaquant.cb_ldlq_gate_telemetry import (
+            LDLQGateTelemetryCollector,
+        )
+
+        ldlq_telemetry = LDLQGateTelemetryCollector(
+            expected_qnames=_ldlq_telemetry_qnames,
+            kernel_stamp=cb.canonical_ldlq_kernel_stamp(),
+        )
     ldlq_activation_loader = None
     if serialization_context.ldlq:
         if activation_cache_dir is None:
@@ -2998,6 +3094,9 @@ def export_nvfp4_cb_streaming(
         def _pack(qname=qname, h=(kind, h), grid=grid, mode=mode, k=k,
                   codebook=codebook, coding=coding, shape=shape,
                   packed_shape=packed_shape, state=state):
+            from prismaquant.nvfp4_cb_footprint import _ldlq_for_format
+
+            ldlq_for_this = _ldlq_for_format(assignment[qname], serialization_context)
             packed, scale = _stream_pack_target(
                 skeleton, profile, h, qname, grid, mode, k, codebook,
                 col_weights[qname], scale_sweep, coding, shape, device,
@@ -3007,7 +3106,9 @@ def export_nvfp4_cb_streaming(
                 expert_stack_members.get(qname),
                 warm_session=warm_session,
                 format_name=assignment[qname],
-                ldlq_activation_loader=ldlq_activation_loader)
+                ldlq_activation_loader=ldlq_activation_loader if ldlq_for_this else None,
+                ldlq_telemetry=ldlq_telemetry if ldlq_for_this else None,
+            )
             state["scale"] = scale
             return packed.reshape(packed_shape)
 
@@ -3094,6 +3195,9 @@ def export_nvfp4_cb_streaming(
                        qw_name=qw_name, scale_name=scale_name,
                        input_scale_name=input_scale_name,
                        export_base=export_base):
+                from prismaquant.nvfp4_cb_footprint import _ldlq_for_format
+
+                ldlq_for_this = _ldlq_for_format(assignment[qname], serialization_context)
                 packed, scale = _stream_pack_target(
                     skeleton, profile, h, qname, grid, mode, k, codebook,
                     col_weights[qname], scale_sweep, coding, shape, device,
@@ -3103,7 +3207,9 @@ def export_nvfp4_cb_streaming(
                     expert_stack_members.get(qname),
                     warm_session=warm_session,
                     format_name=assignment[qname],
-                    ldlq_activation_loader=ldlq_activation_loader)
+                    ldlq_activation_loader=ldlq_activation_loader if ldlq_for_this else None,
+                    ldlq_telemetry=ldlq_telemetry if ldlq_for_this else None,
+                )
                 out = {qw_name: packed.reshape(packed_shape)}
                 if scale is not None:
                     out[scale_name] = scale.reshape(scale_shape).to(
@@ -3131,6 +3237,9 @@ def export_nvfp4_cb_streaming(
                     packed_shape=packed_shape,
                     state=state,
                 ):
+                    from prismaquant.nvfp4_cb_footprint import _ldlq_for_format
+
+                    ldlq_for_dense = _ldlq_for_format(assignment[qname], serialization_context)
                     packed, scale = _encode_prefetched_cb_tensor(
                         weight,
                         qname=qname,
@@ -3147,7 +3256,8 @@ def export_nvfp4_cb_streaming(
                         verified_source_qnames=verified_cb_source_qnames,
                         warm_session=warm_session,
                         format_name=assignment[qname],
-                        ldlq_activation_loader=ldlq_activation_loader,
+                        ldlq_activation_loader=ldlq_activation_loader if ldlq_for_dense else None,
+                        ldlq_telemetry=ldlq_telemetry if ldlq_for_dense else None,
                     )
                     state["scale"] = scale
                     return packed.reshape(packed_shape)
@@ -3932,6 +4042,15 @@ def export_nvfp4_cb_streaming(
     assert_routes_reconcile(
         **_route_reconciliation_sets(_declared_passthrough_units))
 
+    post_allocation_refinement = None
+    _meta_ref_stream = _recipe_payload.get("__prismaquant__", {})
+    if isinstance(_meta_ref_stream, dict) and "post_allocation_refinement" in _meta_ref_stream:
+        from prismaquant.cb_ldlq_refinement import validate_refinement_provenance
+
+        post_allocation_refinement = validate_refinement_provenance(
+            _meta_ref_stream.get("post_allocation_refinement"),
+            where="export_nvfp4_cb_streaming post_allocation_refinement",
+        )
     quant_config = build_quant_config(
         assignment=assignment,
         cb_targets=cb_targets,
@@ -3951,6 +4070,7 @@ def export_nvfp4_cb_streaming(
         serialization_context=serialization_context,
         cb_render_identity=_recipe_cb_render_identity,
         research_cost_selection=_research_cost_selection,
+        post_allocation_refinement=post_allocation_refinement,
         activation_execution_contract=activation_execution_contract,
         git_commit=_git_commit(),
         cb_target_name=_cb_target_name,
@@ -3969,6 +4089,14 @@ def export_nvfp4_cb_streaming(
         weight_only_stock_targets=sidecar_stock,
         streaming_provenance=True,
         include_tensor_formats=False,
+    )
+    # DSpark is a metadata-only source overlay.  The ordinary copy loop above
+    # emitted its physical mtp.* weight/scale pairs byte-verbatim; now remove
+    # exactly those scale-bearing bases from `ignore`, extend the two existing
+    # source-layout groups, and declare the construction-time vLLM units.  No
+    # allocation target or tensor writer branch is changed by this step.
+    quant_config = apply_dspark_overlay_to_quant_config(
+        quant_config, dspark_source_overlay
     )
     if _per_expert_group_payload is not None:
         quant_config["provenance"]["per_expert_format_group_payload"] = (
@@ -4001,6 +4129,8 @@ def export_nvfp4_cb_streaming(
                 "extra="
                 f"{sorted(verified_cb_source_qnames - expected_scope)[:8]}"
             )
+        if ldlq_telemetry is not None:
+            ldlq_telemetry.payload()
 
     writer.write(
         out_dir / "model.safetensors",
@@ -4022,6 +4152,15 @@ def export_nvfp4_cb_streaming(
     config["quantization_config"] = {
         "quant_method": "gridbook", "format": "nvfp4_cb",
         "config_file": "quant_config.json"}
+    config = apply_dspark_overlay_to_model_config(
+        config, dspark_source_overlay
+    )
+    if dspark_body_only:
+        # A source artifact may already carry a stamp from a prior full DSpark
+        # export.  Subset/exclude is allowed to produce a body-only artifact,
+        # but that artifact must not promise draft modules whose bytes were
+        # deliberately omitted.
+        config.pop("n_mtp_layers", None)
     (out_dir / "config.json").write_text(json.dumps(config, indent=2))
     for aux in ("tokenizer.json", "tokenizer_config.json", "tokenizer.model",
                 "special_tokens_map.json", "generation_config.json",
@@ -4031,6 +4170,8 @@ def export_nvfp4_cb_streaming(
         p = model_dir / aux
         if p.exists():
             (out_dir / aux).write_bytes(p.read_bytes())
+    if ldlq_telemetry is not None:
+        ldlq_telemetry.publish(out_dir, quant_config)
     # Persist and assert a final filesystem inventory distinct from the CB
     # tensor-data payload contract.  This includes both safetensors headers,
     # JSON configs, tokenizer assets, and all other regular output files.
@@ -4055,7 +4196,10 @@ def export_nvfp4_cb_streaming(
     from prismaquant.artifact_completeness import assert_artifact_complete
 
     _verbatim = getattr(profile, "source_passthrough_prefixes", None)
-    verbatim_prefixes = tuple(_verbatim()) if callable(_verbatim) else ("mtp.",)
+    verbatim_prefixes = (
+        () if dspark_source_overlay is not None else
+        (tuple(_verbatim()) if callable(_verbatim) else ("mtp.",))
+    )
     completeness = assert_artifact_complete(
         out_dir, verbatim_prefixes=verbatim_prefixes)
     if excluded_namespaces:
@@ -4075,7 +4219,8 @@ def _stream_pack_target(skeleton, profile, resolved, qname, grid, mode, k,
                         encode_tier, cb_render_identity,
                         verified_source_qnames, member_qnames=None, *,
                         warm_session=None, format_name=None,
-                        ldlq_activation_loader=None):
+                        ldlq_activation_loader=None,
+                        ldlq_telemetry=None):
     """Pack ONE target, streaming experts. Returns (packed uint8 (rows,bytes)
     or (E,out,bytes), scale-plane fp32 or None). Per-expert scales make
     per-expert packing byte-identical to whole-stack packing."""
@@ -4100,6 +4245,7 @@ def _stream_pack_target(skeleton, profile, resolved, qname, grid, mode, k,
             warm_session=warm_session,
             format_name=format_name,
             ldlq_activation_loader=ldlq_activation_loader,
+            ldlq_telemetry=ldlq_telemetry,
         )
     # Experts: build ONE layer's stack (fp4 derives a single per-tensor global
     # over the whole stack, so per-expert packing would diverge — the stack is
@@ -4173,7 +4319,9 @@ def _stream_pack_target(skeleton, profile, resolved, qname, grid, mode, k,
         ldlq_activation_rows=(
             ldlq_activation_loader.load(qname, stack_size=int(w.shape[0]))
             if ldlq_activation_loader is not None else None
-        ))
+        ),
+        ldlq_telemetry=ldlq_telemetry,
+    )
     packed = packed.reshape(w.shape[0], w.shape[1], -1)
     scale = (fields["scales"].reshape(*w.shape[:-1]).cpu()
              if grid == "fp8" else None)
@@ -4214,6 +4362,7 @@ def _encode_prefetched_cb_tensor(
     warm_session=None,
     format_name=None,
     ldlq_activation_loader=None,
+    ldlq_telemetry=None,
 ):
     """Encode the same dense tensor math from a reader-prefetched host value."""
 
@@ -4252,6 +4401,7 @@ def _encode_prefetched_cb_tensor(
                 stack_size=(int(w.shape[0]) if w.dim() == 3 else None),
             ) if ldlq_activation_loader is not None else None
         ),
+        ldlq_telemetry=ldlq_telemetry,
     )
     if w.dim() == 3:
         packed = packed.reshape(w.shape[0], w.shape[1], -1)
@@ -4267,6 +4417,7 @@ def _pack_with_optional_warm_state(
     weight, *, qname, format_name, grid, mode, k, col_weights, codebook,
     scale_sweep, scale_coding, encode_tier, warm_session,
     ldlq_activation_rows=None,
+    ldlq_telemetry=None,
 ):
     """Run normal assignment/packing, optionally seeded by a stored argmin."""
     from prismaquant.cb_warm_state import (
@@ -4275,6 +4426,9 @@ def _pack_with_optional_warm_state(
     )
 
     def encode(warm_scale_state=None):
+        gate_info: dict[str, object] | None = (
+            {} if ldlq_activation_rows is not None else None
+        )
         packed, fields = cb.nvfp4_cb_pack(
             weight,
             k,
@@ -4288,25 +4442,40 @@ def _pack_with_optional_warm_state(
             warm_scale_state=warm_scale_state,
             ldlq=ldlq_activation_rows is not None,
             activation_rows=ldlq_activation_rows,
+            ldlq_gate_info_out=gate_info,
         )
         rendered = {"packed": packed}
         if grid == "fp8":
             rendered["weight_scale"] = fields["scales"]
         return CBEncodedPayload(
-            value=(packed, fields),
+            value=(packed, fields, gate_info),
             selected_scale=selected_scale_state(fields),
             rendered=rendered,
         )
 
     if warm_session is None:
-        return encode().value
-    payload = warm_session.encode(
-        qname,
-        format_name,
-        full_encode=lambda: encode(),
-        seeded_encode=lambda state: encode(state),
-    )
-    return payload.value
+        selected = encode().value
+    else:
+        payload = warm_session.encode(
+            qname,
+            format_name,
+            full_encode=lambda: encode(),
+            seeded_encode=lambda state: encode(state),
+        )
+        selected = payload.value
+    packed, fields, gate_info = selected
+    if ldlq_telemetry is not None:
+        if gate_info is None:
+            raise AssertionError(f"{qname}: LDLQ telemetry has no gate result")
+        ldlq_telemetry.record(
+            qname=qname,
+            shape=tuple(int(dim) for dim in weight.shape),
+            grid=grid,
+            mode=mode,
+            k=k,
+            gate_info=gate_info,
+        )
+    return packed, fields
 
 
 def _train_shared_codebook_streaming(skeleton, profile, expert_groups,

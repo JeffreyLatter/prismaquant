@@ -1242,14 +1242,33 @@ def _fast_install(resolver: dict[str, tuple],
 
 
 def _unload(model: nn.Module, prefixes: list[str]) -> int:
-    """Move all params/buffers under `prefixes` back to meta."""
+    """Move params/buffers under `prefixes` back to meta.
+
+    Non-persistent buffers are SKIPPED, symmetric with the install side
+    (`_fast_install` never restores them): they are derived at skeleton
+    build (rotary `inv_freq` caches), absent from the checkpoint, and
+    therefore impossible to re-materialize on re-install. Meta-izing
+    them breaks any layer that is evicted and installed again — DSv4's
+    faithful forward keeps compressor/indexer rotaries INSIDE the
+    layers, and phase-3's reverse sweep died on exactly this
+    ("Cannot copy out of meta tensor", probe attempt 5). They are a few
+    KB per layer; keeping them resident is free.
+    """
     n = 0
     for name, _ in list(model.named_parameters()):
         if any(name.startswith(p) for p in prefixes):
             set_module_tensor_to_device(model, name, "meta")
             n += 1
+    non_persistent: set[str] = set()
+    for mod_name, mod in model.named_modules():
+        for buf_name in getattr(mod, "_non_persistent_buffers_set", ()):
+            non_persistent.add(
+                f"{mod_name}.{buf_name}" if mod_name else buf_name
+            )
     for name, _ in list(model.named_buffers()):
         if any(name.startswith(p) for p in prefixes):
+            if name in non_persistent:
+                continue
             set_module_tensor_to_device(model, name, "meta")
             n += 1
     return n
