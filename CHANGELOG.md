@@ -52,6 +52,16 @@ pending.
   inconsistent legacy/scope pair refuses. Per-tensor identities now record the
   LDLQ that actually applied to each format, which fixes mismatched identities
   on mixed NVFP4/FP8 assignments.
+- **Both CB exporters resolve LDLQ per format rather than from one global
+  boolean, and the activation loader is handed over per format with it.** In
+  the non-streaming exporter each format resolves through `_ldlq_for_format`
+  and an activation is loaded only when that format's family is LDLQ-eligible
+  under the active scope. The streaming exporter had two further scope leaks:
+  a single global boolean decided the warm path, the recorded identity and the
+  loader requirement for every format alike. The actual per-format family scope
+  now controls all four — encoding, warm path, identity and loader — so an
+  FP8 tensor under `scope=nvfp4` is neither encoded as LDLQ nor charged an
+  activation-loader requirement it cannot satisfy.
 - **Product-atom E16 LDLQ** (`cb_ldlq_atoms.py`): exact FP8 atom-2 / FP4 atom-4
   exhaustive Mahalanobis assignment, with typed Hessian failures so dead
   channels refuse rather than fabricate an identity. The canonical packed route
