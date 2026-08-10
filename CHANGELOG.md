@@ -207,11 +207,22 @@ pending.
   classification, physical-to-construction MTP layer mapping, refusal of partial
   stages, and an atomic hardlink-sibling sidecar publisher that provably
   rewrites zero tensor bytes.
-- Gridbook runtime pin advances **0.8.0 → 0.8.1** (`9011a19` → `c9c1265`) with
-  the matching `0.8.1` backed-rung key `[28,32,36,40,44,48]`, verified per the
-  spec's own protocol. The pin bump had landed without the key, which emptied
-  the fail-closed resolver's backed set and silently degraded every `k%4==0`
-  rung to the expand+GEMM fallback.
+- Gridbook runtime pin advances **0.8.0 → 0.8.1 → 0.8.2** (`9011a19` →
+  `c9c1265` → `9f915dd`), each with its matching backed-rung key
+  `[28,32,36,40,44,48]`. The 0.8.1 bump had landed without its key, which
+  emptied the fail-closed resolver's backed set and silently degraded every
+  `k%4==0` rung to the expand+GEMM fallback.
+  The advance to **0.8.2** is what makes the released pin describe the runtime
+  that actually serves: the DSV4-Flash serving images are built from Gridbook
+  0.8.2, so shipping a pin that declares `0.8.1` with `version_is_release: true`
+  would have asserted a released runtime the artifact does not run on — the
+  exact confusion `tests/test_gridbook_runtime_boundary.py` exists to prevent.
+  The rung set carries over verbatim, verified more strongly than by reading the
+  constant: `gridbook/codec.py` is **byte-unchanged** across the entire
+  v0.8.1..v0.8.2 range, so `FP8_FUSED_KBITS` cannot have moved; 0.8.2's content
+  is loader and dispatch work above the codec. **This release therefore depends
+  on Gridbook v0.8.2 being tagged and its commit pushed** — CI installs the
+  runtime from the pinned git commit and asserts the reported version matches.
 
 ### Campaign tooling
 

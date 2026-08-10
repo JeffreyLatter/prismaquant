@@ -142,13 +142,13 @@ def test_backed_fused_mid_m_rungs_are_spec_data_for_the_pinned_runtime():
     permits every K28..K48 — so five of the published 27B ladder's eight
     rungs silently take expand+GEMM (gridbook ROADMAP K1.2). That set is
     DATA, read against the version in gridbook_runtime_pin.json."""
-    assert sp.gridbook_runtime_version() == "0.8.1"
+    assert sp.gridbook_runtime_version() == "0.8.2"
     backed = sp.serving_lane_route(_PROFILE, "FP8_CB_K36")
     assert backed.fused_mid_m_backed
     assert backed.fused_mid_m_rungs == (28, 32, 36, 40, 44, 48)
     assert backed.fused_mid_m_range == (9, 128)
     assert backed.activation_contract == "w8a8-dynamic-e4m3"
-    assert backed.rungs_source == "serving_profile_spec:0.8.1"
+    assert backed.rungs_source == "serving_profile_spec:0.8.2"
 
     for k in (37, 38, 39, 41, 47):
         unbacked = sp.serving_lane_route(_PROFILE, f"FP8_CB_K{k}")
@@ -178,7 +178,12 @@ def test_the_0_6_0_backed_set_is_the_k_mod_4_law_not_a_missing_five():
     opt-in MXFP8 dense lane -- and ``FP8_FUSED_KBITS`` is still
     ``range(28, 49, 4)`` at the v0.8.0 tag commit. 0.8.1 (per-expert
     multi-format stacks, python-only, no kernel/codec change) declares the
-    same law: ``FP8_FUSED_KBITS`` is unchanged at the v0.8.1 tag c9c1265."""
+    same law: ``FP8_FUSED_KBITS`` is unchanged at the v0.8.1 tag c9c1265.
+    0.8.2 (DSV4-Flash serving enablement: the grouped ``attn.wo_a`` MXFP8
+    adapter, per-role ownership for heterogeneous dense fusions, the DSV4
+    source-passthrough name bridge) is verified more strongly still --
+    ``gridbook/codec.py`` is byte-unchanged across the whole v0.8.1..v0.8.2
+    range, so the constant cannot have moved."""
     backed = sp.serving_lane_route(_PROFILE, "FP8_CB_K36").fused_mid_m_rungs
     assert backed == tuple(range(28, 49, 4))
     for k in range(28, 49):
@@ -194,9 +199,10 @@ def test_advancing_the_pin_adds_a_version_key_and_never_edits_an_old_one():
     lane = next(l for l in sp.load_serving_profile(_PROFILE).serving_lanes
                 if l.id == "fp8_cb_fused_mid_m")
     declared = dict(lane.fused_mid_m_rungs_by_runtime_version)
-    assert {"0.5.0", "0.6.0", "0.7.0", "0.8.0", "0.8.1"} <= set(declared)
+    assert {"0.5.0", "0.6.0", "0.7.0", "0.8.0", "0.8.1",
+            "0.8.2"} <= set(declared)
     assert (declared["0.5.0"] == declared["0.6.0"] == declared["0.7.0"]
-            == declared["0.8.0"] == declared["0.8.1"]
+            == declared["0.8.0"] == declared["0.8.1"] == declared["0.8.2"]
             == tuple(range(28, 49, 4)))
 
     for old_version in ("0.5.0", "0.6.0"):
@@ -274,7 +280,7 @@ def test_profiles_without_a_declared_lane_return_none():
 def test_the_lane_catalog_is_reportable_and_names_its_runtime():
     catalog = sp.serving_lane_catalog(_PROFILE)
     assert catalog["schema"] == sp.SERVING_LANE_SCHEMA
-    assert catalog["gridbook_runtime_version"] == "0.8.1"
+    assert catalog["gridbook_runtime_version"] == "0.8.2"
     assert set(catalog["lanes"]) == {
         "nvfp4_cb_quality_path", "fp8_cb_fused_mid_m",
         # The two SOURCE-PASSTHROUGH lanes. They are declared as lanes of
@@ -354,7 +360,7 @@ def test_selection_provenance_splits_backed_rungs_from_the_fallback():
     }
     prov = selection_serving_lane_provenance(
         assignment, None, target_profile=_PROFILE)
-    assert prov["gridbook_runtime_version"] == "0.8.1"
+    assert prov["gridbook_runtime_version"] == "0.8.2"
     assert prov["units_total"] == 4
     assert prov["units_on_backed_fused_mid_m_lane"] == 1
     assert prov["units_on_fallback_route"] == 2

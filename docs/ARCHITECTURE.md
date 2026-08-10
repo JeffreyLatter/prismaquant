@@ -3,8 +3,12 @@
 As of: 2026-08-09 · branch `integration/dsv4-ldlq-export` · verified against implementation
 baseline commit `cf0420e` plus the DeepSeek DSpark source-overlay contract,
 with the external Gridbook runtime pinned to release commit
-`c9c1265` (v0.8.1). The active DeepSeek deployment packages local integration
-commit `b159bb8` on top of that release. This branch ports the dated
+`9f915dd` (v0.8.2). The pin advanced 0.8.1 → 0.8.2 in this release because the
+DSV4-Flash serving images are built from that runtime, not from 0.8.1: declaring
+0.8.1 would have described a runtime the artifact does not serve on. The backed
+fused mid-M rung set is unchanged, and for a stronger reason than reading the
+constant — `gridbook/codec.py` is byte-unchanged across the whole v0.8.1..v0.8.2
+range, so `FP8_FUSED_KBITS` cannot have moved (§ serving lanes). This branch ports the dated
 2026-08-01 DeepSeek-V4-Flash-0731 92 GB study record (§9.2) forward from its 0.5.1
 working tree; the study's Gridbook-candidate claims were **not** carried over, because
 the candidate they described has since been reviewed, cut, and pinned as Gridbook 0.6.0.
@@ -2003,7 +2007,7 @@ artifacts exported before the rename.
 | gemma4 | `gemma4.py` | 140 | ✅ | `vllm_packed_moe` | CT | ⚠ none | none |
 | lfm2_moe (LFM2.5) | `lfm2_moe.py` | 150 | ✅ | `vllm_packed_moe` | CT | ⚠ none | `has_mtp → False` |
 | minimax_m2 | `minimax_m2.py` | 160 | ✅ **added R22** — all 8 overrides declared | `vllm_packed_moe` **(added R22)** | CT | ⚠ none | `has_mtp → False` |
-| deepseek_v4 | `deepseek_v4.py` | 170 | ✅ | `vllm_packed_moe` **(added R22)** | CT, **nvfp4_cb** (CT) | declared by Gridbook v0.8.1; streaming CB export, source-format passthrough, and top-level loader are wired | `has_mtp → False`; three source-quantized DSpark stages are declared by the header-validated physical→construction overlay (§6.3), with no tensor rewrite |
+| deepseek_v4 | `deepseek_v4.py` | 170 | ✅ | `vllm_packed_moe` **(added R22)** | CT, **nvfp4_cb** (CT) | declared by Gridbook v0.8.2; streaming CB export, source-format passthrough, and top-level loader are wired | `has_mtp → False`; three source-quantized DSpark stages are declared by the header-validated physical→construction overlay (§6.3), with no tensor rewrite |
 | hy_v3 | `hy_v3.py` | 180 | ✅ | `gguf` (overridden, L1) | CT, nvfp4_cb, **gguf** (gguf) | declared by pinned Gridbook contract | `has_mtp → False`; MTP passthrough + out-of-band CB scripts |
 | laguna (poolside S/XS 2.x) | `laguna.py` | 190 | ✅ | `nvfp4_cb` (overridden, L1) | CT, **nvfp4_cb** (nvfp4_cb) | declared by pinned Gridbook contract; drafter still separate | `has_mtp → False` |
 | default | `default.py` | — (terminal) | n/a by design | — | CT (default) | n/a | none |
