@@ -6,7 +6,8 @@ per-rung learned/lattice source-map contract, the routed-MoE learned-codebook
 producer contract, the DeepSeek DSpark source-overlay contract, the streamed CB
 cached-menu render/consume contract, and the profile-declared routed-expert
 AURA/empirical hybrid key-space contract, plus the platform-agnostic anchored-cost
-mechanism, CB mapping plugin, and DSv4 one-shot acceptance-driver contract,
+mechanism, CB mapping plugin, DSv4 one-shot acceptance-driver contract, and the
+anchored-AURA allocator admission branch (P0, closed 2026-08-11),
 with the external Gridbook runtime pinned to the **unreleased** 0.8.3
 preparation commit `032e815`. That commit adds the opt-in routed-MoE per-role
 LUT ABI; it has not been tagged, published, or device-validated, and the pin's
@@ -945,14 +946,38 @@ render-input `cb_col_weights.pkl`, and `selection.json` with at least `feasible`
 `chosen_achieved_bits`, `predicted_dloss`, and `budget_bytes`; it never overwrites the Track-A
 comparison artifact.
 
-**Current launch blocker.** The generic mechanism correctly identifies anchored AURA as an
-activation-inclusive supersurrogate, but the shared allocator candidate reader still classifies
-all explicit `predicted_dloss` rows as weight-only and can remove an exactly-zero measured AURA
-cell as `activation_cost_unmeasured`. `tools/aura_cb_reprice_preflight.py` therefore blocks before
-GPU launch on `AURA supersurrogate allocator semantics`. No epsilon floor, fabricated
-`output_mse`, or rewritten probe `h_trace` is an acceptable bypass: the shared allocator needs an
-explicit AURA branch that reads the value directly, excludes it from activation calibration,
-retains a true zero, and stamps that provenance.
+**Anchored-AURA allocator admission — CLOSED 2026-08-11.**
+`allocator_candidates.cost_entry_is_anchored_aura_supersurrogate` identifies an anchored row by
+three independent stamps — `cost_currency = aura_predicted_dloss`,
+`cost_source = production_arm_render`, `fisher_application_count == 1` — in the forgery-refusing
+style of `cost_entry_is_source_passthrough`, and
+`AURA_SUPERSURROGATE_ALLOCATOR_SEMANTICS = True` declares the branch exists. Four behaviours:
+the value is read directly (no P5a transfer), the row is kept out of the activation-calibration
+sample, a measured zero is retained instead of being removed as `activation_cost_unmeasured`,
+and the row is stamped `anchored_aura_extrapolation`. No epsilon floor, fabricated `output_mse`,
+or rewritten probe `h_trace` was used; the zero-guard bypass is scoped to matching rows, so every
+other cost table keeps it at full strength.
+
+**The word "activation-inclusive" was wrong and has been retired here.** An earlier draft of this
+section claimed anchored AURA is an activation-*inclusive* supersurrogate. It is not.
+`aura_cost.py` runs its KL-adjoint on **unquantized** boundary activations and `dW` is a weight
+delta, so no activation-quantization error enters the number. AURA is activation-**weighted**
+(`gW` carries `X` — the alignment term its measured win lives in) and
+activation-quantization-**blind**. "Supersurrogate" remains correct as a **currency** claim: one
+projection replaced the two-factor magnitude score (`h_trace × output_mse`, `h_trace × cw_m2`)
+that preceded it. It is not an error-model claim.
+
+**Standing activation-blindness limitation (reported, not gated).** Every rung of `nvfp4_cb` and
+`fp8_cb` has `act_quant_changes_input = True`, and an anchored table carries no measured
+`output_mse`, so P5a has no calibration sample and `penalty_for` already returns exactly 1.0 —
+skipping it is a provenance statement, not a number change. Two facts bound the exposure. The
+activation path is **constant across K within each CB family**, so the blindness cannot reorder
+rungs *inside* a family; it can only shift the `nvfp4_cb`-vs-`fp8_cb` family-choice margin. And
+AURA's validated wins (−38%/−39.5% @4B, −17.9% @27B on served KL) were measured **against**
+`h_trace × output_mse` — a baseline that *did* carry the A side, since `measure_quant_cost`
+applies `activation_quantize_dequantize(X)` — on menus already mixing W4A4 NVFP4, W8A8 FP8 and
+BF16, i.e. the same family-choice margin. This is carried exactly like the route-flip limitation
+below: named, reported, with the served A/B as the arbiter.
 
 **Standing routed-expert limitation.** AURA measures smooth local weight damage but is blind
 to route flips (`expert_empirical_cost.py` module contract). Routed-unit discovery/classification

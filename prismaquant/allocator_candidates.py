@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import math
+import operator
 import os
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -49,6 +50,37 @@ from .serving_profiles import (
 # ``weight_mse``: it says the row was never measured because there is nothing
 # to measure.
 SOURCE_PASSTHROUGH_COST_SOURCE = "source_passthrough"
+
+# ---------------------------------------------------------------------------
+# Anchored-AURA supersurrogate admission (P0)
+#
+# ``anchored_cost`` prices a whole menu from one production-arm render per
+# unit: ``cost(i,K) = predicted_dloss(i,K̂) x [g(K)/g(K̂)]``. Those rows are a
+# distinct provenance from every other weight-only row the allocator reads,
+# and the three stamps below are what identify them. Defined HERE, not in
+# ``anchored_cost``, because that module imports this one — one definition,
+# no cycle.
+ANCHORED_AURA_COST_CURRENCY = "aura_predicted_dloss"
+ANCHORED_AURA_COST_SOURCE = "production_arm_render"
+# The activation-pricing branch label such a row is stamped with.
+ANCHORED_AURA_BRANCH = "anchored_aura_extrapolation"
+
+# The allocator has an explicit branch for anchored-AURA rows: it reads
+# ``predicted_dloss`` directly, keeps them out of the P5a calibration sample,
+# and admits a measured zero instead of removing it as
+# ``activation_cost_unmeasured``.
+#
+# ⚠ WHAT THIS FLAG DOES **NOT** CLAIM. "Supersurrogate" is a statement about
+# the CURRENCY — one KL-adjoint projection replaced the two-factor magnitude
+# score (``h_trace x output_mse`` / ``h_trace x cw_m2``) that preceded it. It
+# is NOT a claim that AURA models activation-QUANTIZATION error. It does not:
+# ``aura_cost.py`` runs its adjoint on unquantized boundary activations and
+# ``dW`` is a weight delta, so no A-side error enters. AURA is
+# activation-WEIGHTED (``gW`` carries X — that is the alignment term its win
+# lives in) and activation-quantization-BLIND. See
+# ``cost_entry_is_anchored_aura_supersurrogate`` for the standing limitation
+# this leaves open, and why it is reported rather than gated.
+AURA_SUPERSURROGATE_ALLOCATOR_SEMANTICS = True
 
 # Serving-route token for a passthrough whose bytes the model's OWN loader
 # consumes, with no Gridbook codec in the path.
@@ -1149,6 +1181,66 @@ def cost_entry_weight_only_dloss(
     )
 
 
+def cost_entry_is_anchored_aura_supersurrogate(cost_entry: dict) -> bool:
+    """Whether one row was priced by the anchored-AURA campaign.
+
+    Three independent stamps, ALL required, in the same forgery-refusing style
+    as ``cost_entry_is_source_passthrough`` — a hand-written table cannot claim
+    this provenance by writing one string:
+
+      * ``cost_currency`` is the AURA projection currency, so the number is
+        ``0.5*mean_k<gW,dW>^2`` and not an MSE wearing the same field name;
+      * ``cost_source`` says a PRODUCTION-ARM render produced the anchor.
+        RTN-vs-rendered ``dW`` is result-changing (+36% at fp8), and the
+        byte-verbatim terminals carry ``SOURCE_PASSTHROUGH_COST_SOURCE``
+        instead, so they are excluded here and handled by the exact branch;
+      * ``fisher_application_count == 1`` — the h^2 guard. ``predicted_dloss``
+        already contains the KL-Fisher; extrapolation multiplies by a ratio of
+        ``g``, never by a sensitivity a second time.
+
+    **The standing limitation this admission accepts.** Every rung in the CB
+    menus quantizes activations (``act_quant_changes_input`` is True for all of
+    ``nvfp4_cb`` and ``fp8_cb``), while AURA's ``dW`` is weights-only. So these
+    prices are activation-quantization-blind, and the P5a penalty cannot fix it
+    here: an anchored table carries no measured ``output_mse`` rows at all, so
+    every family is uncalibrated and ``penalty_for`` already returns exactly
+    1.0. Skipping the penalty is a provenance statement, not a number change.
+
+    Two facts bound the exposure, which is why this is reported and not gated:
+
+      * the activation path is CONSTANT across K within each CB family, so the
+        blindness cannot reorder rungs INSIDE a family — it can only shift the
+        nvfp4_cb-vs-fp8_cb family-choice margin;
+      * AURA's validated wins (-38%/-39.5% @4B, -17.9% @27B on served KL) were
+        measured against ``h_trace x output_mse``, and THAT baseline carried
+        the A side (``measure_quant_cost`` applies
+        ``activation_quantize_dequantize(X)``). The activation-blind projection
+        beat an activation-inclusive cost, on menus already mixing W4A4 NVFP4,
+        W8A8 FP8 and BF16 — the same family-choice margin.
+
+    This is the route-flip pattern (``expert_empirical_cost`` module contract):
+    a named limitation carried forward, with the served A/B as the arbiter.
+    """
+    if not isinstance(cost_entry, dict):
+        return False
+    if cost_entry.get("cost_currency") != ANCHORED_AURA_COST_CURRENCY:
+        return False
+    if cost_entry.get("cost_source") != ANCHORED_AURA_COST_SOURCE:
+        return False
+    applications = cost_entry.get("fisher_application_count")
+    if isinstance(applications, bool):
+        # ``True == 1``; a boolean is not a count and must not forge one.
+        return False
+    try:
+        # ``__index__`` rather than ``int()``: it admits the numpy integers a
+        # pickled cost table really carries, and refuses the string "1" and
+        # the float 1.0, neither of which any writer of this stamp emits.
+        applications = operator.index(applications)
+    except TypeError:
+        return False
+    return applications == 1
+
+
 def cost_entry_activation_pricing_branch(
     stats_entry: dict,
     cost_entry: dict,
@@ -1186,6 +1278,13 @@ def cost_entry_activation_pricing_branch(
         # An aggregated super-item entry: the members' penalties are already
         # folded into its predicted_dloss (aggregate_* below).
         return BRANCH_CALIBRATED
+    if cost_entry_is_anchored_aura_supersurrogate(cost_entry):
+        # Its own label rather than BRANCH_UNCALIBRATED: both are priced at a
+        # 1.0 multiplier, but "no calibration sample was found for this family"
+        # and "this row is an anchored KL-adjoint projection that the P5a
+        # transfer does not apply to" are different audit answers, and the
+        # artifact has to be able to tell them apart.
+        return ANCHORED_AURA_BRANCH
     act_changes = _format_act_quant_changes_input(format_name)
     if activation_pricing is None:
         return (
@@ -1260,6 +1359,18 @@ def cost_entry_predicted_dloss(
         # Aggregated super item: its members were penalized individually and
         # the result summed. Re-applying here would square the correction.
         return base
+    if cost_entry_is_anchored_aura_supersurrogate(cost_entry):
+        # Read the anchored projection directly. The P5a penalty transfers a
+        # weight-SPACE number onto the measured output scale using a constant
+        # fitted from that family's own measured/weight-only row pairs; an
+        # anchored table has no measured rows, so there is no such constant to
+        # apply (``penalty_for`` already returns 1.0 via BRANCH_UNCALIBRATED).
+        # Naming the branch instead of falling through keeps the artifact
+        # honest about WHY the multiplier was 1.0. Numerically identical today
+        # — and it stays correct if a future run mixes an anchored table with a
+        # measured one, where falling through would silently apply another
+        # family's transfer constant to a projection that is not in its units.
+        return base
     return base * _activation_penalty(format_name, activation_pricing)
 
 
@@ -1313,6 +1424,23 @@ def cost_entry_prices_unmeasured_activation_at_zero(
         BF16.
     """
     if format_name is None:
+        return False
+    if cost_entry_is_anchored_aura_supersurrogate(cost_entry):
+        # An anchored-AURA zero is a MEASUREMENT, not the absence of one, and
+        # this guard exists for the absence. The zeros it was built to catch
+        # are placeholders — a band-interpolated row that never produced an
+        # output number, a dense-ladder fit that could not be made — and an
+        # anchored table cannot contain those: ``assert_aura_only_cost_table``
+        # refuses any row carrying output_mse/weight_mse/h_trace at all, and
+        # per-unit checkpoint completeness refuses a missing anchor rather than
+        # defaulting it to zero.
+        #
+        # It is also very nearly vacuous, which is the point: 0.5*mean_k<gW,dW>^2
+        # is exactly 0.0 only if dW is exactly zero (a byte-identical render —
+        # the exact-by-construction branch above already owns that) or gW is
+        # exactly zero (h_trace == 0 — the positive-sensitivity condition below
+        # already exempts that). The bypass is scoped to rows this predicate
+        # matches, so every other cost table keeps the guard at full strength.
         return False
     try:
         spec = fr.get_format(str(format_name))
@@ -1394,6 +1522,16 @@ def collect_activation_calibration_rows(
             if entry is None or "error" in entry:
                 continue
             if cost_entry_is_bit_exact(entry, spec.name):
+                continue
+            if cost_entry_is_anchored_aura_supersurrogate(entry):
+                # Never a calibration observation on either side. The sample
+                # fits a measured-over-weight-only RATIO, and an anchored row
+                # has no measured side to be the numerator; counting it in
+                # ``weight_only_by_family`` would inflate the census that
+                # ``calibrate`` fail-closes on, making a run refuse for a
+                # population the penalty is never applied to. Structurally
+                # already excluded (no output_mse), stated explicitly so it
+                # stays excluded if the membership test is ever widened.
                 continue
             if _has_measured_output_mse(stats_entry, entry):
                 measured_by_family[family] += 1

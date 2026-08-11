@@ -962,8 +962,10 @@ def repository_capability_checks(
     if target == "dsv4":
         aura_supersurrogate_ready = (
             "AURA_SUPERSURROGATE_ALLOCATOR_SEMANTICS = True" in candidates
-            and "def cost_entry_is_activation_inclusive_aura" in candidates
-            and candidates.count("cost_entry_is_activation_inclusive_aura(") >= 3
+            and "def cost_entry_is_anchored_aura_supersurrogate" in candidates
+            and candidates.count(
+                "cost_entry_is_anchored_aura_supersurrogate("
+            ) >= 3
             and "anchored_aura_extrapolation" in candidates
         )
         checks.append(
@@ -971,14 +973,20 @@ def repository_capability_checks(
                 "AURA supersurrogate allocator semantics",
                 "PASS" if aura_supersurrogate_ready else "BLOCK",
                 (
-                    "allocator explicitly treats anchored AURA as activation-"
-                    "inclusive and admits measured zero-valued AURA cells"
+                    "allocator has an explicit anchored-AURA branch: reads the "
+                    "projection directly, keeps it out of the P5a sample, and "
+                    "admits a measured zero. NOTE: this is a CURRENCY claim, "
+                    "not an activation error model -- AURA is activation-"
+                    "weighted but activation-quantization-BLIND (constant "
+                    "across K within a CB family, so it moves only the "
+                    "family-choice margin); limitation reported, served A/B "
+                    "arbitrates"
                     if aura_supersurrogate_ready
                     else "allocator still classifies explicit predicted_dloss "
                     "as weight-only and can mask a measured zero AURA CB cell "
                     "as activation_cost_unmeasured; refusing GPU launch until "
-                    "both activation-transfer and zero-admission branches name "
-                    "the AURA supersurrogate explicitly"
+                    "both the pricing branch and the zero-admission branch "
+                    "name the anchored AURA supersurrogate explicitly"
                 ),
                 str(repo / "prismaquant/allocator_candidates.py"),
             )

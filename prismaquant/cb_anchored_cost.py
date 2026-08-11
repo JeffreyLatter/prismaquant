@@ -1350,7 +1350,7 @@ def require_allocator_supersurrogate_support() -> None:
     ready = (
         getattr(candidates, "AURA_SUPERSURROGATE_ALLOCATOR_SEMANTICS", False)
         and callable(getattr(
-            candidates, "cost_entry_is_activation_inclusive_aura", None
+            candidates, "cost_entry_is_anchored_aura_supersurrogate", None
         ))
     )
     if not ready:

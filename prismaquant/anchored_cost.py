@@ -24,7 +24,11 @@ from pathlib import Path
 import subprocess
 from typing import Literal, Protocol, runtime_checkable
 
-from prismaquant.allocator_candidates import SOURCE_PASSTHROUGH_COST_SOURCE
+from prismaquant.allocator_candidates import (
+    ANCHORED_AURA_COST_CURRENCY,
+    ANCHORED_AURA_COST_SOURCE,
+    SOURCE_PASSTHROUGH_COST_SOURCE,
+)
 from prismaquant.cost_stage_checkpoint import (
     atomic_write_bytes,
     canonical_json,
@@ -34,8 +38,11 @@ from prismaquant.cost_stage_checkpoint import (
 )
 
 
-AURA_CURRENCY = "aura_predicted_dloss"
-PRODUCTION_RENDER_SOURCE = "production_arm_render"
+# Re-exported, not redefined: the allocator's admission branch keys off these
+# exact strings, and two spellings of one contract is how a near-miss silently
+# routes an anchored row down the generic weight-only path.
+AURA_CURRENCY = ANCHORED_AURA_COST_CURRENCY
+PRODUCTION_RENDER_SOURCE = ANCHORED_AURA_COST_SOURCE
 ANCHOR_SEGMENT_FIELDS = ("family", "role", "equivalence_class")
 _FORBIDDEN_COST_FIELDS = frozenset({
     "h_trace",

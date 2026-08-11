@@ -756,7 +756,37 @@ def test_dsv4_driver_wires_resume_to_allocator_and_artifact_publish():
         ).body)
 
 
-def test_allocator_supersurrogate_gap_refuses_before_any_campaign_render():
+def test_allocator_supersurrogate_gate_is_satisfied_and_stays_fail_closed(
+    monkeypatch,
+):
+    """CLOSED 2026-08-11 — but the refusal path must keep working.
+
+    The gate is satisfied by the real allocator now that
+    ``allocator_candidates`` carries the explicit anchored-AURA admission
+    branch. What must not regress is its fail-closed shape: if either symbol
+    goes missing or the flag is turned off, the campaign still refuses BEFORE
+    any CUDA work, rather than allocating on rows the allocator would
+    misclassify as generic weight-only.
+    """
+    from prismaquant import allocator_candidates as candidates
+
+    require_allocator_supersurrogate_support()
+
+    monkeypatch.setattr(
+        candidates, "AURA_SUPERSURROGATE_ALLOCATOR_SEMANTICS", False,
+        raising=False)
+    with pytest.raises(
+        AnchoredCostError,
+        match="allocator lacks explicit AURA supersurrogate",
+    ):
+        require_allocator_supersurrogate_support()
+
+    monkeypatch.setattr(
+        candidates, "AURA_SUPERSURROGATE_ALLOCATOR_SEMANTICS", True,
+        raising=False)
+    monkeypatch.delattr(
+        candidates, "cost_entry_is_anchored_aura_supersurrogate",
+        raising=False)
     with pytest.raises(
         AnchoredCostError,
         match="allocator lacks explicit AURA supersurrogate",

@@ -117,12 +117,21 @@ def test_current_branch_is_fail_closed_on_known_dsv4_gaps():
         for check in repository_capability_checks(ROOT, "dsv4")
     }
 
-    # The allocator supersurrogate contract and external receipt remain fail-closed.
-    for name in (
-        "AURA supersurrogate allocator semantics",
-        "commit-bound implementation receipt",
-    ):
-        assert checks[name].status == "BLOCK", (name, checks[name].detail)
+    # The external receipt remains fail-closed: it is an INPUT the operator
+    # supplies at launch, not a repository capability, so no code change can
+    # or should clear it.
+    assert checks["commit-bound implementation receipt"].status == "BLOCK"
+
+    # Closed 2026-08-11 by the explicit anchored-AURA admission branch in
+    # ``allocator_candidates`` (three-stamp predicate, direct pricing, P5a
+    # exclusion, scoped measured-zero retention). The PASS text must keep
+    # naming the activation-quantization blindness as a standing limitation:
+    # AURA is activation-WEIGHTED, not activation-quantization-aware, and this
+    # gate is a currency claim rather than an error model.
+    supersurrogate = checks["AURA supersurrogate allocator semantics"]
+    assert supersurrogate.status == "PASS", supersurrogate.detail
+    assert "activation-quantization-BLIND" in supersurrogate.detail
+    assert "served A/B" in supersurrogate.detail
 
     # Closed by the streamed, anchored DSv4 campaign worker and its bounded render plan.
     assert checks["DSv4 bounded campaign worker"].status == "PASS", (
