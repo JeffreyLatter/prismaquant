@@ -366,6 +366,7 @@ def test_builder_refuses_uncertified_rung_before_training(tmp_path, monkeypatch)
             weights={qname: torch.zeros(2, 256)},
             col_weights={qname: torch.ones(256)},
             formats=("FP8_CB_K47",),
+            learned_formats=("FP8_CB_K47",),
         )
     assert called is False
 

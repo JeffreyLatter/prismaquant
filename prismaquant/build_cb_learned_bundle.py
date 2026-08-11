@@ -191,7 +191,7 @@ def build_bundle_from_model(
             int(name.rsplit("K", 1)[1]), {}
         ).get("enabled") is True
     )
-    if not learned_formats:
+    if not any(name.startswith("FP8_CB_") for name in canonical_formats):
         raise ValueError(
             "CB_CODEBOOK_SOURCE_SCOPE enables FP8 learned books, but the "
             "requested format menu contains no FP8_CB rung"

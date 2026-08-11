@@ -536,6 +536,35 @@ class CBLearnedBundle:
         return resolved
 
     @property
+    def codebook_source_by_format(self) -> dict[str, str]:
+        """Return the bundle-authoritative per-rung source map.
+
+        Bundle construction chooses learned formats once for the complete
+        menu, so every qname carrying a given rung must agree.  Refuse a
+        hand-edited bundle that tries to make source selection qname-local:
+        cost/export provenance is deliberately a compact per-rung map, and a
+        non-uniform map could not be represented without weakening identity.
+        """
+
+        resolved: dict[str, str] = {}
+        owners: dict[str, str] = {}
+        for raw_qname, raw_formats in self.manifest["cells"].items():
+            qname = str(raw_qname)
+            for raw_format, raw_cell in raw_formats.items():
+                canonical, _family, _rung = _canonical_format(raw_format)
+                source = str(raw_cell["source"])
+                previous = resolved.setdefault(canonical, source)
+                if previous != source:
+                    raise ValueError(
+                        f"{self.path}: bundle source for {canonical} differs "
+                        f"between {owners[canonical]!r} ({previous}) and "
+                        f"{qname!r} ({source}); per-rung render identity must "
+                        "be uniform"
+                    )
+                owners.setdefault(canonical, qname)
+        return dict(sorted(resolved.items()))
+
+    @property
     def bundle_content_sha256(self) -> str:
         return str(self.manifest["bundle_content_sha256"])
 
@@ -640,9 +669,10 @@ def train_and_save_bundle(
 ) -> CBLearnedBundle:
     """Train cells, canonicalize FP16 values, and publish one immutable bundle.
 
-    By default every supplied FP8-CB format is learned and every supplied
-    NVFP4-CB format is canonical lattice.  ``learned_formats`` can narrow the
-    learned FP8 set (an empty iterable produces an all-lattice bundle).  The
+    By default every policy-enabled supplied FP8-CB format is learned and all
+    other supplied formats are canonical lattice.  ``learned_formats`` can
+    explicitly narrow the learned FP8 set (an empty iterable produces an
+    all-lattice bundle); an explicit disabled rung is still refused.  The
     formats may be common to all qnames or supplied per qname.  For large
     models, pass ``qnames`` plus ``weight_provider`` instead of ``weights``:
     each decoded weight is requested once, all of its rung cells are trained,
@@ -723,7 +753,12 @@ def train_and_save_bundle(
     if learned_formats is None:
         learned = {
             fmt for fmt in supplied_formats
-            if _canonical_format(fmt)[1].grid == "fp8"
+            if (
+                _canonical_format(fmt)[1].grid == "fp8"
+                and CBL_RUNG_POLICY.get(
+                    _canonical_format(fmt)[2], {}
+                ).get("enabled") is True
+            )
         }
     else:
         learned = {_canonical_format(fmt)[0] for fmt in learned_formats}
