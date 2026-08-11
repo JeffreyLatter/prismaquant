@@ -94,6 +94,13 @@ MAX_FLAT_K = 14
 _SLICE_MAX_ELEMS = 64 * 1024 * 1024
 # Row-chunk bound for the (rows*nvec, K) distance sweep.
 _SCORE_CHUNK_ELEMS = 1 << 26
+# FP8-CB K28 is four K=128 product streams.  The generic cap makes each
+# compiled reduction consume 1024 source rows (roughly 1 GiB across the four
+# resident B moments at width 4096), which is slower than two half-sized
+# launches on production shapes. Keep the generic cap for every other rung --
+# notably K33's K=512 stream, where smaller chunks are neutral and larger
+# chunks regress -- and specialize only this unambiguous layout.
+_K128_PRODUCT_SCORE_CHUNK_ELEMS = 1 << 25
 
 # Scale search (rendering parity with the IQ lane's _grid_fields sweep):
 # number of clipping-level candidates and fixed-point refit iterations. The
@@ -232,12 +239,9 @@ def _vq_dist_argmin(term2: torch.Tensor, term1: torch.Tensor) -> torch.Tensor:
     subtraction folds into the reduction and the plane never exists (measured
     2.9x on the production shapes). Same per-element arithmetic and the same
     first-occurrence tie rule, so the chosen codewords are unchanged."""
-    if _encode_compile_on():
-        try:
-            _raise_encode_recompile_limit()
-            return _vq_dist_argmin_compiled()(term2, term1)
-        except Exception:
-            pass
+    if _compiled_encode_route(term1):
+        _raise_encode_recompile_limit()
+        return _vq_dist_argmin_compiled()(term2, term1)
     return _vq_dist_argmin_eager(term2, term1)
 
 
@@ -716,6 +720,20 @@ def _encode_compile_on() -> bool:
         "0", "false", "no")
 
 
+def _compiled_encode_route(target: torch.Tensor) -> bool:
+    """Whether an index-producing compiled encode kernel may run.
+
+    CUDA only, deliberately.  torch.compile's CPU lowering of
+    ``min(dim=-1)`` has returned the correct minimum value paired with a
+    wrong index on the production torch build.  The index is what is
+    serialized, so value-only validation cannot detect that corruption.
+    CPU therefore takes the eager route; production CUDA fails closed if
+    compilation itself fails instead of silently falling back to a path that
+    is 16--20x slower.
+    """
+    return _encode_compile_on() and bool(target.is_cuda)
+
+
 _ENCODE_RECOMPILE_LIMIT_RAISED = False
 
 
@@ -730,14 +748,11 @@ def _raise_encode_recompile_limit() -> None:
     global _ENCODE_RECOMPILE_LIMIT_RAISED
     if _ENCODE_RECOMPILE_LIMIT_RAISED:
         return
-    try:
-        torch._dynamo.config.recompile_limit = max(
-            int(getattr(torch._dynamo.config, "recompile_limit", 8)), 256)
-        torch._dynamo.config.accumulated_recompile_limit = max(
-            int(getattr(torch._dynamo.config,
-                        "accumulated_recompile_limit", 256)), 4096)
-    except Exception:
-        pass
+    torch._dynamo.config.recompile_limit = max(
+        int(getattr(torch._dynamo.config, "recompile_limit", 8)), 256)
+    torch._dynamo.config.accumulated_recompile_limit = max(
+        int(getattr(torch._dynamo.config,
+                    "accumulated_recompile_limit", 256)), 4096)
     _ENCODE_RECOMPILE_LIMIT_RAISED = True
 
 
@@ -803,12 +818,9 @@ def _score_minargmin_batched_compiled():
 
 
 def _score_minargmin_batched(A, B, s):
-    if _encode_compile_on():
-        try:
-            _raise_encode_recompile_limit()
-            return _score_minargmin_batched_compiled()(A, B, s)
-        except Exception:
-            pass
+    if _compiled_encode_route(B):
+        _raise_encode_recompile_limit()
+        return _score_minargmin_batched_compiled()(A, B, s)
     vs, is_ = [], []
     for i in range(s.shape[-1]):
         v, ix = _score_argmin_eager(A, B, s[:, i:i + 1])
@@ -833,12 +845,9 @@ def _score_min_batched(A, B, s):
 
 
 def _score_argmin(A, B, s):
-    if _encode_compile_on():
-        try:
-            _raise_encode_recompile_limit()
-            return _score_argmin_compiled()(A, B, s)
-        except Exception:
-            pass
+    if _compiled_encode_route(B):
+        _raise_encode_recompile_limit()
+        return _score_argmin_compiled()(A, B, s)
     return _score_argmin_eager(A, B, s)
 
 
@@ -882,7 +891,11 @@ def _stream_moments(x: torch.Tensor, ws: torch.Tensor | None,
 def _moment_rows_step(cb, vec_per_row: int) -> int:
     tables = cb if isinstance(cb, tuple) else (cb,)
     k_max = max(int(t.shape[0]) for t in tables)
-    return max(1, (_SCORE_CHUNK_ELEMS // max(k_max, 1)) // max(vec_per_row, 1))
+    score_elems = _SCORE_CHUNK_ELEMS
+    if (len(tables) == 4
+            and all(int(t.shape[0]) == 128 for t in tables)):
+        score_elems = min(score_elems, _K128_PRODUCT_SCORE_CHUNK_ELEMS)
+    return max(1, (score_elems // max(k_max, 1)) // max(vec_per_row, 1))
 
 
 def _moment_err_groups(moms, s_g: torch.Tensor, grid: str, in_f: int,
@@ -978,13 +991,14 @@ def _argmin_from_moments(moms, wvec, s_g, mode, cb, grid, in_f,
 
 
 def _calibrate_m2_used(w2d, wq2d, grid, mode, cb,
-                       wq_period=None) -> float:
+                       wq_period=None, pilot_moments=None) -> float:
     """Usage-calibrated mean-square codeword coordinate from a pilot encode
     of the tensor's leading rows: the pilot runs the full 16-candidate
     moment-scored sweep, then m2_used = sum(q * dec^2) / sum(q) over the
     pilot's ACTUAL assignments. (The naive all-codeword table m2 lands the
     wrong basin — 2-3x worse error that refits cannot escape; per-tensor
-    pilots also absorb the measured per-role m2 variation.)"""
+    pilots also absorb the measured per-role m2 variation.) ``pilot_moments``
+    may carry the identical-geometry first main chunk so it is not rebuilt."""
     p1 = min(w2d.shape[0], _PILOT_ROWS)
     pilot = w2d[:p1]
     wp2d = wq2d[:p1] if wq2d is not None else None
@@ -1002,7 +1016,8 @@ def _calibrate_m2_used(w2d, wq2d, grid, mode, cb,
         wvec = pilot[r0:r1].reshape(-1, VEC_DIM)
         wqc = (wp2d[r0:r1].reshape(-1, VEC_DIM)
                if wp2d is not None else None)
-        moms = _chunk_moments(wvec, wqc, mode, cb, wq_period)
+        moms = (pilot_moments if r0 == 0 and pilot_moments is not None
+                else _chunk_moments(wvec, wqc, mode, cb, wq_period))
         errs = _moment_err_groups_batched(moms, grid_s[r0:r1], vec_per_group)
         best_col = errs.argmin(dim=-1)
         best_s = torch.gather(grid_s[r0:r1], -1,
@@ -1055,21 +1070,38 @@ def _sweep_encode_moment(w2d: torch.Tensor, grid: str, mode: str, cb,
     encode choices are no worse (equal on unimodal groups)."""
     rows, in_f = w2d.shape
     wq2d = wq.reshape(rows, in_f) if wq is not None else None
-    m2 = _calibrate_m2_used(w2d, wq2d, grid, mode, cb, wq_period)
+    vec_per_row = in_f // VEC_DIM
+    rows_step = _moment_rows_step(cb, vec_per_row)
+
+    # The pilot and first production chunk often cover the identical rows
+    # (DSv4 K33 at 4096 columns; K28 at 8192 columns). Their A/B moments are
+    # read-only and were being built twice. Reuse only at identical row
+    # geometry so the GEMM shape, summation, and serialized argmins cannot
+    # change. Unequal shapes deliberately retain the independent build.
+    pilot_rows = min(rows, _PILOT_ROWS)
+    first_rows = min(rows, rows_step)
+    first_moments = None
+    if pilot_rows == first_rows:
+        first_wvec = w2d[:first_rows].reshape(-1, VEC_DIM)
+        first_wqc = (wq2d[:first_rows].reshape(-1, VEC_DIM)
+                     if wq2d is not None else None)
+        first_moments = _chunk_moments(
+            first_wvec, first_wqc, mode, cb, wq_period)
+    m2 = _calibrate_m2_used(
+        w2d, wq2d, grid, mode, cb, wq_period, first_moments)
     s0 = _analytic_s0(w2d, wq2d, grid, m2)
     grid_s = _tier_scale_grid(s0, w2d, grid, tier)         # (rows, G, S)
     vec_per_group = (FP4_GROUP if grid == "fp4" else in_f) // VEC_DIM
-    vec_per_row = in_f // VEC_DIM
     refits = _TIER_REFITS[tier]
     best_s = torch.empty(rows, s0.shape[1], device=w2d.device)
     enc_parts: list[dict] = []
-    rows_step = _moment_rows_step(cb, vec_per_row)
     for r0 in range(0, rows, rows_step):
         r1 = min(rows, r0 + rows_step)
         wvec = w2d[r0:r1].reshape(-1, VEC_DIM)
         wqc = (wq2d[r0:r1].reshape(-1, VEC_DIM)
                if wq2d is not None else None)
-        moms = _chunk_moments(wvec, wqc, mode, cb, wq_period)
+        moms = (first_moments if r0 == 0 and first_moments is not None
+                else _chunk_moments(wvec, wqc, mode, cb, wq_period))
         # Exhaustive scale grid + assignment in ONE fused batched pass.
         s_c, err, enc, dec = _scan_and_assign(
             moms, wvec, grid_s[r0:r1], mode, cb, grid, in_f, vec_per_group)

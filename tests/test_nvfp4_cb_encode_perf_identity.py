@@ -206,6 +206,124 @@ def test_vq_dist_argmin_fused_matches_eager(device):
 
 
 @pytest.mark.parametrize("device", _DEVICES)
+@pytest.mark.parametrize("periodic", [False, True])
+def test_compiled_score_indices_are_true_argmins(device, periodic):
+    """Check the serialized INDEX, not the minimum value returned beside it.
+
+    A broken min reduction can return a correct-looking value paired with the
+    wrong index.  Both index-producing moment reducers are checked directly
+    against the score plane they claim to minimize, including the compact
+    periodic-A layout used by production imatrix weights.
+    """
+    g = torch.Generator(device="cpu").manual_seed(29)
+    m, p, k, scales = 48, 12, 37, 5
+    B = torch.randn(m, k, generator=g).to(device)
+    A_dense = torch.rand(m, k, generator=g).to(device) + 0.1
+    A = A_dense[:p].clone() if periodic else A_dense
+    if periodic:
+        A_dense = A.repeat(m // p, 1)
+    s = (torch.rand(m, scales, generator=g) + 0.05).to(device)
+
+    direct = ((s * s).unsqueeze(1) * A_dense.unsqueeze(-1)
+              - (2.0 * s).unsqueeze(1) * B.unsqueeze(-1))
+    true_batched = direct.argmin(dim=1)
+    _, got_batched = cb._score_minargmin_batched(A, B, s)
+    assert torch.equal(got_batched, true_batched)
+
+    true_single = direct[:, :, 0].argmin(dim=-1)
+    _, got_single = cb._score_argmin(A, B, s[:, :1])
+    assert torch.equal(got_single, true_single)
+
+
+def test_index_compilers_are_never_called_on_cpu(monkeypatch):
+    """Contain the known torch.compile CPU wrong-index lowering."""
+    monkeypatch.setattr(cb, "_encode_compile_on", lambda: True)
+
+    def forbidden():
+        raise AssertionError("index-producing compiled route reached on CPU")
+
+    monkeypatch.setattr(cb, "_vq_dist_argmin_compiled", forbidden)
+    monkeypatch.setattr(cb, "_score_argmin_compiled", forbidden)
+    monkeypatch.setattr(cb, "_score_minargmin_batched_compiled", forbidden)
+
+    term1 = torch.randn(8, 11)
+    term2 = torch.randn(8, 11)
+    assert torch.equal(cb._vq_dist_argmin(term2, term1),
+                       cb._vq_dist_argmin_eager(term2, term1))
+
+    A = torch.rand(8, 11)
+    B = torch.randn(8, 11)
+    s = torch.rand(8, 3)
+    _, single = cb._score_argmin(A, B, s[:, :1])
+    _, single_ref = cb._score_argmin_eager(A, B, s[:, :1])
+    assert torch.equal(single, single_ref)
+    _, batched = cb._score_minargmin_batched(A, B, s)
+    direct = ((s * s).unsqueeze(1) * A.unsqueeze(-1)
+              - (2.0 * s).unsqueeze(1) * B.unsqueeze(-1))
+    assert torch.equal(batched, direct.argmin(dim=1))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_compiled_score_indices_survive_interleaved_k_specializations():
+    """A mixed-rung campaign must not reuse a wrong K specialization."""
+    g = torch.Generator(device="cpu").manual_seed(41)
+    cases = []
+    for k in (128, 256, 512, 128):
+        A = (torch.rand(64, k, generator=g) + 0.1).cuda()
+        B = torch.randn(64, k, generator=g).cuda()
+        s = (torch.rand(64, 4, generator=g) + 0.05).cuda()
+        cases.append((A, B, s))
+    for A, B, s in cases:
+        direct = ((s * s).unsqueeze(1) * A.unsqueeze(-1)
+                  - (2.0 * s).unsqueeze(1) * B.unsqueeze(-1))
+        _, got = cb._score_minargmin_batched(A, B, s)
+        assert torch.equal(got, direct.argmin(dim=1))
+
+
+def test_k28_product_uses_measured_score_chunk_cap():
+    tables = tuple(torch.empty(128, 2) for _ in range(4))
+    assert cb._moment_rows_step(tables, 512) == 512
+    mixed = (torch.empty(512, 2),) + tables[1:]
+    assert cb._moment_rows_step(mixed, 512) == 256
+
+
+def test_matching_pilot_and_first_chunk_reuse_identical_moments(
+        monkeypatch):
+    """The calibration pilot must not rebuild an identical first chunk."""
+    monkeypatch.setenv("PRISMAQUANT_CB_ENCODE_COMPILE", "0")
+    g = torch.Generator(device="cpu").manual_seed(53)
+    rows, in_f = 8, 256
+    w = torch.randn(rows, in_f, generator=g)
+    cw = torch.rand(in_f, generator=g) + 0.1
+    wq = cw.reshape(1, -1).expand_as(w).contiguous()
+    tables = tuple(torch.randn(2, 2, generator=g) for _ in range(4))
+    period = in_f // cb.VEC_DIM
+    wvec = w.reshape(-1, cb.VEC_DIM)
+    wqvec = wq.reshape(-1, cb.VEC_DIM)
+    moments = cb._chunk_moments(
+        wvec, wqvec, "product", tables, period)
+
+    cold = cb._calibrate_m2_used(
+        w, wq, "fp8", "product", tables, period)
+    reused = cb._calibrate_m2_used(
+        w, wq, "fp8", "product", tables, period, moments)
+    assert cold == reused
+
+    original = cb._chunk_moments
+    calls = 0
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(cb, "_chunk_moments", counted)
+    cb._sweep_encode_moment(
+        w, "fp8", "product", tables, wq, "fast", period)
+    assert calls == 1
+
+
+@pytest.mark.parametrize("device", _DEVICES)
 def test_periodic_split_only_fires_on_true_periodicity(device):
     """The compact-A shortcut must never claim a period it does not have."""
     B = torch.zeros(64, 8, device=device)
