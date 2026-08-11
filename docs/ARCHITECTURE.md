@@ -1,6 +1,6 @@
 # PrismaQuant Architecture
 
-As of: 2026-08-10 · branch `perf/ldlq-atom-compile` · verified against implementation
+As of: 2026-08-11 · branch `perf/ldlq-atom-compile` · verified against implementation
 baseline commit `8620099` plus the learned-codebook producer contract and the
 DeepSeek DSpark source-overlay contract,
 with the external Gridbook runtime pinned to release commit
@@ -866,6 +866,33 @@ not a heuristic; unregistered formats never short-circuit, and an entry declarin
 `cost_source` (the production-render pipeline, whose `weight_mse` is a placeholder) is never
 treated as bit-exact.
 
+**A candidate may not be larger than the source representation it replaces.** This is a
+default-on allocator legality invariant, not a cost-model preference and not an environment
+toggle: for every unit with an exact shape and a source census, the integer comparison is
+`candidate_payload_bytes <= source_payload_bytes` (equality is legal). The source kind resolves
+through `SOURCE_PASSTHROUGH_CONTRACTS` to the registered format that owns a scaled physical
+layout; ordinary FP16/FP32/etc. tensors retain their safetensors dtype and resolve through
+`footprint.py`'s existing dtype-width authority. An explicit unknown, unreadable, or heterogeneous
+owner is rejected rather than assigned a guessed scalar bpp (`source_footprint_owner_for_kind`,
+`allocator_candidates.py`). Candidate and source bytes share `footprint.py`'s exact tensor
+payload helpers, so registered formats use `memory_bytes_for_shape`, plain dtypes use their
+serialized element width, and CB formats use their versioned serialization context, including
+row scales/layout rather than the nominal `FormatSpec` approximation. The
+per-unit comparison deliberately excludes shared/deduplicated sidecars, which remain charged
+once by whole-assignment accounting. `_source_bpp_applicability`
+(`allocator_candidates.py:392-469`) performs the exact-byte test before the candidate reaches
+the DP; a legacy/offline call with no source census is explicitly `not_evaluated`, while a
+present but unknown source kind aborts candidate construction before a unit can disappear.
+
+Every elimination is auditable in `format_applicability.json`, not just counted in a console
+line. Its `source_bpp_legality` provenance carries schema
+`prismaquant.source_bpp_legality.v1`, the comparison and derivation rules, the no-census and
+unknown-kind policies, an explicit evaluated/not-evaluated status, `eliminated_count`, and the complete sorted `eliminated_candidates`
+records. Each `candidate_exceeds_source_bpp` record names the qname, shape, source kind/format,
+candidate format, exact source/candidate payload bytes, floating bpp readouts, and their integer
+bit numerators plus common parameter denominator (`allocator_candidates.py:442-467,1754-1842`;
+report emission `allocator.py:2994-3033`).
+
 **Opt-in gate_up/down role split** (#21, `237a029`). `--packed-role-split`
 (`allocator.py:1289-1300`) keys each packed expert group as two per-layer serving units
 (gate+up, down) by wrapping the profile view (`packed_role_split_profile`,
@@ -1071,7 +1098,7 @@ pricing and emulation. Registry-vs-callable consistency is pinned by
 | `MXFP8_E4M3` | `:720-728` | 8 / 32 / e8m0 | 8.25 | Registered, profile-allowed, **de-menued** |
 | `NVFP4A16`, `MXFP4`, `MXFP6_E3M2/E2M3`, `MXFP8A16`, `MXFP8_E5M2`, `FP8_E5M2`, `INT8_W8A16`, `INT4_W4A16_g128` | `:678-795` | — | — | Research / registry-only |
 | GGUF k-quants + IQ | `:884-902` | `_make_gguf_spec :864` | 2.0625–8.5 | GGUF lane (§9.3) |
-| `NVFP4_CB_K12..K24` / `FP8_CB_K28..K48` | `:913`, `:954` | product-VQ codebook, g256 | 1.78125–3.28125 serialized body / 3.5–6.0 index stream plus row scales | production gridbook CB menu; learned rendering is FP8 K28–K43 only, while K44–K47 are measurement-pending and K48 is rejected (§9.2) |
+| `NVFP4_CB_K12..K24` / `FP8_CB_K28..K48` | `:913`, `:954` | product-VQ codebook, g256 | 1.78125–3.28125 serialized body / 3.5–6.0 index stream plus row scales | production gridbook CB menu; learned rendering is enabled through FP8 K46, while K47/K48 are measured NO-GO (§9.2) |
 | `NVFP4_CB_S13..S16` | `:932` | signed codebook, g256 | legacy/research layout | decoder/export compatible, production-menu denied (§9.2) |
 
 MXFP8 is de-menued rather than denied — `vllm_packed_moe` still allows `MXFP8_E4M3` — because
@@ -1385,6 +1412,7 @@ silently corrupts.
 | Multi-format menu must not resolve to `DefaultProfile` | `validate_default_profile_format_menu` `allocator.py:961-988`, called `:1550-1554` | silently produces the fused-coherence bug class above |
 | Final serving promotion is a no-op | `validate_final_serving_promotion_noop` `allocator.py:1046-1063`, called `:2669` | a late promotion means the DP priced an assignment that is not the one shipped |
 | Passthrough integrity (BF16/FP8_SOURCE only if the source already is) | `allocator_candidates.py:24-27`, `:112-120`; export judges it against the *same* `_scan_source_dtype_manifest` vocabulary (§6.3) | synthesising BF16 from a dequantised FP8 source burns 8 bpp for nothing |
+| A candidate's exact per-unit payload never exceeds its known source-format payload | scaled owners derive from `SOURCE_PASSTHROUGH_CONTRACTS`, plain owners from their safetensors dtype; exact integer-byte gate `_source_bpp_applicability`; common byte authority in `footprint.py`; complete eliminations persisted under `format_applicability.json:source_bpp_legality` | without the gate, a quality-favoured rung can spend more bytes than the representation it replaces while still appearing in a compression frontier; an unknown source owner could hide the same error behind a guessed bpp |
 | Every format in the assignment must have an emit path | `EXPORTABLE_FORMATS` `:7517`, checked `:1548`; the serving profile's `export_lane.codec_formats_from` bounds the allocator's menu by that same constant (`serving_profiles.py:252-330`) | a format with no `config_groups` scheme used to be silently rewritten to BF16 at 16 bpp, blowing the selected byte budget (#27) |
 | Registry ↔ served metadata agree on bits/group | **not enforced** — `FormatSpec` (`format_registry.py:44-168`) and the export `*_SCHEME` constants (`:7247-7336`) are independent sources of truth with no reconciling test | a divergence mis-prices bpp or mis-declares the served scheme; §12 D17 |
 
@@ -2310,17 +2338,20 @@ Gridbook's fail-closed verifier (`cb_export_config.py:781-819`; pinned Gridbook
 0.8.2 `gridbook/cb_digest.py:72-114`).
 
 The learned rung ceiling is a measurement policy table, not the product
-bit-split's 2,048-entry structural rule (`cb_learned_bundle.py:54-95`):
+bit-split's 2,048-entry structural rule (`cb_learned_bundle.py:55-134`):
 
 | FP8-CB rung | learned production policy | provenance meaning |
 |---|---|---|
 | K28–K43 | enabled | K28/K33/K38/K43 are directly measured GO cells; interior rungs are admitted by the certified K43 boundary and labelled as such rather than falsely claiming a per-rung measurement |
-| K44–K47 | disabled, measurement pending | the sweep-matched per-rung run must update the table before any of these rungs can emit learned refs |
-| K48 | rejected, measured NO-GO | learned placement is measured 54–98% worse than lattice |
+| K44 | enabled, measured GO | sweep-matched CBL/lattice ratio **0.6057** (`dq-runs/dsv4-quality-hybrid/sfd-analysis/cbl_k43_k47.log:31`) |
+| K45 | enabled, measured GO | sweep-matched CBL/lattice ratio **0.6929** (`dq-runs/dsv4-quality-hybrid/sfd-analysis/cbl_k43_k47.log:40`) |
+| K46 | enabled, measured GO | sweep-matched CBL/lattice ratio **0.8312** (`dq-runs/dsv4-quality-hybrid/sfd-analysis/cbl_k43_k47.log:51`) |
+| K47 | rejected, measured NO-GO | sweep-matched CBL/lattice ratio **1.0689** (`dq-runs/dsv4-quality-hybrid/sfd-analysis/cbl_k43_k47.log:60`) |
+| K48 | rejected, measured NO-GO | learned placement is measured 54–98% worse than lattice (`transfer-study-fable-verify/F1_GENERALIZATION.md`) |
 
 `require_cbl_rung_enabled` is called both when a bundle is trained and when it
 is loaded, so editing a menu or presenting an old bundle cannot bypass this
-ceiling (`cb_learned_bundle.py:122-145,583-590,888-895`).
+ceiling (`cb_learned_bundle.py:160-183,628,929`).
 
 **Dense serving is already role-distinct; routed-MoE serving is not.** At the
 pinned 0.8.2 commit, Gridbook's dense loader reads `codebook_ref` inside its

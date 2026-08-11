@@ -8,6 +8,7 @@ import torch.nn as nn
 
 from prismaquant import format_registry as fr
 from prismaquant.allocator_candidates import (
+    SOURCE_BPP_EXCEEDED_REASON,
     _scan_source_dtype_manifest,
     cost_entry_source,
 )
@@ -170,7 +171,7 @@ class TestPrismaQuantAllocatorMath(unittest.TestCase):
             "grouped_kl_share",
         )
 
-    def test_build_candidates_prices_source_fp8_below_mxfp8(self):
+    def test_build_candidates_rejects_mxfp8_above_source_fp8(self):
         stats = {
             "layer.weight": {
                 "h_trace": 2.0,
@@ -185,21 +186,23 @@ class TestPrismaQuantAllocatorMath(unittest.TestCase):
                 "MXFP8": {"weight_mse": 0.01},
             }
         }
+        masks = []
         cands = build_candidates(
             stats,
             costs,
             [fr.get_format("FP8_SOURCE"), fr.get_format("MXFP8")],
             source_manifest={"layer.weight": "fp8"},
+            mask_records=masks,
         )
         by_fmt = {cand.fmt: cand for cand in cands["layer.weight"]}
 
-        self.assertLess(
-            by_fmt["FP8_SOURCE"].bits_per_param,
-            by_fmt["MXFP8_E4M3"].bits_per_param,
-        )
+        self.assertNotIn("MXFP8_E4M3", by_fmt)
         self.assertEqual(by_fmt["FP8_SOURCE"].memory_bytes, 128 * 128 + 4)
         self.assertAlmostEqual(by_fmt["FP8_SOURCE"].bits_per_param, 8.001953125)
-        self.assertAlmostEqual(by_fmt["MXFP8_E4M3"].bits_per_param, 8.25)
+        self.assertEqual(len(masks), 1)
+        self.assertEqual(masks[0]["reason"], SOURCE_BPP_EXCEEDED_REASON)
+        self.assertAlmostEqual(masks[0]["source_bpp"], 8.001953125)
+        self.assertAlmostEqual(masks[0]["candidate_bpp"], 8.25)
 
     def test_source_dtype_manifest_uses_profile_name_mapping(self):
         with tempfile.TemporaryDirectory() as td:
@@ -217,7 +220,7 @@ class TestPrismaQuantAllocatorMath(unittest.TestCase):
 
         self.assertEqual(
             manifest,
-            {"model.layers.0.mlp.gate_proj": "fp8"},
+            {"model.layers.0.mlp.gate_proj": "unknown"},
         )
 
     def test_source_dtype_manifest_reads_tensor_dtype_and_scale_sidecars(self):
@@ -238,11 +241,11 @@ class TestPrismaQuantAllocatorMath(unittest.TestCase):
             manifest = _scan_source_dtype_manifest(td)
 
         self.assertEqual(manifest["bf"], "bf16")
-        self.assertEqual(manifest["fp16"], "other")
-        self.assertEqual(manifest["fp32"], "other")
+        self.assertEqual(manifest["fp16"], "f16")
+        self.assertEqual(manifest["fp32"], "f32")
         self.assertEqual(manifest["ct"], "fp8")
 
-    def test_build_candidates_rejects_bf16_when_manifest_entry_missing(self):
+    def test_build_candidates_rejects_missing_source_rate_owner(self):
         stats = {
             "layer": {
                 "h_trace": 2.0,
@@ -258,14 +261,15 @@ class TestPrismaQuantAllocatorMath(unittest.TestCase):
             }
         }
 
-        cands = build_candidates(
-            stats,
-            costs,
-            [fr.get_format("BF16"), fr.get_format("NVFP4")],
-            source_manifest={},
-        )
-
-        self.assertEqual([cand.fmt for cand in cands["layer"]], ["NVFP4"])
+        with self.assertRaisesRegex(
+            ValueError, "source-bpp legality cannot be established"
+        ):
+            build_candidates(
+                stats,
+                costs,
+                [fr.get_format("BF16"), fr.get_format("NVFP4")],
+                source_manifest={},
+            )
 
     def test_source_dtype_manifest_uses_profile_fp8_scale_pairs(self):
         class _ScaleProfile:

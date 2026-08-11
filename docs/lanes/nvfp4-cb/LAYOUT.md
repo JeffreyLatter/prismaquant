@@ -34,8 +34,8 @@ scale) and feeds the existing CUTLASS FP4 path unchanged.
 
 Learned codebooks do **not** introduce `CBL_*` format names. They are a
 value-bearing rendering mode for the same FP8-CB wire formats. The current
-producer policy permits learned FP8-CB only at K28–K43, keeps K44–K47 disabled
-pending per-rung measurement, and rejects measured-NO-GO K48; lattice rendering
+producer policy permits learned FP8-CB through K46 and rejects measured-NO-GO
+K47/K48; lattice rendering
 retains the full K28–K48 ladder (`prismaquant/cb_learned_bundle.py:55-145`).
 
 **Hard constraint:** `in_features % 256 == 0` (the 256-weight superblock is both
@@ -311,7 +311,10 @@ Learned FP8 eligibility is enforced from the data table
 | rungs | state | provenance |
 |---|---|---|
 | K28–K43 | enabled for production | K28/K33/K38/K43 are directly measured GO; each intermediate row says explicitly that it is admitted by the measured K43 boundary, not by a fabricated per-rung result |
-| K44–K47 | disabled | sweep-matched per-rung measurement pending |
+| K44 | enabled for production | sweep-matched CBL/lattice holdout act-MSE ratio 0.6057 (`dq-runs/dsv4-quality-hybrid/sfd-analysis/cbl_k43_k47.log:31`) |
+| K45 | enabled for production | sweep-matched ratio 0.6929 (`cbl_k43_k47.log:40`) |
+| K46 | enabled for production | sweep-matched ratio 0.8312 (`cbl_k43_k47.log:51`) |
+| K47 | rejected | sweep-matched ratio 1.0689 (`cbl_k43_k47.log:60`) |
 | K48 | rejected | measured 54–98% worse than lattice |
 
 Both bundle creation and bundle load call `require_cbl_rung_enabled`, so a stale

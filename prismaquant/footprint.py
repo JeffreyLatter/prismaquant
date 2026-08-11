@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import glob
 import json
+import math
 import os
 import re
 import struct
@@ -81,6 +82,98 @@ _ST_DTYPE_BYTES = {
 }
 
 GB = 1_000_000_000.0  # decimal GB, matching index.json total_size reporting
+
+
+def format_tensor_payload_breakdown(
+    format_spec_or_name: fr.FormatSpec | str,
+    shape: tuple[int, ...],
+    *,
+    qname: str,
+    cb_serialization_context: CBSerializationContext | None = None,
+) -> dict:
+    """Return the exact additive payload for one candidate tensor.
+
+    This is the per-unit primitive shared by allocator legality, candidate
+    pricing, and whole-assignment footprint accounting.  It deliberately
+    excludes shared/deduplicated sidecars: a candidate is compared with the
+    source representation of the same unit, while assignment-level accounting
+    pays each shared codebook once.
+
+    CB formats cannot use their nominal :class:`FormatSpec` byte formula;
+    their row scales and versioned layout live in
+    :func:`cb_tensor_payload_breakdown`.  All other formats use the registered
+    shape-exact producer formula.
+    """
+    spec = (
+        format_spec_or_name
+        if isinstance(format_spec_or_name, fr.FormatSpec)
+        else fr.get_format(str(format_spec_or_name))
+    )
+    canonical = fr.canonical_format_name(spec.name)
+    dims = tuple(int(dim) for dim in shape)
+    if is_cb_format(canonical):
+        if cb_serialization_context is None:
+            raise ValueError(
+                f"{qname}: exact bytes for {canonical} require an explicit "
+                "CBSerializationContext (scale coding/layout + codebook "
+                "identity); refusing to price the legacy FormatSpec "
+                "approximation"
+            )
+        return cb_tensor_payload_breakdown(
+            canonical,
+            dims,
+            qname=qname,
+            context=cb_serialization_context,
+        )
+
+    payload_bytes = int(spec.memory_bytes_for_shape(dims))
+    return {
+        "format": canonical,
+        "shape": list(dims),
+        "params": int(math.prod(dims)) if dims else 1,
+        "tensor_payload_bytes": payload_bytes,
+        "identity_key": None,
+        "sidecar_identity_key": None,
+        "sidecar_payload_bytes": 0,
+    }
+
+
+def plain_source_dtype_tensor_payload_breakdown(
+    source_dtype: str,
+    shape: tuple[int, ...],
+) -> dict:
+    """Return exact bytes for a source tensor with no scale sidecars.
+
+    ``_scan_source_dtype_manifest`` preserves the safetensors dtype token for
+    ordinary FP16/FP32/integer sources.  The byte width comes from this
+    module's existing safetensors dtype authority, not from an allocator bpp
+    table.  Block-scaled FP8 and MXFP4 never use this path: their census kinds
+    resolve to registered source formats that include their scale planes.
+    """
+    dtype = str(source_dtype).strip().upper()
+    fp_alias = re.fullmatch(r"FP([0-9]+)", dtype)
+    if fp_alias is not None:
+        dtype = f"F{fp_alias.group(1)}"
+    try:
+        element_bytes = int(_ST_DTYPE_BYTES[dtype])
+    except KeyError as exc:
+        raise ValueError(
+            f"source dtype {source_dtype!r} has no safetensors storage-width "
+            "entry"
+        ) from exc
+    dims = tuple(int(dim) for dim in shape)
+    if not dims or any(dim <= 0 for dim in dims):
+        raise ValueError(
+            f"source dtype {dtype} needs a positive tensor shape, got {dims}"
+        )
+    n_params = int(math.prod(dims))
+    return {
+        "source_dtype": dtype,
+        "shape": list(dims),
+        "params": n_params,
+        "tensor_payload_bytes": n_params * element_bytes,
+        "element_storage_bytes": element_bytes,
+    }
 
 
 def _read_safetensors_header(path: str) -> dict:

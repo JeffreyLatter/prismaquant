@@ -52,10 +52,10 @@ GRIDBOOK_PIN_VERSION = "0.8.2"
 GRIDBOOK_PIN_COMMIT = "9f915dd868eab2e13ab7847a67c594e2c5c8955c"
 
 
-# This is a measurement policy table, not a structural bit-split rule.  In
-# particular K44 remains disabled even though its largest product subtable has
-# only 2048 entries.  The running K44--K47 sweep can update individual rows
-# without changing the trainer or inventing a new format name.
+# This is a measurement policy table, not a structural bit-split rule.  K44,
+# K45, and K46 are enabled by their own completed sweep-matched measurements;
+# K47 is independently disabled by its completed NO-GO result. Rows can change
+# one at a time without inventing a maximum-rung proxy.
 CBL_RUNG_POLICY: dict[int, dict[str, object]] = {
     rung: {
         "enabled": True,
@@ -80,13 +80,46 @@ CBL_RUNG_POLICY: dict[int, dict[str, object]] = {
     for rung in range(28, 44)
 }
 CBL_RUNG_POLICY.update({
-    rung: {
+    44: {
+        "enabled": True,
+        "status": "measured_go_sweep_matched",
+        "provenance": (
+            "dq-runs/dsv4-quality-hybrid/sfd-analysis/"
+            "cbl_k43_k47.log:31"
+        ),
+        "cbl_over_lattice_base_ratio": 0.6057,
+        "note": "sweep-matched holdout activation-MSE: CBL is 39.43% better",
+    },
+    45: {
+        "enabled": True,
+        "status": "measured_go_sweep_matched",
+        "provenance": (
+            "dq-runs/dsv4-quality-hybrid/sfd-analysis/"
+            "cbl_k43_k47.log:40"
+        ),
+        "cbl_over_lattice_base_ratio": 0.6929,
+        "note": "sweep-matched holdout activation-MSE: CBL is 30.71% better",
+    },
+    46: {
+        "enabled": True,
+        "status": "measured_go_sweep_matched",
+        "provenance": (
+            "dq-runs/dsv4-quality-hybrid/sfd-analysis/"
+            "cbl_k43_k47.log:51"
+        ),
+        "cbl_over_lattice_base_ratio": 0.8312,
+        "note": "sweep-matched holdout activation-MSE: CBL is 16.88% better",
+    },
+    47: {
         "enabled": False,
-        "status": "measurement_pending",
-        "provenance": "2026-08-10 sweep-matched K43--K47 run pending",
-        "note": "disabled until the per-rung measurement is recorded",
-    }
-    for rung in range(44, 48)
+        "status": "measured_no_go_sweep_matched",
+        "provenance": (
+            "dq-runs/dsv4-quality-hybrid/sfd-analysis/"
+            "cbl_k43_k47.log:60"
+        ),
+        "cbl_over_lattice_base_ratio": 1.0689,
+        "note": "sweep-matched holdout activation-MSE: CBL is 6.89% worse",
+    },
 })
 CBL_RUNG_POLICY[43] = {
     "enabled": True,

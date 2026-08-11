@@ -231,7 +231,7 @@ def test_source_dtype_manifest_classifies_packed_expert_params(tmp_path):
     assert manifest[
         "model.layers.0.feed_forward.experts.down_proj"] == "bf16"
     assert manifest["model.layers.0.self_attn.q_proj"] == "bf16"
-    assert manifest["model.layers.0.self_attn.k_proj"] == "other"
+    assert manifest["model.layers.0.self_attn.k_proj"] == "f32"
 
 
 def test_source_dtype_manifest_classifies_mtp_tensors(tmp_path):

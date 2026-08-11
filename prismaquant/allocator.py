@@ -2484,9 +2484,10 @@ def main():
             print(f"[alloc] WARNING: {args.calibration} has no usable "
                   f"calibrated_gains; running uncalibrated", flush=True)
 
-    # Source-dtype manifest drives passthrough-integrity filtering in
-    # build_candidates. None when model path is unknown — candidates
-    # fall back to cost-pickle-only gating (pre-passthrough behavior).
+    # Source-dtype manifest drives passthrough-integrity filtering and the
+    # exact candidate-payload <= source-payload gate in build_candidates.
+    # None when model path is unknown — legacy/offline allocations cannot
+    # evaluate either source-dependent rule.
     source_manifest: dict[str, str] | None = None
     if probe_model_path:
         source_manifest = _scan_source_dtype_manifest(
@@ -2554,6 +2555,7 @@ def main():
                 qname=name,
                 source_kind=source_kind,
                 target_profile=target_profile,
+                cb_serialization_context=cb_serialization_context,
             )
             if not verdict.legal:
                 continue
@@ -3024,7 +3026,13 @@ def main():
         "activation_fair_pricing": activation_pricing.as_dict(),
         "cb_ladder_cross_family_verdict": cross_family_verdict,
         "serving_lanes": serving_lane_catalog(target_profile),
-        **summarize_applicability_masks(candidate_mask_records),
+        **summarize_applicability_masks(
+            candidate_mask_records,
+            source_census_present=source_manifest is not None,
+            source_census_units=(
+                len(source_manifest) if source_manifest is not None else None
+            ),
+        ),
     }
     applicability_report_path.write_text(
         json.dumps(applicability_payload, indent=2, sort_keys=True) + "\n"

@@ -8,10 +8,10 @@ cost-ldlq/transfer-study-fable-verify/BURN_INTEGRATION_CBL.md and
 gates_amended.json (ALL PASS, 2026-08-05).
 
 Semantics registered here:
-  * adopted rungs {28,33,38,43}: pooled learned product book per
+  * measurement-enabled rungs: pooled learned product book per
     (layer, projection, rung), one-shot cand-0 scales, weighted assignment,
     NO scale sweep, NO LDLQ ("cbl_poolb").
-  * all other rungs (K48 incl. audit draws): incumbent sweep WITHOUT LDLQ
+  * disabled/NO-GO rungs (K47/K48 included): incumbent sweep WITHOUT LDLQ
     ("incumbent_sweep_noldlq") — operator decision 2026-08-05: LDLQ leaves
     the measurement loop (export-time A/B decides "if at all").
   * books are ARTIFACTS: content-addressed under RUN_ROOT/bucket-books/,
@@ -35,6 +35,7 @@ from safetensors.torch import save_file
 
 from prismaquant import nvfp4_cb_formats as cb
 from prismaquant.cb_learned_bundle import (
+    CBL_RUNG_POLICY,
     LLOYD_CAP,
     LLOYD_ITERS,
     LLOYD_ROW_SAMPLE,
@@ -48,11 +49,9 @@ from tools import dsv4_ldlq_cost_campaign as _ldlq_campaign
 from tools.dsv4_ldlq_cost_campaign import RUN_ROOT
 
 CBL_ADOPTED_RUNGS = frozenset({28, 33, 38})  # the anchor set; books are
-# always banked here.  Encoder dispatch no longer keys on membership —
-# see cbl_eligible (semantics v2).
-CBL_ELIGIBLE_MAX_RUNG = 44  # registered 2048 rule: every product sub-table
-# holds <= 2048 entries through K44; K45+ stays incumbent everywhere.
-CBL_SEMANTICS_SCHEMA = "prismaquant.dsv4_cbl_measurement_semantics.v2"
+# always banked here. Encoder dispatch consults the shared per-rung measured
+# policy instead of membership or a structural maximum.
+CBL_SEMANTICS_SCHEMA = "prismaquant.dsv4_cbl_measurement_semantics.v3"
 BOOK_ROOT = RUN_ROOT / "bucket-books"
 AUDIT_N = 16
 AUDIT_SALT = "cbl-audit-v1"
@@ -61,21 +60,21 @@ MICROCHECK_K43_MEDIAN_MAX = -0.10      # registered first-layer drift gate
 
 
 def cbl_eligible(rung) -> bool:
-    """Semantics v2 dispatch rule: CBL wherever the 2048 rule admits it.
+    """Dispatch CBL only when that exact rung's measured policy enables it."""
 
-    Every measured rung <= K44 is encoded with the pooled learned book, so
-    anchors, the audit draw, fallback interiors, and demand extensions all
-    share one basis; the menu can never mix encoder families below K45."""
-    return int(rung) <= CBL_ELIGIBLE_MAX_RUNG
+    return CBL_RUNG_POLICY.get(int(rung), {}).get("enabled") is True
 
 
 SEMANTICS_STAMP = {
     "schema": CBL_SEMANTICS_SCHEMA,
     "adopted_rungs": sorted(CBL_ADOPTED_RUNGS),
     "priced_domain": [28, 38],
-    "above_ceiling_policy": "demand_extension_or_native_fp8_fallback",
-    "cbl_dispatch": "eligible_le_k44",
-    "eligible_max_rung": CBL_ELIGIBLE_MAX_RUNG,
+    "disabled_rung_policy": "incumbent_sweep_noldlq",
+    "cbl_dispatch": "per_rung_measurement_policy",
+    "cbl_rung_policy": {
+        str(rung): dict(policy)
+        for rung, policy in sorted(CBL_RUNG_POLICY.items())
+    },
     "audit_basis": "cbl",
     "interp_coordinate": "hierarchical_law_v1_two_probe",
     "interp_anchors": [29, 35],

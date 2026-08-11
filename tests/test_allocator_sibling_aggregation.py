@@ -351,7 +351,8 @@ def test_fused_group_with_disjoint_member_menus_hard_errors():
     layer = "model.layers.0.self_attn"
     q, k = f"{layer}.q_proj", f"{layer}.k_proj"
     stats = {
-        # q_proj: fp16 source -> BF16 passthrough illegal (never synthesize).
+        # q_proj: FP16 source -> BF16 passthrough illegal (never synthesize),
+        # while NVFP4 remains below the source rate.
         q: {"h_trace": 0.5, "n_params": 4096 * 4096,
             "in_features": 4096, "out_features": 4096},
         # k_proj: in_features not divisible by the NVFP4 group -> masked.
@@ -366,7 +367,7 @@ def test_fused_group_with_disjoint_member_menus_hard_errors():
     specs = _format_specs()
     cands = build_candidates(
         stats, costs, specs,
-        source_manifest={q: "other", k: "bf16"},
+        source_manifest={q: "f16", k: "bf16"},
     )
     assert [c.fmt for c in cands[q]] == ["NVFP4"]
     assert [c.fmt for c in cands[k]] == ["BF16"]

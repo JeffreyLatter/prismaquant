@@ -68,11 +68,27 @@ def test_rung_policy_is_measurement_gated_not_the_2048_rule():
     assert bundle.require_cbl_rung_enabled(28) == 28
     assert bundle.require_cbl_rung_enabled("FP8_CB_K43") == 43
     assert bundle.CBL_RUNG_POLICY[43]["enabled"] is True
-    assert bundle.CBL_RUNG_POLICY[44]["enabled"] is False
-    assert bundle.CBL_RUNG_POLICY[47]["status"] == "measurement_pending"
+    expected_new_measurements = {
+        44: (0.6057, "cbl_k43_k47.log:31"),
+        45: (0.6929, "cbl_k43_k47.log:40"),
+        46: (0.8312, "cbl_k43_k47.log:51"),
+    }
+    for rung, (ratio, provenance) in expected_new_measurements.items():
+        policy = bundle.CBL_RUNG_POLICY[rung]
+        assert bundle.require_cbl_rung_enabled(rung) == rung
+        assert policy["enabled"] is True
+        assert policy["status"] == "measured_go_sweep_matched"
+        assert policy["cbl_over_lattice_base_ratio"] == pytest.approx(ratio)
+        assert str(policy["provenance"]).endswith(provenance)
+    assert bundle.CBL_RUNG_POLICY[47]["status"] == (
+        "measured_no_go_sweep_matched"
+    )
+    assert bundle.CBL_RUNG_POLICY[47]["cbl_over_lattice_base_ratio"] == (
+        pytest.approx(1.0689)
+    )
     assert bundle.CBL_RUNG_POLICY[48]["status"] == "measured_no_go"
-    with pytest.raises(ValueError, match=r"K44.*measurement_pending"):
-        bundle.require_cbl_rung_enabled(44)
+    with pytest.raises(ValueError, match=r"K47.*measured_no_go_sweep_matched"):
+        bundle.require_cbl_rung_enabled(47)
     with pytest.raises(ValueError, match=r"K48.*measured_no_go"):
         bundle.require_cbl_rung_enabled("FP8_CB_K48")
     with pytest.raises(ValueError, match="NVFP4 CBL is measured NO-GO"):
@@ -299,12 +315,12 @@ def test_builder_refuses_uncertified_rung_before_training(tmp_path, monkeypatch)
 
     monkeypatch.setattr(bundle, "learn_pool", should_not_train)
     qname = "model.layers.0.self_attn.q_proj"
-    with pytest.raises(ValueError, match=r"K44.*measurement_pending"):
+    with pytest.raises(ValueError, match=r"K47.*measured_no_go_sweep_matched"):
         bundle.train_and_save_bundle(
-            tmp_path / "k44.pqcb",
+            tmp_path / "k47.pqcb",
             weights={qname: torch.zeros(2, 256)},
             col_weights={qname: torch.ones(256)},
-            formats=("FP8_CB_K44",),
+            formats=("FP8_CB_K47",),
         )
     assert called is False
 
@@ -319,6 +335,17 @@ def test_certified_kernel_is_cpu_deterministic_and_tool_delegates(monkeypatch):
     assert all(torch.equal(left, right) for left, right in zip(first, second))
 
     from tools import dsv4_cbl_kernels as study
+
+    assert all(study.cbl_eligible(rung) for rung in (44, 45, 46))
+    assert not study.cbl_eligible(47)
+    assert not study.cbl_eligible(48)
+    assert study.SEMANTICS_STAMP["cbl_dispatch"] == (
+        "per_rung_measurement_policy"
+    )
+    assert "eligible_max_rung" not in study.SEMANTICS_STAMP
+    assert study.SEMANTICS_STAMP["cbl_rung_policy"]["46"] == (
+        bundle.CBL_RUNG_POLICY[46]
+    )
 
     marker = object()
     monkeypatch.setattr(study, "_certified_learn_pool", lambda *_args: marker)
