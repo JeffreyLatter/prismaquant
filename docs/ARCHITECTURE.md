@@ -1,7 +1,8 @@
 # PrismaQuant Architecture
 
-As of: 2026-08-09 · branch `integration/dsv4-ldlq-export` · verified against implementation
-baseline commit `cf0420e` plus the DeepSeek DSpark source-overlay contract,
+As of: 2026-08-10 · branch `perf/ldlq-atom-compile` · verified against implementation
+baseline commit `8620099` plus the learned-codebook producer contract and the
+DeepSeek DSpark source-overlay contract,
 with the external Gridbook runtime pinned to release commit
 `9f915dd` (v0.8.2). The pin advanced 0.8.1 → 0.8.2 in this release because the
 DSV4-Flash serving images are built from that runtime, not from 0.8.1: declaring
@@ -219,12 +220,16 @@ flowchart TD
   SRC["source checkpoint<br/>HF safetensors"]
   PROBE["[1/4] incremental_probe -- run-pipeline.sh:544-560<br/>per-Linear empirical Fisher h_trace<br/>artifacts/probe.pkl"]
   ACT["activation cache<br/>WORK_DIR/act"]
+  CBL["learned-CB pre-render gate (scope fp8)<br/>immutable value-bearing CB_CODEBOOK_BUNDLE<br/>trained once before cost/cache/KL/export"]
   BASE["[2/4] incremental_measure_quant_cost -- :645-658<br/>RTN per-Linear-per-format error<br/>cost.pkl (local) or cost_baseline.pkl"]
 
   SRC --> PROBE
   PROBE --> ACT
+  SRC --> CBL
+  ACT --> CBL
   PROBE --> BASE
   ACT --> BASE
+  CBL --> BASE
 
   subgraph COST["cost stage -- one of three COST_MODEs, dispatched in the COST_MODE case"]
     PRS["production-render-score -- explicit/legacy<br/>build_production_cache --render-scope format-menu<br/>then production_render_cost -> cost.pkl"]
@@ -259,6 +264,7 @@ flowchart TD
 
   SVF --> PCACHE
   ALLOC -->|"SELECTION_MODE=surrogate"| PCACHE
+  CBL -. "exact learned tensors" .-> PCACHE
 
   EXPCT["export_native_compressed -- :1665-1699"]
   EXPCB["export_nvfp4_cb or export_nvfp4_cb_streaming<br/>auto-switch above 80 GB source (:1585-1641)<br/>optional read → ordered encode → bounded ordered write"]
@@ -267,6 +273,8 @@ flowchart TD
   PCACHE --> EXPCT
   ALLOC -->|"EXPORT_CONTAINER=nvfp4_cb, PRODUCTION_CACHE=0"| EXPCB
   ALLOC -->|"EXPORT_CONTAINER=gguf, PRODUCTION_CACHE=0"| EXPGG
+  CBL -. "same tensors; no retraining" .-> VAK
+  CBL -. "same tensors; emit once" .-> EXPCB
 
   OUTCT["compressed-tensors checkpoint<br/>WORK_DIR/exported"]
   OUTCB["CB checkpoint + quant_config.json + cb_codebooks.pqcb<br/>WORK_DIR/exported_nvfp4_cb"]
@@ -330,6 +338,7 @@ which is what the rows touched since are keyed on.
 | **1/4** | Sensitivity probe — per-Linear empirical Fisher `h_trace`, body + MTP in one pass; tied heads materialized and excluded, KV-sharing cotangents grafted (§7.5) | `prismaquant.incremental_probe` (`544-560`) | `artifacts/probe.pkl`; activations → `act/`; shards → `work/`; `logs/probe.log` | settings-hash `probe` (`703`); reuse also re-checks stored `calibration_modality` | — |
 | **2/4** | Baseline per-(Linear,format) RTN cost | `prismaquant.incremental_measure_quant_cost` (`645-658`) | `artifacts/cost.pkl` (`COST_MODE=local`) or `artifacts/cost_baseline.pkl` (`314-380`); `logs/cost.log` | settings-hash `base-cost` (`768`) + cost-mode provenance when it IS the allocator table (`769-777`) | — |
 | **2a-CB** | imatrix column-weight harvest | `harvest_cb_col_weights` — ONE shell function, four call sites (`[2/4] pre-cost`, `[2b/4] cost-cache`, `[2d-CB]`, `[4/4]`) → `export_gguf.build_imatrix_from_act_cache` + `moe_imatrix.synthesize_packed_expert_col_weights` | `artifacts/cb_col_weights.pkl` | settings-hash `cb-col-weights` | CB lane; called by whichever stage needs the vector first |
+| **pre-2-CBL** | Train/verify the immutable value-bearing dense learned-codebook bundle | `ensure_cb_learned_bundle` → `prismaquant.build_cb_learned_bundle` → streaming source reader + certified `learn_pool` | `artifacts/cb_learned_bundle.pqcb` | settings-hash `cb-learned-bundle` includes the col-weight file SHA-256; existing files are fully revalidated | CB lane, learned scope only; runs before the first cost/cache/KL render |
 | **2b/4** | Format-menu production render for allocator cost | `build_production_cache --render-scope format-menu` (`672-686`) | `artifacts/production_render_score_cache.pkl` + `…_weight_cache/` | settings-hash `render-cost-cache` (`837`) | `production-render-score` |
 | **2c/4** | Synthesize allocator cost from render scores | `prismaquant.production_render_cost` (`704-711`) | `artifacts/cost.pkl` | settings-hash `render-cost` (`858`) + cost-mode provenance (`859`) | `production-render-score` |
 | **2b/4** | Format-menu cache for AURA dW | `build_production_cache … --render-scope format-menu` (`857-871`) | frontier cache under validated-surrogate, else `production_render_score_cache.pkl` (`366-378`) | settings-hash `aura-dw-cache` (`913`) | `aura`; `exit 2` if the menu is BF16-only |
@@ -386,6 +395,15 @@ VALIDATED_SOURCE_PREFETCH=require   VALIDATED_FRONTIER_PICK=kneedle,
                                     or `budget` under a TARGET_DISK_GB card
 VALIDATED_FRONTIER_SKIP_CALIB=$NSAMPLES (held-out disjointness, ON)
 CB_EXPERT_EMPIRICAL=0  CB_SCALE_CODING=two_tier  (D15: shipped values)
+CB_CODEBOOK_SOURCE_SCOPE=none  (legal none|fp8|all; `fp8` is the production
+                     learned-CB arm; `all` is warned research-only because
+                     learned NVFP4-CB is measured NO-GO)
+CB_CODEBOOK_SOURCE=lattice  (legacy artifact-wide ANY scalar, derived from
+                     the scope; `learned` when either family is learned)
+CB_CODEBOOK_BUNDLE=<empty at scope none; otherwise
+                     WORK_DIR/artifacts/cb_learned_bundle.pqcb>
+CB_SCALE_SWEEP=1  CB_SCALE_SWEEP_SCOPE=<unset>  (legal
+                     none|nvfp4|fp8|all; unset preserves the legacy bool)
 CB_LADDER_INTERP=0  (`1` exports PRISMAQUANT_CB_LADDER_INTERP=1 to the cost
                      stage and gates the empirical expert stage's flag)
 ACTIVATION_FAIR_PRICING=1  (exported as PRISMAQUANT_ACTIVATION_FAIR_PRICING)
@@ -410,6 +428,24 @@ With the scope unset the bool decides and the scope is *derived* from it: `all` 
 `none` when false or absent (`:739-745`). Under `require_explicit` at least one of the two
 must be present (`:691-701`) — the CB producer settings are never defaulted silently. Neither
 name has a `run-pipeline.sh` shell default; the CB drivers export them directly.
+
+**The learned-codebook and scale-search selectors are family-scoped producer
+identity.** `CB_CODEBOOK_SOURCE_SCOPE=none|fp8|all` resolves each format through
+`codebook_source_for_format`; `all` emits a warning because learned NVFP4-CB is
+measured NO-GO (`nvfp4_cb_footprint.py:178-199,489-508`).
+`CB_SCALE_SWEEP_SCOPE=none|nvfp4|fp8|all` resolves the scale-search arm through
+`scale_sweep_for_format`; with the scope unset, the old `CB_SCALE_SWEEP` boolean
+still means all/none (`:205-216,525-547,921-1031`). Production two-tier FP4
+requires the NVFP4 family to sweep, so a mixed artifact's measured one-shot-FP8
+arm is `nvfp4`, while sweep-matched CBL is `all` (or the legacy unset+true
+spelling; `:265-274`). The render stamp writes a scope member only for a genuinely
+mixed choice (`fp8` source or `nvfp4|fp8` sweep); homogeneous `none`/`all` remains
+fully represented by the old scalar. Learned stamps additionally enumerate
+`codebook_source_by_format`, so a consumer never has to infer the family split
+from the artifact-wide ANY (`:615-632`). Therefore the unset/default
+all-lattice source and legacy all-family sweep retain the old stamp shape and
+rendered bytes, pinned against baseline `76666bd` by
+`tests/test_cbl_scope_identity.py:67-128`.
 
 `EXPORT_CONTAINER` ∈ {`compressed-tensors`, `gguf`, `nvfp4_cb`} selects the lane, and the
 preflight now **refuses a lane the architecture has not declared** (`supported_lanes`,
@@ -471,11 +507,14 @@ cache **are the same file** (principle 8's one-render identity), and both key se
 Pre-R5 flat manifests are read as a `legacy` block and still guard the stage whose key set they
 match, so no live `WORK_DIR` is invalidated by the upgrade.
 
-**Coverage is now every skip-if-exists artifact** — **15 call sites over 15 declared
+**Coverage is now every skip-if-exists artifact** — **16 call sites over 16 declared
 artifacts**: `probe`, `base-cost`, `render-cost-cache`, `render-cost`, `aura-dw-cache`,
 `aura-cost`, `aura-hybrid-cost`, `cb-col-weights`, `cb-hybrid-cost`, `frontier-cache`,
 `frontier-kl-point`, `frontier-recache`, `production-cache-recached`, `production-cache-raw`,
-`gguf-skeleton`. (Wave 3 reported 16 sites because `cb-col-weights` was guarded at three
+`gguf-skeleton`, and `cb-learned-bundle`. The last is keyed on the source model,
+format menu, learned scope, bundle path, and the exact col-weight file digest
+(`pipeline.py:158-167`; `run-pipeline.sh:1053-1081`). (Wave 3 reported 16 sites
+because `cb-col-weights` was guarded at three
 near-copies of the harvest; wave 4's `harvest_cb_col_weights` collapsed those into one function
 with four callers, so the guard is now stated once and the artifact-to-site map is 1:1.) Render-affecting env is captured in `RENDER_ENV_SETTINGS` (`585`:
 `PRISMAQUANT_NVFP4_SCALE_RULE`, `PRISMAQUANT_GPTQ_DAMP_SWEEP` default `0`,
@@ -577,7 +616,8 @@ Created at `408`:
 ```
 artifacts/  probe.pkl, cost*.pkl, layer_config*.json, pareto.csv,
             pareto_assignments/, production_*_cache.pkl + shard dirs,
-            validated_frontier_kl*.json, cb_col_weights.pkl, skeleton.gguf,
+            validated_frontier_kl*.json, cb_col_weights.pkl,
+            cb_learned_bundle.pqcb, skeleton.gguf,
             pipeline_spec.json, stage_settings.json, *.settings.json
 act/        probe activation cache        work/  streaming layer shards
 logs/       probe|cost|allocator|export   exported/  compressed-tensors ckpt
@@ -1031,7 +1071,7 @@ pricing and emulation. Registry-vs-callable consistency is pinned by
 | `MXFP8_E4M3` | `:720-728` | 8 / 32 / e8m0 | 8.25 | Registered, profile-allowed, **de-menued** |
 | `NVFP4A16`, `MXFP4`, `MXFP6_E3M2/E2M3`, `MXFP8A16`, `MXFP8_E5M2`, `FP8_E5M2`, `INT8_W8A16`, `INT4_W4A16_g128` | `:678-795` | — | — | Research / registry-only |
 | GGUF k-quants + IQ | `:884-902` | `_make_gguf_spec :864` | 2.0625–8.5 | GGUF lane (§9.3) |
-| `NVFP4_CB_K12..K24` / `FP8_CB_K28..K48` | `:913`, `:954` | product-VQ codebook, g256 | 1.78125–3.28125 serialized body / 3.5–6.0 index stream plus row scales | production gridbook CB menu (§9.2) |
+| `NVFP4_CB_K12..K24` / `FP8_CB_K28..K48` | `:913`, `:954` | product-VQ codebook, g256 | 1.78125–3.28125 serialized body / 3.5–6.0 index stream plus row scales | production gridbook CB menu; learned rendering is FP8 K28–K43 only, while K44–K47 are measurement-pending and K48 is rejected (§9.2) |
 | `NVFP4_CB_S13..S16` | `:932` | signed codebook, g256 | legacy/research layout | decoder/export compatible, production-menu denied (§9.2) |
 
 MXFP8 is de-menued rather than denied — `vllm_packed_moe` still allows `MXFP8_E4M3` — because
@@ -2203,7 +2243,7 @@ the artifact ABI; CI
 compares every packing/layout field and every rung so incompatibility fails at the boundary.
 
 At runtime `register()` registers `"gridbook"` plus the legacy artifact alias `"prismaquant"`
-and installs the per-architecture loader hooks. It does not patch vLLM core. Gridbook 0.7.0
+and installs the per-architecture loader hooks. It does not patch vLLM core. Gridbook 0.8.2
 resolves and attests every serving-reachable extension, optional-kernel mode, ABI, device, and
 shape contract during model load. Decode, expansion, activation QDQ, and routing support are
 native CUDA; GEMM and grouped GEMM are native CUTLASS. A missing or ineligible required native
@@ -2241,9 +2281,65 @@ from `config.json` (external Gridbook `gridbook/config.py`,
 `export_nvfp4_cb.py:630-639`); the non-globbed extension
 keeps vLLM's weight loader off it.
 
+**Learned FP8 codebooks are a value-bearing rendering mode, not a new format
+name.** `CB_CODEBOOK_SOURCE_SCOPE=fp8` keeps every NVFP4-CB target on its
+canonical lattice and selects a distinct learned book for each dense
+`(layer, role, rung)` cell; the artifact-wide legacy scalar remains `learned`
+because at least one family carries learned bytes. `none` is the default and
+reproduces the historical all-lattice artifact; `all` is warned research-only
+because learned NVFP4-CB measured <0.4% in the shipped band and is NO-GO
+(`nvfp4_cb_footprint.py:178-216,489-547`; `cb_learned_bundle.py:122-145`).
+
+A non-`none` scope requires one immutable, value-bearing
+`CB_CODEBOOK_BUNDLE` **before any cost, cache, KL, or export render**. The
+bundle trainer runs the certified pooled weighted-Lloyd `learn_pool` once,
+materializes every subtable as the exact contiguous little-endian FP16 payload,
+and gives every learned cell its own physical references. Its manifest binds
+the trainer, source-weight and imatrix value identities, cell/rung policy,
+shapes, and a SHA-256 for each individual FP16 subtable
+(`cb_learned_bundle.py:181-303,413-508`). Bundle load requires the tensor-name
+set, shape map, cell references, and digest map to cover one another exactly;
+missing, extra, stale, or altered values raise instead of falling back to the
+lattice (`:749-957`). Every downstream render receives values reloaded from
+the canonical FP16 payload (promoted to FP32 only for encoder lookup), never
+the trainer's pre-materialization tensor (`:471-504`);
+export-time retraining is forbidden. The exporter writes the selected lattice
+and learned tensors exactly once to `cb_codebooks.pqcb`, and the config's
+`codebook_sha256` map covers the **complete** sidecar name set, matching
+Gridbook's fail-closed verifier (`cb_export_config.py:781-819`; pinned Gridbook
+0.8.2 `gridbook/cb_digest.py:72-114`).
+
+The learned rung ceiling is a measurement policy table, not the product
+bit-split's 2,048-entry structural rule (`cb_learned_bundle.py:54-95`):
+
+| FP8-CB rung | learned production policy | provenance meaning |
+|---|---|---|
+| K28–K43 | enabled | K28/K33/K38/K43 are directly measured GO cells; interior rungs are admitted by the certified K43 boundary and labelled as such rather than falsely claiming a per-rung measurement |
+| K44–K47 | disabled, measurement pending | the sweep-matched per-rung run must update the table before any of these rungs can emit learned refs |
+| K48 | rejected, measured NO-GO | learned placement is measured 54–98% worse than lattice |
+
+`require_cbl_rung_enabled` is called both when a bundle is trained and when it
+is loaded, so editing a menu or presenting an old bundle cannot bypass this
+ceiling (`cb_learned_bundle.py:122-145,583-590,888-895`).
+
+**Dense serving is already role-distinct; routed-MoE serving is not.** At the
+pinned 0.8.2 commit, Gridbook's dense loader reads `codebook_ref` inside its
+per-role loop, interns each distinct reference tuple, concatenates those LUT
+blocks, and emits a `cb_row_offset` covering every output row. Thus fused
+`gate_up_proj` may carry gate≠up and fused `qkv_proj` may carry q≠k≠v
+(external Gridbook `gridbook/linear.py:405-437`). Its routed path instead builds
+one `layer._cb_flat` and launches both w13 and w2 without a row/LUT offset
+(`gridbook/moe.py:458-505,1915-1946`). PrismaQuant therefore refuses a learned
+reference on any routed or rank-3 expert stack with the exact Gridbook pin in
+the error; it never substitutes lattice bytes under a learned stamp
+(`cb_learned_bundle.py:148-172,597-634`). The consumer-side port is specified,
+but deliberately not vendored or implemented here, in
+`docs/lanes/nvfp4-cb/MOE_LEARNED_CODEBOOK_SPEC.md`; lattice routed-CB remains
+unchanged.
+
 **Runtime defaults and kernel provenance live only in Gridbook.** The old table
 here was removed after it drifted from the runtime it described. The current pin is Gridbook
-0.8.0 at `9011a19228ddb96b8a49e11a20ac75c99c83998e`; resolve it from
+0.8.2 at `9f915dd868eab2e13ab7847a67c594e2c5c8955c`; resolve it from
 `prismaquant/gridbook_runtime/gridbook_runtime_pin.json`, then consult that source's
 `docs/PLUGIN.md`, `docs/KERNELS.md`, and dated audits. The cross-project policy
 is only this: a numerics-changing path cannot be promoted by kernel arithmetic
@@ -2378,7 +2474,7 @@ AURA is native-lane evidence and no served CB objective A/B exists. Lane default
 shipping practice (§12 D15 closed).
 
 **Proven results.** These measurements remain tied to their recorded runtime commits; they are
-not relabelled as Gridbook 0.7.0 native-only measurements.
+not relabelled as Gridbook 0.8.2 native-only measurements.
 
 | artifact | result |
 |---|---|
@@ -2710,7 +2806,7 @@ New with the 2026-07-30 merge:
 
 **Open items carried from session handovers.** Of the 41 items the handover census could not
 map to a verified closure, the prior FP4-CB fast-expander/Triton item is now closed by the
-exact pinned Gridbook 0.7.0 runtime: FP4-v2 prepares its native expander at model load, decode
+exact pinned Gridbook 0.8.2 runtime: FP4-v2 prepares its native expander at model load, decode
 uses native CUDA GEMV, M>8 uses native BF16 expansion plus Gridbook's owned CUTLASS grouped
 bridge, and a missing operation fails closed. The remaining re-verified items are folded in
 above: tail-veto (D1), `TARGET_DISK_GB` (D12), the DSv4 CB lane (D3), and the shipped
