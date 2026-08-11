@@ -224,3 +224,21 @@ def test_aura_resume_names_mutated_col_weights_identity(
             resume=True,
         )
     assert resumed_model.forward_calls == 0
+
+
+def test_aura_refuses_multiple_cb_producer_source_digests():
+    model = _TinyLM()
+    cache = _TinyCache(model)
+    cache.metadata["cb_cache_pair_identity"][
+        "producer_source_sha256"
+    ] = ["7" * 64, "8" * 64]
+
+    with pytest.raises(RuntimeError, match="one exact CB renderer source"):
+        aura._validate_aura_checkpoint_cache_identity(cache)
+
+
+@pytest.mark.parametrize("length", [39, 41, 63, 65])
+def test_aura_git_override_rejects_non_object_id_lengths(monkeypatch, length):
+    monkeypatch.setenv("PRISMAQUANT_IDENTITY_GIT_COMMIT", "a" * length)
+    with pytest.raises(RuntimeError, match="40- or 64-character"):
+        aura._git_commit()

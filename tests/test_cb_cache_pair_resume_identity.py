@@ -183,3 +183,33 @@ def test_dense_cb_pair_resume_refuses_mutated_surrogate_score(
 
     with pytest.raises(RuntimeError, match="render_score_sha256.*differs"):
         _fill(model, tmp_path)
+
+
+def test_producer_source_digest_binds_every_package_file(tmp_path):
+    package_root = tmp_path / "prismaquant"
+    nested = package_root / "data"
+    bytecode = package_root / "__pycache__"
+    nested.mkdir(parents=True)
+    bytecode.mkdir()
+    (package_root / "producer.py").write_text("VALUE = 1\n")
+    lattice = nested / "lattice.pt"
+    lattice.write_bytes(b"lattice-v1")
+    ignored = bytecode / "producer.pyc"
+    ignored.write_bytes(b"runtime-cache-v1")
+
+    original = pwc._production_cache_source_sha256(package_root)
+    lattice.write_bytes(b"lattice-v2")
+    assert pwc._production_cache_source_sha256(package_root) != original
+
+    lattice.write_bytes(b"lattice-v1")
+    ignored.write_bytes(b"runtime-cache-v2")
+    assert pwc._production_cache_source_sha256(package_root) == original
+
+
+@pytest.mark.parametrize("length", [39, 41, 63, 65])
+def test_producer_git_override_rejects_non_object_id_lengths(
+    monkeypatch, length
+):
+    monkeypatch.setenv("PRISMAQUANT_IDENTITY_GIT_COMMIT", "a" * length)
+    with pytest.raises(RuntimeError, match="40- or 64-character"):
+        pwc._production_cache_git_commit()

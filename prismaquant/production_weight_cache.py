@@ -2004,10 +2004,10 @@ def _production_cache_git_commit() -> str:
         "PRISMAQUANT_IDENTITY_GIT_COMMIT", ""
     )).strip().lower()
     if override:
-        if re.fullmatch(r"[0-9a-f]{40,64}", override) is None:
+        if re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", override) is None:
             raise RuntimeError(
-                "PRISMAQUANT_IDENTITY_GIT_COMMIT must be a full 40-64 "
-                "character hexadecimal commit id"
+                "PRISMAQUANT_IDENTITY_GIT_COMMIT must be a full 40- or "
+                "64-character hexadecimal commit id"
             )
         return override
     try:
@@ -2024,7 +2024,7 @@ def _production_cache_git_commit() -> str:
             "production CB pair identity cannot resolve git commit"
         ) from exc
     commit = result.stdout.strip().lower()
-    if re.fullmatch(r"[0-9a-f]{40,64}", commit) is None:
+    if re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", commit) is None:
         raise RuntimeError(
             "production CB pair identity resolved an invalid git commit "
             f"{commit!r}"
@@ -2032,24 +2032,40 @@ def _production_cache_git_commit() -> str:
     return commit
 
 
-def _production_cache_source_sha256() -> str:
-    """Hash the actual renderer sources used even in git-less containers."""
-    repo_root = Path(__file__).resolve().parents[1]
-    identity_paths = [
-        "prismaquant/production_weight_cache.py",
-        "prismaquant/nvfp4_cb_formats.py",
-        "prismaquant/nvfp4_cb_footprint.py",
-        "prismaquant/cb_layout.py",
-        "prismaquant/cb_ldlq_atoms.py",
-        "prismaquant/cb_minchain.py",
-        "prismaquant/cb_learned_bundle.py",
-        "prismaquant/cb_banked_books.py",
-        "prismaquant/export_native_compressed.py",
-        "prismaquant/format_registry.py",
-    ]
+def _production_cache_source_sha256(
+    package_root: Path | None = None,
+) -> str:
+    """Hash every durable PrismaQuant package input used by the producer.
+
+    A hand-maintained import list is not fail-closed: a newly introduced
+    transitive renderer dependency could otherwise change bytes without
+    changing a resumable pair's identity.  Hash the complete installed
+    package tree instead, excluding only interpreter bytecode caches.  This
+    also binds packaged lattice/codebook data and model-profile JSON.
+    """
+    root = (
+        Path(package_root)
+        if package_root is not None
+        else Path(__file__).resolve().parent
+    )
+    if not root.is_dir():
+        raise RuntimeError(
+            f"production CB source identity cannot read package root {root}"
+        )
+    identity_paths = sorted(
+        path
+        for path in root.rglob("*")
+        if path.is_file()
+        and "__pycache__" not in path.relative_to(root).parts
+        and path.suffix not in {".pyc", ".pyo"}
+    )
+    if not identity_paths:
+        raise RuntimeError(
+            f"production CB source identity found no files under {root}"
+        )
     digest = hashlib.sha256()
-    for relative in identity_paths:
-        path = repo_root / relative
+    for path in identity_paths:
+        relative = path.relative_to(root).as_posix()
         try:
             payload = path.read_bytes()
         except OSError as exc:

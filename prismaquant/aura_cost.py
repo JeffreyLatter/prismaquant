@@ -71,10 +71,10 @@ def _git_commit() -> str | None:
         "PRISMAQUANT_IDENTITY_GIT_COMMIT", ""
     )).strip().lower()
     if override:
-        if re.fullmatch(r"[0-9a-f]{40,64}", override) is None:
+        if re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", override) is None:
             raise RuntimeError(
-                "PRISMAQUANT_IDENTITY_GIT_COMMIT must be a full 40-64 "
-                "character hexadecimal commit id"
+                "PRISMAQUANT_IDENTITY_GIT_COMMIT must be a full 40- or "
+                "64-character hexadecimal commit id"
             )
         return override
     try:
@@ -109,30 +109,12 @@ def _checkpoint_git_commit() -> str:
 
 
 def _aura_source_sha256() -> str:
-    """Hash the actual AURA implementation used in git-less containers."""
-    repo_root = Path(__file__).resolve().parents[1]
-    identity_paths = [
-        "prismaquant/aura_cost.py",
-        "prismaquant/kl_fisher.py",
-        "prismaquant/perturbed_x_cache.py",
-        "prismaquant/format_registry.py",
-        "prismaquant/production_weight_cache.py",
-    ]
-    digest = hashlib.sha256()
-    for relative in identity_paths:
-        path = repo_root / relative
-        try:
-            payload = path.read_bytes()
-        except OSError as exc:
-            raise RuntimeError(
-                f"AURA source identity cannot read {relative}"
-            ) from exc
-        encoded_name = relative.encode("utf-8")
-        digest.update(len(encoded_name).to_bytes(4, "big"))
-        digest.update(encoded_name)
-        digest.update(len(payload).to_bytes(8, "big"))
-        digest.update(payload)
-    return digest.hexdigest()
+    """Bind AURA to the complete producer package, including dependencies."""
+    from prismaquant.production_weight_cache import (
+        _production_cache_source_sha256,
+    )
+
+    return _production_cache_source_sha256()
 
 
 def _canonical_json(value: object, *, where: str) -> object:
@@ -836,7 +818,10 @@ def _validate_aura_checkpoint_cache_identity(production_cache: object) -> None:
         not isinstance(commits, Sequence)
         or isinstance(commits, (str, bytes))
         or len(commits) != 1
-        or re.fullmatch(r"[0-9a-f]{40,64}", str(commits[0]).lower()) is None
+        or re.fullmatch(
+            r"(?:[0-9a-f]{40}|[0-9a-f]{64})",
+            str(commits[0]).lower(),
+        ) is None
     ):
         raise RuntimeError(
             "AURA durable checkpointing requires one exact CB pair producer "
@@ -846,15 +831,14 @@ def _validate_aura_checkpoint_cache_identity(production_cache: object) -> None:
     if (
         not isinstance(source_digests, Sequence)
         or isinstance(source_digests, (str, bytes))
-        or not source_digests
-        or any(
-            re.fullmatch(r"[0-9a-f]{64}", str(value).lower()) is None
-            for value in source_digests
-        )
+        or len(source_digests) != 1
+        or re.fullmatch(
+            r"[0-9a-f]{64}", str(source_digests[0]).lower()
+        ) is None
     ):
         raise RuntimeError(
-            "AURA durable checkpointing requires exact CB renderer source "
-            "SHA-256 identity"
+            "AURA durable checkpointing requires one exact CB renderer "
+            "source SHA-256 identity"
         )
 
 
