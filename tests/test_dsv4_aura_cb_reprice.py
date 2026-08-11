@@ -14,8 +14,10 @@ from prismaquant.anchored_cost import (
     SegmentKey,
     candidates_by_segment,
     plan_anchor_requests,
+    price_anchored_candidates,
 )
 from prismaquant.cb_anchored_cost import (
+    _identifiable_cb_shape_columns,
     CBPanelPolicy,
     CBUnitDeclaration,
     CodebookAnchoredFormatPlugin,
@@ -37,10 +39,12 @@ from prismaquant.cb_anchored_cost import (
 from prismaquant.dsv4_aura_cb_reprice import (
     DSV4_EXPECTED_ANCHORS,
     DSV4_NONEXPERT_UNITS,
+    DSV4_ANCHOR_FORMATS,
     DSV4_PANEL_POLICY,
     DSV4_TOTAL_UNITS,
     DSv4CampaignError,
     FP8_EXPERT_FORMATS,
+    FP8_EXPERT_RUNGS,
     FP8_NONEXPERT_FORMATS,
     NVFP4_FORMATS,
     _recipe_format,
@@ -81,6 +85,7 @@ def _plugin(*, source_map: dict[str, str] | None = None):
             "production_arm": "gptq-static-act-order-scale-sweep",
             "rtn_anchor_allowed": False,
         },
+        anchor_formats=DSV4_ANCHOR_FORMATS,
     )
 
 
@@ -191,7 +196,7 @@ def test_cb_mapping_uses_authoritative_basis_and_source_gated_ladders():
         candidate for candidate in dense.candidates
         if candidate.family == "fp8_cb"
     ]
-    assert max(candidate.coordinate for candidate in expert_fp8) == 33
+    assert max(candidate.coordinate for candidate in expert_fp8) == 32
     assert max(candidate.coordinate for candidate in dense_fp8) == 48
     assert not any(
         candidate.equivalence_class == LATTICE_BASIS
@@ -202,18 +207,14 @@ def test_cb_mapping_uses_authoritative_basis_and_source_gated_ladders():
     for candidate in dense.candidates:
         if candidate.terminal:
             continue
-        expected_width = (
-            1
-            if (
-                candidate.family,
-                candidate.equivalence_class,
-            ) == ("fp8_cb", LATTICE_BASIS)
-            else 2
-        )
+        # Derived, not declared: every on-law FP8-CB rung is a multiple of
+        # 4, so parity is constant on that ladder and drops out; NVFP4-CB
+        # (K12..K18) still spans both parities and keeps both columns.
+        expected_width = 1 if candidate.family == "fp8_cb" else 2
         assert len(candidate.shape_features) == expected_width
 
     incomplete = _source_map()
-    incomplete.pop("FP8_CB_K47")
+    incomplete.pop("FP8_CB_K48")
     with pytest.raises(AnchoredCostError, match="lacks exact candidate"):
         build_cb_units((
             _declaration("dense", role="wq_a", nonexpert=True),
@@ -230,11 +231,12 @@ def test_anchor_count_scales_by_unit_equivalence_segment_not_rung():
 
     # Expert: NV-lattice + FP8-learned. Dense adds FP8-lattice.
     assert len(anchors) == 2 + 3 == 5
+    # expert 7 NV + 2 on-law FP8; dense 7 NV + 6 on-law FP8.
     assert sum(
         not candidate.terminal
         for unit in units
         for candidate in unit.candidates
-    ) == 41
+    ) == 22
     assert len({
         (request.qname, request.segment)
         for request in anchors
@@ -270,9 +272,9 @@ def test_panel_policy_is_exact_segment_keyed_ranked_and_held_out():
         units, plugin, DSV4_PANEL_POLICY,
     )
 
-    assert len(panel) == 7 * 32 * (4 + 4 + 2) == 2_240
+    assert len(panel) == 7 * 32 * (4 + 4) == 1_792
     assert len(validation) == 7 * 4 * 2 == 56
-    assert report["panel_render_cells"] == 2_240
+    assert report["panel_render_cells"] == 1_792
     assert report["validation_render_cells"] == 56
     assert report["segment_count"] == 7 * 3
     assert {request.qname for request in panel}.isdisjoint(
@@ -286,10 +288,16 @@ def test_panel_policy_is_exact_segment_keyed_ranked_and_held_out():
         assert (nv["design_rank"], nv["design_rank_required"]) == (2, 2)
         assert (
             learned["design_rank"], learned["design_rank_required"]
-        ) == (2, 2)
+        ) == (1, 1)
+        # One legal rung: priced by its own anchor, so nothing is fitted and
+        # no panel render is spent here.
         assert (
             lattice["design_rank"], lattice["design_rank_required"]
-        ) == (1, 1)
+        ) == (0, 0)
+        assert lattice["single_rung_measured"] is True
+        assert lattice["sole_rung"] == "FP8_CB_K48"
+        assert lattice["panel_render_cells"] == 0
+        assert lattice["validation_render_cells"] == 0
         assert all(
             row["segment"]["equivalence_class"]
             == row["segment"]["basis"]
@@ -307,8 +315,8 @@ def test_panel_policy_is_exact_segment_keyed_ranked_and_held_out():
         units, plugin, anchors, panel, validation,
     )
     assert len(anchors) == 7 * 36 * 3 == 756
-    assert union["physical_union_render_cells"] == 2_380
-    assert union["logical_total"] == 756 + 2_240 + 56
+    assert union["physical_union_render_cells"] == 2_156
+    assert union["logical_total"] == 756 + 1_792 + 56
 
 
 def test_panel_fits_are_separate_and_currency_invariance_is_diagnostic():
@@ -316,8 +324,9 @@ def test_panel_fits_are_separate_and_currency_invariance_is_diagnostic():
     panel, _validation, _report = plan_cb_panel_and_validation(
         units, plugin, DSV4_PANEL_POLICY,
     )
+    anchor_requests = plan_anchor_requests(units, plugin)
     costs: dict[str, dict[str, object]] = {}
-    for request in panel:
+    for request in (*panel, *anchor_requests):
         rung = int(request.format_name.rsplit("K", 1)[1])
         level = 1.0 + int(request.qname.split(".")[1])
         parity = rung % 2
@@ -330,10 +339,10 @@ def test_panel_fits_are_separate_and_currency_invariance_is_diagnostic():
             "dw_source": "production_render",
             "production_anchor_measured": True,
         }
-    observations = observations_from_streamed_payload(
-        panel, _streamed_payload(panel, costs, plugin),
-    )
-    fits = fit_all_cb_segments(observations, units, plugin)
+    payload = _streamed_payload((*panel, *anchor_requests), costs, plugin)
+    observations = observations_from_streamed_payload(panel, payload)
+    anchors = anchors_from_streamed_payload(anchor_requests, payload)
+    fits = fit_all_cb_segments(observations, units, plugin, anchors=anchors)
 
     assert len(fits) == 21
     for segment, fit in fits.items():
@@ -349,17 +358,99 @@ def test_panel_fits_are_separate_and_currency_invariance_is_diagnostic():
             and candidate.equivalence_class == segment.equivalence_class
         }
         diagnostic = fit.aura_vs_weight_diagnostic
+        if len(fit.g_by_format) == 1:
+            # Single-rung segment: the anchor is the rung, so there is no
+            # currency to compare and no law to be invariant under.
+            assert fit.coefficients == ()
+            assert set(fit.g_by_format.values()) == {1.0}
+            assert diagnostic is None
+            continue
         assert diagnostic is not None
         assert diagnostic["currency_invariance_test_only"] is True
         assert diagnostic["max_abs_dex"] == pytest.approx(0.0, abs=1e-10)
 
     learned = SegmentKey("fp8_cb", "wq_a", LEARNED_BASIS)
     lattice = SegmentKey("fp8_cb", "wq_a", LATTICE_BASIS)
-    assert fits[learned].design_rank_required == 2
-    assert fits[lattice].design_rank_required == 1
+    assert fits[learned].design_rank_required == 1
+    assert fits[lattice].design_rank_required == 0
+    assert fits[lattice].ratio("FP8_CB_K48", "FP8_CB_K48") == 1.0
     assert set(fits[learned].g_by_format).isdisjoint(
         fits[lattice].g_by_format
     )
+
+
+def test_shape_basis_is_derived_from_the_ladder_not_the_family():
+    """A constant column is unidentifiable, so the ladder decides the basis."""
+    # Mixed parity (NVFP4-CB K12..K18): both registered columns resolve.
+    assert _identifiable_cb_shape_columns(range(12, 19)) == (0, 1)
+    assert _identifiable_cb_shape_columns((28, 29)) == (0, 1)
+    # Every on-law FP8-CB rung is a multiple of 4, so parity never varies and
+    # keeping it would make the panel rank 1 of 2 and fail closed forever.
+    assert _identifiable_cb_shape_columns((28, 32, 36, 40, 44)) == (0,)
+    assert _identifiable_cb_shape_columns((28, 32)) == (0,)
+    # The rung coordinate is always retained: CandidateSpec requires a
+    # nonempty basis, and a one-rung ladder is never fitted anyway.
+    assert _identifiable_cb_shape_columns((48,)) == (0,)
+    with pytest.raises(AnchoredCostError, match="no rungs"):
+        _identifiable_cb_shape_columns(())
+
+
+def test_single_rung_segment_is_priced_measured_not_extrapolated():
+    """FP8-CB lattice declares one legal rung, so its anchor IS its price."""
+    units, plugin = _nonexpert_panel_units()
+    panel, _validation, _report = plan_cb_panel_and_validation(
+        units, plugin, DSV4_PANEL_POLICY,
+    )
+    lattice = SegmentKey("fp8_cb", "wq_a", LATTICE_BASIS)
+
+    # No panel render is spent on a segment that has no law to fit.
+    assert not [
+        request for request in panel
+        if request.segment.equivalence_class == LATTICE_BASIS
+        and request.segment.family == "fp8_cb"
+    ]
+
+    anchor_requests = plan_anchor_requests(units, plugin)
+    assert {
+        request.format_name for request in anchor_requests
+        if request.segment == lattice
+    } == {"FP8_CB_K48"}
+
+    costs: dict[str, dict[str, object]] = {}
+    for request in (*panel, *anchor_requests):
+        rung = int(request.format_name.rsplit("K", 1)[1])
+        level = 1.0 + int(request.qname.split(".")[1])
+        costs.setdefault(request.qname, {})[request.format_name] = {
+            "predicted_dloss": level * 10.0 ** (
+                -0.025 * rung + 0.03 * (rung % 2)
+            ),
+            "weight_mse_diagnostic": None,
+            "dw_source": "production_render",
+            "production_anchor_measured": True,
+        }
+    payload = _streamed_payload((*panel, *anchor_requests), costs, plugin)
+    anchors = anchors_from_streamed_payload(anchor_requests, payload)
+    fits = fit_all_cb_segments(
+        observations_from_streamed_payload(panel, payload),
+        units, plugin, anchors=anchors,
+    )
+    priced = price_anchored_candidates(units, plugin, anchors, fits)
+
+    checked = 0
+    for unit in units:
+        segment = SegmentKey("fp8_cb", unit.role, LATTICE_BASIS)
+        anchor = anchors[(unit.qname, segment)]
+        for cell in priced[unit.qname]:
+            if cell.segment != segment:
+                continue
+            # Ratio exactly 1.0 and the anchor's own render as the value: this
+            # cell is measured, and no extrapolation error can enter it.
+            assert cell.candidate.format_name == "FP8_CB_K48"
+            assert cell.shape_ratio == 1.0
+            assert cell.predicted_dloss == anchor.predicted_dloss
+            assert cell.anchor_format == "FP8_CB_K48"
+            checked += 1
+    assert checked == len(units)
 
 
 def test_streamed_rows_must_be_real_production_arm_measurements():
@@ -532,7 +623,9 @@ def test_heldout_zero_is_strict_json_bad_signal_not_a_gate():
     payload = _streamed_payload(all_requests, costs, plugin)
     anchor_values = anchors_from_streamed_payload(anchors, payload)
     panel_observations = observations_from_streamed_payload(panel, payload)
-    fits = fit_all_cb_segments(panel_observations, units, plugin)
+    fits = fit_all_cb_segments(
+        panel_observations, units, plugin, anchors=anchor_values,
+    )
     validation_observations = observations_from_streamed_payload(
         validation, payload,
     )
@@ -988,7 +1081,7 @@ def test_routed_bundle_origins_are_bound_to_supplied_selection(monkeypatch):
         for projection in ("gate_proj", "up_proj", "down_proj"):
             qname = f"model.layers.{layer}.mlp.experts.{projection}"
             cells[qname] = {}
-            for rung in range(28, 34):
+            for rung in FP8_EXPERT_RUNGS:
                 cells[qname][f"FP8_CB_K{rung}"] = {
                     "source": "learned",
                     "pretrained_origin": {
@@ -1021,7 +1114,7 @@ def test_routed_bundle_origins_are_bound_to_supplied_selection(monkeypatch):
     report = _validate_routed_bundle_selection_identity(
         "/bundle.pqcb", selected_sha,
     )
-    assert report["routed_learned_origin_cells"] == 43 * 3 * 6
+    assert report["routed_learned_origin_cells"] == 43 * 3 * 2 == 258
     assert report["selection_sha256"] == selected_sha
 
     first_qname = next(iter(cells))

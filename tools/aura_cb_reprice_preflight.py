@@ -40,10 +40,16 @@ DSV4_NONEXPERT_UNITS = DSV4_TOTAL_UNITS - DSV4_EXPERT_UNITS
 DSV4_EXPERT_2048X4096_UNITS = 43 * 256 * 2
 DSV4_EXPERT_4096X2048_UNITS = 43 * 256
 DSV4_NVFP4_RUNGS = tuple(range(12, 19))
-DSV4_EXPERT_FP8_RUNGS = tuple(range(28, 34))
-DSV4_NONEXPERT_FP8_RUNGS = tuple(range(28, 49))
-DSV4_FP8_LEARNED_RUNGS = tuple(range(28, 47))
-DSV4_FP8_LATTICE_RUNGS = tuple(range(47, 49))
+# FP8-CB is legal only at k % 4 == 0 (gridbook K1.2 fused mid-M kernel law:
+# type_size = 4k must stay a 16-byte-multiple TMA extent and CbSubW = k/4 is
+# the real sub-table width only there).  serving_profile_specs/nvfp4_cb.json
+# backs [28, 32, 36, 40, 44, 48] for runtimes 0.5.0..0.8.2.  Routed experts
+# are additionally capped at K33 by the byte-exact source-payload ceiling,
+# leaving two rungs.  NVFP4-CB is outside the law and stays contiguous.
+DSV4_EXPERT_FP8_RUNGS = (28, 32)
+DSV4_NONEXPERT_FP8_RUNGS = (28, 32, 36, 40, 44, 48)
+DSV4_FP8_LEARNED_RUNGS = tuple(k for k in DSV4_NONEXPERT_FP8_RUNGS if k <= 46)
+DSV4_FP8_LATTICE_RUNGS = tuple(k for k in DSV4_NONEXPERT_FP8_RUNGS if k > 46)
 DSV4_ROLE_UNITS = (
     ("gate_proj", 11_051),
     ("up_proj", 11_051),
@@ -239,7 +245,7 @@ def _learned_bundle_check(repo: Path, name: str, path: Path) -> Check:
 
 
 def _routed_selection_check(repo: Path, path: Path) -> Check:
-    """Validate the explicit DSv4 K28..K33 routed-book selection."""
+    """Validate the explicit DSv4 on-law routed-book selection (K28/K32)."""
 
     if not path.is_file():
         return Check(
@@ -1009,7 +1015,8 @@ def repository_capability_checks(
                     "cache, AURA, expert KL, and production-render pricing"
                     if split_menu
                     else "one global FORMATS menu cannot express experts "
-                    "K28..K33 and nonexperts K28..K48 across cache, AURA, "
+                    "K28/K32 and nonexperts K28..K48 step 4 across cache, "
+                    "AURA, "
                     "expert KL, and production-render pricing without "
                     "illegal work or truncation"
                 ),
@@ -1473,7 +1480,8 @@ def dense_checks(
             Check(
                 "dense learned-codebook bundle",
                 "BLOCK",
-                "CB_CODEBOOK_BUNDLE is required for CBL K28..K46",
+                "CB_CODEBOOK_BUNDLE is required for the on-law CBL rungs "
+                "K28/K32/K36/K40/K44",
             )
         )
     else:
@@ -1529,13 +1537,13 @@ def _print_human(target: str, checks: Iterable[Check]) -> None:
         f"{accounting['nvfp4_cells']:,} legal cells"
     )
     print(
-        f"  FP8 experts: {accounting['expert_units']:,} x K28..K33 = "
+        f"  FP8 experts: {accounting['expert_units']:,} x K28/K32 = "
         f"{accounting['expert_fp8_cells']:,} legal cells; orientations: "
         f"{accounting['expert_2048x4096_units']:,} x 2048x4096 + "
         f"{accounting['expert_4096x2048_units']:,} x 4096x2048"
     )
     print(
-        f"  FP8 nonexperts: {accounting['nonexpert_units']:,} x K28..K48 = "
+        f"  FP8 nonexperts: {accounting['nonexpert_units']:,} x K28..K48 step 4 = "
         f"{accounting['nonexpert_fp8_cells']:,} legal cells"
     )
     print(

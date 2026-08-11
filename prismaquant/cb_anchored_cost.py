@@ -290,11 +290,90 @@ class CBUnitDeclaration:
     serving_group: str | None = None
 
 
+# The registered CB shape design, widest first.  Which of these columns is
+# actually *identifiable* is a property of the declared ladder, not of the
+# family -- see _identifiable_cb_shape_columns.
+_CB_SHAPE_COLUMNS: tuple[tuple[str, Callable[[int], float]], ...] = (
+    ("rung", lambda rung: float(rung)),
+    ("rung_parity", lambda rung: float(rung % 2)),
+)
+
+
+def _identifiable_cb_shape_columns(rungs: Sequence[int]) -> tuple[int, ...]:
+    """Keep the rung coordinate plus the derived columns this ladder resolves.
+
+    A derived feature that is constant across a segment's legal rungs carries
+    no information: per-unit centering turns it into a zero column, the design
+    drops to rank ``k-1`` of ``k``, and ``_fit_currency`` fails closed forever.
+    The ladder decides which survive, not the family.  Two live ladders make
+    that concrete -- the gridbook K1.2 fused mid-M kernel law admits only
+    ``k % 4 == 0`` FP8-CB rungs, so parity is constant on every legal FP8-CB
+    ladder, while NVFP4-CB (K12..K18) still spans both parities and keeps the
+    full rung-plus-parity design.  The rung coordinate itself is always
+    retained: ``CandidateSpec`` requires a nonempty basis, and the only ladder
+    on which the rung is constant is a one-rung ladder, which is priced by its
+    anchor and never fitted at all.
+    """
+    distinct = {int(rung) for rung in rungs}
+    if not distinct:
+        raise AnchoredCostError("cannot derive a shape basis from no rungs")
+    return (0, *(
+        index
+        for index, (_name, projection) in enumerate(_CB_SHAPE_COLUMNS)
+        if index > 0 and len({projection(rung) for rung in distinct}) > 1
+    ))
+
+
+def _cb_declaration_ladder(
+    declaration: CBUnitDeclaration,
+) -> tuple[str, dict[str, int], tuple[str, ...]]:
+    """Canonicalize one declaration into (terminal, payloads, CB ladder)."""
+    terminal = fr.canonical_format_name(declaration.terminal_format)
+    payloads = {
+        fr.canonical_format_name(str(name)): int(value)
+        for name, value in declaration.payload_bytes_by_format.items()
+    }
+    if terminal not in payloads:
+        raise AnchoredCostError(
+            f"{declaration.qname}: terminal payload is absent"
+        )
+    cb_formats = sorted(
+        (name for name in payloads if name != terminal),
+        key=lambda name: (
+            fr.get_format(name).family, cb_rung(name), name,
+        ),
+    )
+    if not cb_formats:
+        raise AnchoredCostError(
+            f"{declaration.qname}: source-gated CB ladder is empty"
+        )
+    return terminal, payloads, tuple(cb_formats)
+
+
 def build_cb_units(
     declarations: Sequence[CBUnitDeclaration],
     plugin: CodebookAnchoredFormatPlugin,
 ) -> tuple[UnitSpec, ...]:
     """Convert exact caller-owned ladders without redoing source legality."""
+    # Pass 1: the shape basis is a *segment* property, so it must be derived
+    # from the union of legal rungs across every unit in that segment.  Doing
+    # it per unit would hand two units in one segment different widths the
+    # moment source gating trims one ladder, and _fit_currency rejects a
+    # segment whose candidates use mixed shape bases.
+    ladder_rungs: dict[SegmentKey, set[int]] = defaultdict(set)
+    for declaration in declarations:
+        _terminal, _payloads, cb_formats = _cb_declaration_ladder(declaration)
+        for format_name in cb_formats:
+            ladder_rungs[SegmentKey(
+                fr.get_format(format_name).family,
+                declaration.role,
+                plugin.basis_for_format(format_name),
+            )].add(cb_rung(format_name))
+    columns_by_segment = {
+        segment: _identifiable_cb_shape_columns(sorted(rungs))
+        for segment, rungs in ladder_rungs.items()
+    }
+
     units: list[UnitSpec] = []
     seen: set[str] = set()
     for declaration in sorted(declarations, key=lambda item: item.qname):
@@ -303,25 +382,7 @@ def build_cb_units(
                 f"duplicate CB unit declaration {declaration.qname!r}"
             )
         seen.add(declaration.qname)
-        terminal = fr.canonical_format_name(declaration.terminal_format)
-        payloads = {
-            fr.canonical_format_name(str(name)): int(value)
-            for name, value in declaration.payload_bytes_by_format.items()
-        }
-        if terminal not in payloads:
-            raise AnchoredCostError(
-                f"{declaration.qname}: terminal payload is absent"
-            )
-        cb_formats = sorted(
-            (name for name in payloads if name != terminal),
-            key=lambda name: (
-                fr.get_format(name).family, cb_rung(name), name,
-            ),
-        )
-        if not cb_formats:
-            raise AnchoredCostError(
-                f"{declaration.qname}: source-gated CB ladder is empty"
-            )
+        terminal, payloads, cb_formats = _cb_declaration_ladder(declaration)
         plugin.validate_candidate_coverage(cb_formats)
         candidates: list[CandidateSpec] = []
         for format_name in cb_formats:
@@ -329,15 +390,11 @@ def build_cb_units(
             rung = cb_rung(format_name)
             family = fr.get_format(format_name).family
             basis = plugin.basis_for_format(format_name)
-            # FP8-lattice currently contains only K47/K48.  It therefore has
-            # one independently identifiable shape ratio, while the longer
-            # NV-lattice and FP8-learned ladders retain the registered
-            # rung-plus-parity design.  Declaring two columns for K47/K48
-            # would make every panel rank 1 of 2 and fail closed forever.
-            shape_features = (
-                (float(rung),)
-                if (family, basis) == ("fp8_cb", LATTICE_BASIS)
-                else (float(rung), float(rung % 2))
+            shape_features = tuple(
+                _CB_SHAPE_COLUMNS[index][1](rung)
+                for index in columns_by_segment[
+                    SegmentKey(family, declaration.role, basis)
+                ]
             )
             candidates.append(CandidateSpec(
                 format_name=format_name,
@@ -424,10 +481,14 @@ def plan_cb_panel_and_validation(
     """Choose deterministic role cohorts, globally disjoint from validation."""
     by_role_segments: dict[str, set[SegmentKey]] = defaultdict(set)
     by_segment: dict[SegmentKey, list[UnitSpec]] = defaultdict(list)
+    ladder_formats: dict[SegmentKey, set[str]] = defaultdict(set)
     for unit in units:
-        for segment in candidates_by_segment(unit, plugin):
+        for segment, candidates in candidates_by_segment(unit, plugin).items():
             by_role_segments[unit.role].add(segment)
             by_segment[segment].append(unit)
+            ladder_formats[segment].update(
+                candidate.format_name for candidate in candidates
+            )
 
     cohorts: dict[str, tuple[tuple[UnitSpec, ...], tuple[UnitSpec, ...]]] = {}
     for role, segments in sorted(by_role_segments.items()):
@@ -489,6 +550,32 @@ def plan_cb_panel_and_validation(
             fr.canonical_format_name(fmt)
             for fmt in policy.panel_rungs_by_segment.get(key, ())
         )
+        if len(ladder_formats[segment]) == 1:
+            # A one-rung segment has no shape law to fit and no room to fit
+            # one: the anchor is forced onto that rung, so pricing reduces to
+            # ratio 1.0 and the cell carries its own production render.  This
+            # is strictly more faithful than extrapolation, so renders spent
+            # on a panel here would buy nothing -- refuse a policy that asks
+            # for them rather than silently ignoring it.
+            if panel_formats or policy.validation_rungs_by_segment.get(key, ()):
+                raise AnchoredCostError(
+                    f"{segment.stamp} declares one legal rung and is priced "
+                    "by its anchor; it admits no panel or validation rungs"
+                )
+            accounting[segment.stamp] = {
+                "segment": basis_segment_dict(segment),
+                "panel_units": 0,
+                "panel_rungs": [],
+                "panel_render_cells": 0,
+                "validation_units": 0,
+                "validation_rungs": [],
+                "validation_render_cells": 0,
+                "design_rank": 0,
+                "design_rank_required": 0,
+                "single_rung_measured": True,
+                "sole_rung": sorted(ladder_formats[segment])[0],
+            }
+            continue
         if len(panel_formats) < 2:
             raise AnchoredCostError(
                 f"panel policy lacks >=2 rungs for {segment.stamp}"
@@ -801,10 +888,71 @@ def anchors_from_streamed_payload(
     return anchors
 
 
+def _single_rung_shape_fit(
+    segment: SegmentKey,
+    sole: CandidateSpec,
+    anchors: Mapping[tuple[str, SegmentKey], AnchorScalar],
+) -> ShapeFit:
+    """Price a one-rung segment from its own anchors instead of a shape law.
+
+    ``price_anchored_candidates`` evaluates ``anchor.predicted_dloss *
+    fit.ratio(candidate, anchor)``.  When a segment declares exactly one legal
+    rung the anchor is forced onto it, so the ratio is identically 1.0 and the
+    reported cost is that unit's own production render -- measured, not
+    extrapolated.  The identity fit below states that explicitly rather than
+    laundering it through a regression: a one-coordinate design centers to the
+    zero matrix, so fitting is impossible, not merely redundant.  Provenance
+    comes from the anchors themselves, which is exactly the identity pricing
+    re-checks per unit.
+    """
+    scoped = sorted(
+        (anchor for (_qname, key), anchor in anchors.items() if key == segment),
+        key=lambda anchor: anchor.qname,
+    )
+    if not scoped:
+        raise AnchoredCostError(
+            f"{segment.stamp} declares one legal rung but has no anchor"
+        )
+    off_ladder = sorted({
+        anchor.format_name for anchor in scoped
+        if anchor.format_name != sole.format_name
+    })
+    if off_ladder:
+        raise AnchoredCostError(
+            f"{segment.stamp} anchors at {off_ladder} outside its sole legal "
+            f"rung {sole.format_name}"
+        )
+    receipts = [anchor.receipt for anchor in scoped]
+    if len({receipt.arm_identity_sha256 for receipt in receipts}) != 1:
+        raise AnchoredCostError("single-rung segment spans production arms")
+    if len({receipt.payload_identity_sha256 for receipt in receipts}) != 1:
+        raise AnchoredCostError(
+            "single-rung segment spans render payload identities"
+        )
+    return ShapeFit(
+        segment=segment,
+        g_by_format={sole.format_name: 1.0},
+        reference_format=sole.format_name,
+        coefficients=(),
+        design_rank=0,
+        design_rank_required=0,
+        n_units=len({anchor.qname for anchor in scoped}),
+        n_observations=len(scoped),
+        arm_identity_sha256=receipts[0].arm_identity_sha256,
+        payload_identity_sha256=receipts[0].payload_identity_sha256,
+        panel_receipts_sha256=canonical_json_sha256(
+            sorted(receipt.receipt_sha256 for receipt in receipts),
+            where="single-rung measured segment anchor receipts",
+        ),
+    )
+
+
 def fit_all_cb_segments(
     observations: Sequence[ShapeObservation],
     units: Sequence[UnitSpec],
     plugin: CodebookAnchoredFormatPlugin,
+    *,
+    anchors: Mapping[tuple[str, SegmentKey], AnchorScalar],
 ) -> dict[SegmentKey, ShapeFit]:
     by_segment: dict[SegmentKey, list[ShapeObservation]] = defaultdict(list)
     ladders: dict[SegmentKey, dict[str, CandidateSpec]] = defaultdict(dict)
@@ -814,11 +962,16 @@ def fit_all_cb_segments(
         for segment, candidates in candidates_by_segment(unit, plugin).items():
             for candidate in candidates:
                 ladders[segment][candidate.format_name] = candidate
-    if set(by_segment) != set(ladders):
+    # A one-rung segment is priced by its anchor, so it is deliberately absent
+    # from the panel; every other legal segment must still be covered.
+    fitted = {
+        segment for segment, ladder in ladders.items() if len(ladder) > 1
+    }
+    if set(by_segment) != fitted:
         raise AnchoredCostError(
             "panel does not cover every legal family/role/basis segment"
         )
-    return {
+    fits = {
         segment: fit_segment_shape(
             by_segment[segment],
             segment=segment,
@@ -829,8 +982,12 @@ def fit_all_cb_segments(
                 ),
             )),
         )
-        for segment in sorted(ladders)
+        for segment in sorted(fitted)
     }
+    for segment in sorted(set(ladders) - fitted):
+        (sole,) = ladders[segment].values()
+        fits[segment] = _single_rung_shape_fit(segment, sole, anchors)
+    return fits
 
 
 def heldout_validation_report(

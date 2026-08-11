@@ -47,6 +47,7 @@ from prismaquant.cb_anchored_cost import (
     build_cb_allocator_cost_payload,
     build_cb_units,
     build_streamed_cb_render_plan,
+    cb_rung,
     fit_all_cb_segments,
     fitted_cb_hull_report,
     heldout_validation_report,
@@ -73,9 +74,28 @@ DSV4_EXPECTED_ANCHORS = 66_951
 DSV4_BUDGET_BYTES = 112_690_000_000
 DSV4_ARTIFACT_RESERVE_BYTES = 268_435_456
 
+# The FP8-CB menus are the on-law rungs only.  gridbook K1.2's fused mid-M
+# kernel law admits FP8-CB at k % 4 == 0 and nothing else: type_size = 4k is
+# the packed-B TMA box's contiguous extent and must stay a 16-byte multiple,
+# and the fused mainloop's single CbSubW = k/4 sub-table width is the format's
+# real layout only on those rungs -- a uniform decode at, say, k37 would be
+# *wrong*, not merely unaligned.  serving_profile_specs/nvfp4_cb.json backs
+# [28, 32, 36, 40, 44, 48] for every runtime 0.5.0..0.8.2 (the pin is 0.8.2,
+# version_is_release), so this is the served set, not an aspiration.  NVFP4-CB
+# is outside that law -- its lane backs no fused mid-M rungs at any version --
+# so K12..K18 stays contiguous.
 NVFP4_FORMATS = tuple(f"NVFP4_CB_K{k}" for k in range(12, 19))
-FP8_EXPERT_FORMATS = tuple(f"FP8_CB_K{k}" for k in range(28, 34))
-FP8_NONEXPERT_FORMATS = tuple(f"FP8_CB_K{k}" for k in range(28, 49))
+# Routed experts are additionally capped by the byte-exact source-payload
+# ceiling at K33, so on-law + legal leaves exactly two rungs.
+FP8_EXPERT_FORMATS = ("FP8_CB_K28", "FP8_CB_K32")
+FP8_NONEXPERT_FORMATS = (
+    "FP8_CB_K28", "FP8_CB_K32", "FP8_CB_K36",
+    "FP8_CB_K40", "FP8_CB_K44", "FP8_CB_K48",
+)
+# Derived so the routed-book coverage contracts and the basis map can never
+# drift from the menus above.
+FP8_EXPERT_RUNGS = tuple(cb_rung(name) for name in FP8_EXPERT_FORMATS)
+FP8_NONEXPERT_RUNGS = tuple(cb_rung(name) for name in FP8_NONEXPERT_FORMATS)
 
 _ALL_ROLES = (
     "gate_proj", "up_proj", "down_proj",
@@ -104,16 +124,16 @@ DSV4_PANEL_POLICY = CBPanelPolicy(
             )
             for role in _ALL_ROLES
         },
+        # Spans the full dense learned ladder and includes both rungs a routed
+        # expert can legally take, so routed cells are priced by interpolation
+        # inside the panel range rather than off its end.  FP8-CB lattice
+        # declares one legal rung (K48) and is therefore absent by contract:
+        # it is priced by its own anchor, and plan_cb_panel_and_validation
+        # refuses a panel it could not use.
         **{
             ("fp8_cb", role, LEARNED_BASIS): (
-                "FP8_CB_K28", "FP8_CB_K33",
-                "FP8_CB_K41", "FP8_CB_K46",
-            )
-            for role in _ALL_ROLES
-        },
-        **{
-            ("fp8_cb", role, LATTICE_BASIS): (
-                "FP8_CB_K47", "FP8_CB_K48",
+                "FP8_CB_K28", "FP8_CB_K32",
+                "FP8_CB_K40", "FP8_CB_K44",
             )
             for role in _ALL_ROLES
         },
@@ -121,7 +141,7 @@ DSV4_PANEL_POLICY = CBPanelPolicy(
     validation_rungs_by_segment={
         **{
             ("fp8_cb", role, LEARNED_BASIS): (
-                "FP8_CB_K28", "FP8_CB_K46",
+                "FP8_CB_K28", "FP8_CB_K44",
             )
             for role in _ALL_ROLES
         },
@@ -130,6 +150,19 @@ DSV4_PANEL_POLICY = CBPanelPolicy(
     validation_units_per_role=4,
     seed=42,
 )
+# One anchor format per (family, basis) is rendered for *every* unit in that
+# segment, so an anchor must be legal everywhere the segment reaches.  Routed
+# experts stop at K32 and dense units run to K48, so the FP8 learned anchor
+# has to come from the {K28, K32} intersection; K32 is the interior choice,
+# halving the worst extrapolation distance on the dense ladder (K32->K44 is
+# 12 rungs, K28->K44 is 16) at no cost on the 2-rung routed ladder.  FP8
+# lattice declares exactly one legal rung, so its anchor is that rung and
+# pricing there is measured rather than extrapolated.
+DSV4_ANCHOR_FORMATS = {
+    ("nvfp4_cb", LATTICE_BASIS): "NVFP4_CB_K15",
+    ("fp8_cb", LEARNED_BASIS): "FP8_CB_K32",
+    ("fp8_cb", LATTICE_BASIS): "FP8_CB_K48",
+}
 _TERMINAL_BY_SOURCE_KIND = {
     "mxfp4": "MXFP4_SOURCE",
     "fp8_ue8m0": "FP8_BLOCK_UE8M0_SOURCE",
@@ -248,7 +281,8 @@ def _validate_routed_selection(path: str | Path) -> str:
         (layer, projection, rung)
         for layer in range(43)
         for projection in ("gate_proj", "up_proj", "down_proj")
-        for rung in range(28, 34)
+        # 43 layers x 3 projections x the 2 on-law routed rungs = 258 cells.
+        for rung in FP8_EXPERT_RUNGS
     }
     if observed != expected:
         raise DSv4CampaignError(
@@ -275,7 +309,8 @@ def _validate_routed_bundle_selection_identity(
         (layer, projection, rung)
         for layer in range(43)
         for projection in ("gate_proj", "up_proj", "down_proj")
-        for rung in range(28, 34)
+        # 43 layers x 3 projections x the 2 on-law routed rungs = 258 cells.
+        for rung in FP8_EXPERT_RUNGS
     }
     observed: dict[tuple[int, str, int], tuple[str, str]] = {}
     wrong_selection: list[tuple[str, str, str]] = []
@@ -513,7 +548,7 @@ def _assert_authoritative_dsv4_basis_map(
             f"FP8_CB_K{k}": (
                 LEARNED_BASIS if k <= 46 else LATTICE_BASIS
             )
-            for k in range(28, 49)
+            for k in FP8_NONEXPERT_RUNGS
         },
     }
     missing = sorted(set(expected) - set(source_map))
@@ -641,7 +676,9 @@ def prepare_dsv4_campaign(args: argparse.Namespace) -> PreparedDSv4Campaign:
         format_plan.menus["nonexpert"]
     ) != FP8_NONEXPERT_FORMATS:
         raise DSv4CampaignError(
-            "frozen CLI menus differ from DSv4 K28..K33/K28..K48 contract"
+            "frozen CLI menus differ from the DSv4 on-law contract "
+            f"(experts {list(FP8_EXPERT_FORMATS)}, "
+            f"nonexperts {list(FP8_NONEXPERT_FORMATS)})"
         )
     format_plan_path = work_dir / "checkpoints" / "source_format_plan.json"
     format_plan_path.parent.mkdir(parents=True, exist_ok=True)
@@ -676,6 +713,7 @@ def prepare_dsv4_campaign(args: argparse.Namespace) -> PreparedDSv4Campaign:
     plugin = CodebookAnchoredFormatPlugin(
         codebook_source_by_format=source_map,
         arm_identity=arm_identity,
+        anchor_formats=DSV4_ANCHOR_FORMATS,
     )
     units = build_cb_units(declarations, plugin)
     anchor_requests = plan_anchor_requests(units, plugin)
@@ -946,7 +984,7 @@ def render_economics_report(
     # conservative E8 pre-optimization baseline.  The latter is also the only
     # supplied same-shape low-rung reference, so NV K12/K15/K16/K18 use it and
     # are labelled as unmatched rather than pretending it is an NV timing.
-    profile_seconds = {
+    measured_seconds = {
         "NVFP4_CB_K12": 0.069821,
         "NVFP4_CB_K15": 0.069821,
         "NVFP4_CB_K16": 0.069821,
@@ -961,6 +999,20 @@ def render_economics_report(
         "FP8_CB_K47": 3.8868322437820098,
         "FP8_CB_K48": 4.442083168687532,
     }
+    # The on-law FP8 menu (k % 4 == 0) lands on rungs the timing sets never
+    # sampled.  Each borrows the next rung UP from the same measurement
+    # family: encode time grows with K, so a higher rung is a strict
+    # over-estimate.  These are labelled projections and are never presented
+    # as timings of the rung they price -- only wall-clock planning reads
+    # them, never any cost or quality number.
+    onlaw_timing_proxy = {
+        "FP8_CB_K32": "FP8_CB_K33",
+        "FP8_CB_K40": "FP8_CB_K41",
+        "FP8_CB_K44": "FP8_CB_K46",
+    }
+    profile_seconds = dict(measured_seconds)
+    for projected, source in onlaw_timing_proxy.items():
+        profile_seconds[projected] = measured_seconds[source]
     requests_by_cell: dict[tuple[str, str], list[RenderRequest]] = {}
     for request in (
         *prepared.anchor_requests,
@@ -1075,6 +1127,10 @@ def render_economics_report(
                 "raw_records.jsonl: medians of elapsed_encode_seconds for "
                 "K41/K46/K47/K48"
             ),
+            "onlaw_rung_next_rung_up_proxy": {
+                projected: source
+                for projected, source in sorted(onlaw_timing_proxy.items())
+            },
             "p0_proxy": (
                 "/home/rob/dq-runs/dsv4-flash-0731/prod-cal-0p7/"
                 "logs/probe.log: phase1=129.0s, phase2=1.8s, "
@@ -1114,9 +1170,12 @@ def render_economics_report(
         "projection_limitation": (
             "K12/K15/K16/K18 use the measured 69.821ms/E production-shape "
             "low-rung proxy; K41/K46/K47/K48 use older measured pilot "
-            "medians. P0 is a measured-phase scaling proxy, not a timing of "
-            "this new fused pass. Dot-product, checkpoint-fsync, allocator, "
-            "and export-copy wall time are not separately measured."
+            "medians. No on-law FP8 rung above K28 was itself timed: K32/K40/"
+            "K44 borrow the next measured rung up (K33/K41/K46), which "
+            "over-estimates because encode time grows with K. P0 is a "
+            "measured-phase scaling proxy, not a timing of this new fused "
+            "pass. Dot-product, checkpoint-fsync, allocator, and export-copy "
+            "wall time are not separately measured."
         ),
         "projected_peak_new_disk_bytes": projected_new_disk,
         "projected_peak_new_disk_assumptions": (
@@ -1174,7 +1233,7 @@ def run_dsv4_anchor_campaign(
         prepared.panel_requests, streamed_payload
     )
     fits = fit_all_cb_segments(
-        panel_observations, prepared.units, prepared.plugin
+        panel_observations, prepared.units, prepared.plugin, anchors=anchors
     )
     validation_observations = observations_from_streamed_payload(
         prepared.validation_requests, streamed_payload

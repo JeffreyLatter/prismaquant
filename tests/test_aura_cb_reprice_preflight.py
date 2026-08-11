@@ -26,11 +26,11 @@ def test_source_rate_domain_is_not_demand_truncated():
     assert plan["expert_2048x4096_units"] == 22_016
     assert plan["expert_4096x2048_units"] == 11_008
     nvfp4_formats = [f"NVFP4_CB_K{k}" for k in range(12, 19)]
-    expert_fp8_formats = [
-        f"FP8_CB_K{k}" for k in range(28, 34)
-    ]
+    # gridbook K1.2: FP8-CB is legal only at k % 4 == 0.  Routed experts are
+    # additionally capped at K33 by the byte-exact source-payload ceiling.
+    expert_fp8_formats = [f"FP8_CB_K{k}" for k in (28, 32)]
     nonexpert_fp8_formats = [
-        f"FP8_CB_K{k}" for k in range(28, 49)
+        f"FP8_CB_K{k}" for k in (28, 32, 36, 40, 44, 48)
     ]
     assert plan["expert_formats"] == [
         *nvfp4_formats,
@@ -43,15 +43,15 @@ def test_source_rate_domain_is_not_demand_truncated():
         "FP8_BLOCK_UE8M0_SOURCE",
     ]
     assert plan["nvfp4_cells"] == 233_275
-    assert plan["expert_fp8_cells"] == 198_144
-    assert plan["nonexpert_fp8_cells"] == 6_321
-    assert plan["fp8_learned_cells"] == 203_863
-    assert plan["fp8_lattice_cells"] == 602
-    assert plan["fp8_cells"] == 204_465
+    assert plan["expert_fp8_cells"] == 33_024 * 2 == 66_048
+    assert plan["nonexpert_fp8_cells"] == 301 * 6 == 1_806
+    assert plan["fp8_learned_cells"] == 66_048 + 301 * 5 == 67_553
+    assert plan["fp8_lattice_cells"] == 301 * 1 == 301
+    assert plan["fp8_cells"] == 67_854
     assert plan["source_terminal_cells"] == 33_325
-    assert plan["expert_cells"] == 462_336
-    assert plan["nonexpert_cells"] == 8_729
-    assert plan["candidate_cells"] == 471_065
+    assert plan["expert_cells"] == 33_024 * (7 + 2 + 1) == 330_240
+    assert plan["nonexpert_cells"] == 301 * (7 + 6 + 1) == 4_214
+    assert plan["candidate_cells"] == 334_454
     assert plan["segment_key_fields"] == [
         "family", "role", "equivalence_class",
     ]
