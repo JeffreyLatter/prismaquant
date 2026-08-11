@@ -32,10 +32,13 @@ requires); memory-safe (one autograd graph at a time, watchdog-gated).
 from __future__ import annotations
 
 import argparse
+from collections.abc import Mapping
 import hashlib
+import json
 import math
 import os
 import pickle
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -57,10 +60,42 @@ from prismaquant.nvfp4_cb_footprint import (
 )
 
 SCHEMA = "prismaquant.aura_cost.v1"
+AURA_CHECKPOINT_IDENTITY_SCHEMA = "prismaquant.aura_checkpoint.identity.v1"
+AURA_CHECKPOINT_MANIFEST_SCHEMA = "prismaquant.aura_checkpoint.manifest.v1"
+AURA_CHECKPOINT_UNIT_SCHEMA = "prismaquant.aura_checkpoint.unit.v1"
 
 
 def _git_commit() -> str | None:
     """Best-effort commit of the prismaquant tree this cost was computed by."""
+    override = str(os.environ.get(
+        "PRISMAQUANT_IDENTITY_GIT_COMMIT", ""
+    )).strip().lower()
+    if override:
+        if re.fullmatch(r"[0-9a-f]{40,64}", override) is None:
+            raise RuntimeError(
+                "PRISMAQUANT_IDENTITY_GIT_COMMIT must be a full 40-64 "
+                "character hexadecimal commit id"
+            )
+        try:
+            resolved = subprocess.run(
+                ["git", "rev-parse", "--verify", f"{override}^{{commit}}"],
+                cwd=Path(__file__).resolve().parents[1],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            ).stdout.strip().lower()
+        except Exception as exc:
+            raise RuntimeError(
+                "PRISMAQUANT_IDENTITY_GIT_COMMIT does not resolve to a local "
+                "commit"
+            ) from exc
+        if resolved != override:
+            raise RuntimeError(
+                "PRISMAQUANT_IDENTITY_GIT_COMMIT does not resolve to that "
+                f"exact commit: requested={override!r} resolved={resolved!r}"
+            )
+        return resolved
     try:
         return subprocess.run(
             ["git", "rev-parse", "HEAD"],
@@ -69,6 +104,312 @@ def _git_commit() -> str | None:
         ).stdout.strip() or None
     except Exception:
         return None
+
+
+def _checkpoint_git_commit() -> str:
+    commit = _git_commit()
+    if commit is None:
+        raise RuntimeError("AURA checkpoint identity cannot resolve git commit")
+    repo_root = Path(__file__).resolve().parents[1]
+    clean = subprocess.run(
+        ["git", "diff", "--quiet", commit, "--", "prismaquant/aura_cost.py"],
+        cwd=repo_root,
+        check=False,
+        timeout=10,
+    )
+    if clean.returncode != 0:
+        raise RuntimeError(
+            "AURA checkpoint git identity is not exact: aura_cost.py differs "
+            f"from commit {commit}; commit it before checkpoint/resume"
+        )
+    return commit
+
+
+def _canonical_json(value: object, *, where: str) -> object:
+    try:
+        encoded = json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{where} is not canonical JSON data") from exc
+    return json.loads(encoded)
+
+
+def _canonical_json_sha256(value: object, *, where: str) -> str:
+    canonical = _canonical_json(value, where=where)
+    return hashlib.sha256(json.dumps(
+        canonical,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")).hexdigest()
+
+
+def _atomic_write_bytes(path: Path, payload: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    with tmp.open("wb") as handle:
+        handle.write(payload)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
+    # fsync the containing directory so the rename itself is durable across a
+    # host reset. Failure is load-bearing and must not be mistaken for a
+    # durable checkpoint.
+    directory_fd = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def _aura_unit_checkpoint_path(checkpoint_dir: Path, qname: str) -> Path:
+    digest = hashlib.sha256(str(qname).encode("utf-8")).hexdigest()
+    return checkpoint_dir / "units" / f"{digest}.pkl"
+
+
+def _raise_checkpoint_identity_mismatch(
+    *,
+    field: str,
+    stored: object,
+    expected: object,
+) -> None:
+    from prismaquant.production_weight_cache import identity_value_for_error
+
+    raise RuntimeError(
+        f"AURA checkpoint identity mismatch at {field}: "
+        f"stored={identity_value_for_error(stored)} "
+        f"current={identity_value_for_error(expected)}; refusing reuse or "
+        "recompute"
+    )
+
+
+def _write_aura_checkpoint_manifest(
+    checkpoint_dir: Path,
+    identity: Mapping[str, object],
+    names: Sequence[str],
+) -> str:
+    identity_sha256 = _canonical_json_sha256(
+        identity,
+        where="AURA checkpoint identity",
+    )
+    manifest = {
+        "schema": AURA_CHECKPOINT_MANIFEST_SCHEMA,
+        "identity_sha256": identity_sha256,
+        "identity": dict(identity),
+        "units": [
+            {
+                "qname": str(name),
+                "file": str(
+                    _aura_unit_checkpoint_path(checkpoint_dir, name).relative_to(
+                        checkpoint_dir
+                    )
+                ),
+            }
+            for name in names
+        ],
+    }
+    encoded = json.dumps(
+        manifest,
+        indent=2,
+        sort_keys=True,
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    _atomic_write_bytes(checkpoint_dir / "manifest.json", encoded)
+    return identity_sha256
+
+
+def _load_aura_checkpoint_manifest(
+    checkpoint_dir: Path,
+    expected_identity: Mapping[str, object],
+) -> str:
+    path = checkpoint_dir / "manifest.json"
+    try:
+        manifest = json.loads(path.read_text())
+    except Exception as exc:
+        _raise_checkpoint_identity_mismatch(
+            field="manifest_json",
+            stored="<invalid>",
+            expected="<valid canonical JSON>",
+        )
+        raise AssertionError("unreachable") from exc
+    if not isinstance(manifest, Mapping):
+        _raise_checkpoint_identity_mismatch(
+            field="manifest",
+            stored=manifest,
+            expected="<object>",
+        )
+    if manifest.get("schema") != AURA_CHECKPOINT_MANIFEST_SCHEMA:
+        _raise_checkpoint_identity_mismatch(
+            field="manifest.schema",
+            stored=manifest.get("schema"),
+            expected=AURA_CHECKPOINT_MANIFEST_SCHEMA,
+        )
+    stored_identity = manifest.get("identity")
+    from prismaquant.production_weight_cache import first_identity_difference
+
+    difference = first_identity_difference(stored_identity, expected_identity)
+    if difference is not None:
+        field, stored, expected = difference
+        _raise_checkpoint_identity_mismatch(
+            field=field,
+            stored=stored,
+            expected=expected,
+        )
+    expected_digest = _canonical_json_sha256(
+        expected_identity,
+        where="AURA checkpoint identity",
+    )
+    if manifest.get("identity_sha256") != expected_digest:
+        _raise_checkpoint_identity_mismatch(
+            field="manifest.identity_sha256",
+            stored=manifest.get("identity_sha256"),
+            expected=expected_digest,
+        )
+    return expected_digest
+
+
+def _write_aura_unit_checkpoint(
+    checkpoint_dir: Path,
+    *,
+    qname: str,
+    identity_sha256: str,
+    state: Mapping[str, object],
+) -> None:
+    state_bytes = pickle.dumps(dict(state), protocol=pickle.HIGHEST_PROTOCOL)
+    envelope = {
+        "schema": AURA_CHECKPOINT_UNIT_SCHEMA,
+        "qname": str(qname),
+        "identity_sha256": str(identity_sha256),
+        "payload_sha256": hashlib.sha256(state_bytes).hexdigest(),
+        "payload": state_bytes,
+    }
+    encoded = pickle.dumps(envelope, protocol=pickle.HIGHEST_PROTOCOL)
+    _atomic_write_bytes(
+        _aura_unit_checkpoint_path(checkpoint_dir, qname),
+        encoded,
+    )
+
+
+def _load_aura_unit_checkpoint(
+    path: Path,
+    *,
+    qname: str,
+    identity_sha256: str,
+) -> dict[str, object]:
+    try:
+        with path.open("rb") as handle:
+            envelope = pickle.load(handle)
+    except Exception as exc:
+        raise RuntimeError(
+            f"AURA unit checkpoint {path} is corrupt for {qname}; refusing "
+            "reuse or recompute"
+        ) from exc
+    if not isinstance(envelope, Mapping):
+        raise RuntimeError(
+            f"AURA unit checkpoint {path} is not an envelope for {qname}; "
+            "refusing reuse or recompute"
+        )
+    for field, expected in (
+        ("schema", AURA_CHECKPOINT_UNIT_SCHEMA),
+        ("qname", str(qname)),
+        ("identity_sha256", str(identity_sha256)),
+    ):
+        if envelope.get(field) != expected:
+            _raise_checkpoint_identity_mismatch(
+                field=f"unit[{qname}].{field}",
+                stored=envelope.get(field),
+                expected=expected,
+            )
+    payload = envelope.get("payload")
+    if not isinstance(payload, bytes):
+        raise RuntimeError(
+            f"AURA unit checkpoint {path} has no byte payload for {qname}; "
+            "refusing reuse or recompute"
+        )
+    payload_sha256 = hashlib.sha256(payload).hexdigest()
+    if envelope.get("payload_sha256") != payload_sha256:
+        raise RuntimeError(
+            f"AURA unit checkpoint {path} payload_sha256 differs for {qname}; "
+            "refusing reuse or recompute"
+        )
+    try:
+        state = pickle.loads(payload)
+    except Exception as exc:
+        raise RuntimeError(
+            f"AURA unit checkpoint {path} state is corrupt for {qname}; "
+            "refusing reuse or recompute"
+        ) from exc
+    if not isinstance(state, Mapping):
+        raise RuntimeError(
+            f"AURA unit checkpoint {path} state is not an object for {qname}; "
+            "refusing reuse or recompute"
+        )
+    return dict(state)
+
+
+def _prepare_aura_checkpoints(
+    checkpoint_dir: str | Path,
+    *,
+    resume: bool,
+    identity: Mapping[str, object],
+    names: Sequence[str],
+) -> tuple[Path, str, dict[str, dict[str, object]]]:
+    root = Path(checkpoint_dir)
+    if root.exists() and not root.is_dir():
+        raise RuntimeError(f"AURA checkpoint path is not a directory: {root}")
+    root.mkdir(parents=True, exist_ok=True)
+    manifest_path = root / "manifest.json"
+    if manifest_path.is_file():
+        if not resume:
+            raise RuntimeError(
+                f"AURA checkpoint manifest already exists at {manifest_path}; "
+                "pass --resume to validate and reuse it"
+            )
+        identity_sha256 = _load_aura_checkpoint_manifest(root, identity)
+    else:
+        existing_units = sorted((root / "units").glob("*.pkl"))
+        if existing_units:
+            raise RuntimeError(
+                "AURA checkpoint units exist without a manifest; refusing "
+                f"name-gated reuse or recompute. sample={existing_units[:8]}"
+            )
+        identity_sha256 = _write_aura_checkpoint_manifest(
+            root,
+            identity,
+            names,
+        )
+
+    expected_paths = {
+        _aura_unit_checkpoint_path(root, name): str(name)
+        for name in names
+    }
+    unexpected = sorted(
+        path for path in (root / "units").glob("*.pkl")
+        if path not in expected_paths
+    )
+    if unexpected:
+        _raise_checkpoint_identity_mismatch(
+            field="units.unexpected",
+            stored=[str(path.name) for path in unexpected[:8]],
+            expected=[],
+        )
+    completed: dict[str, dict[str, object]] = {}
+    for path, name in expected_paths.items():
+        if not path.is_file():
+            continue
+        completed[name] = _load_aura_unit_checkpoint(
+            path,
+            qname=name,
+            identity_sha256=identity_sha256,
+        )
+    return root, identity_sha256, completed
 
 # Passthrough formats -> zero predicted_dloss. This is the *passthrough rule*
 # (see allocator_candidates.PASSTHROUGH_SOURCE_REQUIREMENTS): zero cost is
@@ -349,6 +690,264 @@ def _guard_packed_expert_coverage(
     return packed
 
 
+def _build_aura_checkpoint_identity(
+    *,
+    model: nn.Module,
+    calib_ids: torch.Tensor,
+    names: Sequence[str],
+    linears: Mapping[str, nn.Linear],
+    formats: Sequence[str],
+    chunks: Sequence[Sequence[str]],
+    n_probes: int,
+    token_scope: str,
+    temperature: float,
+    seed_base: int,
+    dw_dtype: str,
+    include_lm_head: bool,
+    hook_harvest: bool,
+    allow_packed_expert_omission: bool,
+    probe_microbatch: int,
+    collect_col_energy: bool,
+    require_production_cache: bool,
+    production_cache: object,
+    cb_provenance: Mapping[str, object],
+    git_commit: str,
+    extra_identity: Mapping[str, object] | None,
+) -> dict[str, object]:
+    raw_calib_sha256 = hashlib.sha256(
+        calib_ids.detach().cpu().contiguous().numpy().tobytes()
+    ).hexdigest()
+    cache_metadata = getattr(production_cache, "metadata", None)
+    cache_metadata = cache_metadata if isinstance(cache_metadata, Mapping) else {}
+    identity = {
+        "schema": AURA_CHECKPOINT_IDENTITY_SCHEMA,
+        "git_commit": str(git_commit),
+        "calibration": {
+            "shape": [int(dim) for dim in calib_ids.shape],
+            "dtype": str(calib_ids.dtype),
+            "sha256": raw_calib_sha256,
+            "calib_hash": calibration_data_hash(calib_ids),
+        },
+        "formats": [str(fmt) for fmt in formats],
+        "units": [
+            {
+                "qname": str(name),
+                "shape": [int(dim) for dim in linears[name].weight.shape],
+                "dtype": str(linears[name].weight.dtype),
+                "n_params": int(linears[name].weight.numel()),
+            }
+            for name in names
+        ],
+        "chunks": [[str(name) for name in chunk] for chunk in chunks],
+        "n_probes": int(n_probes),
+        "token_scope": str(token_scope),
+        "temperature": float(temperature),
+        "seed_base": int(seed_base),
+        "measurement_dtype": str(next(model.parameters()).dtype),
+        "dw_dtype": str(dw_dtype),
+        "include_lm_head": bool(include_lm_head),
+        "hook_harvest": bool(hook_harvest),
+        "allow_packed_expert_omission": bool(allow_packed_expert_omission),
+        "probe_microbatch": int(probe_microbatch),
+        "collect_col_energy": bool(collect_col_energy),
+        "require_production_cache": bool(require_production_cache),
+        "production_cache_calib_hash": cache_metadata.get("calib_hash"),
+        "production_cache_pair_identity": cache_metadata.get(
+            "cb_cache_pair_identity"
+        ),
+        # The complete value-bearing identity is intentionally embedded, not
+        # reduced to a cache filename. It binds codebooks, source/column
+        # weights, scale/layout/sweep/LDLQ, and every qname/rung format scope.
+        "cb_render_identity": cb_provenance.get("cb_render_identity"),
+        "extra": dict(extra_identity or {}),
+    }
+    return _canonical_json(identity, where="AURA checkpoint identity")
+
+
+def _validate_aura_checkpoint_cache_identity(production_cache: object) -> None:
+    metadata = getattr(production_cache, "metadata", None)
+    if not isinstance(metadata, Mapping):
+        raise RuntimeError(
+            "AURA durable checkpointing requires production-cache metadata; "
+            "refusing model/cache name-gated resume"
+        )
+    calibration_hash = metadata.get("calib_hash")
+    if not isinstance(calibration_hash, str) or not calibration_hash:
+        raise RuntimeError(
+            "AURA durable checkpointing requires the production cache's exact "
+            "calib_hash; refusing model/cache name-gated resume"
+        )
+    pair_set = metadata.get("cb_cache_pair_identity")
+    if not isinstance(pair_set, Mapping):
+        raise RuntimeError(
+            "AURA durable checkpointing requires identity-bound CB pair "
+            "artifacts; refusing model/cache name-gated resume"
+        )
+    if pair_set.get("schema") != (
+        "prismaquant.production_weight_cache.cb_pair_set.v1"
+    ):
+        raise RuntimeError(
+            "AURA durable checkpointing found an unsupported CB pair identity "
+            f"schema {pair_set.get('schema')!r}"
+        )
+    try:
+        entries = int(pair_set["entries"])
+        published_entries = int(pair_set["published_entries"])
+    except Exception as exc:
+        raise RuntimeError(
+            "AURA durable checkpointing found malformed CB pair entry counts"
+        ) from exc
+    if entries < 1 or published_entries != entries:
+        raise RuntimeError(
+            "AURA durable checkpointing requires every identity-bound CB pair "
+            f"artifact to be published; entries={entries} "
+            f"published_entries={published_entries}"
+        )
+    for field in ("identity_sha256", "artifact_sha256"):
+        digest = str(pair_set.get(field, "")).lower()
+        if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise RuntimeError(
+                "AURA durable checkpointing found an invalid CB pair "
+                f"{field}"
+            )
+    calibration_hashes = pair_set.get("calibration_hashes")
+    if (
+        not isinstance(calibration_hashes, Sequence)
+        or isinstance(calibration_hashes, (str, bytes))
+        or list(calibration_hashes) != [calibration_hash]
+    ):
+        raise RuntimeError(
+            "AURA durable checkpointing found a production-cache calibration "
+            "hash that differs from its CB pair artifacts"
+        )
+    commits = pair_set.get("git_commits")
+    if (
+        not isinstance(commits, Sequence)
+        or isinstance(commits, (str, bytes))
+        or len(commits) != 1
+        or re.fullmatch(r"[0-9a-f]{40,64}", str(commits[0]).lower()) is None
+    ):
+        raise RuntimeError(
+            "AURA durable checkpointing requires one exact CB pair producer "
+            "git commit"
+        )
+
+
+def _aura_unit_state(
+    name: str,
+    nonzero_formats: Sequence[str],
+    *,
+    s2: Mapping[tuple[str, str], float],
+    s4: Mapping[tuple[str, str], float],
+    x2_probe: Mapping[tuple[str, str], list[float]],
+    dw_src: Mapping[tuple[str, str], str],
+    g_trace: Mapping[str, float],
+    col_energy: Mapping[str, torch.Tensor],
+) -> dict[str, object]:
+    rows: dict[str, dict[str, object]] = {}
+    for fmt in nonzero_formats:
+        key = (name, fmt)
+        if key not in s2:
+            continue
+        rows[fmt] = {
+            "s2": float(s2[key]),
+            "s4": float(s4[key]),
+            "x2_probe": list(x2_probe[key]),
+            "dw_src": str(dw_src[key]),
+        }
+    return {
+        "g_trace": float(g_trace[name]),
+        "rows": rows,
+        "col_energy": (
+            col_energy[name].detach().to(device="cpu", dtype=torch.float32)
+            if name in col_energy
+            else None
+        ),
+    }
+
+
+def _restore_aura_unit_state(
+    name: str,
+    state: Mapping[str, object],
+    *,
+    nonzero_formats: Sequence[str],
+    n_probes: int,
+    collect_col_energy: bool,
+    s2: dict[tuple[str, str], float],
+    s4: dict[tuple[str, str], float],
+    x2_probe: dict[tuple[str, str], list[float]],
+    dw_src: dict[tuple[str, str], str],
+    g_trace: dict[str, float],
+    col_energy: dict[str, torch.Tensor],
+) -> None:
+    try:
+        g_trace[name] = float(state["g_trace"])
+    except Exception as exc:
+        raise RuntimeError(
+            f"AURA unit checkpoint state for {name} has invalid g_trace; "
+            "refusing reuse or recompute"
+        ) from exc
+    rows = state.get("rows")
+    if not isinstance(rows, Mapping):
+        raise RuntimeError(
+            f"AURA unit checkpoint state for {name} has invalid rows; "
+            "refusing reuse or recompute"
+        )
+    unexpected = sorted(set(str(fmt) for fmt in rows) - set(nonzero_formats))
+    if unexpected:
+        raise RuntimeError(
+            f"AURA unit checkpoint state for {name} has unexpected formats "
+            f"{unexpected}; refusing reuse or recompute"
+        )
+    for raw_fmt, raw_row in rows.items():
+        fmt = str(raw_fmt)
+        if not isinstance(raw_row, Mapping):
+            raise RuntimeError(
+                f"AURA unit checkpoint state for {name}@{fmt} is invalid; "
+                "refusing reuse or recompute"
+            )
+        samples = raw_row.get("x2_probe")
+        if (
+            not isinstance(samples, Sequence)
+            or isinstance(samples, (str, bytes))
+            or len(samples) != int(n_probes)
+        ):
+            raise RuntimeError(
+                f"AURA unit checkpoint state for {name}@{fmt} has "
+                f"x2_probe length {len(samples) if isinstance(samples, Sequence) else '<invalid>'}; "
+                f"expected {n_probes}; refusing reuse or recompute"
+            )
+        key = (name, fmt)
+        try:
+            s2[key] = float(raw_row["s2"])
+            s4[key] = float(raw_row["s4"])
+            x2_probe[key] = [float(value) for value in samples]
+            dw_src[key] = str(raw_row["dw_src"])
+        except Exception as exc:
+            raise RuntimeError(
+                f"AURA unit checkpoint state for {name}@{fmt} is malformed; "
+                "refusing reuse or recompute"
+            ) from exc
+    stored_col_energy = state.get("col_energy")
+    if collect_col_energy:
+        if stored_col_energy is not None and not isinstance(
+            stored_col_energy, torch.Tensor
+        ):
+            raise RuntimeError(
+                f"AURA unit checkpoint state for {name} has invalid "
+                "col_energy; refusing reuse or recompute"
+            )
+        if isinstance(stored_col_energy, torch.Tensor):
+            col_energy[name] = stored_col_energy.detach().to(
+                device="cpu", dtype=torch.float32
+            )
+    elif stored_col_energy is not None:
+        raise RuntimeError(
+            f"AURA unit checkpoint state for {name} unexpectedly carries "
+            "col_energy; refusing reuse or recompute"
+        )
+
+
 def compute_aura_cost(
     model: nn.Module,
     calib_ids: torch.Tensor,
@@ -370,6 +969,10 @@ def compute_aura_cost(
     allow_packed_expert_omission: bool = False,
     probe_microbatch: int = 0,
     collect_col_energy: bool = False,
+    checkpoint_dir: str | Path | None = None,
+    resume: bool = False,
+    unit_filter: str | None = None,
+    checkpoint_identity_extra: Mapping[str, object] | None = None,
 ) -> dict:
     """Return a cost.pkl payload dict (stats + costs) for the allocator.
 
@@ -382,6 +985,8 @@ def compute_aura_cost(
     just computed in G memory-bounded passes. 0 = auto-size from free memory."""
     if n_probes < 1:
         raise ValueError(f"n_probes must be >= 1, got {n_probes!r}")
+    if resume and checkpoint_dir is None:
+        raise ValueError("resume=True requires checkpoint_dir")
     omitted_packed_experts = _guard_packed_expert_coverage(
         model, allow_omission=allow_packed_expert_omission)
     _dw_torch_dtype = torch.float32 if str(dw_dtype) == "float32" else torch.bfloat16
@@ -413,6 +1018,19 @@ def compute_aura_cost(
                 f"includes the embedding-path contribution, so this cost would "
                 f"not measure the lm_head-only decision the allocator prices. "
                 f"Drop --include-lm-head for tied models.")
+    if unit_filter:
+        try:
+            unit_pattern = re.compile(str(unit_filter))
+        except re.error as exc:
+            raise ValueError(f"invalid unit_filter regex {unit_filter!r}") from exc
+        linears = {
+            name: mod for name, mod in linears.items()
+            if unit_pattern.search(name)
+        }
+        if not linears:
+            raise ValueError(
+                f"unit_filter {unit_filter!r} matched no AURA Linear qnames"
+            )
     names = list(linears.keys())
     fmts = [fr.canonical_format_name(f) for f in formats]
     nonzero_fmts = [f for f in fmts if f not in _ZERO_COST_FORMATS]
@@ -432,6 +1050,14 @@ def compute_aura_cost(
             require_for_formats=fmts,
             where="AURA production cache",
         )
+    if checkpoint_dir is not None and not cb_provenance:
+        raise RuntimeError(
+            "AURA durable checkpointing requires a value-bearing CB "
+            "ProductionWeightCache identity; refusing model/cache name-gated "
+            "resume"
+        )
+    if checkpoint_dir is not None:
+        _validate_aura_checkpoint_cache_identity(production_cache)
     # Passthrough-rule guard (opt-in; default off keeps the output byte-for-byte
     # identical). BF16 zero-cost is only valid when the source weight is already
     # bf16/fp16 -- on an fp32-source model loaded as fp32, casting W to BF16 is a
@@ -488,14 +1114,90 @@ def compute_aura_cost(
     col_energy: dict[str, torch.Tensor] = {}
     inv = 1.0 / float(n_probes)
 
-    for ci, chunk in enumerate(chunks):
+    checkpoint_root: Path | None = None
+    checkpoint_identity_sha256: str | None = None
+    completed_checkpoint_units: set[str] = set()
+    checkpoint_git_commit: str | None = None
+    if checkpoint_dir is not None:
+        checkpoint_git_commit = _checkpoint_git_commit()
+        checkpoint_identity = _build_aura_checkpoint_identity(
+            model=model,
+            calib_ids=calib_ids,
+            names=names,
+            linears=linears,
+            formats=fmts,
+            chunks=chunks,
+            n_probes=n_probes,
+            token_scope=token_scope,
+            temperature=temperature,
+            seed_base=seed_base,
+            dw_dtype=dw_dtype,
+            include_lm_head=include_lm_head,
+            hook_harvest=hook_harvest,
+            allow_packed_expert_omission=allow_packed_expert_omission,
+            probe_microbatch=probe_microbatch,
+            collect_col_energy=collect_col_energy,
+            require_production_cache=require_production_cache,
+            production_cache=production_cache,
+            cb_provenance=cb_provenance,
+            git_commit=checkpoint_git_commit,
+            extra_identity=checkpoint_identity_extra,
+        )
+        checkpoint_root, checkpoint_identity_sha256, completed_states = (
+            _prepare_aura_checkpoints(
+                checkpoint_dir,
+                resume=resume,
+                identity=checkpoint_identity,
+                names=names,
+            )
+        )
+        for name in names:
+            state = completed_states.get(name)
+            if state is None:
+                continue
+            _restore_aura_unit_state(
+                name,
+                state,
+                nonzero_formats=nonzero_fmts,
+                n_probes=n_probes,
+                collect_col_energy=collect_col_energy,
+                s2=s2,
+                s4=s4,
+                x2_probe=x2_probe,
+                dw_src=dw_src,
+                g_trace=g_trace,
+                col_energy=col_energy,
+            )
+            completed_checkpoint_units.add(name)
+        if completed_checkpoint_units:
+            _log(
+                f"checkpoint resume: validated {len(completed_checkpoint_units)}/"
+                f"{len(names)} completed Linear units"
+            )
+
+    for ci, original_chunk in enumerate(chunks):
+        pending_chunk = [
+            name for name in original_chunk
+            if name not in completed_checkpoint_units
+        ]
+        if not pending_chunk:
+            if checkpoint_root is not None:
+                _log(f"chunk {ci+1}/{len(chunks)}: fully checkpointed; skip")
+            continue
+        # A process can die between the atomic publication of two unit shards
+        # from the same completed chunk. Re-arm the complete original chunk so
+        # each pending unit sees the identical autograd topology/kernel work it
+        # saw uninterrupted; already-published siblings are harvested and then
+        # discarded, never accumulated twice.
+        chunk = list(original_chunk)
+        pending_names = set(pending_chunk)
         for n in chunk:
             linears[n].weight.requires_grad_(True)
         # Precompute dW_{i,f} (fp32 delta, stored bf16) for this chunk only.
         dW: dict[tuple[str, str], torch.Tensor] = {}
         with torch.no_grad():
             for f in nonzero_fmts:
-                for n in chunk:
+                for n in pending_chunk:
                     res = _delta_w(n, f, linears[n].weight.data,
                                    production_cache,
                                    strict=require_production_cache)
@@ -507,7 +1209,7 @@ def compute_aura_cost(
             s2.setdefault(key, 0.0)
             s4.setdefault(key, 0.0)
             x2_probe.setdefault(key, [])
-        for n in chunk:
+        for n in pending_chunk:
             g_trace.setdefault(n, 0.0)
         # dW is now materialized for this chunk; the cache's LRU-resident
         # rendered weights are no longer needed. Evict them (back to disk
@@ -532,6 +1234,7 @@ def compute_aura_cost(
         torch.cuda.empty_cache()
         if len(chunks) > 1:
             _log(f"chunk {ci+1}/{len(chunks)}: {len(chunk)} Linears, "
+                 f"pending={len(pending_chunk)}/{len(chunk)} Linears, "
                  f"dW pairs={len(dW)}; free={_free_gib():.1f}")
 
         # K probe backward passes; one autograd graph alive at a time (fresh
@@ -549,6 +1252,8 @@ def compute_aura_cost(
             sums. Single reduction shared by all three harvest sites (hook,
             post-backward straggler sweep, legacy loop) so they are
             arithmetically identical by construction."""
+            if name not in pending_names:
+                return
             with torch.no_grad():
                 gf = g.float()
                 g_trace[name] += float((gf * gf).sum().item())
@@ -675,6 +1380,28 @@ def compute_aura_cost(
                      f"free={_free_gib():.1f}")
         for h in hook_handles:
             h.remove()
+        if checkpoint_root is not None:
+            assert checkpoint_identity_sha256 is not None
+            # Publish one durable accumulator shard per completed Linear only
+            # after all of its probes have been harvested. A kill between unit
+            # renames loses at most the unpublished units in this chunk.
+            for n in pending_chunk:
+                state = _aura_unit_state(
+                    n,
+                    nonzero_fmts,
+                    s2=s2,
+                    s4=s4,
+                    x2_probe=x2_probe,
+                    dw_src=dw_src,
+                    g_trace=g_trace,
+                    col_energy=col_energy,
+                )
+                _write_aura_unit_checkpoint(
+                    checkpoint_root,
+                    qname=n,
+                    identity_sha256=checkpoint_identity_sha256,
+                    state=state,
+                )
         # Release this chunk's dW + grad enablement before the next chunk.
         del dW
         for n in chunk:
@@ -781,7 +1508,11 @@ def compute_aura_cost(
             "omitted_packed_experts": omitted_packed_experts,
             "dw_rendered_rows": n_rendered,
             "dw_rtn_fallback_rows": n_rtn,
-            "git_commit": _git_commit(),
+            "git_commit": (
+                checkpoint_git_commit
+                if checkpoint_git_commit is not None
+                else _git_commit()
+            ),
             **(
                 cb_provenance
                 if cb_provenance
@@ -798,6 +1529,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--formats", default="NVFP4,FP8_DYNAMIC,BF16")
     p.add_argument("--production-cache", default=None,
                    help="ProductionWeightCache pickle for production-faithful dW")
+    p.add_argument("--checkpoint-dir", default=None,
+                   help="Durable per-Linear AURA checkpoint directory. The "
+                        "manifest value-binds calibration, cache rendering, "
+                        "formats, execution knobs, and producer commit.")
+    p.add_argument("--resume", action="store_true",
+                   help="Validate and reuse exact per-Linear checkpoints. An "
+                        "identity mismatch refuses both reuse and recompute.")
+    p.add_argument("--unit-filter", default="",
+                   help="Optional regex selecting exact Linear qnames; the "
+                        "resolved ordered unit scope is identity-bound.")
     p.add_argument("--n-probes", type=int, default=16)
     p.add_argument("--n-calib-samples", type=int, default=4)
     p.add_argument("--calib-seqlen", type=int, default=256)
@@ -902,6 +1643,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                    help="Pipeline COST_MODE stamped into "
                         "provenance['cost_mode'] (re-vet R2).")
     args = p.parse_args(argv)
+    if args.resume and not args.checkpoint_dir:
+        p.error("--resume requires --checkpoint-dir")
     from prismaquant.gpu_guard import require_cuda_hot_path
     require_cuda_hot_path("aura_cost", args.device)
 
@@ -993,6 +1736,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         allow_packed_expert_omission=args.allow_packed_expert_omission,
         probe_microbatch=args.probe_microbatch,
         collect_col_energy=args.collect_col_energy,
+        checkpoint_dir=args.checkpoint_dir,
+        resume=args.resume,
+        unit_filter=(args.unit_filter or None),
+        checkpoint_identity_extra={
+            "gradient_checkpointing": bool(args.gradient_checkpointing),
+        },
     )
     payload["provenance"].update({
         "model": str(args.model),
