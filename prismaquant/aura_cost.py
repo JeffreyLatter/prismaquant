@@ -76,26 +76,7 @@ def _git_commit() -> str | None:
                 "PRISMAQUANT_IDENTITY_GIT_COMMIT must be a full 40-64 "
                 "character hexadecimal commit id"
             )
-        try:
-            resolved = subprocess.run(
-                ["git", "rev-parse", "--verify", f"{override}^{{commit}}"],
-                cwd=Path(__file__).resolve().parents[1],
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=5,
-            ).stdout.strip().lower()
-        except Exception as exc:
-            raise RuntimeError(
-                "PRISMAQUANT_IDENTITY_GIT_COMMIT does not resolve to a local "
-                "commit"
-            ) from exc
-        if resolved != override:
-            raise RuntimeError(
-                "PRISMAQUANT_IDENTITY_GIT_COMMIT does not resolve to that "
-                f"exact commit: requested={override!r} resolved={resolved!r}"
-            )
-        return resolved
+        return override
     try:
         return subprocess.run(
             ["git", "rev-parse", "HEAD"],
@@ -110,6 +91,8 @@ def _checkpoint_git_commit() -> str:
     commit = _git_commit()
     if commit is None:
         raise RuntimeError("AURA checkpoint identity cannot resolve git commit")
+    if os.environ.get("PRISMAQUANT_IDENTITY_GIT_COMMIT"):
+        return commit
     repo_root = Path(__file__).resolve().parents[1]
     clean = subprocess.run(
         ["git", "diff", "--quiet", commit, "--", "prismaquant/aura_cost.py"],
@@ -123,6 +106,33 @@ def _checkpoint_git_commit() -> str:
             f"from commit {commit}; commit it before checkpoint/resume"
         )
     return commit
+
+
+def _aura_source_sha256() -> str:
+    """Hash the actual AURA implementation used in git-less containers."""
+    repo_root = Path(__file__).resolve().parents[1]
+    identity_paths = [
+        "prismaquant/aura_cost.py",
+        "prismaquant/kl_fisher.py",
+        "prismaquant/perturbed_x_cache.py",
+        "prismaquant/format_registry.py",
+        "prismaquant/production_weight_cache.py",
+    ]
+    digest = hashlib.sha256()
+    for relative in identity_paths:
+        path = repo_root / relative
+        try:
+            payload = path.read_bytes()
+        except OSError as exc:
+            raise RuntimeError(
+                f"AURA source identity cannot read {relative}"
+            ) from exc
+        encoded_name = relative.encode("utf-8")
+        digest.update(len(encoded_name).to_bytes(4, "big"))
+        digest.update(encoded_name)
+        digest.update(len(payload).to_bytes(8, "big"))
+        digest.update(payload)
+    return digest.hexdigest()
 
 
 def _canonical_json(value: object, *, where: str) -> object:
@@ -722,6 +732,7 @@ def _build_aura_checkpoint_identity(
     identity = {
         "schema": AURA_CHECKPOINT_IDENTITY_SCHEMA,
         "git_commit": str(git_commit),
+        "producer_source_sha256": _aura_source_sha256(),
         "calibration": {
             "shape": [int(dim) for dim in calib_ids.shape],
             "dtype": str(calib_ids.dtype),
@@ -830,6 +841,20 @@ def _validate_aura_checkpoint_cache_identity(production_cache: object) -> None:
         raise RuntimeError(
             "AURA durable checkpointing requires one exact CB pair producer "
             "git commit"
+        )
+    source_digests = pair_set.get("producer_source_sha256")
+    if (
+        not isinstance(source_digests, Sequence)
+        or isinstance(source_digests, (str, bytes))
+        or not source_digests
+        or any(
+            re.fullmatch(r"[0-9a-f]{64}", str(value).lower()) is None
+            for value in source_digests
+        )
+    ):
+        raise RuntimeError(
+            "AURA durable checkpointing requires exact CB renderer source "
+            "SHA-256 identity"
         )
 
 

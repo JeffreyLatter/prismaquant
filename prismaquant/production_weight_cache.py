@@ -2009,12 +2009,10 @@ def _production_cache_git_commit() -> str:
                 "PRISMAQUANT_IDENTITY_GIT_COMMIT must be a full 40-64 "
                 "character hexadecimal commit id"
             )
-        requested_commit = override
-    else:
-        requested_commit = "HEAD"
+        return override
     try:
         result = subprocess.run(
-            ["git", "rev-parse", "--verify", f"{requested_commit}^{{commit}}"],
+            ["git", "rev-parse", "--verify", "HEAD^{commit}"],
             cwd=repo_root,
             check=True,
             capture_output=True,
@@ -2031,38 +2029,39 @@ def _production_cache_git_commit() -> str:
             "production CB pair identity resolved an invalid git commit "
             f"{commit!r}"
         )
-    if override and commit != override:
-        raise RuntimeError(
-            "PRISMAQUANT_IDENTITY_GIT_COMMIT does not resolve to that exact "
-            f"commit: requested={override!r} resolved={commit!r}"
-        )
-    if override:
-        identity_paths = [
-            "prismaquant/production_weight_cache.py",
-            "prismaquant/nvfp4_cb_formats.py",
-            "prismaquant/nvfp4_cb_footprint.py",
-            "prismaquant/cb_layout.py",
-            "prismaquant/cb_ldlq_atoms.py",
-            "prismaquant/cb_minchain.py",
-            "prismaquant/cb_learned_bundle.py",
-            "prismaquant/cb_banked_books.py",
-            "prismaquant/export_native_compressed.py",
-            "prismaquant/format_registry.py",
-        ]
-        clean = subprocess.run(
-            ["git", "diff", "--quiet", commit, "--", *identity_paths],
-            cwd=repo_root,
-            check=False,
-            timeout=10,
-        )
-        if clean.returncode != 0:
-            raise RuntimeError(
-                "production CB pair git identity is not exact: one or more "
-                "renderer source files differ from commit "
-                f"{commit}; commit the identity-bearing implementation before "
-                "an override-bound render/resume"
-            )
     return commit
+
+
+def _production_cache_source_sha256() -> str:
+    """Hash the actual renderer sources used even in git-less containers."""
+    repo_root = Path(__file__).resolve().parents[1]
+    identity_paths = [
+        "prismaquant/production_weight_cache.py",
+        "prismaquant/nvfp4_cb_formats.py",
+        "prismaquant/nvfp4_cb_footprint.py",
+        "prismaquant/cb_layout.py",
+        "prismaquant/cb_ldlq_atoms.py",
+        "prismaquant/cb_minchain.py",
+        "prismaquant/cb_learned_bundle.py",
+        "prismaquant/cb_banked_books.py",
+        "prismaquant/export_native_compressed.py",
+        "prismaquant/format_registry.py",
+    ]
+    digest = hashlib.sha256()
+    for relative in identity_paths:
+        path = repo_root / relative
+        try:
+            payload = path.read_bytes()
+        except OSError as exc:
+            raise RuntimeError(
+                f"production CB source identity cannot read {relative}"
+            ) from exc
+        encoded_name = relative.encode("utf-8")
+        digest.update(len(encoded_name).to_bytes(4, "big"))
+        digest.update(encoded_name)
+        digest.update(len(payload).to_bytes(8, "big"))
+        digest.update(payload)
+    return digest.hexdigest()
 
 
 def _cb_pair_codebook_identity(
@@ -2154,6 +2153,7 @@ def build_cb_cache_pair_identity(
     cb_serialization_context=None,
     render_input_contract: Mapping[str, object] | None = None,
     validated_context=None,
+    producer_source_sha256: str | None = None,
 ) -> dict[str, object]:
     """Project the global CB render identity onto one resumable cache pair."""
     if validated_context is None:
@@ -2266,7 +2266,12 @@ def build_cb_cache_pair_identity(
         "calibration_hash": str(calibration_hash),
         "render_input_contract": dict(render_input_contract or {}),
         "git_commit": str(git_commit).lower(),
+        "producer_source_sha256": str(
+            producer_source_sha256 or _production_cache_source_sha256()
+        ).lower(),
     }
+    if re.fullmatch(r"[0-9a-f]{64}", pair["producer_source_sha256"]) is None:
+        raise ValueError("CB cache pair producer source SHA-256 is invalid")
     return _canonical_json_value(pair, where="CB cache pair identity")
 
 
@@ -4559,6 +4564,7 @@ def fill_production_weight_cache(
             calibration_hash = calibration_data_hash(calib_ids)
             cb_pair_calibration_hash = calibration_hash
             git_commit = _production_cache_git_commit()
+            producer_source_sha256 = _production_cache_source_sha256()
             named_modules = dict(model.named_modules())
             # Validate every pre-existing pair before file-existence pruning.
             # A single mismatch aborts the whole launch before an activation
@@ -4588,6 +4594,7 @@ def fill_production_weight_cache(
                             "max_act_rows": int(max_act_rows),
                         },
                         validated_context=cb_pair_context,
+                        producer_source_sha256=producer_source_sha256,
                     )
                     cb_pair_identities[key] = pair_identity
                     admitted = _validate_cb_cache_pair_resume(
@@ -5206,6 +5213,10 @@ def fill_production_weight_cache(
                 str(pair["git_commit"])
                 for pair in canonical_pairs.values()
             }),
+            "producer_source_sha256": sorted({
+                str(pair["producer_source_sha256"])
+                for pair in canonical_pairs.values()
+            }),
         }
     cache = ProductionWeightCache(
         weights=weights,
@@ -5690,6 +5701,7 @@ def fill_packed_expert_cache_entries(
             ),
         }
         packed_git_commit = _production_cache_git_commit()
+        packed_producer_source_sha256 = _production_cache_source_sha256()
         packed_identity = cache.metadata[CB_RENDER_IDENTITY_METADATA_KEY]
         packed_pair_context = validate_cb_render_identity_metadata(
             packed_identity,
@@ -5711,6 +5723,7 @@ def fill_packed_expert_cache_entries(
                 cb_serialization_context=cb_serialization_context,
                 render_input_contract=packed_render_input_contract,
                 validated_context=packed_pair_context,
+                producer_source_sha256=packed_producer_source_sha256,
             )
             packed_cb_pair_identities[key] = pair_identity
             admitted = _validate_cb_cache_pair_resume(
@@ -6367,6 +6380,10 @@ def fill_packed_expert_cache_entries(
             }),
             "git_commits": sorted({
                 str(pair["git_commit"])
+                for pair in pair_identities.values()
+            }),
+            "producer_source_sha256": sorted({
+                str(pair["producer_source_sha256"])
                 for pair in pair_identities.values()
             }),
         }

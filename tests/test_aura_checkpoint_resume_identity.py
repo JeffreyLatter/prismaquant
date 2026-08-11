@@ -42,6 +42,7 @@ class _TinyCache:
                 "published_entries": 2,
                 "calibration_hashes": ["cache-calibration-content"],
                 "git_commits": ["9" * 40],
+                "producer_source_sha256": ["8" * 64],
             },
         }
         self._weights = {
