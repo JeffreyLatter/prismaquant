@@ -70,7 +70,10 @@ _RENDER_SETTINGS: tuple[str, ...] = (
 _CB_SERIALIZATION_SETTINGS: tuple[str, ...] = (
     "CB_SCALE_CODING",
     "CB_CODEBOOK_SOURCE",
+    "CB_CODEBOOK_SOURCE_SCOPE",
+    "CB_CODEBOOK_BUNDLE",
     "CB_SCALE_SWEEP",
+    "CB_SCALE_SWEEP_SCOPE",
     "PRISMAQUANT_CB_LDLQ",
     "PRISMAQUANT_CB_MINCHAIN",
     "PRISMAQUANT_CB_MINCHAIN_ANCHORS",
@@ -157,6 +160,10 @@ STAGE_SETTINGS_KEYS: dict[str, tuple[tuple[str, str], ...]] = {
     # produced that cache. Minutes to rebuild, so keying is generous.
     "cb-col-weights": _key_pairs(
         "MODEL_PATH", "DATASET", "NSAMPLES", "SEQLEN", "ACTIVATION_ROWS_LIMIT",
+    ),
+    "cb-learned-bundle": _key_pairs(
+        "MODEL_PATH", "FORMATS", "CB_CODEBOOK_SOURCE_SCOPE",
+        "CB_CODEBOOK_BUNDLE", "CB_COL_WEIGHTS_SHA256",
     ),
     "cb-hybrid-cost": _key_pairs(
         "MODEL_PATH", "FORMATS", "COST_MODE",

@@ -88,7 +88,34 @@ set -euo pipefail
 if [[ "$EXPORT_CONTAINER" == "nvfp4_cb" ]]; then
   # Producer identity must be fixed before allocation: candidate bytes and the
   # final export must describe the same layout and shared sidecars.
-  : "${CB_CODEBOOK_SOURCE:=lattice}"
+  # Family-scoped source policy.  `none` is the historical all-lattice
+  # producer and deliberately serializes with no new stamp member.  `fp8`
+  # enables learned books only where they measured useful; `all` is an
+  # explicitly warned research arm because NVFP4 CBL measured NO-GO.
+  : "${CB_CODEBOOK_SOURCE_SCOPE:=none}"
+  case "$CB_CODEBOOK_SOURCE_SCOPE" in
+    none) _cb_expected_source=lattice ;;
+    fp8) _cb_expected_source=learned ;;
+    all)
+      _cb_expected_source=learned
+      echo "[pipeline] WARNING: CB_CODEBOOK_SOURCE_SCOPE=all is research-only; learned NVFP4 codebooks are measured NO-GO" >&2
+      ;;
+    *)
+      echo "[pipeline] ERROR: CB_CODEBOOK_SOURCE_SCOPE must be none, fp8, or all" >&2
+      exit 2
+      ;;
+  esac
+  : "${CB_CODEBOOK_SOURCE:=$_cb_expected_source}"
+  if [[ "$CB_CODEBOOK_SOURCE" != "$_cb_expected_source" ]]; then
+    echo "[pipeline] ERROR: CB_CODEBOOK_SOURCE=$CB_CODEBOOK_SOURCE conflicts with CB_CODEBOOK_SOURCE_SCOPE=$CB_CODEBOOK_SOURCE_SCOPE (expected $_cb_expected_source)" >&2
+    exit 2
+  fi
+  unset _cb_expected_source
+  if [[ "$CB_CODEBOOK_SOURCE_SCOPE" != "none" ]]; then
+    : "${CB_CODEBOOK_BUNDLE:=${WORK_DIR}/artifacts/cb_learned_bundle.pqcb}"
+  else
+    : "${CB_CODEBOOK_BUNDLE:=}"
+  fi
   : "${CB_SCALE_CODING:=two_tier}"
   # Static fused-W4A4 activation metadata is calibrated from the same probe
   # cache as the weighted CB render.  MSE-grid is a deterministic producer
@@ -105,10 +132,6 @@ if [[ "$EXPORT_CONTAINER" == "nvfp4_cb" ]]; then
   : "${PRISMAQUANT_CB_MINCHAIN_AUDIT_MEDIAN:=0.05}"
   : "${PRISMAQUANT_CB_MINCHAIN_AUDIT_P95:=0.15}"
   : "${PRISMAQUANT_CB_ENCODE_TIER:=balanced}"
-  if [[ "$CB_CODEBOOK_SOURCE" == "learned" ]]; then
-    echo "[pipeline] ERROR: learned CB is research-only until one immutable value-bearing codebook bundle is loaded verbatim by cost/cache/KL/export. Digests alone do not supply those values, and export-time retraining depends on the selected assignment. Use CB_CODEBOOK_SOURCE=lattice." >&2
-    exit 2
-  fi
   # Cost renderers resolve CBSerializationContext from the environment. These
   # must be exported (not merely shell locals) or a legacy-v1/default split can
   # recur between the Python cost process and the exporter CLI.
@@ -120,6 +143,21 @@ if [[ "$EXPORT_CONTAINER" == "nvfp4_cb" ]]; then
       exit 2
       ;;
   esac
+  if [[ -n "${CB_SCALE_SWEEP_SCOPE:-}" ]]; then
+    case "$CB_SCALE_SWEEP_SCOPE" in
+      none) _cb_expected_sweep=0 ;;
+      nvfp4|fp8|all) _cb_expected_sweep=1 ;;
+      *)
+        echo "[pipeline] ERROR: CB_SCALE_SWEEP_SCOPE must be none, nvfp4, fp8, or all" >&2
+        exit 2
+        ;;
+    esac
+    if [[ "$CB_SCALE_SWEEP" != "$_cb_expected_sweep" ]]; then
+      echo "[pipeline] ERROR: CB_SCALE_SWEEP=$CB_SCALE_SWEEP conflicts with CB_SCALE_SWEEP_SCOPE=$CB_SCALE_SWEEP_SCOPE" >&2
+      exit 2
+    fi
+    unset _cb_expected_sweep
+  fi
   case "$PRISMAQUANT_CB_LDLQ" in
     1|true|True|TRUE|yes|Yes|YES|on|On|ON) PRISMAQUANT_CB_LDLQ=1 ;;
     0|false|False|FALSE|no|No|NO|off|Off|OFF) PRISMAQUANT_CB_LDLQ=0 ;;
@@ -147,7 +185,8 @@ if [[ "$EXPORT_CONTAINER" == "nvfp4_cb" ]]; then
     echo "[pipeline] ERROR: CB layout-v2/two_tier requires CB_SCALE_SWEEP=1; its scale encoder has no defined one-shot render" >&2
     exit 2
   fi
-  export CB_CODEBOOK_SOURCE CB_SCALE_CODING CB_SCALE_SWEEP PRISMAQUANT_CB_LDLQ
+  export CB_CODEBOOK_SOURCE CB_CODEBOOK_SOURCE_SCOPE CB_CODEBOOK_BUNDLE
+  export CB_SCALE_CODING CB_SCALE_SWEEP CB_SCALE_SWEEP_SCOPE PRISMAQUANT_CB_LDLQ
   export PRISMAQUANT_CB_MINCHAIN PRISMAQUANT_CB_MINCHAIN_ANCHORS
   export PRISMAQUANT_CB_MINCHAIN_HOLDBACKS PRISMAQUANT_CB_MINCHAIN_AUDIT_SEED
   export PRISMAQUANT_CB_MINCHAIN_BACKSTOP PRISMAQUANT_CB_MINCHAIN_AUDIT_MEDIAN
@@ -882,7 +921,10 @@ STAGE_SETTINGS_ENV=(
   "SERVE_PEAK_SCRATCH_BYTES=${SERVE_PEAK_SCRATCH_BYTES:-0}"
   "CB_SCALE_CODING=${CB_SCALE_CODING:-}"
   "CB_CODEBOOK_SOURCE=${CB_CODEBOOK_SOURCE:-}"
+  "CB_CODEBOOK_SOURCE_SCOPE=${CB_CODEBOOK_SOURCE_SCOPE:-}"
+  "CB_CODEBOOK_BUNDLE=${CB_CODEBOOK_BUNDLE:-}"
   "CB_SCALE_SWEEP=${CB_SCALE_SWEEP:-}"
+  "CB_SCALE_SWEEP_SCOPE=${CB_SCALE_SWEEP_SCOPE:-}"
   "PRISMAQUANT_CB_LDLQ=${PRISMAQUANT_CB_LDLQ:-}"
   "PRISMAQUANT_CB_MINCHAIN=${PRISMAQUANT_CB_MINCHAIN:-}"
   "PRISMAQUANT_CB_MINCHAIN_ANCHORS=${PRISMAQUANT_CB_MINCHAIN_ANCHORS:-}"
@@ -1008,6 +1050,36 @@ print(f"[pipeline] {stage} wrote {out}: {len(cw)} entries")
 PY
 }
 
+ensure_cb_learned_bundle() {
+  if [[ "${CB_CODEBOOK_SOURCE_SCOPE:-none}" == "none" ]]; then
+    return 0
+  fi
+  harvest_cb_col_weights "$1"
+  local col_sha
+  col_sha="$(sha256sum "$CB_COL_WEIGHTS" | cut -d' ' -f1)"
+  require_stage_settings "$CB_CODEBOOK_BUNDLE" cb-learned-bundle \
+    "CB_COL_WEIGHTS_SHA256=$col_sha"
+  if [[ -f "$CB_CODEBOOK_BUNDLE" ]]; then
+    # Full name/shape/digest/cell validation; a same-path replacement never
+    # counts as an immutable bundle merely because the file exists.
+    python3 - "$CB_CODEBOOK_BUNDLE" <<'PY'
+import sys
+from prismaquant.cb_learned_bundle import load_bundle
+bundle = load_bundle(sys.argv[1])
+print(f"[pipeline] learned CB bundle verified: {bundle.path} "
+      f"sha256={bundle.bundle_content_sha256}")
+PY
+    return 0
+  fi
+  echo "[pipeline] $1 training immutable learned CB cells before any cost/cache/KL render ..."
+  python3 -m prismaquant.build_cb_learned_bundle \
+    --model-dir "$MODEL_PATH" \
+    --col-weights "$CB_COL_WEIGHTS" \
+    --formats "$FORMATS" \
+    --output "$CB_CODEBOOK_BUNDLE" \
+    --device "$DEVICE"
+}
+
 formats_contain_cb() {
   python3 - "$1" <<'PY'
 import sys
@@ -1088,6 +1160,12 @@ fi
 # 2. Cost measurement (per-(Linear, format) measured RTN error,
 #    body + MTP in one pass)
 # -----------------------------------------------------------------------
+if [[ "$EXPORT_CONTAINER" == "nvfp4_cb" ]]; then
+  ensure_cb_learned_bundle "[2/4] pre-cost"
+  if [[ "$CB_CODEBOOK_SOURCE_SCOPE" != "none" ]]; then
+    export PRISMAQUANT_CB_COL_WEIGHTS="$CB_COL_WEIGHTS"
+  fi
+fi
 require_stage_settings "${BASE_COST_PATH}" base-cost
 # Under COST_MODE=local the baseline IS the allocator's cost table, so it is
 # also gated on the stamped cost_mode. Under the other modes cost_baseline.pkl
@@ -1465,11 +1543,18 @@ if [[ "$EXPORT_CONTAINER" == "nvfp4_cb" ]]; then
   ALLOCATOR_CB_ARGS=(
     --cb-scale-coding "$CB_SCALE_CODING"
     --cb-codebook-source "$CB_CODEBOOK_SOURCE"
+    --cb-codebook-source-scope "$CB_CODEBOOK_SOURCE_SCOPE"
     --cb-scale-sweep "$CB_SCALE_SWEEP"
     --cb-ldlq "$PRISMAQUANT_CB_LDLQ"
     --cb-minchain "$PRISMAQUANT_CB_MINCHAIN"
     --cb-encode-tier "$PRISMAQUANT_CB_ENCODE_TIER"
     --cb-col-weights "$CB_COL_WEIGHTS"
+  )
+  [[ -n "$CB_CODEBOOK_BUNDLE" ]] && ALLOCATOR_CB_ARGS+=(
+    --cb-codebook-bundle "$CB_CODEBOOK_BUNDLE"
+  )
+  [[ -n "${CB_SCALE_SWEEP_SCOPE:-}" ]] && ALLOCATOR_CB_ARGS+=(
+    --cb-scale-sweep-scope "$CB_SCALE_SWEEP_SCOPE"
   )
 fi
 python3 -m prismaquant.allocator \
@@ -2110,11 +2195,9 @@ if [[ "$EXPORT_CONTAINER" == "nvfp4_cb" ]]; then
   # cache. Requires the nvfp4_cb serving profile (gated above); the cost render
   # only has to be imatrix-weighted, which the R3 assertion enforces.
   : "${CB_OUT:=${WORK_DIR}/exported_nvfp4_cb}"
-  # Production uses deterministic fixed-lattice FP4/FP8 tables, serialized as
-  # one FP16 sidecar set per format. The direct exporter retains learned
-  # codebooks for research/back-compat, but the pipeline blocks them above
-  # until a value-bearing immutable bundle is shared by every render stage.
-  : "${CB_CODEBOOK_SOURCE:=lattice}"
+  # Source/sweep scopes were resolved before the probe.  A learned scope has
+  # already built and verified its immutable bundle before cost measurement;
+  # export is a pure consumer and is forbidden to retrain.
   : "${CB_CODEBOOK_ITERS:=4}"
   : "${CB_CODEBOOK_SEED:=0}"
   # Joint E4M3-legal scale sweep is default-ON (IQ-rendering parity; the

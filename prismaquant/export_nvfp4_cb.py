@@ -65,6 +65,9 @@ from prismaquant.nvfp4_cb_footprint import (
     cb_payload_summary,
     cb_serialization_metadata_from_assignment_payload,
     cb_serialization_context_from_env,
+    codebook_source_for_format,
+    effective_codebook_source_scope,
+    scale_sweep_for_format,
     cb_tensor_payload_breakdown,
     finalize_cb_export_artifact_inventory,
     resolve_cb_encode_tier,
@@ -553,6 +556,26 @@ def export_nvfp4_cb(
     if source not in ("lattice", "learned"):
         raise ValueError(f"shared_codebook_spec source must be lattice/learned,"
                          f" got {source!r}")
+    _env_cb_context = cb_serialization_context_from_env()
+    _scoped_bundle_export = (
+        effective_codebook_source_scope(_env_cb_context) != "none"
+    )
+    if _scoped_bundle_export:
+        if source != _env_cb_context.codebook_source:
+            raise ValueError(
+                "export_nvfp4_cb: shared_codebook_spec source differs from "
+                "CB_CODEBOOK_SOURCE_SCOPE/CB_CODEBOOK_BUNDLE"
+            )
+        source = _env_cb_context.codebook_source
+    elif source == "learned" and bool(spec.get("train", False)) and not (
+        allow_unstamped_research
+    ):
+        raise ValueError(
+            "export_nvfp4_cb: production export-time learned-codebook "
+            "retraining is forbidden; build CB_CODEBOOK_BUNDLE before cost. "
+            "The legacy trainer is available only with "
+            "allow_unstamped_research=True."
+        )
 
     assignment = load_assignment(layer_config_path)
     _recipe_payload = json.loads(Path(layer_config_path).read_text())
@@ -782,29 +805,69 @@ def export_nvfp4_cb(
     activation_scales_by_physical_target: dict[str, float] = {}
     activation_scale_policy_id = None
 
-    # --- Resolve/train codebooks, grouped by (ref, format). ---
+    # --- Resolve codebooks, grouped by (physical ref, format).  Production
+    # learned cells come only from the immutable pre-render bundle.  The old
+    # pooled trainer remains behind allow_unstamped_research for reproducible
+    # historical experiments; it is never reached by a stamped export. ---
     provided = spec.get("codebooks", {}) if source == "learned" else {}
     train = bool(spec.get("train", False))
     iters = int(spec.get("iters", 4))
     seed = int(spec.get("seed", 0))
     train_cap = int(spec.get("train_cap", 1 << 20))
 
-    # (ref, fmt) -> codebook object; ref = "lattice" or role.
+    learned_bundle = None
+    if _scoped_bundle_export:
+        from prismaquant.cb_learned_bundle import load_bundle_cached
+
+        learned_bundle = load_bundle_cached(_env_cb_context.codebook_bundle_path)
+
+    # (ref, fmt) -> codebook object; learned production refs are one qname per
+    # cell (and therefore one layer/role/rung), while lattice stays canonical.
     codebooks: dict[tuple[str, str], object] = {}
     # qname -> (ref, fmt, codebook, source_kind)
     target_cb: dict[str, tuple[str, str, object, str]] = {}
     by_group: dict[tuple[str, str], list[str]] = {}
     for qname, (grid, mode, k) in cb_targets.items():
         fmt = assignment[qname]
-        ref = _role_of(qname) if source == "learned" else "lattice"
+        kind = (
+            codebook_source_for_format(fmt, _env_cb_context)
+            if _scoped_bundle_export
+            else source
+        )
+        ref = (
+            qname if _scoped_bundle_export and kind == "learned"
+            else (_role_of(qname) if kind == "learned" else "lattice")
+        )
         by_group.setdefault((ref, fmt), []).append(qname)
 
     for (ref, fmt), qnames in by_group.items():
         grid, mode, k = cb_targets[qnames[0]]
-        if source == "lattice":
+        kind = (
+            codebook_source_for_format(fmt, _env_cb_context)
+            if _scoped_bundle_export
+            else source
+        )
+        if kind == "lattice":
             codebooks[(ref, fmt)] = cb._resolve_codebook(
                 k, grid, mode, None, torch.device(device))
-            kind = "lattice"
+        elif _scoped_bundle_export:
+            if len(qnames) != 1 or learned_bundle is None:
+                raise AssertionError(
+                    f"{ref}/{fmt}: learned bundle cell must own one qname"
+                )
+            qname = qnames[0]
+            weight = _decoded_cb_source_weight(
+                skeleton,
+                _resolve_skeleton(qname, skeleton, _profile),
+                model_weight_name=qname + ".weight",
+                fp8_scale_inv_map=_source_fp8_scale_map,
+            )
+            codebooks[(ref, fmt)] = learned_bundle.codebook_for(
+                qname,
+                fmt,
+                weight=weight,
+                col_weights=col_weights[qname],
+            )
         else:
             role = ref
             if train:
@@ -828,7 +891,6 @@ def export_nvfp4_cb(
                     f"role {role!r} ({fmt}): codebook_source=learned but no "
                     f"codebook supplied and train=False — missing learned "
                     f"sidecar for {len(qnames)} tensor(s)")
-            kind = "learned"
         for q in qnames:
             target_cb[q] = (ref, fmt, codebooks[(ref, fmt)], kind)
 
@@ -840,33 +902,88 @@ def export_nvfp4_cb(
         for (ref, fmt), codebook in codebooks.items()
         for name, tensor in _codebook_tensors(ref, fmt, codebook).items()
     }
-    materialized_codebook_digests = {
+    selected_codebook_digests = {
         name: hashlib.sha256(
             tensor.to(torch.float16).cpu().contiguous().numpy().tobytes()
         ).hexdigest()
         for name, tensor in materialized_codebook_tensors.items()
     }
-    _env_cb_context = cb_serialization_context_from_env()
+    materialized_codebook_digests = (
+        dict(_env_cb_context.codebook_content_digests or {})
+        if _scoped_bundle_export
+        else {}
+    )
+    for name, digest in selected_codebook_digests.items():
+        previous = materialized_codebook_digests.get(name)
+        if previous is not None and previous != digest:
+            raise ValueError(
+                f"export_nvfp4_cb: selected codebook {name!r} differs from "
+                "the immutable bundle digest"
+            )
+        materialized_codebook_digests[name] = digest
+    selected_refs_by_format = {
+        qname: {
+            fmt: _codebook_tensor_names(ref, fmt, codebook)
+        }
+        for qname, (ref, fmt, codebook, _kind) in target_cb.items()
+    }
+    if _scoped_bundle_export:
+        refs_by_format = {
+            str(qname): dict(by_format)
+            for qname, by_format in (
+                _env_cb_context.codebook_refs_by_qname_format or {}
+            ).items()
+        }
+        for qname, by_format in selected_refs_by_format.items():
+            target_formats = refs_by_format.setdefault(qname, {})
+            for fmt, refs in by_format.items():
+                previous = target_formats.get(fmt)
+                if previous is not None and tuple(
+                    (previous,) if isinstance(previous, str) else previous
+                ) != tuple(refs):
+                    raise ValueError(
+                        f"{qname}/{fmt}: exporter refs differ from immutable "
+                        "bundle refs"
+                    )
+                target_formats[fmt] = refs
+    else:
+        refs_by_format = None
     serialization_context = CBSerializationContext(
         scale_coding=scale_coding,
         codebook_source=source,
-        scale_sweep=bool(scale_sweep),
+        codebook_source_scope=(
+            _env_cb_context.codebook_source_scope
+            if _scoped_bundle_export else None
+        ),
+        scale_sweep=(
+            _env_cb_context.scale_sweep
+            if _scoped_bundle_export else bool(scale_sweep)
+        ),
+        scale_sweep_scope=(
+            _env_cb_context.scale_sweep_scope
+            if _scoped_bundle_export else None
+        ),
         ldlq=_env_cb_context.ldlq,
         ldlq_scope=getattr(_env_cb_context, "ldlq_scope", "all" if _env_cb_context.ldlq else "none"),
         minchain=_env_cb_context.minchain,
         minchain_version=_env_cb_context.minchain_version,
-        encode_tier=resolve_cb_encode_tier(),
+        encode_tier=_env_cb_context.encode_tier,
         activation_contract=_claimed_activation_contract,
         activation_execution=(
             NVFP4_ACTIVATION_EXECUTION
             if _claimed_activation_contract is not None
             else None
         ),
-        codebook_refs={
+        codebook_refs=None if _scoped_bundle_export else {
             qname: _codebook_tensor_names(ref, fmt, codebook)
             for qname, (ref, fmt, codebook, _kind) in target_cb.items()
         },
+        codebook_refs_by_qname_format=refs_by_format,
         codebook_content_digests=materialized_codebook_digests,
+        codebook_bundle_path=(
+            _env_cb_context.codebook_bundle_path
+            if _scoped_bundle_export else None
+        ),
     )
     validate_cb_serialization_context_stamp(
         _recipe_cb_context_stamp,
@@ -1102,7 +1219,10 @@ def export_nvfp4_cb(
             packed, fields = cb.nvfp4_cb_pack(
                 w, k, grid=grid, mode=mode,
                 col_weights=col_weights[canon].to(device),
-                codebook=cbook, scale_sweep=scale_sweep,
+                codebook=cbook,
+                scale_sweep=scale_sweep_for_format(
+                    fmt, serialization_context
+                ),
                 scale_coding=(scale_coding if grid == "fp4"
                               else cb.SCALE_CODING_V1),
                 encode_tier=serialization_context.encode_tier,
@@ -1333,7 +1453,7 @@ def export_nvfp4_cb(
         ignore=ignore,
         codebook_file=codebook_file,
         scale_coding=scale_coding,
-        codebook_source=source,
+        codebook_source=serialization_context.codebook_source,
         serialized_payload_summary=serialized_payload_summary,
         serialization_context=serialization_context,
         cb_render_identity=_recipe_cb_render_identity,

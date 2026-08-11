@@ -141,10 +141,16 @@ def test_core_recipe_defaults_are_pinned():
     assert ': "${VALIDATED_FRONTIER_PICK:=budget}"' in script
 
 
-def test_learned_cb_pipeline_is_blocked_before_production_stages():
+def test_learned_cb_pipeline_builds_immutable_bundle_before_production_stages():
     script = _run_pipeline_script()
 
-    gate = "learned CB is research-only until one immutable value-bearing"
-    assert gate in script
-    assert script.index(gate) < script.index("python3 -m prismaquant.allocator")
-    assert "Learned production is accepted" not in script
+    # Default remains the historical all-lattice producer.  Opt-in learned
+    # runs must materialize and validate one immutable value-bearing bundle
+    # before cost measurement or allocation can price those exact bytes.
+    assert _shell_default(script, "CB_CODEBOOK_SOURCE_SCOPE") == "none"
+    pre_cost = 'ensure_cb_learned_bundle "[2/4] pre-cost"'
+    assert pre_cost in script
+    assert script.index(pre_cost) < script.index("python3 -m prismaquant.allocator")
+    assert "python3 -m prismaquant.build_cb_learned_bundle" in script
+    assert "load_bundle(sys.argv[1])" in script
+    assert "same-path replacement never" in script
