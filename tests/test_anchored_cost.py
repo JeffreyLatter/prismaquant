@@ -297,7 +297,14 @@ def _identity(**updates: str) -> dict[str, str]:
 
 
 def test_protocol_has_five_methods_and_core_is_platform_vocabulary_free():
-    assert AnchoredFormatPlugin.__protocol_attrs__ == {
+    # ``__protocol_attrs__`` is a CPython implementation detail of
+    # typing.Protocol that only exists on 3.12+; read the declared members off
+    # the class instead so this pins the contract on every supported Python.
+    declared = {
+        name for name in vars(AnchoredFormatPlugin)
+        if not name.startswith("_")
+    }
+    assert declared == {
         "plugin_identity",
         "describe_candidate",
         "select_anchor",

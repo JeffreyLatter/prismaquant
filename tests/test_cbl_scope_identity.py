@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import platform
 
 import pytest
 import torch
@@ -78,21 +79,30 @@ def test_unset_scopes_pin_76666bd_stamp_and_rendered_bytes():
         "0077c86757b4b8ab1ca3a24642baa5336317c0422dfac12454801f968b8edfe7",
     )
 
-    # These hashes pin every packed tensor byte plus FP8's complete FP32 row
-    # scale plane from 76666bd.  A direct equality against a second call through
-    # the new helper would only prove self-consistency, not backward identity.
+    # These hashes pin every packed tensor byte from 76666bd.  A direct
+    # equality against a second call through the new helper would only prove
+    # self-consistency, not backward identity.
+    #
+    # The FP8 row scale is pinned by VALUE, not by digest.  It is the scalar
+    # argmin of a scale sweep whose objective is a reduction over all 256
+    # columns, and that reduction is not bit-reproducible across CPU
+    # architectures: the recorded digest below reproduces exactly on the
+    # aarch64 build box and differs in the low bits on x86 CI, while the packed
+    # indices -- the bytes that actually ship -- are identical on both.  The
+    # bound is float32's own worst case for reordering an n-term sum,
+    # n * 2**-23, not a tuned constant.  The exact digest is still asserted
+    # where it was recorded, so the strongest claim keeps running on the
+    # machine that builds artifacts.
     weight = torch.linspace(-0.5, 0.5, 256, dtype=torch.float32).reshape(1, 256)
     col_weights = torch.linspace(0.1, 1.0, 256, dtype=torch.float32)
-    expected = {
-        _NV: (
-            "5434e7fb94b22160209b2692b94a6285af417bbfe61ea3a3f78207cb73678bde",
-            None,
-        ),
-        _FP8: (
-            "5d8dba3c2a76e3d46e564b2aa63777a1be53cc431d3772e5cbac14ead2b41ba9",
-            "620ea8dae04d1794e36f7322520386a450d05b41d03ff0f7ae573db0ecd33d59",
-        ),
+    reduction_rtol = weight.shape[1] * 2 ** -23
+    expected_packed = {
+        _NV: "5434e7fb94b22160209b2692b94a6285af417bbfe61ea3a3f78207cb73678bde",
+        _FP8: "5d8dba3c2a76e3d46e564b2aa63777a1be53cc431d3772e5cbac14ead2b41ba9",
     }
+    expected_fp8_scale = 0.0021216266322880983
+    expected_fp8_scale_digest_on_aarch64 = (
+        "620ea8dae04d1794e36f7322520386a450d05b41d03ff0f7ae573db0ecd33d59")
     for format_name in (_NV, _FP8):
         grid = "fp4" if format_name == _NV else "fp8"
         k = int(format_name.rsplit("K", 1)[1])
@@ -103,15 +113,21 @@ def test_unset_scopes_pin_76666bd_stamp_and_rendered_bytes():
             col_weights=col_weights,
         )
         packed = cb.nvfp4_cb_assemble_bytes(fields, k, grid, "product")
-        packed_digest = hashlib.sha256(_tensor_bytes(packed)).hexdigest()
-        scale_digest = (
-            hashlib.sha256(
-                _tensor_bytes(fields["scales"].to(torch.float32))
-            ).hexdigest()
-            if grid == "fp8"
-            else None
+        assert hashlib.sha256(
+            _tensor_bytes(packed)).hexdigest() == expected_packed[format_name]
+        if grid != "fp8":
+            continue
+        scales = fields["scales"].to(torch.float32)
+        torch.testing.assert_close(
+            scales,
+            torch.full_like(scales, expected_fp8_scale),
+            rtol=reduction_rtol,
+            atol=0.0,
         )
-        assert (packed_digest, scale_digest) == expected[format_name]
+        if platform.machine() == "aarch64":
+            assert hashlib.sha256(
+                _tensor_bytes(scales)
+            ).hexdigest() == expected_fp8_scale_digest_on_aarch64
 
 
 def test_homogeneous_explicit_scopes_canonicalize_to_old_stamp():
