@@ -710,6 +710,9 @@ def build_quant_config(
     requant_targets: Mapping[str, str] | None = None,
     stock_targets: Mapping[str, str],
     by_group: Mapping[tuple[str, str], Sequence[str]],
+    cb_group_target_names: Mapping[
+        tuple[str, str], Sequence[str]
+    ] | None = None,
     codebooks: Mapping[tuple[str, str], object],
     col_weights: Mapping[str, torch.Tensor],
     codebook_tensors_by_name: Mapping[str, torch.Tensor],
@@ -760,12 +763,42 @@ def build_quant_config(
     ``source_passthrough`` key.  Empty or ``None`` omits the key entirely —
     its ABSENCE is what marks a legacy all-CB artifact, so an empty record
     would be a different (and false) claim.
+
+    ``cb_group_target_names`` is a partial override keyed like ``by_group``.
+    Its values are already-serialized, exact target names and therefore bypass
+    ``cb_target_name``.  This lets one packed routed-expert tensor publish
+    ordinary logical ``gate_proj`` and ``up_proj`` groups with distinct
+    codebook references while leaving its physical checkpoint tensor fused.
+    Groups absent from the override retain the legacy target-name path.
     """
 
     source_targets = list(source_targets)
     native_source_targets = dict(native_source_targets or {})
     requant_targets = dict(requant_targets or {})
     weight_only_stock_targets = set(weight_only_stock_targets)
+    cb_group_target_names = dict(cb_group_target_names or {})
+    unknown_cb_target_groups = set(cb_group_target_names) - set(by_group)
+    if unknown_cb_target_groups:
+        raise ValueError(
+            "cb_group_target_names contains keys absent from by_group: "
+            f"{sorted(unknown_cb_target_groups)}"
+        )
+    for group_key, target_names in cb_group_target_names.items():
+        if not target_names:
+            raise ValueError(
+                "cb_group_target_names entries must be nonempty; "
+                f"{group_key!r} has no targets"
+            )
+        if any(not isinstance(name, str) or not name for name in target_names):
+            raise ValueError(
+                "cb_group_target_names entries must contain nonempty strings; "
+                f"{group_key!r} has {list(target_names)!r}"
+            )
+        if len(set(target_names)) != len(target_names):
+            raise ValueError(
+                "cb_group_target_names entries must contain unique targets; "
+                f"{group_key!r} has {list(target_names)!r}"
+            )
     assignment_sha = hashlib.sha256(
         json.dumps(
             dict(sorted(assignment.items())),
@@ -796,6 +829,8 @@ def build_quant_config(
     for group_index, ((ref, fmt), qnames) in enumerate(
         sorted(by_group.items())
     ):
+        from .nvfp4_cb_footprint import codebook_source_for_format
+
         grid, mode, k = cb_targets[qnames[0]]
         scheme = build_cb_scheme(
             ref=ref,
@@ -806,10 +841,23 @@ def build_quant_config(
             codebook=codebooks[(ref, fmt)],
             scale_coding=scale_coding,
             activation_contract=activation_contract_ref,
-            codebook_source=codebook_source,
+            # A mixed artifact is deliberately lattice on NVFP4 and learned
+            # on FP8-CB.  The old run-global scalar is retained in provenance
+            # for wire/backward compatibility, but it must never be copied
+            # onto every scheme: Gridbook dispatches the value-bearing
+            # ``codebook_ref`` carried by this specific target group.
+            codebook_source=codebook_source_for_format(
+                fmt, serialization_context
+            ),
+        )
+        serialized_target_names = cb_group_target_names.get((ref, fmt))
+        targets = (
+            sorted(serialized_target_names)
+            if serialized_target_names is not None
+            else sorted(cb_target_name(qname) for qname in qnames)
         )
         config_groups[f"group_{group_index}"] = {
-            "targets": sorted(cb_target_name(qname) for qname in qnames),
+            "targets": targets,
             "format": fmt,
             "scheme": scheme,
         }
@@ -898,6 +946,12 @@ def build_quant_config(
         "serialized_payload": dict(serialized_payload_summary),
         "render_identity_verified": cb_render_identity is not None,
     }
+    source_scope = getattr(serialization_context, "codebook_source_scope", None)
+    if source_scope not in (None, "none"):
+        provenance["codebook_source_scope"] = str(source_scope)
+    sweep_scope = getattr(serialization_context, "scale_sweep_scope", None)
+    if sweep_scope not in (None, "none", "all"):
+        provenance["scale_sweep_scope"] = str(sweep_scope)
     if streaming_provenance is not None:
         provenance["streaming"] = bool(streaming_provenance)
     acknowledged = sorted(set(route_pending_passthrough_acknowledged))

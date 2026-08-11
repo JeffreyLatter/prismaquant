@@ -31,6 +31,7 @@ import json
 import math
 import re
 import struct
+import warnings
 from collections.abc import Mapping, MutableMapping, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
@@ -51,6 +52,7 @@ from .cb_layout import (
     subtable_bit_widths,
     type_size as cb_type_size,
 )
+from .routed_moe_codebooks import bundle_role_qname
 
 CB_SERIALIZED_PAYLOAD_SCHEMA = "prismaquant.cb_serialized_payload.v3"
 MINCHAIN_CB_SERIALIZED_PAYLOAD_SCHEMA = "prismaquant.cb_serialized_payload.v4"
@@ -118,18 +120,22 @@ _SAFETENSORS_DTYPE_BITS = {
 class CBSerializationContext:
     """Artifact-wide producer choices needed for exact CB byte pricing.
 
-    ``codebook_source`` is the producer's sharing policy: ``lattice`` shares
-    one table set per format; ``learned`` shares one per projection role.  A
-    caller with an already-materialized config can pass exact physical tensor
-    names through ``codebook_refs`` (qname -> string/list).  Omitting the
-    context is an error on exact producer paths: otherwise an old caller would
-    silently fall back to legacy-v1 bytes.
+    ``codebook_source_by_format`` is authoritative when present; the legacy
+    ``codebook_source`` scalar is its artifact-wide ANY (``learned`` iff any
+    rung is learned). Lattice rungs share one table set per format and learned
+    rungs share one per projection role. A caller with an already-materialized
+    config can pass exact physical tensor names through ``codebook_refs``
+    (qname -> string/list). Omitting the context is an error on exact producer
+    paths: otherwise an old caller would silently fall back to legacy-v1 bytes.
     """
 
     scale_coding: str
     codebook_source: str
     layout_version: int | None = None
+    codebook_source_scope: str | None = None
+    codebook_source_by_format: Mapping[str, str] | None = None
     scale_sweep: bool = True
+    scale_sweep_scope: str | None = None
     ldlq: bool = False
     ldlq_scope: str | None = None
     minchain: bool = False
@@ -139,7 +145,13 @@ class CBSerializationContext:
     activation_contract: str | None = None
     activation_execution: str | None = None
     codebook_refs: Mapping[str, str | Sequence[str]] | None = None
+    codebook_refs_by_qname_format: Mapping[
+        str, Mapping[str, str | Sequence[str]]
+    ] | None = None
     codebook_content_digests: Mapping[str, str] | None = None
+    # Runtime locator only. Artifact identity is the complete physical ref ->
+    # FP16 digest map above; paths are intentionally never serialized.
+    codebook_bundle_path: str | None = None
 
     def __post_init__(self) -> None:
         coding = str(self.scale_coding).strip().lower()
@@ -166,11 +178,45 @@ class CBSerializationContext:
         object.__setattr__(self, "scale_coding", coding)
         object.__setattr__(self, "codebook_source", source)
         object.__setattr__(self, "layout_version", layout)
+        raw_source_scope = self.codebook_source_scope
+        if raw_source_scope is not None:
+            source_scope = str(raw_source_scope).strip().lower()
+            if source_scope not in {"none", "fp8", "all"}:
+                raise ValueError(
+                    "CB codebook_source_scope must be one of "
+                    f"none/fp8/all, got {raw_source_scope!r}"
+                )
+            # The scope is authoritative, as with LDLQ below.  Keep the old
+            # scalar normalized to the artifact-wide ANY so old readers still
+            # see lattice for an all-lattice artifact and learned whenever any
+            # family carries learned bytes.
+            source = "lattice" if source_scope == "none" else "learned"
+            object.__setattr__(self, "codebook_source", source)
+            object.__setattr__(self, "codebook_source_scope", source_scope)
+            if source_scope == "all":
+                warnings.warn(
+                    "codebook_source_scope='all' is research-only: learned "
+                    "NVFP4 codebooks are measured NO-GO in the shipped band",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
         if not isinstance(self.scale_sweep, bool):
             raise TypeError(
                 "CB scale_sweep identity must be an explicit bool, got "
                 f"{self.scale_sweep!r}"
             )
+        raw_sweep_scope = self.scale_sweep_scope
+        if raw_sweep_scope is not None:
+            sweep_scope = str(raw_sweep_scope).strip().lower()
+            if sweep_scope not in {"none", "nvfp4", "fp8", "all"}:
+                raise ValueError(
+                    "CB scale_sweep_scope must be one of "
+                    f"none/nvfp4/fp8/all, got {raw_sweep_scope!r}"
+                )
+            # The legacy bool records whether any family sweeps.  The scope is
+            # the exact family selector for mixed recipes.
+            object.__setattr__(self, "scale_sweep", sweep_scope != "none")
+            object.__setattr__(self, "scale_sweep_scope", sweep_scope)
         if not isinstance(self.ldlq, bool):
             raise TypeError(
                 "CB ldlq identity must be an explicit bool, got "
@@ -219,7 +265,12 @@ class CBSerializationContext:
             raise ValueError(
                 "CB minchain_version cannot be set when minchain is disabled"
             )
-        if coding == PRODUCTION_FP4_SCALE_CODING and not self.scale_sweep:
+        nvfp4_scale_sweep = (
+            self.scale_sweep
+            if self.scale_sweep_scope is None
+            else self.scale_sweep_scope in {"nvfp4", "all"}
+        )
+        if coding == PRODUCTION_FP4_SCALE_CODING and not nvfp4_scale_sweep:
             raise ValueError(
                 "CB layout-v2/two_tier requires scale_sweep=True; the "
                 "two-tier scale encoder has no defined one-shot render"
@@ -271,6 +322,86 @@ class CBSerializationContext:
                 "CB activation_execution cannot be set without an "
                 "activation_contract"
             )
+        source_map = self.codebook_source_by_format
+        if source_map is None and self.codebook_bundle_path is not None:
+            bundle_path = str(self.codebook_bundle_path).strip()
+            if bundle_path:
+                # Exporters rebuild a context after selecting physical refs.
+                # Loading the same immutable bundle here keeps that derived
+                # context map-authoritative even when the call site predates
+                # this optional field.
+                from .cb_learned_bundle import load_bundle_cached
+
+                source_map = load_bundle_cached(
+                    bundle_path
+                ).codebook_source_by_format
+                object.__setattr__(
+                    self, "codebook_source_by_format", source_map
+                )
+        if source_map is not None:
+            normalized_sources: dict[str, str] = {}
+            for raw_format, raw_source in (
+                source_map.items()
+            ):
+                canonical = fr.get_format(str(raw_format)).name
+                if not is_cb_format(canonical):
+                    raise ValueError(
+                        "CB codebook_source_by_format contains a non-CB "
+                        f"format {raw_format!r}"
+                    )
+                cell_source = str(raw_source).strip().lower()
+                if cell_source not in {"lattice", "learned"}:
+                    raise ValueError(
+                        f"CB source for {canonical} must be lattice/learned, "
+                        f"got {raw_source!r}"
+                    )
+                if canonical in normalized_sources:
+                    raise ValueError(
+                        "CB codebook_source_by_format repeats canonical "
+                        f"format {canonical!r}"
+                    )
+                normalized_sources[canonical] = cell_source
+            if not normalized_sources:
+                raise ValueError("CB codebook_source_by_format cannot be empty")
+            normalized_sources = dict(sorted(normalized_sources.items()))
+            object.__setattr__(
+                self, "codebook_source_by_format", normalized_sources
+            )
+            learned_formats = [
+                name
+                for name, cell_source in normalized_sources.items()
+                if cell_source == "learned"
+            ]
+            declared_source_scope = self.codebook_source_scope
+            if declared_source_scope == "none" and learned_formats:
+                raise ValueError(
+                    "CB codebook_source_scope='none' cannot carry learned "
+                    f"bundle cells: {learned_formats[:8]}"
+                )
+            if declared_source_scope == "fp8":
+                learned_outside_scope = [
+                    name
+                    for name in learned_formats
+                    if _cb_scope_family(name) != "fp8"
+                ]
+                if learned_outside_scope:
+                    raise ValueError(
+                        "CB codebook_source_scope='fp8' cannot carry learned "
+                        "NVFP4 bundle cells: "
+                        f"{learned_outside_scope[:8]}"
+                    )
+            # The old scalar is retained only as an artifact-wide ANY for
+            # readers predating per-rung source identity.  A value-bearing
+            # bundle map, not the build scope, decides it.
+            object.__setattr__(
+                self,
+                "codebook_source",
+                (
+                    "learned"
+                    if "learned" in normalized_sources.values()
+                    else "lattice"
+                ),
+            )
         if self.codebook_refs is not None:
             normalized_refs: dict[str, str | tuple[str, ...]] = {}
             for qname, raw_refs in self.codebook_refs.items():
@@ -280,6 +411,44 @@ class CBSerializationContext:
                     else tuple(str(item) for item in raw_refs)
                 )
             object.__setattr__(self, "codebook_refs", normalized_refs)
+        if self.codebook_refs_by_qname_format is not None:
+            normalized_refs_by_format: dict[
+                str, dict[str, str | tuple[str, ...]]
+            ] = {}
+            for raw_qname, raw_formats in (
+                self.codebook_refs_by_qname_format.items()
+            ):
+                qname = str(raw_qname)
+                if not isinstance(raw_formats, Mapping):
+                    raise TypeError(
+                        "CB codebook_refs_by_qname_format entries must be "
+                        f"format mappings, got {type(raw_formats).__name__} "
+                        f"for {qname!r}"
+                    )
+                by_format: dict[str, str | tuple[str, ...]] = {}
+                for raw_format, raw_refs in raw_formats.items():
+                    canonical = fr.get_format(str(raw_format)).name
+                    if parse_format_name(canonical) is None:
+                        raise ValueError(
+                            "CB codebook_refs_by_qname_format contains a "
+                            f"non-CB format {raw_format!r} for {qname!r}"
+                        )
+                    if canonical in by_format:
+                        raise ValueError(
+                            "CB codebook_refs_by_qname_format repeats "
+                            f"canonical format {canonical!r} for {qname!r}"
+                        )
+                    by_format[canonical] = (
+                        str(raw_refs)
+                        if isinstance(raw_refs, str)
+                        else tuple(str(item) for item in raw_refs)
+                    )
+                normalized_refs_by_format[qname] = by_format
+            object.__setattr__(
+                self,
+                "codebook_refs_by_qname_format",
+                normalized_refs_by_format,
+            )
         if self.codebook_content_digests is not None:
             normalized_digests: dict[str, str] = {}
             for raw_name, raw_digest in self.codebook_content_digests.items():
@@ -294,6 +463,11 @@ class CBSerializationContext:
             object.__setattr__(
                 self, "codebook_content_digests", normalized_digests
             )
+        if self.codebook_bundle_path is not None:
+            bundle_path = str(self.codebook_bundle_path).strip()
+            if not bundle_path:
+                raise ValueError("CB codebook_bundle_path cannot be empty")
+            object.__setattr__(self, "codebook_bundle_path", bundle_path)
 
     @classmethod
     def production(
@@ -305,7 +479,13 @@ class CBSerializationContext:
         minchain: bool = False,
         encode_tier: str = CB_ENCODE_TIER_DEFAULT,
         codebook_source: str = "lattice",
+        codebook_source_scope: str | None = None,
+        codebook_source_by_format: Mapping[str, str] | None = None,
+        scale_sweep_scope: str | None = None,
         codebook_refs: Mapping[str, str | Sequence[str]] | None = None,
+        codebook_refs_by_qname_format: Mapping[
+            str, Mapping[str, str | Sequence[str]]
+        ] | None = None,
         codebook_content_digests: Mapping[str, str] | None = None,
     ) -> CBSerializationContext:
         from .nvfp4_activation_contract import (
@@ -324,15 +504,19 @@ class CBSerializationContext:
             scale_coding=PRODUCTION_FP4_SCALE_CODING,
             layout_version=2,
             scale_sweep=scale_sweep,
+            scale_sweep_scope=scale_sweep_scope,
             ldlq=bool(ldlq),
             ldlq_scope=scope,
             minchain=minchain,
             minchain_version=(MINCHAIN_CONTEXT_VERSION if minchain else None),
             encode_tier=encode_tier,
             codebook_source=codebook_source,
+            codebook_source_scope=codebook_source_scope,
+            codebook_source_by_format=codebook_source_by_format,
             activation_contract=NVFP4_ACTIVATION_CONTRACT_SCHEMA,
             activation_execution=NVFP4_ACTIVATION_EXECUTION,
             codebook_refs=codebook_refs,
+            codebook_refs_by_qname_format=codebook_refs_by_qname_format,
             codebook_content_digests=codebook_content_digests,
         )
 
@@ -346,7 +530,13 @@ class CBSerializationContext:
         minchain: bool = False,
         encode_tier: str = CB_ENCODE_TIER_DEFAULT,
         codebook_source: str = "lattice",
+        codebook_source_scope: str | None = None,
+        codebook_source_by_format: Mapping[str, str] | None = None,
+        scale_sweep_scope: str | None = None,
         codebook_refs: Mapping[str, str | Sequence[str]] | None = None,
+        codebook_refs_by_qname_format: Mapping[
+            str, Mapping[str, str | Sequence[str]]
+        ] | None = None,
         codebook_content_digests: Mapping[str, str] | None = None,
     ) -> CBSerializationContext:
         """Explicit legacy writer context; old artifacts remain readable."""
@@ -360,15 +550,130 @@ class CBSerializationContext:
             scale_coding=LEGACY_FP4_SCALE_CODING,
             layout_version=1,
             scale_sweep=scale_sweep,
+            scale_sweep_scope=scale_sweep_scope,
             ldlq=bool(ldlq),
             ldlq_scope=scope,
             encode_tier=encode_tier,
             codebook_source=codebook_source,
+            codebook_source_scope=codebook_source_scope,
+            codebook_source_by_format=codebook_source_by_format,
             activation_contract=None,
             activation_execution=None,
             codebook_refs=codebook_refs,
+            codebook_refs_by_qname_format=codebook_refs_by_qname_format,
             codebook_content_digests=codebook_content_digests,
         )
+
+
+def _cb_scope_family(format_name: str) -> str:
+    parsed = parse_format_name(str(format_name).strip().upper())
+    if parsed is None:
+        raise ValueError(f"{format_name!r} is not a CB format")
+    family, _k = parsed
+    return "nvfp4" if family.grid == "fp4" else "fp8"
+
+
+def effective_codebook_source_scope(context: CBSerializationContext) -> str:
+    """Return the canonical family scope carrying learned codebook bytes."""
+    scope = context.codebook_source_scope
+    if scope is None:
+        return "all" if context.codebook_source == "learned" else "none"
+    return str(scope)
+
+
+def codebook_source_for_format(
+    format_name: str,
+    context: CBSerializationContext,
+) -> str:
+    """Resolve lattice/learned for one format under the artifact contract.
+
+    A value-bearing bundle freezes this map when the render context is
+    created.  The scope/policy path remains only for legacy logical contexts
+    that have no bundle map; ``CB_CODEBOOK_SOURCE_SCOPE`` is a build-time
+    training selector, not a render-time assertion about every FP8 rung.
+    """
+
+    canonical = fr.get_format(str(format_name)).name
+    explicit_sources = context.codebook_source_by_format
+    if explicit_sources is not None:
+        try:
+            return str(explicit_sources[canonical])
+        except KeyError as exc:
+            raise ValueError(
+                f"{canonical}: value-bearing CB source map has no rung entry; "
+                "refusing to infer one from current policy"
+            ) from exc
+    scope = effective_codebook_source_scope(context)
+    if scope == "none":
+        return "lattice"
+    family = _cb_scope_family(canonical)
+    if family == "fp8" and scope in {"fp8", "all"}:
+        # CBL is a measured rendering policy, not a structural consequence of
+        # the product-codebook split.  Disabled/pending rungs stay canonical
+        # lattice even under an FP8 learned scope; this keeps K48 in the menu
+        # without shipping the measured regression and lets K44--47 turn on
+        # one row at a time as their sweep closes.
+        from .cb_learned_bundle import CBL_RUNG_POLICY
+
+        parsed = parse_format_name(canonical)
+        assert parsed is not None
+        _family, rung = parsed
+        return (
+            "learned"
+            if CBL_RUNG_POLICY.get(int(rung), {}).get("enabled") is True
+            else "lattice"
+        )
+    return "learned" if scope == "all" else "lattice"
+
+
+def codebook_source_for_cell(
+    qname: str,
+    format_name: str,
+    context: CBSerializationContext,
+) -> str:
+    """Resolve one render from its exact bundle cell when values are present."""
+
+    canonical = fr.get_format(str(format_name)).name
+    if context.codebook_bundle_path is None:
+        return codebook_source_for_format(canonical, context)
+
+    from .cb_learned_bundle import load_bundle_cached
+
+    source = str(
+        load_bundle_cached(context.codebook_bundle_path).cell(
+            str(qname), canonical
+        )["source"]
+    )
+    explicit_sources = context.codebook_source_by_format
+    if explicit_sources is not None:
+        expected = codebook_source_for_format(canonical, context)
+        if source != expected:
+            raise ValueError(
+                f"{qname}/{canonical}: bundle cell source {source!r} differs "
+                f"from the frozen per-rung source map {expected!r}"
+            )
+    return source
+
+
+def effective_scale_sweep_scope(context: CBSerializationContext) -> str:
+    """Return the canonical family scope on which scale search is enabled."""
+    scope = context.scale_sweep_scope
+    if scope is None:
+        return "all" if context.scale_sweep else "none"
+    return str(scope)
+
+
+def scale_sweep_for_format(
+    format_name: str,
+    context: CBSerializationContext,
+) -> bool:
+    """Resolve the scale-search arm for one format under the scoped contract."""
+    scope = effective_scale_sweep_scope(context)
+    if scope == "none":
+        return False
+    if scope == "all":
+        return True
+    return _cb_scope_family(format_name) == scope
 
 
 def _ldlq_for_format(format_name: str, context: CBSerializationContext) -> bool:
@@ -401,15 +706,59 @@ def cb_serialization_context_stamp(
     """Small identity stamp suitable for an allocator recipe's metadata."""
     if context is None:
         raise ValueError("CB serialization context stamp requires a context")
-    if (
-        context.codebook_source == "learned"
-        and not context.codebook_content_digests
-    ):
+    source_scope = effective_codebook_source_scope(context)
+    sweep_scope = effective_scale_sweep_scope(context)
+    canonical_formats = (
+        sorted({
+            (
+                item.name
+                if isinstance(item, fr.FormatSpec)
+                else fr.get_format(str(item)).name
+            )
+            for item in formats
+            if is_cb_format(
+                item.name if isinstance(item, fr.FormatSpec) else str(item)
+            )
+        })
+        if formats is not None
+        else None
+    )
+    source_formats = (
+        sorted(context.codebook_source_by_format)
+        if context.codebook_source_by_format is not None
+        else canonical_formats
+    )
+    source_by_format = (
+        {
+            name: codebook_source_for_format(name, context)
+            for name in source_formats
+        }
+        if source_formats
+        and (
+            context.codebook_source_by_format is not None
+            or source_scope != "none"
+        )
+        else None
+    )
+    has_learned = (
+        "learned" in source_by_format.values()
+        if source_by_format is not None
+        else context.codebook_source == "learned"
+    )
+    if has_learned and not context.codebook_content_digests:
         raise ValueError(
             "learned CB serialization identity requires materialized "
             "codebook_content_digests; a logical role/ref does not identify "
             "the bytes that cost, KL, and export must share"
         )
+    lattice_formats = (
+        [
+            name for name in source_formats
+            if codebook_source_for_format(name, context) == "lattice"
+        ]
+        if source_formats is not None
+        else []
+    )
     ldlq_scope = getattr(
         context, "ldlq_scope", "all" if context.ldlq else "none"
     )
@@ -418,12 +767,37 @@ def cb_serialization_context_stamp(
         from .nvfp4_cb_formats import packed_ldlq_artifact_stamp
 
         ldlq_kernel = packed_ldlq_artifact_stamp()
+    stamped_scalar_source = (
+        "learned"
+        if source_by_format is not None
+        and "learned" in source_by_format.values()
+        else (
+            "lattice"
+            if source_by_format is not None
+            else context.codebook_source
+        )
+    )
     return {
         "schema": _serialized_payload_schema(context),
         "scale_coding": context.scale_coding,
         "layout_version": context.layout_version,
-        "codebook_source": context.codebook_source,
+        "codebook_source": stamped_scalar_source,
+        **({
+            "codebook_source_scope": source_scope,
+        } if (
+            source_scope == "fp8"
+            or (
+                source_by_format is not None
+                and source_scope != "none"
+            )
+        ) else {}),
+        **({
+            "codebook_source_by_format": source_by_format,
+        } if source_by_format is not None else {}),
         "scale_sweep": context.scale_sweep,
+        **({
+            "scale_sweep_scope": sweep_scope,
+        } if sweep_scope in {"nvfp4", "fp8"} else {}),
         "ldlq": context.ldlq,
         "ldlq_scope": ldlq_scope,
         **({"ldlq_packed_kernel": ldlq_kernel} if ldlq_kernel is not None else {}),
@@ -440,19 +814,9 @@ def cb_serialization_context_stamp(
         **({
             "lattice_codebook_sha256_by_format": {
                 name: list(lattice_codebook_content_sha256(name))
-                for name in sorted({
-                    (
-                        item.name
-                        if isinstance(item, fr.FormatSpec)
-                        else fr.get_format(str(item)).name
-                    )
-                    for item in formats
-                    if is_cb_format(
-                        item.name if isinstance(item, fr.FormatSpec) else str(item)
-                    )
-                })
+                for name in lattice_formats
             },
-        } if context.codebook_source == "lattice" and formats is not None else {}),
+        } if lattice_formats else {}),
         **({
             "codebook_refs": {
                 str(name): (
@@ -463,6 +827,21 @@ def cb_serialization_context_stamp(
                 for name, refs in sorted(context.codebook_refs.items())
             },
         } if context.codebook_refs is not None else {}),
+        **({
+            "codebook_refs_by_qname_format": {
+                str(name): {
+                    str(format_name): (
+                        str(refs)
+                        if isinstance(refs, str)
+                        else list(refs)
+                    )
+                    for format_name, refs in sorted(by_format.items())
+                }
+                for name, by_format in sorted(
+                    context.codebook_refs_by_qname_format.items()
+                )
+            },
+        } if context.codebook_refs_by_qname_format is not None else {}),
         **({
             "codebook_content_sha256": dict(sorted(
                 context.codebook_content_digests.items()
@@ -544,10 +923,81 @@ def cb_serialization_context_from_stamp(
             f"{where}: CB serialized-payload v2 stamp cannot claim an "
             "activation_contract"
         )
-    raw_digests = stamp.get("codebook_content_sha256")
-    if str(stamp["codebook_source"]).strip().lower() == "learned" and not isinstance(
-        raw_digests, Mapping
+    raw_source_scope = stamp.get("codebook_source_scope")
+    if raw_source_scope is not None:
+        source_scope = str(raw_source_scope).strip().lower()
+        if source_scope not in {"none", "fp8", "all"}:
+            raise ValueError(
+                f"{where}: CB codebook_source_scope must be one of "
+                f"none/fp8/all, got {raw_source_scope!r}"
+            )
+    else:
+        source_scope = None
+    raw_source_by_format = stamp.get("codebook_source_by_format")
+    if raw_source_by_format is not None and not isinstance(
+        raw_source_by_format, Mapping
     ):
+        raise ValueError(
+            f"{where}: CB codebook_source_by_format stamp is not an object"
+        )
+    source_by_format: dict[str, str] | None = None
+    if isinstance(raw_source_by_format, Mapping):
+        source_by_format = {}
+        for raw_format, raw_source in raw_source_by_format.items():
+            canonical = fr.get_format(str(raw_format)).name
+            if not is_cb_format(canonical):
+                raise ValueError(
+                    f"{where}: source map contains non-CB format "
+                    f"{raw_format!r}"
+                )
+            source = str(raw_source).strip().lower()
+            if source not in {"lattice", "learned"}:
+                raise ValueError(
+                    f"{where}: source map value for {canonical} must be "
+                    f"lattice/learned, got {raw_source!r}"
+                )
+            if canonical in source_by_format:
+                raise ValueError(
+                    f"{where}: source map repeats canonical format "
+                    f"{canonical!r}"
+                )
+            source_by_format[canonical] = source
+        if not source_by_format:
+            raise ValueError(f"{where}: CB source map cannot be empty")
+        expected_scalar_source = (
+            "learned"
+            if "learned" in source_by_format.values()
+            else "lattice"
+        )
+        observed_scalar_source = str(stamp["codebook_source"]).strip().lower()
+        if observed_scalar_source != expected_scalar_source:
+            raise ValueError(
+                f"{where}: CB codebook_source scalar must be the artifact-wide "
+                "ANY of codebook_source_by_format: "
+                f"stamp={observed_scalar_source!r}, "
+                f"map={expected_scalar_source!r}"
+            )
+    raw_sweep_scope = stamp.get("scale_sweep_scope")
+    if raw_sweep_scope is not None:
+        sweep_scope = str(raw_sweep_scope).strip().lower()
+        if sweep_scope not in {"none", "nvfp4", "fp8", "all"}:
+            raise ValueError(
+                f"{where}: CB scale_sweep_scope must be one of "
+                f"none/nvfp4/fp8/all, got {raw_sweep_scope!r}"
+            )
+    else:
+        sweep_scope = None
+    raw_digests = stamp.get("codebook_content_sha256")
+    has_learned = (
+        "learned" in source_by_format.values()
+        if source_by_format is not None
+        else (
+            source_scope in {"fp8", "all"}
+            if source_scope is not None
+            else str(stamp["codebook_source"]).strip().lower() == "learned"
+        )
+    )
+    if has_learned and not isinstance(raw_digests, Mapping):
         raise ValueError(
             f"{where}: learned CB serialized-payload context is missing "
             "codebook_content_sha256"
@@ -579,6 +1029,20 @@ def cb_serialization_context_from_stamp(
     raw_refs = stamp.get("codebook_refs")
     if raw_refs is not None and not isinstance(raw_refs, Mapping):
         raise ValueError(f"{where}: CB codebook_refs stamp is not an object")
+    raw_refs_by_format = stamp.get("codebook_refs_by_qname_format")
+    if raw_refs_by_format is not None and not isinstance(
+        raw_refs_by_format, Mapping
+    ):
+        raise ValueError(
+            f"{where}: CB codebook_refs_by_qname_format stamp is not an object"
+        )
+    if isinstance(raw_refs_by_format, Mapping) and any(
+        not isinstance(value, Mapping)
+        for value in raw_refs_by_format.values()
+    ):
+        raise ValueError(
+            f"{where}: CB codebook_refs_by_qname_format entries must be objects"
+        )
     minchain = schema == MINCHAIN_CB_SERIALIZED_PAYLOAD_SCHEMA
     if minchain and stamp.get("minchain") is not True:
         raise ValueError(
@@ -627,7 +1091,10 @@ def cb_serialization_context_from_stamp(
         scale_coding=str(stamp["scale_coding"]),
         layout_version=int(stamp["layout_version"]),
         codebook_source=str(stamp["codebook_source"]),
+        codebook_source_scope=source_scope,
+        codebook_source_by_format=source_by_format,
         scale_sweep=stamp["scale_sweep"],
+        scale_sweep_scope=sweep_scope,
         ldlq=stamp["ldlq"],
         ldlq_scope=ldlq_scope,
         minchain=minchain,
@@ -647,6 +1114,17 @@ def cb_serialization_context_from_stamp(
         codebook_refs=(
             {str(name): value for name, value in raw_refs.items()}
             if isinstance(raw_refs, Mapping)
+            else None
+        ),
+        codebook_refs_by_qname_format=(
+            {
+                str(name): {
+                    str(format_name): refs
+                    for format_name, refs in by_format.items()
+                }
+                for name, by_format in raw_refs_by_format.items()
+            }
+            if isinstance(raw_refs_by_format, Mapping)
             else None
         ),
         codebook_content_digests=(
@@ -678,20 +1156,29 @@ def cb_serialization_context_from_env(
         environ = os.environ
     scale = environ.get("CB_SCALE_CODING")
     source = environ.get("CB_CODEBOOK_SOURCE")
+    raw_source_scope = environ.get("CB_CODEBOOK_SOURCE_SCOPE")
     raw_sweep = environ.get("CB_SCALE_SWEEP")
+    raw_sweep_scope = environ.get("CB_SCALE_SWEEP_SCOPE")
     raw_ldlq = environ.get("PRISMAQUANT_CB_LDLQ")
     raw_ldlq_scope = environ.get("PRISMAQUANT_CB_LDLQ_SCOPE")
     raw_minchain = environ.get("PRISMAQUANT_CB_MINCHAIN")
     raw_tier = environ.get("PRISMAQUANT_CB_ENCODE_TIER")
+    bundle_source = str(environ.get("CB_CODEBOOK_BUNDLE", "")).strip()
     if require_explicit and (
-        not scale or not source or raw_sweep is None or (raw_ldlq is None and raw_ldlq_scope is None)
+        not scale
+        or (not source and raw_source_scope is None)
+        or (raw_sweep is None and raw_sweep_scope is None)
+        or (raw_ldlq is None and raw_ldlq_scope is None)
         or not raw_tier
     ):
         missing = [
             name for name, value in (
                 ("CB_SCALE_CODING", scale),
-                ("CB_CODEBOOK_SOURCE", source),
-                ("CB_SCALE_SWEEP", raw_sweep),
+                (
+                    "CB_CODEBOOK_SOURCE_SCOPE/CB_CODEBOOK_SOURCE",
+                    raw_source_scope or source,
+                ),
+                ("CB_SCALE_SWEEP_SCOPE/CB_SCALE_SWEEP", raw_sweep_scope or raw_sweep),
                 ("PRISMAQUANT_CB_LDLQ_SCOPE/PRISMAQUANT_CB_LDLQ", raw_ldlq_scope or raw_ldlq),
                 ("PRISMAQUANT_CB_ENCODE_TIER", raw_tier),
             ) if not value
@@ -711,6 +1198,103 @@ def cb_serialization_context_from_env(
         name="CB_SCALE_SWEEP",
         where=where,
     )
+    source_scope = (
+        str(raw_source_scope).strip().lower()
+        if raw_source_scope is not None
+        else None
+    )
+    if source_scope is not None:
+        if source_scope not in {"none", "fp8", "all"}:
+            raise ValueError(
+                f"{where}: CB_CODEBOOK_SOURCE_SCOPE must be one of "
+                f"none/fp8/all, got {raw_source_scope!r}"
+            )
+        # Without a bundle there is no per-rung artifact to consult, so keep
+        # the legacy scalar/scope consistency error (and the missing-bundle
+        # diagnostic below).  With a bundle, compare the scalar to the
+        # bundle's artifact-wide ANY after loading its cell map instead.
+        if not bundle_source:
+            expected_source = (
+                "lattice" if source_scope == "none" else "learned"
+            )
+            if (
+                source is not None
+                and str(source).strip().lower() != expected_source
+            ):
+                raise ValueError(
+                    f"{where}: CB_CODEBOOK_SOURCE={source!r} is "
+                    "inconsistent with "
+                    f"CB_CODEBOOK_SOURCE_SCOPE={raw_source_scope!r}"
+                )
+            source = expected_source
+    bundle_requested = (
+        source_scope in {"fp8", "all"}
+        if source_scope is not None
+        else str(source or "lattice").strip().lower() == "learned"
+    )
+    refs_by_qname_format = None
+    source_by_format = None
+    if bundle_requested:
+        if not bundle_source:
+            raise ValueError(
+                f"{where}: learned CB requires CB_CODEBOOK_BUNDLE pointing "
+                "at the immutable value-bearing .pqcb; a digest manifest or "
+                "logical ref cannot supply the values cost/cache/KL/export "
+                "must share"
+            )
+        if digest_source:
+            raise ValueError(
+                f"{where}: set CB_CODEBOOK_BUNDLE, not the legacy "
+                "digest-only CB_CODEBOOK_DIGESTS contract, for learned CB"
+            )
+        from .cb_learned_bundle import load_bundle_cached
+
+        bundle = load_bundle_cached(bundle_source)
+        digests = dict(bundle.codebook_content_digests)
+        source_by_format = bundle.codebook_source_by_format
+        bundle_scalar = (
+            "learned"
+            if "learned" in source_by_format.values()
+            else "lattice"
+        )
+        if (
+            source is not None
+            and str(source).strip().lower() != bundle_scalar
+        ):
+            raise ValueError(
+                f"{where}: CB_CODEBOOK_SOURCE={source!r} is inconsistent "
+                "with the value-bearing bundle's per-rung source map "
+                f"(artifact-wide source={bundle_scalar!r})"
+            )
+        source = bundle_scalar
+        refs_by_qname_format = {
+            str(qname): dict(by_format)
+            for qname, by_format in bundle.codebook_refs_by_cell.items()
+        }
+    elif bundle_source:
+        raise ValueError(
+            f"{where}: CB_CODEBOOK_BUNDLE is set while the effective learned "
+            "scope is none; refusing a stale value-bearing input that the "
+            "stamp would otherwise ignore"
+        )
+    sweep_scope = (
+        str(raw_sweep_scope).strip().lower()
+        if raw_sweep_scope is not None
+        else None
+    )
+    if sweep_scope is not None:
+        if sweep_scope not in {"none", "nvfp4", "fp8", "all"}:
+            raise ValueError(
+                f"{where}: CB_SCALE_SWEEP_SCOPE must be one of "
+                f"none/nvfp4/fp8/all, got {raw_sweep_scope!r}"
+            )
+        expected_sweep = sweep_scope != "none"
+        if raw_sweep is not None and scale_sweep != expected_sweep:
+            raise ValueError(
+                f"{where}: CB_SCALE_SWEEP={raw_sweep!r} is inconsistent with "
+                f"CB_SCALE_SWEEP_SCOPE={raw_sweep_scope!r}"
+            )
+        scale_sweep = expected_sweep
     # New per-family scope is authoritative; legacy bool maps to all/none.
     raw_ldlq_scope_clean = str(raw_ldlq_scope).strip().lower() if raw_ldlq_scope is not None else None
     if raw_ldlq_scope_clean is not None:
@@ -758,7 +1342,10 @@ def cb_serialization_context_from_env(
     return CBSerializationContext(
         scale_coding=scale or PRODUCTION_FP4_SCALE_CODING,
         codebook_source=source or "lattice",
+        codebook_source_scope=source_scope,
+        codebook_source_by_format=source_by_format,
         scale_sweep=scale_sweep,
+        scale_sweep_scope=sweep_scope,
         ldlq=ldlq,
         ldlq_scope=ldlq_scope,
         minchain=minchain,
@@ -766,7 +1353,9 @@ def cb_serialization_context_from_env(
         encode_tier=resolve_cb_encode_tier(raw_tier, environ=environ),
         activation_contract=NVFP4_ACTIVATION_CONTRACT_SCHEMA,
         activation_execution=NVFP4_ACTIVATION_EXECUTION,
+        codebook_refs_by_qname_format=refs_by_qname_format,
         codebook_content_digests=digests,
+        codebook_bundle_path=(bundle_source if bundle_requested else None),
     )
 
 
@@ -837,6 +1426,7 @@ def validate_cb_serialization_context_stamp(
     context: CBSerializationContext,
     *,
     where: str,
+    formats: Sequence[str | fr.FormatSpec] | None = None,
 ) -> None:
     """Fail when export choices drift from an allocator-stamped recipe.
 
@@ -848,8 +1438,8 @@ def validate_cb_serialization_context_stamp(
         return
     if not isinstance(stamp, Mapping):
         raise TypeError(f"{where}: CB serialized-payload stamp is not an object")
-    cb_serialization_context_from_stamp(stamp, where=where)
-    expected = cb_serialization_context_stamp(context)
+    observed_context = cb_serialization_context_from_stamp(stamp, where=where)
+    expected = cb_serialization_context_stamp(context, formats=formats)
     base_keys = (
         "schema",
         "scale_coding",
@@ -870,6 +1460,89 @@ def validate_cb_serialization_context_stamp(
         raise ValueError(
             f"{where}: CB serialization context differs from allocator "
             f"recipe: recipe={observed}, exporter={expected_base}"
+        )
+    observed_source_scope = effective_codebook_source_scope(observed_context)
+    expected_source_scope = effective_codebook_source_scope(context)
+    if observed_source_scope != expected_source_scope:
+        raise ValueError(
+            f"{where}: CB codebook source scope differs from allocator recipe: "
+            f"recipe={observed_source_scope!r}, "
+            f"exporter={expected_source_scope!r}"
+        )
+    observed_source_by_format = stamp.get("codebook_source_by_format")
+    expected_source_by_format = None
+    if context.codebook_source_by_format is not None:
+        expected_source_by_format = dict(context.codebook_source_by_format)
+    elif formats is not None:
+        expected_formats = sorted({
+            (
+                item.name
+                if isinstance(item, fr.FormatSpec)
+                else fr.get_format(str(item)).name
+            )
+            for item in formats
+            if is_cb_format(
+                item.name if isinstance(item, fr.FormatSpec) else str(item)
+            )
+        })
+        if expected_source_scope != "none" and expected_formats:
+            expected_source_by_format = {
+                name: codebook_source_for_format(name, context)
+                for name in expected_formats
+            }
+    if expected_source_by_format is not None:
+        observed_source_map = (
+            {
+                fr.get_format(str(name)).name: str(source)
+                for name, source in observed_source_by_format.items()
+            }
+            if isinstance(observed_source_by_format, Mapping)
+            else None
+        )
+        if observed_source_map != expected_source_by_format:
+            observed_keys = (
+                set(observed_source_map) if observed_source_map is not None else set()
+            )
+            expected_keys = set(expected_source_by_format)
+            changed = sorted(
+                name for name in observed_keys & expected_keys
+                if observed_source_map[name] != expected_source_by_format[name]
+            )
+            raise ValueError(
+                f"{where}: CB per-rung codebook source map differs from the "
+                "render: "
+                f"missing={sorted(expected_keys - observed_keys)[:8]}, "
+                f"extra={sorted(observed_keys - expected_keys)[:8]}, "
+                f"changed={changed[:8]}"
+            )
+    elif (
+        context.codebook_source_scope is not None
+        and expected_source_scope != "none"
+    ):
+        if not isinstance(observed_source_by_format, Mapping):
+            raise ValueError(
+                f"{where}: scoped learned CB recipe has no checked "
+                "codebook_source_by_format rung policy"
+            )
+        mismatched_source_formats = [
+            str(format_name)
+            for format_name, observed_source in observed_source_by_format.items()
+            if str(observed_source) != codebook_source_for_format(
+                str(format_name), context
+            )
+        ]
+        if mismatched_source_formats:
+            raise ValueError(
+                f"{where}: CB per-format learned rung policy differs from the "
+                f"producer: {mismatched_source_formats[:8]}"
+            )
+    observed_sweep_scope = effective_scale_sweep_scope(observed_context)
+    expected_sweep_scope = effective_scale_sweep_scope(context)
+    if observed_sweep_scope != expected_sweep_scope:
+        raise ValueError(
+            f"{where}: CB scale-sweep scope differs from allocator recipe: "
+            f"recipe={observed_sweep_scope!r}, "
+            f"exporter={expected_sweep_scope!r}"
         )
     # Per-family scope: new stamps carry ldlq_scope, old stamps only have ldlq bool.
     # For backward compat, an old stamp without scope is interpreted as all/none
@@ -914,7 +1587,52 @@ def validate_cb_serialization_context_stamp(
                 f"recipe: missing={missing_refs[:8]}, "
                 f"mismatched={mismatched_refs[:8]}"
             )
-    if context.codebook_source == "learned":
+    observed_refs_by_format = stamp.get("codebook_refs_by_qname_format")
+    if context.codebook_refs_by_qname_format is not None:
+        if not isinstance(observed_refs_by_format, Mapping):
+            raise ValueError(
+                f"{where}: CB recipe has no per-qname/format codebook refs"
+            )
+        missing_by_format: list[str] = []
+        mismatched_by_format: list[str] = []
+        for qname, expected_formats in (
+            context.codebook_refs_by_qname_format.items()
+        ):
+            observed_formats = observed_refs_by_format.get(qname)
+            if not isinstance(observed_formats, Mapping):
+                missing_by_format.append(qname)
+                continue
+            for format_name, refs in expected_formats.items():
+                label = f"{qname}/{format_name}"
+                if format_name not in observed_formats:
+                    missing_by_format.append(label)
+                    continue
+                observed_value = observed_formats[format_name]
+                observed_tuple = (
+                    (str(observed_value),)
+                    if isinstance(observed_value, str)
+                    else tuple(str(item) for item in observed_value)
+                )
+                expected_tuple = (
+                    (str(refs),)
+                    if isinstance(refs, str)
+                    else tuple(str(item) for item in refs)
+                )
+                if observed_tuple != expected_tuple:
+                    mismatched_by_format.append(label)
+        if missing_by_format or mismatched_by_format:
+            raise ValueError(
+                f"{where}: CB per-qname/format codebook refs differ from "
+                "allocator recipe: "
+                f"missing={missing_by_format[:8]}, "
+                f"mismatched={mismatched_by_format[:8]}"
+            )
+    has_learned_codebook = (
+        any(source == "learned" for source in expected_source_by_format.values())
+        if expected_source_by_format is not None
+        else effective_codebook_source_scope(context) != "none"
+    )
+    if has_learned_codebook:
         observed_digests = stamp.get("codebook_content_sha256")
         if not isinstance(observed_digests, Mapping):
             raise ValueError(
@@ -978,15 +1696,21 @@ def validate_cb_cost_provenance(
             f"{where}: CB cost payload has no serialized-payload identity; "
             "refusing a cache whose scale layout/codebook source is unknown"
         )
-    validate_cb_serialization_context_stamp(stamp, context, where=where)
-    if context.codebook_source == "lattice":
-        expected_lattice = {
-            fr.get_format(name).name: list(
-                lattice_codebook_content_sha256(fr.get_format(name).name)
-            )
-            for name in names
-            if is_cb_format(name)
-        }
+    validate_cb_serialization_context_stamp(
+        stamp,
+        context,
+        where=where,
+        formats=names,
+    )
+    expected_lattice = {
+        fr.get_format(name).name: list(
+            lattice_codebook_content_sha256(fr.get_format(name).name)
+        )
+        for name in names
+        if is_cb_format(name)
+        and codebook_source_for_format(name, context) == "lattice"
+    }
+    if expected_lattice:
         observed_lattice = stamp.get("lattice_codebook_sha256_by_format")
         if not isinstance(observed_lattice, Mapping) or any(
             observed_lattice.get(name) != digests
@@ -1060,6 +1784,7 @@ def cb_fields_for_context(
     weight,
     *,
     context: CBSerializationContext,
+    qname: str | None = None,
     col_weights=None,
     codebook=None,
     activation_rows=None,
@@ -1089,11 +1814,34 @@ def cb_fields_for_context(
     grid, mode, k = info
     from .nvfp4_cb_formats import SCALE_CODING_V1, nvfp4_cb_fields
 
-    if context.codebook_source == "learned" and codebook is None:
-        raise ValueError(
-            f"{spec.name}: learned-codebook cost render requires the exact "
-            "materialized codebook; refusing to render the lattice and stamp "
-            "it as learned"
+    source = (
+        codebook_source_for_cell(str(qname), spec.name, context)
+        if qname
+        else codebook_source_for_format(spec.name, context)
+    )
+    if source == "learned" and qname:
+        from .cb_learned_bundle import refuse_routed_moe_learned
+
+        refuse_routed_moe_learned(str(qname), weight=weight)
+    if source == "learned" and codebook is None:
+        if not qname:
+            raise ValueError(
+                f"{spec.name}: learned-codebook render requires its exact "
+                "unit qname and materialized bundle cell; refusing to render "
+                "the lattice and stamp it as learned"
+            )
+        if not context.codebook_bundle_path:
+            raise ValueError(
+                f"{qname} ({spec.name}): learned-codebook render has no "
+                "value-bearing CB_CODEBOOK_BUNDLE"
+            )
+        from .cb_learned_bundle import load_bundle_cached
+
+        codebook = load_bundle_cached(context.codebook_bundle_path).codebook_for(
+            str(qname),
+            spec.name,
+            weight=weight,
+            col_weights=col_weights,
         )
     coding = context.scale_coding if grid == "fp4" else SCALE_CODING_V1
     fields = nvfp4_cb_fields(
@@ -1103,7 +1851,7 @@ def cb_fields_for_context(
         mode=mode,
         col_weights=col_weights,
         codebook=codebook,
-        scale_sweep=context.scale_sweep,
+        scale_sweep=scale_sweep_for_format(spec.name, context),
         scale_coding=coding,
         encode_tier=context.encode_tier,
         warm_scale_state=warm_scale_state,
@@ -1168,9 +1916,11 @@ def cb_quantize_dequantize_for_context(
     weight,
     *,
     context: CBSerializationContext,
+    qname: str | None = None,
     col_weights=None,
     codebook=None,
     activation_rows=None,
+    ldlq_missing_activation_ok: bool = False,
 ):
     """Render a CB weight under the exact artifact serialization context."""
     info = _cb_info(spec.name)
@@ -1183,9 +1933,11 @@ def cb_quantize_dequantize_for_context(
         spec,
         weight,
         context=context,
+        qname=qname,
         col_weights=col_weights,
         codebook=codebook,
         activation_rows=activation_rows,
+        ldlq_missing_activation_ok=ldlq_missing_activation_ok,
     )
     return nvfp4_cb_reconstruct(
         fields,
@@ -1504,10 +2256,22 @@ def _physical_codebook_refs(
     format_name: str,
     context: CBSerializationContext,
 ) -> tuple[str, ...]:
-    expected_count = len(codebook_subtable_shapes(format_name))
+    canonical = str(format_name).strip().upper()
+    expected_count = len(codebook_subtable_shapes(canonical))
     supplied = None
+    if context.codebook_refs_by_qname_format is not None:
+        by_format = context.codebook_refs_by_qname_format.get(qname)
+        if by_format is not None:
+            supplied = by_format.get(canonical)
     if context.codebook_refs is not None:
-        supplied = context.codebook_refs.get(qname)
+        legacy_supplied = context.codebook_refs.get(qname)
+        if supplied is not None and legacy_supplied is not None:
+            raise ValueError(
+                f"{qname}: {canonical} has both per-format and legacy "
+                "codebook refs; refusing an ambiguous physical identity"
+            )
+        if supplied is None:
+            supplied = legacy_supplied
     if supplied is not None:
         refs = (supplied,) if isinstance(supplied, str) else tuple(
             str(item) for item in supplied
@@ -1524,8 +2288,9 @@ def _physical_codebook_refs(
             )
         return tuple(str(item) for item in refs)
 
-    logical = _default_logical_ref(qname, context.codebook_source)
-    base = f"cb_codebook.{logical}.{str(format_name).strip().upper()}"
+    source = codebook_source_for_format(canonical, context)
+    logical = _default_logical_ref(qname, source)
+    base = f"cb_codebook.{logical}.{canonical}"
     if expected_count == 1:
         return (base,)
     return tuple(f"{base}.sub{index}" for index in range(expected_count))
@@ -1539,8 +2304,9 @@ def _sidecar_identity(
     canonical = str(format_name).strip().upper()
     refs = _physical_codebook_refs(qname, canonical, context)
     shapes = codebook_subtable_shapes(canonical)
+    source = codebook_source_for_format(canonical, context)
     content_sha256 = None
-    if context.codebook_source == "learned":
+    if source == "learned":
         digests = context.codebook_content_digests or {}
         missing = [ref for ref in refs if ref not in digests]
         if missing:
@@ -1566,13 +2332,113 @@ def _sidecar_identity(
             )
     return {
         "format": canonical,
-        "codebook_source": context.codebook_source,
+        "codebook_source": source,
         "codebook_ref": list(refs),
         "dtype": "float16",
         "subtable_shapes": [list(shape) for shape in shapes],
         "payload_bytes": codebook_sidecar_payload_bytes(canonical),
         "content_sha256": content_sha256,
     }
+
+
+def _has_explicit_codebook_refs(
+    qname: str,
+    format_name: str,
+    context: CBSerializationContext,
+) -> bool:
+    """Return whether ``qname`` explicitly supplies refs for this format."""
+    canonical = str(format_name).strip().upper()
+    by_format = context.codebook_refs_by_qname_format
+    format_supplied = (
+        by_format is not None
+        and qname in by_format
+        and canonical in by_format[qname]
+    )
+    legacy_supplied = (
+        context.codebook_refs is not None
+        and qname in context.codebook_refs
+    )
+    if format_supplied and legacy_supplied:
+        raise ValueError(
+            f"{qname}: {canonical} has both per-format and legacy "
+            "codebook refs; refusing an ambiguous physical identity"
+        )
+    return bool(format_supplied or legacy_supplied)
+
+
+def _tensor_sidecar_identities(
+    qname: str,
+    format_name: str,
+    context: CBSerializationContext,
+) -> tuple[dict, ...]:
+    """Resolve the physical codebook sets consumed by one packed tensor.
+
+    Routed MoE ``gate_up_proj`` remains one packed weight tensor, but the
+    per-role Gridbook ABI consumes a gate LUT for its first output-row half
+    and an up LUT for its second half.  The producer represents those LUTs as
+    ordinary logical ``gate_proj``/``up_proj`` cells.  Only that explicit,
+    complete declaration changes accounting; legacy fused refs, lattice
+    contexts, and dense ``gate_up_proj`` tensors retain their one-sidecar
+    identity exactly.
+    """
+    canonical = str(format_name).strip().upper()
+    routed_marker = ".experts.gate_up_proj"
+    physical_parent = str(qname)
+    discriminator = None
+    if "." in physical_parent:
+        candidate, discriminator = physical_parent.rsplit(".", 1)
+        if discriminator.startswith("format_group_"):
+            physical_parent = candidate
+        else:
+            discriminator = None
+    if (
+        codebook_source_for_format(canonical, context) == "learned"
+        and discriminator is not None
+        and physical_parent.endswith(".experts.down_proj")
+    ):
+        return (
+            _sidecar_identity(
+                bundle_role_qname(str(qname), "down_proj"),
+                canonical,
+                context,
+            ),
+        )
+    if (
+        codebook_source_for_format(canonical, context) != "learned"
+        or not physical_parent.endswith(routed_marker)
+    ):
+        return (_sidecar_identity(qname, canonical, context),)
+
+    gate_qname = bundle_role_qname(str(qname), "gate_proj")
+    up_qname = bundle_role_qname(str(qname), "up_proj")
+    physical_supplied = _has_explicit_codebook_refs(
+        str(qname), canonical, context
+    )
+    gate_supplied = _has_explicit_codebook_refs(
+        gate_qname, canonical, context
+    )
+    up_supplied = _has_explicit_codebook_refs(
+        up_qname, canonical, context
+    )
+
+    if not gate_supplied and not up_supplied:
+        return (_sidecar_identity(qname, canonical, context),)
+    if physical_supplied:
+        raise ValueError(
+            f"{qname}: learned routed-MoE {canonical} supplies both the "
+            "physical fused codebook refs and logical gate/up refs; use "
+            "exactly one ABI"
+        )
+    if gate_supplied != up_supplied:
+        missing = up_qname if gate_supplied else gate_qname
+        raise ValueError(
+            f"{qname}: learned routed-MoE {canonical} per-role sidecars are "
+            f"incomplete; missing explicit refs for {missing!r}"
+        )
+    return (
+        _sidecar_identity(gate_qname, canonical, context),
+        _sidecar_identity(up_qname, canonical, context),
+    )
 
 
 def _identity_key(identity: Mapping) -> str:
@@ -1633,7 +2499,22 @@ def cb_tensor_payload_breakdown(
         + fp8_row_scale_bytes
         + input_global_scale_bytes
     )
-    sidecar = _sidecar_identity(qname, canonical, context)
+    sidecars = _tensor_sidecar_identities(qname, canonical, context)
+    if len(sidecars) == 1:
+        sidecar = sidecars[0]
+    else:
+        sidecar = {
+            "kind": "routed_moe_per_role_codebooks",
+            "roles": [
+                {"projection": projection, "sidecar": identity}
+                for projection, identity in zip(
+                    ("gate_proj", "up_proj"), sidecars, strict=True
+                )
+            ],
+            "payload_bytes": sum(
+                int(identity["payload_bytes"]) for identity in sidecars
+            ),
+        }
     payload_schema = _serialized_payload_schema(context)
     # Per-family LDLQ: the tensor's ldlq stamps the ACTUAL result, not the
     # global context's ANY. For scope nvfp4, NVFP4_CB tensors are ldlq:true
@@ -1647,7 +2528,7 @@ def cb_tensor_payload_breakdown(
         "k": k,
         "artifact_scale_coding": context.scale_coding,
         "layout_version": context.layout_version,
-        "scale_sweep": context.scale_sweep,
+        "scale_sweep": scale_sweep_for_format(canonical, context),
         "ldlq": tensor_ldlq,
         "ldlq_scope": getattr(context, "ldlq_scope", "all" if context.ldlq else "none"),
         **({
@@ -1674,7 +2555,7 @@ def cb_tensor_payload_breakdown(
         "tensor_payload_bytes": int(tensor_payload_bytes),
         "sidecar": sidecar,
     }
-    return {
+    result = {
         "schema": payload_schema,
         "identity": identity,
         "identity_key": _identity_key(identity),
@@ -1695,6 +2576,12 @@ def cb_tensor_payload_breakdown(
         "sidecar_identity_key": _identity_key(sidecar),
         "sidecar_payload_bytes": int(sidecar["payload_bytes"]),
     }
+    if len(sidecars) > 1:
+        result["sidecar_identities"] = list(sidecars)
+        result["sidecar_identity_keys"] = [
+            _identity_key(identity) for identity in sidecars
+        ]
+    return result
 
 
 def cb_assignment_payload_breakdown(
@@ -1731,50 +2618,98 @@ def cb_assignment_payload_breakdown(
         per_tensor[qname] = item
         for key in totals:
             totals[key] += int(item[key])
-        sidecar_key = item["sidecar_identity_key"]
-        sidecar_identity = item["sidecar_identity"]
-        refs = tuple(str(ref) for ref in sidecar_identity["codebook_ref"])
-        overlapping_keys = {
-            sidecar_key_by_ref[ref]
-            for ref in refs
-            if ref in sidecar_key_by_ref
-        }
-        if overlapping_keys and overlapping_keys != {sidecar_key}:
-            raise ValueError(
-                f"{qname}: physical CB codebook refs are partially shared or "
-                "reused with conflicting shape/content identity. Explicit "
-                "ref sets must be disjoint or completely identical; "
-                f"refs={list(refs)}, prior_identity_keys="
-                f"{sorted(overlapping_keys)}"
+        tensor_sidecars = item.get(
+            "sidecar_identities", (item["sidecar_identity"],)
+        )
+        for sidecar_identity in tensor_sidecars:
+            sidecar_key = _identity_key(sidecar_identity)
+            refs = tuple(
+                str(ref) for ref in sidecar_identity["codebook_ref"]
             )
-        previous = sidecars.get(sidecar_key)
-        if previous is None:
-            if overlapping_keys:
+            overlapping_keys = {
+                sidecar_key_by_ref[ref]
+                for ref in refs
+                if ref in sidecar_key_by_ref
+            }
+            if overlapping_keys and overlapping_keys != {sidecar_key}:
                 raise ValueError(
-                    f"{qname}: physical CB codebook refs overlap a prior "
-                    "sidecar without an identical complete identity"
+                    f"{qname}: physical CB codebook refs are partially shared "
+                    "or reused with conflicting shape/content identity. "
+                    "Explicit ref sets must be disjoint or completely "
+                    f"identical; refs={list(refs)}, prior_identity_keys="
+                    f"{sorted(overlapping_keys)}"
                 )
-            sidecars[sidecar_key] = sidecar_identity
-            sidecar_key_by_ref.update({ref: sidecar_key for ref in refs})
-        elif previous != sidecar_identity:
-            raise ValueError(
-                f"conflicting CB sidecar identity for {qname}: {previous} vs "
-                f"{sidecar_identity}"
-            )
-        elif any(sidecar_key_by_ref.get(ref) != sidecar_key for ref in refs):
-            raise ValueError(
-                f"{qname}: identical CB sidecar identity did not resolve to "
-                "the same complete physical ref set"
-            )
+            previous = sidecars.get(sidecar_key)
+            if previous is None:
+                if overlapping_keys:
+                    raise ValueError(
+                        f"{qname}: physical CB codebook refs overlap a prior "
+                        "sidecar without an identical complete identity"
+                    )
+                sidecars[sidecar_key] = sidecar_identity
+                sidecar_key_by_ref.update({ref: sidecar_key for ref in refs})
+            elif previous != sidecar_identity:
+                raise ValueError(
+                    f"conflicting CB sidecar identity for {qname}: "
+                    f"{previous} vs {sidecar_identity}"
+                )
+            elif any(
+                sidecar_key_by_ref.get(ref) != sidecar_key for ref in refs
+            ):
+                raise ValueError(
+                    f"{qname}: identical CB sidecar identity did not resolve "
+                    "to the same complete physical ref set"
+                )
     sidecar_bytes = sum(int(item["payload_bytes"]) for item in sidecars.values())
     total_bytes = totals["tensor_payload_bytes"] + sidecar_bytes
+    serialized_formats = sorted({
+        str(item["format"]) for item in per_tensor.values()
+    })
+    serialized_source_map = (
+        dict(context.codebook_source_by_format)
+        if context.codebook_source_by_format is not None
+        else (
+            {
+                name: codebook_source_for_format(name, context)
+                for name in serialized_formats
+            }
+            if serialized_formats
+            and effective_codebook_source_scope(context) != "none"
+            else None
+        )
+    )
+    serialized_scalar_source = (
+        "learned"
+        if serialized_source_map is not None
+        and "learned" in serialized_source_map.values()
+        else (
+            "lattice"
+            if serialized_source_map is not None
+            else context.codebook_source
+        )
+    )
     return {
         "schema": _serialized_payload_schema(context),
         "context": {
             "scale_coding": context.scale_coding,
             "layout_version": context.layout_version,
-            "codebook_source": context.codebook_source,
+            "codebook_source": serialized_scalar_source,
+            **({
+                "codebook_source_scope": effective_codebook_source_scope(context),
+            } if (
+                effective_codebook_source_scope(context) == "fp8"
+                or (
+                    serialized_source_map is not None
+                    and effective_codebook_source_scope(context) != "none"
+                )
+            ) else {}),
+            **({
+                "codebook_source_by_format": serialized_source_map,
+            } if serialized_source_map is not None else {}),
             "scale_sweep": context.scale_sweep,
+            **({
+                "scale_sweep_scope": effective_scale_sweep_scope(context),
+            } if effective_scale_sweep_scope(context) in {"nvfp4", "fp8"} else {}),
             "ldlq": context.ldlq,
             **({
                 "minchain": True,
@@ -2445,11 +3380,15 @@ def cb_footprint(
         n_params += params
         if is_cb_format(format_name):
             item = cb_breakdown["per_tensor"][qname]
-            sidecar_key = item["sidecar_identity_key"]
             charged = 0
-            if sidecar_key not in sidecar_first_owner:
-                sidecar_first_owner.add(sidecar_key)
-                charged = int(item["sidecar_payload_bytes"])
+            tensor_sidecars = item.get(
+                "sidecar_identities", (item["sidecar_identity"],)
+            )
+            for sidecar_identity in tensor_sidecars:
+                sidecar_key = _identity_key(sidecar_identity)
+                if sidecar_key not in sidecar_first_owner:
+                    sidecar_first_owner.add(sidecar_key)
+                    charged += int(sidecar_identity["payload_bytes"])
             grid, _mode, k = _cb_info(format_name)  # type: ignore[misc]
             per_tensor[qname] = {
                 "format": str(format_name),
@@ -2463,7 +3402,9 @@ def cb_footprint(
                 ),
                 "channel_scale_bytes": int(item["fp8_row_scale_bytes"]),
                 "sidecar_bytes": charged,
-                "codebook_source": ctx.codebook_source,
+                "codebook_source": codebook_source_for_format(
+                    format_name, ctx
+                ),
                 "body_bpw": 8.0 * int(item["packed_weight_bytes"]) / max(params, 1),
                 "serialization_identity": item["identity"],
             }

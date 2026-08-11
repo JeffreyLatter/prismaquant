@@ -130,13 +130,13 @@ from .nvfp4_cb_footprint import (
     CBSerializationContext,
     cb_assignment_payload_breakdown,
     cb_assignment_serialization_stamps,
+    cb_serialization_context_from_env,
     cb_serialization_context_stamp,
     cb_tensor_payload_breakdown,
     is_cb_format,
     validate_cb_cost_provenance,
     whole_artifact_budget_stamp,
 )
-from .cb_minchain import MINCHAIN_CONTEXT_VERSION
 from .production_weight_cache import (
     project_cb_render_identity,
     validate_cb_render_provenance,
@@ -1718,6 +1718,24 @@ def main():
         ),
     )
     ap.add_argument(
+        "--cb-codebook-source-scope",
+        choices=("none", "fp8", "all"),
+        default=None,
+        help=(
+            "Family-scoped source contract. none is the byte-identical "
+            "all-lattice default; fp8 keeps NVFP4 lattice and binds FP8_CB "
+            "to immutable learned cells; all is research-only/NO-GO on NVFP4."
+        ),
+    )
+    ap.add_argument(
+        "--cb-codebook-bundle",
+        default=None,
+        help=(
+            "Immutable value-bearing .pqcb used by every learned render "
+            "stage. Required when the effective source scope is not none."
+        ),
+    )
+    ap.add_argument(
         "--cb-codebook-digests",
         default=None,
         help=(
@@ -1731,6 +1749,15 @@ def main():
         choices=("0", "1"),
         default=None,
         help="Exact CB scale-search contract; required with CB formats.",
+    )
+    ap.add_argument(
+        "--cb-scale-sweep-scope",
+        choices=("none", "nvfp4", "fp8", "all"),
+        default=None,
+        help=(
+            "Optional per-family scale-search scope. Unset preserves the "
+            "legacy --cb-scale-sweep bool and its byte-identical stamp."
+        ),
     )
     ap.add_argument(
         "--cb-ldlq",
@@ -1977,14 +2004,16 @@ def main():
                          "allocator).")
     args = ap.parse_args()
 
-    if args.cb_codebook_source == "learned":
+    effective_cb_source_scope = args.cb_codebook_source_scope
+    if effective_cb_source_scope is None:
+        effective_cb_source_scope = (
+            "all" if args.cb_codebook_source == "learned" else "none"
+        )
+    if effective_cb_source_scope != "none" and not args.cb_codebook_bundle:
         raise SystemExit(
-            "[alloc] ERROR: learned CB is blocked in the production allocator "
-            "until an immutable value-bearing codebook bundle is loaded by "
-            "cost, cache, KL, allocator, and export. A digest manifest proves "
-            "identity but does not supply the codebook values, and export-time "
-            "retraining is assignment-dependent. The direct learned exporter/"
-            "accounting APIs remain research-only."
+            "[alloc] ERROR: learned CB requires an immutable value-bearing "
+            "codebook bundle before reading probe/cost inputs; pass "
+            "--cb-codebook-bundle. Digest-only identity cannot render values."
         )
 
     if args.target_disk_gb is not None:
@@ -2265,12 +2294,11 @@ def main():
                 "--cb-minchain, and "
                 "--cb-encode-tier; refusing implicit render defaults."
             )
-        codebook_digests = None
         if args.cb_codebook_digests is not None:
             raise SystemExit(
-                "[alloc] ERROR: --cb-codebook-digests cannot be consumed by "
-                "the production allocator until learned CB has immutable "
-                "value-bearing codebook input"
+                "[alloc] ERROR: --cb-codebook-digests is a digest-only legacy "
+                "contract and cannot supply learned values. Pass "
+                "--cb-codebook-bundle instead."
             )
         if args.cb_col_weights is None:
             raise SystemExit(
@@ -2292,25 +2320,28 @@ def main():
                 "tensor mapping"
             )
         try:
-            from prismaquant.nvfp4_activation_contract import (
-                NVFP4_ACTIVATION_CONTRACT_SCHEMA,
-                NVFP4_ACTIVATION_EXECUTION,
-            )
-
-            cb_serialization_context = CBSerializationContext(
-                scale_coding=args.cb_scale_coding,
-                codebook_source=args.cb_codebook_source,
-                scale_sweep=args.cb_scale_sweep == "1",
-                ldlq=args.cb_ldlq == "1",
-                ldlq_scope=args.cb_ldlq_scope,
-                minchain=args.cb_minchain == "1",
-                minchain_version=(
-                    MINCHAIN_CONTEXT_VERSION if args.cb_minchain == "1" else None
-                ),
-                encode_tier=args.cb_encode_tier,
-                activation_contract=NVFP4_ACTIVATION_CONTRACT_SCHEMA,
-                activation_execution=NVFP4_ACTIVATION_EXECUTION,
-                codebook_content_digests=codebook_digests,
+            cb_env = {
+                "CB_SCALE_CODING": args.cb_scale_coding,
+                "CB_CODEBOOK_SOURCE": args.cb_codebook_source,
+                "CB_SCALE_SWEEP": args.cb_scale_sweep,
+                "PRISMAQUANT_CB_LDLQ": args.cb_ldlq,
+                "PRISMAQUANT_CB_MINCHAIN": args.cb_minchain,
+                "PRISMAQUANT_CB_ENCODE_TIER": args.cb_encode_tier,
+            }
+            if args.cb_codebook_source_scope is not None:
+                cb_env["CB_CODEBOOK_SOURCE_SCOPE"] = (
+                    args.cb_codebook_source_scope
+                )
+            if args.cb_scale_sweep_scope is not None:
+                cb_env["CB_SCALE_SWEEP_SCOPE"] = args.cb_scale_sweep_scope
+            if args.cb_ldlq_scope is not None:
+                cb_env["PRISMAQUANT_CB_LDLQ_SCOPE"] = args.cb_ldlq_scope
+            if args.cb_codebook_bundle is not None:
+                cb_env["CB_CODEBOOK_BUNDLE"] = args.cb_codebook_bundle
+            cb_serialization_context = cb_serialization_context_from_env(
+                cb_env,
+                require_explicit=True,
+                where="allocator CB producer context",
             )
         except ValueError as exc:
             raise SystemExit(f"[alloc] ERROR: {exc}") from None
@@ -2319,7 +2350,9 @@ def main():
             f"scale_coding={cb_serialization_context.scale_coding} "
             f"layout_version={cb_serialization_context.layout_version} "
             f"codebook_source={cb_serialization_context.codebook_source} "
+            f"codebook_source_scope={cb_serialization_context.codebook_source_scope} "
             f"scale_sweep={cb_serialization_context.scale_sweep} "
+            f"scale_sweep_scope={cb_serialization_context.scale_sweep_scope} "
             f"ldlq={cb_serialization_context.ldlq} "
             f"encode_tier={cb_serialization_context.encode_tier} "
             f"renderer_abi={cb_serialization_context.renderer_abi}",
@@ -2451,9 +2484,10 @@ def main():
             print(f"[alloc] WARNING: {args.calibration} has no usable "
                   f"calibrated_gains; running uncalibrated", flush=True)
 
-    # Source-dtype manifest drives passthrough-integrity filtering in
-    # build_candidates. None when model path is unknown — candidates
-    # fall back to cost-pickle-only gating (pre-passthrough behavior).
+    # Source-dtype manifest drives passthrough-integrity filtering and the
+    # exact candidate-payload <= source-payload gate in build_candidates.
+    # None when model path is unknown — legacy/offline allocations cannot
+    # evaluate either source-dependent rule.
     source_manifest: dict[str, str] | None = None
     if probe_model_path:
         source_manifest = _scan_source_dtype_manifest(
@@ -2521,6 +2555,7 @@ def main():
                 qname=name,
                 source_kind=source_kind,
                 target_profile=target_profile,
+                cb_serialization_context=cb_serialization_context,
             )
             if not verdict.legal:
                 continue
@@ -2991,7 +3026,13 @@ def main():
         "activation_fair_pricing": activation_pricing.as_dict(),
         "cb_ladder_cross_family_verdict": cross_family_verdict,
         "serving_lanes": serving_lane_catalog(target_profile),
-        **summarize_applicability_masks(candidate_mask_records),
+        **summarize_applicability_masks(
+            candidate_mask_records,
+            source_census_present=source_manifest is not None,
+            source_census_units=(
+                len(source_manifest) if source_manifest is not None else None
+            ),
+        ),
     }
     applicability_report_path.write_text(
         json.dumps(applicability_payload, indent=2, sort_keys=True) + "\n"

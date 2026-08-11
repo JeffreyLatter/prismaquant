@@ -78,7 +78,11 @@ def _qdq_accepts_col_weights(spec: fr.FormatSpec) -> bool:
 
 
 def weighted_quantize_dequantize(
-    spec: fr.FormatSpec, w: torch.Tensor, col_weights: torch.Tensor | None,
+    spec: fr.FormatSpec,
+    w: torch.Tensor,
+    col_weights: torch.Tensor | None,
+    *,
+    qname: str | None = None,
 ) -> torch.Tensor:
     """THE single weighted-render definition: reconstruct ``w`` in ``spec``'s
     format, applying the per-input-column imatrix when the family's exporter
@@ -106,6 +110,7 @@ def weighted_quantize_dequantize(
             spec,
             w.clone(),
             context=cb_serialization_context_from_env(),
+            qname=qname,
             col_weights=(
                 None if col_weights is None else col_weights.to(w.device)
             ),
@@ -159,7 +164,9 @@ class _WeightSwapper:
             # only the *rounded* weight/activation buckets shift. col_weights
             # (E[x'^2]=E[x^2]/s^2) are recomputed in lockstep by the caller.
             w_in = w if smooth is None else w * smooth.to(w.device, w.dtype)
-            w_hat = _render_weight(spec, w_in, cw).to(dtype=w.dtype, device=w.device)
+            w_hat = _render_weight(
+                spec, w_in, cw, qname=qname
+            ).to(dtype=w.dtype, device=w.device)
             self._orig.append((mod, w))  # keep original tensor (still resident)
             mod.weight.data = w_hat
             if self._act_emulation and _wants_act_emulation(spec):

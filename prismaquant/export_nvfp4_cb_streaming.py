@@ -106,6 +106,14 @@ from prismaquant.export_nvfp4_cb import (
 )
 from prismaquant.layer_config import canonicalize_assignment, load_assignment
 from prismaquant.model_profiles import detect_profile
+from prismaquant.routed_moe_codebooks import (
+    ROUTED_MOE_CBL_BANK_RUNGS,
+    RoutedMoECodebookRole,
+    bundle_role_qname,
+    logical_role_qname,
+    split_role_rows,
+    stacked_role_col_weights,
+)
 from prismaquant.export_output_safety import (
     prepare_fresh_export_directory,
     transactional_directory_output,
@@ -121,6 +129,9 @@ from prismaquant.nvfp4_cb_footprint import (
     cb_payload_summary,
     cb_serialization_metadata_from_assignment_payload,
     cb_serialization_context_from_env,
+    codebook_source_for_format,
+    effective_codebook_source_scope,
+    scale_sweep_for_format,
     cb_tensor_payload_breakdown,
     finalize_cb_export_artifact_inventory,
     resolve_cb_encode_tier,
@@ -2218,6 +2229,26 @@ def export_nvfp4_cb_streaming(
     source = str(spec.get("source", "lattice")).lower()
     if source not in ("lattice", "learned"):
         raise ValueError(f"shared_codebook_spec source must be lattice/learned")
+    _env_cb_context = cb_serialization_context_from_env()
+    _scoped_bundle_export = (
+        effective_codebook_source_scope(_env_cb_context) != "none"
+    )
+    if _scoped_bundle_export:
+        if source != _env_cb_context.codebook_source:
+            raise ValueError(
+                "export_nvfp4_cb_streaming: shared_codebook_spec source "
+                "differs from CB_CODEBOOK_SOURCE_SCOPE/CB_CODEBOOK_BUNDLE"
+            )
+        source = _env_cb_context.codebook_source
+    elif source == "learned" and bool(spec.get("train", False)) and not (
+        allow_unstamped_research
+    ):
+        raise ValueError(
+            "export_nvfp4_cb_streaming: production export-time learned-"
+            "codebook retraining is forbidden; build CB_CODEBOOK_BUNDLE "
+            "before cost. The legacy trainer is available only with "
+            "allow_unstamped_research=True."
+        )
 
     assignment = load_assignment(layer_config_path)
     _recipe_payload = json.loads(Path(layer_config_path).read_text())
@@ -2704,18 +2735,133 @@ def export_nvfp4_cb_streaming(
     activation_execution_contract = None
     activation_scales_by_physical_target: dict[str, float] = {}
 
-    # --- Resolve/train codebooks (bounded pooling for learned). ---
+    # --- Resolve codebooks. Production learned cells are immutable bundle
+    # inputs trained before cost; the bounded export-time trainer survives only
+    # for an explicitly unstamped historical research run. ---
     provided = spec.get("codebooks", {}) if source == "learned" else {}
     train = bool(spec.get("train", False))
     iters = int(spec.get("iters", 4))
     seed = int(spec.get("seed", 0))
     train_cap = int(spec.get("train_cap", 1 << 20))
+    learned_bundle = None
+    if _scoped_bundle_export:
+        from prismaquant.cb_learned_bundle import load_bundle_cached
+
+        learned_bundle = load_bundle_cached(_env_cb_context.codebook_bundle_path)
     codebooks: dict[tuple[str, str], object] = {}
     target_cb: dict[str, tuple] = {}
     by_group: dict[tuple[str, str], list[str]] = {}
+    expert_role_plans: dict[
+        str, tuple[RoutedMoECodebookRole, ...]
+    ] = {}
+    cb_group_target_names: dict[tuple[str, str], tuple[str, ...]] = {}
+    role_group_keys: set[tuple[str, str]] = set()
     for qname in cb_targets:
         fmt = assignment[qname]
+        grid, mode, k = cb_targets[qname]
+        source_kind = (
+            codebook_source_for_format(fmt, _env_cb_context)
+            if _scoped_bundle_export else source
+        )
+        target_shape = _target_shape(qname)
+        target_kind, target_handle = _resolve_target(qname)
+        if source_kind == "learned":
+            from prismaquant.cb_learned_bundle import refuse_routed_moe_learned
+
+            refuse_routed_moe_learned(
+                qname,
+                routed_moe=(target_kind == "experts" or len(target_shape) == 3),
+            )
         plan = _per_expert_plan_by_target.get(qname)
+        if (
+            source_kind == "learned"
+            and _scoped_bundle_export
+            and (target_kind == "experts" or len(target_shape) == 3)
+        ):
+            if learned_bundle is None:
+                raise AssertionError("scoped routed CBL has no learned bundle")
+            if (
+                grid != "fp8"
+                or mode != "product"
+                or k not in ROUTED_MOE_CBL_BANK_RUNGS
+            ):
+                raise ValueError(
+                    f"{qname}/{fmt}: routed learned books are banked only for "
+                    "FP8-CB K28--K33"
+                )
+            members = expert_stack_members.get(qname)
+            if target_kind != "experts" or members is None:
+                raise ValueError(
+                    f"{qname}: learned per-role expert export requires the "
+                    "per-expert source/member map so gate, up, and down input "
+                    "identities can be verified independently"
+                )
+            prefix, packed_proj, group = target_handle
+            projections = _packed_expert_projection_names(profile, packed_proj)
+            expected = (
+                ("gate_proj", "up_proj")
+                if str(packed_proj) == "gate_up_proj"
+                else ("down_proj",)
+            )
+            if tuple(projections) != expected:
+                raise ValueError(
+                    f"{qname}: Gridbook per-role LUT ABI expects {expected}, "
+                    f"profile declared {tuple(projections)}"
+                )
+            physical_target = _base_name(qname)
+            roles: list[RoutedMoECodebookRole] = []
+            for projection in projections:
+                # The immutable cell is shared by every expert subgroup at
+                # this layer/projection/rung.  Only the runtime target retains
+                # the split-stack discriminator.
+                logical_qname = bundle_role_qname(qname, projection)
+                logical_target = logical_role_qname(
+                    physical_target, projection
+                )
+                role_cw, role_members = stacked_role_col_weights(
+                    packed_qname=qname,
+                    projection=projection,
+                    member_qnames=members,
+                    col_weights=col_weights,
+                )
+                first_expert = min(group[projection])
+                source_shape = skeleton.logical_shape(
+                    group[projection][first_expert] + ".weight"
+                )
+                if len(source_shape) != 2:
+                    raise ValueError(
+                        f"{logical_qname}: expert member must be rank 2, got "
+                        f"{source_shape}"
+                    )
+                codebook = learned_bundle.codebook_for(logical_qname, fmt)
+                group_key = (logical_qname, fmt)
+                if group_key in codebooks:
+                    raise ValueError(
+                        f"duplicate routed learned role group {group_key}"
+                    )
+                codebooks[group_key] = codebook
+                by_group[group_key] = [qname]
+                role_group_keys.add(group_key)
+                cb_group_target_names[group_key] = (logical_target,)
+                roles.append(RoutedMoECodebookRole(
+                    projection=projection,
+                    qname=logical_qname,
+                    ref=logical_qname,
+                    format_name=fmt,
+                    codebook=codebook,
+                    col_weights=role_cw,
+                    output_rows=int(source_shape[0]),
+                    member_qnames=role_members,
+                ))
+            expert_role_plans[qname] = tuple(roles)
+            first_role = roles[0]
+            target_cb[qname] = (
+                first_role.ref,
+                fmt,
+                first_role.codebook,
+                "learned",
+            )
+            continue
         # Every group in a declared mixed layer owns one physical sidecar.
         # This includes a family that happens to have a single format while
         # its sibling family is split: the per-expert footprint contract
@@ -2729,14 +2875,43 @@ def export_nvfp4_cb_streaming(
                 f"{_format_group_slug(plan['format_wire_id'])}"
             )
         else:
-            ref = _role_of(qname) if source == "learned" else "lattice"
+            ref = (
+                qname
+                if _scoped_bundle_export and source_kind == "learned"
+                else (_role_of(qname) if source_kind == "learned" else "lattice")
+            )
         by_group.setdefault((ref, fmt), []).append(qname)
     for (ref, fmt), qnames in by_group.items():
+        if (ref, fmt) in role_group_keys:
+            continue
         grid, mode, k = cb_targets[qnames[0]]
-        if source == "lattice":
+        source_kind = (
+            codebook_source_for_format(fmt, _env_cb_context)
+            if _scoped_bundle_export else source
+        )
+        if source_kind == "lattice":
             codebooks[(ref, fmt)] = cb._resolve_codebook(
                 k, grid, mode, None, torch.device(device))
             kind = "lattice"
+        elif _scoped_bundle_export:
+            if len(qnames) != 1 or learned_bundle is None:
+                raise AssertionError(
+                    f"{ref}/{fmt}: learned bundle cell must own one qname"
+                )
+            qname = qnames[0]
+            target_kind, target_handle = _resolve_target(qname)
+            if target_kind != "tensor":
+                from prismaquant.cb_learned_bundle import refuse_routed_moe_learned
+
+                refuse_routed_moe_learned(qname, routed_moe=True)
+            weight = skeleton.dequant_weight(target_handle).to(device)
+            codebooks[(ref, fmt)] = learned_bundle.codebook_for(
+                qname,
+                fmt,
+                weight=weight,
+                col_weights=col_weights[qname],
+            )
+            kind = "learned"
         elif train:
             codebooks[(ref, fmt)] = _train_shared_codebook_streaming(
                 skeleton, profile, expert_groups, _resolve_target,
@@ -2758,33 +2933,96 @@ def export_nvfp4_cb_streaming(
         for (ref, fmt), codebook in codebooks.items()
         for name, tensor in _codebook_tensors(ref, fmt, codebook).items()
     }
-    materialized_codebook_digests = {
+    selected_codebook_digests = {
         name: hashlib.sha256(
             tensor.to(torch.float16).cpu().contiguous().numpy().tobytes()
         ).hexdigest()
         for name, tensor in materialized_codebook_tensors.items()
     }
-    _env_cb_context = cb_serialization_context_from_env()
+    materialized_codebook_digests = (
+        dict(_env_cb_context.codebook_content_digests or {})
+        if _scoped_bundle_export else {}
+    )
+    for name, digest in selected_codebook_digests.items():
+        previous = materialized_codebook_digests.get(name)
+        if previous is not None and previous != digest:
+            raise ValueError(
+                f"export_nvfp4_cb_streaming: selected codebook {name!r} "
+                "differs from the immutable bundle digest"
+            )
+        materialized_codebook_digests[name] = digest
+    selected_refs_by_format: dict[str, dict[str, tuple[str, ...]]] = {}
+    for qname, (ref, fmt, codebook, _kind) in target_cb.items():
+        roles = expert_role_plans.get(qname)
+        if roles is None:
+            selected_refs_by_format[qname] = {
+                fmt: _codebook_tensor_names(ref, fmt, codebook)
+            }
+            continue
+        for role in roles:
+            selected_refs_by_format[role.qname] = {
+                role.format_name: _codebook_tensor_names(
+                    role.ref, role.format_name, role.codebook
+                )
+            }
+    if _scoped_bundle_export:
+        refs_by_format = {
+            str(qname): dict(by_format)
+            for qname, by_format in (
+                _env_cb_context.codebook_refs_by_qname_format or {}
+            ).items()
+        }
+        for qname, by_format in selected_refs_by_format.items():
+            target_formats = refs_by_format.setdefault(qname, {})
+            for fmt, refs in by_format.items():
+                previous = target_formats.get(fmt)
+                if previous is not None and tuple(
+                    (previous,) if isinstance(previous, str) else previous
+                ) != tuple(refs):
+                    raise ValueError(
+                        f"{qname}/{fmt}: streaming exporter refs differ from "
+                        "immutable bundle refs"
+                    )
+                target_formats[fmt] = refs
+    else:
+        refs_by_format = None
     serialization_context = CBSerializationContext(
         scale_coding=scale_coding,
         codebook_source=source,
-        scale_sweep=bool(scale_sweep),
+        codebook_source_scope=(
+            _env_cb_context.codebook_source_scope
+            if _scoped_bundle_export else None
+        ),
+        scale_sweep=(
+            _env_cb_context.scale_sweep
+            if _scoped_bundle_export else bool(scale_sweep)
+        ),
+        scale_sweep_scope=(
+            _env_cb_context.scale_sweep_scope
+            if _scoped_bundle_export else None
+        ),
         ldlq=_env_cb_context.ldlq,
         ldlq_scope=getattr(_env_cb_context, "ldlq_scope", "all" if _env_cb_context.ldlq else "none"),
         minchain=_env_cb_context.minchain,
         minchain_version=_env_cb_context.minchain_version,
-        encode_tier=resolve_cb_encode_tier(),
+        encode_tier=_env_cb_context.encode_tier,
         activation_contract=_claimed_activation_contract,
         activation_execution=(
             NVFP4_ACTIVATION_EXECUTION
             if _claimed_activation_contract is not None
             else None
         ),
-        codebook_refs={
+        codebook_refs=None if _scoped_bundle_export else {
             qname: _codebook_tensor_names(ref, fmt, codebook)
             for qname, (ref, fmt, codebook, _kind) in target_cb.items()
+            if qname not in expert_role_plans
         },
+        codebook_refs_by_qname_format=refs_by_format,
         codebook_content_digests=materialized_codebook_digests,
+        codebook_bundle_path=(
+            _env_cb_context.codebook_bundle_path
+            if _scoped_bundle_export else None
+        ),
     )
     validate_cb_serialization_context_stamp(
         _recipe_cb_context_stamp,
@@ -2793,9 +3031,26 @@ def export_nvfp4_cb_streaming(
     )
     from prismaquant.nvfp4_cb_footprint import _ldlq_for_format
 
-    _ldlq_telemetry_qnames = {
-        qname for qname in cb_targets
+    routed_ldlq = sorted(
+        qname
+        for qname in expert_role_plans
         if _ldlq_for_format(assignment[qname], serialization_context)
+    )
+    if routed_ldlq:
+        raise ValueError(
+            "routed learned per-role CBL reuses the immutable no-LDLQ burn "
+            "identity; PRISMAQUANT_CB_LDLQ_SCOPE must exclude FP8 for "
+            f"{routed_ldlq[:5]}"
+        )
+
+    _ldlq_telemetry_qnames = {
+        telemetry_qname
+        for qname in cb_targets
+        if _ldlq_for_format(assignment[qname], serialization_context)
+        for telemetry_qname in (
+            tuple(role.qname for role in expert_role_plans[qname])
+            if qname in expert_role_plans else (qname,)
+        )
     }
     ldlq_telemetry = None
     if _ldlq_telemetry_qnames:
@@ -3099,11 +3354,16 @@ def export_nvfp4_cb_streaming(
             ldlq_for_this = _ldlq_for_format(assignment[qname], serialization_context)
             packed, scale = _stream_pack_target(
                 skeleton, profile, h, qname, grid, mode, k, codebook,
-                col_weights[qname], scale_sweep, coding, shape, device,
+                col_weights[qname], scale_sweep_for_format(
+                    assignment[qname], serialization_context
+                ), coding, shape, device,
                 serialization_context.encode_tier,
                 _recipe_cb_render_identity,
                 verified_cb_source_qnames,
                 expert_stack_members.get(qname),
+                expert_roles=expert_role_plans.get(qname),
+                learned_bundle=learned_bundle,
+                all_col_weights=col_weights,
                 warm_session=warm_session,
                 format_name=assignment[qname],
                 ldlq_activation_loader=ldlq_activation_loader if ldlq_for_this else None,
@@ -3200,11 +3460,16 @@ def export_nvfp4_cb_streaming(
                 ldlq_for_this = _ldlq_for_format(assignment[qname], serialization_context)
                 packed, scale = _stream_pack_target(
                     skeleton, profile, h, qname, grid, mode, k, codebook,
-                    col_weights[qname], scale_sweep, coding, shape, device,
+                    col_weights[qname], scale_sweep_for_format(
+                        assignment[qname], serialization_context
+                    ), coding, shape, device,
                     serialization_context.encode_tier,
                     _recipe_cb_render_identity,
                     verified_cb_source_qnames,
                     expert_stack_members.get(qname),
+                    expert_roles=expert_role_plans.get(qname),
+                    learned_bundle=learned_bundle,
+                    all_col_weights=col_weights,
                     warm_session=warm_session,
                     format_name=assignment[qname],
                     ldlq_activation_loader=ldlq_activation_loader if ldlq_for_this else None,
@@ -3248,7 +3513,9 @@ def export_nvfp4_cb_streaming(
                         k=k,
                         codebook=codebook,
                         cw=col_weights[qname],
-                        scale_sweep=scale_sweep,
+                        scale_sweep=scale_sweep_for_format(
+                            assignment[qname], serialization_context
+                        ),
                         coding=coding,
                         device=device,
                         encode_tier=serialization_context.encode_tier,
@@ -3940,12 +4207,15 @@ def export_nvfp4_cb_streaming(
                         codebook_bytes = int(
                             per_tensor["sidecar_payload_bytes"]
                         )
-                        codebook_tensor_names = [
+                        sidecar_identities = per_tensor.get(
+                            "sidecar_identities",
+                            (per_tensor["sidecar_identity"],),
+                        )
+                        codebook_tensor_names = sorted({
                             str(name)
-                            for name in per_tensor["sidecar_identity"][
-                                "codebook_ref"
-                            ]
-                        ]
+                            for sidecar in sidecar_identities
+                            for name in sidecar["codebook_ref"]
+                        })
                     missing_names = sorted(
                         name for name in tensor_names if name not in entry_bytes
                     )
@@ -4059,13 +4329,14 @@ def export_nvfp4_cb_streaming(
         requant_targets=requant_targets,
         stock_targets=stock_targets,
         by_group=by_group,
+        cb_group_target_names=cb_group_target_names,
         codebooks=codebooks,
         col_weights=col_weights,
         codebook_tensors_by_name=cb_tensor_blobs,
         ignore=ignore,
         codebook_file=codebook_file,
         scale_coding=scale_coding,
-        codebook_source=source,
+        codebook_source=serialization_context.codebook_source,
         serialized_payload_summary=serialized_payload_summary,
         serialization_context=serialization_context,
         cb_render_identity=_recipe_cb_render_identity,
@@ -4218,6 +4489,8 @@ def _stream_pack_target(skeleton, profile, resolved, qname, grid, mode, k,
                         codebook, cw, scale_sweep, coding, shape, device,
                         encode_tier, cb_render_identity,
                         verified_source_qnames, member_qnames=None, *,
+                        expert_roles=None, learned_bundle=None,
+                        all_col_weights=None,
                         warm_session=None, format_name=None,
                         ldlq_activation_loader=None,
                         ldlq_telemetry=None):
@@ -4311,6 +4584,23 @@ def _stream_pack_target(skeleton, profile, resolved, qname, grid, mode, k,
             where="export_nvfp4_cb_streaming expert stack",
         )
         verified_source_qnames.add(qname)
+    if expert_roles is not None:
+        return _pack_routed_moe_role_books(
+            w,
+            qname=qname,
+            roles=tuple(expert_roles),
+            grid=grid,
+            mode=mode,
+            k=k,
+            scale_sweep=scale_sweep,
+            coding=coding,
+            device=device,
+            encode_tier=encode_tier,
+            learned_bundle=learned_bundle,
+            all_col_weights=all_col_weights,
+            ldlq_activation_loader=ldlq_activation_loader,
+            ldlq_telemetry=ldlq_telemetry,
+        )
     packed, fields = _pack_with_optional_warm_state(
         w, qname=qname, format_name=format_name, grid=grid, mode=mode, k=k,
         col_weights=cw.to(device), codebook=cbook,
@@ -4326,6 +4616,94 @@ def _stream_pack_target(skeleton, profile, resolved, qname, grid, mode, k,
     scale = (fields["scales"].reshape(*w.shape[:-1]).cpu()
              if grid == "fp8" else None)
     return packed.to(torch.uint8).cpu().contiguous(), scale
+
+
+def _pack_routed_moe_role_books(
+    weight,
+    *,
+    qname,
+    roles,
+    grid,
+    mode,
+    k,
+    scale_sweep,
+    coding,
+    device,
+    encode_tier,
+    learned_bundle,
+    all_col_weights,
+    ldlq_activation_loader=None,
+    ldlq_telemetry=None,
+):
+    """Encode contiguous expert roles with their exact immutable books."""
+
+    if (
+        grid != "fp8"
+        or mode != "product"
+        or int(k) not in ROUTED_MOE_CBL_BANK_RUNGS
+    ):
+        raise ValueError(
+            f"{qname}: per-role expert books require the banked "
+            "FP8-CB K28--K33 range"
+        )
+    if learned_bundle is None or all_col_weights is None:
+        raise AssertionError(f"{qname}: per-role expert plan lost bundle inputs")
+    role_slices = split_role_rows(weight, tuple(roles))
+    activation_rows = (
+        ldlq_activation_loader.load(qname, stack_size=int(weight.shape[0]))
+        if ldlq_activation_loader is not None else None
+    )
+    packed_parts = []
+    scale_parts = []
+    for role, role_weight in role_slices:
+        if role.format_name.rsplit("K", 1)[-1] != str(int(k)):
+            raise ValueError(
+                f"{qname}: role {role.qname} format {role.format_name} "
+                f"disagrees with physical K{k}"
+            )
+        if len(role.member_qnames) != int(role_weight.shape[0]):
+            raise ValueError(
+                f"{role.qname}: member count does not match expert population"
+            )
+        for expert_index, member in enumerate(role.member_qnames):
+            if member not in all_col_weights:
+                raise ValueError(
+                    f"{role.qname}: learned role member {member!r} has no "
+                    "col_weights entry"
+                )
+            learned_bundle.validate_inputs(
+                member,
+                weight=role_weight[expert_index],
+                col_weights=all_col_weights[member],
+            )
+        packed, fields = _pack_with_optional_warm_state(
+            role_weight,
+            qname=role.qname,
+            format_name=role.format_name,
+            grid=grid,
+            mode=mode,
+            k=k,
+            col_weights=role.col_weights.to(device),
+            codebook=_to_device(role.codebook, device),
+            scale_sweep=scale_sweep,
+            scale_coding=coding,
+            encode_tier=encode_tier,
+            # Collapsed stacks already cold-fallback in the existing warm-state
+            # contract. A logical role has no independently measured argmin.
+            warm_session=None,
+            ldlq_activation_rows=activation_rows,
+            ldlq_telemetry=ldlq_telemetry,
+        )
+        packed_parts.append(packed.reshape(
+            role_weight.shape[0], role_weight.shape[1], -1
+        ))
+        scale_parts.append(fields["scales"].reshape(
+            role_weight.shape[0], role_weight.shape[1]
+        ))
+    return (
+        torch.cat(packed_parts, dim=1).to(torch.uint8).cpu().contiguous(),
+        torch.cat(scale_parts, dim=1).to(torch.float32).cpu().contiguous(),
+    )
 
 
 def _prefetch_source_weight(skeleton, weight_key: str, device) -> torch.Tensor:

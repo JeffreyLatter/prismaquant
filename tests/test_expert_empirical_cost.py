@@ -80,6 +80,126 @@ def test_measure_unit_costs_on_tiny_packed_moe():
         model.inner.mlp.experts.down_proj.detach(), before["down"])
 
 
+class _Dsv4PerExpert(nn.Module):
+    def __init__(self, hidden: int = 16, intermediate: int = 32):
+        super().__init__()
+        self.gate_proj = nn.Linear(hidden, intermediate, bias=False)
+        self.up_proj = nn.Linear(hidden, intermediate, bias=False)
+        self.down_proj = nn.Linear(intermediate, hidden, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down_proj(
+            torch.nn.functional.silu(self.gate_proj(x)) * self.up_proj(x)
+        )
+
+
+class _Dsv4PerExpertMlp(nn.Module):
+    def __init__(self, hidden: int = 16, num_experts: int = 2):
+        super().__init__()
+        self.experts = nn.ModuleList(
+            [_Dsv4PerExpert(hidden) for _ in range(num_experts)]
+        )
+
+    def forward(self, x: torch.Tensor, routes: torch.Tensor) -> torch.Tensor:
+        flat = x.reshape(-1, x.shape[-1])
+        route_flat = routes.reshape(-1).remainder(len(self.experts))
+        out = torch.zeros_like(flat)
+        for expert_id, expert in enumerate(self.experts):
+            selected = route_flat == expert_id
+            if bool(selected.any()):
+                out[selected] = expert(flat[selected])
+        return out.reshape_as(x)
+
+
+class _Dsv4PerExpertLayer(nn.Module):
+    def __init__(self, hidden: int = 16):
+        super().__init__()
+        self.mlp = _Dsv4PerExpertMlp(hidden)
+
+    def forward(self, x: torch.Tensor, routes: torch.Tensor) -> torch.Tensor:
+        return x + self.mlp(x, routes)
+
+
+class _Dsv4PerExpertCausal(nn.Module):
+    """Functional DSv4-shaped tree with per-expert ``nn.Linear`` rows."""
+
+    def __init__(self, vocab: int = 32, hidden: int = 16):
+        super().__init__()
+        self.model = nn.Module()
+        self.model.embed_tokens = nn.Embedding(vocab, hidden)
+        self.model.layers = nn.ModuleList([_Dsv4PerExpertLayer(hidden)])
+        self.lm_head = nn.Linear(hidden, vocab, bias=False)
+
+    def forward(self, input_ids: torch.Tensor):
+        hidden = self.model.embed_tokens(input_ids)
+        for layer in self.model.layers:
+            hidden = layer(hidden, input_ids)
+        return types.SimpleNamespace(logits=self.lm_head(hidden))
+
+
+def test_measure_unit_costs_on_dsv4_unpacked_expert_linears():
+    from prismaquant.model_profiles.deepseek_v4 import DeepseekV4Profile
+
+    torch.manual_seed(19)
+    model = _Dsv4PerExpertCausal().eval()
+    calib = torch.randint(0, 32, (2, 12))
+    expert_names = {
+        f"model.layers.0.mlp.experts.{expert_id}.{projection}"
+        for expert_id in range(2)
+        for projection in ("gate_proj", "up_proj", "down_proj")
+    }
+    before = {
+        name: module.weight.detach().clone()
+        for name, module in model.named_modules()
+        if name in expert_names
+    }
+
+    stats, costs, unit_kls = measure_expert_unit_costs(
+        model,
+        DeepseekV4Profile(),
+        calib,
+        ["NVFP4", "BF16"],
+        progress=False,
+    )
+
+    assert set(stats) == expert_names
+    assert set(costs) == expert_names
+    assert set(unit_kls) == {"model.layers.0.mlp.experts"}
+    unit = unit_kls["model.layers.0.mlp.experts"]
+    assert unit["NVFP4"] > 0.0
+    assert sum(
+        costs[name]["NVFP4"]["predicted_dloss"] for name in expert_names
+    ) == pytest.approx(unit["NVFP4"], rel=1e-6)
+    for name in expert_names:
+        assert stats[name]["_unpacked_expert_unit"] == (
+            "model.layers.0.mlp.experts"
+        )
+        assert "num_experts" not in stats[name]
+        assert stats[name]["in_features"] == before[name].shape[1]
+        assert stats[name]["out_features"] == before[name].shape[0]
+    for name, module in model.named_modules():
+        if name in expert_names:
+            assert torch.equal(module.weight.detach(), before[name])
+
+
+def test_dsv4_unpacked_cb_cost_refuses_missing_member_col_weights():
+    from prismaquant.model_profiles.deepseek_v4 import DeepseekV4Profile
+
+    torch.manual_seed(23)
+    model = _Dsv4PerExpertCausal().eval()
+    calib = torch.randint(0, 32, (1, 8))
+
+    with pytest.raises(ValueError, match="CB stack member.*col_weights"):
+        measure_expert_unit_costs(
+            model,
+            DeepseekV4Profile(),
+            calib,
+            ["FP8_CB_K28"],
+            progress=False,
+            col_weights={},
+        )
+
+
 def test_merge_refuses_double_costed_names():
     base = {"stats": {"a": {}}, "costs": {"a": {"NVFP4": {}}}}
     with pytest.raises(RuntimeError, match="collision"):

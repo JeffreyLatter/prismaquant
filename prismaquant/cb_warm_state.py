@@ -32,7 +32,9 @@ from .cb_layout import (
 from .format_registry import canonical_format_name
 from .nvfp4_cb_footprint import (
     CBSerializationContext,
+    _physical_codebook_refs,
     cb_serialization_context_stamp,
+    codebook_source_for_format,
     lattice_codebook_content_sha256,
 )
 
@@ -84,12 +86,14 @@ def warm_serialization_context(
     """Project the full byte-affecting encoder context onto one CB format."""
     fmt = canonical_format_name(format_name)
     stamp = cb_serialization_context_stamp(context, formats=[fmt])
-    # Lattice physical sidecar names do not affect assignment.  Export knows
-    # those names while inline cost does not, so retain the canonical lattice
-    # payload digests and discard artifact-wide naming details.  Learned
-    # codebooks are not warm-startable until cost has the materialized table.
-    if context.codebook_source == "lattice":
+    # Lattice physical sidecar names do not affect assignment. Discard the
+    # artifact-wide learned bundle details for a lattice family so an NVFP4
+    # warm start remains reusable inside a mixed lattice-NV/learned-FP8 run.
+    # Learned cells retain their exact refs/digests and the initializer identity
+    # below projects those values onto the concrete qname.
+    if codebook_source_for_format(fmt, context) == "lattice":
         stamp.pop("codebook_refs", None)
+        stamp.pop("codebook_refs_by_qname_format", None)
         stamp.pop("codebook_content_sha256", None)
     return {
         "schema": CB_WARM_CONTEXT_SCHEMA,
@@ -101,14 +105,32 @@ def warm_serialization_context(
 def encoder_initializer_identity(
     context: CBSerializationContext,
     format_name: str,
+    *,
+    qname: str | None = None,
 ) -> dict[str, Any]:
     """Identify the codebook initializer/seed behind a selected scale."""
     fmt = canonical_format_name(format_name)
-    if context.codebook_source != "lattice":
-        raise ValueError(
-            "CB warm state currently requires codebook_source='lattice'; "
-            "learned cost renders must bind their materialized initializer"
-        )
+    source = codebook_source_for_format(fmt, context)
+    if source == "learned":
+        if not qname:
+            raise ValueError(
+                f"{fmt}: learned CB warm identity requires the unit qname"
+            )
+        refs = _physical_codebook_refs(str(qname), fmt, context)
+        digests = context.codebook_content_digests or {}
+        missing = [ref for ref in refs if ref not in digests]
+        if missing:
+            raise ValueError(
+                f"{qname} ({fmt}): learned CB warm identity is missing exact "
+                f"FP16 codebook digest(s) for {missing}"
+            )
+        return {
+            "schema": CB_WARM_ENCODER_SCHEMA,
+            "codebook_source": "learned",
+            "initializer": "fable_certified.learn_pool.v1",
+            "codebook_ref": list(refs),
+            "content_sha256": [digests[ref] for ref in refs],
+        }
     from . import nvfp4_cb_formats as cb
 
     return {
@@ -189,7 +211,9 @@ def build_warm_record(
         "col_weights_shape": col_shape,
         "col_weights_digest": col_digest,
         "serialization_context": warm_serialization_context(context, fmt),
-        "encoder_initializer": encoder_initializer_identity(context, fmt),
+        "encoder_initializer": encoder_initializer_identity(
+            context, fmt, qname=str(qname)
+        ),
     }
     return CBWarmStateRecord(
         metadata=metadata,
@@ -342,7 +366,9 @@ class CBWarmStateStore:
                 "col_weights_shape": [int(dim) for dim in col_weights_shape],
                 "col_weights_digest": str(col_weights_digest).lower(),
                 "serialization_context": warm_serialization_context(context, fmt),
-                "encoder_initializer": encoder_initializer_identity(context, fmt),
+                "encoder_initializer": encoder_initializer_identity(
+                    context, fmt, qname=str(qname)
+                ),
             }
             if metadata != expected:
                 return None

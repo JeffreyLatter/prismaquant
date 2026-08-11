@@ -9,9 +9,10 @@ Six things are pinned here, in the order they matter:
      WEIGHT error, which is the whole reason this format exists separately
      from MXFP8_E4M3 — together with the reason that does NOT make the layer
      output exact, since the lane is W8A8;
-  4. menu legality — a re-quantization rung, not a source-gated passthrough,
-     and one whose unmeasured A side must leave the menu rather than be
-     priced at the DP's global minimum;
+  4. menu legality — a re-quantization rung rather than a source-gated
+     passthrough, still bounded by the source representation's exact bit rate,
+     and one whose unmeasured A side must leave the menu rather than be priced
+     at the DP's global minimum;
   5. the wire contract: id, config group, and the emitted tensor pair;
   6. cost-measurement wiring — no codebook machinery, and the batched render
      agreeing with the unbatched one.
@@ -27,6 +28,8 @@ from prismaquant import serving_profiles as sp
 from prismaquant.allocator_candidates import (
     PASSTHROUGH_WIRE_FORMAT_IDS,
     REQUANT_WIRE_FORMAT_IDS,
+    SOURCE_BPP_EXCEEDED_REASON,
+    SOURCE_BPP_UNKNOWN_REASON,
     SOURCE_PASSTHROUGH_CONTRACTS,
     WIRE_FORMAT_IDS,
     check_format_applicability,
@@ -475,8 +478,8 @@ def test_a_measured_activation_side_passes_menu_admission():
     assert chosen["BF16"].activation_pricing == "bit_exact"
 
 
-def test_it_is_a_requantization_rung_not_a_source_gated_passthrough():
-    """Legal on ANY source dtype — the whole difference from the *_SOURCE family."""
+def test_requantization_is_still_capped_by_the_source_bit_rate():
+    """Requantization is not passthrough, but may not enlarge its source."""
     assert FMT not in SOURCE_PASSTHROUGH_CONTRACTS
     spec = fr.get_format(FMT)
     # It has a real encoder, which is precisely what disqualifies it from the
@@ -485,12 +488,22 @@ def test_it_is_a_requantization_rung_not_a_source_gated_passthrough():
     assert not torch.equal(spec.quantize_dequantize(probe), probe)
 
     shape = (256, 256)
-    for source_kind in ("bf16", "fp8", "fp8_ue8m0", "mxfp4", "other", None):
+    expected = {
+        "bf16": (True, None),
+        "fp8": (False, SOURCE_BPP_EXCEEDED_REASON),
+        "fp8_ue8m0": (False, SOURCE_BPP_EXCEEDED_REASON),
+        "mxfp4": (False, SOURCE_BPP_EXCEEDED_REASON),
+        "other": (False, SOURCE_BPP_UNKNOWN_REASON),
+        None: (True, None),
+    }
+    for source_kind, (legal, reason) in expected.items():
         verdict = check_format_applicability(
             shape, FMT, source_kind=source_kind,
             target_profile="nvfp4_cb",
             qname="model.layers.0.self_attn.q_proj")
-        assert verdict.legal, (source_kind, verdict.reason, verdict.detail)
+        assert verdict.legal is legal, (
+            source_kind, verdict.reason, verdict.detail)
+        assert verdict.reason == reason
 
 
 def test_the_body_and_attention_menus_carry_it_and_packed_experts_do_not():
@@ -510,13 +523,11 @@ def test_the_body_and_attention_menus_carry_it_and_packed_experts_do_not():
     assert denied.reason == "runtime_unsupported"
 
 
-def test_the_expert_cost_menu_is_enumerated_and_excludes_it_by_bpw():
-    """The <= 4.25 bpw expert menu is an ENUMERATION, not a numeric cap.
+def test_the_expert_cost_menu_stays_below_source_as_defense_in_depth():
+    """The measured menu is economical before the allocator rechecks it.
 
-    There is no bpw-cap predicate anywhere in the codebase; the routed-expert
-    ladder is the explicit MENU list in the cost driver. This pins the
-    invariant that makes 'MXFP8 is naturally excluded' true: every rung that
-    menu measures is at or under 4.25 bpw, so an 8.25 bpw rung cannot be on it.
+    The script's enumeration avoids measuring obviously illegal expert rungs;
+    the general allocator gate remains authoritative and shape-exact.
     """
     driver = Path(__file__).resolve().parents[1] / (
         "scripts/run_dsv4_mxfp4_cost.sh")

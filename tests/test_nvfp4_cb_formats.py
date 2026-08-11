@@ -1294,10 +1294,28 @@ def _tiny_moe_model(mdl: Path, n_exp: int = 3, in_f: int = 256):
 
 
 @pytest.mark.parametrize("source", ["lattice", "learned"])
-def test_exporter_packed_experts_roundtrip(export_dir, source):
+def test_exporter_packed_experts_roundtrip(export_dir, source, monkeypatch):
     from safetensors.torch import load_file
 
+    from prismaquant import cb_learned_bundle
+    from prismaquant import gridbook_runtime_pin as runtime_pin
     from prismaquant.export_nvfp4_cb import export_nvfp4_cb
+
+    # The learned arm exports routed-MoE learned refs, which are gated on
+    # GRIDBOOK_ROUTED_MOE_PER_ROLE_CODEBOOK_LUT_MIN_VERSION. The shipped pin is
+    # the released 0.8.2 and correctly refuses that path, so supply the
+    # capability explicitly rather than letting the production pin decide
+    # whether this test runs its subject.
+    monkeypatch.setattr(
+        cb_learned_bundle, "load_gridbook_runtime_pin",
+        lambda: runtime_pin.parse_gridbook_runtime_pin({
+            "schema": runtime_pin.GRIDBOOK_RUNTIME_PIN_SCHEMA,
+            "repository": "https://github.com/RobTand/gridbook.git",
+            "commit": "a" * 40,
+            "version": (runtime_pin
+                        .GRIDBOOK_ROUTED_MOE_PER_ROLE_CODEBOOK_LUT_MIN_VERSION),
+            "version_is_release": False,
+        }))
 
     mdl, out = export_dir / "model", export_dir / "out"
     tens = _tiny_moe_model(mdl)

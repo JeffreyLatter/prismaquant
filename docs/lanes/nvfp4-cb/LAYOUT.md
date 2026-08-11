@@ -32,6 +32,13 @@ a stale copy of it crashed the first full-ladder 27B export on `cb_k=47`.
 A decoded fp4 tile is bit-compatible NVFP4 (E2M1 codes + NVFP4 group-16 E4M3
 scale) and feeds the existing CUTLASS FP4 path unchanged.
 
+Learned codebooks do **not** introduce `CBL_*` format names. They are a
+value-bearing rendering mode for the same FP8-CB wire formats. The current
+producer policy permits learned FP8-CB through K46 and rejects measured-NO-GO
+K47/K48; lattice rendering retains the full K28–K48 ladder (see
+`CBL_RUNG_POLICY` and `require_cbl_rung_enabled` in
+`prismaquant.cb_learned_bundle`).
+
 **Hard constraint:** `in_features % 256 == 0` (the 256-weight superblock is both
 byte-exact and the vector-tiling unit). Linears that fail it are shipped BF16.
 
@@ -214,12 +221,23 @@ For each **CB target Linear** `<q>` (e.g. `model.layers.0.mlp.gate_proj`):
 laid out exactly as the 2-D case; expert `e` = `cb_qweight[e]`), and the fp8
 `<q>.weight_scale` is fp32 `(E, out)`. Encoding uses per-expert `col_weights`
 `(E, 1, in)` when provided (a single `(in,)` vector is broadcast to all
-experts); all experts of a stack share one format + one codebook (the
-allocator's serving-unit promotion guarantees it). **Served** by
+experts). A uniform stack shares one format; the existing per-expert-format
+declaration may instead partition its experts into physical rung sub-stacks.
+With the unreleased Gridbook 0.8.3 preparation pin, learned FP8-CB stacks may
+carry one pooled book per logical gate/up/down role: `gate_up_proj` stays one physical
+tensor, while ordinary logical `gate_proj` and `up_proj` config targets carry
+distinct refs and select row-offset blocks. Split logical targets retain their
+`format_group_*` discriminator and reuse the matching unsuffixed role/rung
+bundle cell. **Served** by
 `PrismaQuantCBMoEMethod` ([external Gridbook `moe.py`](https://github.com/RobTand/gridbook/blob/master/gridbook/moe.py)), which registers
 w13/w2 buffers at these exact shapes so loading is a plain `copy_`; archs that
 map experts at the top level additionally need a loader line in
 Gridbook's packaged runtime contract and loader table (see `moe_cb_design.md` §4).
+The producer version-gates this path: pins older than 0.8.3, malformed pins,
+and non-final version strings retain the routed/rank-3 refusal. The new runtime
+path is also opt-in (`PRISMAQUANT_CB_MOE_PER_ROLE_LUT=1`) until device serving
+validation completes. There is no lattice fallback under a learned identity;
+the exact ABI and ship gate are recorded in `MOE_LEARNED_CODEBOOK_SPEC.md`.
 
 **Codebooks — shipped once per `(ref, format)`, never per tensor:**
 
@@ -229,20 +247,100 @@ Gridbook's packaged runtime contract and loader table (see `moe_cb_design.md` §
 | `cb_codebook.<ref>.<fmt>.sub{i}` | fp16 `(2^b_i, 8/n_sub)` | `product` sub-codebook `i` |
 
 `<ref>` is `lattice` (the deterministic fixed lattice, shipped once per format)
-or
-a role name (a shared per-role learned codebook, e.g. `gate_proj`). `<fmt>` is
-the rung name (`NVFP4_CB_K16`, …). Codebook values are grid-valued and **exact
-in fp16** for both grids; the plugin may re-pack them to 4-bit (fp4) / 8-bit
+or the exact dense target qname for a learned cell (for example
+`model.layers.0.mlp.gate_proj`). Because `<fmt>` includes the rung, this gives
+one distinct physical reference set per `(layer, role, rung)` even if two cells'
+current values happen to match. `<fmt>` is the rung name (`NVFP4_CB_K16`, …).
+Codebook values are grid-valued and **exact in fp16** for both grids; the plugin
+may re-pack them to 4-bit (fp4) / 8-bit
 (fp8) codes in `process_weights_after_loading` (a load-time transform of a tiny
 table — not a resident weight expansion, so INV-1 is unaffected).
 
-### 3.1 Authoritative serialized-payload accounting
+### 3.1 Learned bundle, family scopes, and sidecar identity
+
+Learned codebooks are selected per family by
+`CB_CODEBOOK_SOURCE_SCOPE=none|fp8|all`:
+
+| value | NVFP4-CB | FP8-CB | contract |
+|---|---|---|---|
+| `none` (default) | lattice | lattice | historical producer; the scope member is omitted from identity so the serialized stamp and rendered bytes stay byte-identical to baseline `76666bd` |
+| `fp8` | lattice | learned | production CBL arm |
+| `all` | learned | learned | research-only warning; the production bundle builder refuses learned NVFP4-CB because it is measured NO-GO |
+
+The legacy `CB_CODEBOOK_SOURCE` scalar remains on the wire as an artifact-wide
+ANY: it is `lattice` for `none` and `learned` otherwise. The mixed `fp8` value
+is additionally stamped as `codebook_source_scope: "fp8"` and an explicit
+`codebook_source_by_format` map; homogeneous `none`/`all` needs no new scope key
+because the old scalar already identifies it unambiguously
+(`prismaquant/nvfp4_cb_footprint.py:489-508,568-632`).
+
+Scale search is independent and selected by
+`CB_SCALE_SWEEP_SCOPE=none|nvfp4|fp8|all`. If it is unset, the legacy
+`CB_SCALE_SWEEP` boolean still means none/all. A mixed one-shot-FP8 arm uses
+`nvfp4`; the measured sweep-matched CBL arm uses `all` (or unset with
+`CB_SCALE_SWEEP=1`). The production two-tier FP4 layout requires NVFP4 scale
+search, so `none` or `fp8` is invalid when that layout is present. Only the
+genuinely mixed values `nvfp4`/`fp8` add `scale_sweep_scope` to the stamp
+(`nvfp4_cb_footprint.py:205-216,265-274,525-547,615-632`).
+
+Any learned scope requires `CB_CODEBOOK_BUNDLE`, one immutable safetensors
+`.pqcb` with schema `prismaquant.cb_learned_codebook_bundle.v1`. It is created
+before cost/cache/KL, never during export. The bundle contains:
+
+- the exact canonical FP16 lattice and learned subtables needed by its cells;
+- one learned reference set per dense `(qname, format)` — equivalently
+  `(layer, role, rung)`;
+- the certified `learn_pool` trainer identity and the source-weight/imatrix
+  value identity for every cell;
+- for production banked expert cells, the exact selection/burn/book origin and
+  payload digests, tied to the role input identity again on bundle reload;
+- the measurement-backed rung-policy table; and
+- `codebook_content_sha256`, one SHA-256 per contiguous little-endian FP16
+  subtable payload, covering the bundle's tensor-name set exactly.
+
+Training atomically publishes the bundle and refuses to overwrite an existing
+path. Loading revalidates schema, trainer, names, shapes, cell ownership, full
+reference coverage, and every digest; lookup of an absent or mismatched cell
+raises instead of substituting a lattice book (see `train_and_save_bundle`,
+`load_bundle`, and `CBLearnedBundle.codebook_for` in
+`prismaquant.cb_learned_bundle`).
+
+The exporter uses those exact selected tensors and writes them once to the
+artifact's `cb_codebooks.pqcb`. Its `provenance.codebook_sha256` is a **complete
+name map over that final sidecar**, including canonical lattice tensors and
+learned tensors. This is stricter than a learned-only manifest because pinned
+Gridbook compares the complete expected and observed name sets before checking
+each value digest (`build_quant_config` in `prismaquant.cb_export_config`;
+external Gridbook `gridbook/cb_digest.py`). Export-time retraining and silent lattice
+fallback are both contract violations.
+
+Learned FP8 eligibility is enforced from the data table
+`CBL_RUNG_POLICY`, not inferred from subtable size:
+
+| rungs | state | provenance |
+|---|---|---|
+| K28–K43 | enabled for production | K28/K33/K38/K43 are directly measured GO; each intermediate row says explicitly that it is admitted by the measured K43 boundary, not by a fabricated per-rung result |
+| K44 | enabled for production | sweep-matched CBL/lattice holdout act-MSE ratio 0.6057 (`dq-runs/dsv4-quality-hybrid/sfd-analysis/cbl_k43_k47.log:31`) |
+| K45 | enabled for production | sweep-matched ratio 0.6929 (`cbl_k43_k47.log:40`) |
+| K46 | enabled for production | sweep-matched ratio 0.8312 (`cbl_k43_k47.log:51`) |
+| K47 | rejected | sweep-matched ratio 1.0689 (`cbl_k43_k47.log:60`) |
+| K48 | rejected | measured 54–98% worse than lattice |
+
+Both bundle creation and bundle load call `require_cbl_rung_enabled`, so a stale
+bundle cannot bypass a policy change (see `train_and_save_bundle` and
+`load_bundle` in `prismaquant.cb_learned_bundle`).
+
+### 3.2 Authoritative serialized-payload accounting
 
 `prismaquant.nvfp4_cb_footprint` is the producer byte contract. Its persisted
-schema is `prismaquant.cb_serialized_payload.v1`; exact calls require a
-`CBSerializationContext` carrying scale coding/layout, codebook sharing source,
-and (when already materialized) physical sidecar refs. Omitting that context on
-producer paths is an error rather than an implicit legacy-v1 estimate.
+production schema is `prismaquant.cb_serialized_payload.v3` (v4 only when
+min-chain identity is enabled); v1 is legacy and rejected by current strict
+producer rehydration. Exact calls require a `CBSerializationContext` carrying
+scale coding/layout, family-scoped source and scale-search choices, physical
+sidecar refs by `(qname, format)`, and materialized content digests for every
+learned table. Omitting that context on producer paths is an error rather than
+an implicit legacy estimate (`prismaquant/nvfp4_cb_footprint.py:56-89,118-152,
+685-718`).
 
 This contract is exact for **tensor data spans**, not for the byte size of the
 finished export directory. Safetensors' 8-byte prefixes and JSON headers,
@@ -296,26 +394,26 @@ codebooks — this is a distinct `quant_method`). Also mirrored into
   "format": "nvfp4_cb",
   "config_groups": {
     "group_0": {
-      "targets": ["model.layers.0.mlp.gate_proj", ...],   // module names
-      "format": "NVFP4_CB_K16",
+      "targets": ["model.layers.0.mlp.gate_proj"],
+      "format": "FP8_CB_K38",
       "scheme": {
-        "grid": "fp4",            // "fp4" | "fp8"
-        "mode": "product",        // "full" | "product" | "signed"
-        "k": 16,
+        "grid": "fp8",            // "fp4" | "fp8"
+        "mode": "product",
+        "k": 38,
         "superblock": 256,
-        "group_size": 16,         // fp4 group-16 scale; 0 for fp8
+        "group_size": 0,          // fp4 group-16 scale; 0 for fp8
         "vec_dim": 8,
-        "n_sub": 2,               // product sub-count; 1 for full/signed
-        "type_size": 73,          // production-v2 bytes / 256-weight superblock
-        "act_bits": 4,            // 4 (fp4, W4A4) | 8 (fp8, W8A8)
-        "codebook_source": "learned",   // "lattice" | "learned"
-        "codebook_ref": ["cb_codebook.gate_proj.NVFP4_CB_K16.sub0",
-                         "cb_codebook.gate_proj.NVFP4_CB_K16.sub1"],
-        "codebook_group": "gate_proj",  // null for lattice
-        // v2 (layout_version 2) fp4 groups ONLY — absence ⇒ v1:
-        "scale_coding": {"kind": "two_tier", "sub_bits": 4,
-                         "super_bias": 127,
-                         "table": [1.0, 1.125, /* … 16 e4m3-exact floats */]}
+        "n_sub": 4,
+        "type_size": 152,         // 4*k; no scale bytes in FP8 weight body
+        "act_bits": 8,
+        "codebook_source": "learned",
+        "codebook_ref": [
+          "cb_codebook.model.layers.0.mlp.gate_proj.FP8_CB_K38.sub0",
+          "cb_codebook.model.layers.0.mlp.gate_proj.FP8_CB_K38.sub1",
+          "cb_codebook.model.layers.0.mlp.gate_proj.FP8_CB_K38.sub2",
+          "cb_codebook.model.layers.0.mlp.gate_proj.FP8_CB_K38.sub3"
+        ],
+        "codebook_group": "model.layers.0.mlp.gate_proj"
       }
     }
   },
@@ -326,35 +424,62 @@ codebooks — this is a distinct `quant_method`). Also mirrored into
     "git_commit": "...",
     "assignment_sha256": "...",
     "imatrix_sha256": "...",
-    "codebook_sha256": {"cb_codebook.gate_proj.NVFP4_CB_K16.sub0": "...", ...},
+    // Complete final cb_codebooks.pqcb name map: lattice AND learned tensors.
+    "codebook_sha256": {
+      "cb_codebook.lattice.NVFP4_CB_K16.sub0": "...",
+      "cb_codebook.lattice.NVFP4_CB_K16.sub1": "...",
+      "cb_codebook.model.layers.0.mlp.gate_proj.FP8_CB_K38.sub0": "..."
+      // ... all remaining sidecar names, with no extras or omissions
+    },
     "codebook_source": "learned",
+    "codebook_source_scope": "fp8",
     "scale_sweep": true,
+    // no scale_sweep_scope means the legacy/all-family sweep-matched arm;
+    // a mixed one-shot-FP8 arm writes "scale_sweep_scope": "nvfp4".
+    "ldlq": false,
+    "encode_tier": "balanced",
+    "renderer_abi": "prismaquant.nvfp4_cb_renderer.v1",
     "cb_targets": 128,
+    "render_identity_verified": true,
     "serialized_payload": {
-      "schema": "prismaquant.cb_serialized_payload.v1",
+      "schema": "prismaquant.cb_serialized_payload.v3",
       "context": {"scale_coding": "two_tier", "layout_version": 2,
-                  "codebook_source": "learned"},
+                  "codebook_source": "learned",
+                  "codebook_source_scope": "fp8",
+                  "scale_sweep": true, "ldlq": false,
+                  "encode_tier": "balanced",
+                  "renderer_abi": "prismaquant.nvfp4_cb_renderer.v1",
+                  "activation_contract": "prismaquant.nvfp4_w4a4_activation.v1",
+                  "activation_execution": "e2m1_group16_ue4m3_static"},
       "tensor_payload_bytes": 123456,
       "codebook_sidecar_bytes": 4096,
       "global_scale_bytes": 0,
       "total_bytes": 127552,
       "n_tensors": 128,
-      "sidecars": [/* physical FP16 ref/shape identities */]
+      "sidecars": [/* physical FP16 ref/shape/content-digest identities */]
     },
-    "tensor_formats": {"model.layers.0.mlp.gate_proj": "NVFP4_CB_K16", ...}
+    "tensor_formats": {"model.layers.0.mlp.gate_proj": "FP8_CB_K38", ...}
   }
 }
 ```
 
 `codebook_ref` is a single tensor name (`full`/`signed`) or a list of sub-table
 names (`product`, ordered sub0..sub{n_sub-1}). Grouping: targets sharing one
-`(codebook_ref, format)` are one config group.
+`(codebook_ref, format)` are one config group. Learned dense cells normally
+have distinct refs and therefore distinct groups; canonical lattice cells at
+one format share refs and may group together.
 
 **Plugin dispatch:** a prefix matching a group's `targets` → the CB method
 (decode via that scheme); a prefix in `ignore` → `UnquantizedLinearMethod`;
-plain NVFP4/FP8 (mixed-container, future) → delegate to stock
-compressed-tensors. Fused siblings / packed MoE experts are guaranteed uniform
-per group at export time (union-find promotion), so no per-shard scheme mixing.
+plain NVFP4/FP8 groups → the pinned runtime's delegated native route. Dense
+fusion does **not** require one ref across sibling roles: Gridbook reads
+each role's `codebook_ref`, interns distinct reference tuples, concatenates the
+blocks, and supplies a per-row `cb_row_offset`, so gate≠up and q≠k≠v are valid
+(external Gridbook `gridbook/linear.py:405-437`). Gridbook 0.8.3 ports that
+mechanism to routed MoE behind its per-role-LUT opt-in. PrismaQuant emits three
+ordinary logical config targets (`gate_proj`, `up_proj`, `down_proj`) with
+independent refs while retaining the two physical `gate_up_proj`/`down_proj`
+payloads. An older pin still refuses before those refs can be emitted.
 
 ---
 
@@ -380,3 +505,8 @@ for each row, each superblock s:
 
 This reproduces the emulation render bit-for-bit; the two are pinned equal by
 `test_nvfp4_cb_pack_unpack_matches_emulation`.
+For a fused dense module, `codebook` above means the role block selected by that
+output row's `cb_row_offset`. The 0.8.3 routed opt-in applies the same rule to
+each expert: the first `w13` row segment selects gate, the second selects up,
+and `w2` selects down. The offset vector is resident and captured with the
+decode route; it is not recomputed or read from host state per token.

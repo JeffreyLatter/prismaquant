@@ -438,9 +438,8 @@ def test_streaming_render_matches_resident():
     )
 
 
-def test_streaming_cli_requires_assignment_and_cache_dir():
-    """--streaming fails fast without the assignment/cache-dir/act-cache it
-    needs, before any model load."""
+def test_streaming_cli_requires_scope_specific_inputs_and_cache_dirs():
+    """--streaming validates format-menu/assignment inputs before model load."""
     import argparse
 
     from prismaquant.build_production_cache import _run_streaming
@@ -452,11 +451,16 @@ def test_streaming_cli_requires_assignment_and_cache_dir():
         activation_cache_dir=None, skip_qnames=None,
         expert_render_mode="batched", expert_token_budget=32768,
         h_detail_dir=None, allow_incomplete=False,
+        # Mirrors the real parser (build_production_cache.main, --format-plan).
+        # This fixture is hand-built, so every new CLI flag _run_streaming
+        # reads has to be added here or the test dies on AttributeError
+        # before it reaches the validation it exists to cover.
+        format_plan=None,
     )
-    # Wrong render scope.
+    # Format-menu is supported, but still requires cache + activation dirs.
     assert _run_streaming(
         argparse.Namespace(**base), ["NVFP4"], {}, torch.bfloat16) == 2
-    # Assignment scope but no layer config.
+    # Assignment scope additionally requires a concrete layer config.
     base2 = dict(base, render_scope="assignment")
     assert _run_streaming(
         argparse.Namespace(**base2), ["NVFP4"], {}, torch.bfloat16) == 2

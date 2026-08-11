@@ -24,8 +24,9 @@ both directions:
   | model.layers.N.self_attn.X              | layers.N.attn.X                      |
   | model.layers.N.self_attn.compressor.X   | layers.N.attn.compressor.X           |
   | model.layers.N.mlp.gate.weight          | layers.N.ffn.gate.weight             |
-  | model.layers.N.mlp.experts.gate_up_proj | layers.N.ffn.experts.{0..255}.{w1,w3}|
-  | model.layers.N.mlp.experts.down_proj    | layers.N.ffn.experts.{0..255}.w2     |
+  | model.layers.N.mlp.experts.E.gate_proj  | layers.N.ffn.experts.E.w1            |
+  | model.layers.N.mlp.experts.E.up_proj    | layers.N.ffn.experts.E.w3            |
+  | model.layers.N.mlp.experts.E.down_proj  | layers.N.ffn.experts.E.w2            |
   | model.layers.N.mlp.shared_experts.X     | layers.N.ffn.shared_experts.X        |
   | model.layers.N.attn_hc.{base,fn,scale}  | layers.N.hc_attn_{base,fn,scale}     |
   | model.layers.N.ffn_hc.{base,fn,scale}   | layers.N.hc_ffn_{base,fn,scale}      |
@@ -34,9 +35,10 @@ both directions:
 Also:
   - shared experts use HF-style `gate_proj`/`up_proj`/`down_proj` in live, but
     the checkpoint stores them as `w1`/`w2`/`w3` (Mixtral convention)
-  - routed experts are PACKED into `gate_up_proj` (E, 2*I, H) and
-    `down_proj` (E, H, I) in the live module; checkpoint stores
-    per-expert separately
+  - the vendored probe topology exposes routed experts as per-expert
+    `nn.Linear` gate/up/down projections, matching the separately stored
+    checkpoint rows; the serving/export profile groups and virtual-packs them
+    as `gate_up_proj` (E, 2*I, H) and `down_proj` (E, H, I)
 
 Important: vLLM main landed DSv4 support today (PR #40860). Once the
 container is rebuilt, set `vllm_architecture_class()` to `"DeepseekV4ForCausalLM"`

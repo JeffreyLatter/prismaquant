@@ -1,14 +1,14 @@
-"""Empirical packed-MoE expert costs for the AURA hybrid recipe.
+"""Empirical routed-MoE expert costs for the AURA hybrid recipe.
 
 AURA's smooth per-Linear cost is route-flip-blind on routed experts (Step A,
 2026-06-29: Spearman drops 0.45->0.35 under faithful dW; predicted NVFP4/FP8
 ratios 2-49x vs measured 1.1-1.5x), so expert costs are MEASURED, not
-modeled: per MoE layer the serving unit = all packed expert tensors of that
-module (they must share one format — vLLM FusedMoE constraint), and the unit
-cost of a format is the end-to-end mean-token KL(BF16 || unit-quantized)
-with everything else left at source precision. The unit KL is split across
-the member tensors proportionally to n_params so the allocator's per-member
-aggregation charges it exactly once.
+modeled: per MoE layer the serving unit = all profile-coupled routed expert
+tensors (packed Parameters or per-expert Linears; they must share one format —
+vLLM FusedMoE constraint), and the unit cost of a format is the end-to-end
+mean-token KL(BF16 || unit-quantized) with everything else left at source
+precision. The unit KL is split across the member tensors proportionally to
+n_params so the allocator's per-member aggregation charges it exactly once.
 
 The quantizer is plain RTN ``quantize_dequantize`` from the format registry —
 the same estimator contract as the AURA non-expert cost (RTN-vs-GPTQ dW is a
@@ -42,6 +42,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 from prismaquant import format_registry as fr
@@ -60,6 +61,12 @@ from prismaquant.nvfp4_cb_footprint import (
     cb_quantize_dequantize_for_context,
     cb_serialization_context_from_env,
     validate_cb_cost_provenance,
+)
+from prismaquant.routed_experts import (
+    UnpackedExpertLinear,
+    profile_declared_routed_expert_targets,
+    profile_declared_unpacked_expert_linears,
+    resolve_routed_expert_profile,
 )
 
 SCHEMA = "prismaquant.expert_empirical_cost.v1"
@@ -122,6 +129,8 @@ def _baseline_logprobs(
     model, calib_ids: torch.Tensor,
     capture_units: Sequence[tuple[str, object]] | None = None,
     capture_rows: int = 4096,
+    *,
+    forward_model=None,
 ) -> list[torch.Tensor] | tuple[list[torch.Tensor], dict]:
     """Baseline log-probs; optionally capture each expert module's INPUT rows
     during the same forwards (bounded to ``capture_rows`` per unit) for the
@@ -146,7 +155,9 @@ def _baseline_logprobs(
         out = []
         bs = _calib_batch()
         for i in range(0, calib_ids.shape[0], bs):
-            logits = model(calib_ids[i:i + bs]).logits.float()
+            logits = (forward_model or model)(
+                calib_ids[i:i + bs]
+            ).logits.float()
             out.append(F.log_softmax(logits, dim=-1).cpu())
     finally:
         for h in handles:
@@ -283,11 +294,12 @@ def _quantize_unit_inplace(
     if spec.family in _CB_FAMILIES:
         context = cb_serialization_context_from_env()
 
-        def qdq(weight, col_weights=None):
+        def qdq(weight, col_weights=None, *, qname=None):
             return cb_quantize_dequantize_for_context(
                 spec,
                 weight,
                 context=context,
+                qname=qname,
                 col_weights=col_weights,
             )
     weighted = _qdq_accepts_col_weights(spec)
@@ -308,10 +320,12 @@ def _quantize_unit_inplace(
                 cw_s = (cw_dev[idx] if cw_dev.ndim >= 3
                         and cw_dev.shape[0] == w.shape[0] else cw_dev)
                 w[idx] = qdq(
-                    w[idx].float(), col_weights=cw_s).to(w.dtype)
+                    w[idx].float(), col_weights=cw_s, qname=full
+                ).to(w.dtype)
             else:
                 w.copy_(qdq(
-                    w.float(), col_weights=cw_dev).to(w.dtype))
+                    w.float(), col_weights=cw_dev, qname=full
+                ).to(w.dtype))
         elif spec.family == "nv":
             # NV formats derive one per-TENSOR global scale from
             # whatever slice they are given, while export ships one
@@ -353,6 +367,7 @@ def _unit_kl(
     unit_qname: str = "",
     sample_idx: torch.Tensor | None = None,
     per_window: bool = False,
+    forward_model=None,
 ) -> float | tuple[float, list[float]]:
     """Mean-token KL(BF16 || model-with-this-unit-quantized).
 
@@ -381,7 +396,9 @@ def _unit_kl(
         bs = _calib_batch()
         for bi, i in enumerate(range(0, calib_ids.shape[0], bs)):
             lp = F.log_softmax(
-                model(calib_ids[i:i + bs]).logits.float(), -1)
+                (forward_model or model)(
+                    calib_ids[i:i + bs]
+                ).logits.float(), -1)
             bl = baseline[bi].to(lp.device)
             kl = (bl.exp() * (bl - lp)).sum(-1)
             wsum = float(kl.sum().item())
@@ -398,6 +415,288 @@ def _unit_kl(
                 w.copy_(originals[pn])
             else:
                 w[sample_idx.to(w.device)] = originals[pn]
+
+
+class _UnpackedExpertUnit(NamedTuple):
+    """One routed serving unit backed by per-expert ``nn.Linear`` rows."""
+
+    qname: str
+    group_key: str
+    members: tuple[UnpackedExpertLinear, ...]
+    roles: tuple[tuple[str, tuple[str, ...]], ...]
+    num_experts: int
+    members_by_target: dict[str, dict[tuple[str, int], str]]
+
+
+def _expert_profile_call(profile, accessor: str, *args):
+    method = getattr(profile, accessor, None)
+    if not callable(method):
+        raise RuntimeError(
+            f"profile {type(profile).__name__} cannot render routed experts: "
+            f"missing callable {accessor}()"
+        )
+    try:
+        return method(*args)
+    except Exception as exc:
+        raise RuntimeError(
+            f"profile {type(profile).__name__} could not determine routed-"
+            f"expert layout via {accessor}()"
+        ) from exc
+
+
+def _unpacked_expert_units(model, profile) -> list[_UnpackedExpertUnit]:
+    """Validate and group profile-declared per-expert Linear units.
+
+    Classification already happened through ``packed_expert_format_group``.
+    The remaining profile accessors declare how those physical rows form the
+    packed serving tensors used by the quantizer/exporter.  Missing projection
+    coverage, non-contiguous expert ids, or an accessor that cannot answer is
+    a hard error; none of those states is equivalent to a dense model.
+    """
+    discovered = profile_declared_unpacked_expert_linears(model, profile)
+    grouped: dict[str, list[UnpackedExpertLinear]] = {}
+    for member in discovered:
+        grouped.setdefault(member.unit_qname, []).append(member)
+
+    units: list[_UnpackedExpertUnit] = []
+    for qname in sorted(grouped):
+        members = sorted(grouped[qname], key=lambda member: member.qname)
+        group_keys = {member.group_key for member in members}
+        if len(group_keys) != 1:
+            raise RuntimeError(
+                f"{qname}: profile {type(profile).__name__} assigned the "
+                f"unpacked expert rows to conflicting serving-format groups: "
+                f"{sorted(group_keys)!r}"
+            )
+
+        by_projection: dict[str, dict[int, UnpackedExpertLinear]] = {}
+        for member in members:
+            per_expert = by_projection.setdefault(member.projection_name, {})
+            if member.expert_id in per_expert:
+                raise RuntimeError(
+                    f"{qname}: duplicate routed expert projection "
+                    f"{member.projection_name!r} for expert {member.expert_id}"
+                )
+            per_expert[member.expert_id] = member
+        expected_ids: list[int] | None = None
+        for projection, per_expert in sorted(by_projection.items()):
+            ids = sorted(per_expert)
+            if ids != list(range(len(ids))):
+                raise RuntimeError(
+                    f"{qname}: non-contiguous expert ids for {projection}: "
+                    f"{ids[:16]!r}"
+                )
+            if expected_ids is None:
+                expected_ids = ids
+            elif ids != expected_ids:
+                raise RuntimeError(
+                    f"{qname}: expert ids differ across projections; "
+                    f"{projection} has {ids[:16]!r}, expected "
+                    f"{expected_ids[:16]!r}"
+                )
+        if not expected_ids:
+            raise RuntimeError(f"{qname}: routed expert group has no members")
+
+        projections_by_parent: dict[str, set[str]] = {}
+        for projection in by_projection:
+            parent = _expert_profile_call(
+                profile, "packed_expert_parent_for_projection", projection
+            )
+            if not isinstance(parent, str) or not parent:
+                raise RuntimeError(
+                    f"{qname}: profile {type(profile).__name__} grouped "
+                    f"projection {projection!r} as routed but did not declare "
+                    "its packed serving parent"
+                )
+            projections_by_parent.setdefault(parent, set()).add(projection)
+
+        roles: list[tuple[str, tuple[str, ...]]] = []
+        members_by_target: dict[str, dict[tuple[str, int], str]] = {}
+        consumed: set[str] = set()
+        for parent in sorted(projections_by_parent):
+            declared = _expert_profile_call(
+                profile, "packed_expert_projection_names", parent
+            )
+            try:
+                projections = tuple(str(name) for name in declared)
+            except TypeError as exc:
+                raise RuntimeError(
+                    f"{qname}: profile {type(profile).__name__} returned a "
+                    f"malformed projection order for packed parent {parent!r}"
+                ) from exc
+            actual = projections_by_parent[parent]
+            if not projections or set(projections) != actual:
+                raise RuntimeError(
+                    f"{qname}: packed parent {parent!r} needs exactly profile-"
+                    f"declared projections {projections!r}, found "
+                    f"{sorted(actual)!r}"
+                )
+            if len(set(projections)) != len(projections):
+                raise RuntimeError(
+                    f"{qname}: packed parent {parent!r} repeats a projection "
+                    f"in {projections!r}"
+                )
+            consumed.update(projections)
+            target = f"{qname}.{parent}"
+            members_by_target[target] = {
+                (projection, expert_id):
+                    by_projection[projection][expert_id].qname
+                for projection in projections
+                for expert_id in expected_ids
+            }
+            roles.append((parent, projections))
+
+            # Packing concatenates projections along the output dimension.
+            # Every row in one role must therefore share an input width, and
+            # every expert must expose the same physical shape per projection.
+            input_widths: set[int] = set()
+            for projection in projections:
+                shapes = {
+                    tuple(int(dim) for dim in member.module.weight.shape)
+                    for member in by_projection[projection].values()
+                }
+                if len(shapes) != 1:
+                    raise RuntimeError(
+                        f"{qname}: {projection} shapes differ across experts: "
+                        f"{sorted(shapes)!r}"
+                    )
+                shape = next(iter(shapes))
+                if len(shape) != 2:
+                    raise RuntimeError(
+                        f"{qname}: profile-declared unpacked Linear "
+                        f"{projection} has non-matrix shape {shape!r}"
+                    )
+                input_widths.add(shape[1])
+            if len(input_widths) != 1:
+                raise RuntimeError(
+                    f"{qname}: packed parent {parent!r} projections disagree "
+                    f"on input width: {sorted(input_widths)!r}"
+                )
+        if consumed != set(by_projection):
+            raise RuntimeError(
+                f"{qname}: routed expert layout did not consume projections "
+                f"{sorted(set(by_projection) - consumed)!r}"
+            )
+        units.append(_UnpackedExpertUnit(
+            qname=qname,
+            group_key=next(iter(group_keys)),
+            members=tuple(members),
+            roles=tuple(roles),
+            num_experts=len(expected_ids),
+            members_by_target=members_by_target,
+        ))
+    return units
+
+
+def _virtual_packed_module(unit: _UnpackedExpertUnit) -> nn.Module:
+    """Materialize the export-equivalent packed stacks for one live unit."""
+    by_key = {
+        (member.projection_name, member.expert_id): member
+        for member in unit.members
+    }
+    packed = nn.Module()
+    for parent, projections in unit.roles:
+        expert_rows = []
+        for expert_id in range(unit.num_experts):
+            tensors = [
+                by_key[(projection, expert_id)].module.weight.detach()
+                for projection in projections
+            ]
+            expert_rows.append(
+                tensors[0] if len(tensors) == 1
+                else torch.cat(tensors, dim=0)
+            )
+        setattr(
+            packed,
+            parent,
+            nn.Parameter(torch.stack(expert_rows), requires_grad=False),
+        )
+    return packed
+
+
+def _scatter_virtual_packed_module(
+    unit: _UnpackedExpertUnit,
+    packed: nn.Module,
+    expert_ids: Sequence[int],
+) -> None:
+    by_key = {
+        (member.projection_name, member.expert_id): member
+        for member in unit.members
+    }
+    for parent, projections in unit.roles:
+        tensor = getattr(packed, parent).data
+        offset = 0
+        for projection in projections:
+            width = int(by_key[(projection, 0)].module.weight.shape[0])
+            for expert_id in expert_ids:
+                by_key[(projection, int(expert_id))].module.weight.data.copy_(
+                    tensor[int(expert_id), offset:offset + width]
+                )
+            offset += width
+
+
+@torch.no_grad()
+def _unpacked_unit_kl(
+    model,
+    calib_ids: torch.Tensor,
+    baseline: list[torch.Tensor],
+    unit: _UnpackedExpertUnit,
+    fmt: str,
+    *,
+    expert_chunk: int = 16,
+    col_weights: Mapping[str, torch.Tensor] | None = None,
+    sample_idx: torch.Tensor | None = None,
+    per_window: bool = False,
+    forward_model=None,
+) -> float | tuple[float, list[float]]:
+    """Unit KL for per-expert Linears via the shipped packed-stack render."""
+    if sample_idx is None:
+        expert_ids = list(range(unit.num_experts))
+    else:
+        expert_ids = [int(value) for value in sample_idx.tolist()]
+    selected = set(expert_ids)
+    originals = {
+        member.qname: member.module.weight.data.clone()
+        for member in unit.members
+        if member.expert_id in selected
+    }
+    packed = _virtual_packed_module(unit)
+    param_names = [parent for parent, _projections in unit.roles]
+    try:
+        _quantize_unit_inplace(
+            packed,
+            param_names,
+            fmt,
+            expert_chunk=expert_chunk,
+            col_weights=col_weights,
+            unit_qname=unit.qname,
+            sample_idx=sample_idx,
+        )
+        _scatter_virtual_packed_module(unit, packed, expert_ids)
+        total = 0.0
+        n_tok = 0
+        windows: list[float] = []
+        bs = _calib_batch()
+        for bi, i in enumerate(range(0, calib_ids.shape[0], bs)):
+            lp = F.log_softmax(
+                (forward_model or model)(
+                    calib_ids[i:i + bs]
+                ).logits.float(), -1
+            )
+            bl = baseline[bi].to(lp.device)
+            kl = (bl.exp() * (bl - lp)).sum(-1)
+            wsum = float(kl.sum().item())
+            total += wsum
+            n_tok += kl.numel()
+            if per_window:
+                windows.append(wsum / max(kl.numel(), 1))
+        mean = total / max(n_tok, 1)
+        return (mean, windows) if per_window else mean
+    finally:
+        for member in unit.members:
+            original = originals.get(member.qname)
+            if original is not None:
+                member.module.weight.data.copy_(original)
 
 
 def _cb_ladder_split(measured_fmts: Sequence[str]):
@@ -801,8 +1100,11 @@ def measure_expert_unit_costs(
     expert_sample: int = 0,
     max_units: int = 0,
     unit_filter: str | None = None,
+    forward_model=None,
+    baseline_logprobs: list[torch.Tensor] | None = None,
+    synthesize_col_weights: bool = True,
 ) -> tuple[dict, dict, dict]:
-    """Measure per-serving-unit empirical KL costs for packed-MoE experts.
+    """Measure empirical KL costs for profile-declared routed experts.
 
     Returns ``(stats, costs, unit_kls)`` where stats/costs are
     allocator-payload row dicts keyed by full member names and ``unit_kls``
@@ -813,15 +1115,54 @@ def measure_expert_unit_costs(
         _packed_experts_param_names,
     )
 
+    profile = resolve_routed_expert_profile(model, profile)
     menu = _canon_formats(formats)
     measured_fmts = [f for f in menu if f not in PASSTHROUGH_FORMATS]
-    units = [
+    # First classify every routed target through the profile-owned, rank-free
+    # predicate.  Physical-layout discovery below is allowed to inspect rank
+    # only to choose a renderer; it must account for every classified target.
+    routed_targets = set(profile_declared_routed_expert_targets(model, profile))
+    packed_units = [
         (qn, m) for qn, m in model.named_modules()
         if _is_packed_experts_module(m, profile)
     ]
+    unpacked_units = _unpacked_expert_units(model, profile)
+    packed_qnames = {qn for qn, _mod in packed_units}
+    unpacked_qnames = {unit.qname for unit in unpacked_units}
+    overlap = sorted(packed_qnames & unpacked_qnames)
+    if overlap:
+        raise RuntimeError(
+            "profile-declared routed expert units expose both packed "
+            f"Parameters and unpacked Linears at {overlap[:8]!r}; refusing "
+            "to measure overlapping state twice"
+        )
+
+    accounted: set[str] = {
+        member.qname
+        for unit in unpacked_units
+        for member in unit.members
+    }
+    for qn, mod in packed_units:
+        for param_name in _packed_experts_param_names(mod, profile):
+            accounted.add(f"{qn}.{param_name}" if qn else str(param_name))
+    if accounted != routed_targets:
+        missing = sorted(routed_targets - accounted)
+        unexpected = sorted(accounted - routed_targets)
+        raise RuntimeError(
+            "profile-declared routed expert discovery could not form an "
+            "empirical serving unit for every target; "
+            f"unaccounted={missing[:8]!r}, non-profile targets="
+            f"{unexpected[:8]!r}"
+        )
+
+    units: list[tuple[str, str, object]] = [
+        ("packed", qn, mod) for qn, mod in packed_units
+    ] + [
+        ("unpacked", unit.qname, unit) for unit in unpacked_units
+    ]
     if unit_filter:
         pat = re.compile(unit_filter)
-        units = [(qn, m) for qn, m in units if pat.search(qn)]
+        units = [record for record in units if pat.search(record[1])]
     if max_units > 0:
         units = units[:max_units]
     if progress:
@@ -841,22 +1182,58 @@ def measure_expert_unit_costs(
     has_cb = any(fr.get_format(f).family in _CB_FAMILIES
                  for f in measured_fmts)
     if has_cb:
-        # Capture module inputs during the baseline forwards and synthesize
-        # any missing packed-expert imatrix entries (down_proj is NEVER in
-        # the harvested cache — its input is the per-expert intermediate).
+        # Packed modules can synthesize missing imatrix entries from a module
+        # input capture. Unpacked per-expert Linears already have one harvested
+        # entry per member; those are pooled below with the exporter's exact
+        # virtual-stack rule and missing coverage is a hard error.
         if col_weights is None:
             col_weights = {}
-        baseline, unit_x = _baseline_logprobs(
-            model, calib_ids, capture_units=units)
-        added = ensure_unit_col_weights(model, units, col_weights, unit_x)
+        selected_packed = [
+            (qn, mod) for kind, qn, mod in units if kind == "packed"
+        ]
+        if baseline_logprobs is not None:
+            baseline = baseline_logprobs
+            added = []
+            if selected_packed and synthesize_col_weights:
+                raise ValueError(
+                    "precomputed baseline cannot synthesize packed-expert "
+                    "col_weights because its module-input capture is absent"
+                )
+        elif selected_packed and synthesize_col_weights:
+            baseline, unit_x = _baseline_logprobs(
+                model, calib_ids, capture_units=selected_packed,
+                forward_model=forward_model)
+            added = ensure_unit_col_weights(
+                model, selected_packed, col_weights, unit_x
+            )
+            del unit_x
+        else:
+            baseline = _baseline_logprobs(
+                model, calib_ids, forward_model=forward_model)
+            added = []
         if added and progress:
             _log(f"synthesized {len(added)} packed-expert imatrix entries "
                  f"(module-input pool / down_proj replay): "
                  f"{added[:4]}{'...' if len(added) > 4 else ''}")
         measure_expert_unit_costs.last_added_col_weights = added
-        del unit_x
+        # Reuse the exporter's production rule: fuse gate/up in declared
+        # order, and average their per-member imatrix vectors per expert.
+        from prismaquant.export_nvfp4_cb_streaming import (
+            _packed_expert_col_weights,
+        )
+        for kind, _qn, unit in units:
+            if kind == "unpacked":
+                col_weights = _packed_expert_col_weights(
+                    col_weights, unit.members_by_target, profile
+                )
     else:
-        baseline = _baseline_logprobs(model, calib_ids)
+        baseline = (
+            baseline_logprobs
+            if baseline_logprobs is not None
+            else _baseline_logprobs(
+                model, calib_ids, forward_model=forward_model
+            )
+        )
         measure_expert_unit_costs.last_added_col_weights = []
     ladder = _cb_ladder_split(measured_fmts) if ladder_interp else None
     # Visible accept/reject rate for the holdout gate (R20): a ladder that
@@ -864,21 +1241,61 @@ def measure_expert_unit_costs(
     # the anchors, and the operator must be able to see that from the log.
     ladder_accept = 0
     ladder_reject = 0
-    for qn, mod in units:
-        pnames = list(_packed_experts_param_names(mod, profile))
-        n_params_unit = sum(int(getattr(mod, pn).numel()) for pn in pnames)
-        num_experts = int(getattr(mod, pnames[0]).shape[0])
-        for pn in pnames:
-            t = getattr(mod, pn)
-            if not bool((t != 0).any()):
+    for unit_kind, qn, storage in units:
+        if unit_kind == "packed":
+            mod = storage
+            pnames = list(_packed_experts_param_names(mod, profile))
+            n_params_unit = sum(
+                int(getattr(mod, pn).numel()) for pn in pnames
+            )
+            num_experts = int(getattr(mod, pnames[0]).shape[0])
+            row_members = [
+                (
+                    f"{qn}.{pn}" if qn else pn,
+                    getattr(mod, pn),
+                    {
+                        "num_experts": num_experts,
+                        "_packed_experts_module": qn,
+                        "_packed_param": pn,
+                    },
+                )
+                for pn in pnames
+            ]
+            for pn in pnames:
+                t = getattr(mod, pn)
+                if not bool((t != 0).any()):
+                    raise RuntimeError(
+                        f"{qn}.{pn}: packed-expert stack is ALL ZERO — the "
+                        f"checkpoint's per-expert weights were never mapped "
+                        f"into the packed class param (the zero-expert "
+                        f"calibration bug). A unit KL measured now would read "
+                        f"exactly 0 for every format. Fill via "
+                        f"layer_streaming.fill_packed_experts_from_source "
+                        f"before measuring."
+                    )
+        else:
+            unit = storage
+            num_experts = unit.num_experts
+            n_params_unit = sum(
+                int(member.module.weight.numel()) for member in unit.members
+            )
+            row_members = [
+                (
+                    member.qname,
+                    member.module.weight,
+                    {"_unpacked_expert_unit": qn},
+                )
+                for member in unit.members
+            ]
+            if not any(
+                bool((member.module.weight != 0).any())
+                for member in unit.members
+            ):
                 raise RuntimeError(
-                    f"{qn}.{pn}: packed-expert stack is ALL ZERO — the "
-                    f"checkpoint's per-expert weights were never mapped "
-                    f"into the packed class param (the zero-expert "
-                    f"calibration bug). A unit KL measured now would read "
-                    f"exactly 0 for every format. Fill via "
-                    f"layer_streaming.fill_packed_experts_from_source "
-                    f"before measuring.")
+                    f"{qn}: profile-declared unpacked expert unit is ALL "
+                    "ZERO; an empirical unit KL would silently read zero for "
+                    "every format"
+                )
         # One stratified subsample SHARED across every format of the unit, so
         # inter-format comparability (what the allocator consumes) is exact
         # even under sampling; the extrapolation to the full unit rides on
@@ -894,11 +1311,19 @@ def measure_expert_unit_costs(
         kl_windows: dict[str, list[float]] = {}
 
         def kl_of(fmt):
-            out = _unit_kl(
-                model, calib_ids, baseline, mod, pnames, fmt,
-                expert_chunk=expert_chunk, col_weights=col_weights,
-                unit_qname=qn, sample_idx=sample_idx,
-                per_window=ladder is not None)
+            if unit_kind == "packed":
+                out = _unit_kl(
+                    model, calib_ids, baseline, mod, pnames, fmt,
+                    expert_chunk=expert_chunk, col_weights=col_weights,
+                    unit_qname=qn, sample_idx=sample_idx,
+                    per_window=ladder is not None,
+                    forward_model=forward_model)
+            else:
+                out = _unpacked_unit_kl(
+                    model, calib_ids, baseline, unit, fmt,
+                    expert_chunk=expert_chunk, col_weights=col_weights,
+                    sample_idx=sample_idx, per_window=ladder is not None,
+                    forward_model=forward_model)
             if ladder is None:
                 return kl_scale * out
             mean, windows = out
@@ -963,22 +1388,24 @@ def measure_expert_unit_costs(
                 "sampled": int(sample_idx.numel()),
                 "scale": round(kl_scale, 4),
             }
-        for pn in pnames:
-            tensor = getattr(mod, pn)
+        for full, tensor, expert_metadata in row_members:
             npm = int(tensor.numel())
-            full = f"{qn}.{pn}" if qn else pn
             shape = list(tensor.shape)
+            if unit_kind == "packed":
+                in_features = int(shape[2])
+                out_features = int(shape[1])
+            else:
+                in_features = int(shape[1])
+                out_features = int(shape[0])
             stats[full] = {
                 # h_trace is meaningless for an empirically-costed unit; the
                 # allocator consumes predicted_dloss directly. 0.0 marks
                 # "do not fall back to h_trace x weight_mse" for this row.
                 "h_trace": 0.0,
                 "n_params": npm,
-                "in_features": int(shape[2]),
-                "out_features": int(shape[1]),
-                "num_experts": num_experts,
-                "_packed_experts_module": qn,
-                "_packed_param": pn,
+                "in_features": in_features,
+                "out_features": out_features,
+                **expert_metadata,
                 "n_probes": 0,
             }
             row: dict = {}
@@ -1023,6 +1450,408 @@ def measure_expert_unit_costs(
     return stats, costs, unit_kls
 
 
+EXPERT_CHECKPOINT_IDENTITY_SCHEMA = (
+    "prismaquant.expert_empirical_checkpoint.identity.v1"
+)
+EXPERT_CHECKPOINT_STAGE = "expert empirical cost"
+
+
+def _tensor_value_stamp(tensor: torch.Tensor) -> dict[str, object]:
+    value = torch.as_tensor(tensor).detach().to("cpu").contiguous()
+    raw = value.view(torch.uint8).numpy().tobytes()
+    return {
+        "shape": [int(dim) for dim in value.shape],
+        "dtype": str(value.dtype),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+    }
+
+
+def _streamed_expert_unit_records(model, profile, *, unit_filter, max_units):
+    """Return serving units in the resident measurer's exact order."""
+    from prismaquant.sensitivity_probe import (
+        _is_packed_experts_module,
+        _packed_experts_param_names,
+    )
+
+    packed = [
+        ("packed", qname, mod)
+        for qname, mod in model.named_modules()
+        if _is_packed_experts_module(mod, profile)
+    ]
+    unpacked = [
+        ("unpacked", unit.qname, unit)
+        for unit in _unpacked_expert_units(model, profile)
+    ]
+    records = packed + unpacked
+    if unit_filter:
+        pattern = re.compile(str(unit_filter))
+        records = [record for record in records if pattern.search(record[1])]
+    if max_units > 0:
+        records = records[:max_units]
+    identities: list[dict[str, object]] = []
+    for kind, qname, storage in records:
+        if kind == "packed":
+            members = []
+            for param_name in _packed_experts_param_names(storage, profile):
+                tensor = getattr(storage, param_name)
+                members.append({
+                    "qname": f"{qname}.{param_name}" if qname else param_name,
+                    "shape": [int(dim) for dim in tensor.shape],
+                    "dtype": str(tensor.dtype),
+                })
+        else:
+            members = [
+                {
+                    "qname": member.qname,
+                    "shape": [
+                        int(dim) for dim in member.module.weight.shape
+                    ],
+                    "dtype": str(member.module.weight.dtype),
+                }
+                for member in storage.members
+            ]
+        identities.append({
+            "qname": str(qname),
+            "storage": str(kind),
+            "members": members,
+        })
+    return records, identities
+
+
+def _expert_checkpoint_identity(
+    *,
+    runner,
+    profile,
+    calib_ids: torch.Tensor,
+    formats: Sequence[str],
+    col_weights: Mapping[str, torch.Tensor],
+    unit_identities: Sequence[Mapping[str, object]],
+    model_identity: Mapping[str, object],
+    expert_chunk: int,
+    ladder_interp: bool,
+    ladder_tol: float,
+    expert_sample: int,
+    max_units: int,
+    unit_filter: str | None,
+    identity_extra: Mapping[str, object] | None,
+) -> dict[str, object]:
+    from prismaquant.cost_stage_checkpoint import canonical_json
+    from prismaquant.perturbed_x_cache import calibration_data_hash
+    from prismaquant.production_weight_cache import (
+        _production_cache_source_sha256,
+    )
+
+    calib = calib_ids.detach().to("cpu").contiguous()
+    from prismaquant.cost_streaming import validate_streamed_model_identity
+
+    exact_model_identity = validate_streamed_model_identity(
+        model_identity, where="expert empirical checkpointing"
+    )
+    identity = {
+        "schema": EXPERT_CHECKPOINT_IDENTITY_SCHEMA,
+        "git_commit": _git_commit(),
+        "producer_source_sha256": _production_cache_source_sha256(),
+        "model": exact_model_identity,
+        "profile": {
+            "module": type(profile).__module__,
+            "class": type(profile).__qualname__,
+        },
+        "calibration": {
+            "shape": [int(dim) for dim in calib.shape],
+            "dtype": str(calib.dtype),
+            "sha256": hashlib.sha256(
+                calib.view(torch.uint8).numpy().tobytes()
+            ).hexdigest(),
+            "calib_hash": calibration_data_hash(calib_ids),
+        },
+        "formats": [str(fmt) for fmt in formats],
+        "units": [dict(record) for record in unit_identities],
+        "imatrix": {
+            str(name): _tensor_value_stamp(value)
+            for name, value in sorted(col_weights.items())
+        },
+        # This stamp value-binds the selected learned bundle/lattice books,
+        # serialization layout, encode tier, and every CB menu semantic.
+        "cb_cost_provenance": cb_cost_provenance(formats),
+        "measurement_dtype": str(runner.dtype),
+        "expert_chunk": int(expert_chunk),
+        "calib_batch": int(_calib_batch()),
+        "ladder_interp": bool(ladder_interp),
+        "ladder_tol": float(ladder_tol),
+        "expert_sample": int(expert_sample),
+        "max_units": int(max_units),
+        "unit_filter": unit_filter,
+        "extra": dict(identity_extra or {}),
+    }
+    return canonical_json(identity, where="expert empirical checkpoint identity")
+
+
+def _write_expert_unit_checkpoint(
+    root: Path,
+    *,
+    qname: str,
+    identity_sha256: str,
+    state: Mapping[str, object],
+) -> None:
+    """Patchable publication seam used by interruption tests."""
+    from prismaquant.cost_stage_checkpoint import write_unit
+
+    write_unit(
+        root,
+        stage=EXPERT_CHECKPOINT_STAGE,
+        qname=qname,
+        identity_sha256=identity_sha256,
+        state=state,
+    )
+
+
+def _validate_expert_checkpoint_state(
+    qname: str, state: Mapping[str, object]
+) -> dict[str, object]:
+    expected = {"stats", "costs", "unit_kls"}
+    if set(state) != expected:
+        raise RuntimeError(
+            f"expert unit checkpoint for {qname} has fields "
+            f"{sorted(state)!r}, expected {sorted(expected)!r}; refusing "
+            "reuse or recompute"
+        )
+    for field in expected:
+        if not isinstance(state[field], Mapping):
+            raise RuntimeError(
+                f"expert unit checkpoint for {qname} has invalid {field}; "
+                "refusing reuse or recompute"
+            )
+    unit_kls = state["unit_kls"]
+    if set(unit_kls) != {qname}:
+        raise RuntimeError(
+            f"expert unit checkpoint for {qname} carries unit_kls keys "
+            f"{sorted(unit_kls)!r}; refusing reuse or recompute"
+        )
+    return dict(state)
+
+
+def measure_expert_unit_costs_streamed(
+    runner,
+    profile,
+    calib_ids: torch.Tensor,
+    formats: Sequence[str],
+    *,
+    expert_chunk: int = 16,
+    progress: bool = True,
+    col_weights: Mapping[str, torch.Tensor] | None = None,
+    ladder_interp: bool = False,
+    ladder_tol: float = 0.10,
+    expert_sample: int = 0,
+    max_units: int = 0,
+    unit_filter: str | None = None,
+    checkpoint_dir: str | Path | None = None,
+    resume: bool = False,
+    model_identity: Mapping[str, object] | None = None,
+    checkpoint_identity_extra: Mapping[str, object] | None = None,
+    formats_by_qname: Mapping[str, Sequence[str]] | None = None,
+) -> tuple[dict, dict, dict]:
+    """Measure routed serving units with one decoder layer resident at once.
+
+    The numerical core is the resident ``measure_expert_unit_costs`` function:
+    identical qdq, fp32 log-softmax/KL, window order, ladder, and row builder.
+    Streaming changes only model residency.  A target layer stays pinned for
+    the complete serving unit so its temporary qdq is restored before the
+    context can cache/unload it.
+    """
+    if resume and checkpoint_dir is None:
+        raise ValueError("resume=True requires checkpoint_dir")
+    profile = resolve_routed_expert_profile(runner.model, profile)
+    menu = _canon_formats(formats)
+    weights = {
+        str(name): torch.as_tensor(value)
+        for name, value in dict(col_weights or {}).items()
+    }
+    records, unit_identities = _streamed_expert_unit_records(
+        runner.model,
+        profile,
+        unit_filter=unit_filter,
+        max_units=max_units,
+    )
+    qnames = [str(record[1]) for record in records]
+    if len(qnames) != len(set(qnames)):
+        raise RuntimeError(
+            "streamed expert discovery produced duplicate serving-unit qnames"
+        )
+    # Every serving unit is layer-local by serving contract. Resolve this
+    # before opening the journal so malformed topology cannot acquire state.
+    for qname in qnames:
+        runner.layer_index_for_qname(qname)
+
+    menu_by_unit = {qname: menu for qname in qnames}
+    canonical_format_plan = None
+    if formats_by_qname is not None:
+        canonical_format_plan = {
+            str(name): tuple(_canon_formats(values))
+            for name, values in formats_by_qname.items()
+        }
+        planned_universe = {
+            fmt
+            for values in canonical_format_plan.values()
+            for fmt in values
+        }
+        menu_by_unit = {}
+        for identity in unit_identities:
+            unit_qname = str(identity["qname"])
+            members = [str(row["qname"]) for row in identity["members"]]
+            missing = sorted(
+                member for member in members
+                if member not in canonical_format_plan
+            )
+            if missing:
+                raise ValueError(
+                    f"streamed expert format plan does not cover serving "
+                    f"unit {unit_qname}; sample={missing[:8]}"
+                )
+            projected = {
+                tuple(
+                    fmt for fmt in menu
+                    if fmt not in planned_universe
+                    or fmt in canonical_format_plan[member]
+                )
+                for member in members
+            }
+            if len(projected) != 1:
+                raise ValueError(
+                    "streamed expert format plan straddles one serving unit "
+                    f"{unit_qname}: {sorted(projected)}"
+                )
+            unit_menu = next(iter(projected))
+            if not unit_menu:
+                raise ValueError(
+                    f"streamed expert format plan leaves {unit_qname} empty"
+                )
+            menu_by_unit[unit_qname] = unit_menu
+
+    completed: dict[str, dict[str, object]] = {}
+    journal_root: Path | None = None
+    journal_identity_sha256: str | None = None
+    if checkpoint_dir is not None:
+        if model_identity is None:
+            raise RuntimeError(
+                "streamed expert checkpointing requires exact model_identity; "
+                "refusing model-name-gated resume"
+            )
+        extra = dict(checkpoint_identity_extra or {})
+        if canonical_format_plan is not None:
+            if "formats_by_qname" in extra:
+                raise ValueError(
+                    "checkpoint_identity_extra cannot override "
+                    "formats_by_qname"
+                )
+            extra["formats_by_qname"] = {
+                name: list(values)
+                for name, values in canonical_format_plan.items()
+            }
+        identity = _expert_checkpoint_identity(
+            runner=runner,
+            profile=profile,
+            calib_ids=calib_ids,
+            formats=menu,
+            col_weights=weights,
+            unit_identities=unit_identities,
+            model_identity=model_identity,
+            expert_chunk=expert_chunk,
+            ladder_interp=ladder_interp,
+            ladder_tol=ladder_tol,
+            expert_sample=expert_sample,
+            max_units=max_units,
+            unit_filter=unit_filter,
+            identity_extra=extra,
+        )
+        from prismaquant.cost_stage_checkpoint import prepare_journal
+
+        journal_root, journal_identity_sha256, raw_completed = prepare_journal(
+            checkpoint_dir,
+            stage=EXPERT_CHECKPOINT_STAGE,
+            resume=resume,
+            identity=identity,
+            qnames=qnames,
+        )
+        completed = {
+            qname: _validate_expert_checkpoint_state(qname, state)
+            for qname, state in raw_completed.items()
+        }
+
+    pending = [qname for qname in qnames if qname not in completed]
+    baseline = None
+    if pending:
+        # Resume identity was validated above, before this first forward.
+        baseline = _baseline_logprobs(
+            runner.model,
+            calib_ids,
+            forward_model=runner,
+        )
+
+    results: dict[str, dict[str, object]] = dict(completed)
+    for qname in pending:
+        if progress:
+            _log(f"streamed unit {qname}")
+        exact_filter = rf"\A{re.escape(qname)}\Z"
+        unit_menu = menu_by_unit[qname]
+        with runner.pin_layer_for_qname(qname):
+            unit_stats, unit_costs, unit_kls = measure_expert_unit_costs(
+                runner.model,
+                profile,
+                calib_ids,
+                unit_menu,
+                expert_chunk=expert_chunk,
+                progress=False,
+                col_weights=weights,
+                ladder_interp=ladder_interp,
+                ladder_tol=ladder_tol,
+                expert_sample=expert_sample,
+                max_units=0,
+                unit_filter=exact_filter,
+                forward_model=runner,
+                baseline_logprobs=baseline,
+                # Packed streamed units must receive complete persisted
+                # imatrix values. Synthesis needs a second mutable live unit
+                # plus router replay and is intentionally fail-closed here.
+                synthesize_col_weights=False,
+            )
+        if set(unit_kls) != {qname}:
+            raise RuntimeError(
+                f"streamed expert unit {qname} produced unit_kls keys "
+                f"{sorted(unit_kls)!r}"
+            )
+        state = {
+            "stats": unit_stats,
+            "costs": unit_costs,
+            "unit_kls": unit_kls,
+        }
+        results[qname] = state
+        if journal_root is not None:
+            assert journal_identity_sha256 is not None
+            _write_expert_unit_checkpoint(
+                journal_root,
+                qname=qname,
+                identity_sha256=journal_identity_sha256,
+                state=state,
+            )
+
+    stats: dict = {}
+    costs: dict = {}
+    unit_kls: dict = {}
+    for qname in qnames:
+        state = results[qname]
+        stats.update(state["stats"])
+        costs.update(state["costs"])
+        unit_kls.update(state["unit_kls"])
+    if ladder_interp and unit_kls:
+        measure_expert_unit_costs.last_cross_family_verdict = (
+            verdict_from_unit_kls(unit_kls)
+        )
+    else:
+        measure_expert_unit_costs.last_cross_family_verdict = None
+    measure_expert_unit_costs.last_added_col_weights = []
+    return stats, costs, unit_kls
+
+
 def merge_cost_payloads(
     base: Mapping[str, object],
     expert_stats: Mapping[str, object],
@@ -1051,7 +1880,7 @@ def merge_cost_payloads(
         raise RuntimeError(
             f"hybrid merge collision: {len(overlap)} names costed by BOTH "
             f"the base payload and the expert empirical pass (e.g. "
-            f"{sorted(overlap)[:3]}). The base run must omit packed experts "
+            f"{sorted(overlap)[:3]}). The base run must omit routed experts "
             f"(or pass replace_experts for the CB-lane replace semantics).")
     canonical_formats = _canon_formats(formats)
     validate_cb_cost_provenance(
@@ -1116,7 +1945,7 @@ def backfill_missing_from_base(
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Empirical packed-MoE expert cost (+ hybrid merge)")
+        description="Empirical routed-MoE expert cost (+ hybrid merge)")
     p.add_argument("--model", required=True)
     p.add_argument("--cost-mode", default="",
                    help="Pipeline COST_MODE stamped into "
@@ -1126,6 +1955,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "--formats", default="NVFP4,FP8_DYNAMIC,BF16",
         help="Expert format menu. Non-passthrough formats are measured; "
         "BF16/FP8_SOURCE rows are passthrough-zero.")
+    p.add_argument(
+        "--format-plan",
+        default=None,
+        help="Identity-bound source-class format plan. Streaming measurement "
+        "intersects the global menu for every serving unit and refuses a "
+        "group whose members straddle planned menus.",
+    )
     p.add_argument("--n-calib-samples", type=int, default=16)
     p.add_argument("--calib-seqlen", type=int, default=512)
     p.add_argument("--calib-split", default="train")
@@ -1187,13 +2023,48 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--unit-filter", default=None,
         help="Regex on the experts qname; only matching units are "
-        "measured. Validation/sharding aid.")
+             "measured. Validation/sharding aid.")
+    p.add_argument(
+        "--checkpoint-dir", default=None,
+        help="Durable identity-bound per-serving-unit checkpoint directory.")
+    p.add_argument(
+        "--resume", action="store_true",
+        help="Validate and reuse completed qname-keyed unit shards; any "
+             "identity mismatch refuses reuse and recomputation.")
+    p.add_argument(
+        "--streaming", action="store_true",
+        help="Use the existing decoder-layer prefetch/cache context instead "
+             "of loading the expanded source model resident.")
+    p.add_argument(
+        "--streaming-offload-dir", default=None,
+        help="Streaming model work directory. Defaults below the checkpoint "
+             "or output directory and is never placed in /tmp.")
     p.add_argument("--device", default="cuda")
     return p
 
 
+def _streaming_model_identity(
+    runner,
+    source_model: str,
+    *,
+    identity_cache_path: str | Path | None = None,
+) -> dict[str, object]:
+    """Stable source manifest used to bind expert end-to-end KL resumes."""
+    from prismaquant.cost_streaming import build_streamed_model_identity
+
+    return build_streamed_model_identity(
+        runner,
+        source_model,
+        identity_cache_path=identity_cache_path,
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
+    if args.resume and not args.checkpoint_dir:
+        raise SystemExit("--resume requires --checkpoint-dir")
+    if args.format_plan and not args.streaming:
+        raise SystemExit("--format-plan requires --streaming")
 
     from prismaquant.gpu_guard import require_cuda_hot_path
     require_cuda_hot_path("expert_empirical_cost", args.device)
@@ -1202,22 +2073,43 @@ def main(argv: Sequence[str] | None = None) -> int:
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from prismaquant.build_rtn_cache import stage_multimodal
-    from prismaquant.model_profiles import detect_profile_with_warning
+    from prismaquant.model_profiles import detect_profile
 
     staged, _cleanup = stage_multimodal(args.model)
+    # Detection is the authority for routed-expert membership and also
+    # installs any architecture-owned vendored modelling override. Resolve it
+    # before constructing the model; a fallback-after-load would recreate the
+    # silent wrong-topology failure this empirical path exists to prevent.
+    profile = detect_profile(staged)
     local_only = Path(staged).exists()
     tok = AutoTokenizer.from_pretrained(
         staged, trust_remote_code=True, local_files_only=local_only)
     _log(f"loading {args.model} (staged={staged}) bf16 ...")
-    model = AutoModelForCausalLM.from_pretrained(
-        staged, dtype=torch.bfloat16, trust_remote_code=True,
-        local_files_only=local_only, attn_implementation="eager",
-        device_map=args.device,
-    ).eval()
-    for prm in model.parameters():
-        prm.requires_grad_(False)
-    profile = detect_profile_with_warning(
-        staged, entrypoint="expert-empirical-cost")
+    model = None
+    streamed_runner = None
+    if args.streaming:
+        from prismaquant.cost_streaming import build_streamed_causal_lm
+
+        offload_dir = args.streaming_offload_dir
+        if not offload_dir:
+            anchor = Path(args.checkpoint_dir or args.output).parent
+            offload_dir = str(anchor / "expert-cost-streaming-offload")
+        streamed_runner = build_streamed_causal_lm(
+            staged,
+            device=torch.device(args.device),
+            dtype=torch.bfloat16,
+            offload_folder=offload_dir,
+            profile=profile,
+        )
+        model = streamed_runner.model
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            staged, dtype=torch.bfloat16, trust_remote_code=True,
+            local_files_only=local_only, attn_implementation="eager",
+            device_map=args.device,
+        ).eval()
+        for prm in model.parameters():
+            prm.requires_grad_(False)
     # Per-expert-on-disk -> packed-in-class checkpoints (Qwen3.5-MoE /
     # Ornith): the text class lacks the per-expert->packed mapper, so the
     # packed params load ZERO-INITIALIZED — the zero-expert calibration bug
@@ -1231,8 +2123,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     # (`model.language_model.*`), so against the staged index the fill's
     # prefix filter silently matches nothing (how production_recache calls it).
     fill_src = args.model if Path(args.model).exists() else staged
-    filled = fill_packed_experts_from_source(
-        model, fill_src, profile, progress=True)
+    filled = (
+        0
+        if streamed_runner is not None
+        else fill_packed_experts_from_source(
+            model, fill_src, profile, progress=True
+        )
+    )
     if filled:
         _log(f"filled {filled} packed-expert params from source shards")
 
@@ -1252,6 +2149,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     formats = _canon_formats(
         [f for f in args.formats.split(",") if f.strip()])
+    source_format_plan = None
+    if args.format_plan:
+        from prismaquant.source_class_format_plan import load_format_plan
+
+        source_format_plan = load_format_plan(args.format_plan)
     col_weights = None
     if args.col_weights:
         with open(args.col_weights, "rb") as fh:
@@ -1261,12 +2163,55 @@ def main(argv: Sequence[str] | None = None) -> int:
         os.environ.get("PRISMAQUANT_CB_LADDER_INTERP", "0") == "1")
     if col_weights is None:
         col_weights = {}
-    stats, costs, unit_kls = measure_expert_unit_costs(
-        model, profile, calib, formats, expert_chunk=args.expert_chunk,
-        col_weights=col_weights, ladder_interp=ladder_interp,
-        ladder_tol=args.ladder_holdout_tol,
-        expert_sample=args.expert_sample, max_units=args.max_units,
-        unit_filter=args.unit_filter)
+    if streamed_runner is not None:
+        try:
+            streamed_model_identity = None
+            if args.checkpoint_dir:
+                streamed_model_identity = _streaming_model_identity(
+                    streamed_runner,
+                    args.model,
+                    identity_cache_path=(
+                        Path(args.checkpoint_dir)
+                        / "streamed_model_identity.json"
+                    ),
+                )
+            stats, costs, unit_kls = measure_expert_unit_costs_streamed(
+                streamed_runner,
+                profile,
+                calib,
+                formats,
+                expert_chunk=args.expert_chunk,
+                col_weights=col_weights,
+                ladder_interp=ladder_interp,
+                ladder_tol=args.ladder_holdout_tol,
+                expert_sample=args.expert_sample,
+                max_units=args.max_units,
+                unit_filter=args.unit_filter,
+                checkpoint_dir=args.checkpoint_dir,
+                resume=args.resume,
+                model_identity=streamed_model_identity,
+                checkpoint_identity_extra=(
+                    {
+                        "source_format_plan_identity_sha256": (
+                            source_format_plan.identity_sha256
+                        )
+                    }
+                    if source_format_plan is not None else None
+                ),
+                formats_by_qname=(
+                    source_format_plan.formats_by_qname()
+                    if source_format_plan is not None else None
+                ),
+            )
+        finally:
+            streamed_runner.shutdown()
+    else:
+        stats, costs, unit_kls = measure_expert_unit_costs(
+            model, profile, calib, formats, expert_chunk=args.expert_chunk,
+            col_weights=col_weights, ladder_interp=ladder_interp,
+            ladder_tol=args.ladder_holdout_tol,
+            expert_sample=args.expert_sample, max_units=args.max_units,
+            unit_filter=args.unit_filter)
     added_cw = getattr(
         measure_expert_unit_costs, "last_added_col_weights", [])
     if added_cw and args.col_weights:

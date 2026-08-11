@@ -1,5 +1,125 @@
 # Changelog
 
+## Unreleased
+
+## 0.11.0 — 2026-08-11
+
+The learned-codebook release: value-bearing learned books reach the production
+allocator and exporter, and the cost surrogate is refactored so that the
+*evaluation of a model no longer knows what a codebook is*. A platform-agnostic
+anchored-cost core owns anchor planning, shape fitting, hull pruning and
+exposure reporting; a mapping plugin supplies the format vocabulary.
+
+MINOR, not patch: the allocator now rejects candidates that price above the
+source bit rate and replaces the structural CBL rung ceiling with a measured
+per-rung policy, so a CB menu can select a different assignment than 0.10.0
+would have. Published artifacts on disk are unaffected; the lattice default
+render is byte-identical.
+
+**Nothing here is a served result.** There is no vLLM KL-vs-BF16 or WikiText
+PPL for learned codebooks, for LDLQ, or for anchored AURA in this release. The
+routed learned-book runtime opt-in ships **default-off**. The DSv4 anchored-AURA
+campaign has not been run — its driver's first production run will also be the
+first end-to-end exercise of the seams below, every one of which is fail-closed.
+
+### Learned codebooks reach production
+
+- Lift the allocator's hard refusal of `--cb-codebook-source=learned`, replaced
+  by scoped learned bundles: an immutable, value-bearing `.pqcb` read by cost,
+  cache, KL, allocator and export from one identity, rather than a digest
+  manifest plus export-time retraining.
+- A bundle reports its basis **per rung** via `codebook_source_by_format()`
+  (refusing a non-uniform map), which is what lets a single FP8_CB menu span
+  learned K28–K46 alongside lattice K47/K48 instead of forcing one basis on the
+  whole family. `load_bundle`'s policy stamp remains the primary guard.
+- Wire learned bundles through the production exporter.
+- Routed-MoE learned books, **producer side only and refusing by default**:
+  version-gate routed learned refs on the Gridbook per-role LUT ABI
+  (`>= 0.8.3`) so that old, prerelease, local or malformed pins refuse before
+  export. Expert bundle cells are built only from explicitly selected,
+  identity-verified K28–K33 burn shards, copying their FP16 books exactly with
+  no export-time training, LDLQ, directory search or lattice fallback.
+  Independent logical role refs are emitted for fused uniform and
+  per-expert-format stacks while their physical `gate_up_proj`/`down_proj`
+  payloads are retained.
+- **The Gridbook pin stays on the released 0.8.2** (`9f915dd`). An earlier
+  revision of this work advanced it to an "0.8.3 preparation commit"
+  `032e8158…`; that commit exists nowhere — not on the Gridbook remote, whose
+  newest tag is `v0.8.2`, and not in any checkout on the build box, where
+  `gridbook.__version__` still reads `"0.8.2"`. CI caught it at
+  `pip install gridbook @ git+…@032e8158…` and the pin was reverted before this
+  release. Consequence: the routed learned path refuses under the shipped pin,
+  which is the correct state while its ABI is unreleased, and the 0.8.2 fused
+  mid-M rung table remains the attested backed set.
+
+### Anchored AURA — a platform-agnostic cost core with a format plugin
+
+- `anchored_cost` owns the generic mechanism and imports no format module. A
+  plugin declares the candidate ladder, the shape-transfer equivalence
+  partition, the renderer hook, the anchor-rung policy and provenance;
+  `cb_anchored_cost` is the codebook instance.
+- The equivalence partition is load-bearing: segment keys are
+  `(family, role, equivalence_class)` with the class declared by the plugin, and
+  the core refuses to fit or apply a shape across a declared boundary — so
+  pricing a family as one segment when it spans two bases is impossible by
+  construction rather than by convention.
+- AURA `predicted_dloss` is the sole currency; `weight_mse`, `output_mse`,
+  `h_trace` and `cw_m2` are refused as cost inputs so a sensitivity cannot be
+  applied twice. Anchors are production-arm renders bound to a render receipt —
+  a bare scalar cannot masquerade as one.
+- The allocator admits anchored AURA on **provenance**, not on a claimed
+  property: three independent stamps, with `fisher_application_count` read
+  through `operator.index` so a string cannot forge it.
+- **`activation-inclusive` is retired.** Calling anchored AURA an
+  activation-inclusive supersurrogate was wrong. "Supersurrogate" is a statement
+  about the *currency* — one projection replaced the two-factor
+  `h_trace x output_mse` score — not an activation error model: `aura_cost`
+  runs its adjoint on unquantized boundary activations and `dW` is a weight
+  delta. AURA is activation-**weighted** and activation-quantization-**blind**.
+  The activation path is constant across K within a CB family, so the blindness
+  moves only the `nvfp4_cb`-vs-`fp8_cb` family-choice margin. Carried as a named
+  limitation, reported and not gated; a served A/B arbitrates.
+- `dsv4_aura_cb_reprice` is a thin acceptance driver (model profile, CB plugin,
+  byte budget) behind the frozen `tools/run_aura_cb_reprice.sh`, defining none
+  of the pricing math: one production anchor per legal
+  `(unit, family, equivalence_class)` — 66,951 for DSv4, against ~198k cells and
+  ~3.3 TB for a full-menu campaign.
+
+### Allocation legality and provenance
+
+- Derive exact source and candidate payloads from the footprint authorities,
+  reject above-source candidates, and persist complete elimination provenance.
+- Byte-verbatim terminals now speak the allocator's source-passthrough contract
+  (`SOURCE_PASSTHROUGH_COST_SOURCE`) instead of a second spelling of it.
+  Allocation was already numerically correct, but every terminal had been
+  misclassified in provenance and on the activation branch. The two spellings
+  are pinned together by a test.
+- Correct the DSv4 routed-expert profile declarations.
+
+### Identity-bound resume, checkpointing, and exact accounting
+
+- `production_render_cost` gains `--format-plan` and validates the cache format
+  set against it, so a cost run can no longer be scored against a menu the cache
+  was not built for; `source_class_format_plan` derives the plan from source
+  classes rather than a hardcoded family.
+- Streamed cost with identity-bound atomic checkpoints, so a long cost stage
+  resumes on the exact model/menu/arm identity instead of trusting file
+  presence. Same treatment for CB pair shards and per-linear KL adjoints;
+  resumed CB artifact state is verified rather than assumed.
+- Producer identity hashes the complete producer package and binds git-less
+  producer source bytes.
+- Exact per-rung footprint rate accounting, plus an encode-identity regression
+  test so a performance change cannot silently move bytes.
+
+### Performance
+
+- Fuse the LDLQ atom candidate search into one compiled region behind
+  `PRISMAQUANT_CB_ATOM_COMPILE=1` (unset is a byte-identical no-op). Measured at
+  production shapes: `reassign_product_2d` 223.6 ms → 70.0 ms (3.19x),
+  `reassign_product_3d_batched` 1994.5 ms → 258.5 ms (7.72x), peak GPU memory
+  unchanged at 1.21 GB. The eager route keeps `torch.linalg.solve_triangular` —
+  substituting it unconditionally regressed the gate-OFF path to 0.46x.
+
 ## 0.10.0 — 2026-08-09
 
 The DeepSeek-V4-Flash campaign release: LDLQ becomes a *certified* encoder path,

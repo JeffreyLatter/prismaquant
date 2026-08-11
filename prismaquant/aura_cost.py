@@ -32,10 +32,13 @@ requires); memory-safe (one autograd graph at a time, watchdog-gated).
 from __future__ import annotations
 
 import argparse
+from collections.abc import Mapping
 import hashlib
+import json
 import math
 import os
 import pickle
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -55,12 +58,30 @@ from prismaquant.nvfp4_cb_footprint import (
     cb_cost_provenance,
     is_cb_format,
 )
+from prismaquant.routed_experts import (
+    profile_declared_routed_expert_targets,
+    profile_declared_unpacked_expert_linears,
+    resolve_routed_expert_profile,
+)
 
 SCHEMA = "prismaquant.aura_cost.v1"
+AURA_CHECKPOINT_IDENTITY_SCHEMA = "prismaquant.aura_checkpoint.identity.v1"
+AURA_CHECKPOINT_MANIFEST_SCHEMA = "prismaquant.aura_checkpoint.manifest.v1"
+AURA_CHECKPOINT_UNIT_SCHEMA = "prismaquant.aura_checkpoint.unit.v1"
 
 
 def _git_commit() -> str | None:
     """Best-effort commit of the prismaquant tree this cost was computed by."""
+    override = str(os.environ.get(
+        "PRISMAQUANT_IDENTITY_GIT_COMMIT", ""
+    )).strip().lower()
+    if override:
+        if re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", override) is None:
+            raise RuntimeError(
+                "PRISMAQUANT_IDENTITY_GIT_COMMIT must be a full 40- or "
+                "64-character hexadecimal commit id"
+            )
+        return override
     try:
         return subprocess.run(
             ["git", "rev-parse", "HEAD"],
@@ -69,6 +90,323 @@ def _git_commit() -> str | None:
         ).stdout.strip() or None
     except Exception:
         return None
+
+
+def _checkpoint_git_commit() -> str:
+    commit = _git_commit()
+    if commit is None:
+        raise RuntimeError("AURA checkpoint identity cannot resolve git commit")
+    if os.environ.get("PRISMAQUANT_IDENTITY_GIT_COMMIT"):
+        return commit
+    repo_root = Path(__file__).resolve().parents[1]
+    clean = subprocess.run(
+        ["git", "diff", "--quiet", commit, "--", "prismaquant/aura_cost.py"],
+        cwd=repo_root,
+        check=False,
+        timeout=10,
+    )
+    if clean.returncode != 0:
+        raise RuntimeError(
+            "AURA checkpoint git identity is not exact: aura_cost.py differs "
+            f"from commit {commit}; commit it before checkpoint/resume"
+        )
+    return commit
+
+
+def _aura_source_sha256() -> str:
+    """Bind AURA to the complete producer package, including dependencies."""
+    from prismaquant.production_weight_cache import (
+        _production_cache_source_sha256,
+    )
+
+    return _production_cache_source_sha256()
+
+
+def _canonical_json(value: object, *, where: str) -> object:
+    try:
+        encoded = json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{where} is not canonical JSON data") from exc
+    return json.loads(encoded)
+
+
+def _canonical_json_sha256(value: object, *, where: str) -> str:
+    canonical = _canonical_json(value, where=where)
+    return hashlib.sha256(json.dumps(
+        canonical,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")).hexdigest()
+
+
+def _atomic_write_bytes(path: Path, payload: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    with tmp.open("wb") as handle:
+        handle.write(payload)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
+    # fsync the containing directory so the rename itself is durable across a
+    # host reset. Failure is load-bearing and must not be mistaken for a
+    # durable checkpoint.
+    directory_fd = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def _aura_unit_checkpoint_path(checkpoint_dir: Path, qname: str) -> Path:
+    digest = hashlib.sha256(str(qname).encode("utf-8")).hexdigest()
+    return checkpoint_dir / "units" / f"{digest}.pkl"
+
+
+def _raise_checkpoint_identity_mismatch(
+    *,
+    field: str,
+    stored: object,
+    expected: object,
+) -> None:
+    from prismaquant.production_weight_cache import identity_value_for_error
+
+    raise RuntimeError(
+        f"AURA checkpoint identity mismatch at {field}: "
+        f"stored={identity_value_for_error(stored)} "
+        f"current={identity_value_for_error(expected)}; refusing reuse or "
+        "recompute"
+    )
+
+
+def _write_aura_checkpoint_manifest(
+    checkpoint_dir: Path,
+    identity: Mapping[str, object],
+    names: Sequence[str],
+) -> str:
+    identity_sha256 = _canonical_json_sha256(
+        identity,
+        where="AURA checkpoint identity",
+    )
+    manifest = {
+        "schema": AURA_CHECKPOINT_MANIFEST_SCHEMA,
+        "identity_sha256": identity_sha256,
+        "identity": dict(identity),
+        "units": [
+            {
+                "qname": str(name),
+                "file": str(
+                    _aura_unit_checkpoint_path(checkpoint_dir, name).relative_to(
+                        checkpoint_dir
+                    )
+                ),
+            }
+            for name in names
+        ],
+    }
+    encoded = json.dumps(
+        manifest,
+        indent=2,
+        sort_keys=True,
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    _atomic_write_bytes(checkpoint_dir / "manifest.json", encoded)
+    return identity_sha256
+
+
+def _load_aura_checkpoint_manifest(
+    checkpoint_dir: Path,
+    expected_identity: Mapping[str, object],
+) -> str:
+    path = checkpoint_dir / "manifest.json"
+    try:
+        manifest = json.loads(path.read_text())
+    except Exception as exc:
+        _raise_checkpoint_identity_mismatch(
+            field="manifest_json",
+            stored="<invalid>",
+            expected="<valid canonical JSON>",
+        )
+        raise AssertionError("unreachable") from exc
+    if not isinstance(manifest, Mapping):
+        _raise_checkpoint_identity_mismatch(
+            field="manifest",
+            stored=manifest,
+            expected="<object>",
+        )
+    if manifest.get("schema") != AURA_CHECKPOINT_MANIFEST_SCHEMA:
+        _raise_checkpoint_identity_mismatch(
+            field="manifest.schema",
+            stored=manifest.get("schema"),
+            expected=AURA_CHECKPOINT_MANIFEST_SCHEMA,
+        )
+    stored_identity = manifest.get("identity")
+    from prismaquant.production_weight_cache import first_identity_difference
+
+    difference = first_identity_difference(stored_identity, expected_identity)
+    if difference is not None:
+        field, stored, expected = difference
+        _raise_checkpoint_identity_mismatch(
+            field=field,
+            stored=stored,
+            expected=expected,
+        )
+    expected_digest = _canonical_json_sha256(
+        expected_identity,
+        where="AURA checkpoint identity",
+    )
+    if manifest.get("identity_sha256") != expected_digest:
+        _raise_checkpoint_identity_mismatch(
+            field="manifest.identity_sha256",
+            stored=manifest.get("identity_sha256"),
+            expected=expected_digest,
+        )
+    return expected_digest
+
+
+def _write_aura_unit_checkpoint(
+    checkpoint_dir: Path,
+    *,
+    qname: str,
+    identity_sha256: str,
+    state: Mapping[str, object],
+) -> None:
+    state_bytes = pickle.dumps(dict(state), protocol=pickle.HIGHEST_PROTOCOL)
+    envelope = {
+        "schema": AURA_CHECKPOINT_UNIT_SCHEMA,
+        "qname": str(qname),
+        "identity_sha256": str(identity_sha256),
+        "payload_sha256": hashlib.sha256(state_bytes).hexdigest(),
+        "payload": state_bytes,
+    }
+    encoded = pickle.dumps(envelope, protocol=pickle.HIGHEST_PROTOCOL)
+    _atomic_write_bytes(
+        _aura_unit_checkpoint_path(checkpoint_dir, qname),
+        encoded,
+    )
+
+
+def _load_aura_unit_checkpoint(
+    path: Path,
+    *,
+    qname: str,
+    identity_sha256: str,
+) -> dict[str, object]:
+    try:
+        with path.open("rb") as handle:
+            envelope = pickle.load(handle)
+    except Exception as exc:
+        raise RuntimeError(
+            f"AURA unit checkpoint {path} is corrupt for {qname}; refusing "
+            "reuse or recompute"
+        ) from exc
+    if not isinstance(envelope, Mapping):
+        raise RuntimeError(
+            f"AURA unit checkpoint {path} is not an envelope for {qname}; "
+            "refusing reuse or recompute"
+        )
+    for field, expected in (
+        ("schema", AURA_CHECKPOINT_UNIT_SCHEMA),
+        ("qname", str(qname)),
+        ("identity_sha256", str(identity_sha256)),
+    ):
+        if envelope.get(field) != expected:
+            _raise_checkpoint_identity_mismatch(
+                field=f"unit[{qname}].{field}",
+                stored=envelope.get(field),
+                expected=expected,
+            )
+    payload = envelope.get("payload")
+    if not isinstance(payload, bytes):
+        raise RuntimeError(
+            f"AURA unit checkpoint {path} has no byte payload for {qname}; "
+            "refusing reuse or recompute"
+        )
+    payload_sha256 = hashlib.sha256(payload).hexdigest()
+    if envelope.get("payload_sha256") != payload_sha256:
+        raise RuntimeError(
+            f"AURA unit checkpoint {path} payload_sha256 differs for {qname}; "
+            "refusing reuse or recompute"
+        )
+    try:
+        state = pickle.loads(payload)
+    except Exception as exc:
+        raise RuntimeError(
+            f"AURA unit checkpoint {path} state is corrupt for {qname}; "
+            "refusing reuse or recompute"
+        ) from exc
+    if not isinstance(state, Mapping):
+        raise RuntimeError(
+            f"AURA unit checkpoint {path} state is not an object for {qname}; "
+            "refusing reuse or recompute"
+        )
+    return dict(state)
+
+
+def _prepare_aura_checkpoints(
+    checkpoint_dir: str | Path,
+    *,
+    resume: bool,
+    identity: Mapping[str, object],
+    names: Sequence[str],
+) -> tuple[Path, str, dict[str, dict[str, object]]]:
+    root = Path(checkpoint_dir)
+    if root.exists() and not root.is_dir():
+        raise RuntimeError(f"AURA checkpoint path is not a directory: {root}")
+    root.mkdir(parents=True, exist_ok=True)
+    manifest_path = root / "manifest.json"
+    if manifest_path.is_file():
+        if not resume:
+            raise RuntimeError(
+                f"AURA checkpoint manifest already exists at {manifest_path}; "
+                "pass --resume to validate and reuse it"
+            )
+        identity_sha256 = _load_aura_checkpoint_manifest(root, identity)
+    else:
+        existing_units = sorted((root / "units").glob("*.pkl"))
+        if existing_units:
+            raise RuntimeError(
+                "AURA checkpoint units exist without a manifest; refusing "
+                f"name-gated reuse or recompute. sample={existing_units[:8]}"
+            )
+        identity_sha256 = _write_aura_checkpoint_manifest(
+            root,
+            identity,
+            names,
+        )
+
+    expected_paths = {
+        _aura_unit_checkpoint_path(root, name): str(name)
+        for name in names
+    }
+    unexpected = sorted(
+        path for path in (root / "units").glob("*.pkl")
+        if path not in expected_paths
+    )
+    if unexpected:
+        _raise_checkpoint_identity_mismatch(
+            field="units.unexpected",
+            stored=[str(path.name) for path in unexpected[:8]],
+            expected=[],
+        )
+    completed: dict[str, dict[str, object]] = {}
+    for path, name in expected_paths.items():
+        if not path.is_file():
+            continue
+        completed[name] = _load_aura_unit_checkpoint(
+            path,
+            qname=name,
+            identity_sha256=identity_sha256,
+        )
+    return root, identity_sha256, completed
 
 # Passthrough formats -> zero predicted_dloss. This is the *passthrough rule*
 # (see allocator_candidates.PASSTHROUGH_SOURCE_REQUIREMENTS): zero cost is
@@ -85,7 +423,12 @@ def _git_commit() -> str | None:
 # no source tensor in a bf16/fp32-loaded model, so its legality is gated by the
 # allocator's passthrough-integrity check, not here; aura only declines to
 # double-count it.
-_ZERO_COST_FORMATS = {"BF16", "FP8_SOURCE"}
+_ZERO_COST_FORMATS = {
+    "BF16",
+    "FP8_SOURCE",
+    "FP8_BLOCK_UE8M0_SOURCE",
+    "MXFP4_SOURCE",
+}
 
 
 def _resolve_auto_dtype(
@@ -178,7 +521,11 @@ def _free_gib() -> float:
 
 
 def _target_linears(
-    model: nn.Module, *, include_lm_head: bool = False,
+    model: nn.Module,
+    *,
+    include_lm_head: bool = False,
+    include_routed_experts: bool = False,
+    profile=None,
 ) -> dict[str, nn.Linear]:
     """Quantizable nn.Linear targets. lm_head is EXCLUDED by default (the
     profile pins it BF16). include_lm_head adds it so Aura can MEASURE its
@@ -186,9 +533,21 @@ def _target_linears(
     decision rather than a hardcoded pin -- the KL probe gradient flows
     directly into lm_head (it produces the logits), so its cost is
     measured the same way as any body Linear."""
+    # Routed-expert membership is a serving/model-profile property, not a
+    # tensor-rank property.  In particular DSv4's probe model exposes every
+    # expert projection as a 2-D Linear, which otherwise looks exactly like a
+    # smooth AURA target.  Resolve the same profile-owned predicate used by
+    # the coverage guard below so exclusion and enforcement cannot diverge.
+    profile = resolve_routed_expert_profile(model, profile)
+    unpacked_expert_names = {
+        member.qname
+        for member in profile_declared_unpacked_expert_linears(model, profile)
+    }
     out: dict[str, nn.Linear] = {}
     for name, mod in model.named_modules():
         if not isinstance(mod, nn.Linear):
+            continue
+        if name in unpacked_expert_names and not include_routed_experts:
             continue
         if "lm_head" in name and not include_lm_head:
             continue
@@ -312,16 +671,13 @@ def _auto_n_chunks(
 
 
 def _packed_expert_targets(model: nn.Module, profile=None) -> list[str]:
-    from prismaquant.build_rtn_cache import iter_quantizable_tensors
+    """Profile-declared routed expert targets in either physical layout.
 
-    out: list[str] = []
-    for name, mod, attr in iter_quantizable_tensors(model, profile):
-        if isinstance(mod, nn.Linear):
-            continue
-        param = getattr(mod, attr, None)
-        if isinstance(param, nn.Parameter) and param.dim() == 3:
-            out.append(str(name))
-    return sorted(set(out))
+    The historical name is retained for artifact/provenance compatibility,
+    but rank is intentionally absent: packed 3-D Parameters and unpacked 2-D
+    expert Linears are the same route-sensitive serving class.
+    """
+    return profile_declared_routed_expert_targets(model, profile)
 
 
 def _guard_packed_expert_coverage(
@@ -330,23 +686,379 @@ def _guard_packed_expert_coverage(
     *,
     allow_omission: bool = False,
 ) -> list[str]:
-    packed = _packed_expert_targets(model, profile)
-    if packed and not allow_omission:
-        sample = ", ".join(packed[:6])
+    routed = _packed_expert_targets(model, profile)
+    if routed and not allow_omission:
+        sample = ", ".join(routed[:6])
         raise RuntimeError(
-            "Aura cost does not yet implement packed-MoE expert costs; "
-            f"found {len(packed)} packed expert tensor(s), sample={sample}. "
-            "Use the empirical packed-expert cost path or pass "
+            "Aura cost does not yet implement packed-MoE expert costs in its "
+            "smooth sweep; "
+            f"found {len(routed)} profile-declared routed expert target(s), "
+            f"sample={sample}. Use the empirical routed-expert cost path or pass "
             "--allow-packed-expert-omission only for an explicit research/debug "
             "run that accepts experts being omitted from the AURA cost payload."
         )
-    if packed:
+    if routed:
         print(
-            "[aura-cost] WARNING: omitting packed-MoE experts from Aura cost "
-            f"by explicit request: {len(packed)} tensors, sample={packed[:6]}",
+            "[aura-cost] WARNING: omitting profile-declared routed experts "
+            "from Aura cost by explicit request: "
+            f"{len(routed)} targets, sample={routed[:6]}",
             flush=True,
         )
-    return packed
+    return routed
+
+
+def _build_aura_checkpoint_identity(
+    *,
+    model: nn.Module,
+    calib_ids: torch.Tensor,
+    names: Sequence[str],
+    linears: Mapping[str, nn.Linear],
+    formats: Sequence[str],
+    chunks: Sequence[Sequence[str]],
+    n_probes: int,
+    token_scope: str,
+    temperature: float,
+    seed_base: int,
+    dw_dtype: str,
+    include_lm_head: bool,
+    hook_harvest: bool,
+    allow_packed_expert_omission: bool,
+    probe_microbatch: int,
+    collect_col_energy: bool,
+    require_production_cache: bool,
+    production_cache: object,
+    cb_provenance: Mapping[str, object],
+    git_commit: str,
+    extra_identity: Mapping[str, object] | None,
+) -> dict[str, object]:
+    raw_calib_sha256 = hashlib.sha256(
+        calib_ids.detach().cpu().contiguous().numpy().tobytes()
+    ).hexdigest()
+    cache_metadata = getattr(production_cache, "metadata", None)
+    cache_metadata = cache_metadata if isinstance(cache_metadata, Mapping) else {}
+    identity = {
+        "schema": AURA_CHECKPOINT_IDENTITY_SCHEMA,
+        "git_commit": str(git_commit),
+        "producer_source_sha256": _aura_source_sha256(),
+        "calibration": {
+            "shape": [int(dim) for dim in calib_ids.shape],
+            "dtype": str(calib_ids.dtype),
+            "sha256": raw_calib_sha256,
+            "calib_hash": calibration_data_hash(calib_ids),
+        },
+        "formats": [str(fmt) for fmt in formats],
+        "units": [
+            {
+                "qname": str(name),
+                "shape": [int(dim) for dim in linears[name].weight.shape],
+                "dtype": str(linears[name].weight.dtype),
+                "n_params": int(linears[name].weight.numel()),
+            }
+            for name in names
+        ],
+        "chunks": [[str(name) for name in chunk] for chunk in chunks],
+        "n_probes": int(n_probes),
+        "token_scope": str(token_scope),
+        "temperature": float(temperature),
+        "seed_base": int(seed_base),
+        "measurement_dtype": str(next(model.parameters()).dtype),
+        "dw_dtype": str(dw_dtype),
+        "include_lm_head": bool(include_lm_head),
+        "hook_harvest": bool(hook_harvest),
+        "allow_packed_expert_omission": bool(allow_packed_expert_omission),
+        "probe_microbatch": int(probe_microbatch),
+        "collect_col_energy": bool(collect_col_energy),
+        "require_production_cache": bool(require_production_cache),
+        "production_cache_calib_hash": cache_metadata.get("calib_hash"),
+        "production_cache_pair_identity": cache_metadata.get(
+            "cb_cache_pair_identity"
+        ),
+        # The complete value-bearing identity is intentionally embedded, not
+        # reduced to a cache filename. It binds codebooks, source/column
+        # weights, scale/layout/sweep/LDLQ, and every qname/rung format scope.
+        "cb_render_identity": cb_provenance.get("cb_render_identity"),
+        "extra": dict(extra_identity or {}),
+    }
+    return _canonical_json(identity, where="AURA checkpoint identity")
+
+
+def _validate_aura_checkpoint_cache_identity(production_cache: object) -> None:
+    metadata = getattr(production_cache, "metadata", None)
+    if not isinstance(metadata, Mapping):
+        raise RuntimeError(
+            "AURA durable checkpointing requires production-cache metadata; "
+            "refusing model/cache name-gated resume"
+        )
+    calibration_hash = metadata.get("calib_hash")
+    if not isinstance(calibration_hash, str) or not calibration_hash:
+        raise RuntimeError(
+            "AURA durable checkpointing requires the production cache's exact "
+            "calib_hash; refusing model/cache name-gated resume"
+        )
+    pair_set = metadata.get("cb_cache_pair_identity")
+    if not isinstance(pair_set, Mapping):
+        raise RuntimeError(
+            "AURA durable checkpointing requires identity-bound CB pair "
+            "artifacts; refusing model/cache name-gated resume"
+        )
+    if pair_set.get("schema") != (
+        "prismaquant.production_weight_cache.cb_pair_set.v1"
+    ):
+        raise RuntimeError(
+            "AURA durable checkpointing found an unsupported CB pair identity "
+            f"schema {pair_set.get('schema')!r}"
+        )
+    try:
+        entries = int(pair_set["entries"])
+        published_entries = int(pair_set["published_entries"])
+    except Exception as exc:
+        raise RuntimeError(
+            "AURA durable checkpointing found malformed CB pair entry counts"
+        ) from exc
+    if entries < 1 or published_entries != entries:
+        raise RuntimeError(
+            "AURA durable checkpointing requires every identity-bound CB pair "
+            f"artifact to be published; entries={entries} "
+            f"published_entries={published_entries}"
+        )
+    for field in ("identity_sha256", "artifact_sha256"):
+        digest = str(pair_set.get(field, "")).lower()
+        if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise RuntimeError(
+                "AURA durable checkpointing found an invalid CB pair "
+                f"{field}"
+            )
+    calibration_hashes = pair_set.get("calibration_hashes")
+    if (
+        not isinstance(calibration_hashes, Sequence)
+        or isinstance(calibration_hashes, (str, bytes))
+        or list(calibration_hashes) != [calibration_hash]
+    ):
+        raise RuntimeError(
+            "AURA durable checkpointing found a production-cache calibration "
+            "hash that differs from its CB pair artifacts"
+        )
+    commits = pair_set.get("git_commits")
+    if (
+        not isinstance(commits, Sequence)
+        or isinstance(commits, (str, bytes))
+        or len(commits) != 1
+        or re.fullmatch(
+            r"(?:[0-9a-f]{40}|[0-9a-f]{64})",
+            str(commits[0]).lower(),
+        ) is None
+    ):
+        raise RuntimeError(
+            "AURA durable checkpointing requires one exact CB pair producer "
+            "git commit"
+        )
+    source_digests = pair_set.get("producer_source_sha256")
+    if (
+        not isinstance(source_digests, Sequence)
+        or isinstance(source_digests, (str, bytes))
+        or len(source_digests) != 1
+        or re.fullmatch(
+            r"[0-9a-f]{64}", str(source_digests[0]).lower()
+        ) is None
+    ):
+        raise RuntimeError(
+            "AURA durable checkpointing requires one exact CB renderer "
+            "source SHA-256 identity"
+        )
+
+
+def _aura_unit_state(
+    name: str,
+    nonzero_formats: Sequence[str],
+    *,
+    s2: Mapping[tuple[str, str], float],
+    s4: Mapping[tuple[str, str], float],
+    x2_probe: Mapping[tuple[str, str], list[float]],
+    dw_src: Mapping[tuple[str, str], str],
+    g_trace: Mapping[str, float],
+    col_energy: Mapping[str, torch.Tensor],
+    weight_mse_diagnostic: Mapping[tuple[str, str], float] | None = None,
+    source_weight_identity: Mapping[str, Mapping[str, object]] | None = None,
+) -> dict[str, object]:
+    rows: dict[str, dict[str, object]] = {}
+    for fmt in nonzero_formats:
+        key = (name, fmt)
+        if key not in s2:
+            continue
+        rows[fmt] = {
+            "s2": float(s2[key]),
+            "s4": float(s4[key]),
+            "x2_probe": list(x2_probe[key]),
+            "dw_src": str(dw_src[key]),
+        }
+        if (
+            weight_mse_diagnostic is not None
+            and key in weight_mse_diagnostic
+        ):
+            rows[fmt]["weight_mse_diagnostic"] = float(
+                weight_mse_diagnostic[key]
+            )
+    state = {
+        "g_trace": float(g_trace[name]),
+        "rows": rows,
+        "col_energy": (
+            col_energy[name].detach().to(device="cpu", dtype=torch.float32)
+            if name in col_energy
+            else None
+        ),
+    }
+    if source_weight_identity is not None and name in source_weight_identity:
+        state["source_weight_identity"] = dict(
+            source_weight_identity[name]
+        )
+    return state
+
+
+def _restore_aura_unit_state(
+    name: str,
+    state: Mapping[str, object],
+    *,
+    nonzero_formats: Sequence[str],
+    n_probes: int,
+    collect_col_energy: bool,
+    s2: dict[tuple[str, str], float],
+    s4: dict[tuple[str, str], float],
+    x2_probe: dict[tuple[str, str], list[float]],
+    dw_src: dict[tuple[str, str], str],
+    g_trace: dict[str, float],
+    col_energy: dict[str, torch.Tensor],
+    diagnostic_weight_mse_pairs: set[tuple[str, str]] | None = None,
+    weight_mse_diagnostic: dict[tuple[str, str], float] | None = None,
+    require_source_weight_identity: bool = False,
+    source_weight_identity: dict[str, dict[str, object]] | None = None,
+) -> None:
+    try:
+        g_trace[name] = float(state["g_trace"])
+    except Exception as exc:
+        raise RuntimeError(
+            f"AURA unit checkpoint state for {name} has invalid g_trace; "
+            "refusing reuse or recompute"
+        ) from exc
+    rows = state.get("rows")
+    if not isinstance(rows, Mapping):
+        raise RuntimeError(
+            f"AURA unit checkpoint state for {name} has invalid rows; "
+            "refusing reuse or recompute"
+        )
+    unexpected = sorted(set(str(fmt) for fmt in rows) - set(nonzero_formats))
+    if unexpected:
+        raise RuntimeError(
+            f"AURA unit checkpoint state for {name} has unexpected formats "
+            f"{unexpected}; refusing reuse or recompute"
+        )
+    for raw_fmt, raw_row in rows.items():
+        fmt = str(raw_fmt)
+        if not isinstance(raw_row, Mapping):
+            raise RuntimeError(
+                f"AURA unit checkpoint state for {name}@{fmt} is invalid; "
+                "refusing reuse or recompute"
+            )
+        samples = raw_row.get("x2_probe")
+        if (
+            not isinstance(samples, Sequence)
+            or isinstance(samples, (str, bytes))
+            or len(samples) != int(n_probes)
+        ):
+            raise RuntimeError(
+                f"AURA unit checkpoint state for {name}@{fmt} has "
+                f"x2_probe length {len(samples) if isinstance(samples, Sequence) else '<invalid>'}; "
+                f"expected {n_probes}; refusing reuse or recompute"
+            )
+        key = (name, fmt)
+        try:
+            s2[key] = float(raw_row["s2"])
+            s4[key] = float(raw_row["s4"])
+            x2_probe[key] = [float(value) for value in samples]
+            dw_src[key] = str(raw_row["dw_src"])
+        except Exception as exc:
+            raise RuntimeError(
+                f"AURA unit checkpoint state for {name}@{fmt} is malformed; "
+                "refusing reuse or recompute"
+            ) from exc
+        expected_diagnostic = (
+            diagnostic_weight_mse_pairs is not None
+            and key in diagnostic_weight_mse_pairs
+        )
+        observed_diagnostic = "weight_mse_diagnostic" in raw_row
+        if observed_diagnostic != expected_diagnostic:
+            raise RuntimeError(
+                f"AURA unit checkpoint state for {name}@{fmt} diagnostic "
+                "weight-MSE scope differs; refusing reuse or recompute"
+            )
+        if expected_diagnostic:
+            if weight_mse_diagnostic is None:
+                raise RuntimeError(
+                    "AURA diagnostic weight-MSE restore has no destination"
+                )
+            try:
+                weight_mse_diagnostic[key] = float(
+                    raw_row["weight_mse_diagnostic"]
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"AURA unit checkpoint state for {name}@{fmt} has an "
+                    "invalid diagnostic weight-MSE"
+                ) from exc
+    stored_col_energy = state.get("col_energy")
+    if collect_col_energy:
+        if stored_col_energy is not None and not isinstance(
+            stored_col_energy, torch.Tensor
+        ):
+            raise RuntimeError(
+                f"AURA unit checkpoint state for {name} has invalid "
+                "col_energy; refusing reuse or recompute"
+            )
+        if isinstance(stored_col_energy, torch.Tensor):
+            col_energy[name] = stored_col_energy.detach().to(
+                device="cpu", dtype=torch.float32
+            )
+    elif stored_col_energy is not None:
+        raise RuntimeError(
+            f"AURA unit checkpoint state for {name} unexpectedly carries "
+            "col_energy; refusing reuse or recompute"
+        )
+    raw_source = state.get("source_weight_identity")
+    if require_source_weight_identity:
+        if not isinstance(raw_source, Mapping):
+            raise RuntimeError(
+                f"AURA unit checkpoint state for {name} has no production "
+                "anchor source-weight identity; refusing reuse or recompute"
+            )
+        try:
+            shape = [int(dim) for dim in raw_source["shape"]]
+            digest = str(raw_source["sha256"]).lower()
+        except Exception as exc:
+            raise RuntimeError(
+                f"AURA unit checkpoint state for {name} has malformed "
+                "source-weight identity"
+            ) from exc
+        if (
+            len(shape) != 2
+            or any(dim <= 0 for dim in shape)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        ):
+            raise RuntimeError(
+                f"AURA unit checkpoint state for {name} has invalid "
+                "source-weight shape/hash"
+            )
+        if source_weight_identity is None:
+            raise RuntimeError(
+                "AURA source-weight identity restore has no destination"
+            )
+        source_weight_identity[name] = {
+            "shape": shape,
+            "sha256": digest,
+        }
+    elif raw_source is not None:
+        raise RuntimeError(
+            f"AURA unit checkpoint state for {name} unexpectedly carries a "
+            "production-anchor source identity"
+        )
 
 
 def compute_aura_cost(
@@ -370,6 +1082,11 @@ def compute_aura_cost(
     allow_packed_expert_omission: bool = False,
     probe_microbatch: int = 0,
     collect_col_energy: bool = False,
+    checkpoint_dir: str | Path | None = None,
+    resume: bool = False,
+    unit_filter: str | None = None,
+    checkpoint_identity_extra: Mapping[str, object] | None = None,
+    profile=None,
 ) -> dict:
     """Return a cost.pkl payload dict (stats + costs) for the allocator.
 
@@ -382,11 +1099,15 @@ def compute_aura_cost(
     just computed in G memory-bounded passes. 0 = auto-size from free memory."""
     if n_probes < 1:
         raise ValueError(f"n_probes must be >= 1, got {n_probes!r}")
+    if resume and checkpoint_dir is None:
+        raise ValueError("resume=True requires checkpoint_dir")
+    profile = resolve_routed_expert_profile(model, profile)
     omitted_packed_experts = _guard_packed_expert_coverage(
-        model, allow_omission=allow_packed_expert_omission)
+        model, profile, allow_omission=allow_packed_expert_omission)
     _dw_torch_dtype = torch.float32 if str(dw_dtype) == "float32" else torch.bfloat16
     device = next(model.parameters()).device
-    linears = _target_linears(model, include_lm_head=include_lm_head)
+    linears = _target_linears(
+        model, include_lm_head=include_lm_head, profile=profile)
     if include_lm_head:
         # Tied-embeddings guard: with tie_word_embeddings the lm_head Parameter
         # IS the input embedding. The retained probe gradient on the shared
@@ -413,6 +1134,19 @@ def compute_aura_cost(
                 f"includes the embedding-path contribution, so this cost would "
                 f"not measure the lm_head-only decision the allocator prices. "
                 f"Drop --include-lm-head for tied models.")
+    if unit_filter:
+        try:
+            unit_pattern = re.compile(str(unit_filter))
+        except re.error as exc:
+            raise ValueError(f"invalid unit_filter regex {unit_filter!r}") from exc
+        linears = {
+            name: mod for name, mod in linears.items()
+            if unit_pattern.search(name)
+        }
+        if not linears:
+            raise ValueError(
+                f"unit_filter {unit_filter!r} matched no AURA Linear qnames"
+            )
     names = list(linears.keys())
     fmts = [fr.canonical_format_name(f) for f in formats]
     nonzero_fmts = [f for f in fmts if f not in _ZERO_COST_FORMATS]
@@ -432,6 +1166,14 @@ def compute_aura_cost(
             require_for_formats=fmts,
             where="AURA production cache",
         )
+    if checkpoint_dir is not None and not cb_provenance:
+        raise RuntimeError(
+            "AURA durable checkpointing requires a value-bearing CB "
+            "ProductionWeightCache identity; refusing model/cache name-gated "
+            "resume"
+        )
+    if checkpoint_dir is not None:
+        _validate_aura_checkpoint_cache_identity(production_cache)
     # Passthrough-rule guard (opt-in; default off keeps the output byte-for-byte
     # identical). BF16 zero-cost is only valid when the source weight is already
     # bf16/fp16 -- on an fp32-source model loaded as fp32, casting W to BF16 is a
@@ -488,14 +1230,90 @@ def compute_aura_cost(
     col_energy: dict[str, torch.Tensor] = {}
     inv = 1.0 / float(n_probes)
 
-    for ci, chunk in enumerate(chunks):
+    checkpoint_root: Path | None = None
+    checkpoint_identity_sha256: str | None = None
+    completed_checkpoint_units: set[str] = set()
+    checkpoint_git_commit: str | None = None
+    if checkpoint_dir is not None:
+        checkpoint_git_commit = _checkpoint_git_commit()
+        checkpoint_identity = _build_aura_checkpoint_identity(
+            model=model,
+            calib_ids=calib_ids,
+            names=names,
+            linears=linears,
+            formats=fmts,
+            chunks=chunks,
+            n_probes=n_probes,
+            token_scope=token_scope,
+            temperature=temperature,
+            seed_base=seed_base,
+            dw_dtype=dw_dtype,
+            include_lm_head=include_lm_head,
+            hook_harvest=hook_harvest,
+            allow_packed_expert_omission=allow_packed_expert_omission,
+            probe_microbatch=probe_microbatch,
+            collect_col_energy=collect_col_energy,
+            require_production_cache=require_production_cache,
+            production_cache=production_cache,
+            cb_provenance=cb_provenance,
+            git_commit=checkpoint_git_commit,
+            extra_identity=checkpoint_identity_extra,
+        )
+        checkpoint_root, checkpoint_identity_sha256, completed_states = (
+            _prepare_aura_checkpoints(
+                checkpoint_dir,
+                resume=resume,
+                identity=checkpoint_identity,
+                names=names,
+            )
+        )
+        for name in names:
+            state = completed_states.get(name)
+            if state is None:
+                continue
+            _restore_aura_unit_state(
+                name,
+                state,
+                nonzero_formats=nonzero_fmts,
+                n_probes=n_probes,
+                collect_col_energy=collect_col_energy,
+                s2=s2,
+                s4=s4,
+                x2_probe=x2_probe,
+                dw_src=dw_src,
+                g_trace=g_trace,
+                col_energy=col_energy,
+            )
+            completed_checkpoint_units.add(name)
+        if completed_checkpoint_units:
+            _log(
+                f"checkpoint resume: validated {len(completed_checkpoint_units)}/"
+                f"{len(names)} completed Linear units"
+            )
+
+    for ci, original_chunk in enumerate(chunks):
+        pending_chunk = [
+            name for name in original_chunk
+            if name not in completed_checkpoint_units
+        ]
+        if not pending_chunk:
+            if checkpoint_root is not None:
+                _log(f"chunk {ci+1}/{len(chunks)}: fully checkpointed; skip")
+            continue
+        # A process can die between the atomic publication of two unit shards
+        # from the same completed chunk. Re-arm the complete original chunk so
+        # each pending unit sees the identical autograd topology/kernel work it
+        # saw uninterrupted; already-published siblings are harvested and then
+        # discarded, never accumulated twice.
+        chunk = list(original_chunk)
+        pending_names = set(pending_chunk)
         for n in chunk:
             linears[n].weight.requires_grad_(True)
         # Precompute dW_{i,f} (fp32 delta, stored bf16) for this chunk only.
         dW: dict[tuple[str, str], torch.Tensor] = {}
         with torch.no_grad():
             for f in nonzero_fmts:
-                for n in chunk:
+                for n in pending_chunk:
                     res = _delta_w(n, f, linears[n].weight.data,
                                    production_cache,
                                    strict=require_production_cache)
@@ -507,7 +1325,7 @@ def compute_aura_cost(
             s2.setdefault(key, 0.0)
             s4.setdefault(key, 0.0)
             x2_probe.setdefault(key, [])
-        for n in chunk:
+        for n in pending_chunk:
             g_trace.setdefault(n, 0.0)
         # dW is now materialized for this chunk; the cache's LRU-resident
         # rendered weights are no longer needed. Evict them (back to disk
@@ -532,6 +1350,7 @@ def compute_aura_cost(
         torch.cuda.empty_cache()
         if len(chunks) > 1:
             _log(f"chunk {ci+1}/{len(chunks)}: {len(chunk)} Linears, "
+                 f"pending={len(pending_chunk)}/{len(chunk)} Linears, "
                  f"dW pairs={len(dW)}; free={_free_gib():.1f}")
 
         # K probe backward passes; one autograd graph alive at a time (fresh
@@ -549,6 +1368,8 @@ def compute_aura_cost(
             sums. Single reduction shared by all three harvest sites (hook,
             post-backward straggler sweep, legacy loop) so they are
             arithmetically identical by construction."""
+            if name not in pending_names:
+                return
             with torch.no_grad():
                 gf = g.float()
                 g_trace[name] += float((gf * gf).sum().item())
@@ -675,6 +1496,28 @@ def compute_aura_cost(
                      f"free={_free_gib():.1f}")
         for h in hook_handles:
             h.remove()
+        if checkpoint_root is not None:
+            assert checkpoint_identity_sha256 is not None
+            # Publish one durable accumulator shard per completed Linear only
+            # after all of its probes have been harvested. A kill between unit
+            # renames loses at most the unpublished units in this chunk.
+            for n in pending_chunk:
+                state = _aura_unit_state(
+                    n,
+                    nonzero_fmts,
+                    s2=s2,
+                    s4=s4,
+                    x2_probe=x2_probe,
+                    dw_src=dw_src,
+                    g_trace=g_trace,
+                    col_energy=col_energy,
+                )
+                _write_aura_unit_checkpoint(
+                    checkpoint_root,
+                    qname=n,
+                    identity_sha256=checkpoint_identity_sha256,
+                    state=state,
+                )
         # Release this chunk's dW + grad enablement before the next chunk.
         del dW
         for n in chunk:
@@ -781,7 +1624,11 @@ def compute_aura_cost(
             "omitted_packed_experts": omitted_packed_experts,
             "dw_rendered_rows": n_rendered,
             "dw_rtn_fallback_rows": n_rtn,
-            "git_commit": _git_commit(),
+            "git_commit": (
+                checkpoint_git_commit
+                if checkpoint_git_commit is not None
+                else _git_commit()
+            ),
             **(
                 cb_provenance
                 if cb_provenance
@@ -791,13 +1638,1092 @@ def compute_aura_cost(
     }
 
 
+def _assemble_streamed_aura_payload(
+    *,
+    linears: Mapping[str, nn.Linear],
+    names: Sequence[str],
+    formats: Sequence[str],
+    formats_by_qname: Mapping[str, Sequence[str]],
+    n_probes: int,
+    token_scope: str,
+    seed_base: int,
+    temperature: float,
+    dw_dtype: str,
+    measurement_dtype: torch.dtype,
+    n_linear_chunks: int,
+    calib_ids: torch.Tensor,
+    omitted_packed_experts: Sequence[str],
+    cb_provenance: Mapping[str, object],
+    checkpoint_git_commit: str | None,
+    collect_col_energy: bool,
+    s2: Mapping[tuple[str, str], float],
+    s4: Mapping[tuple[str, str], float],
+    x2_probe: Mapping[tuple[str, str], list[float]],
+    dw_src: Mapping[tuple[str, str], str],
+    g_trace: Mapping[str, float],
+    col_energy: Mapping[str, torch.Tensor],
+    weight_mse_diagnostic: Mapping[tuple[str, str], float],
+) -> dict:
+    inv = 1.0 / float(n_probes)
+    stats: dict[str, dict] = {}
+    costs: dict[str, dict] = {}
+    for name in names:
+        mod = linears[name]
+        stats[name] = {
+            "h_trace": g_trace[name] * inv,
+            "n_params": int(mod.weight.numel()),
+            "in_features": int(getattr(mod, "in_features", mod.weight.shape[1])),
+            "out_features": int(getattr(mod, "out_features", mod.weight.shape[0])),
+            "n_probes": int(n_probes),
+        }
+        if collect_col_energy and name in col_energy:
+            stats[name]["fisher_col"] = (
+                col_energy[name].float() * inv
+            ).detach().cpu()
+        costs[name] = {}
+        for fmt in formats_by_qname[name]:
+            if fmt in _ZERO_COST_FORMATS:
+                costs[name][fmt] = {
+                    "predicted_dloss": 0.0,
+                    "output_mse_measured": False,
+                    "cost_source": "aura_passthrough_zero",
+                }
+                continue
+            key = (name, fmt)
+            if key not in s2:
+                continue
+            mean_x2 = inv * s2[key]
+            variance = (
+                max(
+                    (s4[key] - n_probes * mean_x2 * mean_x2)
+                    / (n_probes - 1),
+                    0.0,
+                )
+                if n_probes >= 2
+                else 0.0
+            )
+            row = {
+                "predicted_dloss": 0.5 * mean_x2,
+                "predicted_dloss_stderr": 0.5 * math.sqrt(variance * inv),
+                "x2_per_probe": x2_probe[key],
+                "dw_source": dw_src[key],
+                "output_mse_measured": False,
+                "cost_source": "aura",
+            }
+            if dw_src[key] == "production_render":
+                row.update({
+                    "production_anchor_measured": True,
+                    "production_anchor_zero": mean_x2 == 0.0,
+                })
+            if key in weight_mse_diagnostic:
+                row.update({
+                    # Diagnostic only: AURA remains the allocator's sole cost
+                    # currency. This same-render value tests within-basis
+                    # currency-ratio invariance on fitting-panel cells.
+                    "weight_mse_diagnostic": float(
+                        weight_mse_diagnostic[key]
+                    ),
+                    "weight_mse_diagnostic_normalization": "mean_per_weight",
+                    "weight_mse_is_cost_input": False,
+                })
+            costs[name][fmt] = row
+
+    calib_cpu = calib_ids.detach().cpu().contiguous()
+    return {
+        "schema": SCHEMA,
+        "n_probes": n_probes,
+        "formats": list(formats),
+        "token_scope": token_scope,
+        "stats": stats,
+        "costs": costs,
+        "provenance": {
+            "seed_base": int(seed_base),
+            "temperature": float(temperature),
+            "dw_dtype": str(dw_dtype),
+            "measurement_dtype": str(measurement_dtype),
+            "include_lm_head": False,
+            "n_linear_chunks": int(n_linear_chunks),
+            "calib_shape": list(calib_ids.shape),
+            "calib_sha256": hashlib.sha256(
+                calib_cpu.numpy().tobytes()
+            ).hexdigest(),
+            "calib_hash": calibration_data_hash(calib_ids),
+            "calib_hashes": [calibration_data_hash(calib_ids)],
+            "omitted_packed_experts": list(omitted_packed_experts),
+            "dw_rendered_rows": int(sum(
+                value == "rendered" for value in dw_src.values()
+            )),
+            "dw_production_anchor_rows": int(sum(
+                value == "production_render" for value in dw_src.values()
+            )),
+            "dw_rtn_fallback_rows": int(sum(
+                value == "rtn" for value in dw_src.values()
+            )),
+            "git_commit": checkpoint_git_commit or _git_commit(),
+            "streaming": True,
+            **(
+                dict(cb_provenance)
+                if cb_provenance
+                else cb_cost_provenance(formats)
+            ),
+        },
+    }
+
+
+def compute_aura_cost_streamed(
+    runner,
+    calib_ids: torch.Tensor,
+    formats: Sequence[str],
+    *,
+    n_probes: int = 16,
+    token_scope: str = "all",
+    temperature: float = 1.0,
+    production_cache: object | None = None,
+    min_free_gib: float = 20.0,
+    seed_base: int = 7000,
+    assert_bf16_passthrough: bool = False,
+    require_production_cache: bool = False,
+    dw_dtype: str = "bfloat16",
+    include_lm_head: bool = False,
+    allow_packed_expert_omission: bool = False,
+    collect_col_energy: bool = False,
+    checkpoint_dir: str | Path | None = None,
+    resume: bool = False,
+    unit_filter: str | None = None,
+    model_identity: Mapping[str, object] | None = None,
+    checkpoint_identity_extra: Mapping[str, object] | None = None,
+    formats_by_qname: Mapping[str, Sequence[str]] | None = None,
+    anchor_renderer: object | None = None,
+    include_routed_experts: bool = False,
+    diagnostic_weight_mse_pairs: Sequence[tuple[str, str]] | None = None,
+    profile=None,
+) -> dict:
+    """Layer-streamed KL-adjoint with identity-bound per-Linear shards.
+
+    The source forward stores only decoder-boundary activations.  Its reverse
+    pass then installs one decoder layer, recomputes that layer for every KL
+    probe, projects each weight gradient onto production ``dW`` in fp32, and
+    unloads the layer.  Thus source weights, gradients, and rendered deltas
+    are bounded by one decoder layer; no autograd graph can retain the whole
+    model.  The resident :func:`compute_aura_cost` path is deliberately
+    unchanged.
+    """
+    if n_probes < 1:
+        raise ValueError(f"n_probes must be >= 1, got {n_probes!r}")
+    if resume and checkpoint_dir is None:
+        raise ValueError("resume=True requires checkpoint_dir")
+    profile = resolve_routed_expert_profile(
+        runner.model, profile or runner.profile
+    )
+    if include_routed_experts:
+        routed_targets = set(_packed_expert_targets(runner.model, profile))
+        unpacked_targets = {
+            member.qname
+            for member in profile_declared_unpacked_expert_linears(
+                runner.model, profile
+            )
+        }
+        unsupported = sorted(routed_targets - unpacked_targets)
+        if unsupported:
+            raise RuntimeError(
+                "streamed AURA can include routed experts only when the "
+                "profile exposes them as per-expert nn.Linear modules; "
+                f"unsupported profile-declared targets={unsupported[:8]}"
+            )
+        omitted_packed_experts: list[str] = []
+    else:
+        omitted_packed_experts = _guard_packed_expert_coverage(
+            runner.model,
+            profile,
+            allow_omission=allow_packed_expert_omission,
+        )
+    if include_lm_head:
+        raise RuntimeError(
+            "streamed AURA currently requires the profile-pinned lm_head to "
+            "remain resident BF16; --include-lm-head is unsupported"
+        )
+    linears = _target_linears(
+        runner.model,
+        include_lm_head=False,
+        include_routed_experts=include_routed_experts,
+        profile=profile,
+    )
+    fmts = list(dict.fromkeys(
+        fr.canonical_format_name(fmt) for fmt in formats
+    ))
+    raw_plan: dict[str, tuple[str, ...]] | None = None
+    if formats_by_qname is not None:
+        raw_plan = {}
+        for raw_name, raw_formats in formats_by_qname.items():
+            name = str(raw_name)
+            if isinstance(raw_formats, (str, bytes)):
+                raise TypeError(
+                    f"streamed AURA format plan {name!r} must be a sequence"
+                )
+            planned = tuple(dict.fromkeys(
+                fr.canonical_format_name(fmt) for fmt in raw_formats
+            ))
+            if not planned:
+                raise ValueError(
+                    f"streamed AURA format plan has no formats for {name}"
+                )
+            unknown_formats = sorted(set(planned) - set(fmts))
+            if unknown_formats:
+                raise ValueError(
+                    f"streamed AURA format plan for {name} contains formats "
+                    f"outside the requested union: {unknown_formats}"
+                )
+            raw_plan[name] = planned
+        unknown_names = sorted(set(raw_plan) - set(linears))
+        if unknown_names:
+            raise ValueError(
+                "streamed AURA format plan contains qnames that are not "
+                f"eligible live Linears; sample={unknown_names[:8]}"
+            )
+        linears = {
+            name: linears[name] for name in raw_plan
+        }
+    if unit_filter:
+        try:
+            pattern = re.compile(str(unit_filter))
+        except re.error as exc:
+            raise ValueError(f"invalid unit_filter regex {unit_filter!r}") from exc
+        linears = {
+            name: mod for name, mod in linears.items() if pattern.search(name)
+        }
+        if not linears:
+            raise ValueError(
+                f"unit_filter {unit_filter!r} matched no AURA Linear qnames"
+            )
+    names = list(linears)
+    if not names:
+        raise RuntimeError("streamed AURA found no smooth Linear targets")
+    names_by_layer: dict[int, list[str]] = {}
+    for name in names:
+        layer = runner.layer_index_for_qname(name)
+        names_by_layer.setdefault(layer, []).append(name)
+
+    zero_fmts = tuple(fmt for fmt in fmts if fmt in _ZERO_COST_FORMATS)
+    unit_formats: dict[str, tuple[str, ...]] = {}
+    render_formats: dict[str, tuple[str, ...]] = {}
+    for name in names:
+        planned = raw_plan[name] if raw_plan is not None else tuple(fmts)
+        measured = tuple(
+            fmt for fmt in planned if fmt not in _ZERO_COST_FORMATS
+        )
+        unit_formats[name] = tuple(dict.fromkeys((*planned, *zero_fmts)))
+        render_formats[name] = measured
+    nonzero_fmts = list(dict.fromkeys(
+        fmt for name in names for fmt in render_formats[name]
+    ))
+
+    anchor_identity: Mapping[str, object] | None = None
+    if anchor_renderer is not None:
+        if production_cache is not None:
+            raise ValueError(
+                "streamed production anchors cannot also consume a "
+                "materialized production_cache"
+            )
+        if formats_by_qname is None:
+            raise ValueError(
+                "streamed production anchors require an exact "
+                "formats_by_qname anchor plan"
+            )
+        if str(dw_dtype) != "float32":
+            raise ValueError(
+                "streamed production-anchor AURA requires dw_dtype='float32'"
+            )
+        empty = sorted(name for name in names if not render_formats[name])
+        if empty:
+            raise ValueError(
+                "every streamed production-anchor unit needs a real rendered "
+                f"format; passthrough-only sample={empty[:8]}"
+            )
+        renderer_plan = getattr(anchor_renderer, "formats_by_qname", None)
+        expected_plan = {
+            name: tuple(render_formats[name]) for name in names
+        }
+        observed_plan = (
+            {
+                str(name): tuple(
+                    fr.canonical_format_name(fmt) for fmt in values
+                )
+                for name, values in renderer_plan.items()
+            }
+            if isinstance(renderer_plan, Mapping)
+            else None
+        )
+        if observed_plan != expected_plan:
+            raise ValueError(
+                "streamed production anchor renderer plan differs from the "
+                "AURA qname->format plan"
+            )
+        anchor_identity = getattr(anchor_renderer, "identity", None)
+        if not isinstance(anchor_identity, Mapping):
+            raise ValueError(
+                "streamed production anchor renderer has no exact identity"
+            )
+    diagnostic_pairs = {
+        (str(name), fr.canonical_format_name(fmt))
+        for name, fmt in (diagnostic_weight_mse_pairs or ())
+    }
+    if diagnostic_pairs:
+        if anchor_renderer is None:
+            raise ValueError(
+                "diagnostic weight-MSE is available only from streamed "
+                "production-anchor renders"
+            )
+        expected_anchor_pairs = {
+            (name, fmt)
+            for name in names
+            for fmt in render_formats[name]
+        }
+        unexpected = sorted(diagnostic_pairs - expected_anchor_pairs)
+        if unexpected:
+            raise ValueError(
+                "diagnostic weight-MSE requests unrendered anchor cells; "
+                f"sample={unexpected[:8]}"
+            )
+    cb_provenance: dict[str, object] = {}
+    if any(is_cb_format(fmt) for fmt in nonzero_fmts):
+        if anchor_renderer is not None:
+            cb_provenance = {
+                "cb_cost_provenance_schema": (
+                    "prismaquant.aura.production_anchor.v1"
+                ),
+                "cb_render_identity": anchor_identity.get(
+                    "cb_render_identity"
+                ),
+                "production_anchor_renderer": dict(anchor_identity),
+            }
+        elif production_cache is None:
+            raise RuntimeError(
+                "streamed AURA CB cost requires an identity-bound "
+                "ProductionWeightCache"
+            )
+        else:
+            from prismaquant.production_weight_cache import (
+                production_cache_cb_render_provenance,
+            )
+
+            cb_provenance = production_cache_cb_render_provenance(
+                production_cache,
+                require_for_formats=fmts,
+                where="streamed AURA production cache",
+            )
+    if checkpoint_dir is not None:
+        if not cb_provenance:
+            raise RuntimeError(
+                "streamed AURA durable checkpointing requires a value-bearing "
+                "CB ProductionWeightCache identity"
+            )
+        if anchor_renderer is None:
+            _validate_aura_checkpoint_cache_identity(production_cache)
+    if assert_bf16_passthrough and "BF16" in fmts:
+        if runner.dtype not in (torch.bfloat16, torch.float16):
+            raise RuntimeError(
+                "assert_bf16_passthrough: BF16 zero-cost requires a bf16/fp16 "
+                f"streamed source, got {runner.dtype}"
+            )
+    dw_torch_dtype = (
+        torch.float32 if str(dw_dtype) == "float32" else torch.bfloat16
+    )
+
+    for parameter in runner.model.parameters():
+        parameter.requires_grad_(False)
+
+    s2: dict[tuple[str, str], float] = {}
+    s4: dict[tuple[str, str], float] = {}
+    x2_probe: dict[tuple[str, str], list[float]] = {}
+    dw_src: dict[tuple[str, str], str] = {}
+    g_trace: dict[str, float] = {}
+    col_energy: dict[str, torch.Tensor] = {}
+    weight_mse_diagnostic: dict[tuple[str, str], float] = {}
+    source_weight_identity: dict[str, dict[str, object]] = {}
+    completed_checkpoint_units: set[str] = set()
+    checkpoint_root: Path | None = None
+    checkpoint_identity_sha256: str | None = None
+    checkpoint_git_commit: str | None = None
+
+    ordered_layer_chunks = [
+        list(names_by_layer[layer]) for layer in sorted(names_by_layer)
+    ]
+    if checkpoint_dir is not None:
+        checkpoint_git_commit = _checkpoint_git_commit()
+        if model_identity is None:
+            raise RuntimeError(
+                "streamed AURA checkpointing requires exact model_identity; "
+                "refusing model-name-gated resume"
+            )
+        from prismaquant.cost_streaming import (
+            validate_streamed_model_identity,
+        )
+
+        exact_model_identity = validate_streamed_model_identity(
+            model_identity, where="streamed AURA checkpointing"
+        )
+        extra = dict(checkpoint_identity_extra or {})
+        reserved = {
+            "streamed_formats_by_qname",
+            "production_anchor_renderer",
+            "include_routed_experts",
+            "diagnostic_weight_mse_pairs",
+        } & set(extra)
+        if reserved:
+            raise ValueError(
+                "checkpoint_identity_extra attempts to override streamed "
+                f"AURA identity fields: {sorted(reserved)}"
+            )
+        extra["streaming"] = True
+        extra["streamed_model_identity"] = exact_model_identity
+        extra["streamed_formats_by_qname"] = {
+            name: list(unit_formats[name]) for name in names
+        }
+        extra["include_routed_experts"] = bool(include_routed_experts)
+        extra["diagnostic_weight_mse_pairs"] = [
+            [name, fmt] for name, fmt in sorted(diagnostic_pairs)
+        ]
+        if anchor_identity is not None:
+            extra["production_anchor_renderer"] = dict(anchor_identity)
+        identity = _build_aura_checkpoint_identity(
+            model=runner.model,
+            calib_ids=calib_ids,
+            names=names,
+            linears=linears,
+            formats=fmts,
+            chunks=ordered_layer_chunks,
+            n_probes=n_probes,
+            token_scope=token_scope,
+            temperature=temperature,
+            seed_base=seed_base,
+            dw_dtype=dw_dtype,
+            include_lm_head=False,
+            hook_harvest=True,
+            allow_packed_expert_omission=allow_packed_expert_omission,
+            probe_microbatch=0,
+            collect_col_energy=collect_col_energy,
+            require_production_cache=require_production_cache,
+            production_cache=production_cache,
+            cb_provenance=cb_provenance,
+            git_commit=checkpoint_git_commit,
+            extra_identity=extra,
+        )
+        checkpoint_root, checkpoint_identity_sha256, completed_states = (
+            _prepare_aura_checkpoints(
+                checkpoint_dir,
+                resume=resume,
+                identity=identity,
+                names=names,
+            )
+        )
+        for name in names:
+            state = completed_states.get(name)
+            if state is None:
+                continue
+            _restore_aura_unit_state(
+                name,
+                state,
+                nonzero_formats=render_formats[name],
+                n_probes=n_probes,
+                collect_col_energy=collect_col_energy,
+                s2=s2,
+                s4=s4,
+                x2_probe=x2_probe,
+                dw_src=dw_src,
+                g_trace=g_trace,
+                col_energy=col_energy,
+                diagnostic_weight_mse_pairs=diagnostic_pairs,
+                weight_mse_diagnostic=weight_mse_diagnostic,
+                require_source_weight_identity=anchor_renderer is not None,
+                source_weight_identity=source_weight_identity,
+            )
+            completed_checkpoint_units.add(name)
+
+    def _finish_streamed_payload() -> dict:
+        payload = _assemble_streamed_aura_payload(
+            linears=linears,
+            names=names,
+            formats=fmts,
+            formats_by_qname=unit_formats,
+            n_probes=n_probes,
+            token_scope=token_scope,
+            seed_base=seed_base,
+            temperature=temperature,
+            dw_dtype=dw_dtype,
+            measurement_dtype=runner.dtype,
+            n_linear_chunks=len(ordered_layer_chunks),
+            calib_ids=calib_ids,
+            omitted_packed_experts=omitted_packed_experts,
+            cb_provenance=cb_provenance,
+            checkpoint_git_commit=checkpoint_git_commit,
+            collect_col_energy=collect_col_energy,
+            s2=s2,
+            s4=s4,
+            x2_probe=x2_probe,
+            dw_src=dw_src,
+            g_trace=g_trace,
+            col_energy=col_energy,
+            weight_mse_diagnostic=weight_mse_diagnostic,
+        )
+        if anchor_renderer is not None:
+            missing_source_identity = sorted(
+                set(names) - set(source_weight_identity)
+            )
+            if missing_source_identity:
+                raise RuntimeError(
+                    "streamed production-anchor source identity is "
+                    f"incomplete; sample={missing_source_identity[:8]}"
+                )
+            bind_source = getattr(
+                anchor_renderer,
+                "bind_completed_source_weight_identities",
+                None,
+            )
+            completed_renderer_identity = (
+                bind_source(source_weight_identity)
+                if callable(bind_source)
+                else {
+                    **dict(anchor_identity or {}),
+                    "source_weights": {
+                        "complete": True,
+                        "records": {
+                            name: dict(source_weight_identity[name])
+                            for name in sorted(source_weight_identity)
+                        },
+                    },
+                }
+            )
+            payload["provenance"]["production_anchor_renderer"] = (
+                completed_renderer_identity
+            )
+            completed_cb_identity = completed_renderer_identity.get(
+                "cb_render_identity"
+            )
+            if isinstance(completed_cb_identity, Mapping):
+                payload["provenance"]["cb_render_identity"] = dict(
+                    completed_cb_identity
+                )
+            expected_renders = sum(
+                len(render_formats[name]) for name in names
+            )
+            rendered_now = int(getattr(anchor_renderer, "render_count", 0))
+            payload["provenance"].update({
+                "production_anchor_expected_renders": expected_renders,
+                "production_anchor_rendered_this_invocation": rendered_now,
+                "production_anchor_restored_renders": (
+                    expected_renders - rendered_now
+                ),
+                "production_anchor_max_live_rendered": int(getattr(
+                    anchor_renderer, "max_live_rendered", 0
+                )),
+                "production_anchor_no_full_menu_materialization": True,
+                "production_anchor_cost_currency": "aura_only",
+                "weight_mse_diagnostic_rows": len(
+                    weight_mse_diagnostic
+                ),
+                "weight_mse_diagnostic_is_cost_input": False,
+            })
+        return payload
+
+    if completed_checkpoint_units == set(names):
+        _log(f"checkpoint resume: validated all {len(names)} streamed units; "
+             "skip forward/reverse")
+        return _finish_streamed_payload()
+
+    # Identity validation above is intentionally before the first model
+    # forward: a mismatched resume is a refusal, never a recomputation.
+    batch = runner.capture_boundaries(calib_ids)
+    device = runner.device
+    dtype = runner.dtype
+
+    # One independent shared-state cotangent accumulator per KL probe.  This
+    # preserves architectures with declared cross-layer state (e.g. shared
+    # K/V) while remaining an exact no-op for the ordinary decoder contract.
+    from prismaquant.sensitivity_probe import (
+        SharedStateCotangents,
+        kv_cotangent_path_enabled,
+    )
+
+    cotangents = [
+        SharedStateCotangents(enabled=kv_cotangent_path_enabled())
+        for _ in range(n_probes)
+    ]
+    grad_outs: list[torch.Tensor] = []
+    for probe_index in range(n_probes):
+        tail = batch.activations_cpu[-1].to(
+            device=device, dtype=dtype
+        ).detach().requires_grad_(True)
+        logits = runner.tail_logits(batch, tail)
+        probe = fisher_probe_scalar(
+            logits,
+            seed=seed_base + probe_index,
+            token_scope=token_scope,
+            temperature=temperature,
+            distribution="rademacher",
+        )
+        probe.backward()
+        if tail.grad is None:
+            raise RuntimeError("streamed AURA tail produced no cotangent")
+        grad_outs.append(tail.grad.detach().to("cpu"))
+        del logits, probe, tail
+
+    for layer in reversed(range(runner.num_layers)):
+        runner.context.install(layer)
+        pending = [
+            name for name in names_by_layer.get(layer, [])
+            if name not in completed_checkpoint_units
+        ]
+        d_weights: dict[tuple[str, str], torch.Tensor] = {}
+        try:
+            for name in pending:
+                linears[name].weight.requires_grad_(True)
+                g_trace[name] = 0.0
+            with torch.no_grad():
+                if anchor_renderer is not None and pending:
+                    render_layer = getattr(
+                        anchor_renderer, "render_layer", None
+                    )
+                    if not callable(render_layer):
+                        raise TypeError(
+                            "streamed production anchor renderer has no "
+                            "callable render_layer()"
+                        )
+                    layer_modules = {
+                        name: linears[name]
+                        for name in names_by_layer.get(layer, [])
+                    }
+                    rendered_anchors = render_layer(
+                        layer=layer,
+                        modules=layer_modules,
+                        formats_by_qname={
+                            name: render_formats[name] for name in pending
+                        },
+                    )
+                    if not isinstance(rendered_anchors, Mapping):
+                        raise TypeError(
+                            "streamed production anchor render_layer() must "
+                            "return a Mapping"
+                        )
+                    expected_pairs = {
+                        (name, fmt)
+                        for name in pending
+                        for fmt in render_formats[name]
+                    }
+                    observed_pairs = {
+                        (str(name), fr.canonical_format_name(fmt))
+                        for name, fmt in rendered_anchors
+                    }
+                    if observed_pairs != expected_pairs:
+                        raise RuntimeError(
+                            "streamed production anchor renderer returned a "
+                            "different pair set: "
+                            f"missing={sorted(expected_pairs - observed_pairs)[:8]} "
+                            f"unexpected={sorted(observed_pairs - expected_pairs)[:8]}"
+                        )
+                    for name in pending:
+                        weight = linears[name].weight.data
+                        source_lookup = getattr(
+                            anchor_renderer,
+                            "source_weight_identity_for",
+                            None,
+                        )
+                        if callable(source_lookup):
+                            source_weight_identity[name] = dict(
+                                source_lookup(name)
+                            )
+                        else:
+                            # Test/injected renderers may not own a CB cache.
+                            # Production uses the renderer's already-computed
+                            # source binding and therefore never hashes twice.
+                            from prismaquant.production_weight_cache import (
+                                _source_weight_value_identity,
+                            )
+
+                            source_shape, source_sha256 = (
+                                _source_weight_value_identity(weight)
+                            )
+                            source_weight_identity[name] = {
+                                "shape": source_shape,
+                                "sha256": source_sha256,
+                            }
+                        for fmt in render_formats[name]:
+                            key = (name, fmt)
+                            rendered = rendered_anchors[key]
+                            if not isinstance(rendered, torch.Tensor):
+                                raise TypeError(
+                                    "streamed production anchor renderer "
+                                    f"returned {type(rendered).__name__} for "
+                                    f"{name}@{fmt}, expected Tensor"
+                                )
+                            if tuple(rendered.shape) != tuple(weight.shape):
+                                raise RuntimeError(
+                                    "streamed production anchor shape differs "
+                                    f"for {name}@{fmt}: rendered="
+                                    f"{tuple(rendered.shape)} source="
+                                    f"{tuple(weight.shape)}"
+                                )
+                            d_weights[key] = (
+                                rendered.to(device=weight.device, dtype=torch.float32)
+                                - weight.float()
+                            )
+                            if key in diagnostic_pairs:
+                                weight_mse_diagnostic[key] = float(
+                                    d_weights[key].float().pow(2).mean().item()
+                                )
+                            dw_src[key] = "production_render"
+                            s2[key] = 0.0
+                            s4[key] = 0.0
+                            x2_probe[key] = []
+                    del rendered_anchors
+                else:
+                    for name in pending:
+                        for fmt in render_formats[name]:
+                            result = _delta_w(
+                                name,
+                                fmt,
+                                linears[name].weight.data,
+                                production_cache,
+                                strict=require_production_cache,
+                            )
+                            if result is None:
+                                continue
+                            delta, source = result
+                            key = (name, fmt)
+                            d_weights[key] = delta.to(dw_torch_dtype)
+                            dw_src[key] = source
+                            s2[key] = 0.0
+                            s4[key] = 0.0
+                            x2_probe[key] = []
+            if anchor_renderer is None:
+                compact = getattr(production_cache, "compact_for_pickle", None)
+                if callable(compact):
+                    compact()
+
+            next_grad_outs: list[torch.Tensor] = []
+            for probe_index in range(n_probes):
+                x_in = batch.activations_cpu[layer].to(
+                    device=device, dtype=dtype
+                ).detach().requires_grad_(True)
+                isolated = profile.isolated_layer_pass_state(
+                    batch.shared_pass_state, runner.layers[layer]
+                )
+                isolated = cotangents[probe_index].graft(isolated)
+                out = runner.isolated_layer(
+                    batch, layer, x_in, pass_state=isolated
+                )
+                roots, root_grads = cotangents[probe_index].produced_roots()
+                if roots:
+                    torch.autograd.backward(
+                        [out, *roots],
+                        [grad_outs[probe_index].to(device), *root_grads],
+                    )
+                else:
+                    out.backward(grad_outs[probe_index].to(device))
+                cotangents[probe_index].harvest()
+                if x_in.grad is None:
+                    raise RuntimeError(
+                        f"streamed AURA layer {layer} produced no input "
+                        "cotangent"
+                    )
+                next_grad_outs.append(x_in.grad.detach().to("cpu"))
+                for name in pending:
+                    gradient = linears[name].weight.grad
+                    if gradient is None:
+                        # A routed expert not selected by this probe's routed
+                        # tokens has an exact zero projection.  Record the
+                        # sample explicitly so route-sparse and never-routed
+                        # experts remain valid K-probe AURA rows; this models
+                        # the smooth path only and does not claim route-flip
+                        # sensitivity.
+                        for fmt in render_formats[name]:
+                            key = (name, fmt)
+                            if key in d_weights:
+                                x2_probe[key].append(0.0)
+                        continue
+                    # Load-bearing numerical contract: both the Fisher energy
+                    # and every <g,dW> projection accumulate in fp32.
+                    gradient_fp32 = gradient.float()
+                    g_trace[name] += float(
+                        (gradient_fp32 * gradient_fp32).sum().item()
+                    )
+                    if collect_col_energy:
+                        energy = (gradient_fp32 * gradient_fp32).sum(dim=0)
+                        previous = col_energy.get(name)
+                        col_energy[name] = (
+                            energy if previous is None else previous + energy
+                        )
+                    for fmt in render_formats[name]:
+                        key = (name, fmt)
+                        if key not in d_weights:
+                            continue
+                        projection = float(
+                            (
+                                gradient_fp32
+                                * d_weights[key].float()
+                            ).sum().item()
+                        )
+                        value = projection ** 2
+                        s2[key] += value
+                        s4[key] += value * value
+                        x2_probe[key].append(value)
+                    linears[name].weight.grad = None
+                del out, x_in
+            grad_outs = next_grad_outs
+
+            if checkpoint_root is not None:
+                assert checkpoint_identity_sha256 is not None
+                for name in pending:
+                    _write_aura_unit_checkpoint(
+                        checkpoint_root,
+                        qname=name,
+                        identity_sha256=checkpoint_identity_sha256,
+                        state=_aura_unit_state(
+                            name,
+                            render_formats[name],
+                            s2=s2,
+                            s4=s4,
+                            x2_probe=x2_probe,
+                            dw_src=dw_src,
+                            g_trace=g_trace,
+                            col_energy=col_energy,
+                            weight_mse_diagnostic=weight_mse_diagnostic,
+                            source_weight_identity=source_weight_identity,
+                        ),
+                    )
+        finally:
+            for name in pending:
+                linears[name].weight.grad = None
+                linears[name].weight.requires_grad_(False)
+            del d_weights
+            runner.context.unload(layer)
+
+    return _finish_streamed_payload()
+
+
+def run_streamed_production_anchor_aura(
+    runner,
+    calib_ids: torch.Tensor,
+    *,
+    formats_by_qname: Mapping[str, Sequence[str]],
+    render_purposes_by_qname: Mapping[
+        str, Mapping[str, str | Sequence[str]]
+    ] | None = None,
+    activation_index,
+    render_levers: Mapping[str, object],
+    col_weights: Mapping[str, torch.Tensor],
+    cb_serialization_context,
+    calibration_hash: str,
+    arm_identity: Mapping[str, object],
+    model_identity: Mapping[str, object],
+    checkpoint_dir: str | Path,
+    resume: bool,
+    n_probes: int,
+    token_scope: str = "all",
+    temperature: float = 1.0,
+    seed_base: int = 7000,
+    cold_expert_provenance: Mapping[str, object] | None = None,
+    max_act_rows: int = 512,
+    h_detail_dir: str | Path | None = None,
+    checkpoint_identity_extra: Mapping[str, object] | None = None,
+    include_routed_experts: bool = True,
+    collect_col_energy: bool = False,
+    profile=None,
+) -> dict:
+    """Run one streamed KL adjoint over an exact production-anchor plan.
+
+    This is the concrete campaign API. ``formats_by_qname`` may contain
+    several measured CB anchors for a unit (anchor, fitting-panel, and held-out
+    validation cells) plus its exact passthrough terminal.  Terminals are
+    emitted at zero cost but never sent to the renderer.  Every other listed
+    cell is rendered in the fixed production arm exactly once unless its
+    identity-bound per-unit AURA shard is resumed.
+
+    The returned ordinary AURA payload carries scalar ``predicted_dloss`` rows
+    and exact renderer/plan provenance.  Rendered weights and ``dW`` live only
+    for the current reverse layer and are discarded before it is unloaded.
+    """
+    if checkpoint_dir is None:
+        raise ValueError(
+            "production-anchor AURA requires a durable checkpoint_dir"
+        )
+    profile = resolve_routed_expert_profile(
+        runner.model, profile or runner.profile
+    )
+    canonical_plan: dict[str, tuple[str, ...]] = {}
+    render_plan: dict[str, tuple[str, ...]] = {}
+    format_union: list[str] = []
+    for raw_name, raw_formats in formats_by_qname.items():
+        name = str(raw_name)
+        if isinstance(raw_formats, (str, bytes)):
+            raise TypeError(
+                f"production-anchor formats for {name} must be a sequence"
+            )
+        formats = tuple(dict.fromkeys(
+            fr.canonical_format_name(fmt) for fmt in raw_formats
+        ))
+        if not formats:
+            raise ValueError(
+                f"production-anchor formats are empty for {name}"
+            )
+        measured = tuple(
+            fmt for fmt in formats if fmt not in _ZERO_COST_FORMATS
+        )
+        if not measured:
+            raise ValueError(
+                f"production-anchor unit {name} has no real rendered anchor"
+            )
+        canonical_plan[name] = formats
+        render_plan[name] = measured
+        for fmt in formats:
+            if fmt not in format_union:
+                format_union.append(fmt)
+
+    allowed_purposes = frozenset({"anchor", "panel", "validation"})
+    canonical_purposes: dict[str, dict[str, list[str]]] = {}
+    raw_purposes = render_purposes_by_qname
+    for name, formats in render_plan.items():
+        rows: dict[str, list[str]] = {}
+        supplied = (
+            raw_purposes.get(name, {})
+            if isinstance(raw_purposes, Mapping) else {}
+        )
+        if not isinstance(supplied, Mapping):
+            raise TypeError(
+                f"production-anchor purposes for {name} must be a mapping"
+            )
+        for fmt in formats:
+            raw = supplied.get(fmt, "anchor")
+            values = [raw] if isinstance(raw, str) else list(raw)
+            purposes = list(dict.fromkeys(str(value) for value in values))
+            invalid = sorted(set(purposes) - allowed_purposes)
+            if not purposes or invalid:
+                raise ValueError(
+                    f"production-anchor purposes for {name}@{fmt} are "
+                    f"invalid: {purposes}; allowed={sorted(allowed_purposes)}"
+                )
+            rows[fmt] = purposes
+        unexpected = sorted(set(str(fmt) for fmt in supplied) - set(formats))
+        if unexpected:
+            raise ValueError(
+                f"production-anchor purposes contain unrendered cells for "
+                f"{name}: {unexpected}"
+            )
+        canonical_purposes[name] = rows
+    if isinstance(raw_purposes, Mapping):
+        unexpected_names = sorted(set(raw_purposes) - set(render_plan))
+        if unexpected_names:
+            raise ValueError(
+                "production-anchor purposes contain unplanned qnames; "
+                f"sample={unexpected_names[:8]}"
+            )
+
+    from prismaquant.streaming_production_cache import (
+        StreamedProductionAnchorRenderer,
+    )
+
+    renderer = StreamedProductionAnchorRenderer(
+        runner.model,
+        act_index=activation_index,
+        formats_by_qname=render_plan,
+        levers=render_levers,
+        profile=profile,
+        device=runner.device,
+        col_weights=col_weights,
+        cb_serialization_context=cb_serialization_context,
+        calibration_hash=calibration_hash,
+        arm_identity=arm_identity,
+        model_identity=model_identity,
+        cold_expert_provenance=cold_expert_provenance,
+        max_act_rows=max_act_rows,
+        h_detail_dir=h_detail_dir,
+    )
+    extra = dict(checkpoint_identity_extra or {})
+    if "production_anchor_render_purposes" in extra:
+        raise ValueError(
+            "checkpoint_identity_extra cannot override "
+            "production_anchor_render_purposes"
+        )
+    extra["production_anchor_render_purposes"] = canonical_purposes
+    payload = compute_aura_cost_streamed(
+        runner,
+        calib_ids,
+        format_union,
+        n_probes=n_probes,
+        token_scope=token_scope,
+        temperature=temperature,
+        production_cache=None,
+        seed_base=seed_base,
+        require_production_cache=True,
+        dw_dtype="float32",
+        include_lm_head=False,
+        allow_packed_expert_omission=False,
+        collect_col_energy=collect_col_energy,
+        checkpoint_dir=checkpoint_dir,
+        resume=resume,
+        model_identity=model_identity,
+        checkpoint_identity_extra=extra,
+        formats_by_qname=canonical_plan,
+        anchor_renderer=renderer,
+        include_routed_experts=include_routed_experts,
+        diagnostic_weight_mse_pairs=[
+            (name, fmt)
+            for name, rows in canonical_purposes.items()
+            for fmt, purposes in rows.items()
+            if "panel" in purposes
+        ],
+        profile=profile,
+    )
+    counts = {
+        purpose: sum(
+            purpose in purposes
+            for rows in canonical_purposes.values()
+            for purposes in rows.values()
+        )
+        for purpose in sorted(allowed_purposes)
+    }
+    payload["provenance"].update({
+        "production_anchor_render_purposes": canonical_purposes,
+        "production_anchor_purpose_counts": counts,
+        "production_anchor_union_render_count": sum(
+            len(rows) for rows in canonical_purposes.values()
+        ),
+    })
+    return payload
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="Aura KL-adjoint allocator cost")
     p.add_argument("--model", required=True)
     p.add_argument("--output", required=True)
     p.add_argument("--formats", default="NVFP4,FP8_DYNAMIC,BF16")
+    p.add_argument(
+        "--format-plan",
+        default=None,
+        help="Identity-bound source-class format plan. In streaming mode the "
+        "requested family is intersected per qname, so source-rate-illegal "
+        "cells are neither rendered nor priced.",
+    )
     p.add_argument("--production-cache", default=None,
                    help="ProductionWeightCache pickle for production-faithful dW")
+    p.add_argument("--checkpoint-dir", default=None,
+                   help="Durable per-Linear AURA checkpoint directory. The "
+                        "manifest value-binds calibration, cache rendering, "
+                        "formats, execution knobs, and producer commit.")
+    p.add_argument("--resume", action="store_true",
+                   help="Validate and reuse exact per-Linear checkpoints. An "
+                        "identity mismatch refuses both reuse and recompute.")
+    p.add_argument("--unit-filter", default="",
+                   help="Optional regex selecting exact Linear qnames; the "
+                        "resolved ordered unit scope is identity-bound.")
+    p.add_argument(
+        "--streaming", action="store_true",
+        help="Stream decoder layers through the existing prefetch/cache "
+             "context and run a boundary-activation KL adjoint. Required for "
+             "models whose expanded source cannot be resident.")
+    p.add_argument(
+        "--streaming-offload-dir", default=None,
+        help="Streaming model work directory. Defaults beneath the AURA "
+             "checkpoint directory (or the output directory); never /tmp.")
     p.add_argument("--n-probes", type=int, default=16)
     p.add_argument("--n-calib-samples", type=int, default=4)
     p.add_argument("--calib-seqlen", type=int, default=256)
@@ -887,9 +2813,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "equivalent, not bit-identical to monolithic.")
     p.add_argument("--allow-packed-expert-omission", action="store_true",
                    help="Explicit research/debug escape: allow AURA to omit "
-                        "packed-MoE expert tensors from the cost payload. "
-                        "Default is fail-fast because packed experts need an "
-                        "empirical/hybrid expert-cost path, not silent omission.")
+                        "profile-declared routed expert targets from the cost "
+                        "payload. The historical flag name is retained for "
+                        "artifact compatibility. Default is fail-fast because "
+                        "routed experts need an empirical/hybrid expert-cost "
+                        "path, not silent omission.")
+    p.add_argument(
+        "--include-routed-experts",
+        action="store_true",
+        help="Include profile-declared per-expert nn.Linear targets in the "
+        "streamed smooth AURA pass. This remains route-flip-blind and "
+        "refuses packed expert Parameters.",
+    )
     p.add_argument("--collect-col-energy", action="store_true",
                    default=os.environ.get("PRISMAQUANT_FISHER_COL_WEIGHTS") == "1",
                    help="Also emit a per-Linear per-column KL-Fisher energy "
@@ -902,6 +2837,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                    help="Pipeline COST_MODE stamped into "
                         "provenance['cost_mode'] (re-vet R2).")
     args = p.parse_args(argv)
+    if args.resume and not args.checkpoint_dir:
+        p.error("--resume requires --checkpoint-dir")
+    if args.streaming and args.gradient_checkpointing:
+        p.error("--gradient-checkpointing is resident-only; --streaming uses "
+                "an explicit one-layer reverse recomputation")
+    if args.format_plan and not args.streaming:
+        p.error("--format-plan requires --streaming")
     from prismaquant.gpu_guard import require_cuda_hot_path
     require_cuda_hot_path("aura_cost", args.device)
 
@@ -913,8 +2855,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     # with tensor names that match the production cache keys. No-op on
     # pure-text checkpoints.
     from prismaquant.build_rtn_cache import stage_multimodal
+    from prismaquant.model_profiles import detect_profile
 
     staged, _cleanup = stage_multimodal(args.model)
+    # Profile detection installs architecture-owned vendored modelling where
+    # required and is also the fail-closed authority for routed-expert
+    # membership.  Resolve it before model construction and reuse that exact
+    # instance for both the guard and smooth-target enumeration.
+    profile = detect_profile(staged)
     if args.dtype == "auto":
         args.dtype = _resolve_auto_dtype(staged, args.min_free_gib)
     dt = torch.float32 if args.dtype == "float32" else torch.bfloat16
@@ -922,22 +2870,40 @@ def main(argv: Sequence[str] | None = None) -> int:
     _log(f"loading {args.model} (staged={staged}) dtype={args.dtype}")
     tok = AutoTokenizer.from_pretrained(
         staged, trust_remote_code=True, local_files_only=local_only)
-    load_kwargs = dict(
-        dtype=dt, trust_remote_code=True, local_files_only=local_only,
-        attn_implementation="eager",
-    )
-    if args.device.startswith("cuda"):
-        load_kwargs["device_map"] = args.device
-    try:
-        model = AutoModelForCausalLM.from_pretrained(staged, **load_kwargs)
-    except ValueError as exc:
-        if "accelerate" not in str(exc):
-            raise
-        load_kwargs.pop("device_map", None)
-        model = AutoModelForCausalLM.from_pretrained(staged, **load_kwargs)
-        model.to(args.device)
-    model.eval()
+    model = None
+    streamed_runner = None
+    if args.streaming:
+        from prismaquant.cost_streaming import build_streamed_causal_lm
+
+        offload_dir = args.streaming_offload_dir
+        if not offload_dir:
+            anchor = Path(args.checkpoint_dir or args.output).parent
+            offload_dir = str(anchor / "aura-streaming-offload")
+        streamed_runner = build_streamed_causal_lm(
+            staged,
+            device=torch.device(args.device),
+            dtype=dt,
+            offload_folder=offload_dir,
+            profile=profile,
+        )
+    else:
+        load_kwargs = dict(
+            dtype=dt, trust_remote_code=True, local_files_only=local_only,
+            attn_implementation="eager",
+        )
+        if args.device.startswith("cuda"):
+            load_kwargs["device_map"] = args.device
+        try:
+            model = AutoModelForCausalLM.from_pretrained(staged, **load_kwargs)
+        except ValueError as exc:
+            if "accelerate" not in str(exc):
+                raise
+            load_kwargs.pop("device_map", None)
+            model = AutoModelForCausalLM.from_pretrained(staged, **load_kwargs)
+            model.to(args.device)
+        model.eval()
     if args.gradient_checkpointing:
+        assert model is not None
         # transformers gates checkpointing on self.training — in eval() the
         # checkpointed path is silently bypassed and the full graph is stored
         # (observed OOM 2026-06-10). train() arms it; that is numerically
@@ -978,22 +2944,106 @@ def main(argv: Sequence[str] | None = None) -> int:
             cache = pickle.load(fh)
         _log(f"loaded production cache: {args.production_cache}")
 
-    payload = compute_aura_cost(
-        model, calib, [f.strip() for f in args.formats.split(",") if f.strip()],
-        n_probes=args.n_probes, token_scope=args.token_scope,
-        temperature=args.temperature, production_cache=cache,
-        min_free_gib=args.min_free_gib, n_linear_chunks=args.n_linear_chunks,
-        seed_base=args.seed_base,
-        assert_bf16_passthrough=args.assert_bf16_passthrough,
-        accurate_chunk_bytes=args.accurate_chunk_bytes,
-        require_production_cache=args.require_production_cache,
-        dw_dtype=args.dw_dtype,
-        include_lm_head=args.include_lm_head,
-        hook_harvest=args.hook_harvest,
-        allow_packed_expert_omission=args.allow_packed_expert_omission,
-        probe_microbatch=args.probe_microbatch,
-        collect_col_energy=args.collect_col_energy,
-    )
+    requested_formats = [
+        f.strip() for f in args.formats.split(",") if f.strip()
+    ]
+    source_format_plan = None
+    planned_formats_by_qname = None
+    if args.format_plan:
+        from prismaquant.source_class_format_plan import load_format_plan
+
+        source_format_plan = load_format_plan(args.format_plan)
+        allowed_by_qname = source_format_plan.formats_by_qname()
+        planned_universe = {
+            fmt for values in allowed_by_qname.values() for fmt in values
+        }
+        canonical_requested = [
+            fr.canonical_format_name(fmt) for fmt in requested_formats
+        ]
+        planned_formats_by_qname = {
+            qname: tuple(
+                fmt for fmt in canonical_requested
+                if fmt not in planned_universe or fmt in allowed
+            )
+            for qname, allowed in allowed_by_qname.items()
+        }
+    if streamed_runner is not None:
+        try:
+            streamed_model_identity = None
+            if args.checkpoint_dir:
+                from prismaquant.cost_streaming import (
+                    build_streamed_model_identity,
+                )
+
+                streamed_model_identity = build_streamed_model_identity(
+                    streamed_runner,
+                    args.model,
+                    identity_cache_path=(
+                        Path(args.checkpoint_dir)
+                        / "streamed_model_identity.json"
+                    ),
+                )
+            payload = compute_aura_cost_streamed(
+                streamed_runner,
+                calib,
+                requested_formats,
+                n_probes=args.n_probes,
+                token_scope=args.token_scope,
+                temperature=args.temperature,
+                production_cache=cache,
+                min_free_gib=args.min_free_gib,
+                seed_base=args.seed_base,
+                assert_bf16_passthrough=args.assert_bf16_passthrough,
+                require_production_cache=args.require_production_cache,
+                dw_dtype=args.dw_dtype,
+                include_lm_head=args.include_lm_head,
+                allow_packed_expert_omission=args.allow_packed_expert_omission,
+                collect_col_energy=args.collect_col_energy,
+                checkpoint_dir=args.checkpoint_dir,
+                resume=args.resume,
+                unit_filter=(args.unit_filter or None),
+                model_identity=streamed_model_identity,
+                checkpoint_identity_extra={
+                    "streaming": True,
+                    **(
+                        {"source_format_plan_identity_sha256": (
+                            source_format_plan.identity_sha256
+                        )}
+                        if source_format_plan is not None else {}
+                    ),
+                },
+                formats_by_qname=planned_formats_by_qname,
+                include_routed_experts=args.include_routed_experts,
+                profile=profile,
+            )
+        finally:
+            streamed_runner.shutdown()
+    else:
+        assert model is not None
+        payload = compute_aura_cost(
+            model, calib, requested_formats,
+            n_probes=args.n_probes, token_scope=args.token_scope,
+            temperature=args.temperature, production_cache=cache,
+            min_free_gib=args.min_free_gib,
+            n_linear_chunks=args.n_linear_chunks,
+            seed_base=args.seed_base,
+            assert_bf16_passthrough=args.assert_bf16_passthrough,
+            accurate_chunk_bytes=args.accurate_chunk_bytes,
+            require_production_cache=args.require_production_cache,
+            dw_dtype=args.dw_dtype,
+            include_lm_head=args.include_lm_head,
+            hook_harvest=args.hook_harvest,
+            allow_packed_expert_omission=args.allow_packed_expert_omission,
+            probe_microbatch=args.probe_microbatch,
+            collect_col_energy=args.collect_col_energy,
+            checkpoint_dir=args.checkpoint_dir,
+            resume=args.resume,
+            unit_filter=(args.unit_filter or None),
+            checkpoint_identity_extra={
+                "gradient_checkpointing": bool(args.gradient_checkpointing),
+            },
+            profile=profile,
+        )
     payload["provenance"].update({
         "model": str(args.model),
         "dtype": str(args.dtype),

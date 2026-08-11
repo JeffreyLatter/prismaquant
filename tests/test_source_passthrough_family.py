@@ -27,6 +27,7 @@ from prismaquant.allocator_candidates import (
     passthrough_serving_notes,
     ROUTE_PENDING_PASSTHROUGH_FORMATS,
     SOURCE_PASSTHROUGH_CONTRACTS,
+    SOURCE_BPP_EXCEEDED_REASON,
     SOURCE_PASSTHROUGH_COST_SOURCE,
     SOURCE_PASSTHROUGH_FORMATS,
     build_candidates,
@@ -338,9 +339,11 @@ def test_allocator_synthesizes_a_zero_cost_passthrough_candidate():
         scale_sweep=True, encode_tier="balanced")
     specs = [fr.get_format(f) for f in
              ("NVFP4_CB_K14", "FP8_CB_K36", "MXFP4_SOURCE")]
+    masks: list[dict] = []
     cands = build_candidates(
         stats, costs, specs, source_manifest=manifest,
-        target_profile="nvfp4_cb", cb_serialization_context=ctx)
+        target_profile="nvfp4_cb", cb_serialization_context=ctx,
+        mask_records=masks)
     assert cands, "no candidates built"
     for name, rows in cands.items():
         by_fmt = {c.fmt: c for c in rows}
@@ -353,10 +356,13 @@ def test_allocator_synthesizes_a_zero_cost_passthrough_candidate():
         expected = (EXPERT_W2_BYTES if name.endswith("down_proj")
                     else EXPERT_W13_BYTES)
         assert passthrough.memory_bytes == expected
-        # ...and it strictly dominates the costlier lossy rung.
-        k36 = by_fmt["FP8_CB_K36"]
-        assert passthrough.memory_bytes < k36.memory_bytes
-        assert passthrough.predicted_dloss < k36.predicted_dloss
+        # K36 is above the 4.25-bpp source representation and therefore never
+        # reaches the DP, irrespective of its measured quality.
+        assert "FP8_CB_K36" not in by_fmt
+    k36_masks = [m for m in masks if m["format"] == "FP8_CB_K36"]
+    assert len(k36_masks) == len(stats)
+    assert all(m["reason"] == SOURCE_BPP_EXCEEDED_REASON for m in k36_masks)
+    assert all(m["source_bpp"] == 4.25 for m in k36_masks)
 
 
 def test_passthrough_is_not_offered_where_the_source_is_something_else():

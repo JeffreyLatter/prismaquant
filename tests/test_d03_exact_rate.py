@@ -27,6 +27,11 @@ import pickle
 
 import pytest
 
+from prismaquant.serving_profiles import (
+    gridbook_runtime_version,
+    serving_lane_route,
+)
+
 from prismaquant import d03_exact_rate as d03
 from prismaquant.nvfp4_cb_footprint import (
     CBSerializationContext,
@@ -385,11 +390,42 @@ def test_report_records_serving_lanes_per_arm(tmp_path):
     lanes = report["serving_lane_provenance_by_arm"]
     cb = lanes["cb:FP8_CB_K36"]
     native = lanes["native:NVFP4"]
-    # K36 IS in gridbook 0.7.0's backed fused mid-M set; vanilla NVFP4 has no
-    # declared CB lane at all.
-    assert cb["units_on_backed_fused_mid_m_lane"] == len(_DENSE)
-    assert cb["selected_rungs_fused_mid_m_backed"] == [36]
+
+    # Vanilla NVFP4 has no declared CB lane at all.
     assert native["units_without_declared_lane"] == len(_DENSE)
+
+    # The CB arm's units are fully accounted for, and the report stamps the
+    # runtime the route was resolved against -- that provenance is the point
+    # of this record, because the backed set is attested PER GRIDBOOK RELEASE
+    # and therefore moves with the pin.
+    assert cb["gridbook_runtime_version"] == gridbook_runtime_version()
+    assert (
+        cb["units_on_backed_fused_mid_m_lane"]
+        + cb["units_on_fallback_route"]
+        + cb["units_without_declared_lane"]
+    ) == len(_DENSE)
+
+    # Which side of that split K36 lands on is a function of the pin, so it is
+    # asserted against the pin rather than hardcoded. The repo currently pins
+    # 0.8.3 with ``version_is_release: false`` and the spec attests through
+    # 0.8.2, so K36 is on the fallback route today. Declaring a 0.8.3 backed
+    # set is a SERVING PROMOTION needing measured evidence, never an edit made
+    # to turn this assertion green.
+    if 36 in serving_profile_backed_rungs("nvfp4_cb"):
+        assert cb["units_on_backed_fused_mid_m_lane"] == len(_DENSE)
+        assert cb["selected_rungs_fused_mid_m_backed"] == [36]
+    else:
+        assert cb["units_on_fallback_route"] == len(_DENSE)
+        assert cb["selected_rungs_fused_mid_m_backed"] == []
+        assert cb["selected_rungs_on_fallback_route"] == [36]
+
+
+def serving_profile_backed_rungs(profile_id: str) -> tuple[int, ...]:
+    """The fused mid-M rungs the CURRENT pin attests for ``profile_id``."""
+    lane = serving_lane_route(profile_id, "FP8_CB_K36")
+    if lane is None or not lane.fused_mid_m_backed:
+        return ()
+    return tuple(lane.fused_mid_m_rungs)
 
 
 def test_no_serving_constraints_stamps_that_none_were_evaluated(tmp_path):

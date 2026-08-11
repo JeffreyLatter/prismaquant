@@ -110,6 +110,93 @@ def test_resident_and_streaming_emit_identical_schemes_for_same_inputs():
     assert "tensor_formats" not in streaming["provenance"]
 
 
+def test_cb_group_target_names_emit_distinct_logical_moe_role_groups():
+    inputs = _config_inputs()
+    packed = "model.layers.0.mlp.experts.gate_up_proj"
+    fmt = "FP8_CB_K28"
+    gate_key = ("layer0-gate", fmt)
+    up_key = ("layer0-up", fmt)
+    inputs["assignment"] = {packed: fmt}
+    inputs["cb_targets"] = {packed: ("fp8", "product", 28)}
+    inputs["by_group"] = {
+        gate_key: [packed],
+        up_key: [packed],
+    }
+    inputs["codebooks"] = {
+        gate_key: tuple(torch.zeros(128, 2) for _ in range(4)),
+        up_key: tuple(torch.ones(128, 2) for _ in range(4)),
+    }
+    inputs["codebook_tensors_by_name"] = {
+        name: tensor
+        for (ref, group_fmt), codebook in inputs["codebooks"].items()
+        for name, tensor in codebook_tensors(ref, group_fmt, codebook).items()
+    }
+    inputs["col_weights"] = {packed: torch.tensor([1.0])}
+    inputs["stock_targets"] = {}
+    inputs["source_targets"] = []
+
+    gate_target = "model.layers.0.mlp.experts.gate_proj"
+    up_target = "model.layers.0.mlp.experts.up_proj"
+    config = build_quant_config(
+        **inputs,
+        cb_group_target_names={
+            gate_key: [gate_target],
+            up_key: [up_target],
+        },
+        # Exact overrides bypass the default/custom serialization hook.
+        cb_target_name=lambda qname: f"mapped.{qname}",
+    )
+
+    cb_groups = [
+        group for group in config["config_groups"].values()
+        if group.get("format") == fmt
+    ]
+    assert {tuple(group["targets"]) for group in cb_groups} == {
+        (gate_target,),
+        (up_target,),
+    }
+    scheme_by_target = {
+        group["targets"][0]: group["scheme"] for group in cb_groups
+    }
+    assert scheme_by_target[gate_target]["codebook_group"] == "layer0-gate"
+    assert scheme_by_target[up_target]["codebook_group"] == "layer0-up"
+    assert (
+        scheme_by_target[gate_target]["codebook_ref"]
+        != scheme_by_target[up_target]["codebook_ref"]
+    )
+
+
+def test_cb_group_target_names_unset_preserves_legacy_config_bytes():
+    inputs = _config_inputs()
+
+    legacy = build_quant_config(**inputs)
+    explicit_empty = build_quant_config(
+        **inputs,
+        cb_group_target_names={},
+    )
+
+    assert explicit_empty == legacy
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        ({("missing", "FP8_CB_K28"): ["logical"]}, "absent from by_group"),
+        ({("lattice", "FP8_CB_K28"): []}, "must be nonempty"),
+        (
+            {("lattice", "FP8_CB_K28"): ["logical", "logical"]},
+            "must contain unique targets",
+        ),
+    ],
+)
+def test_cb_group_target_names_refuse_invalid_overrides(overrides, match):
+    with pytest.raises(ValueError, match=match):
+        build_quant_config(
+            **_config_inputs(),
+            cb_group_target_names=overrides,
+        )
+
+
 def test_delta_reuse_signature_comes_from_the_canonical_scheme():
     codebook = (torch.zeros(64, 4), torch.zeros(64, 4))
     scheme = build_cb_scheme(

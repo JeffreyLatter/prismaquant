@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import math
+import operator
 import os
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -30,8 +31,11 @@ from .allocator_solver import (
 )
 from .nvfp4_cb_footprint import (
     CBSerializationContext,
-    cb_tensor_payload_breakdown,
     is_cb_format,
+)
+from .footprint import (
+    format_tensor_payload_breakdown,
+    plain_source_dtype_tensor_payload_breakdown,
 )
 from .serving_profiles import (
     SERVING_LANE_SCHEMA,
@@ -46,6 +50,37 @@ from .serving_profiles import (
 # ``weight_mse``: it says the row was never measured because there is nothing
 # to measure.
 SOURCE_PASSTHROUGH_COST_SOURCE = "source_passthrough"
+
+# ---------------------------------------------------------------------------
+# Anchored-AURA supersurrogate admission (P0)
+#
+# ``anchored_cost`` prices a whole menu from one production-arm render per
+# unit: ``cost(i,K) = predicted_dloss(i,K̂) x [g(K)/g(K̂)]``. Those rows are a
+# distinct provenance from every other weight-only row the allocator reads,
+# and the three stamps below are what identify them. Defined HERE, not in
+# ``anchored_cost``, because that module imports this one — one definition,
+# no cycle.
+ANCHORED_AURA_COST_CURRENCY = "aura_predicted_dloss"
+ANCHORED_AURA_COST_SOURCE = "production_arm_render"
+# The activation-pricing branch label such a row is stamped with.
+ANCHORED_AURA_BRANCH = "anchored_aura_extrapolation"
+
+# The allocator has an explicit branch for anchored-AURA rows: it reads
+# ``predicted_dloss`` directly, keeps them out of the P5a calibration sample,
+# and admits a measured zero instead of removing it as
+# ``activation_cost_unmeasured``.
+#
+# ⚠ WHAT THIS FLAG DOES **NOT** CLAIM. "Supersurrogate" is a statement about
+# the CURRENCY — one KL-adjoint projection replaced the two-factor magnitude
+# score (``h_trace x output_mse`` / ``h_trace x cw_m2``) that preceded it. It
+# is NOT a claim that AURA models activation-QUANTIZATION error. It does not:
+# ``aura_cost.py`` runs its adjoint on unquantized boundary activations and
+# ``dW`` is a weight delta, so no A-side error enters. AURA is
+# activation-WEIGHTED (``gW`` carries X — that is the alignment term its win
+# lives in) and activation-quantization-BLIND. See
+# ``cost_entry_is_anchored_aura_supersurrogate`` for the standing limitation
+# this leaves open, and why it is reported rather than gated.
+AURA_SUPERSURROGATE_ALLOCATOR_SEMANTICS = True
 
 # Serving-route token for a passthrough whose bytes the model's OWN loader
 # consumes, with no Gridbook codec in the path.
@@ -209,6 +244,79 @@ PASSTHROUGH_SOURCE_REQUIREMENTS: dict[str, str] = {
     for name, contract in SOURCE_PASSTHROUGH_CONTRACTS.items()
 }
 
+# An allocator candidate may never carry more serialized tensor payload than
+# the representation already stored for that unit.  Source kinds are resolved
+# through the passthrough contracts rather than through a numeric bpp table:
+# the registered source FormatSpec owns the exact weight/scale footprint.
+SOURCE_BPP_EXCEEDED_REASON = "candidate_exceeds_source_bpp"
+SOURCE_BPP_UNKNOWN_REASON = "source_bpp_unknown"
+SOURCE_BPP_POLICY_SCHEMA = "prismaquant.source_bpp_legality.v1"
+
+_source_kinds = [
+    contract.source_kind
+    for contract in SOURCE_PASSTHROUGH_CONTRACTS.values()
+]
+if len(set(_source_kinds)) != len(_source_kinds):
+    duplicates = sorted(
+        kind for kind, count in Counter(_source_kinds).items() if count > 1
+    )
+    raise RuntimeError(
+        "SOURCE_PASSTHROUGH_CONTRACTS has ambiguous source footprint "
+        f"owners for source kinds {duplicates}"
+    )
+SOURCE_FORMAT_BY_KIND: dict[str, str] = {
+    contract.source_kind: name
+    for name, contract in SOURCE_PASSTHROUGH_CONTRACTS.items()
+}
+
+
+@dataclass(frozen=True)
+class SourceFootprintOwner:
+    """Exact source-payload authority selected by a census kind."""
+
+    source_kind: str
+    format_name: str | None = None
+    safetensors_dtype: str | None = None
+
+
+def source_footprint_owner_for_kind(
+    source_kind: str,
+) -> SourceFootprintOwner | None:
+    """Resolve special scaled formats or an ordinary safetensors dtype.
+
+    Scale-bearing native formats are owned by their registered producer
+    ``FormatSpec``.  Every other supported dtype is derived through
+    ``footprint``'s safetensors storage-width authority.  Sentinels such as
+    ``unknown``/``heterogeneous`` have neither owner and therefore fail closed.
+    """
+    kind = str(source_kind)
+    format_name = SOURCE_FORMAT_BY_KIND.get(kind)
+    if format_name is not None:
+        return SourceFootprintOwner(kind, format_name=format_name)
+    try:
+        item = plain_source_dtype_tensor_payload_breakdown(kind, (1,))
+    except ValueError:
+        return None
+    return SourceFootprintOwner(
+        kind,
+        safetensors_dtype=str(item["source_dtype"]),
+    )
+
+
+def source_format_for_kind(source_kind: str) -> fr.FormatSpec | None:
+    """Resolve a census source kind to its registered footprint owner.
+
+    ``SOURCE_FORMAT_BY_KIND`` is derived from
+    ``SOURCE_PASSTHROUGH_CONTRACTS`` and validated one-to-one at import time.
+    Adding a future source representation to that contract table automatically
+    subjects every candidate to its exact registered footprint; there is no
+    parallel numeric source-bpp lookup to update or drift.
+    """
+    owner = source_footprint_owner_for_kind(source_kind)
+    if owner is None or owner.format_name is None:
+        return None
+    return fr.get_format(owner.format_name)
+
 # Passthrough formats whose Δloss is EXACT BY CONSTRUCTION, so the allocator
 # synthesizes their candidate instead of requiring a cost-table column.
 #
@@ -319,19 +427,11 @@ def serialized_candidate_payload(
     missing context prevents an old ``4k+16`` estimate from silently leaking
     back into a production-v2 allocation.
     """
-    if not is_cb_format(spec.name):
-        return int(spec.memory_bytes_for_shape(shape)), None, None
-    if cb_serialization_context is None:
-        raise ValueError(
-            f"{qname}: exact bytes for {spec.name} require an explicit "
-            "CBSerializationContext (scale coding/layout + codebook identity); "
-            "refusing to price the legacy FormatSpec approximation"
-        )
-    item = cb_tensor_payload_breakdown(
-        spec.name,
+    item = format_tensor_payload_breakdown(
+        spec,
         shape,
         qname=qname,
-        context=cb_serialization_context,
+        cb_serialization_context=cb_serialization_context,
     )
     return (
         int(item["tensor_payload_bytes"]),
@@ -363,6 +463,112 @@ class FormatApplicability:
     legal: bool
     reason: str | None = None
     detail: str = ""
+    provenance: dict[str, object] | None = None
+
+
+def _source_bpp_applicability(
+    shape: tuple[int, ...],
+    spec: fr.FormatSpec,
+    *,
+    qname: str,
+    source_kind: str | None,
+    cb_serialization_context: CBSerializationContext | None,
+) -> FormatApplicability:
+    """Apply the exact candidate-payload <= source-payload legality rule.
+
+    Both payloads describe the same shape, so comparing their integer byte
+    counts is exactly equivalent to comparing bpp and cannot accidentally
+    admit a candidate through a floating-point tolerance.  ``None`` means the
+    caller supplied no source census at all (legacy/offline analysis); an
+    explicit but unrecognized census kind fails closed.
+    """
+    if source_kind is None:
+        return FormatApplicability(True)
+    source_owner = source_footprint_owner_for_kind(source_kind)
+    if source_owner is None:
+        provenance = {
+            "policy_schema": SOURCE_BPP_POLICY_SCHEMA,
+            "source_kind": str(source_kind),
+            "candidate_format": fr.canonical_format_name(spec.name),
+            "comparison": "candidate_payload_bytes <= source_payload_bytes",
+        }
+        return FormatApplicability(
+            False,
+            SOURCE_BPP_UNKNOWN_REASON,
+            f"{qname}: source_kind={source_kind!r} has no exact source "
+            "footprint owner (registered scaled format or safetensors dtype); "
+            "refusing to admit a candidate whose source bpp cannot be derived",
+            provenance,
+        )
+
+    # Structural-only callers historically use this helper without a CB
+    # producer context.  They cannot price a versioned CB layout exactly, so
+    # leave the rate verdict to ``build_candidates`` / allocator preflight,
+    # both of which own and pass the mandatory context.  Non-CB formats need
+    # no such deferral.
+    if is_cb_format(spec.name) and cb_serialization_context is None:
+        return FormatApplicability(True)
+
+    candidate_item = format_tensor_payload_breakdown(
+        spec,
+        shape,
+        qname=qname,
+        cb_serialization_context=cb_serialization_context,
+    )
+    if source_owner.format_name is not None:
+        source_item = format_tensor_payload_breakdown(
+            source_owner.format_name,
+            shape,
+            qname=qname,
+            cb_serialization_context=cb_serialization_context,
+        )
+        source_label = source_owner.format_name
+        source_owner_provenance = {
+            "source_footprint_owner": "registered_format",
+            "source_format": source_owner.format_name,
+        }
+    else:
+        assert source_owner.safetensors_dtype is not None
+        source_item = plain_source_dtype_tensor_payload_breakdown(
+            source_owner.safetensors_dtype,
+            shape,
+        )
+        source_label = source_owner.safetensors_dtype
+        source_owner_provenance = {
+            "source_footprint_owner": "safetensors_dtype",
+            "source_dtype": source_owner.safetensors_dtype,
+        }
+    candidate_bytes = int(candidate_item["tensor_payload_bytes"])
+    source_bytes = int(source_item["tensor_payload_bytes"])
+    n_params = max(int(math.prod(shape)), 1)
+    provenance = {
+        "policy_schema": SOURCE_BPP_POLICY_SCHEMA,
+        "source_kind": str(source_kind),
+        **source_owner_provenance,
+        "candidate_format": fr.canonical_format_name(spec.name),
+        "shape": [int(dim) for dim in shape],
+        "params": n_params,
+        "source_payload_bytes": source_bytes,
+        "candidate_payload_bytes": candidate_bytes,
+        "source_bpp": 8.0 * source_bytes / n_params,
+        "candidate_bpp": 8.0 * candidate_bytes / n_params,
+        "source_bpp_numerator_bits": 8 * source_bytes,
+        "candidate_bpp_numerator_bits": 8 * candidate_bytes,
+        "bpp_denominator_params": n_params,
+        "comparison": "candidate_payload_bytes <= source_payload_bytes",
+    }
+    if candidate_bytes > source_bytes:
+        return FormatApplicability(
+            False,
+            SOURCE_BPP_EXCEEDED_REASON,
+            f"{qname}: {spec.name} payload {candidate_bytes} bytes "
+            f"({provenance['candidate_bpp']:.10g} bpp) exceeds "
+            f"source_kind={source_kind!r} / {source_label} payload "
+            f"{source_bytes} bytes ({provenance['source_bpp']:.10g} bpp); "
+            "comparison is exact integer bytes with no tolerance",
+            provenance,
+        )
+    return FormatApplicability(True, provenance=provenance)
 
 
 def _profile_allows_format(
@@ -398,13 +604,15 @@ def check_format_applicability(
     qname: str | None = None,
     source_kind: str | None = None,
     target_profile: str | None = None,
+    cb_serialization_context: CBSerializationContext | None = None,
 ) -> FormatApplicability:
     """Return whether a Linear shape can legally use a format.
 
     The verdict captures all cheap preflight constraints that otherwise show
     up later as allocator-invalid choices or RTN/kernel crashes: source
     passthrough integrity, serving profile restrictions, group divisibility,
-    and known runtime kernel shape rules.
+    known runtime kernel shape rules, and (when an exact producer context is
+    available for CB) the source bit-rate ceiling.
     """
     try:
         spec = (
@@ -477,7 +685,13 @@ def check_format_applicability(
             shape_decision.reason or "kernel_shape",
             shape_decision.detail,
         )
-    return FormatApplicability(True)
+    return _source_bpp_applicability(
+        shape,
+        spec,
+        qname=str(qname or "<unnamed Linear>"),
+        source_kind=source_kind,
+        cb_serialization_context=cb_serialization_context,
+    )
 
 
 def check_stats_format_applicability(
@@ -487,6 +701,7 @@ def check_stats_format_applicability(
     qname: str | None = None,
     source_kind: str | None = None,
     target_profile: str | None = None,
+    cb_serialization_context: CBSerializationContext | None = None,
 ) -> FormatApplicability:
     """Stats-entry wrapper for ``check_format_applicability``.
 
@@ -504,6 +719,7 @@ def check_stats_format_applicability(
         qname=qname,
         source_kind=source_kind,
         target_profile=target_profile,
+        cb_serialization_context=cb_serialization_context,
     )
 
 
@@ -965,6 +1181,66 @@ def cost_entry_weight_only_dloss(
     )
 
 
+def cost_entry_is_anchored_aura_supersurrogate(cost_entry: dict) -> bool:
+    """Whether one row was priced by the anchored-AURA campaign.
+
+    Three independent stamps, ALL required, in the same forgery-refusing style
+    as ``cost_entry_is_source_passthrough`` — a hand-written table cannot claim
+    this provenance by writing one string:
+
+      * ``cost_currency`` is the AURA projection currency, so the number is
+        ``0.5*mean_k<gW,dW>^2`` and not an MSE wearing the same field name;
+      * ``cost_source`` says a PRODUCTION-ARM render produced the anchor.
+        RTN-vs-rendered ``dW`` is result-changing (+36% at fp8), and the
+        byte-verbatim terminals carry ``SOURCE_PASSTHROUGH_COST_SOURCE``
+        instead, so they are excluded here and handled by the exact branch;
+      * ``fisher_application_count == 1`` — the h^2 guard. ``predicted_dloss``
+        already contains the KL-Fisher; extrapolation multiplies by a ratio of
+        ``g``, never by a sensitivity a second time.
+
+    **The standing limitation this admission accepts.** Every rung in the CB
+    menus quantizes activations (``act_quant_changes_input`` is True for all of
+    ``nvfp4_cb`` and ``fp8_cb``), while AURA's ``dW`` is weights-only. So these
+    prices are activation-quantization-blind, and the P5a penalty cannot fix it
+    here: an anchored table carries no measured ``output_mse`` rows at all, so
+    every family is uncalibrated and ``penalty_for`` already returns exactly
+    1.0. Skipping the penalty is a provenance statement, not a number change.
+
+    Two facts bound the exposure, which is why this is reported and not gated:
+
+      * the activation path is CONSTANT across K within each CB family, so the
+        blindness cannot reorder rungs INSIDE a family — it can only shift the
+        nvfp4_cb-vs-fp8_cb family-choice margin;
+      * AURA's validated wins (-38%/-39.5% @4B, -17.9% @27B on served KL) were
+        measured against ``h_trace x output_mse``, and THAT baseline carried
+        the A side (``measure_quant_cost`` applies
+        ``activation_quantize_dequantize(X)``). The activation-blind projection
+        beat an activation-inclusive cost, on menus already mixing W4A4 NVFP4,
+        W8A8 FP8 and BF16 — the same family-choice margin.
+
+    This is the route-flip pattern (``expert_empirical_cost`` module contract):
+    a named limitation carried forward, with the served A/B as the arbiter.
+    """
+    if not isinstance(cost_entry, dict):
+        return False
+    if cost_entry.get("cost_currency") != ANCHORED_AURA_COST_CURRENCY:
+        return False
+    if cost_entry.get("cost_source") != ANCHORED_AURA_COST_SOURCE:
+        return False
+    applications = cost_entry.get("fisher_application_count")
+    if isinstance(applications, bool):
+        # ``True == 1``; a boolean is not a count and must not forge one.
+        return False
+    try:
+        # ``__index__`` rather than ``int()``: it admits the numpy integers a
+        # pickled cost table really carries, and refuses the string "1" and
+        # the float 1.0, neither of which any writer of this stamp emits.
+        applications = operator.index(applications)
+    except TypeError:
+        return False
+    return applications == 1
+
+
 def cost_entry_activation_pricing_branch(
     stats_entry: dict,
     cost_entry: dict,
@@ -1002,6 +1278,13 @@ def cost_entry_activation_pricing_branch(
         # An aggregated super-item entry: the members' penalties are already
         # folded into its predicted_dloss (aggregate_* below).
         return BRANCH_CALIBRATED
+    if cost_entry_is_anchored_aura_supersurrogate(cost_entry):
+        # Its own label rather than BRANCH_UNCALIBRATED: both are priced at a
+        # 1.0 multiplier, but "no calibration sample was found for this family"
+        # and "this row is an anchored KL-adjoint projection that the P5a
+        # transfer does not apply to" are different audit answers, and the
+        # artifact has to be able to tell them apart.
+        return ANCHORED_AURA_BRANCH
     act_changes = _format_act_quant_changes_input(format_name)
     if activation_pricing is None:
         return (
@@ -1076,6 +1359,18 @@ def cost_entry_predicted_dloss(
         # Aggregated super item: its members were penalized individually and
         # the result summed. Re-applying here would square the correction.
         return base
+    if cost_entry_is_anchored_aura_supersurrogate(cost_entry):
+        # Read the anchored projection directly. The P5a penalty transfers a
+        # weight-SPACE number onto the measured output scale using a constant
+        # fitted from that family's own measured/weight-only row pairs; an
+        # anchored table has no measured rows, so there is no such constant to
+        # apply (``penalty_for`` already returns 1.0 via BRANCH_UNCALIBRATED).
+        # Naming the branch instead of falling through keeps the artifact
+        # honest about WHY the multiplier was 1.0. Numerically identical today
+        # — and it stays correct if a future run mixes an anchored table with a
+        # measured one, where falling through would silently apply another
+        # family's transfer constant to a projection that is not in its units.
+        return base
     return base * _activation_penalty(format_name, activation_pricing)
 
 
@@ -1129,6 +1424,23 @@ def cost_entry_prices_unmeasured_activation_at_zero(
         BF16.
     """
     if format_name is None:
+        return False
+    if cost_entry_is_anchored_aura_supersurrogate(cost_entry):
+        # An anchored-AURA zero is a MEASUREMENT, not the absence of one, and
+        # this guard exists for the absence. The zeros it was built to catch
+        # are placeholders — a band-interpolated row that never produced an
+        # output number, a dense-ladder fit that could not be made — and an
+        # anchored table cannot contain those: ``assert_aura_only_cost_table``
+        # refuses any row carrying output_mse/weight_mse/h_trace at all, and
+        # per-unit checkpoint completeness refuses a missing anchor rather than
+        # defaulting it to zero.
+        #
+        # It is also very nearly vacuous, which is the point: 0.5*mean_k<gW,dW>^2
+        # is exactly 0.0 only if dW is exactly zero (a byte-identical render —
+        # the exact-by-construction branch above already owns that) or gW is
+        # exactly zero (h_trace == 0 — the positive-sensitivity condition below
+        # already exempts that). The bypass is scoped to rows this predicate
+        # matches, so every other cost table keeps the guard at full strength.
         return False
     try:
         spec = fr.get_format(str(format_name))
@@ -1210,6 +1522,16 @@ def collect_activation_calibration_rows(
             if entry is None or "error" in entry:
                 continue
             if cost_entry_is_bit_exact(entry, spec.name):
+                continue
+            if cost_entry_is_anchored_aura_supersurrogate(entry):
+                # Never a calibration observation on either side. The sample
+                # fits a measured-over-weight-only RATIO, and an anchored row
+                # has no measured side to be the numerator; counting it in
+                # ``weight_only_by_family`` would inflate the census that
+                # ``calibrate`` fail-closes on, making a run refuse for a
+                # population the penalty is never applied to. Structurally
+                # already excluded (no output_mse), stated explicitly so it
+                # stays excluded if the membership test is ever widened.
                 continue
             if _has_measured_output_mse(stats_entry, entry):
                 measured_by_family[family] += 1
@@ -1347,6 +1669,12 @@ def build_candidates(stats: dict, costs: dict, formats: list[fr.FormatSpec],
     defensive check for stale or hand-written recipes, but the DP must never
     see choices that the selected serving profile cannot run.
 
+    When ``source_manifest`` is present, every census kind must resolve to a
+    registered source footprint owner and each candidate's exact additive
+    tensor payload must be no larger than that source payload.  An absent
+    manifest is the explicit legacy/offline mode; a partial or unknown
+    manifest fails rather than silently omitting an unpriceable unit.
+
     ``activation_pricing`` (ultraplan P5a) is the run's ONE per-family
     activation calibration; it corrects the weight-only branches and stamps
     the branch that priced every candidate. ``target_profile``'s declared
@@ -1375,6 +1703,24 @@ def build_candidates(stats: dict, costs: dict, formats: list[fr.FormatSpec],
             source_manifest.get(name, "unknown")
             if source_manifest is not None else None
         )
+        if (
+            source_manifest is not None
+            and len(shape) < 2
+        ):
+            raise ValueError(
+                f"{name}: source-bpp legality needs an exact rank>=2 Linear "
+                f"shape, got {shape}; refusing to price row/scale overhead"
+            )
+        if (
+            source_manifest is not None
+            and source_footprint_owner_for_kind(str(source_kind)) is None
+        ):
+            raise ValueError(
+                f"{name}: source_kind={source_kind!r} has no exact source "
+                "footprint owner (registered scaled format or safetensors "
+                "dtype); source-bpp legality cannot be established, so "
+                "refusing to build allocator candidates"
+            )
         cands = []
         for spec in formats:
             entry = None
@@ -1401,6 +1747,7 @@ def build_candidates(stats: dict, costs: dict, formats: list[fr.FormatSpec],
                 qname=name,
                 source_kind=source_kind,
                 target_profile=target_profile,
+                cb_serialization_context=cb_serialization_context,
             )
             if not verdict.legal:
                 if mask_records is not None:
@@ -1413,6 +1760,7 @@ def build_candidates(stats: dict, costs: dict, formats: list[fr.FormatSpec],
                         "out_features": out_features,
                         "in_features": in_features,
                         "source_kind": source_kind,
+                        **(verdict.provenance or {}),
                     })
                 masked.setdefault(
                     (spec.name, verdict.reason or "not_applicable"),
@@ -1636,7 +1984,12 @@ def selection_serving_lane_provenance(
     }
 
 
-def summarize_applicability_masks(records: list[dict]) -> dict:
+def summarize_applicability_masks(
+    records: list[dict],
+    *,
+    source_census_present: bool | None = None,
+    source_census_units: int | None = None,
+) -> dict:
     """Summarize format candidates removed before the optimizer sees them.
 
     The allocator's legality gate is part of the optimization layer: illegal
@@ -1671,6 +2024,24 @@ def summarize_applicability_masks(records: list[dict]) -> dict:
             key=lambda row: (-int(row["count"]), row["shape"]),
         )
 
+    sorted_records = sorted(
+        records,
+        key=lambda row: (
+            str(row.get("format", "")),
+            str(row.get("reason", "")),
+            int(row.get("out_features", 0) or 0),
+            int(row.get("in_features", 0) or 0),
+            str(row.get("qname", "")),
+        ),
+    )
+    source_bpp_eliminations = [
+        row for row in sorted_records
+        if row.get("reason") in {
+            SOURCE_BPP_EXCEEDED_REASON,
+            SOURCE_BPP_UNKNOWN_REASON,
+        }
+    ]
+
     return {
         "summary": {
             fmt: dict(sorted(reason_counts.items()))
@@ -1683,16 +2054,44 @@ def summarize_applicability_masks(records: list[dict]) -> dict:
             }
             for fmt, reason_map in sorted(shape_payload.items())
         },
-        "records": sorted(
-            records,
-            key=lambda row: (
-                str(row.get("format", "")),
-                str(row.get("reason", "")),
-                int(row.get("out_features", 0) or 0),
-                int(row.get("in_features", 0) or 0),
-                str(row.get("qname", "")),
+        "records": sorted_records,
+        "source_bpp_legality": {
+            "schema": SOURCE_BPP_POLICY_SCHEMA,
+            "enabled": True,
+            "evaluated": (
+                source_census_present
+                if source_census_present is not None else None
             ),
-        ),
+            "evaluation_status": (
+                "evaluated"
+                if source_census_present is True
+                else "not_evaluated_no_source_census"
+                if source_census_present is False
+                else "unspecified_by_summary_caller"
+            ),
+            "source_census_units": (
+                int(source_census_units)
+                if source_census_units is not None else None
+            ),
+            "comparison": (
+                "candidate_payload_bytes <= source_payload_bytes"
+            ),
+            "comparison_arithmetic": (
+                "exact_integer_bytes_no_float_tolerance"
+            ),
+            "source_footprint_derivation": (
+                "source_kind -> (SOURCE_PASSTHROUGH_CONTRACTS -> "
+                "registered FormatSpec, or safetensors dtype -> existing "
+                "storage-width authority) -> footprint tensor payload"
+            ),
+            "candidate_footprint_derivation": (
+                "footprint.format_tensor_payload_breakdown"
+            ),
+            "no_source_census_policy": "not_evaluated",
+            "unknown_source_kind_policy": "abort_allocator",
+            "eliminated_count": len(source_bpp_eliminations),
+            "eliminated_candidates": source_bpp_eliminations,
+        },
     }
 
 
@@ -2348,9 +2747,11 @@ def _scan_source_dtype_manifest(
 ) -> dict[str, str]:
     """Classify source Linear weights for passthrough gating.
 
-    Returns ``bf16`` only for actual BF16 source tensors, ``fp8`` for native
-    FP8/scale-sidecar sources, and ``other`` for FP16/FP32/etc. passthroughs
-    that would be synthesized rather than byte-preserving.
+    Scale-bearing native layouts receive semantic kinds (``mxfp4``, ``fp8``,
+    ``fp8_ue8m0``). Ordinary tensors retain their lower-case safetensors dtype
+    token (``bf16``, ``f16``, ``f32``, ...), so source-rate accounting can
+    derive their storage width without guessing. Unreadable/mixed stacks are
+    explicit sentinels and fail the allocator's source-rate gate.
     """
     from safetensors import safe_open
 
@@ -2530,7 +2931,7 @@ def _scan_source_dtype_manifest(
         else:
             # A packed unit is passthrough-legal only when every serialized
             # constituent has the same native source representation.
-            manifest[name] = "other"
+            manifest[name] = "heterogeneous"
 
     manifest: dict[str, str] = {}
     for base, suffixes in bases.items():
@@ -2553,16 +2954,19 @@ def _scan_source_dtype_manifest(
             # Block-FP8 with UE8M0 block exponents (DeepSeek-V3.1/V4), NOT
             # the FP32 weight_scale_inv contract FP8_SOURCE models.
             source_kind = "fp8_ue8m0"
-        elif "weight_scale_inv" in suffixes or "weight_scale" in suffixes:
+        elif (
+            ("weight_scale_inv" in suffixes or "weight_scale" in suffixes)
+            and dtype is not None
+        ):
             source_kind = "fp8"
         elif dtype == "BF16":
             source_kind = "bf16"
         elif dtype is not None and dtype.startswith("F8"):
             source_kind = "fp8"
         elif dtype is None:
-            source_kind = "bf16"
+            source_kind = "unknown"
         else:
-            source_kind = "other"
+            source_kind = dtype.lower()
         recipe_name = (
             _packed_to_recipe_name(base) if base in packed_bases
             else _to_recipe_name(base)
@@ -2598,6 +3002,6 @@ def _scan_source_dtype_manifest(
             # header scan derived from the actual dtypes: doing so is what
             # made 33,024 packed-MXFP4 experts look like FP32-scaled fp8.
             # It still fills in names the dtype scan could not classify.
-            if manifest.get(live_qname) in (None, "other"):
+            if manifest.get(live_qname) in (None, "unknown"):
                 manifest[live_qname] = "fp8"
     return manifest

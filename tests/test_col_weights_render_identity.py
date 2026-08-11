@@ -99,6 +99,54 @@ def test_weighted_families_actually_use_the_vector(fmt):
     assert not torch.equal(uniform, weighted)
 
 
+def test_fp8_cb_k43_production_rerender_is_bit_deterministic():
+    """A discarded menu rung can be reproduced at its stored cache dtype."""
+    from prismaquant.nvfp4_cb_footprint import CBSerializationContext
+    from prismaquant.production_weight_cache import render_production_weight
+
+    context = CBSerializationContext.production(
+        codebook_source="lattice",
+        codebook_source_scope="none",
+        scale_sweep=True,
+        scale_sweep_scope="all",
+        ldlq=False,
+        ldlq_scope="none",
+        minchain=False,
+        encode_tier="balanced",
+    )
+    assert context.scale_coding == "two_tier"
+    assert context.codebook_source == "lattice"
+    assert context.scale_sweep is True
+    assert context.ldlq is False
+    assert context.minchain is False
+    assert context.encode_tier == "balanced"
+
+    generator = torch.Generator(device="cpu").manual_seed(731)
+    weight = torch.randn(8, 256, generator=generator)
+    acts = torch.randn(32, 256, generator=generator)
+    col_weights = torch.rand(256, generator=generator) + 0.05
+    render_kwargs = {
+        "qname": "lin",
+        "activations": {"lin": acts},
+        "levers": {"gptq": False, "weighted_vq": True},
+        "col_weights": col_weights,
+        "cb_serialization_context": context,
+    }
+
+    first = render_production_weight(
+        weight, "FP8_CB_K43", **render_kwargs,
+    )
+    second = render_production_weight(
+        weight, "FP8_CB_K43", **render_kwargs,
+    )
+
+    # ProductionWeightCache stores FP32 renders as BF16 shards. Compare the
+    # canonical value-bearing bytes that scoring later has to reproduce.
+    first_stored = first.to(dtype=torch.bfloat16).contiguous()
+    second_stored = second.to(dtype=torch.bfloat16).contiguous()
+    assert torch.equal(first_stored, second_stored)
+
+
 def test_only_weighted_vq_is_offered_to_the_weighted_families():
     import prismaquant.production_weight_cache as pwc
 
@@ -193,6 +241,7 @@ def test_build_cache_cb_context_requires_explicit_producer_settings(monkeypatch)
     monkeypatch.delenv("CB_CODEBOOK_SOURCE", raising=False)
     monkeypatch.delenv("CB_SCALE_SWEEP", raising=False)
     monkeypatch.delenv("PRISMAQUANT_CB_LDLQ", raising=False)
+    monkeypatch.delenv("PRISMAQUANT_CB_MINCHAIN", raising=False)
     monkeypatch.delenv("PRISMAQUANT_CB_ENCODE_TIER", raising=False)
     with pytest.raises(SystemExit, match="missing explicit CB producer"):
         _explicit_cb_render_context(["NVFP4_CB_K16"])
@@ -201,6 +250,7 @@ def test_build_cache_cb_context_requires_explicit_producer_settings(monkeypatch)
     monkeypatch.setenv("CB_CODEBOOK_SOURCE", "lattice")
     monkeypatch.setenv("CB_SCALE_SWEEP", "1")
     monkeypatch.setenv("PRISMAQUANT_CB_LDLQ", "0")
+    monkeypatch.setenv("PRISMAQUANT_CB_MINCHAIN", "0")
     monkeypatch.setenv("PRISMAQUANT_CB_ENCODE_TIER", "balanced")
     context = _explicit_cb_render_context(["NVFP4_CB_K16"])
     assert context.scale_coding == "v1"
