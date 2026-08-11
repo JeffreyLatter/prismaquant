@@ -722,6 +722,25 @@ case "$COST_MODE" in
     exit 2
     ;;
   production-render-score|production-render)
+    # FAIL-CLOSED: this mode is UNLICENSED on any CB/CBL-containing menu.
+    # Its score field is `weight_mse` (since audit M6), and the per-unit
+    # factorization mse(e,K) ~= s_e * g(K) — the assumption the whole
+    # adaptive-render/allocation story rests on — FAILS in weight currency
+    # across a codebook-basis change: CV over experts of
+    # weight_mse_CBL/weight_mse_lattice is monotone in rung, 0.088 (K28) ->
+    # 0.224 (K48), with 8 of 10 rung-pairs breaching the 0.10 bar. The same
+    # six planes pass lattice->lattice at CV 0.067/0.056, so it is not a
+    # cohort artifact. Mechanism: a learned book is fit to the POOLED weight
+    # distribution (redistributing error across experts rather than scaling
+    # it), and CBL is itself selected under an imatrix-weighted weight metric
+    # (nvfp4_cb_formats.py `err = err * wq`) — shaped in one currency,
+    # measured in another. It was also already shown to mis-rank LDLQ.
+    # Allocating a CB menu on this estimator means allocating in the currency
+    # that demonstrably does not transfer. Use aura (the default) or local.
+    if [[ "${EXPORT_CONTAINER:-}" == "nvfp4_cb" || "${FORMATS:-}" == *_CB_* ]]; then
+      echo "[pipeline] ERROR: COST_MODE=$COST_MODE is unlicensed on a CB/CBL menu (EXPORT_CONTAINER=${EXPORT_CONTAINER:-unset}, FORMATS=${FORMATS:-unset}). Its score field is weight_mse, the currency in which the per-unit factorization FAILS across a codebook-basis change (CV 0.088 at K28 -> 0.224 at K48; 8/10 rung-pairs breach the 0.10 bar, while lattice->lattice passes at 0.067/0.056). Activation currency holds where weight currency does not. This spelling remains valid only for reproducing pre-CB artifacts on non-CB menus. Use COST_MODE=aura (default) or local." >&2
+      exit 2
+    fi
     BASE_COST_PATH="${WORK_DIR}/artifacts/cost_baseline.pkl"
     COST_PATH="${WORK_DIR}/artifacts/cost.pkl"
     PRODUCTION_RENDER_COST_CACHE_PATH="${WORK_DIR}/artifacts/production_render_score_cache.pkl"
@@ -1351,7 +1370,7 @@ PY
   fi
 
   # [2c] The AURA cost itself: KL-Fisher probes x production-rendered dW.
-  # Packed-MoE experts are deliberately omitted here (the smooth adjoint is
+  # Profile-declared routed experts are deliberately omitted here (the smooth adjoint is
   # route-flip-blind on them) and costed empirically in [2d].
   require_stage_settings "$AURA_COST_RAW" aura-cost
   if [[ ! -f "$AURA_COST_RAW" ]]; then
@@ -1382,7 +1401,8 @@ PY
   fi
 
   # [2d] Hybrid finalize: measured empirical unit-KL costs for any omitted
-  # packed experts (FP8 kept in the menu — real-KL rejects it, no bans),
+  # routed experts (packed or per-expert Linear; FP8 kept in the menu —
+  # real-KL rejects it, no bans),
   # plus sidecar (MTP/visual) row backfill from the baseline cost. Backfilled
   # rows carry the baseline estimator and are recorded in provenance.
   require_stage_settings "$COST_PATH" aura-hybrid-cost
@@ -1396,7 +1416,7 @@ print(len(payload.get("provenance", {}).get("omitted_packed_experts", []) or [])
 PY
 )"
     if [[ "$OMITTED_EXPERTS" != "0" ]]; then
-      echo "[pipeline] [2d/4] measuring empirical packed-expert unit-KL costs (${OMITTED_EXPERTS} omitted tensors; hybrid merge) ..."
+      echo "[pipeline] [2d/4] measuring empirical routed-expert unit-KL costs (${OMITTED_EXPERTS} omitted targets; hybrid merge) ..."
       python3 -m prismaquant.expert_empirical_cost \
         --model "$MODEL_PATH" \
         --cost-mode "$COST_MODE" \
@@ -1407,9 +1427,10 @@ PY
         --calib-seqlen "$AURA_EXPERT_SEQLEN" \
         --merge-base "$AURA_COST_RAW" \
         --backfill-base "$BASE_COST_PATH" \
+        "${COST_CACHE_COL_WEIGHT_ARGS[@]+"${COST_CACHE_COL_WEIGHT_ARGS[@]}"}" \
         2>&1 | tee "${WORK_DIR}/logs/expert_empirical_cost.log"
     else
-      echo "[pipeline] [2d/4] no packed experts omitted; finalizing AURA cost (sidecar backfill) ..."
+      echo "[pipeline] [2d/4] no routed experts omitted; finalizing AURA cost (sidecar backfill) ..."
       COST_MODE="$COST_MODE" python3 - "$AURA_COST_RAW" "$BASE_COST_PATH" "$COST_PATH" <<'PY'
 import os
 import pickle

@@ -125,6 +125,67 @@ def test_production_cache_union_is_archived_and_blocked():
     assert "tools.build_union_cache" not in script
 
 
+def test_production_render_score_is_unlicensed_on_a_cb_menu():
+    """COST_MODE=production-render-score fails fast on any CB/CBL menu.
+
+    Its score field is `weight_mse` (audit M6), and the per-unit factorization
+    mse(e,K) ~= s_e * g(K) FAILS in weight currency across a codebook-basis
+    change: CV over experts of weight_mse_CBL/weight_mse_lattice is monotone in
+    rung, 0.088 (K28) -> 0.224 (K48), 8 of 10 rung-pairs breaching the 0.10
+    bar, while lattice->lattice on the same planes passes at 0.067/0.056.
+    Allocating a CB menu on that estimator allocates in the currency that does
+    not transfer.
+    """
+    script = _run_pipeline_script()
+
+    assert "unlicensed on a CB/CBL menu" in script
+    # The evidence travels with the guard, so the refusal is auditable.
+    assert "0.088" in script and "0.224" in script
+    # The escape hatch stays honest: it is still valid off CB menus.
+    assert "reproducing pre-CB artifacts on non-CB menus" in script
+
+
+def test_cb_unlicensed_guard_actually_fires():
+    """Execute the guard's real predicate; a gate never seen firing is not a gate.
+
+    Text assertions alone would only prove the string exists -- the exact
+    guard-scope failure this repo keeps paying for. So pull the condition out
+    of the shipped script and evaluate it under both CB signals and both
+    non-CB controls.
+    """
+    import subprocess
+
+    path = (
+        Path(__file__).resolve().parent.parent / "prismaquant" / "run-pipeline.sh"
+    )
+    cond = None
+    for line in path.read_text().splitlines():
+        if 'FORMATS:-}" == *_CB_*' in line:
+            cond = line.strip().removeprefix("if ").removesuffix("; then")
+            break
+    assert cond is not None, "CB-unlicensed guard condition not found in script"
+
+    def fires(export_container: str, formats: str) -> bool:
+        proc = subprocess.run(
+            ["bash", "-c", f"if {cond}; then exit 7; else exit 0; fi"],
+            env={
+                "PATH": "/usr/bin:/bin",
+                "EXPORT_CONTAINER": export_container,
+                "FORMATS": formats,
+            },
+            check=False,
+        )
+        assert proc.returncode in (0, 7), proc.returncode
+        return proc.returncode == 7
+
+    # Both CB signals must trip it, independently.
+    assert fires("nvfp4_cb", "NVFP4,FP8_DYNAMIC,BF16")
+    assert fires("compressed-tensors", "FP8_CB_K28,FP8_CB_K43")
+    # ...and neither control may.
+    assert not fires("compressed-tensors", "NVFP4,FP8_DYNAMIC,BF16")
+    assert not fires("", "")
+
+
 def test_core_recipe_defaults_are_pinned():
     script = _run_pipeline_script()
 

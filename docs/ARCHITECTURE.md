@@ -1,8 +1,12 @@
 # PrismaQuant Architecture
 
 As of: 2026-08-11 · branch `perf/ldlq-atom-compile` · verified against
-implementation baseline commit `c96eefc` plus this routed-MoE learned-codebook
-producer contract and the DeepSeek DSpark source-overlay contract,
+implementation baseline commit `3a5ec22` plus this bundle-authoritative
+per-rung learned/lattice source-map contract, the routed-MoE learned-codebook
+producer contract, the DeepSeek DSpark source-overlay contract, the streamed CB
+cached-menu render/consume contract, and the profile-declared routed-expert
+AURA/empirical hybrid key-space contract, plus the platform-agnostic anchored-cost
+mechanism, CB mapping plugin, and DSv4 one-shot acceptance-driver contract,
 with the external Gridbook runtime pinned to the **unreleased** 0.8.3
 preparation commit `032e815`. That commit adds the opt-in routed-MoE per-role
 LUT ABI; it has not been tagged, published, or device-validated, and the pin's
@@ -145,7 +149,7 @@ perturbed-X fixed point → L3 propagated end-KL) was **retired from the spine o
 and its code walled at `archive/l3_propagated_2026-07-30/` (re-vet R4). What ships is *one
 faithful unary cost* — **AURA by default since 2026-07-30** (re-vet R2),
 `production-render-score` as the explicit/legacy spelling, plus measured empirical unit-KL for
-packed experts — and *real held-out KL* to select among
+profile-declared routed experts in either packed or per-expert-Linear form — and *real held-out KL* to select among
 the candidates that cost proposes. The retiring evidence is measured, not argued: the L2
 fixed point beat additive L1 by **−1.5%** while AURA beat L1 by **−38.5%** on the same
 baseline (`aura_cascade_headtohead`); a better single cost was worth 25× more than another
@@ -232,16 +236,29 @@ flowchart TD
   CBL --> BASE
 
   subgraph COST["cost stage -- one of three COST_MODEs, dispatched in the COST_MODE case"]
-    PRS["production-render-score -- explicit/legacy<br/>build_production_cache --render-scope format-menu<br/>then production_render_cost -> cost.pkl"]
+    PRS["production-render-score -- explicit/legacy<br/>build_production_cache --render-scope format-menu<br/>CB streaming: render -> acknowledged score checkpoint -> discard<br/>then production_render_cost -> cost.pkl"]
     LOC["local<br/>the RTN base cost IS the allocator cost<br/>the CB/GGUF lanes shipping recipe"]
-    AUR["aura -- DEFAULT since 2026-07-30<br/>aura_cost -> cost_aura.pkl<br/>then expert_empirical_cost --merge-base -> cost.pkl<br/>then the [3c] additivity report"]
+    AUR["aura -- DEFAULT since 2026-07-30<br/>aura_cost excludes profile-declared routed experts -> cost_aura.pkl<br/>then expert_empirical_cost --merge-base -> cost.pkl<br/>then the [3c] additivity report"]
     CBH["CB sub-stage (:966-1035)<br/>cb_col_weights.pkl imatrix harvest, then<br/>expert_empirical_cost --replace-experts"]
+  end
+
+  subgraph DSVA["platform-agnostic anchored-cost mechanism -- DSv4 is the CB acceptance driver"]
+    DAP0["evaluate<br/>format-blind streamed checkpointed KL-adjoint -> gW_i<br/>global Fisher; profile-declared routed experts"]
+    DAMAP["map plugin<br/>format_registry family + model-profile role<br/>ladder/rate, transfer-equivalence partition,<br/>renderer + anchor policy + provenance"]
+    DAP1["price<br/>one production anchor per legal unit/segment<br/>render -> fp32 AURA scalar -> discard<br/>within-equivalence fit + hull + exposure"]
+    DAP3["allocate<br/>one exact-byte DP under the driver budget<br/>no iteration; blind export assignment"]
+    DAART["driver-specific exportable artifacts<br/>DSv4 CB: layer_config.json + selection.json<br/>+ render-input cb_col_weights.pkl"]
+    DAP0 --> DAP1 --> DAP3 --> DAART
+    DAMAP --> DAP1
   end
 
   BASE --> PRS
   BASE --> LOC
   BASE --> AUR
   LOC --> CBH
+  SRC --> DAP0
+  ACT --> DAP0
+  CBL --> DAMAP
 
   ALLOC["[3/4] allocator + allocator_solver -- :1076-1090<br/>multi-choice knapsack DP over Linear x format<br/>union-find serving-unit promotion<br/>artifacts/layer_config.json + pareto.csv"]
 
@@ -275,6 +292,7 @@ flowchart TD
   ALLOC -->|"EXPORT_CONTAINER=gguf, PRODUCTION_CACHE=0"| EXPGG
   CBL -. "same tensors; no retraining" .-> VAK
   CBL -. "same tensors; emit once" .-> EXPCB
+  DAART -. "selected assignment; same render inputs" .-> EXPCB
 
   OUTCT["compressed-tensors checkpoint<br/>WORK_DIR/exported"]
   OUTCB["CB checkpoint + quant_config.json + cb_codebooks.pqcb<br/>WORK_DIR/exported_nvfp4_cb"]
@@ -303,7 +321,7 @@ flowchart TD
 
   classDef optin stroke:#c07800,stroke-width:2px,stroke-dasharray:4
   classDef manual stroke:#c0392b,stroke-width:2px
-  class AUR,CBH,FR,VAK,SVF optin
+  class AUR,CBH,FR,VAK,SVF,DAP0,DAP1,DAP3,DAART optin
   class VNE,VQM,GOLD,NOSMOKE manual
 ```
 
@@ -339,13 +357,14 @@ which is what the rows touched since are keyed on.
 | **2/4** | Baseline per-(Linear,format) RTN cost | `prismaquant.incremental_measure_quant_cost` (`645-658`) | `artifacts/cost.pkl` (`COST_MODE=local`) or `artifacts/cost_baseline.pkl` (`314-380`); `logs/cost.log` | settings-hash `base-cost` (`768`) + cost-mode provenance when it IS the allocator table (`769-777`) | — |
 | **2a-CB** | imatrix column-weight harvest | `harvest_cb_col_weights` — ONE shell function, four call sites (`[2/4] pre-cost`, `[2b/4] cost-cache`, `[2d-CB]`, `[4/4]`) → `export_gguf.build_imatrix_from_act_cache` + `moe_imatrix.synthesize_packed_expert_col_weights` | `artifacts/cb_col_weights.pkl` | settings-hash `cb-col-weights` | CB lane; called by whichever stage needs the vector first |
 | **pre-2-CBL** | Train/verify the immutable value-bearing dense learned-codebook bundle | `ensure_cb_learned_bundle` → `prismaquant.build_cb_learned_bundle` → streaming source reader + certified `learn_pool` | `artifacts/cb_learned_bundle.pqcb` | settings-hash `cb-learned-bundle` includes the col-weight file SHA-256; existing files are fully revalidated | CB lane, learned scope only; runs before the first cost/cache/KL render |
-| **2b/4** | Format-menu production render for allocator cost | `build_production_cache --render-scope format-menu` (`672-686`) | `artifacts/production_render_score_cache.pkl` + `…_weight_cache/` | settings-hash `render-cost-cache` (`837`) | `production-render-score` |
+| **2b/4** | Format-menu production render for allocator cost. Materialized mode retains render shards; streamed CB mode synchronously renders each full-menu pair, checkpoints the consumer acknowledgement, then discards the tensor (§5.4) | `build_production_cache --render-scope format-menu` (`672-686`); transient lifetime is implemented by `streaming_production_cache.py` through the existing `ProductionWeightCache` | `artifacts/production_render_score_cache.pkl`; `…_weight_cache/` contains tensors only for materialized mode, while transient CB pairs retain identity/digest/consumer sidecars but no rendered-weight shard | settings-hash `render-cost-cache` (`837`) | `production-render-score`; transient mode is CB-only and must cover the complete requested menu |
 | **2c/4** | Synthesize allocator cost from render scores | `prismaquant.production_render_cost` (`704-711`) | `artifacts/cost.pkl` | settings-hash `render-cost` (`858`) + cost-mode provenance (`859`) | `production-render-score` |
-| **2b/4** | Format-menu cache for AURA dW | `build_production_cache … --render-scope format-menu` (`857-871`) | frontier cache under validated-surrogate, else `production_render_score_cache.pkl` (`366-378`) | settings-hash `aura-dw-cache` (`913`) | `aura`; `exit 2` if the menu is BF16-only |
+| **2b/4** | Format-menu render for AURA dW. A materialized cache exposes dW later; the streamed CB lifetime exposes each canonical render to the synchronous cost consumer and discards it only after that row is durably acknowledged (§5.4) | `build_production_cache … --render-scope format-menu` (`857-871`) | frontier cache under validated-surrogate, else `production_render_score_cache.pkl` (`366-378`); transient CB mode retains pair attestations rather than loser weight shards | settings-hash `aura-dw-cache` (`913`) | `aura`; `exit 2` if the menu is BF16-only; every requested candidate must be consumed |
 | **2c/4** | AURA downstream-KL-adjoint cost | `prismaquant.aura_cost` (`881-900`) | `artifacts/cost_aura.pkl` | settings-hash `aura-cost` (`939`) | `aura` |
-| **2d/4** | Hybrid finalize: empirical packed-expert unit-KL + sidecar backfill | `prismaquant.expert_empirical_cost --merge-base --backfill-base` (`920-929`) or inline backfill (`932-952`) | `artifacts/cost.pkl` | settings-hash `aura-hybrid-cost` (`971`) + cost-mode provenance (`972`) | `aura` |
-| **2d-CB** | CB hybrid: replace packed-expert rows with empirical unit-KL | `harvest_cb_col_weights "[2d-CB]"` → `expert_empirical_cost --replace-experts --col-weights` | `artifacts/cost_local_raw.pkl`, `artifacts/cost.pkl`, `cb_col_weights.pkl` | settings-hash `cb-hybrid-cost` + the in-payload merge probe; col-weights `cb-col-weights` | CB lane, `CB_EXPERT_EMPIRICAL=1` |
+| **2d/4** | Hybrid finalize: empirical profile-declared routed-expert unit-KL + sidecar backfill | `prismaquant.expert_empirical_cost --merge-base --backfill-base` (with the shared `--col-weights` on weighted cached-menu lanes) or inline backfill (`run-pipeline.sh`, AURA `[2d]`) | `artifacts/cost.pkl` | settings-hash `aura-hybrid-cost` + cost-mode provenance | `aura` |
+| **2d-CB** | CB hybrid: replace routed-expert rows with empirical unit-KL | `harvest_cb_col_weights "[2d-CB]"` → `expert_empirical_cost --replace-experts --col-weights` | `artifacts/cost_local_raw.pkl`, `artifacts/cost.pkl`, `cb_col_weights.pkl` | settings-hash `cb-hybrid-cost` + the in-payload merge probe; col-weights `cb-col-weights` | CB lane, `CB_EXPERT_EMPIRICAL=1` |
 | **2b/4 cw** | Cost-cache col-weights (weighted lanes only) | `harvest_cb_col_weights "[2b/4] cost-cache"` → `build_production_cache --col-weights` | `artifacts/cb_col_weights.pkl` | settings-hash `cb-col-weights` | `COST_RENDER=cached-menu` on a CB/GGUF lane (§4.7) |
+| **P0–P3** | Platform-agnostic anchored-AURA mechanism: format-blind streamed adjoint; plugin-mapped production anchors per legal `(unit,family,equivalence_class)`; within-segment shape fit; recomputed hull; one byte-budget DP (§4.3) | frozen DSv4 shim `tools/run_aura_cb_reprice.sh` → `prismaquant.dsv4_aura_cb_reprice`; generic mechanism `prismaquant.anchored_cost`; CB mapping plugin on `format_registry` + `model_profiles` | identity-bound scalar checkpoints; the driver emits a new exportable artifacts directory containing `layer_config.json`, `selection.json`, and the platform render inputs (`cb_col_weights.pkl` on CB) | qname-keyed atomic resume bound to model/menu/arm/plugin/calibration/format-plan/render-input identity | generic evaluate/price/allocate mechanism with a machine-specific map plugin; DSv4 remains the acceptance vehicle; never a full-menu render campaign |
 | **3/4** | Allocator — multi-choice knapsack over per-Linear formats (§4) | `prismaquant.allocator` (`1076-1090`) | `artifacts/layer_config.json`, `artifacts/pareto.csv`, `artifacts/pareto_assignments/` (validated-surrogate only, `1056-1061`); `logs/allocator.log` | **none — always runs** | — |
 | **4/4 A** | Frontier format-menu cache | `build_production_cache … --render-scope format-menu --render-packed-experts` | `artifacts/production_weight_cache_frontier_raw.pkl` + `…_frontier/` | settings-hash `frontier-cache` (`1206`) | validated-surrogate; `exit 2` if `PRODUCTION_CACHE=0` |
 | **4/4 B** | Measured held-out KL per Pareto point | `prismaquant.validate_assignments_kl` (`1243-1248` per-point, `1272-1277` batched) | `artifacts/validated_frontier_kl.json` + `…_parts/*.json` (merged `1250-1269`) | settings-hash `frontier-kl-point` per point (`1294`) | validated-surrogate |
@@ -395,11 +414,13 @@ VALIDATED_SOURCE_PREFETCH=require   VALIDATED_FRONTIER_PICK=kneedle,
                                     or `budget` under a TARGET_DISK_GB card
 VALIDATED_FRONTIER_SKIP_CALIB=$NSAMPLES (held-out disjointness, ON)
 CB_EXPERT_EMPIRICAL=0  CB_SCALE_CODING=two_tier  (D15: shipped values)
-CB_CODEBOOK_SOURCE_SCOPE=none  (legal none|fp8|all; `fp8` is the production
-                     learned-CB arm; `all` is warned research-only because
-                     learned NVFP4-CB is measured NO-GO)
-CB_CODEBOOK_SOURCE=lattice  (legacy artifact-wide ANY scalar, derived from
-                     the scope; `learned` when either family is learned)
+CB_CODEBOOK_SOURCE_SCOPE=none  (legal none|fp8|all; build-time family selector
+                     for codebook training. `fp8` is the production learned-CB
+                     arm; `all` is warned research-only because learned
+                     NVFP4-CB is measured NO-GO)
+CB_CODEBOOK_SOURCE=lattice  (legacy artifact-wide ANY scalar; derived from the
+                     bundle's per-rung source map when present, otherwise from
+                     the legacy scope; `learned` when any rung is learned)
 CB_CODEBOOK_BUNDLE=<empty at scope none; otherwise
                      WORK_DIR/artifacts/cb_learned_bundle.pqcb>
 CB_SCALE_SWEEP=1  CB_SCALE_SWEEP_SCOPE=<unset>  (legal
@@ -429,22 +450,38 @@ With the scope unset the bool decides and the scope is *derived* from it: `all` 
 must be present (`:691-701`) — the CB producer settings are never defaulted silently. Neither
 name has a `run-pipeline.sh` shell default; the CB drivers export them directly.
 
-**The learned-codebook and scale-search selectors are family-scoped producer
-identity.** `CB_CODEBOOK_SOURCE_SCOPE=none|fp8|all` resolves each format through
-`codebook_source_for_format`; `all` emits a warning because learned NVFP4-CB is
-measured NO-GO (`nvfp4_cb_footprint.py:178-199,489-508`).
+**The learned-codebook selector is build-time intent; the bundle is render
+authority.** `CB_CODEBOOK_SOURCE_SCOPE=none|fp8|all` chooses which family the
+bundle builder may train, and `CBL_RUNG_POLICY[k]["enabled"]` decides each FP8
+rung within that family. Once a value-bearing bundle is present,
+`CBLearnedBundle.codebook_source_by_format` freezes its complete per-rung map
+and `cb_fields_for_context` checks the exact `(qname, format)` cell before it
+decides whether calling the strict `codebook_for()` is legal. The current
+production map is learned K28–K46 plus lattice K47/K48 in one menu; changing
+the process-global policy after context creation cannot reinterpret that
+artifact (`cb_learned_bundle.py`, `nvfp4_cb_footprint.py`). `all` still warns
+because learned NVFP4-CB is measured NO-GO.
+
+**Scale search remains family-scoped producer identity.**
 `CB_SCALE_SWEEP_SCOPE=none|nvfp4|fp8|all` resolves the scale-search arm through
 `scale_sweep_for_format`; with the scope unset, the old `CB_SCALE_SWEEP` boolean
 still means all/none (`:205-216,525-547,921-1031`). Production two-tier FP4
 requires the NVFP4 family to sweep, so a mixed artifact's measured one-shot-FP8
 arm is `nvfp4`, while sweep-matched CBL is `all` (or the legacy unset+true
-spelling; `:265-274`). The render stamp writes a scope member only for a genuinely
-mixed choice (`fp8` source or `nvfp4|fp8` sweep); homogeneous `none`/`all` remains
-fully represented by the old scalar. Learned stamps additionally enumerate
-`codebook_source_by_format`, so a consumer never has to infer the family split
-from the artifact-wide ANY (`:615-632`). Therefore the unset/default
-all-lattice source and legacy all-family sweep retain the old stamp shape and
-rendered bytes, pinned against baseline `76666bd` by
+spelling; `:265-274`). Source-bearing cost stamps enumerate the exact
+`codebook_source_by_format` map, round-trip it, and compare the complete key/value
+map at the cost/render gate; the compact serialized-payload context copied into
+`quant_config.json` carries the complete frozen bundle map too. The legacy
+scalar is always the ANY of the stamped map, learned-content digests are required
+iff that map contains a learned rung, and an explicit non-`none` build scope is
+retained when the scalar alone cannot represent it (including an all-lattice
+K47/K48 policy menu). A missing K43 entry, learned→lattice flip, or contradictory
+scalar is a refusal (`nvfp4_cb_footprint.py`;
+`tests/test_per_rung_codebook_source.py`). The render stamp writes a sweep scope
+only for a genuinely mixed `nvfp4|fp8` choice; homogeneous scale-search choices
+retain the legacy shape. Therefore the unset/default all-lattice source and
+legacy all-family sweep retain the old stamp shape and rendered bytes, pinned
+against baseline `76666bd` by
 `tests/test_cbl_scope_identity.py:67-128`.
 
 `EXPORT_CONTAINER` ∈ {`compressed-tensors`, `gguf`, `nvfp4_cb`} selects the lane, and the
@@ -455,8 +492,12 @@ memory and generates coherent-looking garbage.
 **`COST_MODE=aura` is the default since 2026-07-30 (re-vet R2).** Both flagship artifacts
 (regen-27B, 35B arm-E) were produced with it and its served margin over the previous default
 is −38%/−39.5% confident-KL at the 4B knee across two calibrations and −17.9% at 27B (§4.3).
-`production-render-score` remains fully supported and is the explicit/legacy spelling —
-historical artifacts reproduce by setting it. The flip was gated on the two preconditions R2
+`production-render-score` remains fully supported **on non-CB menus** and is the
+explicit/legacy spelling — historical artifacts reproduce by setting it. It is **unlicensed on
+any CB/CBL-containing menu** and fails `exit 2` there (§3.5): its score field is `weight_mse`,
+and the per-unit factorization `mse(e,K) ≈ s_e·g(K)` fails in weight currency across a
+codebook-basis change (CV monotone in rung, 0.088 at K28 → 0.224 at K48; 8 of 10 rung-pairs
+breach the 0.10 bar, while lattice→lattice on the same planes passes at 0.067/0.056). The flip was gated on the two preconditions R2
 named, both landed: the `provenance["cost_mode"]` stamp (§3.4), so a `WORK_DIR` built under
 the old default **rebuilds its cost table loudly** instead of silently allocating on the other
 estimator; and the wired additivity report (§4.3, stage `[3c]`), so every AURA artifact carries
@@ -567,6 +608,16 @@ is refused without the allocator flag; an unstamped table cannot be blessed by t
 | `ALLOC_PROPAGATED_SENSITIVITY_REPORT` non-empty | `374-380` | `archive/l3_propagated_2026-07-30` |
 | `PRODUCTION_CACHE_UNION` truthy | `381-387` | `archive/union_cache_2026-07-30` |
 | `MSE_PROMOTION` truthy | `388-394` | `archive/mse_promotion_2026-07-30` |
+
+**A twelfth `exit 2` gate that is *not* an archived mode.** `COST_MODE=production-render-score`
+(or `production-render`) refuses when the run targets a CB/CBL menu — detected as
+`EXPORT_CONTAINER=nvfp4_cb` **or** a `FORMATS` entry matching `*_CB_*`. The mode itself is
+alive and correct off CB; what is unlicensed is the *pairing*, because the mode scores on
+`weight_mse` and that currency does not survive a codebook-basis change (§4.3 wording above;
+measured CV 0.088 → 0.224 across K28→K48). Activation currency holds where weight currency
+does not, which is why `aura` is unaffected. The guard's predicate is executed — not merely
+asserted to exist — by `tests/test_run_pipeline_defaults.py::test_cb_unlicensed_guard_actually_fires`,
+which trips it on each CB signal independently and confirms both non-CB controls pass.
 
 Four of these landed with the 2026-07-30 re-vet (R17, R4, R18 ×2). Each error string carries
 **the measurement that killed the lever**, so the refusal teaches rather than merely blocks.
@@ -683,6 +734,15 @@ Contract at `production_render_cost.py:1-16`: the rendered score is the damage o
 export will actually ship, so rows set `output_mse_measured=False` and the allocator consumes
 `predicted_dloss` directly instead of re-applying the Fisher proxy.
 
+The streamed CB spelling changes **render lifetime only**, never menu membership or score
+semantics. `streaming_production_cache.py` visits every eligible `(Linear, requested CB rung)`,
+hands the cache-canonical tensor to the scalar consumer synchronously, and requires an
+acknowledged pair checkpoint before releasing it. `production_render_cost.py` may consume a
+score-only CB pair only through that attestation; an unattested scalar with no retained shard
+is stale, not a cache hit. The complete pair count is a close condition, so disk pressure can
+bound residency but can never prune the allocator's candidate set (§5.4; contrast the archived
+`PRODUCTION_CACHE_UNION`, §11).
+
 **M6 — the score field is `weight_mse`, not `h_trace × output_mse`.** The legacy product
 carries activation energy `E‖x‖²` twice, since `h_trace` is already a weight-space Fisher
 trace. Served A/B at matched 4.75 bpp: Qwen3-4B KL −50.8% / PPL −15.1%; Qwen3-0.6B KL −58.5% /
@@ -711,20 +771,197 @@ The probe is `kl_fisher.fisher_probe_scalar` (`kl_fisher.py:77-131`). `dW` prove
 recorded per row as `rendered` vs `rtn` (`aura_cost.py:195-234`) — immaterial at fp4, decisive
 at fp8 (+36% served KL under RTN dW); `--require-production-cache` makes a missing rendered row
 fatal and the pipeline always passes it (`run-pipeline.sh:886`). Passthroughs are zero-cost by
-construction (`aura_cost.py:83`). Packed-MoE experts are hard-excluded (`:315-337`); the
-pipeline passes `--allow-packed-expert-omission` (`run-pipeline.sh:899`) and covers them in
-`[2d]`. Three sub-stages: `[2b]` format-menu cache for dW (`:825-874` — under
+construction (`aura_cost.py:_ZERO_COST_FORMATS`). Every routed expert declared by the resolved
+`ModelProfile` is hard-excluded, independent of whether its physical weight is a packed 3-D
+Parameter or a per-expert 2-D `nn.Linear`
+(`routed_experts.py:ProfileRoutedExpertClassifier`,
+`aura_cost.py:_guard_packed_expert_coverage/_target_linears`). The classifier routes the
+decision through `packed_expert_format_group()` after the profile's name mappings and validates
+the projection vocabulary through `packed_expert_projection_names()`,
+`unpacked_expert_projection_names()`, and
+`vllm_fused_moe_scheme_projection_names()`; missing, malformed, conflicting, or throwing
+profile answers are fatal rather than an empty success. The pipeline passes
+`--allow-packed-expert-omission` and covers the omitted routed rows in `[2d]`. Three sub-stages:
+`[2b]` format-menu cache for dW (`run-pipeline.sh`, AURA `[2b]` — under
 `validated-surrogate` this *is* the frontier cache, per the one-cache principle), `[2c]`
-`aura_cost` (`:879-903`), `[2d]` hybrid finalize (`:905-956`).
+`aura_cost`, `[2d]` hybrid finalize.
+
+On the streamed CB path, `[2b]` and the scalar consumer are coupled by the synchronous
+`ProductionWeightCache` consumption protocol in §5.4: AURA reduces the live canonical render
+to its row before the pair can be discarded. The resulting cost table must cover the same
+full format menu as a materialized run. The later assignment/export pass remains
+assignment-scoped and retained; it re-renders only the selected pairs and must match each
+scored pair's canonical tensor digest before the bytes are accepted.
 
 **Empirical expert costs** (`expert_empirical_cost.py`) exist because AURA's smooth cost is
 route-flip-blind on routed experts (Spearman 0.45→0.35 under faithful dW; predicted NVFP4/FP8
-ratios 2–49× vs measured 1.1–1.5×, `:1-28`). The unit is all packed expert tensors of one MoE
-module (vLLM FusedMoE must share one format); unit cost is end-to-end mean-token
-`KL(BF16 ‖ unit-quantized)` split across members ∝ `n_params` (`:481+`, `_unit_kl :318+`). FP8
-stays in the expert menu by standing decision — no hardcoded ban; the DP plus real KL rejects
-it (`:19-23`). CB families render the whole stack in one qdq call (`:53-55`), with opt-in
-holdout-gated RD-law ladder interpolation `D(k)=C·2^(−k/4)` (`:57-66`).
+ratios 2–49× vs measured 1.1–1.5×, module preamble). The unit is every tensor in one
+profile-declared serving-format group (vLLM FusedMoE must share one format); unit cost is
+end-to-end mean-token `KL(BF16 ‖ unit-quantized)` split across allocator rows ∝ `n_params`
+(`measure_expert_unit_costs`). Packed models retain their existing direct-stack renderer.
+For live per-expert Linears, the empirical path validates contiguous expert/projection coverage,
+virtual-packs the rows in `packed_expert_projection_names()` order, quantizes the same full
+stack spelling export uses, scatters the rendered slices into the live model for KL, and restores
+the originals exactly (`_unpacked_expert_units`, `_virtual_packed_module`,
+`_unpacked_unit_kl`). CB col weights use the exporter's `_packed_expert_col_weights` pooling
+rule; a missing member vector is fatal, and the AURA `[2d]` invocation receives the same
+`--col-weights` argument as its cached-menu render. FP8 stays in the expert menu by standing
+decision — no hardcoded ban; the DP plus real KL rejects it. CB families render the whole stack
+in one qdq call, with opt-in holdout-gated RD-law ladder interpolation
+`D(k)=C·2^(−k/4)`.
+
+#### Platform-agnostic anchored cost; DSv4 CB acceptance driver
+
+The dependency direction is **evaluate → price → allocate**, with a machine-specific
+**map plugin** supplying the vocabulary that pricing needs. `prismaquant.anchored_cost` owns the
+format-blind mechanism: scalar production anchors, identity-bound resume, shape fitting,
+same-segment extrapolation, hull computation, and exposure reporting. A mapping plugin obtains
+format family from `format_registry`, consumes exact source-gated payload rates from the shared
+allocator legality path, obtains role/unit structure from the active `model_profile`, and declares five facts: the source-gated candidate ladder, the
+shape-transfer equivalence partition, the production renderer hook and arm identity, the anchor
+rung policy, and extra provenance identity fields. The core does not import or enumerate CB,
+GGUF, NV, MX, or FP vocabulary.
+
+The shape-transfer equivalence class is load-bearing. The generic segment key is
+`(family,role,equivalence_class)`, and the core refuses to fit or apply one curve across two
+classes declared by the plugin. CB maps the class to its bundle-authoritative codebook basis;
+ordinary single-basis families can declare one trivial class, while a future platform can
+declare a different partition without changing the mechanism. This turns the learned/lattice
+seam defect from a campaign convention into a checked plugin contract.
+
+`prismaquant.dsv4_aura_cb_reprice`, launched by the frozen
+`tools/run_aura_cb_reprice.sh`, is the acceptance driver wiring the DSv4 profile, the CB mapping plugin,
+and the **112.690 GB exact-byte budget** into that mechanism. It remains a one-shot campaign
+rather than a four-phase `run-pipeline.sh` cost mode: rank the weights, solve once, and export
+the resulting assignment blind. There is no contested set, certificate, or cost-driven
+iteration. The only quality gate is the served artifact: exact full-vocabulary vLLM KL-vs-BF16
+plus direct WikiText PPL against `artifact-112p69-raw` at matched bpp. Qwen3.8-27B can reuse the
+same generic mechanism and CB plugin while supplying its own model profile, source-gated unit
+classes, budget, and acceptance driver.
+
+**AURA is the campaign's one cost currency.** Weight MSE and activation/output MSE are
+degenerate projections of the same weight error, not parallel allocator terms: `gW` already
+contains the input activation and downstream backpropagated sensitivity. Consequently the
+campaign never adds `cw_m2`, imatrix dispersion, `weight_mse`, or activation MSE to
+`predicted_dloss`. `cb_col_weights.pkl` still matters, but only as the production renderer's
+imatrix input, part of render identity, and an input copied into the exportable artifact. A
+panel may use weight-MSE *ratios* to diagnose or fit ladder shape as described below; no bare
+weight-MSE value can price a unit. Likewise, `predicted_dloss` already contains the KL Fisher,
+so extrapolation must not multiply by `h_trace` or any second sensitivity term.
+
+For unit `i`, its production-rendered anchor `K_hat` supplies the measured level and the
+within-segment ladder supplies only a ratio:
+
+```
+cost(i,K) = predicted_dloss(i,K_hat) * g[family,role,equivalence_class](K)
+                               / g[family,role,equivalence_class](K_hat)
+```
+
+The anchor key is every legal **`(unit,family,equivalence_class)`**, while fitting, application,
+and provenance use the stricter generic segment key
+**`(family,role,equivalence_class)`**. In the CB plugin the equivalence-class values are the
+authoritative `learned` and `lattice` basis labels. The DSv4 census is 33,325
+NVFP4-lattice anchors (K12–K18 is legal for every unit), 33,325 FP8-learned anchors (experts
+K28–K33; nonexperts K28–K46), and 301 FP8-lattice anchors (nonexpert K47/K48 only): **66,951
+production renders before panel and validation renders**. Experts stop at K33 under the exact
+source-rate ceiling and therefore have no FP8-lattice segment. Every unit also receives its
+exact source passthrough terminal without synthesis.
+
+No `g` fit or application may cross a family or a plugin-declared equivalence boundary. In the
+CB mapping, that means no transfer across the learned/lattice seam. In particular,
+FP8-learned and FP8-lattice are separate vertical levels even though both spell `FP8_CB`; the
+DP compares their separately rendered per-unit anchors. `codebook_source_by_format` in the
+immutable bundle is the rendering authority for that split. A family-level segment that joins
+K28–K48 is invalid, as is using a learned anchor to normalize K47/K48. This is a structural
+response to measured cross-basis direction rotation, not a tolerance around it.
+
+P0 streams the checkpointed KL-adjoint with global Fisher normalization. P1 fuses the fixed
+production arm into the same one-layer reverse window: render the layer's legal anchors,
+reduce each dW immediately to its fp32 AURA scalar, durably acknowledge it, and discard the
+tensor before the layer unloads. RTN is not an anchor substitute. Per-unit checkpoints are
+SHA-256/qname keyed, atomic, and identity-bound to the model, complete legal menu and format
+plan, production arm, learned/lattice bundle map, calibration/probe contract, renderer and
+`cb_col_weights` input. Resume trusts names and identities rather than list position and
+refuses any mismatch. For routed learned cells, every bundle bank origin must cover exactly the
+43×3×6 DSv4 `(layer,projection,K28..K33)` coordinates and carry the SHA of the supplied routed
+selection; stamping an unrelated coverage-valid selection beside different bundle books is a
+preflight and driver refusal.
+
+The measured-output scope and extrapolation-input scope are distinct in provenance. The former
+contains only the sparse anchor/panel/holdout cells that actually produced `dW`. The latter binds
+the exact source tensors, imatrix, codebooks, and production arm for the complete legal ladder so
+the allocator/exporter can reproduce whichever extrapolated rung the DP selects; it explicitly
+states that those outputs were not materialized. Global renderer identity is hashed once per
+streamed payload and reused by the per-cell scalar receipts, avoiding an accidental
+render-count-times-global-manifest CPU serialization path.
+
+The pinned DSv4 calibration has 51 projection units belonging to 17 never-routed experts.
+Those units are not inferred merely from absent activation files: the driver requires exact
+equality among the activation-cache misses, profile-declared routed-expert names whose probe
+records have `n_tokens_seen == 0`, and the names in the imatrix provenance sidecar. The rule,
+name set, and sidecar SHA are part of the production-arm identity. The existing cold-expert
+renderer branch then emits the same imatrix-weighted production render used by export when no
+activation rows exist; it is neither RTN nor a borrowed sibling cost level
+(`dsv4_aura_cb_reprice._validated_cold_expert_provenance`;
+`streaming_production_cache.StreamedProductionAnchorRenderer`).
+
+P2 fits shape on a bounded, rank-identifiable panel independently within each
+`(family,role,equivalence_class)` segment. Existing p7 weight-MSE rungs may supply lattice-only shape;
+learned segments require the fresh production-arm panel. On the panel, fitting the ratios once
+in weight-MSE currency and once in AURA currency is a direction-stability diagnostic, and the
+disagreement is reported. A disjoint holdout renders at least two rungs inside the learned
+basis and reports predicted-vs-measured AURA dex error against the 0.05 reference bar. These
+reports do not gate or rewrite the allocation, and a bad result does not trigger an automatic
+cross-basis substitution or full-menu fallback.
+
+The DSv4 policy instantiates 32 fitting units per each of seven roles at four NV-lattice,
+four FP8-learned, and two FP8-lattice rungs: `7×32×(4+4+2) = 2,240` logical panel cells. Its
+disjoint learned-basis holdout is `7×4×2 = 56` cells. Panel/anchor overlap removes
+`7×32×3 = 672` duplicate physical renders, so the complete bounded union is
+`66,951 + 2,240 + 56 - 672 = 68,575` production renders, versus 437,740 rendered CB cells in
+the legal full ladder. `dsv4_aura_cb_reprice.render_economics_report` scales each physical
+cell by its exact probe `n_params` in 2048×4096 equivalents. Using the measured 69.821 ms/E
+low-rung reference, current one-expert K28/K33 medians (75.109/144.363 ms), and measured older
+same-shape K41/K46/K47/K48 medians gives **3.573 projected GPU-hours for encoding**. Scaling
+the measured DSv4 adjoint phases (129.0 s forward, 1.8 s head backward/probe, 107.8 s layer
+backward/probe, one 151.8 s non-backward reverse charge) to 32 probes gives **1.052 hours**, or
+**4.625 projected GPU-hours total**; the deliberately broad measured-phase bracket is
+4.586–5.932 hours because the new fused P0 has not itself run. This is a projection, not a
+completed campaign timing (`docs/results/cb_encode_cuda_profile_2026-08-11.md`;
+`dq-runs/dsv4-flash-0731/nested-pilot/raw_records.jsonl`;
+`dq-runs/dsv4-flash-0731/prod-cal-0p7/logs/probe.log`). The scalar-checkpoint/cost/export
+layout persists no rendered weights; charging one filesystem block per physical scalar, legal
+cost cell, and source-plan unit plus one 466,388,371-byte imatrix copy projects a conservative
+**2,813,253,011 bytes of new writable data** (`dsv4_aura_cb_reprice.py`). This projection states
+those block-allocation assumptions explicitly; variable pickle/JSON sizes and allocator Pareto
+artifacts are not mechanically bounded, so the figure is not presented as a proven upper bound.
+
+P3 recomputes each segment's lower convex hull from that run's fitted `g`; no Track-A hull is
+hardcoded. Hull removal is the only authorized candidate exclusion because an interior
+`(bits,g)` point cannot be optimal under the anchored positive-level factorization. Render
+budgets never truncate the legal menu. The campaign then runs one exact-byte DP and emits a
+**new** directly exportable artifacts directory containing `layer_config.json`, the same
+render-input `cb_col_weights.pkl`, and `selection.json` with at least `feasible`,
+`chosen_achieved_bits`, `predicted_dloss`, and `budget_bytes`; it never overwrites the Track-A
+comparison artifact.
+
+**Current launch blocker.** The generic mechanism correctly identifies anchored AURA as an
+activation-inclusive supersurrogate, but the shared allocator candidate reader still classifies
+all explicit `predicted_dloss` rows as weight-only and can remove an exactly-zero measured AURA
+cell as `activation_cost_unmeasured`. `tools/aura_cb_reprice_preflight.py` therefore blocks before
+GPU launch on `AURA supersurrogate allocator semantics`. No epsilon floor, fabricated
+`output_mse`, or rewritten probe `h_trace` is an acceptable bypass: the shared allocator needs an
+explicit AURA branch that reads the value directly, excludes it from activation calibration,
+retains a true zero, and stamps that provenance.
+
+**Standing routed-expert limitation.** AURA measures smooth local weight damage but is blind
+to route flips (`expert_empirical_cost.py` module contract). Routed-unit discovery/classification
+is owned by the active model profile; that model-profile axis is unchanged by the mapping-plugin
+refactor. On this CB lane the empirical
+alternative remains default-off (`CB_EXPERT_EMPIRICAL=0` in `run-pipeline.sh`), because
+empirical unit-KL was refuted at CB fidelity by the BF16 chaos floor. Anchored AURA therefore
+improves the local MSE previously used for routed experts, but it does **not** model routing
+discontinuities; activation weighting inside `gW` must not be presented as route-flip coverage.
 
 **UCB — two of them, both default-off, neither set by the pipeline.** Cost-side
 `PRISMAQUANT_COST_UCB_Z` adds `z·stderr` before the DP (`allocator_candidates.py:357-370`);
@@ -1098,7 +1335,7 @@ pricing and emulation. Registry-vs-callable consistency is pinned by
 | `MXFP8_E4M3` | `:720-728` | 8 / 32 / e8m0 | 8.25 | Registered, profile-allowed, **de-menued** |
 | `NVFP4A16`, `MXFP4`, `MXFP6_E3M2/E2M3`, `MXFP8A16`, `MXFP8_E5M2`, `FP8_E5M2`, `INT8_W8A16`, `INT4_W4A16_g128` | `:678-795` | — | — | Research / registry-only |
 | GGUF k-quants + IQ | `:884-902` | `_make_gguf_spec :864` | 2.0625–8.5 | GGUF lane (§9.3) |
-| `NVFP4_CB_K12..K24` / `FP8_CB_K28..K48` | `:913`, `:954` | product-VQ codebook, g256 | 1.78125–3.28125 serialized body / 3.5–6.0 index stream plus row scales | production gridbook CB menu; learned rendering is enabled through FP8 K46, while K47/K48 are measured NO-GO (§9.2) |
+| `NVFP4_CB_K12..K24` / `FP8_CB_K28..K48` | `:913`, `:954` | product-VQ codebook, g256 | 1.78125–3.28125 serialized body / 3.5–6.0 index stream plus row scales | one production Gridbook CB menu: FP8 K28–K46 render learned, FP8 K47/K48 render lattice by measured policy (§9.2) |
 | `NVFP4_CB_S13..S16` | `:932` | signed codebook, g256 | legacy/research layout | decoder/export compatible, production-menu denied (§9.2) |
 
 MXFP8 is de-menued rather than denied — `vllm_packed_moe` still allows `MXFP8_E4M3` — because
@@ -1157,6 +1394,33 @@ weights and `render_production_weight` (`:1785`) the only producer. Not tidiness
 surrogate, the KL validation, and the exported bytes must be the *same* rendering, or every A/B
 carries a rendering confound. Levers are recorded on the cache (`:165`, `:835-858`), which is
 what makes M19 (§6.1) possible.
+
+**A streamed CB format menu is a lifetime mode of that same cache, not a second cache.**
+`build_production_cache --streaming --render-scope format-menu` routes the complete requested
+CB menu through `streaming_production_cache.py`; there is no disk-budget candidate filter.
+For each `(Linear, rung)`, the producer canonicalizes the render exactly as a persisted cache
+shard would, makes that tensor available to one synchronous consumer, and waits for the
+consumer's durable acknowledgement. The pair sidecar then binds the full CB render identity,
+the canonical tensor SHA-256, render-score digest, and consumer acknowledgement. Only after
+that checkpoint is accepted may the rendered tensor be evicted and its weight shard omitted.
+The manifest refuses to close if any eligible requested pair is missing or unacknowledged.
+
+The transient path is **CB-only**. Its correctness rests on measured bit determinism under a
+pinned render context; non-CB/GPTQ menus remain materialized until they have their own direct
+repeat-render proof. The CB context remains fail-closed and includes scale coding, codebook
+source (and immutable bundle/value identity when learned), scale-sweep choice, LDLQ scope,
+min-chain mode/version, and encoder tier, plus the exact source-weight, imatrix/`col_weights`,
+calibration, layout, and renderer identities (`production_weight_cache.py` CB pair identity
+and `tests/test_col_weights_render_identity.py`). None of the allocator's incomplete-context or
+`col_weights`-identity gates is relaxed.
+
+Selected bytes are verified, not assumed. The cost-stage sidecar's canonical tensor digest is
+the commitment to the render that was scored. The later assignment-scoped cache/export pass
+re-renders only the winning rung, retains it as before, and compares its canonical digest with
+that commitment; a mismatch is a hard failure. Thus streamed menu scoring bounds transient
+disk residency while the surrogate, selected-assignment KL, and export still share one
+bit-identical rendering. Assignment-scoped cache builds and materialized format-menu/frontier
+builds retain their existing shard semantics.
 
 Render mechanisms are a registry with declared ordering semantics, not a lever string parsed in
 spelling order (`render_score.py:188-260`): each `RenderMechanismSpec` declares `operation`,
@@ -1899,7 +2163,7 @@ flowchart TD
 
 | Registry | Where | Holds |
 |---|---|---|
-| Model structure | `model_profiles/<arch>.py` (`ModelProfile` subclass) + `model_profiles/specs/<name>.json` (`ModelStructureSpec`, schema `prismaquant.model_structure.v1`, `structure.py:20`) | detection (`match`, `priority`), naming across five name spaces, fused groups, packed-expert layout, pinned/passthrough names, staging, shard regexes, probe skips, `default_serving_profile`, `supported_lanes`/`preferred_lane` |
+| Model structure | `model_profiles/<arch>.py` (`ModelProfile` subclass) + `model_profiles/specs/<name>.json` (`ModelStructureSpec`, schema `prismaquant.model_structure.v1`, `structure.py:20`) | detection (`match`, `priority`), naming across five name spaces, routed-expert packed/unpacked layout and format groups, pinned/passthrough names, staging, shard regexes, probe skips, `default_serving_profile`, `supported_lanes`/`preferred_lane` |
 | Serving constraints | `serving_profiles.py` + `serving_profile_specs/<id>.json` (schema `prismaquant.serving_profile.v1`) | per-format allow/deny rules with name conditions, shape rules, runtime shape validators, runtime package requirements; `extends` composition (`serving_profiles.py:557-609`) |
 | Pipeline contract | `pipeline.py` | almost nothing — `target_profile` as a kwarg (`:644`), run metadata (`:688`), CLI passthrough (`:1115`, `:1151`), one `model.structure_graph` stage spec (`:877-884`). Zero architecture names, which is correct: the contract layer should not know models (§3.6) |
 
@@ -1984,7 +2248,7 @@ HyV3 (`hy_v3.py:75-89`) still hand-override `to_vllm_internal_name`. Spec `regex
 can now express those; `lfm2_moe.json` already does.
 
 Roughly 25 further accessors are pure spec reads (packed-expert names/classes, pinned names,
-per-expert regexes, source/recipe/live name mapping, format groups, passthrough prefixes,
+unpacked expert projection names, per-expert regexes, source/recipe/live name mapping, format groups, passthrough prefixes,
 staging, layer prefixes, lm_head, probe skips, export-lane eligibility,
 `bypass_hf_fp8_module_rewrite`), `base.py:169-820`. Deliberately Python-only,
 because they are forward-pass *behaviour* rather than naming: MTP (`:248-272`),
@@ -1994,6 +2258,14 @@ streaming-probe adapters (`:823-947` — `checkpoint_to_live_name`, `fp8_scale_p
 KV-cotangent path now grafts through — §7.5), `register_vendored_modeling()` (`:974-979`).
 `vllm_fused_moe_scheme_projection_names` (`:443-468`) is intentionally hardcoded to vLLM's
 canonical names — §6.2.
+
+Routed-expert classification for the AURA hybrid is also a profile boundary, not a shape
+heuristic. `routed_experts.py` treats `packed_expert_format_group(qname)` as the membership
+answer, validates it against the packed/unpacked/vLLM projection accessors, and maps live,
+recipe, and vLLM names before deciding. `deepseek_v4.json` therefore declares live unpacked
+`gate_proj` / `up_proj` / `down_proj` explicitly; its vendored probe topology is per-expert
+Linears even though Gridbook serves their profile-declared virtual packed parents. Core cost
+code contains no DSv4 architecture literal or rank-based expert predicate.
 
 **Two plugin-contract additions landed on this branch.**
 
@@ -2313,29 +2585,38 @@ from `config.json` (external Gridbook `gridbook/config.py`,
 keeps vLLM's weight loader off it.
 
 **Learned FP8 codebooks are a value-bearing rendering mode, not a new format
-name.** `CB_CODEBOOK_SOURCE_SCOPE=fp8` keeps every NVFP4-CB target on its
-canonical lattice and selects a distinct learned book for each dense
-`(layer, role, rung)` cell; the artifact-wide legacy scalar remains `learned`
-because at least one family carries learned bytes. `none` is the default and
-reproduces the historical all-lattice artifact; `all` is warned research-only
-because learned NVFP4-CB measured <0.4% in the shipped band and is NO-GO
-(`nvfp4_cb_footprint.py:178-216,489-547`; `cb_learned_bundle.py:122-145`).
+name.** `CB_CODEBOOK_SOURCE_SCOPE=fp8` is the build instruction: it keeps every
+NVFP4-CB target on its canonical lattice and trains a distinct book only when
+the rung's measured `CBL_RUNG_POLICY` row is enabled. The resulting single
+FP8-CB K28–K48 menu therefore carries learned `(layer, role, rung)` cells for
+K28–K46 and canonical-lattice cells for K47/K48. The artifact-wide legacy
+scalar remains `learned` because at least one rung carries learned bytes;
+rendering never uses that scalar to reinterpret every FP8 rung. `none` is the
+default and reproduces the historical all-lattice artifact; `all` is warned
+research-only because learned NVFP4-CB measured <0.4% in the shipped band and
+is NO-GO (`cb_learned_bundle.py:62-145`; `build_cb_learned_bundle.py`).
 
 A non-`none` scope requires one immutable, value-bearing
 `CB_CODEBOOK_BUNDLE` **before any cost, cache, KL, or export render**. The
-bundle trainer runs the certified pooled weighted-Lloyd `learn_pool` once,
-materializes every subtable as the exact contiguous little-endian FP16 payload,
-and gives every learned cell its own physical references. Its manifest binds
+bundle trainer runs the certified pooled weighted-Lloyd `learn_pool` once for
+each policy-enabled cell, materializes learned and canonical-lattice subtables
+as exact contiguous little-endian FP16 payloads, and gives every learned cell
+its own physical references while lattice cells use the shared lattice refs.
+Its manifest binds
 the trainer, source-weight and imatrix value identities, cell/rung policy,
 shapes, and a SHA-256 for each individual FP16 subtable (see
 `train_and_save_bundle` and `CBLearnedBundle` in
 `prismaquant.cb_learned_bundle`). Bundle load requires the tensor-name
 set, shape map, cell references, and digest map to cover one another exactly;
-missing, extra, stale, or altered values raise instead of falling back to the
-lattice (see `load_bundle`). Every downstream render receives values reloaded
-from the canonical FP16 payload (promoted to FP32 only for encoder lookup),
-never the trainer's pre-materialization tensor (`CBLearnedBundle.codebook_for`);
-export-time retraining is forbidden. The exporter writes the selected lattice
+missing, extra, stale, or altered values raise. The caller reads the cell's
+`source`: learned cells alone call `CBLearnedBundle.codebook_for`, which remains
+strict and raises on K47/K48 rather than implementing a lattice fallback;
+lattice cells take the ordinary canonical lattice renderer. Every learned
+render receives values reloaded from the canonical FP16 payload (promoted to
+FP32 only for encoder lookup), never the trainer's pre-materialization tensor;
+export-time retraining is forbidden. Cost provenance and export's compact
+serialized-payload context both stamp the per-rung source map, so surrogate,
+KL, and bytes cannot silently disagree. The exporter writes the selected lattice
 and learned tensors exactly once to `cb_codebooks.pqcb`, and the config's
 `codebook_sha256` map covers the **complete** sidecar name set, matching
 Gridbook's fail-closed verifier (`build_quant_config` in
@@ -2354,10 +2635,11 @@ bit-split's 2,048-entry structural rule (`CBL_RUNG_POLICY` in
 | K47 | rejected, measured NO-GO | sweep-matched CBL/lattice ratio **1.0689** (`dq-runs/dsv4-quality-hybrid/sfd-analysis/cbl_k43_k47.log:60`) |
 | K48 | rejected, measured NO-GO | learned placement is measured 54–98% worse than lattice (`transfer-study-fable-verify/F1_GENERALIZATION.md`) |
 
-`require_cbl_rung_enabled` is called both when a bundle is trained and when it
-is loaded, so editing a menu or presenting an old bundle cannot bypass this
-ceiling (`require_cbl_rung_enabled` call sites in `train_and_save_bundle` and
-`load_bundle`).
+`require_cbl_rung_enabled` is called for every cell that claims to be learned,
+both when a bundle is trained and when it is loaded. Policy-disabled cells are
+legal only as explicit lattice cells, so editing a menu or presenting an old
+bundle cannot relabel K47/K48 learned (`require_cbl_rung_enabled` call sites in
+`train_and_save_bundle` and `load_bundle`).
 
 **Dense and opt-in routed-MoE serving can both be role-distinct at the 0.8.3
 preparation pin.** Gridbook's dense loader reads `codebook_ref` inside its
