@@ -49,6 +49,22 @@ _CB_CONTEXT = CBSerializationContext.production()
 _PROFILE = "nvfp4_cb"
 
 
+def _attested_rungs() -> tuple[int, ...]:
+    """The fused mid-M rungs the spec attests for the CURRENTLY pinned runtime.
+
+    The backed set is keyed to a Gridbook RELEASE, so these tests ask the spec
+    rather than restating one version's answer.  A pin move onto a version with
+    no entry backs nothing — the fail-closed direction — and that has to read
+    as "fallback route", not as a red test.  Adding an entry is a serving
+    promotion needing measured evidence on a released runtime.
+    """
+    for lane in sp.load_serving_profile(_PROFILE).serving_lanes:
+        rungs, _source = lane.backed_rungs(sp.gridbook_runtime_version())
+        if rungs:
+            return rungs
+    return ()
+
+
 def _shape_decision(fmt, *, out_features, in_features=1024):
     return sp.check_serving_shape(
         _PROFILE, fmt, in_features=in_features, out_features=out_features)
@@ -142,15 +158,19 @@ def test_backed_fused_mid_m_rungs_are_spec_data_for_the_pinned_runtime():
     permits every K28..K48 — so five of the published 27B ladder's eight
     rungs silently take expand+GEMM (gridbook ROADMAP K1.2). That set is
     DATA, read against the version in gridbook_runtime_pin.json."""
-    # The immutable pre-tag 0.8.3 pin carries the loader ABI.  Served-rung
-    # credit remains on the latest released table (0.8.2) until the owner tags.
-    assert sp.gridbook_runtime_version() == "0.8.3"
+    # Read against whatever the pin currently names rather than a hardcoded
+    # version: the backed set is keyed to a Gridbook RELEASE, so a pin move
+    # onto an unattested version must flip this to the fallback route rather
+    # than fail the test.  Adding an attestation entry is a serving promotion.
+    attested = _attested_rungs()
     backed = sp.serving_lane_route(_PROFILE, "FP8_CB_K36")
-    assert not backed.fused_mid_m_backed
-    assert backed.fused_mid_m_rungs == ()
+    assert backed.fused_mid_m_backed is (36 in attested)
+    assert backed.fused_mid_m_rungs == attested
     assert backed.fused_mid_m_range == (9, 128)
     assert backed.activation_contract == "w8a8-dynamic-e4m3"
-    assert backed.rungs_source == "pinned_runtime_version_not_declared"
+    assert backed.rungs_source == (
+        f"serving_profile_spec:{sp.gridbook_runtime_version()}" if attested
+        else "pinned_runtime_version_not_declared")
 
     released = sp.serving_lane_route(
         _PROFILE, "FP8_CB_K36", runtime_version="0.8.2"
@@ -293,7 +313,7 @@ def test_profiles_without_a_declared_lane_return_none():
 def test_the_lane_catalog_is_reportable_and_names_its_runtime():
     catalog = sp.serving_lane_catalog(_PROFILE)
     assert catalog["schema"] == sp.SERVING_LANE_SCHEMA
-    assert catalog["gridbook_runtime_version"] == "0.8.3"
+    assert catalog["gridbook_runtime_version"] == sp.gridbook_runtime_version()
     assert set(catalog["lanes"]) == {
         "nvfp4_cb_quality_path", "fp8_cb_fused_mid_m",
         # The two SOURCE-PASSTHROUGH lanes. They are declared as lanes of
@@ -304,10 +324,13 @@ def test_the_lane_catalog_is_reportable_and_names_its_runtime():
         # currently UNBACKED: no released Gridbook runtime carries a loader.
         "mxfp8_ue8m0_g32",
     }
-    assert catalog["lanes"]["fp8_cb_fused_mid_m"]["fused_mid_m_rungs"] == []
+    attested = _attested_rungs()
+    assert catalog["lanes"]["fp8_cb_fused_mid_m"]["fused_mid_m_rungs"] == list(
+        attested)
     assert catalog["lanes"]["fp8_cb_fused_mid_m"][
         "fused_mid_m_rungs_source"
-    ] == "pinned_runtime_version_not_declared"
+    ] == (f"serving_profile_spec:{sp.gridbook_runtime_version()}" if attested
+          else "pinned_runtime_version_not_declared")
     # A passthrough lane backs no fused mid-M rung, and says so explicitly
     # rather than leaving the field absent: there is no decode prologue to
     # fuse, so an empty backed set is the honest state, not a data gap. The
@@ -349,16 +372,24 @@ def test_candidates_carry_the_concrete_serving_lane_route():
         target_profile=_PROFILE,
         cb_serialization_context=_CB_CONTEXT)
     by_fmt = {c.fmt: c for c in cands["model.layers.0.self_attn.o_proj"]}
-    assert not by_fmt["FP8_CB_K36"].serving_lane.fused_mid_m_backed
+    attested = _attested_rungs()
+    assert by_fmt["FP8_CB_K36"].serving_lane.fused_mid_m_backed is (
+        36 in attested)
+    # K37 is off the fused rung set in every attested table, so it is on the
+    # fallback route regardless of which version the pin names.
     assert not by_fmt["FP8_CB_K37"].serving_lane.fused_mid_m_backed
     assert by_fmt["NVFP4_CB_K16"].serving_lane.activation_contract == (
         "w4-bf16-bridge")
     assert by_fmt["BF16"].serving_lane is None
-    # The unreleased pin fail-closes both rungs onto one fallback execution
-    # route.  The latest released contract still distinguishes backed K36
-    # from fallback K37.
-    assert (by_fmt["FP8_CB_K36"].serving_lane.route_key()
-            == by_fmt["FP8_CB_K37"].serving_lane.route_key())
+    # The route key separates a backed rung from a fallback one only while the
+    # pin names a version that attests it.  On an unattested pin both rungs
+    # fail closed onto the same execution route — which is the whole point of
+    # keying the backed set to a release.
+    assert (
+        (by_fmt["FP8_CB_K36"].serving_lane.route_key()
+         == by_fmt["FP8_CB_K37"].serving_lane.route_key())
+        is (36 not in attested)
+    )
     assert (
         sp.serving_lane_route(
             _PROFILE, "FP8_CB_K36", runtime_version="0.8.2"
@@ -367,10 +398,10 @@ def test_candidates_carry_the_concrete_serving_lane_route():
             _PROFILE, "FP8_CB_K37", runtime_version="0.8.2"
         ).route_key()
     )
-    # The side map injected by build_candidates carries the same fail-closed
-    # route for paths that read stats rather than candidates.
+    # The side map injected by build_candidates carries the same route for
+    # paths that read stats rather than candidates.
     lanes = stats["model.layers.0.self_attn.o_proj"]["_serving_lane_by_format"]
-    assert not lanes["FP8_CB_K36"].fused_mid_m_backed
+    assert lanes["FP8_CB_K36"].fused_mid_m_backed is (36 in attested)
 
 
 def test_selection_provenance_splits_backed_rungs_from_the_fallback():
@@ -384,13 +415,16 @@ def test_selection_provenance_splits_backed_rungs_from_the_fallback():
     }
     prov = selection_serving_lane_provenance(
         assignment, None, target_profile=_PROFILE)
-    assert prov["gridbook_runtime_version"] == "0.8.3"
+    k36_backed = 36 in _attested_rungs()
+    assert prov["gridbook_runtime_version"] == sp.gridbook_runtime_version()
     assert prov["units_total"] == 4
-    assert prov["units_on_backed_fused_mid_m_lane"] == 0
-    assert prov["units_on_fallback_route"] == 3
+    assert prov["units_on_backed_fused_mid_m_lane"] == (1 if k36_backed else 0)
+    assert prov["units_on_fallback_route"] == (2 if k36_backed else 3)
     assert prov["units_without_declared_lane"] == 1
-    assert prov["selected_rungs_fused_mid_m_backed"] == []
-    assert prov["selected_rungs_on_fallback_route"] == [16, 36, 37]
+    assert prov["selected_rungs_fused_mid_m_backed"] == (
+        [36] if k36_backed else [])
+    assert prov["selected_rungs_on_fallback_route"] == (
+        [16, 37] if k36_backed else [16, 36, 37])
     assert prov["activation_contracts"] == {
         "w4-bf16-bridge": 1, "w8a8-dynamic-e4m3": 2}
     assert prov["by_format"]["FP8_CB_K37"]["units"] == 1
@@ -411,8 +445,9 @@ def test_selection_provenance_reads_the_route_off_the_chosen_candidate():
     assignment["model.layers.9.mlp.experts.down_proj"] = "FP8_CB_K36"
     prov = selection_serving_lane_provenance(
         assignment, cands, target_profile=_PROFILE)
-    assert prov["units_on_backed_fused_mid_m_lane"] == 0
-    assert prov["units_on_fallback_route"] == 3
+    k36_backed = 36 in _attested_rungs()
+    assert prov["units_on_backed_fused_mid_m_lane"] == (3 if k36_backed else 0)
+    assert prov["units_on_fallback_route"] == (0 if k36_backed else 3)
     assert prov["units_without_declared_lane"] == 0
     # Every unit's activation-pricing branch is stamped too — including the
     # expanded member with no candidate, which says so rather than claiming

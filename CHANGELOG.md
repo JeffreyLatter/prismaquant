@@ -33,18 +33,24 @@ first end-to-end exercise of the seams below, every one of which is fail-closed.
   learned K28–K46 alongside lattice K47/K48 instead of forcing one basis on the
   whole family. `load_bundle`'s policy stamp remains the primary guard.
 - Wire learned bundles through the production exporter.
-- Routed-MoE learned books (device validation pending): advance the immutable
-  Gridbook preparation pin to 0.8.3 and version-gate routed learned refs on its
-  per-role LUT ABI — old, prerelease, local or malformed pins refuse before
+- Routed-MoE learned books, **producer side only and refusing by default**:
+  version-gate routed learned refs on the Gridbook per-role LUT ABI
+  (`>= 0.8.3`) so that old, prerelease, local or malformed pins refuse before
   export. Expert bundle cells are built only from explicitly selected,
   identity-verified K28–K33 burn shards, copying their FP16 books exactly with
   no export-time training, LDLQ, directory search or lattice fallback.
   Independent logical role refs are emitted for fused uniform and
   per-expert-format stacks while their physical `gate_up_proj`/`down_proj`
-  payloads are retained. **Consequence of the pin move:** 0.8.3 is not a
-  Gridbook release, so no rung is fused-mid-M backed and every CB unit now
-  prices on the fallback serving lane — the attestation chain working
-  fail-closed, not a regression.
+  payloads are retained.
+- **The Gridbook pin stays on the released 0.8.2** (`9f915dd`). An earlier
+  revision of this work advanced it to an "0.8.3 preparation commit"
+  `032e8158…`; that commit exists nowhere — not on the Gridbook remote, whose
+  newest tag is `v0.8.2`, and not in any checkout on the build box, where
+  `gridbook.__version__` still reads `"0.8.2"`. CI caught it at
+  `pip install gridbook @ git+…@032e8158…` and the pin was reverted before this
+  release. Consequence: the routed learned path refuses under the shipped pin,
+  which is the correct state while its ABI is unreleased, and the 0.8.2 fused
+  mid-M rung table remains the attested backed set.
 
 ### Anchored AURA — a platform-agnostic cost core with a format plugin
 

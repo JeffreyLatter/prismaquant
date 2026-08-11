@@ -9,6 +9,8 @@ from safetensors.torch import load_file, save_file
 
 from prismaquant import format_registry as fr
 from prismaquant import nvfp4_cb_formats as cb
+from prismaquant import cb_learned_bundle
+from prismaquant import gridbook_runtime_pin as runtime_pin
 from prismaquant.cb_learned_bundle import train_and_save_bundle
 from prismaquant.nvfp4_cb_footprint import (
     CB_TENSOR_IDENTITY_FIELD,
@@ -72,6 +74,29 @@ class _PerExpertProfile:
 
     def to_vllm_internal_name(self, name):
         return name
+
+
+@pytest.fixture(autouse=True)
+def _pretend_gridbook_supports_routed_lut(monkeypatch):
+    """Patch the pin to a version that carries the routed per-role LUT ABI.
+
+    These tests exercise the routed learned-book PRODUCER, which is gated on
+    ``GRIDBOOK_ROUTED_MOE_PER_ROLE_CODEBOOK_LUT_MIN_VERSION``. The shipped pin
+    is the released 0.8.2, which correctly refuses that path — no released
+    Gridbook carries the ABI yet. Reading the shipped pin here would make the
+    producer's own tests silently vanish the day the pin is right and fail the
+    day it is not, so supply the capability explicitly instead.
+    """
+    supported = runtime_pin.parse_gridbook_runtime_pin({
+        "schema": runtime_pin.GRIDBOOK_RUNTIME_PIN_SCHEMA,
+        "repository": "https://github.com/RobTand/gridbook.git",
+        "commit": "a" * 40,
+        "version": (
+            runtime_pin.GRIDBOOK_ROUTED_MOE_PER_ROLE_CODEBOOK_LUT_MIN_VERSION),
+        "version_is_release": False,
+    })
+    monkeypatch.setattr(
+        cb_learned_bundle, "load_gridbook_runtime_pin", lambda: supported)
 
 
 def _set_learned_env(monkeypatch, bundle_path):

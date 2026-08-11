@@ -8,13 +8,19 @@ cached-menu render/consume contract, and the profile-declared routed-expert
 AURA/empirical hybrid key-space contract, plus the platform-agnostic anchored-cost
 mechanism, CB mapping plugin, DSv4 one-shot acceptance-driver contract, and the
 anchored-AURA allocator admission branch (P0, closed 2026-08-11),
-with the external Gridbook runtime pinned to the **unreleased** 0.8.3
-preparation commit `032e815`. That commit adds the opt-in routed-MoE per-role
-LUT ABI; it has not been tagged, published, or device-validated, and the pin's
-`version_is_release` is therefore false. Serving-lane metadata deliberately
-credits no 0.8.3 fused rung table until the owner cuts and validates the
-release. The latest released 0.8.2 table remains historical evidence, not a
-claim about this pre-tag pin (§ serving lanes). This branch ports the dated
+with the external Gridbook runtime pinned to the released **0.8.2**
+(`9f915dd`). An earlier revision of this branch advanced the pin to an
+"0.8.3 preparation commit" `032e815` carrying the opt-in routed-MoE per-role
+LUT ABI. **That commit does not exist** — not on the Gridbook remote, whose
+newest tag is `v0.8.2`, and not in any checkout on this box; the local
+`gridbook` tree still self-reports `__version__ = "0.8.2"`. CI caught it at the
+install step (`pip install gridbook @ git+…@032e815`), and the pin was reverted
+before 0.11.0. The routed-MoE learned-book *code* ships and self-gates on
+`GRIDBOOK_ROUTED_MOE_PER_ROLE_CODEBOOK_LUT_MIN_VERSION = "0.8.3"`, so under the
+0.8.2 pin it refuses routed learned refs before export — the correct state
+while that ABI is unreleased. Serving-lane metadata credits the 0.8.2 fused
+rung table (§ serving lanes); crediting a 0.8.3 table is a serving promotion
+that needs a cut, published, device-validated release. This branch ports the dated
 2026-08-01 DeepSeek-V4-Flash-0731 92 GB study record (§9.2) forward from its 0.5.1
 working tree; the study's Gridbook-candidate claims were **not** carried over, because
 the candidate they described has since been reviewed, cut, and pinned as Gridbook 0.6.0.
@@ -2577,10 +2583,12 @@ implementation. The container may mix CB groups, ignored BF16 prefixes, and stoc
 groups delegated to vLLM. Gridbook's own FP8 transient paths call vLLM's registered native
 CUDA quantizer and CUTLASS scaled-matmul operators directly after attestation. Fused dense and
 grouped native-NVFP4 paths remain explicit opt-ins: the 2026-08-01 teacher-backed LFM gate
-rejected default enablement even though operator arithmetic passed. The 0.8.3
-preparation commit adds `abi_features.routed_moe_per_role_codebook_lut=1` and
-keeps that path behind `PRISMAQUANT_CB_MOE_PER_ROLE_LUT=1`; no default is
-promoted by this pin advance. The canceled gfx1151/ROCm
+rejected default enablement even though operator arithmetic passed. A future
+Gridbook release is expected to add
+`abi_features.routed_moe_per_role_codebook_lut=1` behind
+`PRISMAQUANT_CB_MOE_PER_ROLE_LUT=1`; **it is not in any released or fetchable
+commit today**, so the pin stays on 0.8.2 and the producer refuses routed
+learned refs. The canceled gfx1151/ROCm
 prototype was removed rather than maintained as an unqualified second backend.
 
 **Storage format.** Product vector quantization onto a codebook whose every entry lies exactly
@@ -2666,8 +2674,8 @@ legal only as explicit lattice cells, so editing a menu or presenting an old
 bundle cannot relabel K47/K48 learned (`require_cbl_rung_enabled` call sites in
 `train_and_save_bundle` and `load_bundle`).
 
-**Dense and opt-in routed-MoE serving can both be role-distinct at the 0.8.3
-preparation pin.** Gridbook's dense loader reads `codebook_ref` inside its
+**Dense serving is role-distinct on the released 0.8.2 pin; routed-MoE
+role-distinct serving awaits a released 0.8.3.** Gridbook's dense loader reads `codebook_ref` inside its
 per-role loop, interns each distinct reference tuple, concatenates those LUT
 blocks, and emits a `cb_row_offset` covering every output row. Thus fused
 `gate_up_proj` may carry gate≠up and fused `qkv_proj` may carry q≠k≠v
@@ -2682,11 +2690,11 @@ per-expert-format producer does the same per rung subgroup, preserving its
 `format_group_*` suffix and declared ascending expert order.
 
 The producer refusal was version-gated, not deleted. A final numeric pin below
-0.8.3, a prerelease/local version string, or an invalid pin still refuses every
-routed name, explicit routed flag, and rank-3 learned source before encoding.
-The exact 0.8.3 preparation pin lifts that producer gate even though
-`version_is_release=false`; release status separately withholds serving-rung
-credit. Production expert bundle cells accept only immutable banked K28–K33
+0.8.3, a prerelease/local version string, or an invalid pin refuses every
+routed name, explicit routed flag, and rank-3 learned source before encoding —
+**which is the state today**, since the pin is the released 0.8.2. Only a pin
+naming >= 0.8.3 lifts that producer gate, and release status separately governs
+serving-rung credit. Production expert bundle cells accept only immutable banked K28–K33
 books, refuse an LDLQ scope that includes FP8, and never call the trainer. The
 bundle records each pooled role's rank-3
 source/imatrix identity plus per-expert aliases so cost/cache/KL/export resolve
@@ -2699,7 +2707,7 @@ lattice routed-CB and the default `CB_CODEBOOK_SOURCE_SCOPE=none` are unchanged.
 
 **Runtime defaults and kernel provenance live only in Gridbook.** The old table
 here was removed after it drifted from the runtime it described. The current pin is Gridbook
-0.8.3 preparation commit `032e8158acc01b13c125db4c5463267f21b1debf`; resolve it from
+release 0.8.2, commit `9f915dd868eab2e13ab7847a67c594e2c5c8955c`; resolve it from
 `prismaquant/gridbook_runtime/gridbook_runtime_pin.json`, then consult that source's
 `docs/PLUGIN.md`, `docs/KERNELS.md`, and dated audits. The cross-project policy
 is only this: a numerics-changing path cannot be promoted by kernel arithmetic

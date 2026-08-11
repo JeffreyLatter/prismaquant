@@ -34,6 +34,7 @@ from prismaquant.serve_constraints import (
 from prismaquant.serve_dispatch_table import parse_dispatch_table, SCHEMA
 from prismaquant.serving_profiles import (
     gridbook_runtime_version,
+    load_serving_profile,
     serving_lane_route,
 )
 
@@ -420,20 +421,31 @@ def test_lane_key_rules():
 
 
 def test_unattested_runtime_pin_backs_nothing():
-    """The fail-closed half of the same rule, asserted at the LIVE pin.
+    """The fail-closed half of the same rule.
 
-    ``gridbook_runtime_pin.json`` currently names 0.8.3 with
-    ``version_is_release: false``, and the spec attests backed sets only
-    through 0.8.2. Every rung must therefore resolve to the fallback lane
-    today. This is the designed behaviour, not a gap: a backed set is keyed to
-    the release that first ships the lane with its flag defaulted on, so a
-    future 0.8.3 entry is a SERVING PROMOTION requiring measured evidence --
-    never a bookkeeping edit made to turn these tests green.
+    A backed set is keyed to the Gridbook release that first ships the lane
+    with its flag defaulted on, so a version the spec does not attest backs
+    NOTHING and every rung takes the fallback route. Adding an entry for a new
+    version is a SERVING PROMOTION requiring measured evidence on a released
+    runtime -- never a bookkeeping edit made to turn a test green.
+
+    Asserted against a version the spec deliberately does not declare rather
+    than against whatever the live pin happens to name, so that moving the pin
+    is never what makes this pass or fail.
     """
-    assert gridbook_runtime_version() == "0.8.3"
+    unattested = "0.9999.0"
+    profile = load_serving_profile("nvfp4_cb")
+    for lane in profile.serving_lanes:
+        rungs, source = lane.backed_rungs(unattested)
+        assert rungs == ()
+        assert source in {
+            "pinned_runtime_version_not_declared",
+            "lane_declares_no_fused_mid_m_lane",
+        }
     for fmt in ("FP8_CB_K36", "FP8_CB_K37", "NVFP4_CB_K16"):
-        assert lane_key_for(serving_lane_route("nvfp4_cb", fmt), 64) == (
-            "fallback"), fmt
+        assert lane_key_for(
+            serving_lane_route("nvfp4_cb", fmt, runtime_version=unattested),
+            64) == "fallback", fmt
 
 
 # ---------------------------------------------------------------------------
