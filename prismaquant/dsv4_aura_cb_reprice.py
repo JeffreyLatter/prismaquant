@@ -1151,8 +1151,11 @@ def run_dsv4_anchor_campaign(
             f"unexpected DSv4 control plane {control_plane!r}"
         )
     prepared = prepare_dsv4_campaign(args)
-    # This is the sole current launch blocker and fires before CUDA/P0.  The
-    # allocator module is explicitly off-limits to this change.
+    # Satisfied since 2026-08-11 (anchored-AURA admission landed in
+    # allocator_candidates); kept as a fail-closed re-check that fires before
+    # CUDA/P0, so a regression or a downgraded checkout refuses at the gate
+    # rather than mid-campaign.  The remaining launch blockers are operator
+    # inputs (WORK_DIR, codebook bundle, routed-book selection, receipt).
     require_allocator_supersurrogate_support()
 
     work_dir = Path(args.work_dir)
