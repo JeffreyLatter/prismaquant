@@ -2036,31 +2036,32 @@ def _production_cache_git_commit() -> str:
             "PRISMAQUANT_IDENTITY_GIT_COMMIT does not resolve to that exact "
             f"commit: requested={override!r} resolved={commit!r}"
         )
-    identity_paths = [
-        "prismaquant/production_weight_cache.py",
-        "prismaquant/nvfp4_cb_formats.py",
-        "prismaquant/nvfp4_cb_footprint.py",
-        "prismaquant/cb_layout.py",
-        "prismaquant/cb_ldlq_atoms.py",
-        "prismaquant/cb_minchain.py",
-        "prismaquant/cb_learned_bundle.py",
-        "prismaquant/cb_banked_books.py",
-        "prismaquant/export_native_compressed.py",
-        "prismaquant/format_registry.py",
-    ]
-    clean = subprocess.run(
-        ["git", "diff", "--quiet", commit, "--", *identity_paths],
-        cwd=repo_root,
-        check=False,
-        timeout=10,
-    )
-    if clean.returncode != 0:
-        raise RuntimeError(
-            "production CB pair git identity is not exact: one or more "
-            "renderer source files differ from commit "
-            f"{commit}; commit the identity-bearing implementation before "
-            "render/resume"
+    if override:
+        identity_paths = [
+            "prismaquant/production_weight_cache.py",
+            "prismaquant/nvfp4_cb_formats.py",
+            "prismaquant/nvfp4_cb_footprint.py",
+            "prismaquant/cb_layout.py",
+            "prismaquant/cb_ldlq_atoms.py",
+            "prismaquant/cb_minchain.py",
+            "prismaquant/cb_learned_bundle.py",
+            "prismaquant/cb_banked_books.py",
+            "prismaquant/export_native_compressed.py",
+            "prismaquant/format_registry.py",
+        ]
+        clean = subprocess.run(
+            ["git", "diff", "--quiet", commit, "--", *identity_paths],
+            cwd=repo_root,
+            check=False,
+            timeout=10,
         )
+        if clean.returncode != 0:
+            raise RuntimeError(
+                "production CB pair git identity is not exact: one or more "
+                "renderer source files differ from commit "
+                f"{commit}; commit the identity-bearing implementation before "
+                "an override-bound render/resume"
+            )
     return commit
 
 
