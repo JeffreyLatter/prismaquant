@@ -796,6 +796,8 @@ def build_quant_config(
     for group_index, ((ref, fmt), qnames) in enumerate(
         sorted(by_group.items())
     ):
+        from .nvfp4_cb_footprint import codebook_source_for_format
+
         grid, mode, k = cb_targets[qnames[0]]
         scheme = build_cb_scheme(
             ref=ref,
@@ -806,7 +808,14 @@ def build_quant_config(
             codebook=codebooks[(ref, fmt)],
             scale_coding=scale_coding,
             activation_contract=activation_contract_ref,
-            codebook_source=codebook_source,
+            # A mixed artifact is deliberately lattice on NVFP4 and learned
+            # on FP8-CB.  The old run-global scalar is retained in provenance
+            # for wire/backward compatibility, but it must never be copied
+            # onto every scheme: Gridbook dispatches the value-bearing
+            # ``codebook_ref`` carried by this specific target group.
+            codebook_source=codebook_source_for_format(
+                fmt, serialization_context
+            ),
         )
         config_groups[f"group_{group_index}"] = {
             "targets": sorted(cb_target_name(qname) for qname in qnames),
@@ -898,6 +907,12 @@ def build_quant_config(
         "serialized_payload": dict(serialized_payload_summary),
         "render_identity_verified": cb_render_identity is not None,
     }
+    source_scope = getattr(serialization_context, "codebook_source_scope", None)
+    if source_scope not in (None, "none"):
+        provenance["codebook_source_scope"] = str(source_scope)
+    sweep_scope = getattr(serialization_context, "scale_sweep_scope", None)
+    if sweep_scope not in (None, "none", "all"):
+        provenance["scale_sweep_scope"] = str(sweep_scope)
     if streaming_provenance is not None:
         provenance["streaming"] = bool(streaming_provenance)
     acknowledged = sorted(set(route_pending_passthrough_acknowledged))

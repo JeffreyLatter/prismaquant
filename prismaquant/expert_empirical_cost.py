@@ -283,11 +283,12 @@ def _quantize_unit_inplace(
     if spec.family in _CB_FAMILIES:
         context = cb_serialization_context_from_env()
 
-        def qdq(weight, col_weights=None):
+        def qdq(weight, col_weights=None, *, qname=None):
             return cb_quantize_dequantize_for_context(
                 spec,
                 weight,
                 context=context,
+                qname=qname,
                 col_weights=col_weights,
             )
     weighted = _qdq_accepts_col_weights(spec)
@@ -308,10 +309,12 @@ def _quantize_unit_inplace(
                 cw_s = (cw_dev[idx] if cw_dev.ndim >= 3
                         and cw_dev.shape[0] == w.shape[0] else cw_dev)
                 w[idx] = qdq(
-                    w[idx].float(), col_weights=cw_s).to(w.dtype)
+                    w[idx].float(), col_weights=cw_s, qname=full
+                ).to(w.dtype)
             else:
                 w.copy_(qdq(
-                    w.float(), col_weights=cw_dev).to(w.dtype))
+                    w.float(), col_weights=cw_dev, qname=full
+                ).to(w.dtype))
         elif spec.family == "nv":
             # NV formats derive one per-TENSOR global scale from
             # whatever slice they are given, while export ships one

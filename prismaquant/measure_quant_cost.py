@@ -80,6 +80,7 @@ def _cb_cost_quantize_dequantize(
         spec,
         weight,
         context=context,
+        qname=qname,
         col_weights=col_weights,
         activation_rows=activation_rows,
         raw_fields_out=raw_render_out,

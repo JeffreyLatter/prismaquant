@@ -34,6 +34,14 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 
 from prismaquant import nvfp4_cb_formats as cb
+from prismaquant.cb_learned_bundle import (
+    LLOYD_CAP,
+    LLOYD_ITERS,
+    LLOYD_ROW_SAMPLE,
+    LLOYD_ROW_SEED,
+    LLOYD_SEED,
+    learn_pool as _certified_learn_pool,
+)
 from prismaquant.nvfp4_cb_formats import nvfp4_cb_fields, nvfp4_cb_reconstruct
 from tools import dsv4_afast_campaign as _campaign
 from tools import dsv4_ldlq_cost_campaign as _ldlq_campaign
@@ -46,11 +54,6 @@ CBL_ELIGIBLE_MAX_RUNG = 44  # registered 2048 rule: every product sub-table
 # holds <= 2048 entries through K44; K45+ stays incumbent everywhere.
 CBL_SEMANTICS_SCHEMA = "prismaquant.dsv4_cbl_measurement_semantics.v2"
 BOOK_ROOT = RUN_ROOT / "bucket-books"
-LLOYD_ROW_SAMPLE = 64
-LLOYD_ROW_SEED = 4321
-LLOYD_CAP = 2_000_000
-LLOYD_ITERS = 4
-LLOYD_SEED = 0
 AUDIT_N = 16
 AUDIT_SALT = "cbl-audit-v1"
 AUDIT_SAMPLE_FALLBACK_MAX = 1          # >1/16 sampled incumbent wins -> abort
@@ -141,40 +144,14 @@ def encode_free_noldlq(**kwargs):
     return fields, recon, errors, timing, warm_path
 
 
-def _wq_pattern(cw_e: torch.Tensor) -> torch.Tensor:
-    """(1, in) col weights -> (in//8, 8) production vector-weight pattern
-    (row-periodic exactness: the production imatrix broadcasts over rows)."""
-    return cb._col_weight_vectors(cw_e.reshape(-1, cb.VEC_DIM))
-
-
 def learn_pool(weight: torch.Tensor, col_weights: torch.Tensor, rung: int):
-    """FABLE-certified pooled weighted-Lloyd product book (cand0 domain)."""
-    E, R, IN = weight.shape
-    dev = weight.device
-    g = torch.Generator().manual_seed(LLOYD_ROW_SEED)
-    rows_tr = torch.randperm(R, generator=g)[:LLOYD_ROW_SAMPLE]
-    vecs, wqs = [], []
-    for e in range(E):
-        v, _, _ = cb._scale_and_vectorize(weight[e, rows_tr].to(torch.float32), "fp8")
-        vecs.append(v)
-        wqs.append(_wq_pattern(col_weights[e].to(dev)).unsqueeze(0).expand(
-            len(rows_tr), IN // cb.VEC_DIM, cb.VEC_DIM).reshape(-1, cb.VEC_DIM))
-    V = torch.cat(vecs)
-    Q = torch.cat(wqs)
-    sel = torch.randperm(V.shape[0], generator=g)[:LLOYD_CAP].to(dev)
-    V, Q = V[sel], Q[sel]
-    n_sub = cb.family_for("fp8", "product").n_sub
-    bits = cb.subtable_bit_widths(int(rung), "product", n_sub)
-    sub = cb.VEC_DIM // n_sub
-    return tuple(
-        cb.learn_codebook(
-            V[:, i * sub:(i + 1) * sub], b, grid="fp8",
-            col_weights=Q[:, i * sub:(i + 1) * sub],
-            init=cb.fixed_lattice(b, "fp8", sub).to(dev),
-            iters=LLOYD_ITERS, seed=LLOYD_SEED,
-        )
-        for i, b in enumerate(bits)
-    )
+    """FABLE-certified pooled weighted-Lloyd product book (cand0 domain).
+
+    The production bundle and the historical study now call one literal
+    implementation.  Keeping this wrapper preserves every campaign import and
+    call site while preventing the producer kernel from drifting.
+    """
+    return _certified_learn_pool(weight, col_weights, rung)
 
 
 def book_sha256(pool: Sequence[torch.Tensor]) -> str:
