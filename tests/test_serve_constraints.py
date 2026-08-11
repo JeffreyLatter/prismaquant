@@ -32,7 +32,10 @@ from prismaquant.serve_constraints import (
     rejection_record,
 )
 from prismaquant.serve_dispatch_table import parse_dispatch_table, SCHEMA
-from prismaquant.serving_profiles import serving_lane_route
+from prismaquant.serving_profiles import (
+    gridbook_runtime_version,
+    serving_lane_route,
+)
 
 _PROV = {
     "source": "tests/test_serve_constraints.py synthetic fixture",
@@ -334,8 +337,19 @@ def _lane_ctx(**slo_kw):
     )
 
 
+# The fused mid-M backed set is attested PER GRIDBOOK RELEASE, and the repo's
+# pin currently names 0.8.3 with ``version_is_release: false``. An unreleased
+# version deliberately backs nothing ("a pinned version with no entry backs
+# nothing, which is the fail-closed direction" -- nvfp4_cb.json), so resolving
+# against the ambient pin here would make these tests assert the PIN rather
+# than the RULE they exist to cover. Pin the newest ATTESTED release instead;
+# ``test_unattested_runtime_pin_backs_nothing`` covers the fail-closed side.
+_ATTESTED_RUNTIME = "0.8.2"
+
+
 def _profile_lane(_name, fmt):
-    return serving_lane_route("nvfp4_cb", fmt)
+    return serving_lane_route(
+        "nvfp4_cb", fmt, runtime_version=_ATTESTED_RUNTIME)
 
 
 def test_backed_and_unbacked_rungs_take_different_table_rows():
@@ -388,8 +402,10 @@ def test_fused_lane_is_not_claimed_outside_its_declared_m_range():
 
 
 def test_lane_key_rules():
-    backed = serving_lane_route("nvfp4_cb", "FP8_CB_K36")
-    unbacked = serving_lane_route("nvfp4_cb", "FP8_CB_K37")
+    backed = serving_lane_route(
+        "nvfp4_cb", "FP8_CB_K36", runtime_version=_ATTESTED_RUNTIME)
+    unbacked = serving_lane_route(
+        "nvfp4_cb", "FP8_CB_K37", runtime_version=_ATTESTED_RUNTIME)
     assert lane_key_for(None, 64) == "native"
     assert lane_key_for(backed, 64) == "fused_mid_m"
     assert lane_key_for(backed, 1400) == "fallback"
@@ -398,7 +414,26 @@ def test_lane_key_rules():
     # The default fp4-CB quality path declares an EMPTY backed set at every
     # runtime version, so it is always the fallback route.
     assert lane_key_for(
-        serving_lane_route("nvfp4_cb", "NVFP4_CB_K16"), 64) == "fallback"
+        serving_lane_route(
+            "nvfp4_cb", "NVFP4_CB_K16", runtime_version=_ATTESTED_RUNTIME),
+        64) == "fallback"
+
+
+def test_unattested_runtime_pin_backs_nothing():
+    """The fail-closed half of the same rule, asserted at the LIVE pin.
+
+    ``gridbook_runtime_pin.json`` currently names 0.8.3 with
+    ``version_is_release: false``, and the spec attests backed sets only
+    through 0.8.2. Every rung must therefore resolve to the fallback lane
+    today. This is the designed behaviour, not a gap: a backed set is keyed to
+    the release that first ships the lane with its flag defaulted on, so a
+    future 0.8.3 entry is a SERVING PROMOTION requiring measured evidence --
+    never a bookkeeping edit made to turn these tests green.
+    """
+    assert gridbook_runtime_version() == "0.8.3"
+    for fmt in ("FP8_CB_K36", "FP8_CB_K37", "NVFP4_CB_K16"):
+        assert lane_key_for(serving_lane_route("nvfp4_cb", fmt), 64) == (
+            "fallback"), fmt
 
 
 # ---------------------------------------------------------------------------
