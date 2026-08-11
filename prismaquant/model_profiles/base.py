@@ -620,10 +620,10 @@ class ModelProfile(ABC):
         names don't match, those optimizations silently no-op (probe speed
         only — per-Linear Fisher still accumulates via the regular hooks).
 
-        Packed-expert architectures (DeepSeek-V4: 3D ``gate_up_proj`` /
-        ``down_proj`` tensors, no per-expert modules) have no such attributes
-        and never match the consumers of this accessor, so the default is
-        harmless for them. A declarative structure spec may override via an
+        Architectures whose live topology is packed into 3D
+        ``gate_up_proj`` / ``down_proj`` tensors have no such attributes and
+        never match the consumers of this accessor, so the default is harmless
+        for them. A declarative structure spec may override via an
         ``unpacked_expert_projection_names`` field; otherwise the default is
         the Qwen3/Qwen3.5 standard ``('w1', 'w2', 'w3')``. Profiles whose
         unpacked experts use different attribute names should override this.
