@@ -487,6 +487,35 @@ def test_every_candidate_is_anchor_priced_once_and_h_squared_inputs_refuse(
             )
 
 
+def test_terminal_cost_source_is_the_allocator_passthrough_contract():
+    """The byte-verbatim terminal must speak the allocator's own vocabulary.
+
+    ``cost_entry_is_source_passthrough`` refuses any other ``cost_source``, so a
+    near-miss label still prices correctly while misclassifying provenance and
+    the activation branch. Pin the two constants together so they cannot drift.
+    """
+    from prismaquant.allocator_candidates import SOURCE_PASSTHROUGH_COST_SOURCE
+
+    units = (_unit("unit.0"),)
+    plugin = _SyntheticPlugin()
+    requests = plan_anchor_requests(units, plugin)
+    anchors = anchors_from_results(requests, _render_receipts(requests, plugin))
+    rows = price_anchored_candidates(
+        units, plugin, anchors, _fits(units, plugin)
+    )
+
+    terminals = [cell for cell in rows["unit.0"] if cell.candidate.terminal]
+    assert len(terminals) == 1
+    entry = terminals[0].allocation_entry()
+    assert entry["cost_source"] == SOURCE_PASSTHROUGH_COST_SOURCE
+    assert entry["predicted_dloss"] == 0.0
+
+    source = (
+        Path(__file__).parents[1] / "prismaquant" / "anchored_cost.py"
+    ).read_text()
+    assert "exact_source_passthrough_terminal" not in source
+
+
 def test_zero_measured_anchor_is_retained_and_not_proof_pruned():
     units = (_unit("unit.0"),)
     plugin = _SyntheticPlugin(zero_anchor=("unit.0", "A1"))

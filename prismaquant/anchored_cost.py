@@ -24,6 +24,7 @@ from pathlib import Path
 import subprocess
 from typing import Literal, Protocol, runtime_checkable
 
+from prismaquant.allocator_candidates import SOURCE_PASSTHROUGH_COST_SOURCE
 from prismaquant.cost_stage_checkpoint import (
     atomic_write_bytes,
     canonical_json,
@@ -1294,7 +1295,10 @@ def price_anchored_candidates(
             terminal,
             0.0,
             None,
-            "exact_source_passthrough_terminal",
+            # The allocator's byte-verbatim contract, not a label of our own:
+            # cost_entry_is_source_passthrough() refuses anything else, and a
+            # near-miss string silently misclassifies the activation branch.
+            SOURCE_PASSTHROUGH_COST_SOURCE,
         ))
         rows[unit.qname] = tuple(sorted(
             priced, key=lambda item: (
