@@ -470,6 +470,30 @@ class _PackedModel(nn.Module):
         self.model.layers[0].mlp.experts = _PackedExperts()
 
 
+class _Dsv4UnpackedExpert(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.gate_proj = nn.Linear(32, 32, bias=False)
+        self.up_proj = nn.Linear(32, 32, bias=False)
+        self.down_proj = nn.Linear(32, 32, bias=False)
+
+
+class _Dsv4UnpackedModel(nn.Module):
+    """DSv4 live/probe shape: routed experts are per-expert Linears."""
+
+    def __init__(self):
+        super().__init__()
+        self.model = nn.Module()
+        self.model.layers = nn.ModuleList([nn.Module()])
+        layer = self.model.layers[0]
+        layer.self_attn = nn.Module()
+        layer.self_attn.q_proj = nn.Linear(32, 32, bias=False)
+        layer.mlp = nn.Module()
+        layer.mlp.experts = nn.ModuleList(
+            [_Dsv4UnpackedExpert(), _Dsv4UnpackedExpert()]
+        )
+
+
 def test_aura_guard_rejects_packed_experts_by_default():
     with pytest.raises(RuntimeError, match="packed-MoE expert costs"):
         _guard_packed_expert_coverage(_PackedModel())
@@ -491,3 +515,45 @@ def test_aura_guard_allows_dense_only_models():
     model = nn.Sequential(nn.Linear(16, 16, bias=False))
 
     assert _guard_packed_expert_coverage(model) == []
+
+
+def test_aura_guard_rejects_profile_declared_dsv4_unpacked_experts():
+    from prismaquant.model_profiles.deepseek_v4 import DeepseekV4Profile
+
+    with pytest.raises(RuntimeError, match="expert costs"):
+        _guard_packed_expert_coverage(
+            _Dsv4UnpackedModel(),
+            DeepseekV4Profile(),
+        )
+
+
+def test_aura_smooth_targets_exclude_dsv4_unpacked_experts():
+    from prismaquant.model_profiles.deepseek_v4 import DeepseekV4Profile
+
+    model = _Dsv4UnpackedModel()
+    profile = DeepseekV4Profile()
+    omitted = _guard_packed_expert_coverage(
+        model,
+        profile,
+        allow_omission=True,
+    )
+
+    assert omitted == [
+        f"model.layers.0.mlp.experts.{expert_id}.{projection}"
+        for expert_id in range(2)
+        for projection in ("down_proj", "gate_proj", "up_proj")
+    ]
+    assert list(_target_linears(model, profile=profile)) == [
+        "model.layers.0.self_attn.q_proj"
+    ]
+
+
+def test_aura_guard_fails_closed_when_profile_cannot_classify_experts():
+    from prismaquant.model_profiles.deepseek_v4 import DeepseekV4Profile
+
+    class BrokenProfile(DeepseekV4Profile):
+        def packed_expert_format_group(self, qname: str):
+            raise LookupError(f"classification unavailable for {qname}")
+
+    with pytest.raises(RuntimeError, match="could not determine routed-expert"):
+        _guard_packed_expert_coverage(_Dsv4UnpackedModel(), BrokenProfile())
