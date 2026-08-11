@@ -113,6 +113,7 @@ def candidate_chunk_size(
     element_size: int,
     workspace_bytes: int,
     chunk_cap: int = LDLQ_CANDIDATE_CHUNK_CAP,
+    candidate_planes: int = 4,
 ) -> int:
     """Bound the exhaustive-search temporaries independently of K.
 
@@ -130,7 +131,10 @@ def candidate_chunk_size(
     cap = int(chunk_cap)
     if min(rows, atom, entries, scalar_bytes, budget, cap) <= 0:
         raise CBLDLQError("candidate workspace dimensions must be positive")
-    bytes_per_candidate = rows * (4 * atom + 1) * scalar_bytes
+    planes = int(candidate_planes)
+    if planes <= 0:
+        raise CBLDLQError("candidate_planes must be positive")
+    bytes_per_candidate = rows * (planes * atom + 1) * scalar_bytes
     budget_chunk = max(1, budget // bytes_per_candidate)
     return min(entries, cap, budget_chunk)
 
@@ -380,6 +384,126 @@ def _forward_substitute_product_atom(
     return torch.stack(solved, dim=-1)
 
 
+
+# --- compile gate for the LDLQ assignment atoms -------------------------------
+# Profiling (2026-08-10, 47,923 samples) put ~88% of DSv4 export runtime under
+# ldlq_reassign_cb_fields, with the atom assignment materialising a
+# (rows, chunk, atom) candidate residual per chunk. nvfp4_cb_formats already
+# compiles its moment-scoring kernels; this file was never compiled at all.
+# dynamic=True on purpose: `rows` varies per tensor, and a static compile would
+# recompile per shape and blow dynamo's recompile limit, which silently falls
+# back to EAGER (the same ~30x trap _raise_encode_recompile_limit documents).
+_ATOM_COMPILE_ENV = "PRISMAQUANT_CB_ATOM_COMPILE"
+_ATOM_COMPILED = {}
+
+
+def _atom_compile_on() -> bool:
+    import os
+    return os.environ.get(_ATOM_COMPILE_ENV, "0").lower() not in ("0", "false", "no")
+
+
+def _atom_compiled(fn):
+    """Compile `fn` once, lazily, when the gate is on; else return it unchanged."""
+    if not _atom_compile_on():
+        return fn
+    got = _ATOM_COMPILED.get(fn)
+    if got is None:
+        import torch as _t
+        try:
+            _t._dynamo.config.cache_size_limit = max(
+                getattr(_t._dynamo.config, "cache_size_limit", 8), 64)
+        except Exception:
+            pass
+        got = _t.compile(fn, dynamic=True)
+        _ATOM_COMPILED[fn] = got
+    return got
+
+
+
+def _atom_chunk_costs(target, per_element_scale, codebook_chunk, upper_atom):
+    """Per-chunk candidate cost. Pure tensor math, no host sync -> fuses whole.
+
+    Kept byte-order-identical to the inline form it replaces: the forward
+    substitution retains its explicit left-to-right column order.
+    """
+    residual = (
+        target[:, None, :]
+        - per_element_scale[:, None, :] * codebook_chunk[None, :, :]
+    )
+    whitened = _forward_substitute_product_atom(residual, upper_atom)
+    return whitened.square().sum(dim=-1)
+
+
+def _atom_chunk_best(target, per_element_scale, codebook_chunk, upper_atom):
+    """Fused residual -> substitute -> squared-norm -> argmin.
+
+    The reduction MUST happen inside the compiled region.  Returning the full
+    (rows, cand) cost tensor made inductor materialise tens of MB per atom
+    step and the path became memcpy-bound -- 65% of runtime sat in
+    Device->Device copies while the arithmetic kernel was 6%.  Reducing
+    in-kernel writes (rows,) instead of (rows, cand).
+
+    Squares accumulate per column rather than via ``torch.stack``: the stack
+    forces a real (rows, cand, atom) buffer that defeats the fusion.
+    """
+    residual = (
+        target[:, None, :]
+        - per_element_scale[:, None, :] * codebook_chunk[None, :, :]
+    )
+    atom = residual.shape[-1]
+    solved = []
+    total = None
+    for column in range(atom):
+        value = residual[..., column]
+        for prior in range(column):
+            value = value - solved[prior] * upper_atom[prior, column]
+        value = value / upper_atom[column, column]
+        solved.append(value)
+        total = value.square() if total is None else total + value.square()
+    return total.min(dim=-1)
+
+
+def _atom_chunk_costs_batched(target, per_element_scale, codebook_chunk,
+                              upper_atom):
+    residual = (
+        target[..., None, :]
+        - per_element_scale[..., None, :] * codebook_chunk[None, None, :, :]
+    )
+    whitened = _forward_substitute_product_atom(residual, upper_atom)
+    return whitened.square().sum(dim=-1)
+
+
+def _fused_route(target: torch.Tensor) -> bool:
+    """Whether the fused compiled route may run.  CUDA ONLY -- deliberately.
+
+    torch.compile's CPU lowering of ``min(dim=-1)`` returns the correct
+    minimum VALUE paired with a WRONG index.  Measured on this box
+    (torch 2.11+cu130): 381/512 rows wrong at fp32 and 396/512 at fp64, the
+    returned index costing up to 31x the true minimum, while CUDA is exact
+    (0/512 wrong, zero excess cost) for both dtypes.
+
+    The index is precisely what gets serialised into the artifact, and the
+    returned cost still looks right, so a CPU fused route would corrupt an
+    export silently and pass any check that only inspects costs.  CPU
+    therefore always takes the eager route.  This costs nothing in
+    production: every hot path here is GPU-or-bust by design.
+    """
+    return _atom_compile_on() and bool(target.is_cuda)
+
+
+def _fused_candidate_planes(target: torch.Tensor) -> int:
+    """Live candidate planes under the active route.
+
+    The eager route really does hold four atom-width planes at once
+    (candidate product, residual, whitened solve, overlap).  The fused route
+    reduces to (rows,) inside one Triton kernel, so only the residual plane
+    is ever live.  Keeping the eager number under compilation split every
+    atom step into three ragged chunks (113 of 256), tripling compiled-graph
+    launches for no memory benefit.
+    """
+    return 1 if _fused_route(target) else 4
+
+
 def assign_product_atom(
     target: torch.Tensor,
     per_element_scale: torch.Tensor,
@@ -388,8 +512,17 @@ def assign_product_atom(
     *,
     workspace_bytes: int,
     chunk_cap: int = LDLQ_CANDIDATE_CHUNK_CAP,
+    defer_finite_check: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Exact exhaustive Mahalanobis assignment with bounded workspace."""
+    """Exact exhaustive Mahalanobis assignment with bounded workspace.
+
+    ``defer_finite_check`` moves the non-finite guard to the caller.  The
+    guard is a host synchronisation; running it once per atom step drained
+    the pipeline columns/atom times per matrix (400 ms of 608 ms in a
+    profile).  ``reassign_product_*`` re-check the identical condition on
+    the stacked costs they already build, so the failure is still closed --
+    only later.
+    """
     rows, atom = map(int, target.shape)
     entries = int(codebook.shape[0])
     chunk = candidate_chunk_size(
@@ -399,6 +532,7 @@ def assign_product_atom(
         element_size=target.element_size(),
         workspace_bytes=workspace_bytes,
         chunk_cap=chunk_cap,
+        candidate_planes=_fused_candidate_planes(target),
     )
     best_cost = torch.full(
         (rows,), float("inf"), device=target.device, dtype=target.dtype
@@ -406,20 +540,96 @@ def assign_product_atom(
     best_index = torch.zeros((rows,), device=target.device, dtype=torch.long)
     for first in range(0, entries, chunk):
         last = min(first + chunk, entries)
-        residual = (
-            target[:, None, :]
-            - per_element_scale[:, None, :] * codebook[None, first:last, :]
-        )
-        whitened = _forward_substitute_product_atom(residual, upper_atom)
-        costs = whitened.square().sum(dim=-1)
-        local_cost, local_index = costs.min(dim=-1)
+        if _fused_route(target):
+            local_cost, local_index = _atom_compiled(_atom_chunk_best)(
+                target, per_element_scale, codebook[first:last], upper_atom
+            )
+        else:
+            costs = _atom_chunk_costs(
+                target, per_element_scale, codebook[first:last], upper_atom
+            )
+            local_cost, local_index = costs.min(dim=-1)
         improve = local_cost < best_cost
         best_cost = torch.where(improve, local_cost, best_cost)
         best_index = torch.where(improve, local_index + first, best_index)
-    if not bool(torch.isfinite(best_cost).all()):
+    if not defer_finite_check and not bool(torch.isfinite(best_cost).all()):
         raise CBLDLQError("atom assignment produced a non-finite cost")
     decoded = per_element_scale * codebook[best_index]
     return decoded, best_index, best_cost
+
+
+
+def _batched_rhs(target, per_element_scale, codebook_chunk,
+                 experts, atom, rows, n_cand):
+    """Residual + layout for the batched triangular solve (fuses; no sync)."""
+    residual = (
+        target[:, :, None, :]
+        - per_element_scale[:, :, None, :] * codebook_chunk[None, None, :, :]
+    )
+    return residual.permute(0, 3, 1, 2).reshape(experts, atom, rows * n_cand)
+
+
+def _batched_costs(whitened, experts, atom, rows, n_cand):
+    """Post-solve reshape + squared-norm reduction (fuses; no sync)."""
+    w = whitened.reshape(experts, atom, rows, n_cand).permute(0, 2, 3, 1)
+    return w.square().sum(dim=-1)
+
+
+
+def _forward_substitute_batched(residual, upper_atom):
+    """Per-expert forward substitution, same recurrence as the 2-D atom path.
+
+    Replaces torch.linalg.solve_triangular for the batched route. cuSOLVER on a
+    4x4 (fp4) / 2x2 (fp8) system is a library call the compiler cannot fuse
+    through, which pinned the batched path at ~1.25x while the 2-D path reached
+    ~5.9x. This is the identical mathematical recurrence, expressed in ops that
+    fuse into the surrounding residual/square/sum chain.
+
+    residual: (E, rows, cand, atom)   upper_atom: (E, atom, atom)
+    Solves U^T y = residual, matching solve_triangular(U^T, ., upper=False).
+    """
+    atom = residual.shape[-1]
+    solved = []
+    for column in range(atom):
+        value = residual[..., column]
+        for prior in range(column):
+            value = value - solved[prior] * upper_atom[:, prior, column].reshape(-1, 1, 1)
+        value = value / upper_atom[:, column, column].reshape(-1, 1, 1)
+        solved.append(value)
+    return torch.stack(solved, dim=-1)
+
+
+def _batched_chunk_best(target, per_element_scale, codebook_chunk, upper_atom):
+    """Per-expert fused residual -> substitute -> squared-norm -> argmin.
+
+    See _atom_chunk_best: the reduction must live inside the compiled region
+    or the (E, rows, cand) cost tensor dominates as Device->Device traffic.
+    """
+    residual = (
+        target[:, :, None, :]
+        - per_element_scale[:, :, None, :] * codebook_chunk[None, None, :, :]
+    )
+    atom = residual.shape[-1]
+    solved = []
+    total = None
+    for column in range(atom):
+        value = residual[..., column]
+        for prior in range(column):
+            value = value - solved[prior] * upper_atom[:, prior, column].reshape(-1, 1, 1)
+        value = value / upper_atom[:, column, column].reshape(-1, 1, 1)
+        solved.append(value)
+        total = value.square() if total is None else total + value.square()
+    return total.min(dim=-1)
+
+
+def _batched_whitened_costs(target, per_element_scale, codebook_chunk, upper_atom):
+    """Fused residual -> forward-substitute -> squared-norm. No sync, no library call."""
+    residual = (
+        target[:, :, None, :]
+        - per_element_scale[:, :, None, :] * codebook_chunk[None, None, :, :]
+    )
+    whitened = _forward_substitute_batched(residual, upper_atom)
+    return whitened.square().sum(dim=-1)
 
 
 def assign_product_atom_batched(
@@ -430,8 +640,12 @@ def assign_product_atom_batched(
     *,
     workspace_bytes: int,
     chunk_cap: int = LDLQ_CANDIDATE_CHUNK_CAP,
+    defer_finite_check: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Per-expert exact atom assignment, vectorized across experts/rows."""
+    """Per-expert exact atom assignment, vectorized across experts/rows.
+
+    See ``assign_product_atom`` for ``defer_finite_check``.
+    """
     experts, rows, atom = map(int, target.shape)
     entries = int(codebook.shape[0])
     chunk = candidate_chunk_size(
@@ -441,6 +655,7 @@ def assign_product_atom_batched(
         element_size=target.element_size(),
         workspace_bytes=workspace_bytes,
         chunk_cap=chunk_cap,
+        candidate_planes=_fused_candidate_planes(target),
     )
     best_cost = torch.full(
         (experts, rows),
@@ -453,25 +668,35 @@ def assign_product_atom_batched(
     )
     for first in range(0, entries, chunk):
         last = min(first + chunk, entries)
-        residual = (
-            target[:, :, None, :]
-            - per_element_scale[:, :, None, :]
-            * codebook[None, None, first:last, :]
-        )
-        rhs = residual.permute(0, 3, 1, 2).reshape(
-            experts, atom, rows * (last - first)
-        )
-        whitened = torch.linalg.solve_triangular(
-            upper_atom.transpose(-2, -1),
-            rhs,
-            upper=False,
-        ).reshape(experts, atom, rows, last - first).permute(0, 2, 3, 1)
-        costs = whitened.square().sum(dim=-1)
-        local_cost, local_index = costs.min(dim=-1)
+        if _fused_route(target):
+            # Fused route: explicit substitution + argmin compile into a single
+            # reduction kernel. cuSOLVER cannot be fused through, and the cost
+            # tensor is never materialised.
+            local_cost, local_index = _atom_compiled(_batched_chunk_best)(
+                target, per_element_scale, codebook[first:last], upper_atom
+            )
+        else:
+            # Default route, unchanged: eager forward substitution is SLOWER
+            # than cuSOLVER, so the gate-off path must keep the library call.
+            residual = (
+                target[:, :, None, :]
+                - per_element_scale[:, :, None, :]
+                * codebook[None, None, first:last, :]
+            )
+            rhs = residual.permute(0, 3, 1, 2).reshape(
+                experts, atom, rows * (last - first)
+            )
+            whitened = torch.linalg.solve_triangular(
+                upper_atom.transpose(-2, -1),
+                rhs,
+                upper=False,
+            ).reshape(experts, atom, rows, last - first).permute(0, 2, 3, 1)
+            costs = whitened.square().sum(dim=-1)
+            local_cost, local_index = costs.min(dim=-1)
         improve = local_cost < best_cost
         best_cost = torch.where(improve, local_cost, best_cost)
         best_index = torch.where(improve, local_index + first, best_index)
-    if not bool(torch.isfinite(best_cost).all()):
+    if not defer_finite_check and not bool(torch.isfinite(best_cost).all()):
         raise CBLDLQError("batched atom assignment produced a non-finite cost")
     decoded = per_element_scale * codebook[best_index]
     return decoded, best_index, best_cost
@@ -539,6 +764,7 @@ def reassign_product_2d(
                 table,
                 upper_atom,
                 workspace_bytes=workspace,
+                defer_finite_check=True,
             )
             residual = tile[:, local_start:local_end] - decoded
             scaled_error = _forward_substitute_product_atom(
@@ -558,12 +784,15 @@ def reassign_product_2d(
             )
 
     vectors = columns // VEC_DIM
+    stacked_costs = torch.stack(cost_parts, dim=1)
+    if not bool(torch.isfinite(stacked_costs).all()):
+        raise CBLDLQError("atom assignment produced a non-finite cost")
     return ProductLDLQResult(
         reconstructed=reconstructed,
         indices=torch.stack(assignment_parts, dim=1).reshape(
             rows, vectors, spec.subtables_per_vector
         ),
-        local_costs=torch.stack(cost_parts, dim=1).reshape(
+        local_costs=stacked_costs.reshape(
             rows, vectors, spec.subtables_per_vector
         ),
     )
@@ -644,6 +873,7 @@ def reassign_product_3d_batched(
                 table,
                 upper_atom,
                 workspace_bytes=workspace,
+                defer_finite_check=True,
             )
             residual = tile[:, :, local_start:local_end] - decoded
             scaled_error = torch.linalg.solve_triangular(
@@ -667,12 +897,15 @@ def reassign_product_3d_batched(
             )
 
     vectors = columns // VEC_DIM
+    stacked_costs = torch.stack(cost_parts, dim=2)
+    if not bool(torch.isfinite(stacked_costs).all()):
+        raise CBLDLQError("batched atom assignment produced a non-finite cost")
     return ProductLDLQResult(
         reconstructed=reconstructed,
         indices=torch.stack(assignment_parts, dim=2).reshape(
             experts, rows, vectors, spec.subtables_per_vector
         ),
-        local_costs=torch.stack(cost_parts, dim=2).reshape(
+        local_costs=stacked_costs.reshape(
             experts, rows, vectors, spec.subtables_per_vector
         ),
     )

@@ -77,15 +77,32 @@ def _coding_for(fmt):
             else cb.SCALE_CODING_V1)
 
 
+def _assert_same_value(av, bv, tag):
+    """Compare a field value, which may be a tensor, or a tuple of tensors.
+
+    ``codebook`` is a tuple of product subtables.  Comparing it with ``==``
+    dispatches to elementwise tensor comparison and raises "Boolean value of
+    Tensor with more than one value is ambiguous", so every parametrisation
+    of these tests errored out before it could check anything.  The
+    determinism they assert was therefore never actually exercised.
+    """
+    if torch.is_tensor(av):
+        assert torch.is_tensor(bv), tag
+        assert av.dtype == bv.dtype and av.shape == bv.shape, tag
+        assert torch.equal(av, bv), f"{tag} is not bit-identical"
+        return
+    if isinstance(av, (tuple, list)):
+        assert isinstance(bv, (tuple, list)) and len(av) == len(bv), tag
+        for index, (ai, bi) in enumerate(zip(av, bv)):
+            _assert_same_value(ai, bi, f"{tag}[{index}]")
+        return
+    assert av == bv, tag
+
+
 def _assert_same_fields(a, b, tag):
     assert set(a) == set(b), tag
     for key, av in a.items():
-        bv = b[key]
-        if not torch.is_tensor(av):
-            assert av == bv, f"{tag}: {key}"
-            continue
-        assert av.dtype == bv.dtype and av.shape == bv.shape, f"{tag}: {key}"
-        assert torch.equal(av, bv), f"{tag}: field {key!r} is not bit-identical"
+        _assert_same_value(av, b[key], f"{tag}: field {key!r}")
 
 
 @pytest.mark.parametrize("device", _DEVICES)
