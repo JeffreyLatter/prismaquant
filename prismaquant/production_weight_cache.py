@@ -75,6 +75,8 @@ import math
 import os
 from pathlib import Path
 import re
+import subprocess
+import time
 
 import torch
 import torch.nn as nn
@@ -104,6 +106,12 @@ CB_RENDER_CONTRACT_SCHEMA = (
 )
 CB_RENDER_MECHANISM_ABI = "prismaquant.production_render_mechanisms.v1"
 CB_RENDER_IDENTITY_METADATA_KEY = "cb_render_identity"
+CB_CACHE_PAIR_IDENTITY_SCHEMA = (
+    "prismaquant.production_weight_cache.cb_pair_identity.v1"
+)
+CB_CACHE_PAIR_SIDECAR_SCHEMA = (
+    "prismaquant.production_weight_cache.cb_pair_sidecar.v1"
+)
 
 
 def _render_base_format(fmt: str) -> str:
@@ -113,6 +121,10 @@ def _render_base_format(fmt: str) -> str:
 def _cache_weight_filename(qname: str, fmt: str) -> str:
     safe = qname.replace("/", "__").replace(".", "_")
     return f"{safe}__{fmt}.pt"
+
+
+def _cache_pair_identity_filename(qname: str, fmt: str) -> str:
+    return _cache_weight_filename(qname, fmt) + ".identity.json"
 
 
 _UNCACHED_PACKED_EXPERT_RE = re.compile(
@@ -197,6 +209,7 @@ class ProductionWeightCache:
     _lru_paths: dict[tuple[str, str], str] | None = None
     _lru_bytes: int = 0
     _lru_max_bytes: int = 0
+    _cb_verified_keys: set[tuple[str, str]] | None = None
 
     def __post_init__(self) -> None:
         # Normalize to ``activation_max_abs`` if a caller used the legacy
@@ -252,6 +265,8 @@ class ProductionWeightCache:
                 # Restore the filename so subsequent lookups still resolve.
                 if self._lru_paths is not None and evict_key in self._lru_paths:
                     self.weights[evict_key] = self._lru_paths[evict_key]
+                if self._cb_verified_keys is not None:
+                    self._cb_verified_keys.discard(evict_key)
 
     def compact_for_pickle(self) -> int:
         """Restore disk-backed resident tensors to path references.
@@ -278,6 +293,7 @@ class ProductionWeightCache:
                     compacted += 1
         self._lru_order = [] if self._lru_order is not None else None
         self._lru_bytes = 0
+        self._cb_verified_keys = None
         return compacted
 
     def _path_for_value(self, value: object) -> str:
@@ -575,6 +591,57 @@ class ProductionWeightCache:
         self._lru_order.append(key)
         self._evict_to_budget()
 
+    def _validate_loaded_cb_pair_tensor(
+        self,
+        key: tuple[str, str],
+        tensor: torch.Tensor,
+    ) -> None:
+        """Verify an admitted CB shard on its necessary consumer load.
+
+        Resume admission validates the small identity sidecar without an eager
+        full-cache scan. The first real consumer load verifies the logical
+        tensor digest from the cache manifest, combining integrity checking
+        with I/O AURA/export already has to perform.
+        """
+        if not _is_cb_format_name(key[1]):
+            return
+        if self._cb_verified_keys is not None and key in self._cb_verified_keys:
+            return
+        metadata = self.metadata if isinstance(self.metadata, Mapping) else {}
+        artifact_set = metadata.get("cb_cache_pair_artifacts")
+        if artifact_set is None:
+            return
+        if not isinstance(artifact_set, Mapping):
+            raise RuntimeError(
+                "ProductionWeightCache CB pair artifact metadata is malformed"
+            )
+        records = artifact_set.get("records")
+        record_key = f"{key[0]}|{key[1]}"
+        record = records.get(record_key) if isinstance(records, Mapping) else None
+        expected = record.get("tensor") if isinstance(record, Mapping) else None
+        if not isinstance(expected, Mapping):
+            raise RuntimeError(
+                f"ProductionWeightCache CB pair artifact identity is missing "
+                f"for {key[0]}@{key[1]}"
+            )
+        observed = _cb_cache_tensor_identity(tensor)
+        difference = first_identity_difference(
+            expected,
+            observed,
+            path="tensor",
+        )
+        if difference is not None:
+            field, stored, current = difference
+            raise RuntimeError(
+                f"ProductionWeightCache CB shard integrity refused for "
+                f"{key[0]}@{key[1]}: identity field '{field}' differs: "
+                f"stored={identity_value_for_error(stored)} "
+                f"current={identity_value_for_error(current)}"
+            )
+        if self._cb_verified_keys is None:
+            self._cb_verified_keys = set()
+        self._cb_verified_keys.add(key)
+
     def prefetch(self, keys: Sequence[tuple[str, str]] | None = None,
                  max_workers: int = 4) -> int:
         """Eagerly load (a subset of) cache entries via a thread pool.
@@ -623,6 +690,7 @@ class ProductionWeightCache:
                 key, original_value, tensor = item
                 if isinstance(self.weights.get(key), torch.Tensor):
                     continue
+                self._validate_loaded_cb_pair_tensor(key, tensor)
                 self.weights[key] = tensor
                 self._record_lru_load(key, original_value, tensor)
                 loaded_count += 1
@@ -637,6 +705,7 @@ class ProductionWeightCache:
         if v is None:
             return None
         if isinstance(v, torch.Tensor):
+            self._validate_loaded_cb_pair_tensor(key, v)
             # Refresh LRU position.
             if self._lru_order is not None:
                 if key in self._lru_order:
@@ -646,6 +715,7 @@ class ProductionWeightCache:
         # Treat anything non-tensor as a filename / path.
         path = self._path_for_value(v)
         loaded = torch.load(path, map_location="cpu", weights_only=True)
+        self._validate_loaded_cb_pair_tensor(key, loaded)
         self.weights[key] = loaded
         self._record_lru_load(key, v, loaded)
         return loaded
@@ -1102,6 +1172,7 @@ def _store_rendered_weight_entry(
     fmt: str,
     tensor: torch.Tensor,
     weight_dtype: torch.dtype,
+    durable: bool = False,
 ) -> None:
     from prismaquant import format_registry as fr
 
@@ -1113,7 +1184,19 @@ def _store_rendered_weight_entry(
         final_path = cache_dir_path / fname
         tmp_path = cache_dir_path / (fname + ".tmp")
         torch.save(stored, tmp_path)
+        if durable:
+            fd = os.open(tmp_path, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
         os.replace(tmp_path, final_path)
+        if durable:
+            directory_fd = os.open(cache_dir_path, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
         weights[(qname, fmt)] = fname
         del stored
     else:
@@ -1836,6 +1919,669 @@ def build_production_cache_cb_render_identity(
         "source_weights_shapes": {},
         "source_weights_content_sha256": {},
     }
+
+
+_IDENTITY_MISSING = object()
+
+
+def first_identity_difference(
+    stored: object,
+    expected: object,
+    *,
+    path: str = "",
+) -> tuple[str, object, object] | None:
+    """Return the first canonical-identity difference, including its field.
+
+    Resume gates use this rather than a single aggregate digest so an operator
+    is told *which* value-bearing input changed.  Mapping keys are traversed in
+    sorted order and sequences in index order, making the reported field stable.
+    """
+    if isinstance(stored, Mapping) and isinstance(expected, Mapping):
+        keys = sorted(set(str(key) for key in stored) | set(
+            str(key) for key in expected
+        ))
+        stored_by_name = {str(key): value for key, value in stored.items()}
+        expected_by_name = {str(key): value for key, value in expected.items()}
+        for key in keys:
+            child = f"{path}.{key}" if path else key
+            left = stored_by_name.get(key, _IDENTITY_MISSING)
+            right = expected_by_name.get(key, _IDENTITY_MISSING)
+            if left is _IDENTITY_MISSING or right is _IDENTITY_MISSING:
+                return child, left, right
+            different = first_identity_difference(left, right, path=child)
+            if different is not None:
+                return different
+        return None
+    if (
+        isinstance(stored, Sequence)
+        and not isinstance(stored, (str, bytes, bytearray))
+        and isinstance(expected, Sequence)
+        and not isinstance(expected, (str, bytes, bytearray))
+    ):
+        if len(stored) != len(expected):
+            child = f"{path}.length" if path else "length"
+            return child, len(stored), len(expected)
+        for index, (left, right) in enumerate(zip(stored, expected)):
+            child = f"{path}[{index}]" if path else f"[{index}]"
+            different = first_identity_difference(left, right, path=child)
+            if different is not None:
+                return different
+        return None
+    if type(stored) is not type(expected) or stored != expected:
+        return path or "value", stored, expected
+    return None
+
+
+def identity_value_for_error(value: object) -> str:
+    if value is _IDENTITY_MISSING:
+        return "<missing>"
+    text = repr(value)
+    return text if len(text) <= 240 else text[:237] + "..."
+
+
+def _canonical_json_sha256(value: object, *, where: str) -> str:
+    canonical = _canonical_json_value(value, where=where)
+    encoded = json.dumps(
+        canonical,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _production_cache_git_commit() -> str:
+    """Resolve the exact source commit once for pair-shard identity.
+
+    A missing commit is not a useful producer identity, so unlike reporting
+    provenance this is deliberately fail-closed.  The optional override is for
+    immutable/container source mounts whose checkout metadata is unavailable;
+    it must still be a full hexadecimal object id.
+    """
+    repo_root = Path(__file__).resolve().parents[1]
+    override = str(os.environ.get(
+        "PRISMAQUANT_IDENTITY_GIT_COMMIT", ""
+    )).strip().lower()
+    if override:
+        if re.fullmatch(r"[0-9a-f]{40,64}", override) is None:
+            raise RuntimeError(
+                "PRISMAQUANT_IDENTITY_GIT_COMMIT must be a full 40-64 "
+                "character hexadecimal commit id"
+            )
+        requested_commit = override
+    else:
+        requested_commit = "HEAD"
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--verify", f"{requested_commit}^{{commit}}"],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "production CB pair identity cannot resolve git commit"
+        ) from exc
+    commit = result.stdout.strip().lower()
+    if re.fullmatch(r"[0-9a-f]{40,64}", commit) is None:
+        raise RuntimeError(
+            "production CB pair identity resolved an invalid git commit "
+            f"{commit!r}"
+        )
+    if override and commit != override:
+        raise RuntimeError(
+            "PRISMAQUANT_IDENTITY_GIT_COMMIT does not resolve to that exact "
+            f"commit: requested={override!r} resolved={commit!r}"
+        )
+    identity_paths = [
+        "prismaquant/production_weight_cache.py",
+        "prismaquant/nvfp4_cb_formats.py",
+        "prismaquant/nvfp4_cb_footprint.py",
+        "prismaquant/cb_layout.py",
+        "prismaquant/cb_ldlq_atoms.py",
+        "prismaquant/cb_minchain.py",
+        "prismaquant/cb_learned_bundle.py",
+        "prismaquant/cb_banked_books.py",
+        "prismaquant/export_native_compressed.py",
+        "prismaquant/format_registry.py",
+    ]
+    clean = subprocess.run(
+        ["git", "diff", "--quiet", commit, "--", *identity_paths],
+        cwd=repo_root,
+        check=False,
+        timeout=10,
+    )
+    if clean.returncode != 0:
+        raise RuntimeError(
+            "production CB pair git identity is not exact: one or more "
+            "renderer source files differ from commit "
+            f"{commit}; commit the identity-bearing implementation before "
+            "render/resume"
+        )
+    return commit
+
+
+def _cb_pair_codebook_identity(
+    identity: Mapping[str, object],
+    qname: str,
+    fmt: str,
+    context,
+    *,
+    runtime_context=None,
+) -> tuple[str, str | None, object]:
+    from prismaquant.nvfp4_cb_footprint import codebook_source_for_format
+
+    source = codebook_source_for_format(fmt, context)
+    stamp = identity["cb_serialized_payload"]
+    if source == "lattice":
+        by_format = stamp.get("lattice_codebook_sha256_by_format")
+        digests = (
+            by_format.get(fmt)
+            if isinstance(by_format, Mapping)
+            else None
+        )
+        if not isinstance(digests, Sequence) or isinstance(digests, str):
+            raise ValueError(
+                f"CB pair identity has no lattice codebook digests for {fmt}"
+            )
+        return source, None, [str(value) for value in digests]
+
+    # The serialized context deliberately does not retain a producer-local
+    # bundle path.  The fresh runtime context is stamp-validated by the caller
+    # and is used only to open the exact bundle whose content digest is then
+    # persisted in the pair identity.
+    bundle_path = getattr(runtime_context, "codebook_bundle_path", None)
+    if not bundle_path:
+        raise ValueError(
+            f"learned CB pair identity has no bundle path for {qname}@{fmt}"
+        )
+    from prismaquant.cb_learned_bundle import load_bundle_cached
+
+    bundle = load_bundle_cached(bundle_path)
+    bundle_digest = str(bundle.bundle_content_sha256).lower()
+    if re.fullmatch(r"[0-9a-f]{64}", bundle_digest) is None:
+        raise ValueError("learned CB bundle content SHA-256 is invalid")
+
+    refs = None
+    refs_by_qname_format = stamp.get("codebook_refs_by_qname_format")
+    if isinstance(refs_by_qname_format, Mapping):
+        by_format = refs_by_qname_format.get(qname)
+        if isinstance(by_format, Mapping):
+            refs = by_format.get(fmt)
+    if refs is None:
+        refs_by_qname = stamp.get("codebook_refs")
+        if isinstance(refs_by_qname, Mapping):
+            refs = refs_by_qname.get(qname)
+    ref_names = (
+        [str(refs)]
+        if isinstance(refs, str)
+        else [str(value) for value in refs]
+        if isinstance(refs, Sequence)
+        else []
+    )
+    if not ref_names:
+        raise ValueError(
+            f"learned CB pair identity has no codebook refs for {qname}@{fmt}"
+        )
+    all_digests = stamp.get("codebook_content_sha256")
+    if not isinstance(all_digests, Mapping):
+        raise ValueError("learned CB pair identity has no codebook digest map")
+    missing = sorted(ref for ref in ref_names if ref not in all_digests)
+    if missing:
+        raise ValueError(
+            "learned CB pair identity references codebooks without content "
+            f"digests; sample={missing[:8]}"
+        )
+    selected = {
+        ref: str(all_digests[ref]).lower()
+        for ref in sorted(set(ref_names))
+    }
+    return source, bundle_digest, selected
+
+
+def build_cb_cache_pair_identity(
+    identity: Mapping[str, object],
+    *,
+    qname: str,
+    fmt: str,
+    calibration_hash: str,
+    git_commit: str,
+    source_weight_dtype: torch.dtype | str,
+    cb_serialization_context=None,
+    render_input_contract: Mapping[str, object] | None = None,
+    validated_context=None,
+) -> dict[str, object]:
+    """Project the global CB render identity onto one resumable cache pair."""
+    if validated_context is None:
+        context = validate_cb_render_identity_metadata(
+            identity,
+            expected_context=cb_serialization_context,
+            expected_formats_by_qname={qname: [fmt]},
+            require_source_complete=False,
+            where=f"CB cache pair identity {qname}@{fmt}",
+        )
+    else:
+        context = validated_context
+        scope = identity.get("cb_formats_by_qname")
+        formats = scope.get(qname) if isinstance(scope, Mapping) else None
+        if (
+            not isinstance(formats, Sequence)
+            or isinstance(formats, str)
+            or fmt not in formats
+        ):
+            raise ValueError(
+                f"CB cache pair identity scope is missing {qname}@{fmt}"
+            )
+    from prismaquant.cb_layout import parse_format_name
+    from prismaquant.nvfp4_cb_footprint import (
+        effective_codebook_source_scope,
+        effective_scale_sweep_scope,
+    )
+
+    parsed = parse_format_name(fmt)
+    if parsed is None:
+        raise ValueError(f"CB cache pair format is invalid: {fmt!r}")
+    _family, rung = parsed
+    source, bundle_digest, codebook_identity = _cb_pair_codebook_identity(
+        identity,
+        qname,
+        fmt,
+        context,
+        runtime_context=cb_serialization_context,
+    )
+    stamp = identity["cb_serialized_payload"]
+    source_shapes = identity["source_weights_shapes"]
+    source_digests = identity["source_weights_content_sha256"]
+    col_shapes = identity["col_weights_shapes"]
+    col_digests = identity["col_weights_content_sha256"]
+    for field_name, values in (
+        ("source_weights_sha256", source_digests),
+        ("source_weights_shape", source_shapes),
+        ("col_weights_sha256", col_digests),
+        ("col_weights_shape", col_shapes),
+    ):
+        if not isinstance(values, Mapping) or qname not in values:
+            raise ValueError(
+                f"CB cache pair identity is missing {field_name} for {qname}"
+            )
+    ldlq_scope = str(getattr(
+        context, "ldlq_scope", "all" if context.ldlq else "none"
+    ))
+    cache_dtype = (
+        torch.bfloat16
+        if str(source_weight_dtype) == str(torch.float32)
+        else source_weight_dtype
+    )
+    pair = {
+        "schema": CB_CACHE_PAIR_IDENTITY_SCHEMA,
+        "qname": str(qname),
+        "format": str(fmt),
+        "rung": int(rung),
+        "codebook_source": str(source),
+        "codebook_source_scope": effective_codebook_source_scope(context),
+        "codebook_bundle_sha256": bundle_digest,
+        "codebook_content_sha256": codebook_identity,
+        "col_weights_sha256": str(col_digests[qname]).lower(),
+        "col_weights_shape": [int(dim) for dim in col_shapes[qname]],
+        "source_weights_sha256": str(source_digests[qname]).lower(),
+        "source_weights_shape": [int(dim) for dim in source_shapes[qname]],
+        "source_weight_dtype": str(source_weight_dtype),
+        "cache_weight_dtype": str(cache_dtype),
+        "scale_coding": str(context.scale_coding),
+        "scale_sweep_scope": effective_scale_sweep_scope(context),
+        "ldlq_scope": ldlq_scope,
+        "minchain": bool(getattr(context, "minchain", False)),
+        "minchain_version": getattr(context, "minchain_version", None),
+        "minchain_cells": (
+            copy.deepcopy(
+                identity.get("cb_minchain_cells", {})
+                .get(qname, {})
+                .get(fmt)
+            )
+            if isinstance(identity.get("cb_minchain_cells"), Mapping)
+            and isinstance(identity["cb_minchain_cells"].get(qname), Mapping)
+            else None
+        ),
+        "layout_version": int(context.layout_version),
+        "encode_tier": str(context.encode_tier),
+        "renderer_abi": str(context.renderer_abi),
+        "activation_contract": getattr(context, "activation_contract", None),
+        "activation_execution": getattr(context, "activation_execution", None),
+        "ldlq_packed_kernel_sha256": (
+            _canonical_json_sha256(
+                stamp["ldlq_packed_kernel"],
+                where="CB LDLQ packed-kernel identity",
+            )
+            if "ldlq_packed_kernel" in stamp
+            else None
+        ),
+        "render_contract_sha256": _canonical_json_sha256(
+            identity["render_contract"],
+            where="CB render-contract identity",
+        ),
+        "calibration_hash": str(calibration_hash),
+        "render_input_contract": dict(render_input_contract or {}),
+        "git_commit": str(git_commit).lower(),
+    }
+    return _canonical_json_value(pair, where="CB cache pair identity")
+
+
+def _read_cb_cache_pair_sidecar(
+    path: Path,
+    *,
+    qname: str,
+    fmt: str,
+) -> dict[str, object]:
+    try:
+        raw = json.loads(path.read_text())
+    except Exception as exc:
+        raise RuntimeError(
+            f"production CB cache resume refused for {qname}@{fmt}: "
+            f"identity field 'sidecar_json' differs: stored=<invalid> "
+            "expected=<valid canonical JSON>; refusing reuse or re-render"
+        ) from exc
+    if not isinstance(raw, Mapping):
+        raise RuntimeError(
+            f"production CB cache resume refused for {qname}@{fmt}: "
+            "identity field 'sidecar' differs: stored=<non-object> "
+            "expected=<object>; refusing reuse or re-render"
+        )
+    return dict(raw)
+
+
+def _validate_cb_cache_pair_resume(
+    *,
+    cache_dir_path: Path,
+    qname: str,
+    fmt: str,
+    expected_identity: Mapping[str, object],
+    legacy_kind: str = "production ",
+    require_render_score: bool = False,
+    require_packed_state: bool = False,
+    verify_shard_payload: bool = False,
+) -> dict[str, object] | None:
+    """Admit one existing CB shard only under its exact per-pair stamp.
+
+    A matching stamp without a shard is an interrupted atomic write and may be
+    rendered.  A shard without a stamp, or any mismatched stamp, is never
+    reused and never overwritten.
+    """
+    shard_path = cache_dir_path / _cache_weight_filename(qname, fmt)
+    sidecar_path = cache_dir_path / _cache_pair_identity_filename(qname, fmt)
+    shard_exists = shard_path.is_file()
+    sidecar_exists = sidecar_path.is_file()
+    if shard_exists and not sidecar_exists:
+        # Keep the legacy test/operator phrase while avoiding the old blanket
+        # source marker used by campaign inventory: only an *unstamped* shard
+        # is disabled now.
+        raise RuntimeError(
+            f"legacy unstamped {legacy_kind}"
+            "CB cache resume is disabled for "
+            f"{qname}@{fmt}: missing identity sidecar {sidecar_path}; "
+            "refusing reuse or re-render"
+        )
+    if not sidecar_exists:
+        return None
+    sidecar = _read_cb_cache_pair_sidecar(
+        sidecar_path,
+        qname=qname,
+        fmt=fmt,
+    )
+    if sidecar.get("schema") != CB_CACHE_PAIR_SIDECAR_SCHEMA:
+        raise RuntimeError(
+            f"production CB cache resume refused for {qname}@{fmt}: "
+            "identity field 'sidecar.schema' differs: "
+            f"stored={identity_value_for_error(sidecar.get('schema'))} "
+            f"expected={CB_CACHE_PAIR_SIDECAR_SCHEMA!r}; refusing reuse or "
+            "re-render"
+        )
+    stored_identity = sidecar.get("identity")
+    difference = first_identity_difference(
+        stored_identity,
+        expected_identity,
+    )
+    if difference is not None:
+        field, stored, expected = difference
+        raise RuntimeError(
+            f"production CB cache resume refused for {qname}@{fmt}: "
+            f"identity field '{field}' differs: "
+            f"stored={identity_value_for_error(stored)} "
+            f"expected={identity_value_for_error(expected)}; "
+            "refusing reuse or re-render"
+        )
+    tensor_metadata = sidecar.get("tensor")
+    if not isinstance(tensor_metadata, Mapping):
+        raise RuntimeError(
+            f"production CB cache resume refused for {qname}@{fmt}: "
+            "identity field 'tensor' differs: stored=<missing> "
+            "expected=<value-bearing shard identity>; refusing reuse or "
+            "re-render"
+        )
+    if shard_exists and verify_shard_payload:
+        try:
+            shard = torch.load(
+                shard_path,
+                map_location="cpu",
+                weights_only=True,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"production CB cache resume refused for {qname}@{fmt}: "
+                "identity field 'tensor.payload' differs: stored=<invalid> "
+                "expected=<loadable tensor>; refusing reuse or re-render"
+            ) from exc
+        if not isinstance(shard, torch.Tensor):
+            raise RuntimeError(
+                f"production CB cache resume refused for {qname}@{fmt}: "
+                "identity field 'tensor.payload' differs: stored=<non-tensor> "
+                "expected=<tensor>; refusing reuse or re-render"
+            )
+        observed_tensor = _cb_cache_tensor_identity(shard)
+        tensor_difference = first_identity_difference(
+            tensor_metadata,
+            observed_tensor,
+            path="tensor",
+        )
+        del shard
+        if tensor_difference is not None:
+            field, stored, expected = tensor_difference
+            raise RuntimeError(
+                f"production CB cache resume refused for {qname}@{fmt}: "
+                f"identity field '{field}' differs: "
+                f"stored={identity_value_for_error(stored)} "
+                f"expected={identity_value_for_error(expected)}; refusing "
+                "reuse or re-render"
+            )
+    render_score = sidecar.get("render_score")
+    if require_render_score:
+        expected_score_identity = {
+            "qname": str(qname),
+            "format": str(fmt).upper(),
+        }
+        if not isinstance(render_score, Mapping):
+            raise RuntimeError(
+                f"production CB cache resume refused for {qname}@{fmt}: "
+                "identity field 'render_score' differs: stored=<missing> "
+                "expected=<identity-bound score>; refusing reuse or re-render"
+            )
+        observed_score_identity = {
+            "qname": render_score.get("qname"),
+            "format": render_score.get("format"),
+        }
+        score_difference = first_identity_difference(
+            observed_score_identity,
+            expected_score_identity,
+            path="render_score",
+        )
+        if score_difference is not None:
+            field, stored, expected = score_difference
+            raise RuntimeError(
+                f"production CB cache resume refused for {qname}@{fmt}: "
+                f"identity field '{field}' differs: "
+                f"stored={identity_value_for_error(stored)} "
+                f"expected={identity_value_for_error(expected)}; refusing "
+                "reuse or re-render"
+            )
+        try:
+            observed_score_sha256 = _canonical_json_sha256(
+                render_score,
+                where=f"CB cache render score {qname}@{fmt}",
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"production CB cache resume refused for {qname}@{fmt}: "
+                "identity field 'render_score' differs: stored=<invalid> "
+                "expected=<finite canonical record>; refusing reuse or "
+                "re-render"
+            ) from exc
+        stored_score_sha256 = sidecar.get("render_score_sha256")
+        if stored_score_sha256 != observed_score_sha256:
+            raise RuntimeError(
+                f"production CB cache resume refused for {qname}@{fmt}: "
+                "identity field 'render_score_sha256' differs: "
+                f"stored={identity_value_for_error(stored_score_sha256)} "
+                f"expected={observed_score_sha256!r}; refusing reuse or "
+                "re-render"
+            )
+    packed_state = sidecar.get("packed_state")
+    if require_packed_state:
+        if not isinstance(packed_state, Mapping):
+            raise RuntimeError(
+                f"production CB cache resume refused for {qname}@{fmt}: "
+                "identity field 'packed_state' differs: stored=<missing> "
+                "expected=<activation/coverage state>; refusing reuse or "
+                "re-render"
+            )
+        try:
+            observed_packed_sha256 = _canonical_json_sha256(
+                packed_state,
+                where=f"packed CB cache state {qname}@{fmt}",
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"production CB cache resume refused for {qname}@{fmt}: "
+                "identity field 'packed_state' differs: stored=<invalid> "
+                "expected=<finite canonical state>; refusing reuse or "
+                "re-render"
+            ) from exc
+        stored_packed_sha256 = sidecar.get("packed_state_sha256")
+        if stored_packed_sha256 != observed_packed_sha256:
+            raise RuntimeError(
+                f"production CB cache resume refused for {qname}@{fmt}: "
+                "identity field 'packed_state_sha256' differs: "
+                f"stored={identity_value_for_error(stored_packed_sha256)} "
+                f"expected={observed_packed_sha256!r}; refusing reuse or "
+                "re-render"
+            )
+        activation_max_abs = packed_state.get("activation_max_abs")
+        coverage = packed_state.get("coverage")
+        if (
+            not isinstance(activation_max_abs, (int, float))
+            or float(activation_max_abs) <= 0.0
+            or not isinstance(coverage, Mapping)
+            or coverage.get("fmt") != fmt
+            or coverage.get("rendered") is not True
+        ):
+            raise RuntimeError(
+                f"production CB cache resume refused for {qname}@{fmt}: "
+                "identity field 'packed_state' differs: stored=<malformed> "
+                "expected=<positive activation scale and exact coverage>; "
+                "refusing reuse or re-render"
+            )
+    return sidecar if shard_exists else None
+
+
+def _cb_cache_tensor_identity(tensor: torch.Tensor) -> dict[str, object]:
+    stored = tensor.detach().to(device="cpu").contiguous()
+    raw = stored.view(torch.uint8).numpy().tobytes()
+    return {
+        "shape": [int(dim) for dim in stored.shape],
+        "dtype": str(stored.dtype),
+        "logical_bytes": len(raw),
+        "content_sha256": hashlib.sha256(raw).hexdigest(),
+    }
+
+
+def _write_cb_cache_pair_sidecar(
+    *,
+    cache_dir_path: Path,
+    qname: str,
+    fmt: str,
+    identity: Mapping[str, object],
+    tensor: torch.Tensor,
+    encode_seconds: float,
+    render_score: Mapping[str, object] | None = None,
+    packed_state: Mapping[str, object] | None = None,
+) -> None:
+    """Durably stamp a pair before the atomic weight-shard publication."""
+    target_dtype = (
+        tensor.dtype if tensor.dtype != torch.float32 else torch.bfloat16
+    )
+    stored = tensor.detach().to(dtype=target_dtype, device="cpu").contiguous()
+    canonical_render_score = (
+        _canonical_json_value(
+            dict(render_score),
+            where=f"CB cache render score {qname}@{fmt}",
+        )
+        if render_score is not None
+        else None
+    )
+    canonical_packed_state = (
+        _canonical_json_value(
+            dict(packed_state),
+            where=f"packed CB cache state {qname}@{fmt}",
+        )
+        if packed_state is not None
+        else None
+    )
+    payload = {
+        "schema": CB_CACHE_PAIR_SIDECAR_SCHEMA,
+        "identity": dict(identity),
+        "measurement": {
+            "encode_seconds": float(encode_seconds),
+        },
+        "tensor": _cb_cache_tensor_identity(stored),
+        "render_score": canonical_render_score,
+        "render_score_sha256": (
+            _canonical_json_sha256(
+                canonical_render_score,
+                where=f"CB cache render score {qname}@{fmt}",
+            )
+            if canonical_render_score is not None
+            else None
+        ),
+        "packed_state": canonical_packed_state,
+        "packed_state_sha256": (
+            _canonical_json_sha256(
+                canonical_packed_state,
+                where=f"packed CB cache state {qname}@{fmt}",
+            )
+            if canonical_packed_state is not None
+            else None
+        ),
+    }
+    path = cache_dir_path / _cache_pair_identity_filename(qname, fmt)
+    tmp = path.with_name(path.name + ".tmp")
+    encoded = json.dumps(
+        payload,
+        indent=2,
+        sort_keys=True,
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    with tmp.open("w", encoding="utf-8") as handle:
+        handle.write(encoded)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
+    directory_fd = os.open(cache_dir_path, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
 
 
 def validate_cb_render_identity_metadata(
@@ -3792,23 +4538,66 @@ def fill_production_weight_cache(
     # collection memory + compute by 99% — and lets a borderline-OOM
     # job finish on the same hardware.
     cache_dir_path: Path | None = None
+    cb_pair_identities: dict[tuple[str, str], dict[str, object]] = {}
+    cb_pair_calibration_hash: str | None = None
+    admitted_cb_pairs: dict[
+        tuple[str, str], dict[str, object]
+    ] = {}
     if cache_dir is not None:
         cache_dir_path = Path(cache_dir)
         cache_dir_path.mkdir(parents=True, exist_ok=True)
-        stale_cb_shards = [
-            cache_dir_path / _cache_weight_filename(qname, fmt)
-            for qname, fmts in render_formats_by_qname.items()
-            for fmt in fmts
-            if _is_cb_format_name(fmt)
-            and (cache_dir_path / _cache_weight_filename(qname, fmt)).is_file()
-        ]
-        if stale_cb_shards:
-            raise RuntimeError(
-                "production CB cache resume is disabled because existing "
-                "weight shards are not independently bound to the fresh "
-                "serialization/imatrix identity; move or rebuild the cache "
-                f"directory first. sample={stale_cb_shards[:8]}"
+        if cb_render_identity is not None:
+            from prismaquant.perturbed_x_cache import calibration_data_hash
+
+            cb_pair_context = validate_cb_render_identity_metadata(
+                cb_render_identity,
+                expected_context=cb_serialization_context,
+                require_source_complete=True,
+                where="ProductionWeightCache dense pair resume",
             )
+            calibration_hash = calibration_data_hash(calib_ids)
+            cb_pair_calibration_hash = calibration_hash
+            git_commit = _production_cache_git_commit()
+            named_modules = dict(model.named_modules())
+            # Validate every pre-existing pair before file-existence pruning.
+            # A single mismatch aborts the whole launch before an activation
+            # forward or encoder call, so stale bytes are neither reused nor
+            # silently replaced.
+            for qname, fmts in render_formats_by_qname.items():
+                mod = named_modules.get(qname)
+                for fmt in fmts:
+                    if not _is_cb_format_name(fmt):
+                        continue
+                    if mod is None or not hasattr(mod, "weight"):
+                        raise ValueError(
+                            f"production CB cache pair source module is "
+                            f"missing for {qname}@{fmt}"
+                        )
+                    key = (qname, fmt)
+                    pair_identity = build_cb_cache_pair_identity(
+                        cb_render_identity,
+                        qname=qname,
+                        fmt=fmt,
+                        calibration_hash=calibration_hash,
+                        git_commit=git_commit,
+                        source_weight_dtype=mod.weight.dtype,
+                        cb_serialization_context=cb_serialization_context,
+                        render_input_contract={
+                            "path": "dense",
+                            "max_act_rows": int(max_act_rows),
+                        },
+                        validated_context=cb_pair_context,
+                    )
+                    cb_pair_identities[key] = pair_identity
+                    admitted = _validate_cb_cache_pair_resume(
+                        cache_dir_path=cache_dir_path,
+                        qname=qname,
+                        fmt=fmt,
+                        expected_identity=pair_identity,
+                        require_render_score=True,
+                    )
+                    if admitted is not None:
+                        admitted_cb_pairs[key] = admitted
     render_score_sidecar_path: Path | None = (
         cache_dir_path / "render_scores.json"
         if cache_dir_path is not None else None
@@ -3816,12 +4605,10 @@ def fill_production_weight_cache(
     render_score_records: dict[str, dict[str, object]] = (
         _load_render_score_sidecar(render_score_sidecar_path)
     )
-    # CB weight shards are deliberately never resumed: their rendered values
-    # are only trustworthy under the fresh source/imatrix/context identity
-    # constructed above.  The score sidecar is another derived artifact of
-    # that same render.  Drop any prior score for the fresh CB scope as well,
-    # otherwise a failed re-render could leave an old score looking current
-    # even though no matching CB shard was admitted.
+    # The global score sidecar is name-keyed and cannot independently admit a
+    # CB score.  Restore admitted scores only from their per-pair sidecars,
+    # whose identity binds the exact calibration/sampling contract and rendered
+    # tensor digest.  Missing pairs discard any stale global record.
     fresh_cb_score_keys = {
         _render_score_record_key(qname, fmt)
         for qname, fmts in render_formats_by_qname.items()
@@ -3830,6 +4617,14 @@ def fill_production_weight_cache(
     }
     for score_key in fresh_cb_score_keys:
         render_score_records.pop(score_key, None)
+    for (qname, fmt), sidecar in admitted_cb_pairs.items():
+        score = sidecar.get("render_score")
+        if not isinstance(score, Mapping):
+            raise RuntimeError(
+                f"production CB cache resume internal score gate failure for "
+                f"{qname}@{fmt}; refusing reuse or re-render"
+            )
+        render_score_records[_render_score_record_key(qname, fmt)] = dict(score)
     if progress and render_score_records:
         print(
             f"[prod-cache] resume: loaded {len(render_score_records)} "
@@ -4184,16 +4979,23 @@ def fill_production_weight_cache(
                 disk_path = cache_dir_path / fname
                 if disk_path.is_file():
                     if _is_cb_format_name(fmt_key):
-                        raise RuntimeError(
-                            "production CB cache resume is disabled for "
-                            f"{qname}@{fmt_key}: pre-existing shard "
-                            f"{disk_path} has no independently verifiable "
-                            "render identity"
-                        )
+                        if (qname, fmt_key) not in admitted_cb_pairs:
+                            raise RuntimeError(
+                                "production CB cache resume internal gate "
+                                f"failure for {qname}@{fmt_key}: shard "
+                                f"{disk_path} was not identity-admitted; "
+                                "refusing reuse or re-render"
+                            )
                     weights[(qname, fmt_key)] = fname
                     skipped_resumed += 1
                     score_key = _render_score_record_key(qname, fmt_key)
                     if score_key not in render_score_records:
+                        if _is_cb_format_name(fmt_key):
+                            raise RuntimeError(
+                                f"identity-admitted CB cache pair "
+                                f"{qname}@{fmt_key} has no admitted render "
+                                "score; refusing partial surrogate reuse"
+                            )
                         try:
                             cached = torch.load(
                                 disk_path,
@@ -4221,6 +5023,13 @@ def fill_production_weight_cache(
                     continue
             try:
                 gate_trace: list[dict[str, object]] = []
+                timed_cb_pair = (
+                    cache_dir_path is not None
+                    and _is_cb_format_name(fmt_key)
+                )
+                if timed_cb_pair and weight.device.type == "cuda":
+                    torch.cuda.synchronize(weight.device)
+                encode_started = time.perf_counter()
                 w_dq = render_production_weight(
                     weight, render_fmt,
                     qname=qname,
@@ -4235,6 +5044,12 @@ def fill_production_weight_cache(
                     ),
                     cb_serialization_context=cb_serialization_context,
                     gate_trace=gate_trace,
+                )
+                if timed_cb_pair and weight.device.type == "cuda":
+                    torch.cuda.synchronize(weight.device)
+                encode_seconds = (
+                    time.perf_counter() - encode_started
+                    if timed_cb_pair else 0.0
                 )
                 render_score_records[_render_score_record_key(qname, fmt_key)] = (
                     _render_score_record(
@@ -4267,6 +5082,24 @@ def fill_production_weight_cache(
             # fp32 but we always re-cast at install time, so storing fp32
             # is wasteful (2× memory).  On 27B this drops the cache from
             # ~25 GB to ~12 GB.
+            if cache_dir_path is not None and _is_cb_format_name(fmt_key):
+                pair_identity = cb_pair_identities.get((qname, fmt_key))
+                if pair_identity is None:
+                    raise RuntimeError(
+                        f"production CB cache pair identity missing before "
+                        f"publishing {qname}@{fmt_key}"
+                    )
+                _write_cb_cache_pair_sidecar(
+                    cache_dir_path=cache_dir_path,
+                    qname=qname,
+                    fmt=fmt_key,
+                    identity=pair_identity,
+                    tensor=w_dq,
+                    encode_seconds=encode_seconds,
+                    render_score=render_score_records[
+                        _render_score_record_key(qname, fmt_key)
+                    ],
+                )
             _store_rendered_weight_entry(
                 weights=weights,
                 cache_dir_path=cache_dir_path,
@@ -4274,6 +5107,7 @@ def fill_production_weight_cache(
                 fmt=fmt_key,
                 tensor=w_dq,
                 weight_dtype=weight.dtype,
+                durable=_is_cb_format_name(fmt_key),
             )
             done += 1
             del w_dq
@@ -4304,6 +5138,74 @@ def fill_production_weight_cache(
         )
     _write_render_score_sidecar(render_score_sidecar_path, render_score_records)
     render_gate_summary = _summarize_render_gate_records(render_gate_records)
+    cb_pair_identity_summary: dict[str, object] | None = None
+    cb_pair_artifact_records: dict[str, dict[str, object]] = {}
+    if cb_pair_identities:
+        canonical_pairs = {
+            f"{qname}|{fmt}": pair
+            for (qname, fmt), pair in sorted(cb_pair_identities.items())
+        }
+        if cache_dir_path is not None:
+            for (qname, fmt), pair in sorted(cb_pair_identities.items()):
+                sidecar_path = (
+                    cache_dir_path
+                    / _cache_pair_identity_filename(qname, fmt)
+                )
+                shard_path = cache_dir_path / _cache_weight_filename(qname, fmt)
+                if not sidecar_path.is_file() or not shard_path.is_file():
+                    continue
+                sidecar = _read_cb_cache_pair_sidecar(
+                    sidecar_path,
+                    qname=qname,
+                    fmt=fmt,
+                )
+                difference = first_identity_difference(
+                    sidecar.get("identity"),
+                    pair,
+                )
+                if difference is not None:
+                    field, stored, expected = difference
+                    raise RuntimeError(
+                        f"production CB cache publication identity differs "
+                        f"for {qname}@{fmt} at '{field}': "
+                        f"stored={identity_value_for_error(stored)} "
+                        f"expected={identity_value_for_error(expected)}"
+                    )
+                cb_pair_artifact_records[f"{qname}|{fmt}"] = {
+                    "identity": pair,
+                    "tensor": sidecar.get("tensor"),
+                    "render_score": sidecar.get("render_score"),
+                    "render_score_sha256": sidecar.get(
+                        "render_score_sha256"
+                    ),
+                }
+        cb_pair_identity_summary = {
+            "schema": "prismaquant.production_weight_cache.cb_pair_set.v1",
+            "pair_schema": CB_CACHE_PAIR_IDENTITY_SCHEMA,
+            "entries": len(canonical_pairs),
+            "identity_sha256": _canonical_json_sha256(
+                canonical_pairs,
+                where="CB cache pair identity set",
+            ),
+            "published_entries": len(cb_pair_artifact_records),
+            "artifact_sha256": _canonical_json_sha256(
+                cb_pair_artifact_records,
+                where="CB cache pair artifact set",
+            ),
+            "codebook_bundle_sha256": sorted({
+                str(pair["codebook_bundle_sha256"])
+                for pair in canonical_pairs.values()
+                if pair.get("codebook_bundle_sha256") is not None
+            }),
+            "calibration_hashes": sorted({
+                str(pair["calibration_hash"])
+                for pair in canonical_pairs.values()
+            }),
+            "git_commits": sorted({
+                str(pair["git_commit"])
+                for pair in canonical_pairs.values()
+            }),
+        }
     cache = ProductionWeightCache(
         weights=weights,
         levers=dict(levers),
@@ -4376,6 +5278,21 @@ def fill_production_weight_cache(
             "render_scope": render_scope,
             "requested_formats": list(requested_formats),
             "requested_entries": int(n),
+            **({
+                "calib_hash": cb_pair_calibration_hash,
+            } if cb_pair_calibration_hash is not None else {}),
+            **({
+                "cb_cache_pair_identity": cb_pair_identity_summary,
+            } if cb_pair_identity_summary is not None else {}),
+            **({
+                "cb_cache_pair_artifacts": {
+                    "schema": (
+                        "prismaquant.production_weight_cache."
+                        "cb_pair_artifact_set.v1"
+                    ),
+                    "records": cb_pair_artifact_records,
+                },
+            } if cb_pair_artifact_records else {}),
             **({
                 CB_RENDER_IDENTITY_METADATA_KEY: cb_render_identity,
             } if cb_render_identity is not None else {}),
@@ -4722,27 +5639,119 @@ def fill_packed_expert_cache_entries(
             where="ProductionWeightCache packed source binding",
         )
 
-    stale_cb_shards: list[Path] = []
-    for _experts_qname, _mod, _parent, _pn, full, fmt in in_scope:
-        if not _is_cb_format_name(fmt):
-            continue
-        key = (full, fmt)
-        value = cache.weights.get(key)
-        if value is not None and not isinstance(value, torch.Tensor):
-            path = Path(cache._path_for_value(value))
-            if path.is_file():
-                stale_cb_shards.append(path)
-        if cache_dir_path is not None:
-            path = cache_dir_path / _cache_weight_filename(full, fmt)
-            if path.is_file() and path not in stale_cb_shards:
-                stale_cb_shards.append(path)
-    if stale_cb_shards:
-        raise RuntimeError(
-            "production packed-CB cache resume is disabled because existing "
-            "weight shards are not independently bound to the fresh "
-            "serialization/imatrix identity; move or rebuild the cache "
-            f"directory first. sample={stale_cb_shards[:8]}"
+    packed_cb_pair_identities: dict[
+        tuple[str, str], dict[str, object]
+    ] = {}
+    admitted_packed_cb_pairs: dict[
+        tuple[str, str], dict[str, object]
+    ] = {}
+    if cache_dir_path is not None and packed_cb_source_weights:
+        from prismaquant.perturbed_x_cache import calibration_data_hash
+
+        fit_calibration_inputs: object
+        if module_acts_override is not None:
+            # calibration_data_hash handles a direct tensor mapping by content;
+            # wrapping it in another mapping would hash dict repr/address data.
+            fit_calibration_inputs = module_acts_override
+            activation_source = "streaming_module_activations"
+        else:
+            fit_calibration_inputs = calib_ids
+            activation_source = "resident_token_ids"
+        packed_calibration_hash = calibration_data_hash(
+            fit_calibration_inputs
         )
+        packed_gate_calibration_hash = (
+            calibration_data_hash(gate_calib_ids)
+            if gate_calib_ids is not None
+            else None
+        )
+        packed_render_input_contract = {
+            "path": "packed_expert",
+            "activation_source": activation_source,
+            "fit_calibration_hash": packed_calibration_hash,
+            "gate_calibration_hash": packed_gate_calibration_hash,
+            "module_token_budget": int(module_token_budget),
+            "max_rows_per_expert": int(max_rows_per_expert),
+            "eval_rows_per_expert": int(eval_rows_per_expert),
+            "gate_token_budget": (
+                int(gate_token_budget or module_token_budget)
+                if gate_calib_ids is not None
+                else None
+            ),
+            "gate_policy": (
+                "cross-domain"
+                if gate_calib_ids is not None
+                else "in-domain-holdout"
+            ),
+            "render_mode": str(render_mode),
+            "max_layers": (
+                int(max_layers) if max_layers is not None else None
+            ),
+        }
+        packed_git_commit = _production_cache_git_commit()
+        packed_identity = cache.metadata[CB_RENDER_IDENTITY_METADATA_KEY]
+        packed_pair_context = validate_cb_render_identity_metadata(
+            packed_identity,
+            expected_context=cb_serialization_context,
+            require_source_complete=False,
+            where="ProductionWeightCache packed pair resume",
+        )
+        for _experts_qname, mod, _parent, pn, full, fmt in in_scope:
+            if not _is_cb_format_name(fmt):
+                continue
+            key = (full, fmt)
+            pair_identity = build_cb_cache_pair_identity(
+                packed_identity,
+                qname=full,
+                fmt=fmt,
+                calibration_hash=packed_calibration_hash,
+                git_commit=packed_git_commit,
+                source_weight_dtype=getattr(mod, pn).dtype,
+                cb_serialization_context=cb_serialization_context,
+                render_input_contract=packed_render_input_contract,
+                validated_context=packed_pair_context,
+            )
+            packed_cb_pair_identities[key] = pair_identity
+            admitted = _validate_cb_cache_pair_resume(
+                cache_dir_path=cache_dir_path,
+                qname=full,
+                fmt=fmt,
+                expected_identity=pair_identity,
+                legacy_kind="production packed-",
+                require_packed_state=True,
+            )
+            if admitted is not None:
+                existing_value = cache.weights.get(key)
+                if (
+                    existing_value is not None
+                    and not isinstance(existing_value, torch.Tensor)
+                ):
+                    admitted_path = (
+                        cache_dir_path / _cache_weight_filename(full, fmt)
+                    ).resolve()
+                    existing_path = Path(
+                        cache._path_for_value(existing_value)
+                    ).resolve()
+                    if existing_path != admitted_path:
+                        raise RuntimeError(
+                            "production packed-CB cache resume refused for "
+                            f"{full}@{fmt}: identity field 'shard_path' "
+                            f"differs: stored={existing_path!s} "
+                            f"expected={admitted_path!s}; refusing reuse or "
+                            "re-render"
+                        )
+                # The verified flat shard is the sole admitted payload. Do not
+                # retain an in-memory or external path under the same pair key.
+                cache.weights[key] = _cache_weight_filename(full, fmt)
+                packed_state = admitted["packed_state"]
+                if cache.activation_max_abs is None:
+                    cache.activation_max_abs = {}
+                    cache.activation_scales = cache.activation_max_abs
+                cache.activation_max_abs[full] = float(
+                    packed_state["activation_max_abs"]
+                )
+                coverage[full] = dict(packed_state["coverage"])
+                admitted_packed_cb_pairs[key] = admitted
 
     if progress:
         print(
@@ -4766,8 +5775,16 @@ def fill_packed_expert_cache_entries(
     )
     if expert_sidecar_path is not None and expert_sidecar_path.is_file():
         try:
-            cache.activation_max_abs.update(_json.loads(
-                expert_sidecar_path.read_text()))
+            loaded_scales = _json.loads(expert_sidecar_path.read_text())
+            if isinstance(loaded_scales, Mapping):
+                admitted_qnames = {
+                    qname for qname, _fmt in admitted_packed_cb_pairs
+                }
+                cache.activation_max_abs.update({
+                    str(qname): float(value)
+                    for qname, value in loaded_scales.items()
+                    if str(qname) not in admitted_qnames
+                })
         except Exception:
             pass
 
@@ -4922,6 +5939,18 @@ def fill_packed_expert_cache_entries(
         shard_exists = (key in weights) or (
             fname is not None and (cache_dir_path / fname).is_file()
         )
+        if (
+            shard_exists
+            and cache_dir_path is not None
+            and _is_cb_format_name(fmt)
+            and key not in admitted_packed_cb_pairs
+            and not isinstance(weights.get(key), torch.Tensor)
+        ):
+            raise RuntimeError(
+                "production packed-CB cache resume internal gate failure for "
+                f"{full}@{fmt}: shard was not identity-admitted; refusing "
+                "reuse or re-render"
+            )
         need_scale = cache.activation_max_abs.get(full) is None
         # Fully done (shard + calibrated scale): just register the path.
         if shard_exists and not need_scale:
@@ -5026,6 +6055,12 @@ def fill_packed_expert_cache_entries(
         heldout_reverts = 0
         cross_gated = 0
         use_batched = (render_mode == "batched" and fmt == "NVFP4")
+        timed_cb_pair = (
+            cache_dir_path is not None and _is_cb_format_name(fmt)
+        )
+        if timed_cb_pair and device.type == "cuda":
+            torch.cuda.synchronize(device)
+        encode_started = time.perf_counter()
         if use_batched:
             from prismaquant.export_batched_gptq import (
                 gptq_obs_rounding_nvfp4_batched,
@@ -5172,16 +6207,14 @@ def fill_packed_expert_cache_entries(
                 del w_dq
             rendered = rendered.to(getattr(mod, pn).dtype)
 
-        _store_rendered_weight_entry(
-            weights=weights,
-            cache_dir_path=cache_dir_path,
-            qname=full,
-            fmt=fmt,
-            tensor=rendered,
-            weight_dtype=getattr(mod, pn).dtype,
+        if timed_cb_pair and device.type == "cuda":
+            torch.cuda.synchronize(device)
+        encode_seconds = (
+            time.perf_counter() - encode_started if timed_cb_pair else 0.0
         )
+
         pos_rows = sorted(r for r in row_counts if r > 0)
-        coverage[full] = {
+        coverage_record = {
             "fmt": fmt,
             "n_experts": int(E),
             "min_rows": int(pos_rows[0]) if pos_rows else 0,
@@ -5199,6 +6232,45 @@ def fill_packed_expert_cache_entries(
             "rendered": True,
             "had_activations": True,
         }
+        if timed_cb_pair:
+            pair_identity = packed_cb_pair_identities.get(key)
+            if pair_identity is None:
+                raise RuntimeError(
+                    f"production packed-CB cache pair identity missing before "
+                    f"publishing {full}@{fmt}"
+                )
+            activation_scale = cache.activation_max_abs.get(full)
+            if (
+                not isinstance(activation_scale, (int, float))
+                or float(activation_scale) <= 0.0
+            ):
+                raise RuntimeError(
+                    f"production packed-CB cache has no positive calibrated "
+                    f"activation_max_abs before publishing {full}@{fmt}"
+                )
+            _write_cb_cache_pair_sidecar(
+                cache_dir_path=cache_dir_path,
+                qname=full,
+                fmt=fmt,
+                identity=pair_identity,
+                tensor=rendered,
+                encode_seconds=encode_seconds,
+                packed_state={
+                    "activation_max_abs": float(activation_scale),
+                    "coverage": coverage_record,
+                },
+            )
+
+        _store_rendered_weight_entry(
+            weights=weights,
+            cache_dir_path=cache_dir_path,
+            qname=full,
+            fmt=fmt,
+            tensor=rendered,
+            weight_dtype=getattr(mod, pn).dtype,
+            durable=_is_cb_format_name(fmt),
+        )
+        coverage[full] = coverage_record
         del rendered, packed_param, proj_split
         # Free this module's GPU-resident derived activations + captured X once
         # its last param is rendered (bounds peak to ~one module's working set).
@@ -5221,6 +6293,82 @@ def fill_packed_expert_cache_entries(
                 f"({_time.monotonic() - t0:.1f}s elapsed)",
                 flush=True,
             )
+
+    if packed_cb_pair_identities and cache_dir_path is not None:
+        if cache.metadata is None:
+            cache.metadata = {}
+        existing_artifact_set = cache.metadata.get("cb_cache_pair_artifacts")
+        existing_records = (
+            existing_artifact_set.get("records")
+            if isinstance(existing_artifact_set, Mapping)
+            else None
+        )
+        pair_artifact_records: dict[str, dict[str, object]] = {
+            str(key): copy.deepcopy(value)
+            for key, value in (existing_records or {}).items()
+            if isinstance(value, Mapping)
+        }
+        for (qname, fmt), pair_identity in sorted(
+            packed_cb_pair_identities.items()
+        ):
+            sidecar_path = (
+                cache_dir_path / _cache_pair_identity_filename(qname, fmt)
+            )
+            shard_path = cache_dir_path / _cache_weight_filename(qname, fmt)
+            if not sidecar_path.is_file() or not shard_path.is_file():
+                continue
+            sidecar = _read_cb_cache_pair_sidecar(
+                sidecar_path,
+                qname=qname,
+                fmt=fmt,
+            )
+            pair_artifact_records[f"{qname}|{fmt}"] = {
+                "identity": pair_identity,
+                "tensor": sidecar.get("tensor"),
+                "render_score": sidecar.get("render_score"),
+                "render_score_sha256": sidecar.get("render_score_sha256"),
+                "packed_state": sidecar.get("packed_state"),
+                "packed_state_sha256": sidecar.get("packed_state_sha256"),
+            }
+        pair_identities = {
+            key: record["identity"]
+            for key, record in sorted(pair_artifact_records.items())
+            if isinstance(record.get("identity"), Mapping)
+        }
+        cache.metadata["cb_cache_pair_artifacts"] = {
+            "schema": (
+                "prismaquant.production_weight_cache."
+                "cb_pair_artifact_set.v1"
+            ),
+            "records": pair_artifact_records,
+        }
+        cache.metadata["cb_cache_pair_identity"] = {
+            "schema": "prismaquant.production_weight_cache.cb_pair_set.v1",
+            "pair_schema": CB_CACHE_PAIR_IDENTITY_SCHEMA,
+            "entries": len(pair_identities),
+            "identity_sha256": _canonical_json_sha256(
+                pair_identities,
+                where="CB cache pair identity set",
+            ),
+            "published_entries": len(pair_artifact_records),
+            "artifact_sha256": _canonical_json_sha256(
+                pair_artifact_records,
+                where="CB cache pair artifact set",
+            ),
+            "codebook_bundle_sha256": sorted({
+                str(pair["codebook_bundle_sha256"])
+                for pair in pair_identities.values()
+                if pair.get("codebook_bundle_sha256") is not None
+            }),
+            "calibration_hashes": sorted({
+                str(pair["calibration_hash"])
+                for pair in pair_identities.values()
+            }),
+            "git_commits": sorted({
+                str(pair["git_commit"])
+                for pair in pair_identities.values()
+            }),
+        }
 
     if progress:
         print(
