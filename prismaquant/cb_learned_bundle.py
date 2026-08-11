@@ -36,6 +36,12 @@ from prismaquant.cb_layout import (
     parse_format_name,
     subtable_bit_widths,
 )
+from prismaquant.gridbook_runtime_pin import (
+    GRIDBOOK_ROUTED_MOE_PER_ROLE_CODEBOOK_LUT_MIN_VERSION,
+    GridbookRuntimePinError,
+    load_gridbook_runtime_pin,
+    supports_routed_moe_per_role_codebook_lut,
+)
 
 
 CB_LEARNED_BUNDLE_SCHEMA = "prismaquant.cb_learned_codebook_bundle.v1"
@@ -47,9 +53,6 @@ LLOYD_ROW_SEED = 4321
 LLOYD_CAP = 2_000_000
 LLOYD_ITERS = 4
 LLOYD_SEED = 0
-
-GRIDBOOK_PIN_VERSION = "0.8.2"
-GRIDBOOK_PIN_COMMIT = "9f915dd868eab2e13ab7847a67c594e2c5c8955c"
 
 
 # This is a measurement policy table, not a structural bit-split rule.  K44,
@@ -190,25 +193,37 @@ def refuse_routed_moe_learned(
     routed_moe: bool = False,
     weight: torch.Tensor | None = None,
 ) -> None:
-    """Fail closed before a learned ref reaches pinned Gridbook routed MoE.
+    """Fail closed unless the pinned runtime carries routed per-role LUTs.
 
-    Gridbook 0.8.2's dense Linear path has per-row LUT offsets.  Its routed-MoE
-    path instead loads one LUT for a fused stack, so gate != up and w13 != w2
-    cannot yet be represented safely.  Rank-3 CB weights are routed stacks in
-    the producer ABI and are refused even if the caller omitted its route flag.
+    Rank-3 CB weights are routed stacks in the producer ABI and take this gate
+    even if the caller omitted its explicit route flag.  Dense Linears never
+    consult the gate because older Gridbook releases already support their
+    per-row LUT offsets.
     """
 
     rank3 = weight is not None and torch.as_tensor(weight).ndim == 3
     routed_name = re.search(r"(?:^|[.])experts(?:[.]|$)", str(qname)) is not None
-    if routed_moe or rank3 or routed_name:
+    if not (routed_moe or rank3 or routed_name):
+        return
+    try:
+        pin = load_gridbook_runtime_pin()
+    except GridbookRuntimePinError as exc:
         raise ValueError(
             f"{qname}: refusing learned codebook_ref on a routed-MoE stack: "
-            f"pinned Gridbook {GRIDBOOK_PIN_VERSION} "
-            f"({GRIDBOOK_PIN_COMMIT}) loads one LUT for the fused expert path "
-            "and has no per-row/per-role LUT offset. Dense Linear CBL is "
-            "supported; routed MoE must wait for the pinned runtime contract "
-            "to carry role-specific offsets."
-        )
+            "the immutable Gridbook runtime pin is invalid "
+            f"({exc}); routed per-role LUTs require Gridbook "
+            f">={GRIDBOOK_ROUTED_MOE_PER_ROLE_CODEBOOK_LUT_MIN_VERSION}."
+        ) from exc
+    if supports_routed_moe_per_role_codebook_lut(pin):
+        return
+    raise ValueError(
+        f"{qname}: refusing learned codebook_ref on a routed-MoE stack: "
+        f"pinned Gridbook {pin.version} ({pin.commit}) predates the "
+        "per-row/per-role LUT offset ABI; routed learned codebooks require "
+        "Gridbook "
+        f">={GRIDBOOK_ROUTED_MOE_PER_ROLE_CODEBOOK_LUT_MIN_VERSION}. Dense "
+        "Linear CBL remains supported."
+    )
 
 
 def _wq_pattern(col_weight: torch.Tensor) -> torch.Tensor:
@@ -449,6 +464,52 @@ def _lattice_codebook(format_name: str) -> tuple[torch.Tensor, ...]:
 
 
 @dataclass(frozen=True)
+class PretrainedCodebookCell:
+    """Value-bearing pretrained tables plus optional immutable provenance.
+
+    The ordinary tensor/sequence spelling remains accepted and byte-identical.
+    Production routed-MoE bank loading uses this wrapper so the bundle cell
+    records which accepted burn shard and content-addressed file supplied the
+    exact tables.
+    """
+
+    codebook: object
+    origin: Mapping[str, object] | None = None
+
+
+def _normalized_pretrained_origin(
+    value: Mapping[str, object], *, where: str
+) -> dict[str, object]:
+    if not isinstance(value, Mapping) or not value:
+        raise ValueError(f"{where}: pretrained origin must be a nonempty object")
+    try:
+        normalized = json.loads(_canonical_json(dict(value)))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{where}: pretrained origin is not strict JSON data: {exc}"
+        ) from exc
+    if not isinstance(normalized, dict) or not normalized:
+        raise ValueError(f"{where}: pretrained origin must be a nonempty object")
+    schema = normalized.get("schema")
+    if not isinstance(schema, str) or not schema:
+        raise ValueError(f"{where}: pretrained origin needs a schema")
+    from prismaquant.cb_banked_books import (
+        BANKED_CBL_ORIGIN_SCHEMA,
+        BankedCBLBookError,
+        validate_banked_cbl_origin,
+    )
+
+    if schema == BANKED_CBL_ORIGIN_SCHEMA:
+        try:
+            normalized = validate_banked_cbl_origin(
+                normalized, where=where
+            )
+        except BankedCBLBookError as exc:
+            raise ValueError(str(exc)) from exc
+    return normalized
+
+
+@dataclass(frozen=True)
 class CBLearnedBundle:
     """A fully verified in-memory snapshot of one immutable ``.pqcb`` bundle."""
 
@@ -463,13 +524,16 @@ class CBLearnedBundle:
     @property
     def codebook_refs_by_cell(self) -> dict[str, dict[str, tuple[str, ...]]]:
         cells = self.manifest["cells"]
-        return {
+        resolved = {
             str(qname): {
                 str(fmt): tuple(str(ref) for ref in cell["codebook_ref"])
                 for fmt, cell in formats.items()
             }
             for qname, formats in cells.items()
         }
+        for alias, entry in self.manifest.get("aliases", {}).items():
+            resolved[str(alias)] = dict(resolved[str(entry["cell_qname"])])
+        return resolved
 
     @property
     def bundle_content_sha256(self) -> str:
@@ -477,8 +541,11 @@ class CBLearnedBundle:
 
     def cell(self, qname: str, format_name: str) -> Mapping[str, object]:
         canonical, _family, _rung = _canonical_format(format_name)
+        requested = str(qname)
+        alias = self.manifest.get("aliases", {}).get(requested)
+        cell_qname = str(alias["cell_qname"]) if alias is not None else requested
         try:
-            return self.manifest["cells"][str(qname)][canonical]
+            return self.manifest["cells"][cell_qname][canonical]
         except KeyError as exc:
             raise ValueError(
                 f"{qname}: immutable learned bundle {self.path} has no "
@@ -492,10 +559,15 @@ class CBLearnedBundle:
         weight: torch.Tensor,
         col_weights: torch.Tensor,
     ) -> None:
-        try:
-            expected = self.manifest["inputs"][str(qname)]
-        except KeyError as exc:
-            raise ValueError(f"{qname}: bundle has no source/imatrix identity") from exc
+        requested = str(qname)
+        expected = self.manifest.get("aliases", {}).get(requested)
+        if expected is None:
+            try:
+                expected = self.manifest["inputs"][requested]
+            except KeyError as exc:
+                raise ValueError(
+                    f"{qname}: bundle has no source/imatrix identity"
+                ) from exc
         actual_weight = _tensor_identity(weight)
         actual_col = _tensor_identity(col_weights)
         if actual_weight != expected["source_weight"]:
@@ -557,6 +629,14 @@ def train_and_save_bundle(
     formats: Sequence[str] | Mapping[str, Sequence[str]],
     learned_formats: Iterable[str] | None = None,
     routed_moe_qnames: Iterable[str] = (),
+    pretrained_codebooks: Mapping[tuple[str, str], object] | None = None,
+    pretrained_codebook_provider: Callable[
+        [str, str, torch.Tensor, torch.Tensor], object | None
+    ] | None = None,
+    input_alias_provider: Callable[
+        [str, torch.Tensor, torch.Tensor],
+        Mapping[str, tuple[torch.Tensor, torch.Tensor]],
+    ] | None = None,
 ) -> CBLearnedBundle:
     """Train cells, canonicalize FP16 values, and publish one immutable bundle.
 
@@ -568,6 +648,14 @@ def train_and_save_bundle(
     each decoded weight is requested once, all of its rung cells are trained,
     and it is released before the next qname.  This keeps residency to one
     source tensor plus the tiny accumulated FP16 books.
+
+    ``pretrained_codebooks`` supplies immutable, value-bearing cells keyed by
+    ``(qname, canonical_format)``.  The provider spelling is invoked only
+    after that qname's current weight and imatrix tensors are resident, so a
+    bank loader can verify their exact identities before returning bytes.  A
+    supplied cell (static or provider-backed) is the only production route for
+    a rank-3 routed-expert population: expert books measured during a burn must
+    be copied byte-for-byte into the bundle, never retrained at export time.
     """
 
     path = Path(path)
@@ -603,6 +691,31 @@ def train_and_save_bundle(
     if missing_col:
         raise ValueError(f"bundle cells are missing col_weights: {missing_col[:8]}")
     routed = {str(name) for name in routed_moe_qnames}
+    supplied_books: dict[tuple[str, str], object] = {}
+    for raw_key, value in (pretrained_codebooks or {}).items():
+        if (
+            not isinstance(raw_key, tuple)
+            or len(raw_key) != 2
+            or not str(raw_key[0]).strip()
+        ):
+            raise ValueError(
+                "pretrained_codebooks keys must be (qname, format) pairs"
+            )
+        key = (str(raw_key[0]), _canonical_format(str(raw_key[1]))[0])
+        if key in supplied_books:
+            raise ValueError(f"duplicate pretrained codebook cell {key}")
+        supplied_books[key] = value
+    expected_cells = {
+        (qname, fmt)
+        for qname, names in formats_by_qname.items()
+        for fmt in names
+    }
+    unknown_books = sorted(set(supplied_books) - expected_cells)
+    if unknown_books:
+        raise ValueError(
+            "pretrained_codebooks contains cells absent from the bundle: "
+            f"{unknown_books[:8]}"
+        )
 
     supplied_formats = {
         fmt for names in formats_by_qname.values() for fmt in names
@@ -629,6 +742,7 @@ def train_and_save_bundle(
         require_cbl_rung_enabled(rung)
 
     inputs: dict[str, dict[str, object]] = {}
+    aliases: dict[str, dict[str, object]] = {}
     cells: dict[str, dict[str, dict[str, object]]] = {}
     tensors: dict[str, torch.Tensor] = {}
     owners: dict[str, tuple[str, str, str]] = {}
@@ -644,33 +758,89 @@ def train_and_save_bundle(
             "source_weight": _tensor_identity(weight),
             "col_weights": _tensor_identity(cw),
         }
+        if input_alias_provider is not None:
+            raw_aliases = input_alias_provider(qname, weight, cw)
+            for raw_alias, pair in raw_aliases.items():
+                alias = str(raw_alias)
+                if not alias or alias in aliases or alias in formats_by_qname:
+                    raise ValueError(
+                        f"{qname}: duplicate or invalid bundle input alias "
+                        f"{alias!r}"
+                    )
+                if not isinstance(pair, tuple) or len(pair) != 2:
+                    raise ValueError(
+                        f"{qname}: input alias {alias!r} must supply "
+                        "(weight, col_weights)"
+                    )
+                alias_weight, alias_col = pair
+                aliases[alias] = {
+                    "cell_qname": qname,
+                    "source_weight": _tensor_identity(alias_weight),
+                    "col_weights": _tensor_identity(alias_col),
+                }
         cells[qname] = {}
         for fmt in formats_by_qname[qname]:
             canonical, family, rung = _canonical_format(fmt)
             source = "learned" if canonical in learned else "lattice"
+            supplied = supplied_books.get((qname, canonical))
+            if source == "learned" and pretrained_codebook_provider is not None:
+                provided = pretrained_codebook_provider(
+                    qname, canonical, weight, cw
+                )
+                if supplied is not None and provided is not None:
+                    raise ValueError(
+                        f"{qname}/{canonical}: both static and provider-backed "
+                        "pretrained books were supplied"
+                    )
+                if provided is not None:
+                    supplied = provided
+            pretrained_origin = None
+            if isinstance(supplied, PretrainedCodebookCell):
+                if supplied.origin is not None:
+                    pretrained_origin = _normalized_pretrained_origin(
+                        supplied.origin,
+                        where=f"{qname}/{canonical}",
+                    )
+                supplied = supplied.codebook
+            if supplied is not None and source != "learned":
+                raise ValueError(
+                    f"{qname}/{canonical}: a pretrained book was supplied for "
+                    "a lattice cell"
+                )
             if source == "learned":
                 refuse_routed_moe_learned(
                     qname,
                     routed_moe=qname in routed,
                     weight=weight,
                 )
-                if weight.ndim != 2:
+                if weight.ndim not in (2, 3):
                     raise ValueError(
-                        f"{qname}: dense learned CBL expects a rank-2 Linear, "
+                        f"{qname}: learned CBL expects a rank-2 Linear or a "
+                        "rank-3 routed-expert population, "
                         f"got shape {tuple(weight.shape)}"
                     )
                 in_features = int(weight.shape[-1])
-                if cw.numel() != in_features:
+                population = int(weight.shape[0]) if weight.ndim == 3 else 1
+                if cw.numel() != population * in_features:
                     raise ValueError(
                         f"{qname}: learned CBL col_weights has {cw.numel()} "
-                        f"values, expected {in_features}"
+                        f"values, expected {population}x{in_features}"
                     )
-                trained = learn_pool(
-                    weight.unsqueeze(0),
-                    cw.reshape(1, in_features),
-                    rung,
-                )
-                tables = _codebook_sequence(canonical, trained)
+                if supplied is not None:
+                    tables = _codebook_sequence(canonical, supplied)
+                elif weight.ndim == 3:
+                    raise ValueError(
+                        f"{qname}/{canonical}: routed-MoE learned CBL requires "
+                        "an immutable banked pretrained_codebooks cell; "
+                        "retraining is forbidden"
+                    )
+                else:
+                    trained = learn_pool(
+                        weight.unsqueeze(0),
+                        cw.reshape(1, in_features),
+                        rung,
+                    )
+                    tables = _codebook_sequence(canonical, trained)
             else:
                 tables = _lattice_codebook(canonical)
             refs = canonical_codebook_refs(qname, canonical, source=source)
@@ -703,6 +873,9 @@ def train_and_save_bundle(
                 **({
                     "rung_policy": dict(CBL_RUNG_POLICY[rung]),
                 } if source == "learned" else {}),
+                **({
+                    "pretrained_origin": pretrained_origin,
+                } if pretrained_origin is not None else {}),
             }
         # The provider owns any external cache.  This function deliberately
         # retains no source weight after the qname's cells are materialized.
@@ -720,6 +893,7 @@ def train_and_save_bundle(
             for rung, policy in sorted(CBL_RUNG_POLICY.items())
         },
         "inputs": inputs,
+        **({"aliases": aliases} if aliases else {}),
         "cells": cells,
         "tensor_shapes": {
             name: [int(dim) for dim in tensor.shape]
@@ -765,6 +939,14 @@ def train_and_save_bundle_streaming(
     formats: Sequence[str] | Mapping[str, Sequence[str]],
     learned_formats: Iterable[str] | None = None,
     routed_moe_qnames: Iterable[str] = (),
+    pretrained_codebooks: Mapping[tuple[str, str], object] | None = None,
+    pretrained_codebook_provider: Callable[
+        [str, str, torch.Tensor, torch.Tensor], object | None
+    ] | None = None,
+    input_alias_provider: Callable[
+        [str, torch.Tensor, torch.Tensor],
+        Mapping[str, tuple[torch.Tensor, torch.Tensor]],
+    ] | None = None,
 ) -> CBLearnedBundle:
     """Explicit spelling of the one-source-tensor residency API."""
 
@@ -776,6 +958,9 @@ def train_and_save_bundle_streaming(
         formats=formats,
         learned_formats=learned_formats,
         routed_moe_qnames=routed_moe_qnames,
+        pretrained_codebooks=pretrained_codebooks,
+        pretrained_codebook_provider=pretrained_codebook_provider,
+        input_alias_provider=input_alias_provider,
     )
 
 
@@ -807,7 +992,7 @@ def load_bundle(path: str | Path) -> CBLearnedBundle:
         raise ValueError(
             f"{path}: unsupported learned bundle schema {manifest.get('schema')!r}"
         )
-    expected_top_level = {
+    required_top_level = {
         "schema",
         "trainer",
         "rung_policy",
@@ -817,11 +1002,12 @@ def load_bundle(path: str | Path) -> CBLearnedBundle:
         "codebook_content_sha256",
         "bundle_content_sha256",
     }
-    if set(manifest) != expected_top_level:
+    allowed_top_level = required_top_level | {"aliases"}
+    if not required_top_level <= set(manifest) or not set(manifest) <= allowed_top_level:
         raise ValueError(
             f"{path}: learned bundle manifest members differ: "
-            f"missing={sorted(expected_top_level - set(manifest))}, "
-            f"unknown={sorted(set(manifest) - expected_top_level)}"
+            f"missing={sorted(required_top_level - set(manifest))}, "
+            f"unknown={sorted(set(manifest) - allowed_top_level)}"
         )
     trainer = _require_mapping(manifest.get("trainer"), where=f"{path} trainer")
     if dict(trainer) != CB_LEARNED_TRAINER_STAMP:
@@ -882,6 +1068,44 @@ def load_bundle(path: str | Path) -> CBLearnedBundle:
     cells = _require_mapping(manifest.get("cells"), where=f"{path} cells")
     if set(map(str, inputs)) != set(map(str, cells)):
         raise ValueError(f"{path}: inputs and cells qname coverage differs")
+
+    def validate_identity_record(raw, *, where):
+        identity = _require_mapping(raw, where=where)
+        shape = identity.get("shape")
+        digest = str(identity.get("sha256", ""))
+        if (
+            set(identity) != {"shape", "sha256"}
+            or not isinstance(shape, list)
+            or not shape
+            or any(
+                isinstance(dim, bool) or not isinstance(dim, int) or dim <= 0
+                for dim in shape
+            )
+            or not re.fullmatch(r"[0-9a-f]{64}", digest)
+        ):
+            raise ValueError(f"{where}: malformed tensor identity")
+
+    raw_aliases = manifest.get("aliases", {})
+    aliases = _require_mapping(raw_aliases, where=f"{path} aliases")
+    for raw_alias, raw_entry in aliases.items():
+        alias = str(raw_alias)
+        if not alias or alias in cells:
+            raise ValueError(f"{path}: invalid or colliding bundle alias {alias!r}")
+        entry = _require_mapping(
+            raw_entry, where=f"{path} aliases[{alias!r}]"
+        )
+        if set(entry) != {"cell_qname", "source_weight", "col_weights"}:
+            raise ValueError(f"{path}: alias members differ for {alias!r}")
+        cell_qname = str(entry.get("cell_qname", ""))
+        if cell_qname not in cells:
+            raise ValueError(
+                f"{path}: alias {alias!r} names missing cell {cell_qname!r}"
+            )
+        for identity_name in ("source_weight", "col_weights"):
+            validate_identity_record(
+                entry.get(identity_name),
+                where=f"{path} aliases[{alias!r}].{identity_name}",
+            )
     referenced: set[str] = set()
     learned_owners: dict[str, tuple[str, str]] = {}
     for qname, raw_formats in cells.items():
@@ -890,23 +1114,10 @@ def load_bundle(path: str | Path) -> CBLearnedBundle:
             inputs[qname], where=f"{path} inputs[{qname!r}]"
         )
         for identity_name in ("source_weight", "col_weights"):
-            identity = _require_mapping(
+            validate_identity_record(
                 input_identity.get(identity_name),
                 where=f"{path} inputs[{qname!r}].{identity_name}",
             )
-            shape = identity.get("shape")
-            digest = str(identity.get("sha256", ""))
-            if (
-                set(identity) != {"shape", "sha256"}
-                or not isinstance(shape, list)
-                or not shape
-                or any(
-                    isinstance(dim, bool) or not isinstance(dim, int) or dim <= 0
-                    for dim in shape
-                )
-                or not re.fullmatch(r"[0-9a-f]{64}", digest)
-            ):
-                raise ValueError(f"{path}: malformed {identity_name} identity for {qname}")
         for raw_fmt, raw_cell in formats.items():
             canonical, family, rung = _canonical_format(str(raw_fmt))
             if canonical != raw_fmt:
@@ -920,6 +1131,13 @@ def load_bundle(path: str | Path) -> CBLearnedBundle:
             expected_cell_members = {
                 "source", "codebook_ref", "content_sha256"
             } | ({"rung_policy"} if source == "learned" else set())
+            if "pretrained_origin" in cell:
+                if source != "learned":
+                    raise ValueError(
+                        f"{path}: lattice cell has pretrained origin for "
+                        f"{qname}/{canonical}"
+                    )
+                expected_cell_members.add("pretrained_origin")
             if set(cell) != expected_cell_members:
                 raise ValueError(
                     f"{path}: cell members differ for {qname}/{canonical}"
@@ -932,10 +1150,58 @@ def load_bundle(path: str | Path) -> CBLearnedBundle:
                     raise ValueError(
                         f"{path}: learned rung policy differs for {qname}/{canonical}"
                     )
+                if "pretrained_origin" in cell:
+                    _normalized_pretrained_origin(
+                        cell["pretrained_origin"],
+                        where=(
+                            f"{path} cells[{qname!r}]"
+                            f"[{canonical!r}].pretrained_origin"
+                        ),
+                    )
             refs = cell.get("codebook_ref")
             cell_digests = cell.get("content_sha256")
             if not isinstance(refs, list) or not isinstance(cell_digests, list):
                 raise ValueError(f"{path}: malformed refs/digests for {qname}/{canonical}")
+            origin = cell.get("pretrained_origin")
+            if origin is not None:
+                from prismaquant.cb_banked_books import (
+                    BANKED_CBL_ORIGIN_SCHEMA,
+                )
+
+                if origin.get("schema") == BANKED_CBL_ORIGIN_SCHEMA:
+                    layer_match = re.search(
+                        r"(?:^|[.])layers[.]([0-9]+)(?:[.]|$)",
+                        str(qname),
+                    )
+                    coordinates = (
+                        None if layer_match is None else int(layer_match.group(1)),
+                        str(qname).rsplit(".", 1)[-1],
+                        rung,
+                    )
+                    if coordinates != (
+                        origin["layer"],
+                        origin["projection"],
+                        origin["rung"],
+                    ):
+                        raise ValueError(
+                            f"{path}: bank origin coordinates differ for "
+                            f"{qname}/{canonical}"
+                        )
+                    if (
+                        origin["source_digest"]
+                        != input_identity["source_weight"]["sha256"]
+                        or origin["col_weights_digest"]
+                        != input_identity["col_weights"]["sha256"]
+                    ):
+                        raise ValueError(
+                            f"{path}: bank origin input identity differs for "
+                            f"{qname}/{canonical}"
+                        )
+                    if origin["subtable_content_sha256"] != cell_digests:
+                        raise ValueError(
+                            f"{path}: bank origin subtable digests differ for "
+                            f"{qname}/{canonical}"
+                        )
             expected_refs = canonical_codebook_refs(
                 str(qname), canonical, source=source
             )
@@ -1034,12 +1300,12 @@ __all__ = [
     "CB_LEARNED_TRAINER_SCHEMA",
     "CB_LEARNED_TRAINER_STAMP",
     "CBLearnedBundle",
-    "GRIDBOOK_PIN_COMMIT",
-    "GRIDBOOK_PIN_VERSION",
+    "GRIDBOOK_ROUTED_MOE_PER_ROLE_CODEBOOK_LUT_MIN_VERSION",
     "LLOYD_CAP",
     "LLOYD_ITERS",
     "LLOYD_ROW_SAMPLE",
     "LLOYD_ROW_SEED",
+    "PretrainedCodebookCell",
     "LLOYD_SEED",
     "canonical_codebook_refs",
     "canonical_fp16_table",

@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### Routed-MoE learned codebooks (device validation pending)
+
+- Advance the immutable Gridbook preparation pin to 0.8.3 and version-gate
+  routed learned refs on its per-role LUT ABI; old, prerelease, local, or
+  malformed pins still refuse before export.
+- Build gate/up/down expert bundle cells only from explicitly selected,
+  identity-verified K28–K33 burn shards, copying their FP16 books exactly with
+  no export-time training, LDLQ, directory search, or lattice fallback.
+- Emit independent logical role refs for fused uniform and per-expert-format
+  stacks while retaining their physical `gate_up_proj`/`down_proj` payloads.
+  The runtime opt-in remains default-off pending real-device serving,
+  CUDA-graph, quality, and throughput validation.
+
 ## 0.10.0 — 2026-08-09
 
 The DeepSeek-V4-Flash campaign release: LDLQ becomes a *certified* encoder path,

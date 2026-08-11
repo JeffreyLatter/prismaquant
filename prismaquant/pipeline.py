@@ -72,6 +72,7 @@ _CB_SERIALIZATION_SETTINGS: tuple[str, ...] = (
     "CB_CODEBOOK_SOURCE",
     "CB_CODEBOOK_SOURCE_SCOPE",
     "CB_CODEBOOK_BUNDLE",
+    "CB_ROUTED_MOE_BOOK_SELECTION_SHA256",
     "CB_SCALE_SWEEP",
     "CB_SCALE_SWEEP_SCOPE",
     "PRISMAQUANT_CB_LDLQ",
@@ -164,6 +165,7 @@ STAGE_SETTINGS_KEYS: dict[str, tuple[tuple[str, str], ...]] = {
     "cb-learned-bundle": _key_pairs(
         "MODEL_PATH", "FORMATS", "CB_CODEBOOK_SOURCE_SCOPE",
         "CB_CODEBOOK_BUNDLE", "CB_COL_WEIGHTS_SHA256",
+        "CB_ROUTED_MOE_BOOK_SELECTION_SHA256",
     ),
     "cb-hybrid-cost": _key_pairs(
         "MODEL_PATH", "FORMATS", "COST_MODE",

@@ -163,6 +163,8 @@ def test_late_override_resolves_a_missing_key(tmp_path):
                     PRODUCTION_CACHE_LEVERS="gptq", PRODUCTION_CACHE_DISABLE_LEVERS="",
                     CB_SCALE_CODING="", CB_CODEBOOK_SOURCE="",
                     CB_CODEBOOK_SOURCE_SCOPE="", CB_CODEBOOK_BUNDLE="",
+                    CB_ROUTED_MOE_BOOK_SELECTION="",
+                    CB_ROUTED_MOE_BOOK_SELECTION_SHA256="",
                     CB_SCALE_SWEEP="1", CB_SCALE_SWEEP_SCOPE="",
                     PRISMAQUANT_CB_LDLQ="0",
                     PRISMAQUANT_CB_MINCHAIN="0",

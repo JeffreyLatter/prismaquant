@@ -35,8 +35,9 @@ scale) and feeds the existing CUTLASS FP4 path unchanged.
 Learned codebooks do **not** introduce `CBL_*` format names. They are a
 value-bearing rendering mode for the same FP8-CB wire formats. The current
 producer policy permits learned FP8-CB through K46 and rejects measured-NO-GO
-K47/K48; lattice rendering
-retains the full K28–K48 ladder (`prismaquant/cb_learned_bundle.py:55-145`).
+K47/K48; lattice rendering retains the full K28–K48 ladder (see
+`CBL_RUNG_POLICY` and `require_cbl_rung_enabled` in
+`prismaquant.cb_learned_bundle`).
 
 **Hard constraint:** `in_features % 256 == 0` (the 256-weight superblock is both
 byte-exact and the vector-tiling unit). Linears that fail it are shipped BF16.
@@ -220,18 +221,23 @@ For each **CB target Linear** `<q>` (e.g. `model.layers.0.mlp.gate_proj`):
 laid out exactly as the 2-D case; expert `e` = `cb_qweight[e]`), and the fp8
 `<q>.weight_scale` is fp32 `(E, out)`. Encoding uses per-expert `col_weights`
 `(E, 1, in)` when provided (a single `(in,)` vector is broadcast to all
-experts). Under the pinned Gridbook 0.8.2 routed ABI, all experts of a stack
-share one format and one lattice LUT (the allocator's serving-unit promotion
-guarantees the format half). **Served** by
+experts). A uniform stack shares one format; the existing per-expert-format
+declaration may instead partition its experts into physical rung sub-stacks.
+With the unreleased Gridbook 0.8.3 preparation pin, learned FP8-CB stacks may
+carry one pooled book per logical gate/up/down role: `gate_up_proj` stays one physical
+tensor, while ordinary logical `gate_proj` and `up_proj` config targets carry
+distinct refs and select row-offset blocks. Split logical targets retain their
+`format_group_*` discriminator and reuse the matching unsuffixed role/rung
+bundle cell. **Served** by
 `PrismaQuantCBMoEMethod` ([external Gridbook `moe.py`](https://github.com/RobTand/gridbook/blob/master/gridbook/moe.py)), which registers
 w13/w2 buffers at these exact shapes so loading is a plain `copy_`; archs that
 map experts at the top level additionally need a loader line in
 Gridbook's packaged runtime contract and loader table (see `moe_cb_design.md` §4).
-The producer refuses any learned `codebook_ref` on a routed or rank-3 stack:
-0.8.2 builds one flat LUT with no per-row/per-role offset, so gate≠up cannot be
-decoded safely. The future consumer ABI is specified in
-`MOE_LEARNED_CODEBOOK_SPEC.md`; there is no lattice fallback under a learned
-identity (`prismaquant/cb_learned_bundle.py:148-172`).
+The producer version-gates this path: pins older than 0.8.3, malformed pins,
+and non-final version strings retain the routed/rank-3 refusal. The new runtime
+path is also opt-in (`PRISMAQUANT_CB_MOE_PER_ROLE_LUT=1`) until device serving
+validation completes. There is no lattice fallback under a learned identity;
+the exact ABI and ship gate are recorded in `MOE_LEARNED_CODEBOOK_SPEC.md`.
 
 **Codebooks — shipped once per `(ref, format)`, never per tensor:**
 
@@ -286,6 +292,8 @@ before cost/cache/KL, never during export. The bundle contains:
   `(layer, role, rung)`;
 - the certified `learn_pool` trainer identity and the source-weight/imatrix
   value identity for every cell;
+- for production banked expert cells, the exact selection/burn/book origin and
+  payload digests, tied to the role input identity again on bundle reload;
 - the measurement-backed rung-policy table; and
 - `codebook_content_sha256`, one SHA-256 per contiguous little-endian FP16
   subtable payload, covering the bundle's tensor-name set exactly.
@@ -293,16 +301,17 @@ before cost/cache/KL, never during export. The bundle contains:
 Training atomically publishes the bundle and refuses to overwrite an existing
 path. Loading revalidates schema, trainer, names, shapes, cell ownership, full
 reference coverage, and every digest; lookup of an absent or mismatched cell
-raises instead of substituting a lattice book
-(`prismaquant/cb_learned_bundle.py:511-717,749-957`).
+raises instead of substituting a lattice book (see `train_and_save_bundle`,
+`load_bundle`, and `CBLearnedBundle.codebook_for` in
+`prismaquant.cb_learned_bundle`).
 
 The exporter uses those exact selected tensors and writes them once to the
 artifact's `cb_codebooks.pqcb`. Its `provenance.codebook_sha256` is a **complete
 name map over that final sidecar**, including canonical lattice tensors and
 learned tensors. This is stricter than a learned-only manifest because pinned
 Gridbook compares the complete expected and observed name sets before checking
-each value digest (`prismaquant/cb_export_config.py:781-819`; external Gridbook
-0.8.2 `gridbook/cb_digest.py:72-114`). Export-time retraining and silent lattice
+each value digest (`build_quant_config` in `prismaquant.cb_export_config`;
+external Gridbook `gridbook/cb_digest.py`). Export-time retraining and silent lattice
 fallback are both contract violations.
 
 Learned FP8 eligibility is enforced from the data table
@@ -318,8 +327,8 @@ Learned FP8 eligibility is enforced from the data table
 | K48 | rejected | measured 54–98% worse than lattice |
 
 Both bundle creation and bundle load call `require_cbl_rung_enabled`, so a stale
-bundle cannot bypass a policy change (`prismaquant/cb_learned_bundle.py:55-145,
-583-590,888-895`).
+bundle cannot bypass a policy change (see `train_and_save_bundle` and
+`load_bundle` in `prismaquant.cb_learned_bundle`).
 
 ### 3.2 Authoritative serialized-payload accounting
 
@@ -463,11 +472,14 @@ one format share refs and may group together.
 **Plugin dispatch:** a prefix matching a group's `targets` → the CB method
 (decode via that scheme); a prefix in `ignore` → `UnquantizedLinearMethod`;
 plain NVFP4/FP8 groups → the pinned runtime's delegated native route. Dense
-fusion does **not** require one ref across sibling roles: Gridbook 0.8.2 reads
+fusion does **not** require one ref across sibling roles: Gridbook reads
 each role's `codebook_ref`, interns distinct reference tuples, concatenates the
 blocks, and supplies a per-row `cb_row_offset`, so gate≠up and q≠k≠v are valid
-(external Gridbook `gridbook/linear.py:405-437`). Routed MoE has no corresponding
-offset and is restricted to lattice by the producer refusal in §3.
+(external Gridbook `gridbook/linear.py:405-437`). Gridbook 0.8.3 ports that
+mechanism to routed MoE behind its per-role-LUT opt-in. PrismaQuant emits three
+ordinary logical config targets (`gate_proj`, `up_proj`, `down_proj`) with
+independent refs while retaining the two physical `gate_up_proj`/`down_proj`
+payloads. An older pin still refuses before those refs can be emitted.
 
 ---
 
@@ -494,5 +506,7 @@ for each row, each superblock s:
 This reproduces the emulation render bit-for-bit; the two are pinned equal by
 `test_nvfp4_cb_pack_unpack_matches_emulation`.
 For a fused dense module, `codebook` above means the role block selected by that
-output row's `cb_row_offset`; for a routed-MoE module at the 0.8.2 pin it remains
-the stack's single lattice LUT.
+output row's `cb_row_offset`. The 0.8.3 routed opt-in applies the same rule to
+each expert: the first `w13` row segment selects gate, the second selects up,
+and `w2` selects down. The offset vector is resident and captured with the
+decode route; it is not recomputed or read from host state per token.

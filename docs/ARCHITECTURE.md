@@ -1,15 +1,15 @@
 # PrismaQuant Architecture
 
-As of: 2026-08-11 · branch `perf/ldlq-atom-compile` · verified against implementation
-baseline commit `8620099` plus the learned-codebook producer contract and the
-DeepSeek DSpark source-overlay contract,
-with the external Gridbook runtime pinned to release commit
-`9f915dd` (v0.8.2). The pin advanced 0.8.1 → 0.8.2 in this release because the
-DSV4-Flash serving images are built from that runtime, not from 0.8.1: declaring
-0.8.1 would have described a runtime the artifact does not serve on. The backed
-fused mid-M rung set is unchanged, and for a stronger reason than reading the
-constant — `gridbook/codec.py` is byte-unchanged across the whole v0.8.1..v0.8.2
-range, so `FP8_FUSED_KBITS` cannot have moved (§ serving lanes). This branch ports the dated
+As of: 2026-08-11 · branch `perf/ldlq-atom-compile` · verified against
+implementation baseline commit `c96eefc` plus this routed-MoE learned-codebook
+producer contract and the DeepSeek DSpark source-overlay contract,
+with the external Gridbook runtime pinned to the **unreleased** 0.8.3
+preparation commit `032e815`. That commit adds the opt-in routed-MoE per-role
+LUT ABI; it has not been tagged, published, or device-validated, and the pin's
+`version_is_release` is therefore false. Serving-lane metadata deliberately
+credits no 0.8.3 fused rung table until the owner cuts and validates the
+release. The latest released 0.8.2 table remains historical evidence, not a
+claim about this pre-tag pin (§ serving lanes). This branch ports the dated
 2026-08-01 DeepSeek-V4-Flash-0731 92 GB study record (§9.2) forward from its 0.5.1
 working tree; the study's Gridbook-candidate claims were **not** carried over, because
 the candidate they described has since been reviewed, cut, and pinned as Gridbook 0.6.0.
@@ -82,7 +82,7 @@ by measurement, not by the cost model (§2).
 | Lane | Container | Runtime | Formats | Status |
 |---|---|---|---|---|
 | Native | `compressed-tensors` | vanilla vLLM, Blackwell CUTLASS | NVFP4, FP8_DYNAMIC/E4M3, FP8_SOURCE, BF16 | production default |
-| CB ("gridbook") | `nvfp4_cb` codebook checkpoint | vLLM + the separately versioned `gridbook` package (native CUDA/CUTLASS-only, fail-closed), installed from the exact commit in `prismaquant/gridbook_runtime/gridbook_runtime_pin.json` | FP4-CB / FP8-CB rungs plus the native menu | production only for architectures declared by Gridbook's packaged runtime contract; DSv4 remains gated |
+| CB ("gridbook") | `nvfp4_cb` codebook checkpoint | vLLM + the separately versioned `gridbook` package (native CUDA/CUTLASS-only, fail-closed), installed from the exact commit in `prismaquant/gridbook_runtime/gridbook_runtime_pin.json` | FP4-CB / FP8-CB rungs plus the native menu | production only for architectures declared by Gridbook's packaged runtime contract; DSv4 is declared, while learned per-role expert LUTs remain device-validation-gated |
 | GGUF | single `.gguf` | llama.cpp; vLLM via `vllm-gguf-plugin` | Q2_K…Q8_0 k-quants + IQ family + BF16 | enabled end-to-end; the only 2–3 bpw path |
 
 Lane detail, defaults and proven results: §9. Export codecs: §6. Pipeline defaults: §3.3.
@@ -2271,7 +2271,7 @@ the artifact ABI; CI
 compares every packing/layout field and every rung so incompatibility fails at the boundary.
 
 At runtime `register()` registers `"gridbook"` plus the legacy artifact alias `"prismaquant"`
-and installs the per-architecture loader hooks. It does not patch vLLM core. Gridbook 0.8.2
+and installs the per-architecture loader hooks. It does not patch vLLM core. Released Gridbook 0.8.2
 resolves and attests every serving-reachable extension, optional-kernel mode, ABI, device, and
 shape contract during model load. Decode, expansion, activation QDQ, and routing support are
 native CUDA; GEMM and grouped GEMM are native CUTLASS. A missing or ineligible required native
@@ -2280,7 +2280,10 @@ implementation. The container may mix CB groups, ignored BF16 prefixes, and stoc
 groups delegated to vLLM. Gridbook's own FP8 transient paths call vLLM's registered native
 CUDA quantizer and CUTLASS scaled-matmul operators directly after attestation. Fused dense and
 grouped native-NVFP4 paths remain explicit opt-ins: the 2026-08-01 teacher-backed LFM gate
-rejected default enablement even though operator arithmetic passed. The canceled gfx1151/ROCm
+rejected default enablement even though operator arithmetic passed. The 0.8.3
+preparation commit adds `abi_features.routed_moe_per_role_codebook_lut=1` and
+keeps that path behind `PRISMAQUANT_CB_MOE_PER_ROLE_LUT=1`; no default is
+promoted by this pin advance. The canceled gfx1151/ROCm
 prototype was removed rather than maintained as an unqualified second backend.
 
 **Storage format.** Product vector quantization onto a codebook whose every entry lies exactly
@@ -2324,21 +2327,23 @@ bundle trainer runs the certified pooled weighted-Lloyd `learn_pool` once,
 materializes every subtable as the exact contiguous little-endian FP16 payload,
 and gives every learned cell its own physical references. Its manifest binds
 the trainer, source-weight and imatrix value identities, cell/rung policy,
-shapes, and a SHA-256 for each individual FP16 subtable
-(`cb_learned_bundle.py:181-303,413-508`). Bundle load requires the tensor-name
+shapes, and a SHA-256 for each individual FP16 subtable (see
+`train_and_save_bundle` and `CBLearnedBundle` in
+`prismaquant.cb_learned_bundle`). Bundle load requires the tensor-name
 set, shape map, cell references, and digest map to cover one another exactly;
 missing, extra, stale, or altered values raise instead of falling back to the
-lattice (`:749-957`). Every downstream render receives values reloaded from
-the canonical FP16 payload (promoted to FP32 only for encoder lookup), never
-the trainer's pre-materialization tensor (`:471-504`);
+lattice (see `load_bundle`). Every downstream render receives values reloaded
+from the canonical FP16 payload (promoted to FP32 only for encoder lookup),
+never the trainer's pre-materialization tensor (`CBLearnedBundle.codebook_for`);
 export-time retraining is forbidden. The exporter writes the selected lattice
 and learned tensors exactly once to `cb_codebooks.pqcb`, and the config's
 `codebook_sha256` map covers the **complete** sidecar name set, matching
-Gridbook's fail-closed verifier (`cb_export_config.py:781-819`; pinned Gridbook
-0.8.2 `gridbook/cb_digest.py:72-114`).
+Gridbook's fail-closed verifier (`build_quant_config` in
+`prismaquant.cb_export_config`; pinned Gridbook `gridbook/cb_digest.py`).
 
 The learned rung ceiling is a measurement policy table, not the product
-bit-split's 2,048-entry structural rule (`cb_learned_bundle.py:55-134`):
+bit-split's 2,048-entry structural rule (`CBL_RUNG_POLICY` in
+`prismaquant.cb_learned_bundle`):
 
 | FP8-CB rung | learned production policy | provenance meaning |
 |---|---|---|
@@ -2351,26 +2356,43 @@ bit-split's 2,048-entry structural rule (`cb_learned_bundle.py:55-134`):
 
 `require_cbl_rung_enabled` is called both when a bundle is trained and when it
 is loaded, so editing a menu or presenting an old bundle cannot bypass this
-ceiling (`cb_learned_bundle.py:160-183,628,929`).
+ceiling (`require_cbl_rung_enabled` call sites in `train_and_save_bundle` and
+`load_bundle`).
 
-**Dense serving is already role-distinct; routed-MoE serving is not.** At the
-pinned 0.8.2 commit, Gridbook's dense loader reads `codebook_ref` inside its
+**Dense and opt-in routed-MoE serving can both be role-distinct at the 0.8.3
+preparation pin.** Gridbook's dense loader reads `codebook_ref` inside its
 per-role loop, interns each distinct reference tuple, concatenates those LUT
 blocks, and emits a `cb_row_offset` covering every output row. Thus fused
 `gate_up_proj` may carry gate≠up and fused `qkv_proj` may carry q≠k≠v
-(external Gridbook `gridbook/linear.py:405-437`). Its routed path instead builds
-one `layer._cb_flat` and launches both w13 and w2 without a row/LUT offset
-(`gridbook/moe.py:458-505,1915-1946`). PrismaQuant therefore refuses a learned
-reference on any routed or rank-3 expert stack with the exact Gridbook pin in
-the error; it never substitutes lattice bytes under a learned stamp
-(`cb_learned_bundle.py:148-172,597-634`). The consumer-side port is specified,
-but deliberately not vendored or implemented here, in
-`docs/lanes/nvfp4-cb/MOE_LEARNED_CODEBOOK_SPEC.md`; lattice routed-CB remains
-unchanged.
+(external Gridbook `gridbook/linear.py:405-437`). Gridbook commits `49733a5`
+and `776c45d` first make its legacy uniform resolver compare refs, then port
+the same block interning and per-row offset mechanism into routed w13/w2.
+PrismaQuant emits ordinary logical `gate_proj`, `up_proj`, and `down_proj`
+config groups with independent singular refs while keeping the physical
+`gate_up_proj`/`down_proj` tensors fused. Gate and up are encoded independently
+and their qweight/row-scale planes are concatenated in physical row order. The
+per-expert-format producer does the same per rung subgroup, preserving its
+`format_group_*` suffix and declared ascending expert order.
+
+The producer refusal was version-gated, not deleted. A final numeric pin below
+0.8.3, a prerelease/local version string, or an invalid pin still refuses every
+routed name, explicit routed flag, and rank-3 learned source before encoding.
+The exact 0.8.3 preparation pin lifts that producer gate even though
+`version_is_release=false`; release status separately withholds serving-rung
+credit. Production expert bundle cells accept only immutable banked K28–K33
+books, refuse an LDLQ scope that includes FP8, and never call the trainer. The
+bundle records each pooled role's rank-3
+source/imatrix identity plus per-expert aliases so cost/cache/KL/export resolve
+the same physical refs. Each banked cell also retains its selection, burn,
+content-addressed file, and payload-digest origin, tied back to those inputs on
+bundle reload. Missing, stale, unreadable, or identity-mismatched burn
+selection fails with no directory search, retraining, or lattice fallback.
+`docs/lanes/nvfp4-cb/MOE_LEARNED_CODEBOOK_SPEC.md` is the normative boundary;
+lattice routed-CB and the default `CB_CODEBOOK_SOURCE_SCOPE=none` are unchanged.
 
 **Runtime defaults and kernel provenance live only in Gridbook.** The old table
 here was removed after it drifted from the runtime it described. The current pin is Gridbook
-0.8.2 at `9f915dd868eab2e13ab7847a67c594e2c5c8955c`; resolve it from
+0.8.3 preparation commit `032e8158acc01b13c125db4c5463267f21b1debf`; resolve it from
 `prismaquant/gridbook_runtime/gridbook_runtime_pin.json`, then consult that source's
 `docs/PLUGIN.md`, `docs/KERNELS.md`, and dated audits. The cross-project policy
 is only this: a numerics-changing path cannot be promoted by kernel arithmetic
@@ -2400,7 +2422,8 @@ candidate-kernel measurements, not served tokens/s.
 **Per-arch wiring — the no-longer-silent no-load trap** (R10, 2026-07-30). Archs whose vLLM
 loader maps experts at the top level never call the per-layer `FusedMoE.load_weights`, so
 Gridbook installs its top-level wrapper from the packaged runtime contract. The authoritative
-module list is deliberately not repeated here. DSv4 remains absent and gated; Gridbook 0.5.0's
+module list is deliberately not repeated here. DSv4 is now contract-declared;
+its new learned per-role expert path remains gated pending device validation. Gridbook 0.5.0's
 warm synthetic DSV4-shape grouped-bridge timing is a kernel microbenchmark, not artifact
 qualification or a production promotion.
 Over-installing is harmless and a missing module is a no-op.

@@ -52,6 +52,7 @@ from .cb_layout import (
     subtable_bit_widths,
     type_size as cb_type_size,
 )
+from .routed_moe_codebooks import bundle_role_qname
 
 CB_SERIALIZED_PAYLOAD_SCHEMA = "prismaquant.cb_serialized_payload.v3"
 MINCHAIN_CB_SERIALIZED_PAYLOAD_SCHEMA = "prismaquant.cb_serialized_payload.v4"
@@ -2030,6 +2031,106 @@ def _sidecar_identity(
     }
 
 
+def _has_explicit_codebook_refs(
+    qname: str,
+    format_name: str,
+    context: CBSerializationContext,
+) -> bool:
+    """Return whether ``qname`` explicitly supplies refs for this format."""
+    canonical = str(format_name).strip().upper()
+    by_format = context.codebook_refs_by_qname_format
+    format_supplied = (
+        by_format is not None
+        and qname in by_format
+        and canonical in by_format[qname]
+    )
+    legacy_supplied = (
+        context.codebook_refs is not None
+        and qname in context.codebook_refs
+    )
+    if format_supplied and legacy_supplied:
+        raise ValueError(
+            f"{qname}: {canonical} has both per-format and legacy "
+            "codebook refs; refusing an ambiguous physical identity"
+        )
+    return bool(format_supplied or legacy_supplied)
+
+
+def _tensor_sidecar_identities(
+    qname: str,
+    format_name: str,
+    context: CBSerializationContext,
+) -> tuple[dict, ...]:
+    """Resolve the physical codebook sets consumed by one packed tensor.
+
+    Routed MoE ``gate_up_proj`` remains one packed weight tensor, but the
+    per-role Gridbook ABI consumes a gate LUT for its first output-row half
+    and an up LUT for its second half.  The producer represents those LUTs as
+    ordinary logical ``gate_proj``/``up_proj`` cells.  Only that explicit,
+    complete declaration changes accounting; legacy fused refs, lattice
+    contexts, and dense ``gate_up_proj`` tensors retain their one-sidecar
+    identity exactly.
+    """
+    canonical = str(format_name).strip().upper()
+    routed_marker = ".experts.gate_up_proj"
+    physical_parent = str(qname)
+    discriminator = None
+    if "." in physical_parent:
+        candidate, discriminator = physical_parent.rsplit(".", 1)
+        if discriminator.startswith("format_group_"):
+            physical_parent = candidate
+        else:
+            discriminator = None
+    if (
+        codebook_source_for_format(canonical, context) == "learned"
+        and discriminator is not None
+        and physical_parent.endswith(".experts.down_proj")
+    ):
+        return (
+            _sidecar_identity(
+                bundle_role_qname(str(qname), "down_proj"),
+                canonical,
+                context,
+            ),
+        )
+    if (
+        codebook_source_for_format(canonical, context) != "learned"
+        or not physical_parent.endswith(routed_marker)
+    ):
+        return (_sidecar_identity(qname, canonical, context),)
+
+    gate_qname = bundle_role_qname(str(qname), "gate_proj")
+    up_qname = bundle_role_qname(str(qname), "up_proj")
+    physical_supplied = _has_explicit_codebook_refs(
+        str(qname), canonical, context
+    )
+    gate_supplied = _has_explicit_codebook_refs(
+        gate_qname, canonical, context
+    )
+    up_supplied = _has_explicit_codebook_refs(
+        up_qname, canonical, context
+    )
+
+    if not gate_supplied and not up_supplied:
+        return (_sidecar_identity(qname, canonical, context),)
+    if physical_supplied:
+        raise ValueError(
+            f"{qname}: learned routed-MoE {canonical} supplies both the "
+            "physical fused codebook refs and logical gate/up refs; use "
+            "exactly one ABI"
+        )
+    if gate_supplied != up_supplied:
+        missing = up_qname if gate_supplied else gate_qname
+        raise ValueError(
+            f"{qname}: learned routed-MoE {canonical} per-role sidecars are "
+            f"incomplete; missing explicit refs for {missing!r}"
+        )
+    return (
+        _sidecar_identity(gate_qname, canonical, context),
+        _sidecar_identity(up_qname, canonical, context),
+    )
+
+
 def _identity_key(identity: Mapping) -> str:
     return json.dumps(identity, sort_keys=True, separators=(",", ":"))
 
@@ -2088,7 +2189,22 @@ def cb_tensor_payload_breakdown(
         + fp8_row_scale_bytes
         + input_global_scale_bytes
     )
-    sidecar = _sidecar_identity(qname, canonical, context)
+    sidecars = _tensor_sidecar_identities(qname, canonical, context)
+    if len(sidecars) == 1:
+        sidecar = sidecars[0]
+    else:
+        sidecar = {
+            "kind": "routed_moe_per_role_codebooks",
+            "roles": [
+                {"projection": projection, "sidecar": identity}
+                for projection, identity in zip(
+                    ("gate_proj", "up_proj"), sidecars, strict=True
+                )
+            ],
+            "payload_bytes": sum(
+                int(identity["payload_bytes"]) for identity in sidecars
+            ),
+        }
     payload_schema = _serialized_payload_schema(context)
     # Per-family LDLQ: the tensor's ldlq stamps the ACTUAL result, not the
     # global context's ANY. For scope nvfp4, NVFP4_CB tensors are ldlq:true
@@ -2129,7 +2245,7 @@ def cb_tensor_payload_breakdown(
         "tensor_payload_bytes": int(tensor_payload_bytes),
         "sidecar": sidecar,
     }
-    return {
+    result = {
         "schema": payload_schema,
         "identity": identity,
         "identity_key": _identity_key(identity),
@@ -2150,6 +2266,12 @@ def cb_tensor_payload_breakdown(
         "sidecar_identity_key": _identity_key(sidecar),
         "sidecar_payload_bytes": int(sidecar["payload_bytes"]),
     }
+    if len(sidecars) > 1:
+        result["sidecar_identities"] = list(sidecars)
+        result["sidecar_identity_keys"] = [
+            _identity_key(identity) for identity in sidecars
+        ]
+    return result
 
 
 def cb_assignment_payload_breakdown(
@@ -2186,41 +2308,48 @@ def cb_assignment_payload_breakdown(
         per_tensor[qname] = item
         for key in totals:
             totals[key] += int(item[key])
-        sidecar_key = item["sidecar_identity_key"]
-        sidecar_identity = item["sidecar_identity"]
-        refs = tuple(str(ref) for ref in sidecar_identity["codebook_ref"])
-        overlapping_keys = {
-            sidecar_key_by_ref[ref]
-            for ref in refs
-            if ref in sidecar_key_by_ref
-        }
-        if overlapping_keys and overlapping_keys != {sidecar_key}:
-            raise ValueError(
-                f"{qname}: physical CB codebook refs are partially shared or "
-                "reused with conflicting shape/content identity. Explicit "
-                "ref sets must be disjoint or completely identical; "
-                f"refs={list(refs)}, prior_identity_keys="
-                f"{sorted(overlapping_keys)}"
+        tensor_sidecars = item.get(
+            "sidecar_identities", (item["sidecar_identity"],)
+        )
+        for sidecar_identity in tensor_sidecars:
+            sidecar_key = _identity_key(sidecar_identity)
+            refs = tuple(
+                str(ref) for ref in sidecar_identity["codebook_ref"]
             )
-        previous = sidecars.get(sidecar_key)
-        if previous is None:
-            if overlapping_keys:
+            overlapping_keys = {
+                sidecar_key_by_ref[ref]
+                for ref in refs
+                if ref in sidecar_key_by_ref
+            }
+            if overlapping_keys and overlapping_keys != {sidecar_key}:
                 raise ValueError(
-                    f"{qname}: physical CB codebook refs overlap a prior "
-                    "sidecar without an identical complete identity"
+                    f"{qname}: physical CB codebook refs are partially shared "
+                    "or reused with conflicting shape/content identity. "
+                    "Explicit ref sets must be disjoint or completely "
+                    f"identical; refs={list(refs)}, prior_identity_keys="
+                    f"{sorted(overlapping_keys)}"
                 )
-            sidecars[sidecar_key] = sidecar_identity
-            sidecar_key_by_ref.update({ref: sidecar_key for ref in refs})
-        elif previous != sidecar_identity:
-            raise ValueError(
-                f"conflicting CB sidecar identity for {qname}: {previous} vs "
-                f"{sidecar_identity}"
-            )
-        elif any(sidecar_key_by_ref.get(ref) != sidecar_key for ref in refs):
-            raise ValueError(
-                f"{qname}: identical CB sidecar identity did not resolve to "
-                "the same complete physical ref set"
-            )
+            previous = sidecars.get(sidecar_key)
+            if previous is None:
+                if overlapping_keys:
+                    raise ValueError(
+                        f"{qname}: physical CB codebook refs overlap a prior "
+                        "sidecar without an identical complete identity"
+                    )
+                sidecars[sidecar_key] = sidecar_identity
+                sidecar_key_by_ref.update({ref: sidecar_key for ref in refs})
+            elif previous != sidecar_identity:
+                raise ValueError(
+                    f"conflicting CB sidecar identity for {qname}: "
+                    f"{previous} vs {sidecar_identity}"
+                )
+            elif any(
+                sidecar_key_by_ref.get(ref) != sidecar_key for ref in refs
+            ):
+                raise ValueError(
+                    f"{qname}: identical CB sidecar identity did not resolve "
+                    "to the same complete physical ref set"
+                )
     sidecar_bytes = sum(int(item["payload_bytes"]) for item in sidecars.values())
     total_bytes = totals["tensor_payload_bytes"] + sidecar_bytes
     return {
@@ -2906,11 +3035,15 @@ def cb_footprint(
         n_params += params
         if is_cb_format(format_name):
             item = cb_breakdown["per_tensor"][qname]
-            sidecar_key = item["sidecar_identity_key"]
             charged = 0
-            if sidecar_key not in sidecar_first_owner:
-                sidecar_first_owner.add(sidecar_key)
-                charged = int(item["sidecar_payload_bytes"])
+            tensor_sidecars = item.get(
+                "sidecar_identities", (item["sidecar_identity"],)
+            )
+            for sidecar_identity in tensor_sidecars:
+                sidecar_key = _identity_key(sidecar_identity)
+                if sidecar_key not in sidecar_first_owner:
+                    sidecar_first_owner.add(sidecar_key)
+                    charged += int(sidecar_identity["payload_bytes"])
             grid, _mode, k = _cb_info(format_name)  # type: ignore[misc]
             per_tensor[qname] = {
                 "format": str(format_name),

@@ -113,6 +113,22 @@ def test_declared_cb_lanes_are_a_subset_of_gridbook_supported():
     _assert_declared_cb_lanes_are_servable()
 
 
+def test_routed_moe_per_role_lut_capability_matches_the_pinned_contract():
+    """The version gate and Gridbook's packaged ABI declaration must agree."""
+    from prismaquant.gridbook_runtime_pin import (
+        load_gridbook_runtime_pin,
+        supports_routed_moe_per_role_codebook_lut,
+    )
+
+    supported = supports_routed_moe_per_role_codebook_lut(
+        load_gridbook_runtime_pin()
+    )
+    features = _runtime_contract().get("abi_features", {})
+    assert features.get("routed_moe_per_role_codebook_lut") == (
+        1 if supported else None
+    )
+
+
 def test_a_declared_lane_the_runtime_cannot_serve_still_fails(monkeypatch):
     """Negative control for the relaxation above.
 

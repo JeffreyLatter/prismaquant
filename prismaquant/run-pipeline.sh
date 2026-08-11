@@ -116,6 +116,22 @@ if [[ "$EXPORT_CONTAINER" == "nvfp4_cb" ]]; then
   else
     : "${CB_CODEBOOK_BUNDLE:=}"
   fi
+  # Optional routed-expert learned cells are selected by an immutable JSON
+  # manifest.  The manifest itself names the bank root and every accepted
+  # burn shard absolutely; no directory scan or export-time training exists.
+  : "${CB_ROUTED_MOE_BOOK_SELECTION:=}"
+  CB_ROUTED_MOE_BOOK_SELECTION_SHA256=""
+  if [[ -n "$CB_ROUTED_MOE_BOOK_SELECTION" ]]; then
+    if [[ "$CB_CODEBOOK_SOURCE_SCOPE" == "none" ]]; then
+      echo "[pipeline] ERROR: CB_ROUTED_MOE_BOOK_SELECTION requires a learned CB_CODEBOOK_SOURCE_SCOPE" >&2
+      exit 2
+    fi
+    if [[ "$CB_ROUTED_MOE_BOOK_SELECTION" != /* || ! -f "$CB_ROUTED_MOE_BOOK_SELECTION" ]]; then
+      echo "[pipeline] ERROR: CB_ROUTED_MOE_BOOK_SELECTION must name an existing absolute JSON file" >&2
+      exit 2
+    fi
+    CB_ROUTED_MOE_BOOK_SELECTION_SHA256="$(sha256sum "$CB_ROUTED_MOE_BOOK_SELECTION" | cut -d' ' -f1)"
+  fi
   : "${CB_SCALE_CODING:=two_tier}"
   # Static fused-W4A4 activation metadata is calibrated from the same probe
   # cache as the weighted CB render.  MSE-grid is a deterministic producer
@@ -186,6 +202,8 @@ if [[ "$EXPORT_CONTAINER" == "nvfp4_cb" ]]; then
     exit 2
   fi
   export CB_CODEBOOK_SOURCE CB_CODEBOOK_SOURCE_SCOPE CB_CODEBOOK_BUNDLE
+  export CB_ROUTED_MOE_BOOK_SELECTION
+  export CB_ROUTED_MOE_BOOK_SELECTION_SHA256
   export CB_SCALE_CODING CB_SCALE_SWEEP CB_SCALE_SWEEP_SCOPE PRISMAQUANT_CB_LDLQ
   export PRISMAQUANT_CB_MINCHAIN PRISMAQUANT_CB_MINCHAIN_ANCHORS
   export PRISMAQUANT_CB_MINCHAIN_HOLDBACKS PRISMAQUANT_CB_MINCHAIN_AUDIT_SEED
@@ -923,6 +941,8 @@ STAGE_SETTINGS_ENV=(
   "CB_CODEBOOK_SOURCE=${CB_CODEBOOK_SOURCE:-}"
   "CB_CODEBOOK_SOURCE_SCOPE=${CB_CODEBOOK_SOURCE_SCOPE:-}"
   "CB_CODEBOOK_BUNDLE=${CB_CODEBOOK_BUNDLE:-}"
+  "CB_ROUTED_MOE_BOOK_SELECTION=${CB_ROUTED_MOE_BOOK_SELECTION:-}"
+  "CB_ROUTED_MOE_BOOK_SELECTION_SHA256=${CB_ROUTED_MOE_BOOK_SELECTION_SHA256:-}"
   "CB_SCALE_SWEEP=${CB_SCALE_SWEEP:-}"
   "CB_SCALE_SWEEP_SCOPE=${CB_SCALE_SWEEP_SCOPE:-}"
   "PRISMAQUANT_CB_LDLQ=${PRISMAQUANT_CB_LDLQ:-}"
@@ -1072,12 +1092,19 @@ PY
     return 0
   fi
   echo "[pipeline] $1 training immutable learned CB cells before any cost/cache/KL render ..."
+  local routed_book_args=()
+  if [[ -n "${CB_ROUTED_MOE_BOOK_SELECTION:-}" ]]; then
+    routed_book_args+=(
+      --routed-moe-book-selection "$CB_ROUTED_MOE_BOOK_SELECTION"
+    )
+  fi
   python3 -m prismaquant.build_cb_learned_bundle \
     --model-dir "$MODEL_PATH" \
     --col-weights "$CB_COL_WEIGHTS" \
     --formats "$FORMATS" \
     --output "$CB_CODEBOOK_BUNDLE" \
-    --device "$DEVICE"
+    --device "$DEVICE" \
+    "${routed_book_args[@]}"
 }
 
 formats_contain_cb() {

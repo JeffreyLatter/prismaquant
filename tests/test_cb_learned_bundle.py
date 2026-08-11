@@ -9,6 +9,7 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 
 from prismaquant import cb_learned_bundle as bundle
+from prismaquant import gridbook_runtime_pin as runtime_pin
 from prismaquant import nvfp4_cb_formats as cb
 from prismaquant.cb_layout import parse_format_name, subtable_bit_widths
 
@@ -271,30 +272,74 @@ def test_cached_loader_invalidates_on_same_path_file_identity_change(mixed_bundl
     assert third is not first
 
 
-@pytest.mark.parametrize("routed_flag", [False, True])
-def test_routed_moe_learned_ref_fails_with_pinned_gridbook_reason(
-    tmp_path, monkeypatch, routed_flag
+def _gridbook_pin(version, *, commit="a" * 40, version_is_release=False):
+    return runtime_pin.parse_gridbook_runtime_pin({
+        "schema": runtime_pin.GRIDBOOK_RUNTIME_PIN_SCHEMA,
+        "repository": "https://github.com/RobTand/gridbook.git",
+        "commit": commit,
+        "version": version,
+        "version_is_release": version_is_release,
+    })
+
+
+_ROUTED_DETECTORS = (
+    ("model.layers.2.mlp.experts.gate_up_proj", False, (2, 256)),
+    ("model.layers.2.mlp.gate_up_proj", True, (2, 256)),
+    ("model.layers.2.mlp.gate_up_proj", False, (2, 2, 256)),
+)
+
+
+@pytest.mark.parametrize("qname,routed_flag,shape", _ROUTED_DETECTORS)
+def test_routed_moe_learned_ref_fails_with_old_gridbook_pin(
+    monkeypatch, qname, routed_flag, shape
 ):
-    monkeypatch.setattr(bundle, "learn_pool", _fast_learn_pool)
-    qname = "model.layers.2.mlp.experts.gate_up_proj"
-    weight = (
-        torch.zeros(2, 2, 256)
-        if not routed_flag
-        else torch.zeros(2, 256)
+    old = _gridbook_pin(
+        "0.8.2",
+        commit="9f915dd868eab2e13ab7847a67c594e2c5c8955c",
+        version_is_release=True,
     )
+    monkeypatch.setattr(bundle, "load_gridbook_runtime_pin", lambda: old)
     with pytest.raises(
         ValueError,
         match=(
             r"Gridbook 0\.8\.2.*9f915dd868eab2e13ab7847a67c594e2c5c8955c"
-            r".*no per-row/per-role LUT offset"
+            r".*per-row/per-role LUT offset ABI.*Gridbook >=0\.8\.3"
         ),
     ):
-        bundle.train_and_save_bundle(
-            tmp_path / f"routed-{routed_flag}.pqcb",
-            weights={qname: weight},
-            col_weights={qname: torch.ones(256)},
-            formats=("FP8_CB_K28",),
-            routed_moe_qnames=({qname} if routed_flag else ()),
+        bundle.refuse_routed_moe_learned(
+            qname,
+            routed_moe=routed_flag,
+            weight=torch.zeros(shape),
+        )
+
+
+@pytest.mark.parametrize("qname,routed_flag,shape", _ROUTED_DETECTORS)
+def test_routed_moe_learned_ref_lifts_at_gridbook_0_8_3_even_before_tag(
+    monkeypatch, qname, routed_flag, shape
+):
+    supported = _gridbook_pin("0.8.3", version_is_release=False)
+    monkeypatch.setattr(
+        bundle, "load_gridbook_runtime_pin", lambda: supported
+    )
+    bundle.refuse_routed_moe_learned(
+        qname,
+        routed_moe=routed_flag,
+        weight=torch.zeros(shape),
+    )
+
+
+def test_routed_moe_learned_ref_fails_closed_on_invalid_pin(monkeypatch):
+    def invalid_pin():
+        raise runtime_pin.GridbookRuntimePinError("malformed pin fixture")
+
+    monkeypatch.setattr(bundle, "load_gridbook_runtime_pin", invalid_pin)
+    with pytest.raises(
+        ValueError,
+        match=r"runtime pin is invalid.*malformed pin fixture.*Gridbook >=0\.8\.3",
+    ):
+        bundle.refuse_routed_moe_learned(
+            "model.layers.2.mlp.experts.gate_up_proj",
+            weight=torch.zeros(2, 256),
         )
 
 

@@ -1,266 +1,183 @@
-# Routed-MoE learned-codebook runtime specification
+# Routed-MoE learned-codebook boundary
 
-## Status and scope
+## Status
 
-This is a design specification for a future Gridbook release. It does not
-authorize PrismaQuant to vendor or import Gridbook, and it does not change the
-runtime pin. PrismaQuant/Gridbook compatibility continues to cross the
-repository boundary only through the immutable release pin and packaged runtime
-contract (`AGENTS.md:25-43`,
-`prismaquant/gridbook_runtime/gridbook_runtime_pin.json:1-6`). Until a release
-implementing this ABI is pinned and served validation passes, PrismaQuant must
-refuse learned-codebook refs on routed-MoE stacks.
+The producer and consumer implementations exist, but the serving path is not
+released or qualified. Gridbook commit
+`032e8158acc01b13c125db4c5463267f21b1debf` prepares version 0.8.3 and declares
+`abi_features.routed_moe_per_role_codebook_lut = 1` in its packaged
+`runtime_contract.json`. It is not tagged or published, PrismaQuant's pin has
+`version_is_release: false`, and no device execution has been performed.
 
-The change is not required for dense fused Linears. Gridbook 0.8.2 already
-resolves each dense shard role independently, interns blocks by the exact ref
-tuple, constructs a per-output-row LUT offset, and asserts that the offset
-covers every packed row
-(`/home/rob/gb-release-prep/gridbook/linear.py:374-445`). That supports distinct
-gate/up books inside dense `gate_up_proj` and distinct q/k/v books inside dense
-`qkv_proj` without a runtime ABI change. Its no-offset fused FP8 mid-M path is
-explicitly ineligible when more than one LUT block exists, and the exact
-offset-aware expansion path serves those rows instead
-(`/home/rob/gb-release-prep/gridbook/linear.py:492-497`,
-`/home/rob/gb-release-prep/gridbook/linear.py:1205-1245`).
+Nothing becomes default-on. PrismaQuant still defaults
+`CB_CODEBOOK_SOURCE_SCOPE=none`; Gridbook still requires
+`PRISMAQUANT_CB_MOE_PER_ROLE_LUT=1`; and serving-lane metadata gives the
+unreleased 0.8.3 pin no fused-rung credit. Compatibility crosses the repository
+boundary only through the immutable pin and packaged contract. PrismaQuant does
+not import or vendor Gridbook.
 
-The missing behavior is specific to routed experts. The uniform MoE resolver
-compares format fields but not `codebook_ref`, returns `schemes[0]`, and the
-loader materializes only that scheme's one LUT
-(`/home/rob/gb-release-prep/gridbook/config.py:1339-1374`,
-`/home/rob/gb-release-prep/gridbook/moe.py:458-505`). Both FP8-CB `w13` and `w2`
-then receive the same LUT
-(`/home/rob/gb-release-prep/gridbook/moe.py:1915-1946`). The mixed-expert path
-owns separate `w13` and `w2` runtime groups, but a `w13` group remains one fused
-gate+up scheme and one LUT
-(`/home/rob/gb-release-prep/gridbook/moe_mixed.py:351-417`,
-`/home/rob/gb-release-prep/gridbook/moe_mixed.py:688-710`).
+## Consumer ABI
 
-## 1. Independent fail-closed safety patch
+The wire uses ordinary config groups, not a new role-map field. A learned
+routed layer has up to three groups whose exact targets end in:
 
-Before adding multi-ref execution, Gridbook should independently add
-`codebook_ref` to the signature compared by `_moe_scheme_for_prefix`. The
-current signature contains only `grid`, `mode`, `k`, `n_sub`, `type_size`, and
-`activation_contract`, then returns the first scheme
-(`/home/rob/gb-release-prep/gridbook/config.py:1364-1374`). A normalized ref is
-the exact string or ordered tuple of subtable names; ref order is semantic
-because product-codebook lists are subtable ordered
-(`prismaquant/cb_export_config.py:643-667`).
+- `experts.gate_proj`, with gate's ordered `codebook_ref` tuple;
+- `experts.up_proj`, with up's ordered `codebook_ref` tuple; and
+- `experts.down_proj`, with down's ordered `codebook_ref` tuple.
 
-With the current one-LUT ABI, any differing ref must raise at model load with
-the conflicting targets and refs in the error. It must never be downgraded to a
-warning and must never select `schemes[0]`. This safety patch is useful on its
-own: it turns a currently possible wrong-table decode into an early refusal.
-The later multi-ref implementation will replace this single-scheme resolution
-with a structured role map rather than weakening the comparison.
+For a split per-expert-format subgroup, each logical target retains the
+physical declaration's discriminator, for example
+`experts.gate_proj.format_group_fp8_cb_k28` and
+`experts.up_proj.format_group_fp8_cb_k28`. The immutable bundle cell remains
+the unsuffixed `(layer, projection, rung)` identity shared by that subgroup.
 
-## 2. TP-safe wire ABI
+The checkpoint payload remains physically fused as
+`experts.gate_up_proj.cb_qweight` followed by its row-scale tensor, plus the
+ordinary `experts.down_proj` payload. Split stacks insert the same
+`format_group_*` discriminator after those physical parent names. Gate rows
+precede up rows. The config must not also declare a fused `gate_up_proj` ref,
+and a gate/up pair must be complete.
 
-### 2.1 Scheme field
+Gridbook commit `49733a5` first made its legacy uniform MoE resolver compare
+`codebook_ref`; without the opt-in, mismatched refs raise at model load instead
+of decoding all roles against the first scheme. Commit `776c45d` adds the
+opt-in execution ABI. It ports the dense loader's exact-reference block
+interning and per-output-row LUT offsets to routed experts:
 
-A multi-ref MoE CB scheme needs a new, explicitly versioned member:
+- distinct reference tuples remain distinct even when their current values are
+  byte-equal;
+- exact duplicate tuples are interned;
+- `w13` receives one offset per `[gate rows; up rows]` output row, shared by all
+  experts rather than repeated on the expert axis; and
+- `w2` independently resolves down's book.
 
-```json
-{
-  "codebook_ref_by_role": {
-    "gate": ["cb_codebook.<cell>.FP8_CB_K28.sub0", "...sub1", "...sub2", "...sub3"],
-    "up": ["cb_codebook.<cell>.FP8_CB_K28.sub0", "...sub1", "...sub2", "...sub3"]
-  }
-}
-```
+Offset-aware native decode operations consume those resident vectors. A
+multi-book prefill uses the exact BF16 bridge; one-LUT fused or persistent
+routes are ineligible. The flag is process-stable: changing it after first use
+raises. Missing refs, mixed formats/activation contracts, invalid role
+coverage, or a route that cannot consume offsets fail before generation.
 
-For `w13`, the mapping must contain exactly `gate` and `up`; for `w2`, it must
-contain exactly `down`. Each value is an ordered physical subtable-ref tuple,
-not a new logical alias. `codebook_ref_by_role` is mutually exclusive with the
-legacy singular `codebook_ref` for multi-ref execution. A list cannot be
-overloaded to mean roles because the existing `codebook_ref` list already means
-the product codebook's ordered subtables
-(`prismaquant/cb_export_config.py:643-667`).
+## Producer ABI
 
-The wire must not persist global `row_start` or `row_count` values. Gridbook
-creates TP-local expert buffers with `w13` output width `2 * inter` and `w2`
-output width `hidden`, where `inter` is already the partition-local intermediate
-size (`/home/rob/gb-release-prep/gridbook/moe.py:353-396`). The loader derives
-the local gate/up boundary from those loaded dimensions. This mirrors the dense
-loader's use of authoritative local widths rather than assuming a global
-checkpoint split (`/home/rob/gb-release-prep/gridbook/linear.py:381-401`).
+PrismaQuant represents one learned book as a logical
+`(layer, projection, rung)` bundle cell. The fused physical tensor is split by
+rows for encoding only: gate and up are encoded independently with their own
+book and per-expert imatrix rows, then their packed qweight and FP8 row-scale
+planes are concatenated back into physical order. Down is encoded independently
+the same way. The streaming per-expert route applies this independently to each
+rung subgroup while preserving the declaration's ascending expert-id order.
+Resident and streaming exporters emit the same logical role/config contract.
 
-For architectures whose fused expert roles are not the canonical equal-width
-gate/up pair, the model profile must provide the ordered role decomposition and
-TP-local widths. The runtime must refuse a mapping it cannot reconcile to the
-loaded row count.
+Bundle inputs bind both levels of identity:
 
-### 2.2 Per-expert-format declaration
+- the logical role records the complete rank-3 `(experts, out, in)` source and
+  stacked `(experts, 1, in)` imatrix digests; and
+- aliases record each per-expert source/imatrix digest used by the empirical
+  cost and cache paths.
 
-The current split-stack schema supports only version 1, models a group as
-`family`, `format_wire_id`, `expert_ids`, and `tensor_prefix`, and strictly
-accepts exactly three serialized entry keys
-(`/home/rob/gb-release-prep/gridbook/per_expert_format.py:14-48`,
-`/home/rob/gb-release-prep/gridbook/per_expert_format.py:73-108`,
-`/home/rob/gb-release-prep/gridbook/per_expert_format.py:149-157`). Version 2
-should add `codebook_ref_by_role` to each CB group entry. The same mapping must
-appear in the config-group scheme resolved for `tensor_prefix`; the parser must
-require exact equality rather than choosing either copy. The duplication binds
-the routing declaration and decode scheme to the same physical bytes and makes
-drift fail closed.
+Every alias resolves the role's same physical ref tuple. This preserves the
+per-Linear measurement vocabulary without training or duplicating a book per
+expert. Footprint accounting charges gate and up sidecars independently and
+deduplicates exact complete ref sets, even though the weight payload is fused.
 
-`ExpertFormatGroup` should retain the normalized immutable role-to-ref mapping.
-For each CB entry, the CPU-only parser must validate before device work:
+Routed learned production is limited to FP8 product-codebook K28–K33. This is
+not another allocator rate implementation: the allocator's common
+candidate-versus-source byte gate is authoritative. DSv4 routed experts have
+MXFP4 source rate 4.25 bpp, so K33 (4.140625 bpp) is legal and K34 (4.265625
+bpp) is not. The producer range check is a fail-closed bank/ABI boundary for
+the only expert cells that may reach export.
 
-- the exact role set for its family (`gate,up` for `w13`; `down` for `w2`);
-- the expected subtable count and order for the declared grid/rung;
-- non-empty, distinct physical names within each role's tuple;
-- exact agreement with the matching config-group scheme;
-- presence of every ref in the externally verified sidecar provenance; and
-- the existing layer, expert partition, tensor-prefix, grid, and rung checks.
+The bank was measured with one-shot `cbl_poolb`, not LDLQ. Both exporters
+therefore refuse a routed learned role when the active LDLQ scope includes
+FP8; the DSv4 production spelling is `PRISMAQUANT_CB_LDLQ_SCOPE=nvfp4` (or
+`none`). This keeps the expert encode plane identical to the burn rather than
+silently applying a different post-fit assignment at export.
 
-The current parser already resolves the matching scheme and validates its grid
-and rung against the group wire id, which is the seam to extend
-(`/home/rob/gb-release-prep/gridbook/per_expert_format.py:217-245`). Version 1
-remains readable only with its legacy one-ref semantics. Unknown versions must
-continue to fail rather than guessing
-(`/home/rob/gb-release-prep/gridbook/per_expert_format.py:101-108`).
+## Immutable burn-book selection
 
-Uniform MoE layers do not carry `per_expert_format_groups`, so the scheme-level
-mapping is authoritative there. Both uniform and split paths should call one
-shared role-map validator.
+Routed cells never call `learn_pool`. They are supplied from an explicit
+operator-selected burn-shard manifest. Each entry names one accepted shard and
+its `(layer, projection, rung)`; the manifest also names the content-addressed
+book root. The loader verifies, in order:
 
-## 3. Loader representation
+1. burn-cell, pass-tag, content-key, layer/projection/rung, expert-population,
+   source, and imatrix identities;
+2. `adopted_encoder=cbl_poolb`, one-shot/no-LDLQ measurement semantics, and
+   trainer parameters `row_sample=64`, `row_seed=4321`, `cap=2_000_000`,
+   `iters=4`, `seed=0`, fixed-lattice initialization, and `cand0_v1`
+   normalization;
+3. the content-addressed path/key and bank metadata;
+4. every FP16 subtable's name, shape, dtype, finite values, file stability,
+   historical pooled digest, and exact payload digest; and
+5. equality between the burn identities and the current role tensors before
+   those exact FP16 values enter the bundle.
 
-Port the dense block-interning mechanism rather than inventing a parallel LUT
-cache. At `process_weights_after_loading`, the MoE method should:
+There is deliberately no directory scan, nearest-rung choice, retraining,
+or lattice fallback. Missing, duplicate, unreadable, stale, or mismatched
+entries stop the build. The selection manifest participates in the pipeline's
+stage-settings hash, so replacing it cannot silently reuse an older bundle.
+Each copied bundle cell also persists the selection digest/path, burn
+content/pass identity, content-addressed book path/key/file digest, pooled and
+per-subtable digests, role/rung, and source/imatrix digests. Bundle reload
+validates that bank-origin schema and ties it back to the cell's input and
+table identities; legacy and dense cells omit the field unchanged.
 
-1. Resolve every role's exact ref tuple and obtain its already hash-verified
-   tensors through `quant_config.get_codebooks()`. That function is the one
-   memoized sidecar-loading choke point for dense, MoE, and top-level loaders
-   (`/home/rob/gb-release-prep/gridbook/config.py:836-866`).
-2. Intern by exact ref tuple, not tensor equality. Differently named refs remain
-   distinct even if their current FP16 values are equal, matching the dense
-   contract (`/home/rob/gb-release-prep/gridbook/linear.py:405-435`).
-3. Concatenate each unique table set into one flat LUT and build TP-local
-   `int32` vectors `_cb_row_offset_w13` and `_cb_row_offset_w2`. The first
-   `inter` entries of `w13` select gate, the second `inter` select up, and all
-   `hidden` entries of `w2` select down. A book pooled across all experts needs
-   an offset by output row, not an `[E,N]` table; the same vector applies to
-   every expert.
-4. Assert dtype, contiguity, device, exact row coverage, legal LUT bounds, and
-   role boundaries before any route can be selected. The dense path's
-   `cb_row_offset.numel() == rows` assertion is the minimum precedent
-   (`/home/rob/gb-release-prep/gridbook/linear.py:435-445`).
+The DSv4 run directory currently needs operator reconciliation before a real
+bundle can be built. A read-only strict audit resolves 287 valid K28–K33 book
+paths covering 284 distinct `(layer, projection, rung)` cells and 285 distinct
+FP16 payloads. The reported 236 is exactly the path count through layer 37;
+completed layers 38–42 add 51 more, so using 236 would silently discard the
+campaign tail. Final layer-shard semantics imply 264 needed logical cells, but
+no persisted file chooses pass precedence or the export assignment; three
+cells have multiple valid paths and one duplicate cell has different payloads.
+Of the strict 287 paths, 76 files are root-owned mode `0600` (141 of all 638
+files in the complete bank have that ownership). Producer code must not guess
+the intended selection or bypass those permissions.
 
-The mixed method must perform the same construction independently for every CB
-sub-stack it creates. Its current loop resolves one scheme and materializes one
-flat LUT per family/format group
-(`/home/rob/gb-release-prep/gridbook/moe_mixed.py:368-429`); the new role map and
-offset vectors belong on that group's lane object.
+## Version gate
 
-## 4. Decode launcher ABI
+`prismaquant.gridbook_runtime_pin` strictly parses the sole packaged pin. A
+final numeric version `>=0.8.3` carries this ABI; `version_is_release` is
+separate because an immutable preparation commit may implement the ABI before
+the tag exists. The current exact 0.8.3 pin therefore permits CPU production
+and export tests while still receiving no released-runtime performance credit.
 
-The FP8 grouped decode op should become conceptually:
+The routed refusal remains active for:
 
-```text
-cb_moe_gemv_fp8(
-    xq, qw_stack, cb_flat_fp8, cb_row_offset, scale,
-    pair_expert, pair_xrow, k_bits, n_sub, type_size)
-```
+- every final numeric version below 0.8.3;
+- prerelease, local, malformed, missing, or structurally invalid versions/pins;
+- any routed name, explicit routed flag, or rank-3 learned source under such a
+  pin.
 
-The Python custom op, fake implementation, extension binding, and CUDA launcher
-must all accept the offset vector. The existing MoE op has no such operand
-(`/home/rob/gb-release-prep/gridbook/ops.py:441-457`), whereas the dense op
-already passes one (`/home/rob/gb-release-prep/gridbook/ops.py:52-64`).
+Dense learned Linears do not consult this gate because their offset ABI was
+already available. Required compatibility CI installs Gridbook from the exact
+VCS commit and asserts that the version-derived capability agrees with the
+packaged `abi_features` marker.
 
-The CUDA kernel indexes an expert stack by `(expert, output_row)` but currently
-uses the unoffset LUT directly
-(`/home/rob/gb-release-prep/gridbook/csrc/cb_gemv.cu:1001-1073`). Port the dense
-operation exactly: load `cb_base = cb_row_offset[n]` and add it before each
-subtable lookup. The existing dense kernel demonstrates that address calculation
-and validates an `int32` vector covering every output row
-(`/home/rob/gb-release-prep/gridbook/csrc/cb_gemv.cu:295-317`,
-`/home/rob/gb-release-prep/gridbook/csrc/cb_gemv.cu:640-662`). The MoE launcher
-must additionally check that the offset is contiguous, on the same CUDA device,
-has `Nout` entries, and cannot address beyond the supplied LUT.
+## Ship gate
 
-`moe.py` must pass `_cb_row_offset_w13` and `_cb_row_offset_w2` to the two stages
-independently; today both stages pass the same LUT without an offset
-(`/home/rob/gb-release-prep/gridbook/moe.py:1915-1946`). The mixed decode path
-must do the same with the lane-local vectors
-(`/home/rob/gb-release-prep/gridbook/moe_mixed.py:688-710`).
+Before tagging or enabling the runtime flag in a shipping image, all of the
+following must pass on unforked vLLM in the known-good container:
 
-The first runtime release may scope multi-ref support to FP8-CB product books.
-Any FP4 or unsupported-mode scheme carrying `codebook_ref_by_role` must fail at
-load until its own grouped kernels implement the same ABI.
+1. Load a complete DSv4 artifact with deliberately different gate, up, and
+   down books at K28 and K33 (include odd K29), with exact sidecar digest and
+   fail-closed missing/extra/stale/mismatched-ref negatives.
+2. Prove decode and every selected prefill route bit-exact against independent
+   producer emulation across multiple experts, zero-token experts, and skewed
+   routing; record route telemetry and prove no one-LUT route engaged.
+3. Capture and repeatedly replay CUDA graphs for both decode and prefill. Put
+   at least two layers with different LUT allocations in one graph, interleave
+   batches/routing patterns, and introduce allocator churn between replays.
+   Compare every replay to eager output. This specifically detects a captured
+   stale LUT or row-offset pointer.
+4. Exercise TP-local row boundaries and verify offset lengths/bases for w13 and
+   w2 after load, including equal-valued but name-distinct refs and exact-ref
+   interning.
+5. Run generation/KL/PPL on the same calibration and assignment contract used
+   for the artifact, with no fallback or missing-load telemetry.
+6. Measure prefill, decode, memory, and served tokens/s on representative DSv4
+   shapes. Performance must be at least parity with the lattice container the
+   learned artifact displaces.
 
-## 5. Prefill and alternate serving routes
-
-Supporting only decode GEMV is insufficient because a loadable artifact may
-select a different prefill route.
-
-The exact BF16 quality bridge already expands FP8-CB through an op that accepts
-row offsets, but the MoE helper currently supplies a cached all-zero vector
-(`/home/rob/gb-release-prep/gridbook/moe.py:1064-1099`). For an expert slice of
-size `n_e`, it must repeat the appropriate TP-local family vector in expert-major
-order to cover the flattened `n_e * Nout` rows. The mixed prefill path calls this
-same helper and inherits the correction
-(`/home/rob/gb-release-prep/gridbook/moe_mixed.py:712-738`).
-
-The optimized FP8 grouped prefill currently obtains one LUT and passes it to
-both `w13` and `w2` launches
-(`/home/rob/gb-release-prep/gridbook/moe.py:1695-1704`,
-`/home/rob/gb-release-prep/gridbook/moe.py:1769-1792`). It must either accept
-the corresponding per-row offset in each launch or be load-time ineligible for
-a multi-ref layer. Until ported and validated, selection must fall back to the
-corrected quality bridge with explicit route telemetry; silently invoking the
-old one-LUT kernel is forbidden.
-
-The same rule applies to every alternative fused, persistent, expansion, or
-decode route: it must consume the role offsets or be deterministically gated
-off for multi-ref schemes. For example, persistent-B prefill currently accepts
-one LUT and no row-offset tensor
-(`/home/rob/gb-release-prep/gridbook/ops.py:273-315`,
-`/home/rob/gb-release-prep/gridbook/moe.py:1289-1307`). Even when a route is
-FP4-only and therefore outside the first FP8-CBL implementation, its selector
-must not accidentally claim a future multi-ref scheme.
-
-All offset tensors are materialized once at load and remain device resident.
-Steady-state dispatch must not read refs, environments, or device values on the
-host; this preserves the existing GPU-bound/capturable contract.
-
-## 6. Minimum served validation gate
-
-A Gridbook release may declare routed learned books production-capable only
-after all of the following pass:
-
-1. **CPU parser/refusal tests.** Version-1 compatibility, version-2 happy paths,
-   and failures for missing/extra roles, malformed subtable tuples, declaration
-   versus scheme mismatch, unknown refs, wrong family/rung, and unsupported
-   grids. Every malformed artifact fails before device work.
-2. **Loader-offset tests.** Use gate/up/down refs whose tensor values are
-   deliberately identical and prove that name-distinct refs remain distinct,
-   that exact duplicates are interned, and that TP-local `w13`/`w2` offsets
-   cover every row with the expected block bases. This protects the deliberate
-   reference-identity behavior already present in dense loading
-   (`/home/rob/gb-release-prep/gridbook/linear.py:405-443`).
-3. **CUDA bit-exactness.** Compare grouped decode and every eligible prefill
-   route against the codec/emulation result for distinct gate/up/down books at
-   representative certified rungs, including K28, K38, and K43; cover odd and
-   even subtable splits, multiple experts, zero-token experts, and skewed
-   routing. Equality is bit-exact at the declared reconstruction boundary, not
-   merely a tolerance claim.
-4. **CUDA graph replay.** Capture and replay decode and prefill with distinct
-   role refs and prove that graph execution retains the correct offsets.
-5. **Artifact negatives.** On unforked vLLM, boot a complete artifact and prove
-   missing, extra, stale, and digest-mismatched refs refuse. Gridbook already
-   requires the external digest name set to cover the sidecar exactly; the new
-   role map must preserve that gate
-   (`/home/rob/gb-release-prep/gridbook/cb_digest.py:72-114`).
-6. **End-to-end serving.** Generate through both decode and prefill, record route
-   telemetry proving the offset-capable kernels engaged, and compare output to
-   the producer's exact learned-book emulation.
-7. **Performance.** Served speed on representative routed shapes is at least at
-   parity with the lattice container displaced. Any correctness fallback used
-   by a multi-ref artifact must itself satisfy the production performance gate.
-
-After those gates, Gridbook must package the producer profile in its immutable
-`runtime_contract.json`, publish a release, and PrismaQuant must update its
-runtime pin. Producer refusal can be removed only for the exact declared
-contract; dense learned-codebook production remains independent of this future
-work (`AGENTS.md:25-43`).
+Only after those gates should the owner tag/publish Gridbook, flip the pin's
+release truth, and consider enabling the runtime opt-in in a served recipe.
