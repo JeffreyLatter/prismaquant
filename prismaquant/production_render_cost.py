@@ -20,8 +20,12 @@ import math
 import pickle
 from collections.abc import Mapping, Sequence
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from prismaquant import format_registry as fr
+
+if TYPE_CHECKING:
+    from prismaquant.source_class_format_plan import SourceClassFormatPlan
 
 
 SCHEMA = "prismaquant.production_render_score_cost.v1"
@@ -72,6 +76,113 @@ def _cache_render_score_records(cache: object) -> dict[tuple[str, str], dict]:
             continue
         out[(qname, fmt)] = dict(raw_record)
     return out
+
+
+def _attested_transient_cb_pairs(cache: object) -> set[tuple[str, str]]:
+    """Validate score-only CB artifacts and return their admitted pair scope.
+
+    A bare ``render_scores`` row is deliberately insufficient.  The transient
+    producer must bind it to the canonical rendered tensor, synchronous
+    consumer result, exact pair identity, and the complete artifact-set digest.
+    """
+    meta = getattr(cache, "metadata", None)
+    if not isinstance(meta, Mapping):
+        return set()
+    transient = meta.get("transient_render_artifacts")
+    if not isinstance(transient, Mapping):
+        return set()
+    records = transient.get("records")
+    consumer_identity = transient.get("consumer_identity")
+    pair_set = meta.get("cb_cache_pair_identity")
+    if (
+        transient.get("schema")
+        != "prismaquant.production_weight_cache.transient_render_artifacts.v1"
+        or not isinstance(records, Mapping)
+        or not isinstance(consumer_identity, Mapping)
+        or not isinstance(pair_set, Mapping)
+    ):
+        raise ValueError("malformed transient CB render artifact manifest")
+
+    from prismaquant.production_weight_cache import (
+        CB_TRANSIENT_CONSUMER_RECEIPT_SCHEMA,
+        _canonical_json_sha256,
+        first_identity_difference,
+    )
+
+    if int(transient.get("entries", -1)) != len(records):
+        raise ValueError("transient CB render artifact entry count differs")
+    if int(pair_set.get("published_entries", -1)) != len(records):
+        raise ValueError("transient CB pair publication count differs")
+    observed_artifact_sha256 = _canonical_json_sha256(
+        records,
+        where="transient CB render artifact set",
+    )
+    if pair_set.get("artifact_sha256") != observed_artifact_sha256:
+        raise ValueError("transient CB render artifact set digest differs")
+
+    score_records = _cache_render_score_records(cache)
+    admitted: set[tuple[str, str]] = set()
+    for raw_key, artifact in records.items():
+        if not isinstance(artifact, Mapping):
+            raise ValueError(f"malformed transient CB artifact {raw_key!r}")
+        identity = artifact.get("identity")
+        tensor = artifact.get("tensor")
+        render_score = artifact.get("render_score")
+        receipt = artifact.get("consumer_receipt")
+        if not all(isinstance(value, Mapping) for value in (
+            identity, tensor, render_score, receipt,
+        )):
+            raise ValueError(
+                f"transient CB artifact {raw_key!r} is not value-bearing"
+            )
+        qname = canonical_cost_name(str(identity.get("qname", "")))
+        fmt = fr.canonical_format_name(str(identity.get("format", "")))
+        expected_binding = {
+            "schema": CB_TRANSIENT_CONSUMER_RECEIPT_SCHEMA,
+            "qname": str(identity.get("qname", "")),
+            "format": fmt,
+            "consumer_identity": dict(consumer_identity),
+            "tensor": dict(tensor),
+            "render_score_sha256": _canonical_json_sha256(
+                render_score,
+                where=f"transient CB render score {raw_key}",
+            ),
+        }
+        observed_binding = {
+            field: receipt.get(field) for field in expected_binding
+        }
+        if first_identity_difference(
+            observed_binding,
+            expected_binding,
+            path="consumer_receipt",
+        ) is not None:
+            raise ValueError(
+                f"transient CB consumer receipt differs for {raw_key}"
+            )
+        result = receipt.get("result")
+        if not isinstance(result, Mapping) or receipt.get(
+            "result_sha256"
+        ) != _canonical_json_sha256(
+            result,
+            where=f"transient CB consumer result {raw_key}",
+        ):
+            raise ValueError(
+                f"transient CB consumer result digest differs for {raw_key}"
+            )
+        manifest_score = score_records.get((qname, fmt))
+        if (
+            manifest_score is None
+            or _canonical_json_sha256(
+                manifest_score,
+                where=f"cache render score {raw_key}",
+            )
+            != expected_binding["render_score_sha256"]
+        ):
+            raise ValueError(
+                f"transient CB render score manifest differs for {raw_key}"
+            )
+        admitted.add((qname, fmt))
+    return admitted
 
 
 def _calibration_hashes(*sources: object) -> list[str]:
@@ -205,6 +316,97 @@ def _production_cost_entry(
     }
 
 
+def _validated_format_plan_scope(
+    production_cache: object,
+    baseline_costs: Mapping[str, object],
+    output_formats: Sequence[str],
+    format_plan: "SourceClassFormatPlan",
+) -> tuple[dict[str, frozenset[str]], frozenset[str]]:
+    """Bind pricing to the exact source-class plan used by the renderer.
+
+    The format plan partitions only its declared family. Formats outside that
+    family (for example BF16/source terminals or a separately declared family)
+    remain global. Within the planned family, every baseline unit receives
+    exactly its declared menu: no illegal higher-rate cell and no
+    demand-truncated legal rung.
+    """
+    metadata = getattr(production_cache, "metadata", None)
+    if not isinstance(metadata, Mapping):
+        raise ValueError(
+            "--format-plan requires cache metadata with a bound plan identity"
+        )
+    expected_identity = str(format_plan.identity_sha256)
+    observed_identity = metadata.get("format_plan_identity_sha256")
+    if observed_identity != expected_identity:
+        raise ValueError(
+            "production cache format-plan identity mismatch: "
+            f"expected={expected_identity!r} observed={observed_identity!r}"
+        )
+
+    scope: dict[str, frozenset[str]] = {}
+    for raw_qname, raw_formats in format_plan.formats_by_qname().items():
+        qname = canonical_cost_name(raw_qname)
+        formats = frozenset(
+            fr.canonical_format_name(str(fmt)) for fmt in raw_formats
+        )
+        previous = scope.setdefault(qname, formats)
+        if previous != formats:
+            raise ValueError(
+                "format plan contains colliding canonical qnames with "
+                f"different menus: {qname}"
+            )
+    planned_universe = frozenset(
+        fmt for formats in scope.values() for fmt in formats
+    )
+    if not planned_universe:
+        raise ValueError("format plan has an empty planned format universe")
+
+    requested_planned = frozenset(
+        fmt for fmt in output_formats if fmt in planned_universe
+    )
+    if requested_planned != planned_universe:
+        raise ValueError(
+            "requested formats truncate the source-class format plan: "
+            f"missing={sorted(planned_universe - requested_planned)}"
+        )
+
+    baseline_names: dict[str, str] = {}
+    for raw_qname in baseline_costs:
+        qname = canonical_cost_name(str(raw_qname))
+        previous = baseline_names.setdefault(qname, str(raw_qname))
+        if previous != str(raw_qname):
+            raise ValueError(
+                "baseline costs contain colliding canonical qnames: "
+                f"{previous!r} and {raw_qname!r}"
+            )
+    missing_baseline = sorted(set(scope) - set(baseline_names))
+    if missing_baseline:
+        raise ValueError(
+            "baseline costs do not cover every format-plan unit; sample="
+            f"{missing_baseline[:8]}"
+        )
+    unplanned_baseline = sorted(set(baseline_names) - set(scope))
+    if unplanned_baseline:
+        raise ValueError(
+            "baseline costs contain units absent from the format plan; "
+            f"sample={unplanned_baseline[:8]}"
+        )
+
+    # Refuse a cache that claims this plan identity but nevertheless recorded
+    # an illegal planned-family render. Ignoring such a row would hide illegal
+    # work and let a future consumer accidentally revive it.
+    for (qname, fmt) in _cache_render_score_records(production_cache):
+        if fmt not in planned_universe:
+            continue
+        allowed = scope.get(qname)
+        if allowed is None or fmt not in allowed:
+            raise ValueError(
+                "production cache contains a render outside its source-class "
+                f"format plan: {qname}@{fmt}"
+            )
+    return scope, planned_universe
+
+
 def synthesize_production_render_cost_payload(
     production_cache: object,
     baseline_cost_payload: Mapping,
@@ -214,6 +416,7 @@ def synthesize_production_render_cost_payload(
     source_label: str | None = None,
     require_render_scores: bool = False,
     require_output_metric: bool = False,
+    format_plan: "SourceClassFormatPlan | None" = None,
 ) -> dict:
     baseline_costs = dict(baseline_cost_payload["costs"])
     output_formats = [
@@ -225,6 +428,16 @@ def synthesize_production_render_cost_payload(
         )
     ]
     output_formats = list(dict.fromkeys(output_formats))
+
+    planned_scope: dict[str, frozenset[str]] | None = None
+    planned_universe: frozenset[str] = frozenset()
+    if format_plan is not None:
+        planned_scope, planned_universe = _validated_format_plan_scope(
+            production_cache,
+            baseline_costs,
+            output_formats,
+            format_plan,
+        )
 
     cb_context = None
     cb_render_provenance: dict[str, object] = {}
@@ -274,11 +487,14 @@ def synthesize_production_render_cost_payload(
             if fr.get_format(fr.canonical_format_name(fmt)).family
             in {"nvfp4_cb", "fp8_cb"}
         }
+        transient_pairs = _attested_transient_cb_pairs(production_cache)
         # A score is usable only when both the value-bearing identity and an
         # actual admitted cache tensor cover the row.  This prevents an old
         # render_scores.json entry (including one left after a failed fresh
         # render) from being relabeled under today's identity.
-        valid_cb_render_records = identity_pairs & cache_pairs
+        valid_cb_render_records = identity_pairs & (
+            cache_pairs | transient_pairs
+        )
 
     records = _cache_render_score_records(production_cache)
 
@@ -293,7 +509,14 @@ def synthesize_production_render_cost_payload(
         cname = canonical_cost_name(str(qname))
         per_name = dict(per_name_raw)
         synthesized: dict[str, dict] = {}
-        for fmt in output_formats:
+        per_qname_formats = output_formats
+        if planned_scope is not None:
+            allowed = planned_scope[cname]
+            per_qname_formats = [
+                fmt for fmt in output_formats
+                if fmt not in planned_universe or fmt in allowed
+            ]
+        for fmt in per_qname_formats:
             fmt_c = fr.canonical_format_name(fmt)
             if fmt_c == "BF16":
                 synthesized[fmt_c] = {
@@ -410,6 +633,10 @@ def synthesize_production_render_cost_payload(
         # value-bearing identity; reconstructing a fresh stamp here would lose
         # the exact imatrix qname scope/content binding.
         inherited_provenance.update(cb_render_provenance)
+    if format_plan is not None:
+        inherited_provenance["source_format_plan_identity_sha256"] = (
+            format_plan.identity_sha256
+        )
     return {
         "schema": SCHEMA,
         "costs": output_costs,
@@ -426,6 +653,10 @@ def synthesize_production_render_cost_payload(
             "production_cache_source": source_label,
             "baseline_schema": baseline_cost_payload.get("schema"),
             "baseline_meta": baseline_cost_payload.get("meta"),
+            "source_format_plan_identity_sha256": (
+                format_plan.identity_sha256
+                if format_plan is not None else None
+            ),
             "score_field": score_field,
             "render_score_entries": int(render_entries),
             "fallback_entries": int(fallback_entries),
@@ -454,6 +685,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--formats",
         default=None,
         help="Comma-separated formats. Defaults to baseline cost formats.",
+    )
+    parser.add_argument(
+        "--format-plan",
+        default=None,
+        help="Identity-bound source-class format plan used to build the "
+        "production cache. Planned-family rows are priced only within each "
+        "qname's exact legal menu; identity drift and truncation are fatal.",
     )
     parser.add_argument(
         "--score-field",
@@ -498,6 +736,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         [fmt.strip() for fmt in args.formats.split(",") if fmt.strip()]
         if args.formats else None
     )
+    format_plan = None
+    if args.format_plan:
+        from prismaquant.source_class_format_plan import load_format_plan
+
+        format_plan = load_format_plan(args.format_plan)
     payload = synthesize_production_render_cost_payload(
         cache,
         baseline,
@@ -506,6 +749,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         source_label=str(args.production_cache),
         require_render_scores=bool(args.require_render_scores),
         require_output_metric=bool(args.require_output_metric),
+        format_plan=format_plan,
     )
     # Stamp the pipeline COST_MODE (re-vet R2 precondition (i)): cost.pkl is
     # the same path under every mode, so reuse must be conditional on it.

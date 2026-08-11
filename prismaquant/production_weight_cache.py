@@ -112,6 +112,9 @@ CB_CACHE_PAIR_IDENTITY_SCHEMA = (
 CB_CACHE_PAIR_SIDECAR_SCHEMA = (
     "prismaquant.production_weight_cache.cb_pair_sidecar.v1"
 )
+CB_TRANSIENT_CONSUMER_RECEIPT_SCHEMA = (
+    "prismaquant.production_weight_cache.cb_transient_consumer_receipt.v1"
+)
 
 
 def _render_base_format(fmt: str) -> str:
@@ -1177,8 +1180,10 @@ def _store_rendered_weight_entry(
     from prismaquant import format_registry as fr
 
     fmt = fr.canonical_format_name(str(fmt).strip().upper())
-    target_dtype = weight_dtype if weight_dtype != torch.float32 else torch.bfloat16
-    stored = tensor.to(target_dtype).cpu()
+    stored = _canonical_rendered_weight_tensor(
+        tensor,
+        weight_dtype=weight_dtype,
+    )
     if cache_dir_path is not None:
         fname = _cache_weight_filename(qname, fmt)
         final_path = cache_dir_path / fname
@@ -1201,6 +1206,27 @@ def _store_rendered_weight_entry(
         del stored
     else:
         weights[(qname, fmt)] = stored
+
+
+def _canonical_rendered_weight_tensor(
+    tensor: torch.Tensor,
+    *,
+    weight_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Return the exact tensor representation a cache shard would contain.
+
+    Renderers may compute in FP32 even when the source model is BF16.  Any
+    transient consumer must score this canonical representation, rather than
+    the wider temporary, so its scalar describes the bytes later installed by
+    validation/export.
+    """
+    target_dtype = (
+        weight_dtype if weight_dtype != torch.float32 else torch.bfloat16
+    )
+    return tensor.detach().to(
+        dtype=target_dtype,
+        device="cpu",
+    ).contiguous()
 
 @dataclass
 class _RenderedCandidate:
@@ -2324,6 +2350,9 @@ def _validate_cb_cache_pair_resume(
     require_render_score: bool = False,
     require_packed_state: bool = False,
     verify_shard_payload: bool = False,
+    allow_missing_shard: bool = False,
+    require_consumer_receipt: bool = False,
+    expected_consumer_identity: Mapping[str, object] | None = None,
 ) -> dict[str, object] | None:
     """Admit one existing CB shard only under its exact per-pair stamp.
 
@@ -2468,6 +2497,83 @@ def _validate_cb_cache_pair_resume(
                 f"expected={observed_score_sha256!r}; refusing reuse or "
                 "re-render"
             )
+    consumer_receipt = sidecar.get("consumer_receipt")
+    if require_consumer_receipt or expected_consumer_identity is not None:
+        if not isinstance(consumer_receipt, Mapping):
+            raise RuntimeError(
+                f"production CB cache resume refused for {qname}@{fmt}: "
+                "identity field 'consumer_receipt' differs: stored=<missing> "
+                "expected=<value-bearing transient-consumer receipt>; "
+                "refusing reuse or re-render"
+            )
+        expected_receipt_binding = {
+            "schema": CB_TRANSIENT_CONSUMER_RECEIPT_SCHEMA,
+            "qname": str(qname),
+            "format": str(fmt).upper(),
+            "tensor": dict(tensor_metadata),
+            "render_score_sha256": sidecar.get("render_score_sha256"),
+        }
+        observed_receipt_binding = {
+            field: consumer_receipt.get(field)
+            for field in expected_receipt_binding
+        }
+        receipt_difference = first_identity_difference(
+            observed_receipt_binding,
+            expected_receipt_binding,
+            path="consumer_receipt",
+        )
+        if receipt_difference is not None:
+            field, stored, expected = receipt_difference
+            raise RuntimeError(
+                f"production CB cache resume refused for {qname}@{fmt}: "
+                f"identity field '{field}' differs: "
+                f"stored={identity_value_for_error(stored)} "
+                f"expected={identity_value_for_error(expected)}; refusing "
+                "reuse or re-render"
+            )
+        if expected_consumer_identity is not None:
+            receipt_difference = first_identity_difference(
+                consumer_receipt.get("consumer_identity"),
+                expected_consumer_identity,
+                path="consumer_receipt.consumer_identity",
+            )
+            if receipt_difference is not None:
+                field, stored, expected = receipt_difference
+                raise RuntimeError(
+                    f"production CB cache resume refused for {qname}@{fmt}: "
+                    f"identity field '{field}' differs: "
+                    f"stored={identity_value_for_error(stored)} "
+                    f"expected={identity_value_for_error(expected)}; refusing "
+                    "reuse or re-render"
+                )
+        result = consumer_receipt.get("result")
+        if not isinstance(result, Mapping):
+            raise RuntimeError(
+                f"production CB cache resume refused for {qname}@{fmt}: "
+                "identity field 'consumer_receipt.result' differs: "
+                "stored=<missing> expected=<canonical result>; refusing "
+                "reuse or re-render"
+            )
+        observed_result_sha256 = _canonical_json_sha256(
+            result,
+            where=f"CB transient consumer result {qname}@{fmt}",
+        )
+        if consumer_receipt.get("result_sha256") != observed_result_sha256:
+            raise RuntimeError(
+                f"production CB cache resume refused for {qname}@{fmt}: "
+                "identity field 'consumer_receipt.result_sha256' differs; "
+                "refusing reuse or re-render"
+            )
+        observed_receipt_sha256 = _canonical_json_sha256(
+            consumer_receipt,
+            where=f"CB transient consumer receipt {qname}@{fmt}",
+        )
+        if sidecar.get("consumer_receipt_sha256") != observed_receipt_sha256:
+            raise RuntimeError(
+                f"production CB cache resume refused for {qname}@{fmt}: "
+                "identity field 'consumer_receipt_sha256' differs; refusing "
+                "reuse or re-render"
+            )
     packed_state = sidecar.get("packed_state")
     if require_packed_state:
         if not isinstance(packed_state, Mapping):
@@ -2513,7 +2619,7 @@ def _validate_cb_cache_pair_resume(
                 "expected=<positive activation scale and exact coverage>; "
                 "refusing reuse or re-render"
             )
-    return sidecar if shard_exists else None
+    return sidecar if (shard_exists or allow_missing_shard) else None
 
 
 def _cb_cache_tensor_identity(tensor: torch.Tensor) -> dict[str, object]:
@@ -2527,6 +2633,41 @@ def _cb_cache_tensor_identity(tensor: torch.Tensor) -> dict[str, object]:
     }
 
 
+def _build_cb_transient_consumer_receipt(
+    *,
+    qname: str,
+    fmt: str,
+    tensor: torch.Tensor,
+    render_score: Mapping[str, object],
+    consumer_identity: Mapping[str, object],
+    result: Mapping[str, object],
+) -> dict[str, object]:
+    """Bind one synchronous scalar consumer to the exact canonical render."""
+    canonical_result = _canonical_json_value(
+        dict(result),
+        where=f"CB transient consumer result {qname}@{fmt}",
+    )
+    return _canonical_json_value(
+        {
+            "schema": CB_TRANSIENT_CONSUMER_RECEIPT_SCHEMA,
+            "qname": str(qname),
+            "format": str(fmt).upper(),
+            "consumer_identity": dict(consumer_identity),
+            "tensor": _cb_cache_tensor_identity(tensor),
+            "render_score_sha256": _canonical_json_sha256(
+                render_score,
+                where=f"CB cache render score {qname}@{fmt}",
+            ),
+            "result": canonical_result,
+            "result_sha256": _canonical_json_sha256(
+                canonical_result,
+                where=f"CB transient consumer result {qname}@{fmt}",
+            ),
+        },
+        where=f"CB transient consumer receipt {qname}@{fmt}",
+    )
+
+
 def _write_cb_cache_pair_sidecar(
     *,
     cache_dir_path: Path,
@@ -2537,6 +2678,8 @@ def _write_cb_cache_pair_sidecar(
     encode_seconds: float,
     render_score: Mapping[str, object] | None = None,
     packed_state: Mapping[str, object] | None = None,
+    consumer_receipt: Mapping[str, object] | None = None,
+    retained_weight: bool = True,
 ) -> None:
     """Durably stamp a pair before the atomic weight-shard publication."""
     target_dtype = (
@@ -2557,6 +2700,14 @@ def _write_cb_cache_pair_sidecar(
             where=f"packed CB cache state {qname}@{fmt}",
         )
         if packed_state is not None
+        else None
+    )
+    canonical_consumer_receipt = (
+        _canonical_json_value(
+            dict(consumer_receipt),
+            where=f"CB transient consumer receipt {qname}@{fmt}",
+        )
+        if consumer_receipt is not None
         else None
     )
     payload = {
@@ -2584,6 +2735,16 @@ def _write_cb_cache_pair_sidecar(
             if canonical_packed_state is not None
             else None
         ),
+        "consumer_receipt": canonical_consumer_receipt,
+        "consumer_receipt_sha256": (
+            _canonical_json_sha256(
+                canonical_consumer_receipt,
+                where=f"CB transient consumer receipt {qname}@{fmt}",
+            )
+            if canonical_consumer_receipt is not None
+            else None
+        ),
+        "retained_weight": bool(retained_weight),
     }
     path = cache_dir_path / _cache_pair_identity_filename(qname, fmt)
     tmp = path.with_name(path.name + ".tmp")
@@ -3922,6 +4083,7 @@ def render_production_weight(
     col_weights: torch.Tensor | None = None,
     cb_serialization_context=None,
     gate_trace: list[dict[str, object]] | None = None,
+    ldlq_missing_activation_ok: bool = False,
 ) -> torch.Tensor:
     """Compute the production-faithful dequantized weight for ``(qname, fmt)``.
 
@@ -3955,6 +4117,13 @@ def render_production_weight(
     activation matrix on this path can reproduce. With it, the CB lane's cost,
     KL and shipped bytes can come from ONE render through
     ``ProductionWeightCache``.
+
+    ``ldlq_missing_activation_ok`` is a deliberately narrow cold-expert
+    escape hatch.  It may be set only by a caller that has already checked an
+    exact never-routed provenance declaration.  In that case the exporter
+    itself fail-closes LDLQ to the raw, imatrix-weighted render, so returning
+    that same render is production-faithful.  The default remains fail-closed
+    for an ordinary missing activation row.
 
     """
     from prismaquant import format_registry as fr
@@ -4034,6 +4203,7 @@ def render_production_weight(
                 qname=qname,
                 col_weights=col_weights.reshape(-1).to(weight.device),
                 activation_rows=acts_for_render,
+                ldlq_missing_activation_ok=ldlq_missing_activation_ok,
             ).to(device=weight.device, dtype=weight.dtype)
         else:
             from prismaquant.emu_forward_kl import weighted_quantize_dequantize
@@ -4565,6 +4735,9 @@ def fill_production_weight_cache(
     admitted_cb_pairs: dict[
         tuple[str, str], dict[str, object]
     ] = {}
+    rerender_expected_cb_pairs: dict[
+        tuple[str, str], dict[str, object]
+    ] = {}
     if cache_dir is not None:
         cache_dir_path = Path(cache_dir)
         cache_dir_path.mkdir(parents=True, exist_ok=True)
@@ -4619,9 +4792,22 @@ def fill_production_weight_cache(
                         fmt=fmt,
                         expected_identity=pair_identity,
                         require_render_score=True,
+                        allow_missing_shard=True,
                     )
                     if admitted is not None:
-                        admitted_cb_pairs[key] = admitted
+                        shard_path = (
+                            cache_dir_path
+                            / _cache_weight_filename(qname, fmt)
+                        )
+                        if shard_path.is_file():
+                            admitted_cb_pairs[key] = admitted
+                        else:
+                            # A streamed-menu consumer intentionally leaves
+                            # only the identity-bound scalar + canonical tensor
+                            # digest.  The selected assignment is re-rendered,
+                            # and publication is allowed only if its canonical
+                            # bytes match what that scalar scored.
+                            rerender_expected_cb_pairs[key] = admitted
     render_score_sidecar_path: Path | None = (
         cache_dir_path / "render_scores.json"
         if cache_dir_path is not None else None
@@ -5113,6 +5299,30 @@ def fill_production_weight_cache(
                         f"production CB cache pair identity missing before "
                         f"publishing {qname}@{fmt_key}"
                     )
+                expected_sidecar = rerender_expected_cb_pairs.get(
+                    (qname, fmt_key)
+                )
+                if expected_sidecar is not None:
+                    observed_tensor = _cb_cache_tensor_identity(
+                        _canonical_rendered_weight_tensor(
+                            w_dq,
+                            weight_dtype=weight.dtype,
+                        )
+                    )
+                    tensor_difference = first_identity_difference(
+                        expected_sidecar.get("tensor"),
+                        observed_tensor,
+                        path="tensor",
+                    )
+                    if tensor_difference is not None:
+                        field, stored, expected = tensor_difference
+                        raise RuntimeError(
+                            "selected CB assignment re-render differs from "
+                            f"the streamed scalar for {qname}@{fmt_key} at "
+                            f"'{field}': stored={identity_value_for_error(stored)} "
+                            f"rerendered={identity_value_for_error(expected)}; "
+                            "refusing publication"
+                        )
                 _write_cb_cache_pair_sidecar(
                     cache_dir_path=cache_dir_path,
                     qname=qname,
@@ -5123,6 +5333,14 @@ def fill_production_weight_cache(
                     render_score=render_score_records[
                         _render_score_record_key(qname, fmt_key)
                     ],
+                    consumer_receipt=(
+                        expected_sidecar.get("consumer_receipt")
+                        if expected_sidecar is not None
+                        and isinstance(
+                            expected_sidecar.get("consumer_receipt"), Mapping
+                        )
+                        else None
+                    ),
                 )
             _store_rendered_weight_entry(
                 weights=weights,
