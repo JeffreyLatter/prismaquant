@@ -48,7 +48,10 @@ from prismaquant.dsv4_aura_cb_reprice import (
     FP8_NONEXPERT_FORMATS,
     NVFP4_FORMATS,
     _recipe_format,
+    _finish_dsv4_campaign,
+    _allocator_command,
     run_dsv4_anchor_campaign,
+    _selected_assignment,
     _validate_routed_bundle_selection_identity,
     _safe_work_dir,
     _validated_cold_expert_provenance,
@@ -170,6 +173,17 @@ def test_cb_mapping_uses_authoritative_basis_and_source_gated_ladders():
     by_name = {unit.qname: unit for unit in units}
     expert, dense = by_name["expert"], by_name["dense"]
 
+    expert_terminal = next(
+        candidate for candidate in expert.candidates if candidate.terminal
+    )
+    dense_terminal = next(
+        candidate for candidate in dense.candidates if candidate.terminal
+    )
+    assert expert_terminal.format_name == "MXFP4_SOURCE"
+    assert expert_terminal.allocator_selectable
+    assert dense_terminal.format_name == "FP8_BLOCK_UE8M0_SOURCE"
+    assert not dense_terminal.allocator_selectable
+
     expert_segments = candidates_by_segment(expert, plugin)
     dense_segments = candidates_by_segment(dense, plugin)
     assert {
@@ -219,6 +233,31 @@ def test_cb_mapping_uses_authoritative_basis_and_source_gated_ladders():
         build_cb_units((
             _declaration("dense", role="wq_a", nonexpert=True),
         ), _plugin(source_map=incomplete))
+
+
+@pytest.mark.parametrize(("terminal", "selectable"), (
+    ("BF16", True),
+    ("FP8_SOURCE", True),
+    ("MXFP4_SOURCE", True),
+    ("FP8_BLOCK_UE8M0_SOURCE", False),
+))
+def test_terminal_selectability_is_activation_identity(
+    terminal, selectable,
+):
+    plugin = _plugin()
+    (unit,) = build_cb_units((CBUnitDeclaration(
+        qname=f"unit.{terminal}",
+        role="wq_a",
+        unit_class="test",
+        n_params=8_192,
+        payload_bytes_by_format={
+            "NVFP4_CB_K12": 1_000,
+            terminal: 9_000,
+        },
+        terminal_format=terminal,
+    ),), plugin)
+    candidate = next(item for item in unit.candidates if item.terminal)
+    assert candidate.allocator_selectable is selectable
 
 
 def test_anchor_count_scales_by_unit_equivalence_segment_not_rung():
@@ -853,7 +892,7 @@ def test_exportable_artifact_resume_safely_finishes_interrupted_publish(
 
 
 def test_dsv4_driver_wires_resume_to_allocator_and_artifact_publish():
-    tree = ast.parse(inspect.getsource(run_dsv4_anchor_campaign))
+    tree = ast.parse(inspect.getsource(_finish_dsv4_campaign))
     calls = {
         node.func.id: node
         for node in ast.walk(tree)
@@ -873,6 +912,43 @@ def test_dsv4_driver_wires_resume_to_allocator_and_artifact_publish():
         assert ast.dump(resume) == ast.dump(ast.parse(
             "bool(args.resume)", mode="eval",
         ).body)
+
+
+def test_dsv4_allocator_command_excludes_unmeasured_fp8_terminal(tmp_path):
+    prepared = SimpleNamespace(
+        args=SimpleNamespace(
+            probe=tmp_path / "probe.pkl",
+            model=tmp_path / "model",
+            col_weights=tmp_path / "col.pkl",
+        ),
+        cb_context=SimpleNamespace(
+            codebook_bundle_path=tmp_path / "bundle.pqcb"
+        ),
+    )
+    command = _allocator_command(
+        prepared,
+        cost_path=tmp_path / "cost.pkl",
+        output_dir=tmp_path / "allocator",
+    )
+    formats = command[command.index("--formats") + 1].split(",")
+    assert "MXFP4_SOURCE" in formats
+    assert "BF16" in formats
+    assert "FP8_BLOCK_UE8M0_SOURCE" not in formats
+
+
+def test_selected_assignment_refuses_identity_only_fp8_terminal(tmp_path):
+    plugin = _plugin()
+    (unit,) = build_cb_units((
+        _declaration("dense", role="wq_a", nonexpert=True),
+    ), plugin)
+    layer_config = tmp_path / "layer_config.json"
+    layer_config.write_text(json.dumps({
+        unit.qname: "FP8_BLOCK_UE8M0_SOURCE",
+    }))
+    with pytest.raises(
+        DSv4CampaignError, match="source-illegal or unmeasured",
+    ):
+        _selected_assignment(layer_config, (unit,))
 
 
 def test_allocator_supersurrogate_gate_is_satisfied_and_stays_fail_closed(

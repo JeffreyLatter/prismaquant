@@ -8,7 +8,12 @@ PREFLIGHT="${REPO_ROOT}/tools/aura_cb_reprice_preflight.py"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 GPU_LOCK="${GPU_LOCK:-/home/rob/dq-runs/gpu.lock}"
 DATASET="${DATASET:-/home/rob/dq-runs/calibration/diverse-v1.jsonl}"
-IMAGE="${IMAGE:-gridbook:test}"
+RUNTIME_IDENTITY_TOOL="${REPO_ROOT}/tools/container_runtime_identity.py"
+# The image name is only a human-facing repository label.  The digest is the
+# execution identity: local tags on the Spark have repeatedly been repointed
+# between materially different Gridbook/Transformers environments.
+PINNED_PRODUCER_IMAGE="gridbook@sha256:f7dad9260fea6f4207bd894acc9ebc034d91c599a70489a89ab1938a75db9c47"
+IMAGE="${IMAGE:-$PINNED_PRODUCER_IMAGE}"
 
 usage() {
   cat <<'EOF'
@@ -49,10 +54,10 @@ if [[ "$TARGET" == "dsv4" ]]; then
   MODEL_PATH="${MODEL_PATH:-${RUN_ROOT}/source}"
   WORK_DIR="${WORK_DIR:-${RUN_ROOT}/aura-cb-reprice}"
   CB_COL_WEIGHTS="${CB_COL_WEIGHTS:-${RUN_ROOT}/prod-cal-0p7/artifacts/cb_col_weights.pkl}"
-  # The worst routed layer builds 51.3 GiB of exact FP32 anchor deltas and
-  # carries ~24.4 GiB of source/gradient state.  Anchors are consumed while
-  # those deltas are built, but a multi-layer source cache would still overlap
-  # the ~75.7 GiB working set and OOM a 128 GiB Spark.  A 100 GiB reserve leaves
+  # The worst routed layer retains 25.62 GiB of BF16 anchor deltas alongside
+  # 12.18 GiB of source weights and its activation/cotangent state. Parameter
+  # gradients are harvested inside backward, but a multi-layer source cache
+  # would still erase the single-Spark safety margin. A 100 GiB reserve leaves
   # at most the forced current-layer slot at the observed 110 GiB free.  Keep
   # this explicit and overridable for a future box with a different memory
   # envelope; the launch log reports cache_slots and must stay <= 1 here.
@@ -164,7 +169,18 @@ if ! command -v docker >/dev/null 2>&1; then
   echo "[aura-cb] BLOCK: docker is not installed" >&2
   exit 2
 fi
-if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+# Tags are mutable even with --pull=never. Resolve only a full content digest
+# or full local image ID, then launch the already-inspected ID so a concurrent
+# retag cannot change the bytes between inspection and docker run.
+if [[ ! "$IMAGE" =~ ^[^@[:space:]]+@sha256:[0-9a-f]{64}$ \
+      && ! "$IMAGE" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+  echo "[aura-cb] BLOCK: IMAGE must be an immutable @sha256 digest or full image ID: $IMAGE" >&2
+  exit 2
+fi
+IMAGE_ID="$(
+  docker image inspect --format '{{.Id}}' "$IMAGE" 2>/dev/null || true
+)"
+if [[ ! "$IMAGE_ID" =~ ^sha256:[0-9a-f]{64}$ ]]; then
   echo "[aura-cb] BLOCK: known-good image is absent: $IMAGE" >&2
   exit 2
 fi
@@ -215,6 +231,36 @@ if [[ ! "$IDENTITY_GIT_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
   echo "[aura-cb] BLOCK: cannot resolve $REPO_ROOT HEAD for producer identity" >&2
   exit 2
 fi
+IDENTITY_GIT_DIRTY="$(
+  git -C "$REPO_ROOT" status --porcelain --untracked-files=all -- \
+    prismaquant tools tests docs/ARCHITECTURE.md
+)"
+if [[ -n "$IDENTITY_GIT_DIRTY" ]]; then
+  echo "[aura-cb] BLOCK: producer identity scope became dirty after preflight" >&2
+  exit 2
+fi
+
+# Bind resumes to the actual base image, reviewed source bytes, and external
+# implementation receipt.  A missing identity is accepted only for an empty
+# checkpoint tree; old checkpoints are never retroactively blessed.  The
+# in-container check below re-hashes the read-only mount before any producer
+# module is imported, eliminating stale site-package/PYTHONPATH ambiguity.
+RUNTIME_IDENTITY_PATH="$WORK_DIR/checkpoints/container_runtime_identity.json"
+runtime_identity_args=(
+  write-or-verify
+  --identity "$RUNTIME_IDENTITY_PATH"
+  --checkpoint-root "$WORK_DIR/checkpoints"
+  --source-root "$REPO_ROOT"
+  --target "$TARGET"
+  --image-ref "$IMAGE"
+  --image-id "$IMAGE_ID"
+  --git-commit "$IDENTITY_GIT_COMMIT"
+  --implementation-receipt "$AURA_CB_LAUNCH_RECEIPT"
+)
+if [[ "$TARGET" == "dsv4" ]]; then
+  runtime_identity_args+=(--require-receipt-image)
+fi
+"$PYTHON_BIN" "$RUNTIME_IDENTITY_TOOL" "${runtime_identity_args[@]}"
 
 docker_args=(
   run --rm --name "$CONTAINER_NAME" --gpus all --ipc=host
@@ -225,6 +271,11 @@ docker_args=(
   -e "PYTHONPATH=/pq"
   -e "PYTHONDONTWRITEBYTECODE=1"
   -e "PRISMAQUANT_IDENTITY_GIT_COMMIT=$IDENTITY_GIT_COMMIT"
+  -e "PQ_RUNTIME_IDENTITY_PATH=$RUNTIME_IDENTITY_PATH"
+  -e "PQ_RUNTIME_IMAGE_REF=$IMAGE"
+  -e "PQ_RUNTIME_IMAGE_ID=$IMAGE_ID"
+  -e "PQ_RUNTIME_PRISMAQUANT_ROOT=/pq"
+  -e "PQ_RUNTIME_PRISMAQUANT_GIT_COMMIT=$IDENTITY_GIT_COMMIT"
   -e "MODEL_PATH=$MODEL_PATH"
   -e "WORK_DIR=$WORK_DIR"
   -e "DATASET=$DATASET"
@@ -261,11 +312,11 @@ docker_args=(
 # unsafe six-slot autoscale observed in launch #3.
 #
 # CACHE_HEADROOM_GB overrides the autoscaler's derived headroom AND sets the
-# dynamic reserve (streaming_model.py `configure_dynamic_budget`).  It is the
-# operator-side handle on the anchor-render peak: `render_layer` materialises a
-# whole layer's anchor set before the per-format `d_weights` are built, so both
-# are resident at once, and the layer cache only shrinks inside `put()` -- which
-# does not happen during that window.  The access pattern here is strictly
+# dynamic reserve (streaming_model.py `configure_dynamic_budget`).  The AURA
+# renderer now consumes one canonical anchor directly into its BF16 dW, but the
+# complete dW plane and current source/gradient state still require the forced
+# one-layer ceiling.  The layer cache only shrinks inside `put()` -- which does
+# not happen during that window.  The access pattern here is strictly
 # sequential (one install/unload per layer), so a multi-slot cache buys nothing
 # and capping it is close to free.
 # CACHE_HEADROOM_GB is the ONLY real knob here -- `streaming_model.py:1108` is
@@ -287,6 +338,13 @@ esac
 
 if [[ "$TARGET" == "dsv4" ]]; then
   docker_args+=(
+    # The base image carries NO_CUDA_MEMORY_CACHING=1 for a historical
+    # diagnostic. That turns every temporary VQ matmul allocation into a
+    # driver cudaMalloc and leaves the production renderer allocator-bound.
+    # Keep the normal caching allocator hot inside a layer; the streamed path
+    # synchronizes and empty_cache()s after the last transient anchor and
+    # before backward, which is the actual lifetime boundary.
+    -e "PYTORCH_NO_CUDA_MEMORY_CACHING=0"
     -v "$RUN_ROOT/prod-cal-0p7:$RUN_ROOT/prod-cal-0p7:ro"
     -e "RUN_ROOT=$RUN_ROOT"
     -e "CB_ROUTED_MOE_BOOK_SELECTION=$CB_ROUTED_MOE_BOOK_SELECTION"
@@ -328,8 +386,14 @@ fi
 
 container_started=1
 if [[ "$TARGET" == "dense" ]]; then
-  docker "${docker_args[@]}" --entrypoint bash "$IMAGE" -lc '
+  docker "${docker_args[@]}" --entrypoint bash "$IMAGE_ID" -lc '
 set -euo pipefail
+python3 /pq/tools/container_runtime_identity.py verify-mounted \
+  --identity "$PQ_RUNTIME_IDENTITY_PATH" \
+  --expected-root "$PQ_RUNTIME_PRISMAQUANT_ROOT" \
+  --expected-image-ref "$PQ_RUNTIME_IMAGE_REF" \
+  --expected-image-id "$PQ_RUNTIME_IMAGE_ID" \
+  --expected-git-commit "$PQ_RUNTIME_PRISMAQUANT_GIT_COMMIT"
 CACHE_MANIFEST="$WORK_DIR/cache/production_weight_cache.pkl"
 COST_OUTPUT="$WORK_DIR/artifacts/cost_aura.pkl"
 # Never skip merely because a nonempty output exists.  The future resume
@@ -380,8 +444,18 @@ else
   # The module named here is the bounded implementation seam: it must consume
   # the split source-rate plan, stream DSv4, checkpoint each unit, and write the
   # hybrid payload.  Preflight refuses before the lock while it is absent.
-  docker "${docker_args[@]}" --entrypoint bash "$IMAGE" -lc '
+  docker "${docker_args[@]}" --entrypoint bash "$IMAGE_ID" -lc '
 set -euo pipefail
+python3 /pq/tools/container_runtime_identity.py verify-mounted \
+  --identity "$PQ_RUNTIME_IDENTITY_PATH" \
+  --expected-root "$PQ_RUNTIME_PRISMAQUANT_ROOT" \
+  --expected-image-ref "$PQ_RUNTIME_IMAGE_REF" \
+  --expected-image-id "$PQ_RUNTIME_IMAGE_ID" \
+  --expected-git-commit "$PQ_RUNTIME_PRISMAQUANT_GIT_COMMIT"
+if [[ "${PYTORCH_NO_CUDA_MEMORY_CACHING:-}" != "0" ]]; then
+  echo "[aura-cb] BLOCK: DSv4 requires the layer-local caching allocator" >&2
+  exit 2
+fi
 python3 -m prismaquant.dsv4_aura_cb_reprice \
   --model "$MODEL_PATH" \
   --probe "$RUN_ROOT/prod-cal-0p7/artifacts/probe.pkl" \

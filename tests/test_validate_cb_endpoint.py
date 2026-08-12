@@ -8,6 +8,10 @@ from pathlib import Path
 import pytest
 
 import prismaquant.validate_cb_endpoint as cbv
+from prismaquant.gridbook_environment import (
+    CANONICAL_GOLD_ENVIRONMENT,
+    CANONICAL_GOLD_SET_ENVIRONMENT,
+)
 from prismaquant.lane_spec import load_lane_spec
 from prismaquant.shipcard import (
     _verify_gridbook_native_record,
@@ -18,9 +22,14 @@ from prismaquant.shipcard import (
 )
 from tools.serve_fingerprint import (
     MANIFEST_SCHEMA,
+    SERVER_ENV_ALLOWLIST,
     collect_manifest,
     elide_argv_paths,
     fingerprint,
+    models_endpoint_binding_from_bytes,
+    models_endpoint_binding_identity,
+    process_identity_sha256,
+    serve_session_fingerprint,
 )
 
 
@@ -32,6 +41,28 @@ _RESOLVED_GRAPH_CONFIG = (
     "'cudagraph_mode': <CUDAGraphMode.FULL_DECODE_ONLY: (2, 0)>, "
     "'cudagraph_capture_sizes': [1], 'max_cudagraph_capture_size': 1}\n"
 )
+_SERVED_MODEL = cbv.DSV4_SERVED_MODEL_PREFIX + "a" * 32
+
+
+def _models_payload(
+    model_id: str = _SERVED_MODEL,
+    *,
+    created: int = 1_700_000_000,
+    permission_id: str = "modelperm-dynamic",
+    root: str = "/model",
+) -> dict:
+    return {
+        "object": "list",
+        "data": [{
+            "id": model_id,
+            "object": "model",
+            "created": created,
+            "owned_by": "vllm",
+            "root": root,
+            "max_model_len": 8192,
+            "permission": [{"id": permission_id}],
+        }],
+    }
 
 
 def _write_bound_manifest(path: Path, arm: str, artifact: Path) -> dict:
@@ -58,7 +89,7 @@ def _manifest(
     pin = cbv._gridbook_runtime_pin()
     argv = [
         "/usr/local/bin/vllm", "serve", "/model",
-        "--served-model-name", "dsv4",
+        "--served-model-name", _SERVED_MODEL,
         "--host", "0.0.0.0",
         "--port", "8000",
         "--trust-remote-code",
@@ -82,12 +113,59 @@ def _manifest(
         ])
     if requires_marlin:
         argv.extend(["--moe-backend", "marlin"])
+    environment = {
+        **dict(CANONICAL_GOLD_SET_ENVIRONMENT),
+        "PQ_GRIDBOOK_RUNTIME_COMMIT": pin["commit"],
+        "PQ_GRIDBOOK_RUNTIME_VERSION": pin["version"],
+        "PRISMAQUANT_CB_EXT_DIR": "/opt/gridbook/ext-cache",
+        "PRISMAQUANT_PRELOAD_FUSED": "1",
+    }
+    process_pids = [1001, 1002]
+    environment_rows = [
+        {
+            "pid": pid,
+            "values": dict(environment),
+            "sha256": cbv._canonical_json_sha256(environment),
+        }
+        for pid in process_pids
+    ]
+    host_identity = {
+        "hostname": "endpoint-test",
+        "boot_id": "11111111-2222-3333-4444-555555555555",
+        "machine_id_sha256": "8" * 64,
+        "pid_namespace": "pid:[4026533000]",
+    }
+    processes = []
+    for index, pid in enumerate(process_pids):
+        process_argv = argv if index == 0 else ["VLLM::EngineCore"]
+        process = {
+            "pid": pid,
+            "argv": process_argv,
+            "cmdline": " ".join(process_argv),
+            "start_time_ticks": 123456 + index,
+            "pid_namespace": "pid:[4026533000]",
+            "executable": "/usr/local/bin/python3.12",
+        }
+        process["identity_sha256"] = process_identity_sha256(
+            process, boot_id=host_identity["boot_id"]
+        )
+        processes.append(process)
+    listener_row = {
+        "family": "ipv4",
+        "address": "0.0.0.0",
+        "port": 8000,
+        "socket_inode": "98765",
+        "pids": [process_pids[0]],
+    }
+    models_raw = json.dumps(_models_payload()).encode("utf-8")
     payload = {
         "schema": MANIFEST_SCHEMA,
+        "hostname": host_identity["hostname"],
+        "host_identity": host_identity,
         "source": "server",
         "image": cbv.DSV4_SPARK_VLLM_IMAGE,
         "model": "/model",
-        "served_model_name": "dsv4",
+        "served_model_name": _SERVED_MODEL,
         "launch_argv": argv,
         "launch_flags": elide_argv_paths(argv),
         "enforce_eager": arm == "eager",
@@ -104,21 +182,48 @@ def _manifest(
         },
         "resident_extensions": ["prismaquant_cb_ext.so"],
         "residency_readable": True,
-        "gpu_name": cbv.DSV4_SPARK_GPU_NAME,
-        "gpu_count": 1,
-        "pq_env": {
-            "PRISMAQUANT_CB_DECODE": "cuda",
-            "PRISMAQUANT_PRELOAD_FUSED": "1",
-            "GRIDBOOK_MXFP8_DENSE": "1",
-            "VLLM_USE_DEEP_GEMM": "0",
+        "processes": processes,
+        "server_process_environment": {
+            "schema": "prismaquant.server_process_environment/1",
+            "allowlist": sorted(SERVER_ENV_ALLOWLIST),
+            "readable_pids": process_pids,
+            "unreadable_pids": [],
+            "consistent": True,
+            "values": dict(environment),
+            "processes": environment_rows,
         },
+        "gpu_name": cbv.DSV4_SPARK_GPU_NAME,
+        "gpu_uuid": "GPU-11111111-2222-3333-4444-555555555555",
+        "gpu_count": 1,
+        "pq_env": dict(environment),
         "artifact_binding": {
             "schema": "prismaquant.served_artifact_binding/1",
             "model_sha": model_sha,
             "artifact_inventory_sha256": "9" * 64,
             "artifact_bytes": 1234,
         },
+        "listener_census": {
+            "schema": "prismaquant.server_tcp_listeners/1",
+            "tables_readable": True,
+            "unreadable_pids": [],
+            "listeners": [listener_row],
+        },
+        "listener_binding": {
+            "schema": "prismaquant.server_listener_binding/1",
+            "base_url": "http://127.0.0.1:8000",
+            "launch_host": "0.0.0.0",
+            "launch_port": 8000,
+            "listeners": [listener_row],
+        },
+        "models_endpoint_binding": models_endpoint_binding_identity(
+            models_endpoint_binding_from_bytes(
+                models_raw,
+                request_url="http://127.0.0.1:8000/v1/models",
+                expected_served_model=_SERVED_MODEL,
+            )
+        ),
     }
+    payload["serve_session_id"] = serve_session_fingerprint(payload)
     payload["serve_fingerprint"] = fingerprint(payload)
     return payload
 
@@ -161,7 +266,7 @@ def _artifact_decode_record(*, requires_marlin: bool = False) -> dict:
 def _smoke_metrics() -> dict:
     generated = b" Paris."
     return {
-        "served_model": "dsv4",
+        "served_model": _SERVED_MODEL,
         "generated_chars": len(generated.decode("utf-8")),
         "generated_utf8_bytes": len(generated),
         "output_sha256": hashlib.sha256(generated).hexdigest(),
@@ -175,6 +280,9 @@ def _smoke_metrics() -> dict:
         "n": 1,
         "stream": False,
         "max_tokens": cbv.DEFAULT_MAX_TOKENS,
+        "models_endpoint_identity": cbv._validate_live_server_session(
+            _manifest("eager"), expected_served_model=_SERVED_MODEL
+        )["models_endpoint_binding"],
     }
 
 
@@ -184,7 +292,7 @@ def test_manifest_validation_binds_each_arm_to_exact_stack(arm):
     assert cbv.validate_serve_manifest(
         manifest,
         arm=arm,
-        expected_served_model="dsv4",
+        expected_served_model=_SERVED_MODEL,
         requires_moe_marlin=False,
         expected_model_sha="c" * 64,
     ) == (
@@ -217,7 +325,7 @@ def test_manifest_validation_fails_closed(mutation, message):
         cbv.validate_serve_manifest(
             manifest,
             arm="eager",
-            expected_served_model="dsv4",
+            expected_served_model=_SERVED_MODEL,
             requires_moe_marlin=False,
             expected_model_sha="c" * 64,
         )
@@ -230,7 +338,7 @@ def test_manifest_fingerprint_cannot_be_stale():
         cbv.validate_serve_manifest(
             manifest,
             arm="graph",
-            expected_served_model="dsv4",
+            expected_served_model=_SERVED_MODEL,
             requires_moe_marlin=False,
         )
 
@@ -244,7 +352,7 @@ def test_manifest_requires_explicit_tp1_in_launch_argv():
         cbv.validate_serve_manifest(
             manifest,
             arm="graph",
-            expected_served_model="dsv4",
+            expected_served_model=_SERVED_MODEL,
             requires_moe_marlin=False,
         )
 
@@ -257,7 +365,7 @@ def test_manifest_requires_prefix_caching_off():
         cbv.validate_serve_manifest(
             manifest,
             arm="eager",
-            expected_served_model="dsv4",
+            expected_served_model=_SERVED_MODEL,
             requires_moe_marlin=False,
         )
 
@@ -271,7 +379,7 @@ def test_manifest_binds_memory_and_batch_launch_contract():
         cbv.validate_serve_manifest(
             manifest,
             arm="graph",
-            expected_served_model="dsv4",
+            expected_served_model=_SERVED_MODEL,
             requires_moe_marlin=False,
         )
 
@@ -284,7 +392,7 @@ def test_manifest_rejects_unknown_or_duplicate_launch_switches():
         cbv.validate_serve_manifest(
             unknown,
             arm="eager",
-            expected_served_model="dsv4",
+            expected_served_model=_SERVED_MODEL,
             requires_moe_marlin=False,
         )
 
@@ -295,7 +403,7 @@ def test_manifest_rejects_unknown_or_duplicate_launch_switches():
         cbv.validate_serve_manifest(
             duplicate,
             arm="eager",
-            expected_served_model="dsv4",
+            expected_served_model=_SERVED_MODEL,
             requires_moe_marlin=False,
         )
 
@@ -308,7 +416,7 @@ def test_manifest_requires_canonical_launch_flags():
         cbv.validate_serve_manifest(
             manifest,
             arm="eager",
-            expected_served_model="dsv4",
+            expected_served_model=_SERVED_MODEL,
             requires_moe_marlin=False,
         )
 
@@ -318,21 +426,21 @@ def test_manifest_marlin_route_is_exactly_artifact_conditional():
     cbv.validate_serve_manifest(
         present,
         arm="graph",
-        expected_served_model="dsv4",
+        expected_served_model=_SERVED_MODEL,
         requires_moe_marlin=True,
     )
     with pytest.raises(cbv.CBEndpointValidationError, match="moe-backend"):
         cbv.validate_serve_manifest(
             _manifest("graph"),
             arm="graph",
-            expected_served_model="dsv4",
+            expected_served_model=_SERVED_MODEL,
             requires_moe_marlin=True,
         )
     with pytest.raises(cbv.CBEndpointValidationError, match="moe-backend"):
         cbv.validate_serve_manifest(
             present,
             arm="graph",
-            expected_served_model="dsv4",
+            expected_served_model=_SERVED_MODEL,
             requires_moe_marlin=False,
         )
 
@@ -345,7 +453,7 @@ def test_manifest_requires_deep_gemm_disabled():
         cbv.validate_serve_manifest(
             manifest,
             arm="eager",
-            expected_served_model="dsv4",
+            expected_served_model=_SERVED_MODEL,
             requires_moe_marlin=False,
         )
 
@@ -365,12 +473,12 @@ def test_endpoint_smoke_is_greedy_repeated_and_nonempty():
     def request(method, url, payload, timeout):
         requests.append((method, url, payload, timeout))
         if method == "GET":
-            return {"data": [{"id": "dsv4"}]}
+            return _models_payload()
         return {"choices": [{"text": " Paris."}]}
 
     metrics = cbv.run_endpoint_smoke(
         base_url="http://127.0.0.1:8000/v1",
-        model_name="dsv4",
+        model_name=_SERVED_MODEL,
         requester=request,
     )
     assert [row[0] for row in requests] == ["GET", "POST", "POST"]
@@ -380,6 +488,84 @@ def test_endpoint_smoke_is_greedy_repeated_and_nonempty():
     assert metrics["deterministic_repeats"] == 2
     assert metrics["generated_chars"] > 0
     assert "perplexity" not in metrics and "throughput" not in metrics
+
+
+def test_models_endpoint_binding_ignores_dynamic_fields_but_binds_identity():
+    first = models_endpoint_binding_from_bytes(
+        json.dumps(_models_payload(created=100, permission_id="one")).encode(),
+        request_url="http://127.0.0.1:8000/v1/models",
+        expected_served_model=_SERVED_MODEL,
+    )
+    second = models_endpoint_binding_from_bytes(
+        json.dumps(_models_payload(created=200, permission_id="two")).encode(),
+        request_url="http://127.0.0.1:8000/v1/models",
+        expected_served_model=_SERVED_MODEL,
+    )
+    assert first["response_sha256"] != second["response_sha256"]
+    assert first["canonical_identity_sha256"] == second[
+        "canonical_identity_sha256"
+    ]
+    assert first["model"] == second["model"]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        _models_payload(model_id=cbv.DSV4_SERVED_MODEL_PREFIX + "b" * 32),
+        _models_payload(root="/different"),
+        {
+            **_models_payload(),
+            "data": [{**_models_payload()["data"][0], "max_model_len": 4096}],
+        },
+    ],
+)
+def test_endpoint_smoke_refuses_a_different_attested_endpoint_identity(payload):
+    expected = cbv._validate_live_server_session(
+        _manifest("eager"), expected_served_model=_SERVED_MODEL
+    )["models_endpoint_binding"]
+
+    def request(method, url, body, timeout):
+        if method == "GET":
+            return payload
+        return {"choices": [{"text": " Paris."}]}
+
+    with pytest.raises(cbv.CBEndpointValidationError):
+        cbv.run_endpoint_smoke(
+            base_url="http://127.0.0.1:8000/v1",
+            model_name=_SERVED_MODEL,
+            requester=request,
+            expected_models_identity=expected,
+        )
+
+
+def test_direct_endpoint_gate_refuses_a_non_session_model_name():
+    manifest = _manifest("eager")
+    with pytest.raises(cbv.CBEndpointValidationError, match="session nonce"):
+        cbv.validate_serve_manifest(
+            manifest,
+            arm="eager",
+            expected_served_model="dsv4-flash-gridbook",
+            requires_moe_marlin=False,
+        )
+
+
+@pytest.mark.parametrize("mutation", ["process", "listener", "session"])
+def test_manifest_session_and_listener_tampering_is_refused(mutation):
+    manifest = _manifest("eager")
+    if mutation == "process":
+        manifest["processes"][0]["start_time_ticks"] += 1
+    elif mutation == "listener":
+        manifest["listener_binding"]["listeners"][0]["pids"] = [1002]
+    else:
+        manifest["serve_session_id"] = "f" * 64
+    manifest["serve_fingerprint"] = fingerprint(manifest)
+    with pytest.raises(cbv.CBEndpointValidationError):
+        cbv.validate_serve_manifest(
+            manifest,
+            arm="eager",
+            expected_served_model=_SERVED_MODEL,
+            requires_moe_marlin=False,
+        )
 
 
 @pytest.mark.parametrize("memory", ["3.25", "-0.05"])
@@ -425,13 +611,13 @@ def test_endpoint_smoke_refuses_empty_or_nondeterministic_generation(texts):
 
     def request(method, url, payload, timeout):
         if method == "GET":
-            return {"data": [{"id": "dsv4"}]}
+            return _models_payload()
         return {"choices": [{"text": next(responses)}]}
 
     with pytest.raises(cbv.CBEndpointValidationError):
         cbv.run_endpoint_smoke(
             base_url="http://127.0.0.1:8000/v1",
-            model_name="dsv4",
+            model_name=_SERVED_MODEL,
             requester=request,
         )
 
@@ -522,7 +708,12 @@ def test_artifact_decode_contract_binds_completeness_and_dspark_overlay(
     )
     quant_config = {
         "provenance": {"dspark_source_overlay": overlay_provenance},
-        "route": {"wire_id": cbv.DSV4_MXFP4_WIRE_ID},
+        "source_passthrough": {
+            "version": 1,
+            "units": {
+                "model.layers.0.mlp.experts": cbv.DSV4_MXFP4_WIRE_ID,
+            },
+        },
     }
 
     evidence = cbv.validate_cb_artifact_decode_contract(
@@ -566,6 +757,53 @@ def test_endpoint_contract_is_self_hashing_and_replayable():
         )
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    ["host", "gpu", "listener_owner", "session", "models"],
+)
+def test_endpoint_contract_refuses_rehashed_session_tampering(mutation):
+    model_sha = "c" * 64
+    manifest = _manifest("eager", model_sha=model_sha)
+    contract = cbv.build_endpoint_contract(
+        arm="eager",
+        model_sha=model_sha,
+        manifest=manifest,
+        manifest_sha256="d" * 64,
+        artifact_decode=_artifact_decode_record(),
+        endpoint_smoke=_smoke_metrics(),
+        cuda_graph=None,
+    )
+    session = contract["endpoint_session"]
+    if mutation == "host":
+        session["host_identity"]["boot_id"] = ""
+    elif mutation == "gpu":
+        session["gpu_uuid"] = "not-a-gpu"
+    elif mutation == "listener_owner":
+        session["listener_binding"]["listeners"][0]["pids"] = [9999]
+    elif mutation == "session":
+        session["serve_session_id"] = "f" * 64
+    else:
+        session["models_endpoint_binding"]["model"]["root"] = "/different"
+        session["models_endpoint_binding"]["canonical_identity_sha256"] = (
+            models_endpoint_binding_identity(
+                models_endpoint_binding_from_bytes(
+                    json.dumps(_models_payload(root="/different")).encode(),
+                    request_url="http://127.0.0.1:8000/v1/models",
+                    expected_served_model=_SERVED_MODEL,
+                )
+            )["canonical_identity_sha256"]
+        )
+    contract.pop("contract_sha256")
+    contract["contract_sha256"] = cbv._canonical_json_sha256(contract)
+    with pytest.raises(cbv.CBEndpointValidationError):
+        cbv.validate_endpoint_contract_record(
+            contract,
+            arm="eager",
+            model_sha=model_sha,
+            serve_fingerprint=manifest["serve_fingerprint"],
+        )
+
+
 def test_cli_fills_only_the_requested_native_export_slot(tmp_path, monkeypatch):
     artifact, shipcard = _artifact_and_card(tmp_path)
     manifest_path = tmp_path / "serve_manifest.json"
@@ -591,7 +829,7 @@ def test_cli_fills_only_the_requested_native_export_slot(tmp_path, monkeypatch):
         "--arm", "graph",
         "--base-url", "http://127.0.0.1:8000/v1",
         "--model-dir", str(artifact),
-        "--model-name", "dsv4",
+        "--model-name", _SERVED_MODEL,
         "--serve-manifest", str(manifest_path),
         "--serve-log", str(serve_log),
         "--shipcard", str(shipcard),
@@ -641,7 +879,7 @@ def test_deferred_result_closes_slot_only_when_committed(tmp_path, monkeypatch):
         "--arm", "eager",
         "--base-url", "http://127.0.0.1:8000/v1",
         "--model-dir", str(artifact),
-        "--model-name", "dsv4",
+        "--model-name", _SERVED_MODEL,
         "--serve-manifest", str(manifest_path),
         "--shipcard", str(shipcard),
         "--output-json", str(result_path),
@@ -680,7 +918,7 @@ def test_deferred_commit_refuses_mutated_hashed_evidence(
         "--arm", arm,
         "--base-url", "http://127.0.0.1:8000/v1",
         "--model-dir", str(artifact),
-        "--model-name", "dsv4",
+        "--model-name", _SERVED_MODEL,
         "--serve-manifest", str(manifest_path),
         "--shipcard", str(shipcard),
         "--output-json", str(result_path),
@@ -717,6 +955,9 @@ def test_driver_and_lane_declare_two_isolated_arms_and_guards():
     assert 'serve_fingerprint.py write' in text
     assert 'prismaquant.validate_cb_endpoint' in text
     assert '--defer-shipcard-fill' in text
+    assert 'openssl rand -hex 16' in text
+    assert 'SERVED_MODEL=dsv4-flash-gridbook-${SERVE_NONCE}' in text
+    assert '--base-url http://127.0.0.1:8000' in text
     assert 'commit_deferred_result' in text
     assert 'docker stop -t 30 "$CID"' in text
     assert text.rindex('docker stop -t 30 "$CID"') < text.index(
@@ -725,9 +966,29 @@ def test_driver_and_lane_declare_two_isolated_arms_and_guards():
     assert 'contains_mxfp4_wire' in text
     assert '-e GRIDBOOK_MXFP8_DENSE=1' in text
     assert '-e VLLM_USE_DEEP_GEMM=0' in text
+    assert '-e PRISMAQUANT_PRELOAD_FUSED=1' in text
+    assert '-e PRISMAQUANT_CB_DECODE=' not in text
+    assert 'PRISMAQUANT_CB_DECODE_CONTRACT=v1' in text
+    assert 'PRISMAQUANT_CB_FUSED_FP4' in text
+    assert 'PRISMAQUANT_CB_FUSED_FP4_MOE' in text
     assert 'validate_cb_artifact_decode_contract' in text
     assert 'EVIDENCE must be outside the immutable MODEL tree' in text
     assert 'EXT_CACHE must be outside the immutable MODEL tree' in text
+
+    endpoint_environment = dict(CANONICAL_GOLD_ENVIRONMENT)
+    endpoint_environment.update({
+        "PRISMAQUANT_CB_EXT_DIR": "/opt/gridbook/ext-cache",
+        "PRISMAQUANT_PRELOAD_FUSED": "1",
+    })
+    unset_block = text.split("    unset ", 1)[1].split(
+        "\n    bash ", 1
+    )[0]
+    for name, value in endpoint_environment.items():
+        if value is None:
+            assert f"-e {name}=" not in text
+            assert name in unset_block
+        else:
+            assert f"-e {name}={value}" in text
 
     lane = load_lane_spec("nvfp4_cb")
     eager = lane.gate("load_generate.eager")
@@ -754,6 +1015,6 @@ def test_manifest_accepts_reviewed_gridbook_native_extension_families(extension)
     cbv.validate_serve_manifest(
         manifest,
         arm="eager",
-        expected_served_model="dsv4",
+        expected_served_model=_SERVED_MODEL,
         requires_moe_marlin=False,
     )

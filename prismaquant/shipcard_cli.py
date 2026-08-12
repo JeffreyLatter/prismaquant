@@ -26,7 +26,9 @@ import sys
 from pathlib import Path
 
 from prismaquant.shipcard import (
+    ALL_SLOTS,
     GOLD_SLOTS,
+    _verify_gold_record,
     compute_model_sha,
     fill_slot,
     load_shipcard,
@@ -48,7 +50,13 @@ PRIMARY_METRIC_KEYS = (
 
 CARRIED_METRIC_KEYS = PRIMARY_METRIC_KEYS + (
     "kl_p99", "kl_max", "n_positions", "n_confident", "n_samples", "seqlen",
-    "n_tokens_scored", "max_chunk_mean_nll", "quantization", "score_positions",
+    "n_tokens_scored", "per_chunk_mean_nll", "max_chunk_mean_nll",
+    "quantization", "score_positions",
+    "dsv4_gridbook_contract", "serve_manifest",
+    "dsv4_gridbook_contract_sha256",
+    "teacher_evidence", "mode", "prompt_top_k", "vocab_size",
+    "split", "n_tokens_requested", "calibration_contract",
+    "calibration_contract_sha256",
 )
 
 
@@ -206,9 +214,37 @@ def _cmd_fill(args: argparse.Namespace) -> int:
         extra={"record_path": str(Path(args.record).resolve()),
                "measured_model": payload.get("model")},
     )
+    is_gridbook = required_slots(
+        card, model_dir=model_dir
+    ) == ALL_SLOTS
+    replay_problems = (
+        _verify_gold_record(
+            args.slot,
+            record,
+            model_dir=model_dir,
+            require_dsv4_gridbook_contract=True,
+            require_current_artifact_path=True,
+        )
+        if is_gridbook and structurally_valid
+        else []
+    )
+    if replay_problems:
+        if args.passed is True:
+            print(
+                "[shipcard] REFUSED: --passed cannot override invalid DSv4 "
+                "Gridbook gold evidence: " + "; ".join(replay_problems),
+                file=sys.stderr,
+            )
+            return 2
+        record["passed"] = False
+        print(
+            "[shipcard] WARN DSv4 Gridbook gold evidence did not replay; "
+            "recording passed=false: " + "; ".join(replay_problems),
+            file=sys.stderr,
+        )
     fill_slot(args.shipcard, args.slot, record)
     print(f"[shipcard] filled {args.slot} from {args.record} "
-          f"(passed={bool(passed)}, primary={slot_primary})")
+          f"(passed={record['passed']}, primary={slot_primary})")
     updated_card = load_shipcard(args.shipcard)
     unfilled = [s for s in required_slots(updated_card, model_dir=model_dir)
                 if not updated_card["slots"].get(s)]

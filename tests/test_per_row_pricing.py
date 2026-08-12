@@ -65,8 +65,10 @@ _REFERENCE_ROOT = Path(
 )
 _REFERENCE_SELECTIONS = [
     _REFERENCE_ROOT / "artifacts-mxfp4-sm121",
-    _REFERENCE_ROOT / "artifacts-mxfp4/oldmenu-grid/b-92",
 ]
+_RETIRED_ACTIVATION_BLIND_SELECTION = (
+    _REFERENCE_ROOT / "artifacts-mxfp4/oldmenu-grid/b-92"
+)
 
 
 @pytest.mark.integration
@@ -80,3 +82,19 @@ def test_reference_selections_reconcile_within_one_part_per_thousand(
     reconstructed, recorded, ratio = reconcile_selection(selection_dir)
     assert reconstructed == pytest.approx(recorded, rel=1.0e-3)
     assert ratio == pytest.approx(1.0, abs=1.0e-3)
+
+
+@pytest.mark.integration
+def test_activation_blind_block_fp8_reference_is_retired():
+    """Do not silently replay the old block-FP8 source terminal as zero.
+
+    This historical selection predates Gridbook's concrete W8A8 route and
+    therefore has no measured activation-side cost for its 27 selected
+    ``FP8_BLOCK_UE8M0_SOURCE`` rows.  Current repricing must refuse it instead
+    of synthesizing the former activation-identity zero.
+    """
+    selection_dir = _RETIRED_ACTIVATION_BLIND_SELECTION
+    if not selection_dir.exists():
+        pytest.skip(f"read-only reference artifact is not mounted: {selection_dir}")
+    with pytest.raises(KeyError, match="missing cost for FP8_BLOCK_UE8M0_SOURCE"):
+        reconcile_selection(selection_dir)

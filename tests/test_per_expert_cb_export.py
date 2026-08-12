@@ -21,6 +21,7 @@ from prismaquant import nvfp4_cb_formats as cb  # noqa: E402
 from prismaquant.export_nvfp4_cb_streaming import (  # noqa: E402
     export_nvfp4_cb_streaming,
 )
+from prismaquant.layer_config import canonicalize_assignment  # noqa: E402
 from prismaquant.shipcard import load_shipcard  # noqa: E402
 
 
@@ -133,6 +134,8 @@ def test_mixed_layer_export_round_trip_and_exact_declaration(mixed_export):
     tensors = load_file(str(out / "model.safetensors"))
     quant_config = json.loads((out / "quant_config.json").read_text())
     declaration = quant_config["per_expert_format_groups"]
+    tensor_formats = quant_config["provenance"]["tensor_formats"]
+    assert tensor_formats == canonicalize_assignment(_flat_config(_mixed_format))
 
     assert declaration == {
         "version": 1,
@@ -231,7 +234,6 @@ def test_mixed_layer_export_round_trip_and_exact_declaration(mixed_export):
                 )
                 assert torch.equal(repacked.reshape_as(packed), packed)
     from prismaquant import footprint
-    from prismaquant.layer_config import canonicalize_assignment
     from prismaquant.nvfp4_cb_footprint import CBSerializationContext
 
     allocation = canonicalize_assignment(_flat_config(_mixed_format))

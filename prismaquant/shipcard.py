@@ -43,6 +43,12 @@ import subprocess
 import time
 from pathlib import Path
 from typing import Any, Iterable, Mapping
+from urllib.parse import urlsplit
+
+from .gridbook_environment import (
+    CANONICAL_GOLD_ENVIRONMENT,
+    CANONICAL_GOLD_SET_ENVIRONMENT,
+)
 
 SCHEMA = "prismaquant.shipcard/1"
 
@@ -84,6 +90,52 @@ DISPLACED_CONTAINER_ELIGIBILITY_SCHEMA = (
     "prismaquant.displaced_container_eligibility/1"
 )
 CB_PERFORMANCE_TOOL = "validate_cb_performance.py"
+DSV4_GRIDBOOK_CONTRACT_SCHEMA = "prismaquant.dsv4_gridbook_llm_contract/1"
+SERVED_ARTIFACT_BINDING_SCHEMA = "prismaquant.served_artifact_binding/1"
+SERVE_MANIFEST_SCHEMA = "prismaquant.serve_manifest/1"
+FULL_KL_TEACHER_EVIDENCE_SCHEMA = "prismaquant.full_kl_teacher_evidence/1"
+WIKITEXT_GOLD_CALIBRATION_SCHEMA = "prismaquant.wikitext_gold_calibration/1"
+WIKITEXT_PPL_CALIBRATION_SCHEMA = "prismaquant.wikitext_ppl_calibration/1"
+GOLD_PRODUCER_IDENTITY_SCHEMA = "prismaquant.gold_producer_identity/1"
+GRIDBOOK_DISTRIBUTION_SCHEMA = (
+    "prismaquant.installed_gridbook_distribution/1"
+)
+TOPK_COVERAGE_POLICY_SCHEMA = "prismaquant.topk_tail_coverage_policy/1"
+WIKITEXT_REVISION = "b08601e04326c79dfdd32d625aee71d232d685c3"
+DSV4_WIKITEXT_DATASET_FINGERPRINT = "7ccd6deaa4fc56e5"
+DSV4_WIKITEXT_CORPUS_SHA256 = (
+    "c5b5caea5bd655cb221545a484f2f0f59d35092a17a66840d7b9513d0b99687d"
+)
+DSV4_WIKITEXT_TOTAL_TOKENS = 287_597
+DSV4_WIKITEXT_SELECTED_TOKEN_IDS_SHA256 = (
+    "6c23cefbd78c327d6edac566a5c6b419871021b6cf9890ec830713c1de704961"
+)
+DSV4_TOKENIZER_IDENTITY_SHA256 = (
+    "9f7ee7cb93b58bf30f278965547e7584b89c848e76c3adfeb92c070a88492de0"
+)
+_TOKENIZER_IDENTITY_FILENAMES = (
+    "added_tokens.json",
+    "merges.txt",
+    "sentencepiece.bpe.model",
+    "special_tokens_map.json",
+    "spiece.model",
+    "tokenizer.json",
+    "tokenizer.model",
+    "tokenizer_config.json",
+    "vocab.json",
+)
+_CB_FORMAT_RE = re.compile(r"^(?:NVFP4_CB|FP8_CB)_[KS][0-9]+$")
+_MXFP8_DENSE_WIRE_IDS = frozenset({
+    "fp8_e4m3_ue8m0_block128",
+    "mxfp8_e4m3_e8m0_g32",
+})
+_CB_MAIN_EXTENSION_RE = re.compile(r"^prismaquant_cb_ext(?:[.][^/]*)?[.]so$")
+_CB_V2_EXTENSION_RE = re.compile(
+    r"^prismaquant_cb_v2_ext(?:[.][^/]*)?[.]so$"
+)
+_MXFP8_DENSE_EXTENSION_RE = re.compile(
+    r"^pq_mxfp8_dense_[A-Za-z0-9_-]+(?:[.][^/]*)?[.]so$"
+)
 CB_PERFORMANCE_TELEMETRY_KINDS = frozenset({
     "routing_per_layer_per_step",
     "expert_occupancy",
@@ -704,7 +756,13 @@ def verify(
         if is_gridbook_cb and slot == "ship_gate":
             problems.extend(_verify_ship_gate_record(slot, record))
         if is_gridbook_cb and slot in GOLD_SLOTS:
-            problems.extend(_verify_gold_record(slot, record))
+            problems.extend(_verify_gold_record(
+                slot,
+                record,
+                model_dir=model_dir,
+                require_dsv4_gridbook_contract=True,
+                require_current_artifact_path=False,
+            ))
         if slot in GOLD_SLOTS:
             spec = record.get("spec_decode_detected")
             if spec is None:
@@ -719,7 +777,1088 @@ def verify(
     return problems
 
 
-def _verify_gold_record(slot: str, record: Mapping[str, Any]) -> list[str]:
+def _gold_extension_requirements(
+    quant_config: Mapping[str, Any],
+) -> frozenset[str]:
+    """Extension families implied by the finalized live assignment."""
+    cb_formats: set[str] = set()
+    dense_mxfp8 = False
+
+    config_groups = quant_config.get("config_groups")
+    if config_groups is not None:
+        if not isinstance(config_groups, Mapping):
+            raise ValueError("quant_config config_groups is not an object")
+        for key, group in config_groups.items():
+            if not isinstance(key, str) or not isinstance(group, Mapping):
+                raise ValueError("quant_config config_groups is malformed")
+            fmt = group.get("format")
+            if isinstance(fmt, str) and _CB_FORMAT_RE.fullmatch(fmt):
+                cb_formats.add(fmt)
+
+    provenance = quant_config.get("provenance")
+    tensor_formats = provenance.get("tensor_formats") if isinstance(
+        provenance, Mapping
+    ) else None
+    if tensor_formats is not None:
+        if not isinstance(tensor_formats, Mapping):
+            raise ValueError("quant_config tensor_formats is not an object")
+        for qname, fmt in tensor_formats.items():
+            if not isinstance(qname, str) or not isinstance(fmt, str):
+                raise ValueError("quant_config tensor_formats is malformed")
+            if _CB_FORMAT_RE.fullmatch(fmt):
+                cb_formats.add(fmt)
+            if fmt in {
+                "FP8_BLOCK_UE8M0_SOURCE", "MXFP8_UE8M0_G32",
+                *_MXFP8_DENSE_WIRE_IDS,
+            }:
+                dense_mxfp8 = True
+
+    delegated = quant_config.get("source_passthrough")
+    if delegated is not None:
+        if (
+            not isinstance(delegated, Mapping)
+            or set(delegated) != {"version", "units"}
+            or delegated.get("version") != 1
+            or not isinstance(delegated.get("units"), Mapping)
+        ):
+            raise ValueError("source_passthrough is not the closed v1 declaration")
+        for qname, wire in delegated["units"].items():
+            if not isinstance(qname, str) or not isinstance(wire, str):
+                raise ValueError("source_passthrough route is malformed")
+            if wire in _MXFP8_DENSE_WIRE_IDS:
+                dense_mxfp8 = True
+
+    per_expert = quant_config.get("per_expert_format_groups")
+    if per_expert is not None:
+        if (
+            not isinstance(per_expert, Mapping)
+            or per_expert.get("version") != 1
+            or not isinstance(per_expert.get("layers"), Mapping)
+        ):
+            raise ValueError("per_expert_format_groups is malformed")
+        for families in per_expert["layers"].values():
+            if not isinstance(families, Mapping):
+                raise ValueError("per-expert family declaration is malformed")
+            for entries in families.values():
+                if not isinstance(entries, list):
+                    raise ValueError("per-expert format groups are malformed")
+                for entry in entries:
+                    wire = entry.get("format_wire_id") if isinstance(
+                        entry, Mapping
+                    ) else None
+                    if not isinstance(wire, str):
+                        raise ValueError("per-expert format route is malformed")
+                    if _CB_FORMAT_RE.fullmatch(wire):
+                        cb_formats.add(wire)
+                    if wire in _MXFP8_DENSE_WIRE_IDS:
+                        dense_mxfp8 = True
+
+    required: set[str] = set()
+    if cb_formats:
+        # Every CB execution family uses the main module for activation QDQ,
+        # expansion/GEMV, and/or routed combine. Layout-v2 FP4 additionally
+        # requires its v2 quality expander at load.
+        required.add("cb_main")
+        if quant_config.get("layout_version", 1) == 2 and any(
+            name.startswith("NVFP4_CB_") for name in cb_formats
+        ):
+            required.add("cb_v2")
+    if dense_mxfp8:
+        required.add("mxfp8_dense")
+    return frozenset(required)
+
+
+def _verify_gold_producer_identity(
+    slot: str,
+    record: Mapping[str, Any],
+    manifest: Mapping[str, Any],
+    *,
+    canonical_sha,
+) -> list[str]:
+    problems: list[str] = []
+    producer = manifest.get("producer_identity")
+    tool = manifest.get("measurement_tool")
+    try:
+        from tools.serve_fingerprint import (
+            _GOLD_PRODUCER_COMMON_FILES,
+            _GOLD_PRODUCER_TOOL_FILES,
+        )
+        expected_files = sorted(set(
+            _GOLD_PRODUCER_COMMON_FILES + _GOLD_PRODUCER_TOOL_FILES[str(tool)]
+        ))
+    except Exception:
+        expected_files = []
+    if (
+        not isinstance(producer, Mapping)
+        or set(producer) != {
+            "schema", "measurement_tool", "git_commit", "git_tree",
+            "git_dirty", "source_files", "source_files_sha256",
+        }
+        or producer.get("schema") != GOLD_PRODUCER_IDENTITY_SCHEMA
+        or producer.get("measurement_tool") != tool
+        or producer.get("git_commit") != record.get("git_commit")
+        or re.fullmatch(
+            r"(?:[0-9a-f]{40}|[0-9a-f]{64})",
+            str(producer.get("git_commit", "")),
+        ) is None
+        or producer.get("git_dirty") is not False
+        or (
+            producer.get("git_tree") is not None
+            and re.fullmatch(
+                r"(?:[0-9a-f]{40}|[0-9a-f]{64})",
+                str(producer.get("git_tree")),
+            ) is None
+        )
+    ):
+        return [f"{slot}: gold producer is not a clean exact commit identity"]
+    files = producer.get("source_files")
+    if (
+        not expected_files
+        or not isinstance(files, Mapping)
+        or sorted(files) != expected_files
+        or producer.get("source_files_sha256") != canonical_sha(files)
+    ):
+        return [f"{slot}: gold producer source-file closure/digest differs"]
+    for name, identity in files.items():
+        if (
+            not isinstance(name, str)
+            or name.startswith("/")
+            or ".." in Path(name).parts
+            or not isinstance(identity, Mapping)
+            or set(identity) != {"bytes", "sha256"}
+            or isinstance(identity.get("bytes"), bool)
+            or not isinstance(identity.get("bytes"), int)
+            or identity.get("bytes", -1) <= 0
+            or re.fullmatch(r"[0-9a-f]{64}", str(identity.get("sha256", "")))
+            is None
+        ):
+            problems.append(f"{slot}: gold producer source identity is malformed")
+            break
+    return problems
+
+
+def _verify_gridbook_distribution_identity(
+    slot: str,
+    manifest: Mapping[str, Any],
+    runtime_pin: Mapping[str, Any],
+    *,
+    canonical_sha,
+) -> list[str]:
+    distribution = manifest.get("gridbook_distribution")
+    expected_vcs = {
+        "vcs": "git",
+        "requested_revision": runtime_pin.get("commit"),
+        "commit_id": runtime_pin.get("commit"),
+    }
+    if not isinstance(distribution, Mapping) or set(distribution) != {
+        "schema", "name", "repository", "version", "direct_url",
+        "direct_url_path", "direct_url_identity", "metadata_path",
+        "metadata_identity", "record_path", "record_identity",
+        "source_files", "source_files_sha256",
+    }:
+        return [f"{slot}: installed Gridbook distribution evidence is not closed"]
+    direct_url = distribution.get("direct_url")
+    transport = direct_url.get("url") if isinstance(
+        direct_url, Mapping
+    ) else None
+    try:
+        parsed_transport = urlsplit(transport) if isinstance(
+            transport, str
+        ) else None
+    except ValueError:
+        parsed_transport = None
+    transport_valid = (
+        transport == runtime_pin.get("repository")
+        or (
+            parsed_transport is not None
+            and parsed_transport.scheme == "file"
+            and parsed_transport.netloc in {"", "localhost"}
+            and parsed_transport.path.startswith("/")
+            and not parsed_transport.query
+            and not parsed_transport.fragment
+            and parsed_transport.username is None
+            and parsed_transport.password is None
+        )
+    )
+    if (
+        distribution.get("schema") != GRIDBOOK_DISTRIBUTION_SCHEMA
+        or distribution.get("name") != "gridbook"
+        or distribution.get("repository") != runtime_pin.get("repository")
+        or distribution.get("version") != runtime_pin.get("version")
+        or not isinstance(direct_url, Mapping)
+        or set(direct_url) != {"url", "vcs_info"}
+        or direct_url.get("vcs_info") != expected_vcs
+        or not transport_valid
+    ):
+        return [
+            f"{slot}: installed Gridbook PEP 610 identity differs from the pin"
+        ]
+
+    def descriptor(value: object) -> bool:
+        return (
+            isinstance(value, Mapping)
+            and set(value) == {"bytes", "sha256"}
+            and isinstance(value.get("bytes"), int)
+            and not isinstance(value.get("bytes"), bool)
+            and value.get("bytes", -1) > 0
+            and re.fullmatch(r"[0-9a-f]{64}", str(value.get("sha256", "")))
+            is not None
+        )
+
+    metadata_paths = [
+        distribution.get("direct_url_path"),
+        distribution.get("metadata_path"),
+        distribution.get("record_path"),
+    ]
+    if (
+        any(
+            not isinstance(value, str)
+            or value.startswith("/")
+            or ".dist-info/" not in value
+            for value in metadata_paths
+        )
+        or not descriptor(distribution.get("direct_url_identity"))
+        or not descriptor(distribution.get("metadata_identity"))
+        or not descriptor(distribution.get("record_identity"))
+    ):
+        return [f"{slot}: installed Gridbook metadata/RECORD identity is malformed"]
+
+    source_files = distribution.get("source_files")
+    required = {
+        "gridbook/__init__.py",
+        "gridbook/cuda_ext.py",
+        "gridbook/plugin.py",
+        "gridbook/runtime_contract.json",
+        "gridbook/source_passthrough.py",
+        "gridbook/csrc/cb_gemv.cu",
+        "gridbook/csrc/mxfp8_dense_gemm.cu",
+    }
+    if (
+        not isinstance(source_files, Mapping)
+        or not required <= set(source_files)
+        or distribution.get("source_files_sha256") != canonical_sha(source_files)
+        or any(
+            not isinstance(name, str)
+            or not name.startswith("gridbook/")
+            or ".." in Path(name).parts
+            or not descriptor(identity)
+            for name, identity in source_files.items()
+        )
+    ):
+        return [f"{slot}: installed Gridbook source/RECORD closure differs"]
+    return []
+
+
+def _verify_dsv4_gridbook_gold_contract(
+    slot: str,
+    record: Mapping[str, Any],
+    metrics: Mapping[str, Any],
+    *,
+    model_dir: str | os.PathLike | None,
+    require_current_artifact_path: bool = True,
+) -> list[str]:
+    """Replay the closed one-Spark in-process Gridbook gold contract.
+
+    Absolute paths in a receipt identify the measurement mount.  They are
+    re-resolved and required to be ``samefile`` at fill time, but a shipped
+    artifact remains the same object after a copy/move: later verification is
+    therefore keyed by model SHA plus its recursive inventory digest/bytes.
+    """
+    problems: list[str] = []
+
+    def problem(detail: str) -> None:
+        problems.append(f"{slot}: {detail}")
+
+    def sha(value: object) -> bool:
+        return isinstance(value, str) and re.fullmatch(
+            r"[0-9a-f]{64}", value
+        ) is not None
+
+    def canonical_sha(value: object) -> str | None:
+        try:
+            encoded = json.dumps(
+                value,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        except (TypeError, ValueError):
+            return None
+        return hashlib.sha256(encoded).hexdigest()
+
+    def positive_int(value: object) -> bool:
+        return (
+            isinstance(value, int)
+            and not isinstance(value, bool)
+            and value > 0
+        )
+
+    def finite_nonnegative(value: object) -> bool:
+        return (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(float(value))
+            and float(value) >= 0
+        )
+
+    contract = metrics.get("dsv4_gridbook_contract")
+    if not isinstance(contract, Mapping):
+        return [f"{slot}: missing DSv4 Gridbook gold contract"]
+    expected_contract_keys = {
+        "schema",
+        "artifact_dir",
+        "requires_moe_backend_marlin",
+        "llm_kwargs",
+        "environment",
+        "tensor_parallel_size",
+        "dtype",
+        "trust_remote_code",
+        "gpu_memory_utilization",
+        "disable_log_stats",
+        "speculative_decoding",
+    }
+    if set(contract) != expected_contract_keys:
+        problem("DSv4 Gridbook contract fields are not closed and exact")
+    if contract.get("schema") != DSV4_GRIDBOOK_CONTRACT_SCHEMA:
+        problem("unsupported DSv4 Gridbook contract schema")
+    artifact_dir = contract.get("artifact_dir")
+    if (
+        not isinstance(artifact_dir, str)
+        or not artifact_dir
+        or not Path(artifact_dir).is_absolute()
+    ):
+        problem("DSv4 Gridbook contract has no absolute artifact directory")
+    requires_marlin = contract.get("requires_moe_backend_marlin")
+    if not isinstance(requires_marlin, bool):
+        problem("DSv4 Gridbook Marlin requirement is not boolean")
+    expected_kwargs: dict[str, Any] = {
+        "trust_remote_code": True,
+        "dtype": "bfloat16",
+        "tensor_parallel_size": 1,
+        "gpu_memory_utilization": 0.84,
+        "max_logprobs": 248_320,
+        "quantization": "gridbook",
+        "kv_cache_dtype": "fp8",
+        "tokenizer_mode": "deepseek_v4",
+        "generation_config": "vllm",
+        "enable_prefix_caching": False,
+        "max_model_len": 8192,
+        "max_num_seqs": 1,
+        "max_num_batched_tokens": 512,
+        "kv_cache_memory_bytes": 1_073_741_824,
+        "seed": 0,
+        "enforce_eager": True,
+        "disable_log_stats": True,
+    }
+    if requires_marlin is True:
+        expected_kwargs["moe_backend"] = "marlin"
+    if contract.get("llm_kwargs") != expected_kwargs:
+        problem("DSv4 Gridbook LLM kwargs differ from the exact release contract")
+    expected_environment = dict(CANONICAL_GOLD_ENVIRONMENT)
+    if contract.get("environment") != expected_environment:
+        problem("DSv4 Gridbook environment is not closed and exact")
+    expected_top_level = {
+        "tensor_parallel_size": 1,
+        "dtype": "bfloat16",
+        "trust_remote_code": True,
+        "gpu_memory_utilization": 0.84,
+        "disable_log_stats": True,
+        "speculative_decoding": False,
+    }
+    for key, expected in expected_top_level.items():
+        if contract.get(key) != expected:
+            problem(f"DSv4 Gridbook contract {key} differs from {expected!r}")
+
+    if slot == "gold.kl":
+        workload = {
+            "mode": "student",
+            "score_positions": "all",
+            "prompt_top_k": 1024,
+            "n_samples": 8,
+            "seqlen": 512,
+            "n_positions": 4088,
+            "quantization": "gridbook",
+        }
+        for key, expected in workload.items():
+            if metrics.get(key) != expected:
+                problem(f"DSv4 KL workload {key} differs from {expected!r}")
+        if not positive_int(metrics.get("vocab_size")) or int(
+            metrics.get("vocab_size", 0)
+        ) <= 1024:
+            problem("DSv4 KL workload has an invalid vocabulary size")
+        if not positive_int(metrics.get("n_confident")) or not finite_nonnegative(
+            metrics.get("kl_confident_mean")
+        ):
+            problem("DSv4 KL workload lacks confident-position evidence")
+
+        teacher = metrics.get("teacher_evidence")
+        expected_teacher_keys = {
+            "schema", "payload_sha256", "payload_bytes",
+            "payload_semantic_sha256", "meta_sha256", "source_model",
+            "source_model_identity_sha256", "calibration_contract",
+            "calibration_contract_sha256", "topk_coverage_mean",
+            "topk_coverage_min", "topk_coverage_policy",
+        }
+        if not isinstance(teacher, Mapping) or set(teacher) != expected_teacher_keys:
+            problem("DSv4 KL teacher evidence is missing or not closed")
+        else:
+            for key in (
+                "payload_sha256", "payload_semantic_sha256", "meta_sha256",
+                "source_model_identity_sha256", "calibration_contract_sha256",
+            ):
+                if not sha(teacher.get(key)):
+                    problem(f"DSv4 KL teacher {key} is not digest-bound")
+            if (
+                teacher.get("schema") != FULL_KL_TEACHER_EVIDENCE_SCHEMA
+                or not positive_int(teacher.get("payload_bytes"))
+            ):
+                problem("DSv4 KL teacher evidence schema/byte count is invalid")
+            coverage_mean = teacher.get("topk_coverage_mean")
+            coverage_min = teacher.get("topk_coverage_min")
+            coverage_policy = teacher.get("topk_coverage_policy")
+            expected_coverage_policy = {
+                "schema": TOPK_COVERAGE_POLICY_SCHEMA,
+                "top_k": 1024,
+                "minimum_probability_mass_per_position": 0.90,
+                "maximum_probability_mass": 1.0,
+                "probability_mass_absolute_tolerance": 1e-6,
+                "maximum_declared_tail_mass_per_position": 1.0 - 0.90,
+                "tail_bucket": True,
+            }
+            if (
+                not finite_nonnegative(coverage_mean)
+                or not finite_nonnegative(coverage_min)
+                or float(coverage_min) < 0.90
+                or float(coverage_mean) < float(coverage_min)
+                or float(coverage_mean) > 1.0 + 1e-6
+                or coverage_policy != expected_coverage_policy
+            ):
+                problem("DSv4 KL teacher top-K/tail coverage policy differs")
+            source = teacher.get("source_model")
+            if (
+                not isinstance(source, Mapping)
+                or set(source) != {
+                    "schema", "content_sha256", "resolved_commit",
+                    "checkpoint_shards", "checkpoint_tensors",
+                }
+                or source.get("schema")
+                != "prismaquant.streamed_model.identity.v1"
+                or not sha(source.get("content_sha256"))
+                or (
+                    source.get("resolved_commit") is not None
+                    and (
+                        not isinstance(source.get("resolved_commit"), str)
+                        or not source.get("resolved_commit")
+                    )
+                )
+                or not positive_int(source.get("checkpoint_shards"))
+                or not positive_int(source.get("checkpoint_tensors"))
+            ):
+                problem("DSv4 KL teacher source-model identity is invalid")
+            calibration = teacher.get("calibration_contract")
+            expected_calibration_keys = {
+                "schema", "dataset", "corpus_construction", "tokenizer",
+                "window_seed", "sampler", "n_samples", "seqlen", "starts",
+                "total_tokens", "calib_ids_sha256", "scoring",
+            }
+            if (
+                not isinstance(calibration, Mapping)
+                or set(calibration) != expected_calibration_keys
+                or calibration.get("schema") != WIKITEXT_GOLD_CALIBRATION_SCHEMA
+                or teacher.get("calibration_contract_sha256")
+                != canonical_sha(calibration)
+            ):
+                problem("DSv4 KL calibration contract/digest is invalid")
+            else:
+                dataset = calibration.get("dataset")
+                if (
+                    not isinstance(dataset, Mapping)
+                    or set(dataset) != {
+                        "name", "config", "split", "revision", "fingerprint",
+                        "corpus_sha256",
+                    }
+                    or dataset.get("name") != "wikitext"
+                    or dataset.get("config") != "wikitext-2-raw-v1"
+                    or dataset.get("split") != "train"
+                    or dataset.get("revision")
+                    != "b08601e04326c79dfdd32d625aee71d232d685c3"
+                    or not isinstance(dataset.get("fingerprint"), str)
+                    or not dataset.get("fingerprint")
+                    or not sha(dataset.get("corpus_sha256"))
+                ):
+                    problem("DSv4 KL calibration dataset identity differs")
+                if calibration.get("corpus_construction") != {
+                    "row_filter": (
+                        "include iff bool(text.strip()); preserve text verbatim"
+                    ),
+                    "join_separator": "\n\n",
+                    "normalization": "none",
+                }:
+                    problem("DSv4 KL calibration corpus construction differs")
+                tokenizer = calibration.get("tokenizer")
+                if (
+                    not isinstance(tokenizer, Mapping)
+                    or tokenizer != {
+                        "identity_sha256": tokenizer.get("identity_sha256"),
+                        "trust_remote_code": True,
+                        "add_special_tokens": False,
+                    }
+                    or not sha(tokenizer.get("identity_sha256"))
+                ):
+                    problem("DSv4 KL calibration tokenizer identity differs")
+                starts = calibration.get("starts")
+                if (
+                    calibration.get("window_seed") != 42
+                    or calibration.get("sampler") != (
+                        "python.random.Random(seed).sample(range(max_start), "
+                        "n_samples)/v1"
+                    )
+                    or calibration.get("n_samples") != 8
+                    or calibration.get("seqlen") != 512
+                    or not isinstance(starts, list)
+                    or len(starts) != 8
+                    or len(set(starts)) != 8
+                    or any(
+                        isinstance(value, bool)
+                        or not isinstance(value, int)
+                        or value < 0
+                        for value in starts
+                    )
+                    or not positive_int(calibration.get("total_tokens"))
+                    or int(calibration.get("total_tokens", 0)) < 513
+                    or not sha(calibration.get("calib_ids_sha256"))
+                    or calibration.get("scoring") != {
+                        "positions": "all",
+                        "prompt_top_k": 1024,
+                        "logprob_dtype": "float32",
+                        "tail_bucket": True,
+                    }
+                ):
+                    problem("DSv4 KL calibration window/scoring contract differs")
+    else:
+        workload = {
+            "split": "test",
+            "n_tokens_requested": 8192,
+            "n_tokens_scored": 8176,
+            "seqlen": 512,
+            "quantization": "gridbook",
+        }
+        for key, expected in workload.items():
+            if metrics.get(key) != expected:
+                problem(f"DSv4 PPL workload {key} differs from {expected!r}")
+        mean_nll = metrics.get("mean_nll")
+        perplexity = metrics.get("ppl")
+        per_chunk = metrics.get("per_chunk_mean_nll")
+        max_chunk = metrics.get("max_chunk_mean_nll")
+        if not finite_nonnegative(mean_nll):
+            problem("DSv4 PPL mean_nll is missing, non-finite, or negative")
+        if (
+            not finite_nonnegative(perplexity)
+            or float(perplexity) < 1.0
+        ):
+            problem("DSv4 PPL ppl is missing, non-finite, or below one")
+        if (
+            not isinstance(per_chunk, list)
+            or len(per_chunk) != 16
+            or any(not finite_nonnegative(value) for value in per_chunk)
+        ):
+            problem(
+                "DSv4 PPL requires exactly 16 finite non-negative "
+                "per-chunk mean NLL values"
+            )
+        elif not finite_nonnegative(max_chunk) or not math.isclose(
+            float(max_chunk),
+            max(float(value) for value in per_chunk),
+            rel_tol=1e-12,
+            abs_tol=1e-12,
+        ):
+            problem("DSv4 PPL max_chunk_mean_nll arithmetic differs")
+        if finite_nonnegative(mean_nll) and isinstance(per_chunk, list) and (
+            len(per_chunk) == 16
+            and all(finite_nonnegative(value) for value in per_chunk)
+        ) and not math.isclose(
+            float(mean_nll),
+            math.fsum(float(value) for value in per_chunk) / 16.0,
+            rel_tol=1e-12,
+            abs_tol=1e-12,
+        ):
+            problem("DSv4 PPL mean_nll differs from the per-chunk mean")
+        if finite_nonnegative(mean_nll) and (
+            finite_nonnegative(perplexity) and float(perplexity) >= 1.0
+        ):
+            try:
+                expected_perplexity = math.exp(float(mean_nll))
+            except OverflowError:
+                expected_perplexity = math.inf
+            if not math.isclose(
+                float(perplexity),
+                expected_perplexity,
+                rel_tol=1e-12,
+                abs_tol=1e-12,
+            ):
+                problem("DSv4 PPL ppl differs from exp(mean_nll)")
+        calibration = metrics.get("calibration_contract")
+        expected_calibration_keys = {
+            "schema", "dataset", "corpus_construction", "tokenizer",
+            "token_selection", "scoring",
+        }
+        if (
+            not isinstance(calibration, Mapping)
+            or set(calibration) != expected_calibration_keys
+            or calibration.get("schema") != WIKITEXT_PPL_CALIBRATION_SCHEMA
+            or metrics.get("calibration_contract_sha256")
+            != canonical_sha(calibration)
+        ):
+            problem("DSv4 PPL calibration contract/digest is invalid")
+        else:
+            dataset = calibration.get("dataset")
+            if (
+                not isinstance(dataset, Mapping)
+                or set(dataset) != {
+                    "name", "config", "split", "revision", "fingerprint",
+                    "corpus_sha256",
+                }
+                or dataset.get("name") != "wikitext"
+                or dataset.get("config") != "wikitext-2-raw-v1"
+                or dataset.get("split") != "test"
+                or dataset.get("revision") != WIKITEXT_REVISION
+                or dataset.get("fingerprint")
+                != DSV4_WIKITEXT_DATASET_FINGERPRINT
+                or dataset.get("corpus_sha256")
+                != DSV4_WIKITEXT_CORPUS_SHA256
+            ):
+                problem("DSv4 PPL calibration dataset identity differs")
+            if calibration.get("corpus_construction") != {
+                "row_filter": (
+                    "include iff bool(text.strip()); preserve text verbatim"
+                ),
+                "join_separator": "\n\n",
+                "normalization": "none",
+            }:
+                problem("DSv4 PPL corpus construction differs")
+            tokenizer = calibration.get("tokenizer")
+            if (
+                not isinstance(tokenizer, Mapping)
+                or set(tokenizer) != {
+                    "identity_sha256", "trust_remote_code",
+                    "add_special_tokens",
+                }
+                or tokenizer.get("trust_remote_code") is not True
+                or tokenizer.get("add_special_tokens") is not False
+                or tokenizer.get("identity_sha256")
+                != DSV4_TOKENIZER_IDENTITY_SHA256
+            ):
+                problem("DSv4 PPL tokenizer identity is invalid")
+            elif model_dir is not None:
+                tokenizer_files: dict[str, dict[str, object]] = {}
+                try:
+                    tokenizer_root = Path(model_dir).resolve(strict=True)
+                    for name in _TOKENIZER_IDENTITY_FILENAMES:
+                        path = tokenizer_root / name
+                        if path.is_file() and not path.is_symlink():
+                            tokenizer_files[name] = {
+                                "bytes": int(path.stat().st_size),
+                                "sha256": _file_content_sha256(path),
+                            }
+                    observed_tokenizer_sha = canonical_sha({
+                        "files": tokenizer_files
+                    })
+                except OSError:
+                    observed_tokenizer_sha = None
+                if (
+                    not tokenizer_files
+                    or tokenizer.get("identity_sha256")
+                    != observed_tokenizer_sha
+                ):
+                    problem(
+                        "DSv4 PPL tokenizer identity differs from artifact"
+                    )
+            selection = calibration.get("token_selection")
+            if (
+                not isinstance(selection, Mapping)
+                or set(selection) != {
+                    "strategy", "n_tokens_requested", "n_tokens_available",
+                    "selected_token_count", "token_ids_sha256",
+                    "digest_encoding",
+                }
+                or selection.get("strategy")
+                != "contiguous_prefix_after_full_corpus_tokenization/v1"
+                or selection.get("n_tokens_requested") != 8192
+                or selection.get("selected_token_count") != 8192
+                or selection.get("n_tokens_available")
+                != DSV4_WIKITEXT_TOTAL_TOKENS
+                or selection.get("token_ids_sha256")
+                != DSV4_WIKITEXT_SELECTED_TOKEN_IDS_SHA256
+                or selection.get("digest_encoding")
+                != "canonical_json_integer_array/v1"
+            ):
+                problem("DSv4 PPL token-prefix identity differs")
+            scoring = calibration.get("scoring")
+            expected_starts = list(range(0, 8192, 512))
+            if (
+                not isinstance(scoring, Mapping)
+                or set(scoring) != {
+                    "chunking", "seqlen", "chunk_starts",
+                    "chunk_token_counts", "positions", "n_tokens_scored",
+                    "prompt_logprobs", "temperature", "max_tokens",
+                    "detokenize",
+                }
+                or scoring.get("chunking")
+                != "nonoverlapping_contiguous/v1"
+                or scoring.get("seqlen") != 512
+                or scoring.get("chunk_starts") != expected_starts
+                or scoring.get("chunk_token_counts") != [512] * 16
+                or scoring.get("positions")
+                != "within_each_chunk_positions_1_through_N_minus_1"
+                or scoring.get("n_tokens_scored") != 8176
+                or scoring.get("prompt_logprobs") != 1
+                or scoring.get("temperature") != 0.0
+                or scoring.get("max_tokens") != 1
+                or scoring.get("detokenize") is not False
+            ):
+                problem("DSv4 PPL scoring-window contract differs")
+
+    manifest = metrics.get("serve_manifest")
+    if not isinstance(manifest, Mapping):
+        return problems + [f"{slot}: missing in-process serve-manifest binding"]
+    if manifest.get("schema") != SERVE_MANIFEST_SCHEMA:
+        problem("unsupported gold serve-manifest schema")
+    contract_sha = canonical_sha(contract)
+    if (
+        contract_sha is None
+        or metrics.get("dsv4_gridbook_contract_sha256") != contract_sha
+        or manifest.get("dsv4_gridbook_contract_sha256") != contract_sha
+        or manifest.get("effective_llm_kwargs") != expected_kwargs
+    ):
+        problem("gold manifest does not bind the exact effective LLM contract")
+    try:
+        from tools.serve_fingerprint import (
+            SERVER_ENV_ALLOWLIST,
+            _serve_model,
+            argv_identifies_vllm_engine,
+            fingerprint,
+            performance_stack_fingerprint,
+            process_identity_sha256,
+            serve_session_fingerprint,
+        )
+
+        recomputed_fingerprint = fingerprint(manifest)
+    except Exception as exc:
+        problem(f"gold serve manifest is not canonical: {exc}")
+        recomputed_fingerprint = None
+    manifest_fingerprint = manifest.get("serve_fingerprint")
+    if (
+        not sha(manifest_fingerprint)
+        or manifest_fingerprint != recomputed_fingerprint
+        or manifest_fingerprint != record.get("serve_fingerprint")
+    ):
+        problem("gold serve fingerprint is missing, stale, or differs from its record")
+    expected_tool = (
+        "measure_vllm_full_kl"
+        if slot == "gold.kl"
+        else "measure_vllm_wikitext_ppl"
+    )
+    if (
+        manifest.get("source") != "in_process"
+        or manifest.get("measurement_tool") != expected_tool
+        or manifest.get("attestation_phase") != "snapshot"
+    ):
+        problem("gold serve manifest has the wrong in-process measurement identity")
+    if manifest.get("speculative_config") is not None:
+        problem("gold serve manifest carries speculative decoding")
+    from .validate_cb_endpoint import (
+        DSV4_SPARK_GPU_NAME,
+        DSV4_SPARK_VLLM_IMAGE,
+        DSV4_SPARK_VLLM_VERSION,
+        _gridbook_runtime_pin,
+    )
+
+    runtime_pin = _gridbook_runtime_pin()
+    expected_runtime_pin = {
+        "commit": runtime_pin["commit"],
+        "version": runtime_pin["version"],
+    }
+    packages = manifest.get("package_versions")
+    extensions = manifest.get("resident_extensions")
+    gpu_uuid = manifest.get("gpu_uuid")
+    if (
+        manifest.get("image") != DSV4_SPARK_VLLM_IMAGE
+        or manifest.get("gpu_name") != DSV4_SPARK_GPU_NAME
+        or manifest.get("gpu_count") != 1
+        or not isinstance(gpu_uuid, str)
+        or not gpu_uuid
+        or not isinstance(manifest.get("driver_version"), str)
+        or not manifest.get("driver_version")
+        or not isinstance(packages, Mapping)
+        or packages.get("vllm") != DSV4_SPARK_VLLM_VERSION
+        or packages.get("gridbook") != runtime_pin["version"]
+        or manifest.get("gridbook_runtime_pin") != expected_runtime_pin
+        or manifest.get("residency_readable") is not True
+        or not isinstance(extensions, list)
+        or any(not isinstance(name, str) for name in extensions)
+        or extensions != sorted(set(extensions))
+    ):
+        problem("gold serve manifest is not the exact one-Spark Gridbook runtime")
+    problems.extend(_verify_gold_producer_identity(
+        slot, record, manifest, canonical_sha=canonical_sha
+    ))
+    problems.extend(_verify_gridbook_distribution_identity(
+        slot, manifest, runtime_pin, canonical_sha=canonical_sha
+    ))
+
+    host = manifest.get("host_identity")
+    processes = manifest.get("processes")
+    process_pids: list[int] = []
+    process_hashes: list[str] = []
+    process_valid = (
+        isinstance(host, Mapping)
+        and isinstance(host.get("boot_id"), str)
+        and bool(host.get("boot_id"))
+        and sha(host.get("machine_id_sha256"))
+        and isinstance(processes, list)
+        and len(processes) >= 2
+    )
+    if process_valid:
+        for row in processes:
+            if not isinstance(row, Mapping):
+                process_valid = False
+                break
+            pid = row.get("pid")
+            argv = row.get("argv")
+            identity = row.get("identity_sha256")
+            if (
+                set(row) != {
+                    "pid", "argv", "cmdline", "start_time_ticks",
+                    "pid_namespace", "executable", "identity_sha256",
+                }
+                or
+                isinstance(pid, bool)
+                or not isinstance(pid, int)
+                or pid <= 0
+                or not isinstance(argv, list)
+                or not argv
+                or any(not isinstance(value, str) for value in argv)
+                or not sha(identity)
+                or identity != process_identity_sha256(
+                    row, boot_id=host.get("boot_id")
+                )
+            ):
+                process_valid = False
+                break
+            process_pids.append(pid)
+            process_hashes.append(str(identity))
+    parent_pid = manifest.get("measurement_parent_pid")
+    engine_pids = manifest.get("engine_descendant_pids")
+    observed_engine_pids = [
+        row.get("pid")
+        for row in (processes if isinstance(processes, list) else [])
+        if isinstance(row, Mapping)
+        and argv_identifies_vllm_engine(row.get("argv", []))
+    ]
+    if (
+        not process_valid
+        or process_pids != sorted(set(process_pids))
+        or len(process_hashes) != len(set(process_hashes))
+        or not positive_int(parent_pid)
+        or parent_pid not in process_pids
+        or not isinstance(engine_pids, list)
+        or not engine_pids
+        or engine_pids != sorted(set(engine_pids))
+        or engine_pids != observed_engine_pids
+        or parent_pid in engine_pids
+        or any(pid not in process_pids for pid in engine_pids)
+        or not sha(manifest.get("serve_session_id"))
+        or manifest.get("serve_session_id") != serve_session_fingerprint(manifest)
+        or not sha(manifest.get("performance_stack_fingerprint"))
+        or manifest.get("performance_stack_fingerprint")
+        != performance_stack_fingerprint(manifest)
+    ):
+        problem("gold process/session identity is incomplete or inconsistent")
+
+    manifest_environment = manifest.get("server_process_environment")
+    environment_rows = manifest_environment.get("processes") if isinstance(
+        manifest_environment, Mapping
+    ) else None
+    environment_valid = (
+        isinstance(manifest_environment, Mapping)
+        and set(manifest_environment) == {
+            "schema", "allowlist", "readable_pids", "unreadable_pids",
+            "consistent", "values", "processes",
+        }
+        and manifest_environment.get("schema")
+        == "prismaquant.server_process_environment/1"
+        and manifest_environment.get("allowlist")
+        == sorted(SERVER_ENV_ALLOWLIST)
+        and manifest_environment.get("readable_pids") == process_pids
+        and manifest_environment.get("unreadable_pids") == []
+        and manifest_environment.get("consistent") is True
+        and manifest_environment.get("values")
+        == dict(CANONICAL_GOLD_SET_ENVIRONMENT)
+        and manifest.get("pq_env") == dict(CANONICAL_GOLD_SET_ENVIRONMENT)
+        and isinstance(environment_rows, list)
+        and len(environment_rows) == len(process_pids)
+    )
+    if environment_valid:
+        for index, row in enumerate(environment_rows):
+            if (
+                not isinstance(row, Mapping)
+                or set(row) != {"pid", "values", "sha256"}
+                or row.get("pid") != process_pids[index]
+                or row.get("values") != dict(CANONICAL_GOLD_SET_ENVIRONMENT)
+                or row.get("sha256")
+                != canonical_sha(dict(CANONICAL_GOLD_SET_ENVIRONMENT))
+            ):
+                environment_valid = False
+                break
+    if not environment_valid:
+        problem("gold process environment differs from the exact contract")
+
+    binding = manifest.get("artifact_binding")
+    if not isinstance(binding, Mapping):
+        return problems + [f"{slot}: gold serve manifest has no artifact binding"]
+    if set(binding) != {
+        "schema", "resolved_path", "launch_model", "model_sha",
+        "artifact_inventory_sha256", "artifact_bytes",
+    } or binding.get("schema") != SERVED_ARTIFACT_BINDING_SCHEMA:
+        problem("gold serve manifest has the wrong artifact-binding schema")
+    if binding.get("model_sha") != record.get("model_sha"):
+        problem("gold serve manifest binds a different model_sha")
+    if (
+        isinstance(artifact_dir, str)
+        and binding.get("resolved_path") != artifact_dir
+    ):
+        problem("gold contract and serve manifest name different artifact paths")
+    launch_model = binding.get("launch_model")
+    if not isinstance(launch_model, str) or not Path(launch_model).is_absolute():
+        problem("gold serve manifest does not bind an absolute launch model")
+
+    launch_argv = manifest.get("launch_argv")
+    observed_launch_model = (
+        _serve_model(launch_argv)
+        if isinstance(launch_argv, list)
+        and all(isinstance(value, str) for value in launch_argv)
+        else None
+    )
+    if (
+        not isinstance(manifest.get("model"), str)
+        or manifest.get("model") != launch_model
+        or observed_launch_model != launch_model
+    ):
+        problem("gold launch argv/model do not bind the measured artifact")
+
+    if model_dir is not None:
+        try:
+            root = Path(model_dir).resolve(strict=True)
+            if not root.is_dir():
+                raise ValueError("verified artifact path is not a directory")
+            if require_current_artifact_path:
+                canonical_root = str(root)
+                for label, value in (
+                    ("contract artifact_dir", artifact_dir),
+                    ("binding resolved_path", binding.get("resolved_path")),
+                    ("binding launch_model", launch_model),
+                    ("manifest model", manifest.get("model")),
+                    ("argv model", observed_launch_model),
+                ):
+                    if not isinstance(value, str) or not Path(value).is_absolute():
+                        raise ValueError(f"{label} is not an absolute path")
+                    resolved = Path(value).resolve(strict=True)
+                    if not resolved.is_dir() or not os.path.samefile(root, resolved):
+                        raise ValueError(f"{label} differs from the verified artifact")
+                if artifact_dir != canonical_root or binding.get(
+                    "resolved_path"
+                ) != canonical_root:
+                    raise ValueError("artifact receipt paths are not canonical")
+            quant_config = json.loads((root / "quant_config.json").read_text(
+                encoding="utf-8"
+            ))
+            provenance = quant_config.get("provenance")
+            inventory = provenance.get("artifact_inventory") if isinstance(
+                provenance, Mapping
+            ) else None
+            if not isinstance(inventory, Mapping):
+                raise ValueError("artifact has no finalized inventory")
+            canonical = json.dumps(
+                inventory,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+            inventory_sha = hashlib.sha256(canonical).hexdigest()
+            if binding.get("artifact_inventory_sha256") != inventory_sha:
+                raise ValueError("inventory digest differs")
+            if binding.get("artifact_bytes") != inventory.get(
+                "export_directory_bytes"
+            ):
+                raise ValueError("artifact byte count differs")
+            if slot == "gold.kl":
+                teacher = metrics.get("teacher_evidence")
+                teacher_source = teacher.get("source_model") if isinstance(
+                    teacher, Mapping
+                ) else None
+                candidate_source = provenance.get(
+                    "source_model_identity"
+                ) if isinstance(provenance, Mapping) else None
+                if teacher_source != candidate_source:
+                    raise ValueError(
+                        "teacher source identity differs from candidate provenance"
+                    )
+            declared_files = inventory.get("file_bytes")
+            if not isinstance(declared_files, Mapping) or not declared_files:
+                raise ValueError("artifact inventory file ledger is empty")
+            observed_files: dict[str, int] = {}
+            for path in sorted(root.rglob("*")):
+                if path.is_symlink():
+                    raise ValueError("artifact inventory contains a symlink")
+                if path.is_file():
+                    observed_files[path.relative_to(root).as_posix()] = int(
+                        path.stat().st_size
+                    )
+            if dict(declared_files) != observed_files or sum(
+                observed_files.values()
+            ) != binding.get("artifact_bytes"):
+                raise ValueError("artifact recursive files differ from inventory")
+            from tools.dsv4_gridbook_contract import requires_moe_backend_marlin
+
+            if requires_moe_backend_marlin(root) is not requires_marlin:
+                raise ValueError("Marlin requirement differs from quant_config")
+            required_extensions = _gold_extension_requirements(quant_config)
+            observed_extensions = (
+                extensions if isinstance(extensions, list) else []
+            )
+            extension_checks = {
+                "cb_main": _CB_MAIN_EXTENSION_RE,
+                "cb_v2": _CB_V2_EXTENSION_RE,
+                "mxfp8_dense": _MXFP8_DENSE_EXTENSION_RE,
+            }
+            missing_extension_families = sorted(
+                family
+                for family in required_extensions
+                if not any(
+                    extension_checks[family].fullmatch(name) is not None
+                    for name in observed_extensions
+                )
+            )
+            if missing_extension_families:
+                raise ValueError(
+                    "resident extension set does not cover finalized routes: "
+                    + ", ".join(missing_extension_families)
+                )
+        except Exception as exc:
+            problem(f"gold artifact-binding replay failed — {exc}")
+    else:
+        problem("gold artifact-binding replay requires the verified artifact path")
+    return problems
+
+
+def _verify_gold_record(
+    slot: str,
+    record: Mapping[str, Any],
+    *,
+    model_dir: str | os.PathLike | None = None,
+    require_dsv4_gridbook_contract: bool = False,
+    require_current_artifact_path: bool = True,
+) -> list[str]:
     """Require a slot-specific finite gold metric plus measurement identity."""
     problems: list[str] = []
     metrics = record.get("metrics")
@@ -768,6 +1907,14 @@ def _verify_gold_record(slot: str, record: Mapping[str, Any]) -> list[str]:
         metrics.get("n_tokens_scored"), bool
     ) or metrics.get("n_tokens_scored", 0) <= 0:
         problems.append(f"{slot}: missing positive scored-token count")
+    if require_dsv4_gridbook_contract:
+        problems.extend(_verify_dsv4_gridbook_gold_contract(
+            slot,
+            record,
+            metrics,
+            model_dir=model_dir,
+            require_current_artifact_path=require_current_artifact_path,
+        ))
     return problems
 
 
@@ -971,9 +2118,10 @@ def _verify_gridbook_performance_record(
 
     The performance validator reads the large paired report/telemetry corpus
     once.  The fixed-size shipcard persists their unique SHA-256 identities,
-    the exact matrix coverage, the independently eligible displaced
-    container, and the candidate inventory.  Publication replays every
-    internal binding here instead of trusting a generic ``passed: true`` row.
+    compact paired raw metric projections, the exact matrix coverage, the
+    independently eligible displaced container, and the candidate inventory.
+    Publication recomputes every ratio and verdict here instead of trusting a
+    generic ``passed: true`` row or a producer-computed statistic.
     """
     problems: list[str] = []
 
@@ -995,7 +2143,10 @@ def _verify_gridbook_performance_record(
     def finite(value: object) -> float | None:
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             return None
-        parsed = float(value)
+        try:
+            parsed = float(value)
+        except (OverflowError, ValueError):
+            return None
         return parsed if math.isfinite(parsed) else None
 
     if record.get("slot") != slot:
@@ -1039,6 +2190,22 @@ def _verify_gridbook_performance_record(
             problem("Gridbook runtime commit is not the tracked pin")
         if metrics.get("gridbook_runtime_version") != pin.get("version"):
             problem("Gridbook runtime version is not the tracked pin")
+
+    environment_contract = metrics.get("server_environment_contract")
+    expected_performance_environment = {
+        **dict(CANONICAL_GOLD_ENVIRONMENT),
+        "PRISMAQUANT_PRELOAD_FUSED": "1",
+    }
+    if environment_contract != {
+        "schema": "prismaquant.gridbook_environment/1",
+        "profile": "matched_budget_performance",
+        "base_profile": "canonical_gold",
+        "overrides": {"PRISMAQUANT_PRELOAD_FUSED": "1"},
+        "environment": expected_performance_environment,
+    }:
+        problem(
+            "performance environment does not carry the exact canonical-plus-preload profile"
+        )
 
     digest_fields = (
         "candidate_inventory_sha256",
@@ -1105,6 +2272,7 @@ def _verify_gridbook_performance_record(
         shipped_max = coverage.get("shipped_max_concurrency")
         valid_concurrencies = (
             isinstance(concurrencies, list)
+            and bool(concurrencies)
             and all(positive_int(value) for value in concurrencies)
             and concurrencies == sorted(set(concurrencies))
             and positive_int(shipped_max)
@@ -1169,14 +2337,6 @@ def _verify_gridbook_performance_record(
                 problem(f"cell verdict {index} has no id")
             else:
                 verdict_ids.append(verdict_id)
-            if (
-                phase not in {"prefill", "decode", "mixed"}
-                or not positive_int(concurrency)
-                or not isinstance(chunked, bool)
-                or (phase == "decode" and decode_mode not in {"plain", "shipped"})
-                or (phase != "decode" and decode_mode is not None)
-            ):
-                problem(f"cell verdict {index} has an invalid configuration")
             configuration_valid = (
                 isinstance(phase, str)
                 and phase in {"prefill", "decode", "mixed"}
@@ -1191,12 +2351,18 @@ def _verify_gridbook_performance_record(
                     or (phase != "decode" and decode_mode is None)
                 )
             )
-            if configuration_valid:
+            if not configuration_valid:
+                problem(f"cell verdict {index} has an invalid configuration")
+            else:
                 verdict_tuples.add((phase, concurrency, chunked, decode_mode))
             if not isinstance(rows, list) or not rows:
                 problem(f"cell verdict {index} has no metric ratios")
                 continue
-            expected_metrics = CB_PERFORMANCE_PHASE_METRICS.get(str(phase), ())
+            expected_metrics = (
+                CB_PERFORMANCE_PHASE_METRICS.get(phase, ())
+                if isinstance(phase, str)
+                else ()
+            )
             observed_metrics = [
                 (row.get("metric"), row.get("direction"))
                 if isinstance(row, Mapping)
@@ -1207,17 +2373,76 @@ def _verify_gridbook_performance_record(
                 problem(
                     f"cell verdict {index} metric names or directions differ "
                     "from the phase contract"
-                )
+            )
             for row_index, row in enumerate(rows):
                 ratios = row.get("paired_ratios") if isinstance(row, Mapping) else None
-                if not isinstance(ratios, list) or len(ratios) < 3:
-                    problem(f"cell verdict {index} metric {row_index} lacks ratios")
+                paired_values = row.get("paired_values") if isinstance(
+                    row, Mapping
+                ) else None
+                if (
+                    not isinstance(ratios, list)
+                    or not isinstance(paired_values, list)
+                    or len(ratios) < 3
+                    or len(paired_values) != len(ratios)
+                    or any(
+                        not isinstance(pair, list) or len(pair) != 2
+                        for pair in paired_values
+                    )
+                ):
+                    problem(
+                        f"cell verdict {index} metric {row_index} lacks exact "
+                        "paired raw values and ratios"
+                    )
                     continue
-                parsed = [finite(value) for value in ratios]
-                if any(value is None or value <= 0 for value in parsed):
-                    problem(f"cell verdict {index} metric {row_index} has invalid ratios")
+                parsed_pairs = [
+                    (finite(pair[0]), finite(pair[1]))
+                    for pair in paired_values
+                ]
+                parsed_ratios = [finite(value) for value in ratios]
+                if (
+                    any(
+                        candidate is None
+                        or candidate <= 0
+                        or baseline is None
+                        or baseline <= 0
+                        for candidate, baseline in parsed_pairs
+                    )
+                    or any(value is None or value <= 0 for value in parsed_ratios)
+                ):
+                    problem(
+                        f"cell verdict {index} metric {row_index} has invalid "
+                        "raw values or ratios"
+                    )
                     continue
-                numeric = [float(value) for value in parsed if value is not None]
+                numeric_pairs = [
+                    (float(candidate), float(baseline))
+                    for candidate, baseline in parsed_pairs
+                    if candidate is not None and baseline is not None
+                ]
+                numeric = [
+                    (
+                        candidate / baseline
+                        if row.get("direction") == "candidate/baseline"
+                        else baseline / candidate
+                    )
+                    for candidate, baseline in numeric_pairs
+                ]
+                if any(
+                    declared is None
+                    or not math.isclose(
+                        computed,
+                        declared,
+                        rel_tol=1e-12,
+                        abs_tol=1e-12,
+                    )
+                    for computed, declared in zip(
+                        numeric, parsed_ratios, strict=True
+                    )
+                ):
+                    problem(
+                        f"cell verdict {index} metric {row_index} ratios differ "
+                        "from paired raw values"
+                    )
                 ordered = sorted(numeric)
                 position = (len(ordered) - 1) * 0.05
                 lower = math.floor(position)
@@ -1293,6 +2518,17 @@ def _verify_gridbook_performance_record(
             if not isinstance(row, Mapping):
                 problem(f"paired report {index} is malformed")
                 continue
+            expected_report_keys = {
+                "cell_id", "candidate_sha256", "baseline_sha256",
+                "candidate_pre_serve_manifest_sha256",
+                "candidate_post_serve_manifest_sha256",
+                "baseline_pre_serve_manifest_sha256",
+                "baseline_post_serve_manifest_sha256",
+                "candidate_serve_session_id", "baseline_serve_session_id",
+                "performance_stack_fingerprint",
+            }
+            if set(row) != expected_report_keys:
+                problem(f"paired report {index} fields are not closed and exact")
             cell_id = row.get("cell_id")
             if not isinstance(cell_id, str) or not cell_id:
                 problem(f"paired report {index} has no cell id")
@@ -1304,6 +2540,34 @@ def _verify_gridbook_performance_record(
                     problem(f"paired report {index} {arm} is not digest-bound")
                 else:
                     report_digests.append(value)
+            manifest_digests = [
+                row.get(key)
+                for key in (
+                    "candidate_pre_serve_manifest_sha256",
+                    "candidate_post_serve_manifest_sha256",
+                    "baseline_pre_serve_manifest_sha256",
+                    "baseline_post_serve_manifest_sha256",
+                )
+            ]
+            if any(not sha(value) for value in manifest_digests) or len(
+                set(manifest_digests)
+            ) != 4:
+                problem(
+                    f"paired report {index} does not bind four distinct "
+                    "pre/post arm manifests"
+                )
+            candidate_session = row.get("candidate_serve_session_id")
+            baseline_session = row.get("baseline_serve_session_id")
+            if (
+                not sha(candidate_session)
+                or not sha(baseline_session)
+                or candidate_session == baseline_session
+                or not sha(row.get("performance_stack_fingerprint"))
+            ):
+                problem(
+                    f"paired report {index} has invalid serve-session or "
+                    "matched-stack identities"
+                )
         if len(cell_ids) != len(set(cell_ids)):
             problem("paired report cell ids are not unique")
         if cell_ids != verdict_ids:
@@ -1395,8 +2659,13 @@ def _verify_gridbook_performance_record(
         if (
             not isinstance(source, Mapping)
             or source.get("schema") != "prismaquant.streamed_model.identity.v1"
-            or not isinstance(source.get("resolved_commit"), str)
-            or not source.get("resolved_commit")
+            or (
+                source.get("resolved_commit") is not None
+                and (
+                    not isinstance(source.get("resolved_commit"), str)
+                    or not source.get("resolved_commit")
+                )
+            )
             or not sha(source.get("content_sha256"))
             or not positive_int(source.get("checkpoint_shards"))
             or not positive_int(source.get("checkpoint_tensors"))

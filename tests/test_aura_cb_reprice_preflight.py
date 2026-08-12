@@ -336,11 +336,29 @@ def test_driver_takes_atomic_mutex_before_any_gpu_container():
     assert "PRISMAQUANT_CB_ENCODE_COMPILE" in driver
     assert "AURA_CB_LAUNCH_RECEIPT" in driver
     assert "--implementation-receipt" in driver
+    assert (
+        "gridbook@sha256:"
+        "f7dad9260fea6f4207bd894acc9ebc034d91c599a70489a89ab1938a75db9c47"
+        in driver
+    )
+    assert "IMAGE must be an immutable @sha256 digest" in driver
+    assert "docker image inspect --format '{{.Id}}'" in driver
+    assert driver.count("--entrypoint bash \"$IMAGE_ID\"") == 2
+    assert '--entrypoint bash "$IMAGE"' not in driver
+    assert "container_runtime_identity.py" in driver
+    assert "write-or-verify" in driver
+    assert driver.count("verify-mounted") == 2
+    assert "--require-receipt-image" in driver
+    assert "PRISMAQUANT_RUNTIME_IMAGE" not in driver
     assert 'CALIB_NSAMPLES="${CALIB_NSAMPLES:-16}"' in driver
     assert 'CALIB_SEQLEN="${CALIB_SEQLEN:-512}"' in driver
     assert 'CALIB_SEED="${CALIB_SEED:-42}"' in driver
     assert 'CACHE_HEADROOM_GB="${CACHE_HEADROOM_GB:-100}"' in driver
     assert '-e "CACHE_HEADROOM_GB=$CACHE_HEADROOM_GB"' in driver
+    assert '-e "PYTORCH_NO_CUDA_MEMORY_CACHING=0"' in driver
+    assert "DSv4 AURA image must declare" not in driver
+    assert "synchronizes and empty_cache()s" in driver
+    assert "DSv4 requires the layer-local caching allocator" in driver
     assert "launch log reports cache_slots and must stay <= 1" in driver
     assert "--resume" in driver
     assert 'if [[ ! -s "$CACHE_MANIFEST" ]]' not in driver

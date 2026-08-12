@@ -302,6 +302,7 @@ class CandidateSpec:
     shape_features: tuple[float, ...]
     coordinate: float
     terminal: bool = False
+    allocator_selectable: bool = True
 
     def __post_init__(self) -> None:
         for name in ("format_name", "family", "equivalence_class"):
@@ -327,6 +328,8 @@ class CandidateSpec:
         object.__setattr__(self, "coordinate", coordinate)
         object.__setattr__(self, "payload_bytes", payload_bytes)
         object.__setattr__(self, "shape_features", features)
+        if not isinstance(self.allocator_selectable, bool):
+            raise ValueError("candidate allocator_selectable must be boolean")
 
 
 @dataclass(frozen=True)
@@ -352,6 +355,8 @@ class UnitSpec:
             raise ValueError("unit must declare exactly one passthrough terminal")
         if not any(not candidate.terminal for candidate in candidates):
             raise ValueError("unit has no renderable candidate")
+        if not any(candidate.allocator_selectable for candidate in candidates):
+            raise ValueError("unit has no allocator-selectable candidate")
         if int(self.n_params) <= 0:
             raise ValueError("unit n_params must be positive")
         object.__setattr__(self, "candidates", candidates)
@@ -1296,17 +1301,21 @@ def price_anchored_candidates(
                     anchor.receipt.receipt_sha256,
                     plugin_arm_sha,
                 ))
-        terminal = next(candidate for candidate in unit.candidates if candidate.terminal)
-        priced.append(PricedCell(
-            unit.qname,
-            terminal,
-            0.0,
-            None,
-            # The allocator's byte-verbatim contract, not a label of our own:
-            # cost_entry_is_source_passthrough() refuses anything else, and a
-            # near-miss string silently misclassifies the activation branch.
-            SOURCE_PASSTHROUGH_COST_SOURCE,
-        ))
+        terminal = next(
+            candidate for candidate in unit.candidates if candidate.terminal
+        )
+        if terminal.allocator_selectable:
+            priced.append(PricedCell(
+                unit.qname,
+                terminal,
+                0.0,
+                None,
+                # The allocator's byte-verbatim contract, not a label of our
+                # own: cost_entry_is_source_passthrough() refuses anything
+                # else, and a near-miss string silently misclassifies the
+                # activation branch.
+                SOURCE_PASSTHROUGH_COST_SOURCE,
+            ))
         rows[unit.qname] = tuple(sorted(
             priced, key=lambda item: (
                 item.candidate.payload_bytes, item.candidate.format_name,
@@ -1378,6 +1387,11 @@ def extrapolation_distance_report(
         if candidate is None:
             raise AnchoredCostError(
                 f"{qname}: exposure selection {selected_name!r} is illegal"
+            )
+        if not candidate.allocator_selectable:
+            raise AnchoredCostError(
+                f"{qname}: exposure selection {selected_name!r} was retained "
+                "only as source/render identity and is not allocator-selectable"
             )
         if candidate.terminal:
             terminal_count += 1

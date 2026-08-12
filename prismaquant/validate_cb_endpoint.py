@@ -34,6 +34,8 @@ from .shipcard import (
     load_shipcard,
     make_record,
 )
+from .gridbook_assignment import artifact_requires_moe_backend_marlin
+from .gridbook_environment import CANONICAL_GOLD_ENVIRONMENT
 
 
 DSV4_SPARK_VLLM_IMAGE = (
@@ -50,14 +52,19 @@ DSV4_GRAPH_COMPILATION_CONFIG = (
 )
 DEFAULT_PROMPT = "The capital of France is"
 DEFAULT_MAX_TOKENS = 8
+DSV4_SERVED_MODEL_PREFIX = "dsv4-flash-gridbook-"
 ENDPOINT_CONTRACT_SCHEMA = "prismaquant.cb_endpoint_contract.v1"
 ARTIFACT_DECODE_CONTRACT_SCHEMA = (
     "prismaquant.cb_artifact_decode_contract.v1"
 )
 ENDPOINT_RESULT_SCHEMA = "prismaquant.cb_endpoint_validation.v1"
+ENDPOINT_SESSION_SCHEMA = "prismaquant.cb_endpoint_session.v1"
 _FINGERPRINT_RE = re.compile(r"[0-9a-f]{64}")
 _GRAPH_CAPTURE_RE = re.compile(
     r"Graph capturing finished in [0-9]+ secs, took -?[0-9.]+ GiB"
+)
+_SESSION_MODEL_RE = re.compile(
+    re.escape(DSV4_SERVED_MODEL_PREFIX) + r"[0-9a-f]{32}"
 )
 _FULL_DECODE_CONFIG_RE = re.compile(
     r"Initializing a V1 LLM engine .*?compilation_config=\{.*?"
@@ -67,11 +74,21 @@ _FULL_DECODE_CONFIG_RE = re.compile(
 _GRIDBOOK_NATIVE_EXTENSION_RE = re.compile(
     r"^(?:prismaquant_cb(?:_v2)?_ext|pq_cb_|pq_mxfp8_dense_)"
 )
-_REQUIRED_SERVE_ENV = {
-    "PRISMAQUANT_CB_DECODE": "cuda",
+_ENDPOINT_SERVE_ENVIRONMENT = {
+    **dict(CANONICAL_GOLD_ENVIRONMENT),
+    # Native eager/graph gates intentionally preload all extension families so
+    # both arms start from matching residency.  This is the sole override of
+    # the canonical Gridbook-0.8.4 gold profile.
     "PRISMAQUANT_PRELOAD_FUSED": "1",
-    "GRIDBOOK_MXFP8_DENSE": "1",
-    "VLLM_USE_DEEP_GEMM": "0",
+    # The endpoint runner mounts one persistent, non-/tmp build cache.  This
+    # residency/build input is path identity rather than a numerical lever,
+    # but it is still attested exactly because Gridbook reads it at import.
+    "PRISMAQUANT_CB_EXT_DIR": "/opt/gridbook/ext-cache",
+}
+_REQUIRED_SERVE_ENV = {
+    name: value
+    for name, value in _ENDPOINT_SERVE_ENVIRONMENT.items()
+    if value is not None
 }
 _SERVE_VALUE_FLAGS = frozenset({
     "--served-model-name",
@@ -128,16 +145,305 @@ def _canonical_json_sha256(payload: object) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _artifact_requires_moe_marlin(quant_config: Mapping[str, Any]) -> bool:
-    """Mirror the driver route test without importing Gridbook or torch."""
-    def contains(value: object) -> bool:
-        if isinstance(value, Mapping):
-            return any(contains(item) for item in value.values())
-        if isinstance(value, list):
-            return any(contains(item) for item in value)
-        return value == DSV4_MXFP4_WIRE_ID
+def _require_session_model_name(value: object) -> str:
+    if not isinstance(value, str) or _SESSION_MODEL_RE.fullmatch(value) is None:
+        raise CBEndpointValidationError(
+            "served model name must contain the fixed DSv4 prefix plus a fresh "
+            "128-bit lowercase hexadecimal session nonce"
+        )
+    return value
 
-    return contains(quant_config)
+
+def _expected_serve_environment(runtime_pin: Mapping[str, Any]) -> dict[str, str]:
+    """Exact set-valued process environment for the endpoint/perf profile."""
+    commit = runtime_pin.get("commit")
+    version = runtime_pin.get("version")
+    if not isinstance(commit, str) or not isinstance(version, str):
+        raise CBEndpointValidationError("Gridbook runtime pin is incomplete")
+    return {
+        **_REQUIRED_SERVE_ENV,
+        "PQ_GRIDBOOK_RUNTIME_COMMIT": commit,
+        "PQ_GRIDBOOK_RUNTIME_VERSION": version,
+    }
+
+
+def _validate_closed_server_environment(
+    payload: Mapping[str, Any],
+    *,
+    runtime_pin: Mapping[str, Any],
+) -> dict[str, str]:
+    """Replay the complete allowlist against every inspected server process."""
+    try:
+        from tools.serve_fingerprint import SERVER_ENV_ALLOWLIST
+    except Exception as exc:  # pragma: no cover - packaging misuse
+        raise CBEndpointValidationError(
+            "tools.serve_fingerprint is unavailable; run from the PrismaQuant tree"
+        ) from exc
+
+    expected = _expected_serve_environment(runtime_pin)
+    process_environment = payload.get("server_process_environment")
+    pq_env = payload.get("pq_env")
+    rows = process_environment.get("processes") if isinstance(
+        process_environment, Mapping
+    ) else None
+    readable_pids = process_environment.get("readable_pids") if isinstance(
+        process_environment, Mapping
+    ) else None
+    processes = payload.get("processes")
+    process_pids = [
+        row.get("pid") for row in processes
+        if isinstance(row, Mapping)
+    ] if isinstance(processes, list) else []
+    if (
+        not isinstance(process_environment, Mapping)
+        or set(process_environment) != {
+            "schema", "allowlist", "readable_pids", "unreadable_pids",
+            "consistent", "values", "processes",
+        }
+        or process_environment.get("schema")
+        != "prismaquant.server_process_environment/1"
+        or process_environment.get("allowlist") != sorted(SERVER_ENV_ALLOWLIST)
+        or process_environment.get("unreadable_pids") != []
+        or process_environment.get("consistent") is not True
+        or process_environment.get("values") != expected
+        or pq_env != expected
+        or not isinstance(rows, list)
+        or not rows
+        or not isinstance(readable_pids, list)
+        or sorted(readable_pids) != sorted(process_pids)
+        or len(readable_pids) != len(set(readable_pids))
+        or len(rows) != len(process_pids)
+    ):
+        raise CBEndpointValidationError(
+            "serve manifest environment is not the exact live-process Gridbook "
+            f"contract; expected exact values for {sorted(expected)}"
+        )
+    row_pids: list[int] = []
+    expected_sha = _canonical_json_sha256(expected)
+    for index, row in enumerate(rows):
+        if (
+            not isinstance(row, Mapping)
+            or set(row) != {"pid", "values", "sha256"}
+            or not isinstance(row.get("pid"), int)
+            or isinstance(row.get("pid"), bool)
+            or row.get("values") != expected
+            or row.get("sha256") != expected_sha
+        ):
+            raise CBEndpointValidationError(
+                f"serve manifest process environment row {index} differs from contract"
+            )
+        row_pids.append(int(row["pid"]))
+    if sorted(row_pids) != sorted(process_pids) or len(row_pids) != len(
+        set(row_pids)
+    ):
+        raise CBEndpointValidationError(
+            "serve manifest process environment rows do not cover its process census"
+        )
+    return expected
+
+
+def _validate_live_server_session(
+    payload: Mapping[str, Any],
+    *,
+    expected_served_model: str,
+) -> dict[str, Any]:
+    """Replay process/session/listener ownership and the live models response."""
+    try:
+        from tools.serve_fingerprint import (
+            models_endpoint_binding_identity,
+            process_identity_sha256,
+            serve_session_fingerprint,
+        )
+    except Exception as exc:  # pragma: no cover - packaging misuse
+        raise CBEndpointValidationError(
+            "tools.serve_fingerprint is unavailable; run from the PrismaQuant tree"
+        ) from exc
+
+    host = payload.get("host_identity")
+    machine_sha = host.get("machine_id_sha256") if isinstance(
+        host, Mapping
+    ) else None
+    if (
+        not isinstance(host, Mapping)
+        or set(host) != {"hostname", "boot_id", "machine_id_sha256", "pid_namespace"}
+        or host.get("hostname") != payload.get("hostname")
+        or not isinstance(host.get("hostname"), str)
+        or not host.get("hostname")
+        or not isinstance(host.get("boot_id"), str)
+        or not host.get("boot_id")
+        or (
+            machine_sha is not None
+            and (
+                not isinstance(machine_sha, str)
+                or _FINGERPRINT_RE.fullmatch(machine_sha) is None
+            )
+        )
+        or not isinstance(host.get("pid_namespace"), str)
+        or not host.get("pid_namespace")
+    ):
+        raise CBEndpointValidationError(
+            "serve manifest has no complete stable host identity"
+        )
+
+    launch_argv = payload.get("launch_argv")
+    processes = payload.get("processes")
+    if not isinstance(launch_argv, list) or not isinstance(processes, list) or not processes:
+        raise CBEndpointValidationError(
+            "serve manifest has no concrete server process census"
+        )
+    process_ids: list[int] = []
+    process_hashes: list[str] = []
+    launch_pids: list[int] = []
+    compact_processes: list[dict[str, Any]] = []
+    for index, process in enumerate(processes):
+        pid = process.get("pid") if isinstance(process, Mapping) else None
+        argv = process.get("argv") if isinstance(process, Mapping) else None
+        identity_sha = process.get("identity_sha256") if isinstance(
+            process, Mapping
+        ) else None
+        if (
+            not isinstance(process, Mapping)
+            or isinstance(pid, bool)
+            or not isinstance(pid, int)
+            or pid <= 0
+            or not isinstance(argv, list)
+            or not argv
+            or any(not isinstance(token, str) or not token for token in argv)
+            or process.get("cmdline") != " ".join(argv)
+            or isinstance(process.get("start_time_ticks"), bool)
+            or not isinstance(process.get("start_time_ticks"), int)
+            or process.get("start_time_ticks", -1) < 0
+            or not isinstance(process.get("pid_namespace"), str)
+            or not process.get("pid_namespace")
+            or not isinstance(process.get("executable"), str)
+            or not process.get("executable")
+            or not isinstance(identity_sha, str)
+            or _FINGERPRINT_RE.fullmatch(identity_sha) is None
+            or identity_sha != process_identity_sha256(
+                process, boot_id=str(host["boot_id"])
+            )
+        ):
+            raise CBEndpointValidationError(
+                f"serve manifest process {index} identity is malformed or stale"
+            )
+        process_ids.append(pid)
+        process_hashes.append(identity_sha)
+        compact_processes.append({"pid": pid, "identity_sha256": identity_sha})
+        if argv == launch_argv:
+            launch_pids.append(pid)
+    if (
+        len(process_ids) != len(set(process_ids))
+        or len(process_hashes) != len(set(process_hashes))
+        or len(launch_pids) != 1
+    ):
+        raise CBEndpointValidationError(
+            "serve manifest does not identify one unique launch process set"
+        )
+
+    census = payload.get("listener_census")
+    census_rows = census.get("listeners") if isinstance(census, Mapping) else None
+    listener = payload.get("listener_binding")
+    listener_rows = listener.get("listeners") if isinstance(listener, Mapping) else None
+    valid_rows = True
+    inodes: list[str] = []
+    if isinstance(census_rows, list):
+        for row in census_rows:
+            owners = row.get("pids") if isinstance(row, Mapping) else None
+            inode = row.get("socket_inode") if isinstance(row, Mapping) else None
+            if (
+                not isinstance(row, Mapping)
+                or set(row) != {"family", "address", "port", "socket_inode", "pids"}
+                or row.get("family") not in {"ipv4", "ipv6"}
+                or not isinstance(row.get("address"), str)
+                or not row.get("address")
+                or isinstance(row.get("port"), bool)
+                or not isinstance(row.get("port"), int)
+                or not 0 < row.get("port", 0) <= 65535
+                or not isinstance(inode, str)
+                or not inode.isdigit()
+                or not isinstance(owners, list)
+                or not owners
+                or len(owners) != len(set(owners))
+                or not set(owners).issubset(process_ids)
+            ):
+                valid_rows = False
+                break
+            inodes.append(inode)
+    if (
+        not isinstance(census, Mapping)
+        or census.get("schema") != "prismaquant.server_tcp_listeners/1"
+        or census.get("tables_readable") is not True
+        or census.get("unreadable_pids") != []
+        or not isinstance(census_rows, list)
+        or not valid_rows
+        or len(inodes) != len(set(inodes))
+        or not isinstance(listener, Mapping)
+        or set(listener) != {
+            "schema", "base_url", "launch_host", "launch_port", "listeners"
+        }
+        or listener.get("schema") != "prismaquant.server_listener_binding/1"
+        or listener.get("base_url") != "http://127.0.0.1:8000"
+        or listener.get("launch_host") != "0.0.0.0"
+        or listener.get("launch_port") != 8000
+        or not isinstance(listener_rows, list)
+        or not listener_rows
+        or listener_rows
+        != [
+            row for row in census_rows
+            if isinstance(row, Mapping) and row.get("port") == 8000
+        ]
+        or launch_pids[0]
+        not in {
+            pid
+            for row in listener_rows
+            if isinstance(row, Mapping)
+            for pid in row.get("pids", [])
+        }
+    ):
+        raise CBEndpointValidationError(
+            "serve manifest listener is not owned by its exact launch process"
+        )
+
+    session_id = payload.get("serve_session_id")
+    if (
+        not isinstance(session_id, str)
+        or _FINGERPRINT_RE.fullmatch(session_id) is None
+        or session_id != serve_session_fingerprint(payload)
+    ):
+        raise CBEndpointValidationError(
+            "serve manifest session identity is missing or stale"
+        )
+    try:
+        endpoint_identity = models_endpoint_binding_identity(
+            payload.get("models_endpoint_binding")
+        )
+    except Exception as exc:
+        raise CBEndpointValidationError(
+            f"serve manifest models endpoint binding is invalid: {exc}"
+        ) from exc
+    model_identity = endpoint_identity.get("model")
+    gpu_uuid = payload.get("gpu_uuid")
+    if (
+        not isinstance(model_identity, Mapping)
+        or model_identity.get("id") != expected_served_model
+        or model_identity.get("root") != "/model"
+        or not isinstance(gpu_uuid, str)
+        or not gpu_uuid.startswith("GPU-")
+        or len(gpu_uuid) <= len("GPU-")
+    ):
+        raise CBEndpointValidationError(
+            "serve manifest models endpoint/GPU does not identify the launched /model session"
+        )
+    return {
+        "schema": ENDPOINT_SESSION_SCHEMA,
+        "serve_session_id": session_id,
+        "host_identity": dict(host),
+        "gpu_uuid": gpu_uuid,
+        "processes": sorted(compact_processes, key=lambda row: row["pid"]),
+        "launch_pid": launch_pids[0],
+        "listener_binding": dict(listener),
+        "models_endpoint_binding": endpoint_identity,
+    }
 
 
 def _canonical_launch_contract(
@@ -267,6 +573,7 @@ def validate_serve_manifest(
     """Validate server-side identity and return its exact fingerprint."""
     if arm not in {"eager", "graph"}:
         raise CBEndpointValidationError(f"unknown validation arm {arm!r}")
+    _require_session_model_name(expected_served_model)
 
     # Import the existing canonicalization only here so ordinary module import
     # remains stdlib + shipcard.  This validator is run from a repository mount
@@ -385,20 +692,12 @@ def validate_serve_manifest(
         raise CBEndpointValidationError(
             "serve manifest has no resident reviewed Gridbook-native CUDA extension"
         )
-    pq_env = payload.get("pq_env")
-    if not isinstance(pq_env, Mapping) or any(
-        not isinstance(key, str) or not isinstance(value, str)
-        for key, value in pq_env.items()
-    ):
-        raise CBEndpointValidationError("serve manifest has no environment record")
-    for key, expected_value in _REQUIRED_SERVE_ENV.items():
-        if pq_env.get(key) != expected_value:
-            raise CBEndpointValidationError(
-                f"serve environment requires {key}={expected_value!r}; "
-                f"got {pq_env.get(key)!r}"
-            )
-
     runtime_pin = _gridbook_runtime_pin()
+    _validate_closed_server_environment(payload, runtime_pin=runtime_pin)
+    _validate_live_server_session(
+        payload,
+        expected_served_model=expected_served_model,
+    )
     manifest_pin = payload.get("gridbook_runtime_pin")
     expected_pin = {
         "commit": runtime_pin["commit"],
@@ -557,7 +856,7 @@ def validate_cb_artifact_decode_contract(
         ),
         "dspark_overlay": overlay_provenance,
         "dspark_overlay_sha256": _canonical_json_sha256(overlay_payload),
-        "requires_moe_backend_marlin": _artifact_requires_moe_marlin(
+        "requires_moe_backend_marlin": artifact_requires_moe_backend_marlin(
             quant_config
         ),
     }
@@ -836,6 +1135,38 @@ def _resolve_served_model(
     return model_ids[0]
 
 
+def _observe_models_endpoint_binding(
+    base_url: str,
+    requested: str,
+    *,
+    timeout: float,
+    requester: Requester,
+) -> dict[str, Any]:
+    """Obtain the stable `/models` projection through the smoke requester."""
+    response = requester("GET", _endpoint(base_url, "models"), None, timeout)
+    try:
+        from tools.serve_fingerprint import models_endpoint_binding_from_bytes
+
+        raw = json.dumps(
+            response,
+            sort_keys=False,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        binding = models_endpoint_binding_from_bytes(
+            raw,
+            request_url=_endpoint(base_url, "models"),
+            expected_served_model=requested,
+        )
+        from tools.serve_fingerprint import models_endpoint_binding_identity
+
+        return models_endpoint_binding_identity(binding)
+    except Exception as exc:
+        raise CBEndpointValidationError(
+            f"live models endpoint identity is invalid: {exc}"
+        ) from exc
+
+
 def _completion_text(payload: Mapping[str, Any]) -> str:
     choices = payload.get("choices")
     if not isinstance(choices, list) or len(choices) != 1:
@@ -857,13 +1188,31 @@ def run_endpoint_smoke(
     max_tokens: int = 8,
     timeout: float = 300.0,
     requester: Requester = _request_json,
+    expected_models_identity: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run two identical greedy requests and return non-quality metrics."""
     if max_tokens <= 0:
         raise CBEndpointValidationError("max_tokens must be positive")
-    served_model = _resolve_served_model(
-        base_url, model_name, timeout=timeout, requester=requester
-    )
+    if model_name is None:
+        served_model = _resolve_served_model(
+            base_url, model_name, timeout=timeout, requester=requester
+        )
+        live_models_identity = None
+    else:
+        served_model = model_name
+        live_models_identity = _observe_models_endpoint_binding(
+            base_url,
+            served_model,
+            timeout=timeout,
+            requester=requester,
+        )
+        if (
+            expected_models_identity is not None
+            and dict(live_models_identity) != dict(expected_models_identity)
+        ):
+            raise CBEndpointValidationError(
+                "validation endpoint is not the attested live server session"
+            )
     request_payload = {
         "model": served_model,
         "prompt": prompt,
@@ -901,6 +1250,7 @@ def run_endpoint_smoke(
         "n": 1,
         "stream": False,
         "max_tokens": max_tokens,
+        "models_endpoint_identity": live_models_identity,
     }
 
 
@@ -916,11 +1266,7 @@ def build_endpoint_contract(
 ) -> dict[str, Any]:
     """Build the path-independent receipt the shipcard verifier can replay."""
     _validate_artifact_decode_record(artifact_decode)
-    served_model = manifest.get("served_model_name")
-    if not isinstance(served_model, str) or not served_model:
-        raise CBEndpointValidationError(
-            "serve manifest has no non-empty served model name"
-        )
+    served_model = _require_session_model_name(manifest.get("served_model_name"))
     launch = _canonical_launch_contract(
         manifest.get("launch_argv") or (),
         arm=arm,
@@ -932,10 +1278,18 @@ def build_endpoint_contract(
     pin = _gridbook_runtime_pin()
     environment = manifest.get("pq_env")
     extensions = manifest.get("resident_extensions")
-    if not isinstance(environment, Mapping) or not isinstance(extensions, list):
+    if (
+        not isinstance(environment, Mapping)
+        or dict(environment) != _expected_serve_environment(pin)
+        or not isinstance(extensions, list)
+    ):
         raise CBEndpointValidationError(
             "serve manifest lacks contract environment or extension residency"
         )
+    session = _validate_live_server_session(
+        manifest,
+        expected_served_model=served_model,
+    )
     graph_record = None
     if cuda_graph is not None:
         graph_record = {
@@ -967,6 +1321,7 @@ def build_endpoint_contract(
             for key, value in sorted(environment.items())
         },
         "resident_extensions": sorted(str(value) for value in extensions),
+        "endpoint_session": session,
         "endpoint_smoke": dict(endpoint_smoke),
         "cuda_graph": graph_record,
     }
@@ -1000,6 +1355,7 @@ def validate_endpoint_contract_record(
         "launch",
         "environment",
         "resident_extensions",
+        "endpoint_session",
         "endpoint_smoke",
         "cuda_graph",
         "contract_sha256",
@@ -1102,7 +1458,7 @@ def validate_endpoint_contract_record(
     requires_marlin = artifact_decode.get("requires_moe_backend_marlin")
     if (
         not isinstance(served_model, str)
-        or not served_model
+        or _SESSION_MODEL_RE.fullmatch(served_model) is None
         or launch.get("model") != "/model"
         or not isinstance(options, Mapping)
         or not isinstance(switches, list)
@@ -1125,23 +1481,20 @@ def validate_endpoint_contract_record(
         )
 
     environment = payload.get("environment")
-    if not isinstance(environment, Mapping) or any(
-        not isinstance(key, str)
-        or not isinstance(value, str)
-        or not (
-            key.startswith("PRISMAQUANT_")
-            or key in {"GRIDBOOK_MXFP8_DENSE", "VLLM_USE_DEEP_GEMM"}
+    expected_environment = _expected_serve_environment(pin)
+    if not isinstance(environment, Mapping) or dict(
+        environment
+    ) != expected_environment:
+        observed = dict(environment) if isinstance(environment, Mapping) else {}
+        differing = sorted(
+            name for name in set(observed) | set(expected_environment)
+            if observed.get(name) != expected_environment.get(name)
+            or (name in observed) != (name in expected_environment)
         )
-        for key, value in environment.items()
-    ):
         raise CBEndpointValidationError(
-            "endpoint contract environment is malformed or out of scope"
+            "endpoint contract environment differs from the complete "
+            f"Gridbook endpoint profile: {differing}"
         )
-    for key, expected_value in _REQUIRED_SERVE_ENV.items():
-        if environment.get(key) != expected_value:
-            raise CBEndpointValidationError(
-                f"endpoint contract requires {key}={expected_value!r}"
-            )
 
     extensions = payload.get("resident_extensions")
     if (
@@ -1162,6 +1515,148 @@ def validate_endpoint_contract_record(
             "endpoint contract has no resident Gridbook-native CUDA extension"
         )
 
+    endpoint_session = payload.get("endpoint_session")
+    session_keys = {
+        "schema", "serve_session_id", "host_identity", "gpu_uuid",
+        "processes", "launch_pid", "listener_binding",
+        "models_endpoint_binding",
+    }
+    if (
+        not isinstance(endpoint_session, Mapping)
+        or set(endpoint_session) != session_keys
+        or endpoint_session.get("schema") != ENDPOINT_SESSION_SCHEMA
+        or _FINGERPRINT_RE.fullmatch(
+            str(endpoint_session.get("serve_session_id", ""))
+        ) is None
+        or not isinstance(endpoint_session.get("processes"), list)
+        or not endpoint_session.get("processes")
+        or endpoint_session.get("launch_pid") not in {
+            row.get("pid")
+            for row in endpoint_session.get("processes", [])
+            if isinstance(row, Mapping)
+        }
+    ):
+        raise CBEndpointValidationError(
+            "endpoint contract has no closed live-server session binding"
+        )
+    try:
+        from tools.serve_fingerprint import (
+            models_endpoint_binding_identity,
+            serve_session_fingerprint,
+        )
+
+        models_identity = models_endpoint_binding_identity(
+            endpoint_session["models_endpoint_binding"]
+        )
+    except Exception as exc:
+        raise CBEndpointValidationError(
+            f"endpoint contract models identity is invalid: {exc}"
+        ) from exc
+    model_identity = models_identity.get("model")
+    if not isinstance(model_identity, Mapping) or (
+        model_identity.get("id") != served_model
+        or model_identity.get("root") != "/model"
+    ):
+        raise CBEndpointValidationError(
+            "endpoint contract session does not bind the launched served model"
+        )
+    session_processes = endpoint_session.get("processes")
+    host_identity = endpoint_session.get("host_identity")
+    machine_sha = host_identity.get("machine_id_sha256") if isinstance(
+        host_identity, Mapping
+    ) else None
+    gpu_uuid = endpoint_session.get("gpu_uuid")
+    if (
+        not isinstance(host_identity, Mapping)
+        or set(host_identity)
+        != {"hostname", "boot_id", "machine_id_sha256", "pid_namespace"}
+        or not isinstance(host_identity.get("hostname"), str)
+        or not host_identity.get("hostname")
+        or not isinstance(host_identity.get("boot_id"), str)
+        or not host_identity.get("boot_id")
+        or (
+            machine_sha is not None
+            and _FINGERPRINT_RE.fullmatch(str(machine_sha)) is None
+        )
+        or not isinstance(host_identity.get("pid_namespace"), str)
+        or not host_identity.get("pid_namespace")
+        or not isinstance(gpu_uuid, str)
+        or not gpu_uuid.startswith("GPU-")
+        or len(gpu_uuid) <= len("GPU-")
+        or any(
+            not isinstance(row, Mapping)
+            or set(row) != {"pid", "identity_sha256"}
+            or isinstance(row.get("pid"), bool)
+            or not isinstance(row.get("pid"), int)
+            or row.get("pid", 0) <= 0
+            or _FINGERPRINT_RE.fullmatch(
+                str(row.get("identity_sha256", ""))
+            ) is None
+            for row in session_processes
+        )
+        or session_processes
+        != sorted(session_processes, key=lambda row: row["pid"])
+        or len({row["pid"] for row in session_processes}) != len(session_processes)
+        or len({row["identity_sha256"] for row in session_processes})
+        != len(session_processes)
+    ):
+        raise CBEndpointValidationError(
+            "endpoint contract session process census is malformed"
+        )
+    listener = endpoint_session.get("listener_binding")
+    listener_rows = listener.get("listeners") if isinstance(
+        listener, Mapping
+    ) else None
+    process_pids = {row["pid"] for row in session_processes}
+    valid_listener_rows = isinstance(listener_rows, list) and bool(listener_rows)
+    listener_inodes: list[str] = []
+    if valid_listener_rows:
+        for row in listener_rows:
+            owners = row.get("pids") if isinstance(row, Mapping) else None
+            inode = row.get("socket_inode") if isinstance(row, Mapping) else None
+            if (
+                not isinstance(row, Mapping)
+                or set(row)
+                != {"family", "address", "port", "socket_inode", "pids"}
+                or row.get("family") not in {"ipv4", "ipv6"}
+                or not isinstance(row.get("address"), str)
+                or not row.get("address")
+                or row.get("port") != 8000
+                or not isinstance(inode, str)
+                or not inode.isdigit()
+                or not isinstance(owners, list)
+                or not owners
+                or len(owners) != len(set(owners))
+                or not set(owners).issubset(process_pids)
+            ):
+                valid_listener_rows = False
+                break
+            listener_inodes.append(inode)
+    if (
+        not isinstance(listener, Mapping)
+        or set(listener)
+        != {"schema", "base_url", "launch_host", "launch_port", "listeners"}
+        or listener.get("schema") != "prismaquant.server_listener_binding/1"
+        or listener.get("base_url") != "http://127.0.0.1:8000"
+        or listener.get("launch_host") != "0.0.0.0"
+        or listener.get("launch_port") != 8000
+        or not valid_listener_rows
+        or len(listener_inodes) != len(set(listener_inodes))
+        or endpoint_session.get("launch_pid")
+        not in {
+            pid
+            for row in listener_rows or []
+            if isinstance(row, Mapping)
+            for pid in row.get("pids", [])
+        }
+        or endpoint_session.get("serve_session_id")
+        != serve_session_fingerprint(endpoint_session)
+        or endpoint_session.get("models_endpoint_binding") != models_identity
+    ):
+        raise CBEndpointValidationError(
+            "endpoint contract session listener is malformed or unowned"
+        )
+
     smoke = payload.get("endpoint_smoke")
     if not isinstance(smoke, Mapping):
         raise CBEndpointValidationError("endpoint contract has no smoke proof")
@@ -1178,6 +1673,7 @@ def validate_endpoint_contract_record(
         "n",
         "stream",
         "max_tokens",
+        "models_endpoint_identity",
     }
     _require_exact_keys(smoke, smoke_keys, where="endpoint smoke proof")
     if (
@@ -1197,6 +1693,8 @@ def validate_endpoint_contract_record(
         or smoke.get("max_tokens") != DEFAULT_MAX_TOKENS
         or smoke.get("prompt_sha256")
         != hashlib.sha256(DEFAULT_PROMPT.encode("utf-8")).hexdigest()
+        or smoke.get("models_endpoint_identity")
+        != endpoint_session.get("models_endpoint_binding")
     ):
         raise CBEndpointValidationError(
             "endpoint contract smoke request/result differs from the exact gate"
@@ -1408,12 +1906,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             expected_model_sha=model_sha,
         )
         manifest_verified = True
+        endpoint_session = _validate_live_server_session(
+            manifest,
+            expected_served_model=args.model_name,
+        )
         endpoint_smoke = run_endpoint_smoke(
             base_url=args.base_url,
             model_name=args.model_name,
             prompt=args.prompt,
             max_tokens=args.max_tokens,
             timeout=args.timeout,
+            expected_models_identity=endpoint_session[
+                "models_endpoint_binding"
+            ],
         )
         metrics.update(endpoint_smoke)
         metrics.update({

@@ -20,11 +20,16 @@ import re
 import shlex
 import statistics
 import sys
+import urllib.parse
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .gridbook_environment import (
+    CANONICAL_GOLD_ENVIRONMENT,
+    GRIDBOOK_ENVIRONMENT_SCHEMA,
+)
 from .gridbook_runtime_pin import load_gridbook_runtime_pin
 from .native_baseline_feasibility import (
     SCHEMA as NATIVE_BASELINE_FEASIBILITY_SCHEMA,
@@ -63,6 +68,13 @@ _SHA256 = frozenset("0123456789abcdef")
 _GRIDBOOK_NATIVE_EXTENSION_RE = re.compile(
     r"^(?:prismaquant_cb(?:_v2)?_ext|pq_cb_|pq_mxfp8_dense_)"
 )
+_CB_FORMAT_RE = re.compile(r"^(?:NVFP4_CB|FP8_CB)_K[0-9]+$")
+_GRIDBOOK_BACKEND_RE = re.compile(r"^gridbook-[a-z0-9][a-z0-9._-]*$")
+_DELEGATED_WIRE_TO_FORMAT = {
+    "mxfp4_e2m1_ue8m0_g32": "MXFP4_SOURCE",
+    "fp8_e4m3_ue8m0_block128": "FP8_BLOCK_UE8M0_SOURCE",
+    "mxfp8_e4m3_e8m0_g32": "MXFP8_UE8M0_G32",
+}
 _PHASES = ("prefill", "decode", "mixed")
 _REQUIRED_TELEMETRY = frozenset(
     {
@@ -106,6 +118,21 @@ _PHASE_METRICS = {
         "request_throughput",
         "output_throughput",
     ),
+}
+# Performance intentionally preloads every Gridbook extension family so the
+# candidate and displaced-container arms have identical residency.  Every
+# other Gridbook 0.8.4 input is the canonical gold value.  The full map keeps
+# the absent variables reviewable; the live process/report representation
+# contains only the set-valued projection, with absence proven by the complete
+# serve-fingerprint allowlist.
+_PERFORMANCE_SERVER_ENVIRONMENT = {
+    **dict(CANONICAL_GOLD_ENVIRONMENT),
+    "PRISMAQUANT_PRELOAD_FUSED": "1",
+}
+_REQUIRED_SERVER_ENVIRONMENT = {
+    name: value
+    for name, value in _PERFORMANCE_SERVER_ENVIRONMENT.items()
+    if value is not None
 }
 
 
@@ -277,6 +304,461 @@ def _artifact_inventory(root: Path) -> tuple[dict[str, Any], str, dict[str, Any]
     return dict(inventory), inventory_digest, quant_config
 
 
+def _cb_scheme_by_format(
+    quant_config: Mapping[str, Any], *, label: str
+) -> dict[str, Mapping[str, Any]]:
+    groups = quant_config.get("config_groups")
+    if not isinstance(groups, Mapping) or not groups:
+        raise CBPerformanceValidationError(
+            f"{label} quant_config has no concrete config groups"
+        )
+    result: dict[str, Mapping[str, Any]] = {}
+    for group_name, raw_group in groups.items():
+        if not isinstance(group_name, str) or not isinstance(raw_group, Mapping):
+            raise CBPerformanceValidationError(
+                f"{label} quant_config has a malformed config group"
+            )
+        fmt = raw_group.get("format")
+        scheme = raw_group.get("scheme")
+        if not isinstance(fmt, str) or _CB_FORMAT_RE.fullmatch(fmt) is None:
+            continue
+        if not isinstance(scheme, Mapping):
+            raise CBPerformanceValidationError(
+                f"{label} CB config group {group_name!r} has no scheme"
+            )
+        prior = result.setdefault(fmt, scheme)
+        scale = scheme.get("scale_coding")
+        prior_scale = prior.get("scale_coding")
+        if scale != prior_scale or scheme.get("grid") != prior.get("grid"):
+            raise CBPerformanceValidationError(
+                f"{label} CB format {fmt!r} has inconsistent route contracts"
+            )
+    return result
+
+
+def _route_contract(
+    fmt: str,
+    *,
+    cb_schemes: Mapping[str, Mapping[str, Any]],
+    label: str,
+) -> dict[str, str]:
+    """Canonical execution identity implied by one finalized artifact route."""
+    if _CB_FORMAT_RE.fullmatch(fmt):
+        scheme = cb_schemes.get(fmt)
+        if not isinstance(scheme, Mapping):
+            raise CBPerformanceValidationError(
+                f"{label} assigns {fmt!r} without a matching CB config group"
+            )
+        grid = scheme.get("grid")
+        if (fmt.startswith("NVFP4_CB_") and grid != "fp4") or (
+            fmt.startswith("FP8_CB_") and grid != "fp8"
+        ):
+            raise CBPerformanceValidationError(
+                f"{label} format {fmt!r} disagrees with its serialized CB grid"
+            )
+        raw_scale = scheme.get("scale_coding")
+        if raw_scale is None:
+            scale_coding = "v1"
+        elif isinstance(raw_scale, Mapping) and raw_scale.get("kind") == "two_tier":
+            scale_coding = "two_tier"
+        else:
+            raise CBPerformanceValidationError(
+                f"{label} format {fmt!r} has an unknown CB scale coding"
+            )
+        return {
+            "format_rung": fmt,
+            "serialized_layout": "product-codebook-indices-v1",
+            "scale_coding": scale_coding,
+            "quant_contract": "W4A4" if grid == "fp4" else "W8A8",
+            "backend_policy": "gridbook",
+        }
+    native = {
+        "MXFP4_SOURCE": {
+            "serialized_layout": "source-passthrough",
+            "scale_coding": "ue8m0-g32",
+            "quant_contract": "W4A16",
+            "backend_policy": "vllm-marlin",
+        },
+        "FP8_BLOCK_UE8M0_SOURCE": {
+            "serialized_layout": "source-passthrough",
+            "scale_coding": "ue8m0-block128",
+            "quant_contract": "W8A8",
+            "backend_policy": "gridbook",
+        },
+        "MXFP8_UE8M0_G32": {
+            "serialized_layout": "gridbook-native",
+            "scale_coding": "e8m0-g32",
+            "quant_contract": "W8A8",
+            "backend_policy": "gridbook",
+        },
+        "NVFP4": {
+            "serialized_layout": "compressed-tensors",
+            "scale_coding": "ue4m3",
+            "quant_contract": "W4A4",
+            "backend_policy": "vllm-cutlass",
+        },
+        "FP8_DYNAMIC": {
+            "serialized_layout": "compressed-tensors",
+            "scale_coding": "fp32-block-scale",
+            "quant_contract": "W8A8",
+            "backend_policy": "vllm-cutlass",
+        },
+        "FP8_SOURCE": {
+            "serialized_layout": "compressed-tensors",
+            "scale_coding": "fp32-block-scale",
+            "quant_contract": "W8A8",
+            "backend_policy": "vllm-cutlass",
+        },
+        "BF16": {
+            "serialized_layout": "plain",
+            "scale_coding": "none",
+            "quant_contract": "W16A16",
+            "backend_policy": "vllm-native",
+        },
+    }.get(fmt)
+    if native is None:
+        raise CBPerformanceValidationError(
+            f"{label} assigns unsupported serving format {fmt!r}"
+        )
+    return {"format_rung": fmt, **native}
+
+
+def _packed_layer_and_member(member: str) -> tuple[str, str, int] | None:
+    match = re.fullmatch(
+        r"model[.]layers[.]([0-9]+)[.]mlp[.]experts[.]([0-9]+)[.]"
+        r"(gate_proj|up_proj|down_proj)",
+        member,
+    )
+    if match is None:
+        return None
+    family = "w13" if match.group(3) in {"gate_proj", "up_proj"} else "w2"
+    return match.group(1), family, int(match.group(2))
+
+
+def _derive_expected_execution_assignments(
+    quant_config: Mapping[str, Any],
+    certified_units: Sequence[Mapping[str, Any]],
+    *,
+    label: str,
+) -> list[dict[str, str]]:
+    """Derive benchmark routes from inventory-bound artifact declarations.
+
+    Report rows are observations.  ``tensor_formats``, the delegated-native
+    declaration, and the per-expert partition are the independently bound
+    producer records that decide what every certified serving unit must run.
+    """
+    provenance = quant_config.get("provenance")
+    tensor_formats = provenance.get("tensor_formats") if isinstance(
+        provenance, Mapping
+    ) else None
+    if not isinstance(tensor_formats, Mapping) or not tensor_formats:
+        raise CBPerformanceValidationError(
+            f"{label} quant_config lacks the finalized tensor_formats route map; "
+            "re-export with the current producer"
+        )
+    formats: dict[str, str] = {}
+    for unit, fmt in tensor_formats.items():
+        if (
+            not isinstance(unit, str)
+            or not unit
+            or not isinstance(fmt, str)
+            or not fmt
+        ):
+            raise CBPerformanceValidationError(
+                f"{label} tensor_formats route map is malformed"
+            )
+        formats[unit] = fmt
+
+    delegated_record = quant_config.get("source_passthrough")
+    delegated: dict[str, str] = {}
+    if delegated_record is not None:
+        units = delegated_record.get("units") if isinstance(
+            delegated_record, Mapping
+        ) else None
+        if (
+            not isinstance(delegated_record, Mapping)
+            or set(delegated_record) != {"version", "units"}
+            or delegated_record.get("version") != 1
+            or not isinstance(units, Mapping)
+            or not units
+        ):
+            raise CBPerformanceValidationError(
+                f"{label} has a malformed delegated-native route declaration"
+            )
+        for unit, wire in units.items():
+            if (
+                not isinstance(unit, str)
+                or not unit
+                or not isinstance(wire, str)
+                or wire not in _DELEGATED_WIRE_TO_FORMAT
+            ):
+                raise CBPerformanceValidationError(
+                    f"{label} has an unknown delegated-native route"
+                )
+            delegated[unit] = _DELEGATED_WIRE_TO_FORMAT[wire]
+
+    cb_schemes = _cb_scheme_by_format(quant_config, label=label)
+    per_expert = quant_config.get("per_expert_format_groups")
+    per_expert_layers = per_expert.get("layers") if isinstance(
+        per_expert, Mapping
+    ) else None
+    if per_expert is not None and (
+        set(per_expert) != {"version", "layers"}
+        or per_expert.get("version") != 1
+        or not isinstance(per_expert_layers, Mapping)
+        or not per_expert_layers
+    ):
+        raise CBPerformanceValidationError(
+            f"{label} has a malformed per-expert route declaration"
+        )
+
+    expected: list[dict[str, str]] = []
+    covered_members: set[str] = set()
+    covered_delegated: set[str] = set()
+    for index, raw_unit in enumerate(certified_units):
+        if not isinstance(raw_unit, Mapping):
+            raise CBPerformanceValidationError(
+                f"certified serving unit {index} is malformed"
+            )
+        kind = raw_unit.get("kind")
+        unit_name = raw_unit.get("name")
+        if not isinstance(unit_name, str) or not unit_name:
+            raise CBPerformanceValidationError(
+                f"certified serving unit {index} has no name"
+            )
+        if kind == "construction":
+            fmt = delegated.get(unit_name)
+            if fmt is None:
+                raise CBPerformanceValidationError(
+                    f"{label} construction unit {unit_name!r} has no bound route"
+                )
+            covered_delegated.add(unit_name)
+            expected.append({
+                "unit": unit_name,
+                **_route_contract(fmt, cb_schemes=cb_schemes, label=label),
+            })
+            continue
+        members = raw_unit.get("members")
+        if kind != "serving" or not isinstance(members, list) or not members:
+            raise CBPerformanceValidationError(
+                f"certified serving unit {unit_name!r} is incomplete"
+            )
+        if any(not isinstance(member, str) or member not in formats for member in members):
+            missing = [member for member in members if member not in formats]
+            raise CBPerformanceValidationError(
+                f"{label} route map does not cover certified members {missing[:8]}"
+            )
+        covered_members.update(members)
+        packed = [_packed_layer_and_member(member) for member in members]
+        layers = {entry[0] for entry in packed if entry is not None}
+        if all(entry is not None for entry in packed) and len(layers) == 1 and (
+            isinstance(per_expert_layers, Mapping)
+            and next(iter(layers)) in per_expert_layers
+        ):
+            layer = next(iter(layers))
+            layer_record = per_expert_layers[layer]
+            if not isinstance(layer_record, Mapping) or set(layer_record) != {"w13", "w2"}:
+                raise CBPerformanceValidationError(
+                    f"{label} per-expert layer {layer} is malformed"
+                )
+            member_index: dict[tuple[str, int], list[str]] = {}
+            for member, member_route in zip(members, packed, strict=True):
+                assert member_route is not None
+                member_index.setdefault(
+                    (member_route[1], member_route[2]), []
+                ).append(member)
+            if any(
+                len(route_members) != (2 if family == "w13" else 1)
+                for (family, _expert), route_members in member_index.items()
+            ):
+                raise CBPerformanceValidationError(
+                    f"{label} certified per-expert unit has an incomplete "
+                    "gate/up/down member partition"
+                )
+            seen_member_keys: set[tuple[str, int]] = set()
+            for family in ("w13", "w2"):
+                entries = layer_record.get(family)
+                if not isinstance(entries, list) or not entries:
+                    raise CBPerformanceValidationError(
+                        f"{label} per-expert layer {layer}/{family} is empty"
+                    )
+                for entry in entries:
+                    if not isinstance(entry, Mapping) or set(entry) != {
+                        "format_wire_id", "expert_ids", "tensor_prefix"
+                    }:
+                        raise CBPerformanceValidationError(
+                            f"{label} per-expert layer {layer}/{family} is malformed"
+                        )
+                    wire = entry.get("format_wire_id")
+                    fmt = _DELEGATED_WIRE_TO_FORMAT.get(str(wire), str(wire))
+                    expert_ids = entry.get("expert_ids")
+                    tensor_prefix = entry.get("tensor_prefix")
+                    if (
+                        not isinstance(wire, str)
+                        or not isinstance(expert_ids, list)
+                        or not expert_ids
+                        or expert_ids != sorted(set(expert_ids))
+                        or any(isinstance(value, bool) or not isinstance(value, int) for value in expert_ids)
+                        or not isinstance(tensor_prefix, str)
+                        or not tensor_prefix
+                    ):
+                        raise CBPerformanceValidationError(
+                            f"{label} per-expert layer {layer}/{family} values are malformed"
+                        )
+                    for expert in expert_ids:
+                        key = (family, expert)
+                        route_members = member_index.get(key)
+                        if (
+                            route_members is None
+                            or key in seen_member_keys
+                            or {formats[member] for member in route_members} != {fmt}
+                        ):
+                            raise CBPerformanceValidationError(
+                                f"{label} per-expert declaration disagrees with tensor_formats"
+                            )
+                        seen_member_keys.add(key)
+                    expected.append({
+                        # ``MXFP4_SOURCE`` deliberately reuses the physical
+                        # expert tensor prefix across w13 and w2.  The runtime
+                        # dispatches those as independent family/format lanes
+                        # from the declaration, so a bare tensor prefix both
+                        # collapses two real routes and violates the execution-
+                        # manifest uniqueness contract.  Encode the consumer
+                        # declaration's complete (tensor-prefix, family,
+                        # wire-id) dispatch identity.
+                        "unit": f"{tensor_prefix}/{family}/{wire}",
+                        **_route_contract(fmt, cb_schemes=cb_schemes, label=label),
+                    })
+            if seen_member_keys != set(member_index):
+                raise CBPerformanceValidationError(
+                    f"{label} per-expert declaration does not cover its certified unit"
+                )
+            continue
+
+        unit_formats = {formats[member] for member in members}
+        if len(unit_formats) != 1:
+            raise CBPerformanceValidationError(
+                f"{label} certified atomic unit {unit_name!r} mixes formats "
+                "without a per-expert route declaration"
+            )
+        fmt = next(iter(unit_formats))
+        declaration_id = unit_name.removeprefix("group:")
+        if ".mlp.experts." in declaration_id:
+            declaration_id = declaration_id.split(".mlp.experts.", 1)[0] + ".mlp.experts"
+        declared_fmt = delegated.get(declaration_id)
+        if fmt in _DELEGATED_WIRE_TO_FORMAT.values():
+            if declared_fmt != fmt:
+                raise CBPerformanceValidationError(
+                    f"{label} delegated route {declaration_id!r} disagrees with tensor_formats"
+                )
+            covered_delegated.add(declaration_id)
+        elif declared_fmt is not None:
+            raise CBPerformanceValidationError(
+                f"{label} route {declaration_id!r} is both native and {fmt!r}"
+            )
+        expected.append({
+            "unit": unit_name,
+            **_route_contract(fmt, cb_schemes=cb_schemes, label=label),
+        })
+
+    extra_members = sorted(set(formats) - covered_members)
+    if extra_members:
+        raise CBPerformanceValidationError(
+            f"{label} tensor_formats includes uncertified serving members "
+            f"{extra_members[:8]}"
+        )
+    # Source-only/floor units (for example DSv4's unallocated block-FP8
+    # attention leaves) are deliberately outside the quantizable probe census
+    # but remain live serving routes.  The finalized delegated declaration is
+    # their authority; include every such unit instead of silently omitting it
+    # from the performance manifest.
+    for unit in sorted(set(delegated) - covered_delegated):
+        expected.append({
+            "unit": unit,
+            **_route_contract(
+                delegated[unit], cb_schemes=cb_schemes, label=label
+            ),
+        })
+    units = [row["unit"] for row in expected]
+    if len(units) != len(set(units)):
+        raise CBPerformanceValidationError(
+            f"{label} artifact-derived execution route ids are not unique"
+        )
+    return sorted(expected, key=lambda row: row["unit"])
+
+
+def _validate_execution_routes(
+    report: Mapping[str, Any],
+    expected: Sequence[Mapping[str, str]],
+    *,
+    label: str,
+) -> None:
+    execution = (report.get("metadata") or {}).get("execution_identity")
+    manifest = execution.get("manifest") if isinstance(execution, Mapping) else None
+    assignments = manifest.get("assignments") if isinstance(manifest, Mapping) else None
+    if not isinstance(assignments, list):
+        raise CBPerformanceValidationError(f"{label} has no execution assignments")
+    if [row.get("unit") for row in assignments if isinstance(row, Mapping)] != sorted(
+        row["unit"] for row in expected
+    ):
+        raise CBPerformanceValidationError(
+            f"{label} execution manifest does not equal the artifact-derived route census"
+        )
+    expected_by_unit = {row["unit"]: row for row in expected}
+    concrete_fields = (
+        "format_rung", "serialized_layout", "scale_coding", "quant_contract"
+    )
+    for assignment in assignments:
+        assert isinstance(assignment, Mapping)
+        expected_row = expected_by_unit[str(assignment["unit"])]
+        if any(assignment.get(field) != expected_row[field] for field in concrete_fields):
+            raise CBPerformanceValidationError(
+                f"{label} execution assignment {assignment['unit']!r} disagrees "
+                "with finalized quant_config"
+            )
+        backend = assignment.get("kernel_backend")
+        policy = expected_row["backend_policy"]
+        if (
+            not isinstance(backend, str)
+            or (
+                _GRIDBOOK_BACKEND_RE.fullmatch(backend) is None
+                if policy == "gridbook"
+                else backend != policy
+            )
+        ):
+            mismatch = (
+                f"non-Gridbook backend {backend!r}"
+                if policy == "gridbook"
+                else f"backend {backend!r}, expected route {policy!r}"
+            )
+            raise CBPerformanceValidationError(
+                f"{label} execution assignment {assignment['unit']!r} uses "
+                f"{mismatch}"
+            )
+        if assignment.get("fallback_state") not in {"none", "none-observed"}:
+            raise CBPerformanceValidationError(
+                f"{label} execution assignment {assignment['unit']!r} used a fallback"
+            )
+
+    assert isinstance(execution, Mapping)
+    summaries = {
+        "format_rung": execution.get("format_rung"),
+        "serialized_layout": (execution.get("serialization") or {}).get("layout"),
+        "scale_coding": (execution.get("serialization") or {}).get("scale_coding"),
+        "quant_contract": execution.get("quant_contract"),
+        "kernel_backend": execution.get("kernel_backend"),
+        "fallback_state": execution.get("fallback_state"),
+    }
+    for field, observed_summary in summaries.items():
+        values = {str(row[field]) for row in assignments}
+        expected_summary = next(iter(values)) if len(values) == 1 else "mixed"
+        if observed_summary != expected_summary:
+            raise CBPerformanceValidationError(
+                f"{label} execution summary {field}={observed_summary!r}, "
+                f"expected {expected_summary!r} from concrete assignments"
+            )
+
+
 def _validate_report(
     report: Mapping[str, Any], *, label: str, pin_commit: str, pin_version: str
 ) -> None:
@@ -417,15 +899,14 @@ def _validate_report(
     environment_values = server_environment.get("values") if isinstance(
         server_environment, Mapping
     ) else None
-    required_environment = {
-        "GRIDBOOK_MXFP8_DENSE": "1",
-        "PRISMAQUANT_CB_DECODE": "cuda",
-        "PRISMAQUANT_PRELOAD_FUSED": "1",
-        "VLLM_USE_DEEP_GEMM": "0",
+    required_report_environment = {
+        **_REQUIRED_SERVER_ENVIRONMENT,
+        "PQ_GRIDBOOK_RUNTIME_COMMIT": pin_commit,
+        "PQ_GRIDBOOK_RUNTIME_VERSION": pin_version,
     }
-    if not isinstance(environment_values, Mapping) or any(
-        environment_values.get(key) != value
-        for key, value in required_environment.items()
+    if (
+        not isinstance(environment_values, Mapping)
+        or dict(environment_values) != required_report_environment
     ):
         raise CBPerformanceValidationError(
             f"{label} lacks the exact DSv4 Gridbook dispatch environment"
@@ -644,12 +1125,29 @@ def _validate_benchmark_commands(
     artifacts = metadata.get("artifacts") if isinstance(metadata, Mapping) else None
     if not isinstance(server, Mapping) or not isinstance(artifacts, Mapping):
         raise CBPerformanceValidationError(f"{label} lacks server/artifact metadata")
+    workload = metadata.get("workload")
+    if not isinstance(workload, Mapping):
+        raise CBPerformanceValidationError(f"{label} has no workload metadata")
     expected_flags = {
         "--base-url": server.get("base_url"),
         "--endpoint": server.get("endpoint"),
         "--served-model-name": expected_model_id,
         "--model": artifacts.get("benchmark_model"),
         "--tokenizer": artifacts.get("tokenizer"),
+        "--dataset-name": "random",
+        "--random-input-len": str(workload.get("requested_random_input_len")),
+        "--random-output-len": str(workload.get("output_len")),
+        "--random-range-ratio": json.dumps(
+            {"input": workload.get("input_range_ratio"), "output": 0.0},
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        "--num-prompts": str(workload.get("num_prompts_per_block")),
+        "--num-warmups": str(workload.get("warmups_per_block")),
+        "--max-concurrency": str(workload.get("max_concurrency")),
+        "--request-rate": str(workload.get("request_rate")),
+        "--burstiness": str(workload.get("request_burstiness")),
+        "--temperature": "0",
     }
     if any(not isinstance(value, str) or not value for value in expected_flags.values()):
         raise CBPerformanceValidationError(
@@ -657,6 +1155,25 @@ def _validate_benchmark_commands(
         )
     blocks = report.get("blocks")
     assert isinstance(blocks, list)  # validated by _validate_report
+    seeds = workload.get("dataset_block_seeds")
+    percentiles = workload.get("percentiles")
+    metrics = workload.get("metrics")
+    if (
+        workload.get("dataset") != "random"
+        or workload.get("sampling")
+        != {"strategy": "greedy", "temperature": 0.0, "sampling_seed": None}
+        or workload.get("ignore_eos") is not True
+        or workload.get("streaming") is not True
+        or not isinstance(seeds, list)
+        or len(seeds) != len(blocks)
+        or not isinstance(percentiles, list)
+        or not percentiles
+        or not isinstance(metrics, list)
+        or not metrics
+    ):
+        raise CBPerformanceValidationError(
+            f"{label} workload metadata is not the exact release benchmark contract"
+        )
     for index, block in enumerate(blocks):
         command = block.get("command") if isinstance(block, Mapping) else None
         if not isinstance(command, list) or not command or not all(
@@ -671,13 +1188,37 @@ def _validate_benchmark_commands(
                     f"{label}.blocks[{index}] does not target the declared "
                     f"server {flag}={expected!r}"
                 )
+        expected_block_flags = {
+            "--seed": str(seeds[index]),
+            "--percentile-metrics": ",".join(str(value) for value in metrics),
+            "--metric-percentiles": ",".join(
+                str(int(value)) if float(value).is_integer() else str(value)
+                for value in percentiles
+            ),
+        }
+        for flag, expected in expected_block_flags.items():
+            if _flag_values(command, flag) != [expected]:
+                raise CBPerformanceValidationError(
+                    f"{label}.blocks[{index}] workload {flag} differs from metadata"
+                )
+        for switch in (
+            "--ignore-eos",
+            "--disable-shuffle",
+            "--save-result",
+            "--save-detailed",
+        ):
+            if command.count(switch) != 1:
+                raise CBPerformanceValidationError(
+                    f"{label}.blocks[{index}] must record exactly one {switch}"
+                )
 
 
-def _validate_performance_serve_manifest(
+def _load_performance_serve_manifests(
     report: Mapping[str, Any],
     expected: Mapping[str, Any],
     *,
     evidence_base: Path,
+    attestation_references: Mapping[str, Any],
     pin_commit: str,
     pin_version: str,
     label: str,
@@ -692,8 +1233,13 @@ def _validate_performance_serve_manifest(
     try:
         from tools.serve_fingerprint import (
             MANIFEST_SCHEMA as SERVE_MANIFEST_SCHEMA,
+            SERVER_ENV_ALLOWLIST,
             elide_argv_paths,
             fingerprint,
+            normalize_performance_argv,
+            performance_stack_fingerprint,
+            process_identity_sha256,
+            serve_session_fingerprint,
         )
     except Exception as exc:  # pragma: no cover - checkout/package misuse
         raise CBPerformanceValidationError(
@@ -708,7 +1254,7 @@ def _validate_performance_serve_manifest(
     if not isinstance(attachments, list) or not attachments:
         raise CBPerformanceValidationError(f"{label} has no server evidence")
 
-    serve_manifests: list[tuple[Mapping[str, Any], str]] = []
+    report_attachments: dict[str, tuple[str, int]] = {}
     for index, attachment in enumerate(attachments):
         assert isinstance(attachment, Mapping)  # validated by _validate_report
         path = _reference(
@@ -735,32 +1281,76 @@ def _validate_performance_serve_manifest(
             raise CBPerformanceValidationError(
                 f"{label} server evidence attachment {index} changed after measurement"
             )
-        try:
-            payload = json.loads(
-                raw,
-                object_pairs_hook=_reject_duplicate_keys,
-                parse_constant=lambda value: (_ for _ in ()).throw(
-                    CBPerformanceValidationError(
-                        f"{label} serve manifest contains non-finite JSON number {value}"
-                    )
-                ),
+        normalized_path = str(path.resolve())
+        if normalized_path in report_attachments:
+            raise CBPerformanceValidationError(
+                f"{label} repeats one server evidence attachment"
             )
-        except CBPerformanceValidationError:
-            raise
-        except (UnicodeError, json.JSONDecodeError):
-            continue
-        if isinstance(payload, Mapping) and payload.get("schema") == SERVE_MANIFEST_SCHEMA:
-            serve_manifests.append((payload, actual_digest))
-    if len(serve_manifests) != 1:
+        report_attachments[normalized_path] = (actual_digest, len(raw))
+
+    if not isinstance(attestation_references, Mapping) or set(
+        attestation_references
+    ) != {"pre", "post"}:
         raise CBPerformanceValidationError(
-            f"{label} must attach exactly one structured {SERVE_MANIFEST_SCHEMA}"
+            f"{label} comparison cell must bind exact pre/post serve attestations"
         )
-    manifest, manifest_digest = serve_manifests[0]
+    by_phase: dict[str, tuple[Mapping[str, Any], str, Path]] = {}
+    for phase in ("pre", "post"):
+        reference = attestation_references.get(phase)
+        if not isinstance(reference, Mapping):
+            raise CBPerformanceValidationError(
+                f"{label} {phase} serve attestation reference is malformed"
+            )
+        manifest, digest, path = _read_bound_json(
+            evidence_base,
+            reference,
+            label=f"{label} {phase} serve attestation",
+        )
+        if (
+            manifest.get("schema") != SERVE_MANIFEST_SCHEMA
+            or manifest.get("attestation_phase") != phase
+        ):
+            raise CBPerformanceValidationError(
+                f"{label} {phase} reference is not a {phase} {SERVE_MANIFEST_SCHEMA}"
+            )
+        by_phase[phase] = (manifest, digest, path)
+    pre, pre_digest, pre_path = by_phase["pre"]
+    post, post_digest, _ = by_phase["post"]
+    if report_attachments.get(str(pre_path.resolve()), (None,))[0] != pre_digest:
+        raise CBPerformanceValidationError(
+            f"{label} report does not digest-bind the exact pre-server attestation"
+        )
+    if any(digest == post_digest for digest, _ in report_attachments.values()):
+        raise CBPerformanceValidationError(
+            f"{label} post-server attestation incorrectly predates the benchmark report"
+        )
+
+    started = _iso_datetime(report.get("started_at"), f"{label}.started_at")
+    finished = _iso_datetime(report.get("finished_at"), f"{label}.finished_at")
+    pre_created = _iso_datetime(pre.get("created"), f"{label} pre serve manifest.created")
+    post_created = _iso_datetime(post.get("created"), f"{label} post serve manifest.created")
+    if not pre_created <= started < finished <= post_created:
+        raise CBPerformanceValidationError(
+            f"{label} serve attestation chronology does not bracket the benchmark"
+        )
+    # The two snapshots describe one immutable live serve.  Only their wall
+    # clock and chronology role may differ; comparing a hand-picked subset
+    # would let a newly added observed field silently drift during a run.
+    chronology_fields = {"created", "attestation_phase", "serve_fingerprint"}
+    immutable_keys = (set(pre) | set(post)) - chronology_fields
+    changed = sorted(key for key in immutable_keys if pre.get(key) != post.get(key))
+    if changed:
+        raise CBPerformanceValidationError(
+            f"{label} live server identity changed during measurement: {changed}"
+        )
+    manifest = pre
 
     recorded_fingerprint = manifest.get("serve_fingerprint")
     if (
         not isinstance(recorded_fingerprint, str)
         or recorded_fingerprint != fingerprint(manifest)
+        or not isinstance(post.get("serve_fingerprint"), str)
+        or post.get("serve_fingerprint") != fingerprint(post)
     ):
         raise CBPerformanceValidationError(f"{label} serve manifest fingerprint is stale")
     expected_binding = {
@@ -769,9 +1359,16 @@ def _validate_performance_serve_manifest(
         "artifact_inventory_sha256": expected.get("artifact_inventory_sha256"),
         "artifact_bytes": expected.get("artifact_bytes"),
     }
-    if manifest.get("artifact_binding") != expected_binding:
+    binding = manifest.get("artifact_binding")
+    if not isinstance(binding, Mapping) or any(
+        binding.get(key) != value for key, value in expected_binding.items()
+    ):
         raise CBPerformanceValidationError(
             f"{label} live server is not bound to the exact expected artifact"
+        )
+    if binding.get("resolved_path") != "/model" or binding.get("launch_model") != "/model":
+        raise CBPerformanceValidationError(
+            f"{label} live artifact path is not the exact /model launch mount"
         )
     expected_model_id = expected.get("model_id")
     if not isinstance(expected_model_id, str) or not expected_model_id:
@@ -793,6 +1390,12 @@ def _validate_performance_serve_manifest(
         )
     if manifest.get("launch_flags") != elide_argv_paths(launch_argv):
         raise CBPerformanceValidationError(f"{label} serve launch_flags are stale")
+    if manifest.get("normalized_performance_argv") != normalize_performance_argv(
+        launch_argv
+    ):
+        raise CBPerformanceValidationError(
+            f"{label} normalized server argv is missing or stale"
+        )
     if _flag_values(launch_argv, "--served-model-name") != [expected_model_id]:
         raise CBPerformanceValidationError(
             f"{label} live server argv does not bind the expected served model name"
@@ -806,7 +1409,11 @@ def _validate_performance_serve_manifest(
         or manifest.get("quantization") != "gridbook"
         or manifest.get("kv_cache_dtype") != "fp8"
         or manifest.get("gpu_name") != DSV4_SPARK_GPU_NAME
+        or not isinstance(manifest.get("gpu_uuid"), str)
+        or not str(manifest.get("gpu_uuid")).startswith("GPU-")
         or manifest.get("gpu_count") != 1
+        or not isinstance(manifest.get("serve_session_id"), str)
+        or len(str(manifest.get("serve_session_id"))) != 64
     ):
         raise CBPerformanceValidationError(
             f"{label} serve manifest has the wrong source/model/image/Gridbook/GPU contract"
@@ -845,48 +1452,232 @@ def _validate_performance_serve_manifest(
     declared_environment = server_environment.get("values") if isinstance(
         server_environment, Mapping
     ) else None
-    if not isinstance(declared_environment, Mapping) or manifest.get(
-        "pq_env"
-    ) != declared_environment:
+    process_environment = manifest.get("server_process_environment")
+    observed_environment = process_environment.get("values") if isinstance(
+        process_environment, Mapping
+    ) else None
+    required_process_environment = {
+        **_REQUIRED_SERVER_ENVIRONMENT,
+        "PQ_GRIDBOOK_RUNTIME_COMMIT": pin_commit,
+        "PQ_GRIDBOOK_RUNTIME_VERSION": pin_version,
+    }
+    if (
+        not isinstance(declared_environment, Mapping)
+        or not isinstance(process_environment, Mapping)
+        or process_environment.get("schema")
+        != "prismaquant.server_process_environment/1"
+        or process_environment.get("allowlist") != sorted(SERVER_ENV_ALLOWLIST)
+        or process_environment.get("consistent") is not True
+        or process_environment.get("unreadable_pids") != []
+        or observed_environment != declared_environment
+        or manifest.get("pq_env") != declared_environment
+        or dict(declared_environment) != required_process_environment
+    ):
         raise CBPerformanceValidationError(
             f"{label} report environment is not the exact live-server environment"
         )
-
-    created = _iso_datetime(manifest.get("created"), f"{label} serve manifest.created")
-    started = _iso_datetime(report.get("started_at"), f"{label}.started_at")
-    if created > started:
+    listener = manifest.get("listener_binding")
+    try:
+        parsed_url = urllib.parse.urlsplit(str(server.get("base_url")))
+    except ValueError as exc:
+        raise CBPerformanceValidationError(f"{label} base URL is invalid") from exc
+    if (
+        not isinstance(listener, Mapping)
+        or listener.get("schema") != "prismaquant.server_listener_binding/1"
+        or listener.get("base_url") != server.get("base_url")
+        or listener.get("launch_port") != parsed_url.port
+        or parsed_url.scheme != "http"
+        or parsed_url.hostname not in {"127.0.0.1", "localhost", "::1"}
+        or not isinstance(listener.get("listeners"), list)
+        or not listener.get("listeners")
+    ):
         raise CBPerformanceValidationError(
-            f"{label} serve manifest was captured after the benchmark began"
+            f"{label} report base URL is not bound to the actual local listener"
         )
+    if manifest.get("performance_stack_fingerprint") != performance_stack_fingerprint(
+        manifest
+    ):
+        raise CBPerformanceValidationError(
+            f"{label} performance stack fingerprint is stale"
+        )
+    host = manifest.get("host_identity")
+    if (
+        not isinstance(host, Mapping)
+        or host.get("hostname") != manifest.get("hostname")
+        or not isinstance(host.get("boot_id"), str)
+        or not host.get("boot_id")
+        or (
+            host.get("machine_id_sha256") is not None
+            and (
+                not isinstance(host.get("machine_id_sha256"), str)
+                or len(str(host.get("machine_id_sha256"))) != 64
+            )
+        )
+        or not isinstance(host.get("pid_namespace"), str)
+    ):
+        raise CBPerformanceValidationError(f"{label} stable host identity is incomplete")
     processes = manifest.get("processes")
     if not isinstance(processes, list) or not processes:
         raise CBPerformanceValidationError(f"{label} serve manifest has no server processes")
     process_ids: list[int] = []
-    has_vllm_server = False
+    process_hashes: list[str] = []
+    api_server_pids: list[int] = []
     for index, process in enumerate(processes):
         pid = process.get("pid") if isinstance(process, Mapping) else None
         cmdline = process.get("cmdline") if isinstance(process, Mapping) else None
+        argv = process.get("argv") if isinstance(process, Mapping) else None
+        identity_sha = process.get("identity_sha256") if isinstance(
+            process, Mapping
+        ) else None
         if (
             isinstance(pid, bool)
             or not isinstance(pid, int)
             or pid <= 0
             or not isinstance(cmdline, str)
             or not cmdline
+            or not isinstance(argv, list)
+            or not argv
+            or cmdline != " ".join(str(value) for value in argv)
+            or not isinstance(process.get("start_time_ticks"), int)
+            or process.get("start_time_ticks", -1) < 0
+            or not isinstance(process.get("pid_namespace"), str)
+            or not isinstance(process.get("executable"), str)
+            or not isinstance(identity_sha, str)
+            or len(identity_sha) != 64
         ):
             raise CBPerformanceValidationError(
                 f"{label} serve manifest process {index} is malformed"
             )
         process_ids.append(pid)
-        if "vllm" in cmdline.lower() and "serve" in cmdline.lower():
-            has_vllm_server = True
-    if len(process_ids) != len(set(process_ids)) or not has_vllm_server:
+        if identity_sha != process_identity_sha256(
+            process, boot_id=str(host.get("boot_id"))
+        ):
+            raise CBPerformanceValidationError(
+                f"{label} serve process {index} identity digest is stale"
+            )
+        process_hashes.append(identity_sha)
+        if argv == launch_argv:
+            api_server_pids.append(pid)
+    if (
+        len(process_ids) != len(set(process_ids))
+        or len(process_hashes) != len(set(process_hashes))
+        or len(api_server_pids) != 1
+    ):
         raise CBPerformanceValidationError(
             f"{label} serve manifest does not identify one concrete vLLM process set"
         )
+    if manifest.get("serve_session_id") != serve_session_fingerprint(manifest):
+        raise CBPerformanceValidationError(f"{label} serve session identity is stale")
+    environment_rows = process_environment.get("processes")
+    readable_pids = process_environment.get("readable_pids")
+    if (
+        not isinstance(environment_rows, list)
+        or not isinstance(readable_pids, list)
+        or readable_pids != sorted(process_ids)
+        or len(environment_rows) != len(process_ids)
+    ):
+        raise CBPerformanceValidationError(
+            f"{label} server-process environment PID coverage is incomplete"
+        )
+    environment_pids: list[int] = []
+    for row_index, row in enumerate(environment_rows):
+        if not isinstance(row, Mapping) or set(row) != {"pid", "values", "sha256"}:
+            raise CBPerformanceValidationError(
+                f"{label} server-process environment row {row_index} is malformed"
+            )
+        row_pid = row.get("pid")
+        values = row.get("values")
+        if (
+            isinstance(row_pid, bool)
+            or not isinstance(row_pid, int)
+            or not isinstance(values, Mapping)
+            or dict(values) != required_process_environment
+        ):
+            raise CBPerformanceValidationError(
+                f"{label} server-process environment row {row_index} differs from contract"
+            )
+        canonical = json.dumps(
+            values, sort_keys=True, separators=(",", ":"), allow_nan=False
+        ).encode("utf-8")
+        if row.get("sha256") != _digest(canonical):
+            raise CBPerformanceValidationError(
+                f"{label} server-process environment row {row_index} digest is stale"
+            )
+        environment_pids.append(row_pid)
+    if sorted(environment_pids) != sorted(process_ids) or len(
+        environment_pids
+    ) != len(set(environment_pids)):
+        raise CBPerformanceValidationError(
+            f"{label} server-process environment rows do not equal the process census"
+        )
+    census = manifest.get("listener_census")
+    census_rows = census.get("listeners") if isinstance(census, Mapping) else None
+    valid_listener_rows = True
+    listener_inodes: list[str] = []
+    if isinstance(census_rows, list):
+        for row in census_rows:
+            owners = row.get("pids") if isinstance(row, Mapping) else None
+            inode = row.get("socket_inode") if isinstance(row, Mapping) else None
+            if (
+                not isinstance(row, Mapping)
+                or set(row)
+                != {"family", "address", "port", "socket_inode", "pids"}
+                or row.get("family") not in {"ipv4", "ipv6"}
+                or not isinstance(row.get("address"), str)
+                or not row.get("address")
+                or isinstance(row.get("port"), bool)
+                or not isinstance(row.get("port"), int)
+                or not 0 < row.get("port", 0) <= 65535
+                or not isinstance(inode, str)
+                or not inode.isdigit()
+                or not isinstance(owners, list)
+                or not owners
+                or len(owners) != len(set(owners))
+                or not set(owners).issubset(process_ids)
+            ):
+                valid_listener_rows = False
+                break
+            listener_inodes.append(inode)
+    if (
+        not isinstance(census, Mapping)
+        or census.get("schema") != "prismaquant.server_tcp_listeners/1"
+        or census.get("tables_readable") is not True
+        or census.get("unreadable_pids") != []
+        or not isinstance(census_rows, list)
+        or not valid_listener_rows
+        or len(listener_inodes) != len(set(listener_inodes))
+        or listener.get("listeners")
+        != [
+            row
+            for row in census_rows
+            if isinstance(row, Mapping)
+            and row.get("port") == listener.get("launch_port")
+        ]
+        or api_server_pids[0]
+        not in {
+            pid
+            for row in listener.get("listeners", [])
+            if isinstance(row, Mapping)
+            for pid in row.get("pids", [])
+        }
+    ):
+        raise CBPerformanceValidationError(
+            f"{label} listener binding differs from its exact process socket census"
+        )
     return {
-        "sha256": manifest_digest,
-        "serve_fingerprint": recorded_fingerprint,
-        "process_identity": (str(manifest.get("hostname")), tuple(sorted(process_ids))),
+        "pre_sha256": pre_digest,
+        "post_sha256": post_digest,
+        "pre_serve_fingerprint": recorded_fingerprint,
+        "post_serve_fingerprint": post["serve_fingerprint"],
+        "performance_stack_fingerprint": manifest["performance_stack_fingerprint"],
+        "serve_session_id": manifest["serve_session_id"],
+        "host_boot_id": host["boot_id"],
+        "host_machine_id_sha256": host["machine_id_sha256"],
+        "gpu_uuid": manifest["gpu_uuid"],
+        "process_identity": (
+            manifest["serve_session_id"],
+            tuple(sorted(process_hashes)),
+        ),
         "artifact_identity": (
             expected_binding["model_sha"],
             expected_binding["artifact_inventory_sha256"],
@@ -939,6 +1730,10 @@ def _cell_ratios(
             {
                 "metric": metric,
                 "direction": direction,
+                "paired_values": [
+                    [left, right]
+                    for left, right in zip(candidate_values, baseline_values)
+                ],
                 "paired_ratios": ratios,
                 "median_ratio": statistics.median(ratios),
                 "conservative_p05_ratio": conservative,
@@ -1099,7 +1894,7 @@ def _validate_native_feasibility(
     byte_budget: int,
     pin_commit: str,
     pin_version: str,
-) -> tuple[str, frozenset[str]]:
+) -> tuple[str, tuple[dict[str, Any], ...]]:
     reference = manifest.get("native_baseline_feasibility")
     if not isinstance(reference, Mapping):
         raise CBPerformanceValidationError(
@@ -1189,7 +1984,7 @@ def _validate_native_feasibility(
         raise CBPerformanceValidationError(
             "native feasibility certificate serving-unit ledger is incomplete"
         )
-    return digest, names
+    return digest, tuple(dict(row) for row in units if isinstance(row, Mapping))
 
 
 def _validate_displaced_container(
@@ -1204,7 +1999,7 @@ def _validate_displaced_container(
     candidate_root: Path,
     candidate_model_sha: str,
     candidate_inventory_sha256: str,
-) -> tuple[str, dict[str, Any]]:
+) -> tuple[str, dict[str, Any], dict[str, Any]]:
     declaration = manifest.get("displaced_container")
     if not isinstance(declaration, Mapping):
         raise CBPerformanceValidationError("displaced_container declaration is missing")
@@ -1400,7 +2195,7 @@ def _validate_displaced_container(
             allow_nan=False,
         ).encode("utf-8")
     )
-    return eligibility_digest, eligibility
+    return eligibility_digest, eligibility, quant_config
 
 
 def _validate_telemetry(
@@ -1490,7 +2285,16 @@ def _validate_telemetry(
                 expected_identity = candidate if arm == "candidate" else baselines[
                     phase_by_cell[cell_id]
                 ]
-                if cell_row.get("model_id") != expected_identity.get("model_id"):
+                identity_fields = (
+                    "model_id",
+                    "model_sha",
+                    "artifact_inventory_sha256",
+                    "artifact_bytes",
+                )
+                if any(
+                    cell_row.get(field) != expected_identity.get(field)
+                    for field in identity_fields
+                ):
                     raise CBPerformanceValidationError(
                         f"telemetry {kind} {arm} {cell_id} model identity differs"
                     )
@@ -1634,6 +2438,17 @@ def _validate_telemetry(
                     occupancy = kind_steps["expert_occupancy"][step_id]
                     active = kind_steps["active_experts"][step_id]
                     grouped = kind_steps["grouped_moe_whole_operator"][step_id]
+                    for field in ("run_label", "block_seed", "timestamp"):
+                        if len(
+                            {
+                                step.get(field)
+                                for step in (routing, occupancy, active, grouped)
+                            }
+                        ) != 1:
+                            raise CBPerformanceValidationError(
+                                f"telemetry {field} differs across kinds for "
+                                f"{arm} {cell_id} layer {layer_id} step {step_id}"
+                            )
                     histogram = routing["expert_histogram"]
                     occupied = occupancy["expert_occupancy"]
                     active_ids = {str(expert) for expert in active["active_experts"]}
@@ -1644,6 +2459,25 @@ def _validate_telemetry(
                     if sum(histogram.values()) != grouped["routed_tokens"]:
                         raise CBPerformanceValidationError(
                             f"grouped routed-token count disagrees for {arm} {cell_id} layer {layer_id} step {step_id}"
+                        )
+                    routed_tokens = sum(histogram.values())
+                    if any(
+                        not math.isclose(
+                            float(occupied[expert]),
+                            float(count) / routed_tokens,
+                            rel_tol=1e-9,
+                            abs_tol=1e-12,
+                        )
+                        for expert, count in histogram.items()
+                    ) or not math.isclose(
+                        sum(float(value) for value in occupied.values()),
+                        1.0,
+                        rel_tol=1e-9,
+                        abs_tol=1e-12,
+                    ):
+                        raise CBPerformanceValidationError(
+                            f"expert occupancy does not reconcile with routing counts for "
+                            f"{arm} {cell_id} layer {layer_id} step {step_id}"
                         )
     return sorted(result, key=lambda row: str(row["kind"]))
 
@@ -1715,8 +2549,13 @@ def validate_cb_performance(
         not isinstance(candidate_source_identity, Mapping)
         or candidate_source_identity.get("schema")
         != "prismaquant.streamed_model.identity.v1"
-        or not isinstance(candidate_source_identity.get("resolved_commit"), str)
-        or not candidate_source_identity.get("resolved_commit")
+        or (
+            candidate_source_identity.get("resolved_commit") is not None
+            and (
+                not isinstance(candidate_source_identity.get("resolved_commit"), str)
+                or not candidate_source_identity.get("resolved_commit")
+            )
+        )
         or isinstance(candidate_source_identity.get("checkpoint_shards"), bool)
         or not isinstance(candidate_source_identity.get("checkpoint_shards"), int)
         or candidate_source_identity.get("checkpoint_shards", 0) <= 0
@@ -1755,7 +2594,7 @@ def validate_cb_performance(
     baselines = manifest.get("baselines")
     if not isinstance(baselines, Mapping) or set(baselines) != set(_PHASES):
         raise CBPerformanceValidationError("manifest must declare a phase-specific baseline")
-    native_feasibility_digest, expected_serving_unit_names = _validate_native_feasibility(
+    native_feasibility_digest, certified_serving_units = _validate_native_feasibility(
         manifest,
         base,
         byte_budget=byte_budget,
@@ -1771,7 +2610,11 @@ def validate_cb_performance(
         raise CBPerformanceValidationError(
             "native infeasibility and candidate identities do not bind the same source content"
         )
-    displaced_digest, displaced_eligibility = _validate_displaced_container(
+    (
+        displaced_digest,
+        displaced_eligibility,
+        displaced_quant_config,
+    ) = _validate_displaced_container(
         manifest,
         base,
         byte_budget=byte_budget,
@@ -1782,6 +2625,16 @@ def validate_cb_performance(
         candidate_root=root,
         candidate_model_sha=model_sha,
         candidate_inventory_sha256=inventory_digest,
+    )
+    expected_candidate_routes = _derive_expected_execution_assignments(
+        candidate_quant_config,
+        certified_serving_units,
+        label="candidate artifact",
+    )
+    expected_baseline_routes = _derive_expected_execution_assignments(
+        displaced_quant_config,
+        certified_serving_units,
+        label="displaced baseline artifact",
     )
 
     raw_cells = manifest.get("cells")
@@ -1831,44 +2684,16 @@ def validate_cb_performance(
             pin_commit=pin.commit,
             pin_version=pin.version,
         )
-        for arm_label, report in (
-            ("candidate", candidate_report),
-            ("baseline", baseline_report),
-        ):
-            execution = report["metadata"].get("execution_identity")
-            execution_manifest = execution.get("manifest") if isinstance(
-                execution, Mapping
-            ) else None
-            assignments = execution_manifest.get("assignments") if isinstance(
-                execution_manifest, Mapping
-            ) else None
-            if (
-                not isinstance(assignments, list)
-                or {
-                    str(row.get("unit"))
-                    for row in assignments
-                    if isinstance(row, Mapping)
-                } != set(expected_serving_unit_names)
-            ):
-                raise CBPerformanceValidationError(
-                    f"cell {cell_id} {arm_label} execution manifest does not "
-                    "enumerate the exact certified DSv4 serving units"
-                )
-            for assignment in assignments:
-                if not isinstance(assignment, Mapping):
-                    raise CBPerformanceValidationError(
-                        f"cell {cell_id} {arm_label} execution manifest "
-                        "contains a malformed assignment"
-                    )
-                backend = str(assignment.get("kernel_backend", "")).lower()
-                fallback = str(assignment.get("fallback_state", "")).lower()
-                if "gridbook" not in backend or fallback not in {
-                    "none", "none-observed"
-                }:
-                    raise CBPerformanceValidationError(
-                        f"cell {cell_id} {arm_label} execution manifest contains "
-                        "a non-Gridbook or fallback serving assignment"
-                    )
+        _validate_execution_routes(
+            candidate_report,
+            expected_candidate_routes,
+            label=f"cell {cell_id} candidate",
+        )
+        _validate_execution_routes(
+            baseline_report,
+            expected_baseline_routes,
+            label=f"cell {cell_id} baseline",
+        )
         for report_label, report in (("candidate", candidate_report), ("baseline", baseline_report)):
             started_at = _iso_datetime(report.get("started_at"), f"cell {cell_id} {report_label}.started_at")
             if started_at <= predeclared_at:
@@ -1887,22 +2712,17 @@ def validate_cb_performance(
             byte_budget=byte_budget,
             label=f"cell {cell_id} candidate",
         )
-        candidate_server_binding = _validate_performance_serve_manifest(
+        candidate_server_binding = _load_performance_serve_manifests(
             candidate_report,
             candidate_identity,
             evidence_base=base,
+            attestation_references=raw_cell.get(
+                "candidate_serve_attestations", {}
+            ),
             pin_commit=pin.commit,
             pin_version=pin.version,
             label=f"cell {cell_id} candidate",
         )
-        candidate_execution = candidate_report["metadata"].get("execution_identity")
-        if (
-            not isinstance(candidate_execution, Mapping)
-            or "gridbook" not in str(candidate_execution.get("kernel_backend", "")).lower()
-        ):
-            raise CBPerformanceValidationError(
-                f"cell {cell_id} candidate did not attest a Gridbook kernel backend"
-            )
         baseline_identity = baselines[str(phase)]
         if not isinstance(baseline_identity, Mapping):
             raise CBPerformanceValidationError(f"{phase} baseline identity is malformed")
@@ -1912,18 +2732,45 @@ def validate_cb_performance(
             byte_budget=byte_budget,
             label=f"cell {cell_id} baseline",
         )
-        baseline_server_binding = _validate_performance_serve_manifest(
+        baseline_server_binding = _load_performance_serve_manifests(
             baseline_report,
             baseline_identity,
             evidence_base=base,
+            attestation_references=raw_cell.get(
+                "baseline_serve_attestations", {}
+            ),
             pin_commit=pin.commit,
             pin_version=pin.version,
             label=f"cell {cell_id} baseline",
         )
-        if candidate_server_binding["sha256"] == baseline_server_binding["sha256"]:
+        if {
+            candidate_server_binding["pre_sha256"],
+            candidate_server_binding["post_sha256"],
+        } & {
+            baseline_server_binding["pre_sha256"],
+            baseline_server_binding["post_sha256"],
+        }:
             raise CBPerformanceValidationError(
                 f"cell {cell_id} candidate and baseline reuse one serve manifest"
             )
+        if (
+            candidate_server_binding["performance_stack_fingerprint"]
+            != baseline_server_binding["performance_stack_fingerprint"]
+        ):
+            raise CBPerformanceValidationError(
+                f"cell {cell_id} candidate and baseline serving stacks differ"
+            )
+        for identity_key in (
+            "host_boot_id",
+            "gpu_uuid",
+        ):
+            if candidate_server_binding[identity_key] != baseline_server_binding[
+                identity_key
+            ]:
+                raise CBPerformanceValidationError(
+                    f"cell {cell_id} candidate and baseline do not run in the "
+                    f"same Spark host session ({identity_key})"
+                )
         for arm, binding in (
             ("candidate", candidate_server_binding),
             ("baseline", baseline_server_binding),
@@ -1944,13 +2791,26 @@ def validate_cb_performance(
                 "cell_id": cell_id,
                 "candidate_sha256": candidate_digest,
                 "baseline_sha256": baseline_digest,
-                "candidate_serve_manifest_sha256": candidate_server_binding["sha256"],
-                "baseline_serve_manifest_sha256": baseline_server_binding["sha256"],
-                "candidate_serve_fingerprint": candidate_server_binding[
-                    "serve_fingerprint"
+                "candidate_pre_serve_manifest_sha256": candidate_server_binding[
+                    "pre_sha256"
                 ],
-                "baseline_serve_fingerprint": baseline_server_binding[
-                    "serve_fingerprint"
+                "candidate_post_serve_manifest_sha256": candidate_server_binding[
+                    "post_sha256"
+                ],
+                "baseline_pre_serve_manifest_sha256": baseline_server_binding[
+                    "pre_sha256"
+                ],
+                "baseline_post_serve_manifest_sha256": baseline_server_binding[
+                    "post_sha256"
+                ],
+                "candidate_serve_session_id": candidate_server_binding[
+                    "serve_session_id"
+                ],
+                "baseline_serve_session_id": baseline_server_binding[
+                    "serve_session_id"
+                ],
+                "performance_stack_fingerprint": candidate_server_binding[
+                    "performance_stack_fingerprint"
                 ],
             }
         )
@@ -2035,6 +2895,13 @@ def validate_cb_performance(
         ],
         "displaced_container_reason": displaced_eligibility["reason"],
         "native_baseline_feasibility_sha256": native_feasibility_digest,
+        "server_environment_contract": {
+            "schema": GRIDBOOK_ENVIRONMENT_SCHEMA,
+            "profile": "matched_budget_performance",
+            "base_profile": "canonical_gold",
+            "overrides": {"PRISMAQUANT_PRELOAD_FUSED": "1"},
+            "environment": dict(_PERFORMANCE_SERVER_ENVIRONMENT),
+        },
     }
     record: dict[str, Any] = {
         "slot": SLOT,

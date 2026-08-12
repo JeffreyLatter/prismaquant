@@ -44,15 +44,15 @@
     },
     {
       "id": "gold.kl",
-      "runner": "tools/measure_vllm_full_kl.py",
+      "runner": "tools/measure_vllm_full_kl.py --dsv4-gridbook-contract",
       "shipcard_slot": "gold.kl",
-      "description": "Served KL-vs-BF16 in the plugin serving env. Match extension residency across A/B arms: loading a CUDA extension shifts allocator addresses and moves confident-KL by up to 17%."
+      "description": "Served KL-vs-BF16 in the plugin serving env. Its BF16 teacher is produced first by tools/build_streamed_full_kl_teacher.py --wikitext-inputs <gold-inputs.json>. Match extension residency across A/B arms: loading a CUDA extension shifts allocator addresses and moves confident-KL by up to 17%."
     },
     {
       "id": "gold.ppl",
-      "runner": "tools/measure_wikitext_ppl.py",
+      "runner": "tools/measure_vllm_wikitext_ppl.py --dsv4-gridbook-contract --wikitext-inputs <gold-inputs.json>",
       "shipcard_slot": "gold.ppl",
-      "description": "Direct WikiText PPL on the served CB artifact."
+      "description": "Direct WikiText PPL on the served CB artifact using the exact CPU-materialized, value-closed offline token payload."
     },
     {
       "id": "perf.matched_budget_parity",

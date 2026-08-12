@@ -180,6 +180,15 @@ def test_streamed_aura_cost_rows_are_exactly_resident_rows():
     )
 
     streamed_model, context, runner = _dense_runner(state)
+    captured = {}
+    capture_boundaries = runner.capture_boundaries
+
+    def capture_and_retain_for_lifetime_audit(input_ids):
+        batch = capture_boundaries(input_ids)
+        captured["batch"] = batch
+        return batch
+
+    runner.capture_boundaries = capture_and_retain_for_lifetime_audit
     streamed_result = aura.compute_aura_cost_streamed(
         runner,
         calib,
@@ -195,6 +204,19 @@ def test_streamed_aura_cost_rows_are_exactly_resident_rows():
     assert streamed_result["stats"] == resident_result["stats"]
     assert streamed_result["costs"] == resident_result["costs"]
     assert context.max_active == 1
+    assert streamed_result["provenance"]["streamed_gradient_harvest"] == (
+        "post_accumulate_per_parameter"
+    )
+    assert streamed_result["provenance"]["streamed_cotangent_rollover"] == (
+        "in_place_per_probe"
+    )
+    assert all(
+        activation.numel() == 0
+        for activation in captured["batch"].activations_cpu
+    )
+    assert all(
+        parameter.grad is None for parameter in streamed_model.parameters()
+    )
 
 
 def _run_streamed_aura(
@@ -391,7 +413,110 @@ def test_streamed_aura_production_anchors_are_sparse_and_never_use_rtn(
     assert model is runner.model
 
 
-def test_streamed_aura_releases_bf16_anchors_while_building_fp32_dweights(
+def test_streamed_aura_consumes_production_anchors_one_at_a_time():
+    torch.manual_seed(113)
+    seed_model = _DenseTinyLM().eval()
+    state = {
+        name: tensor.detach().clone()
+        for name, tensor in seed_model.state_dict().items()
+    }
+    q0 = "model.layers.0.proj"
+    q1 = "model.layers.1.proj"
+    plan = {
+        q0: ("NVFP4", "FP8_E4M3"),
+        q1: ("NVFP4",),
+    }
+
+    control_model, _control_context, control_runner = _dense_runner(state)
+    control = aura.compute_aura_cost_streamed(
+        control_runner,
+        torch.tensor([[1, 2, 3, 4]]),
+        ["NVFP4", "FP8_E4M3"],
+        n_probes=2,
+        dw_dtype="bfloat16",
+        formats_by_qname=plan,
+        anchor_renderer=_ExactAnchorRenderer(plan),
+        profile=DefaultProfile(),
+    )
+
+    class _TransientAnchorRenderer(_ExactAnchorRenderer):
+        def __init__(self, formats_by_qname):
+            super().__init__(formats_by_qname)
+            self.consumer_identities = []
+
+        def render_layer(self, **_kwargs):
+            raise AssertionError("materialized layer render must not run")
+
+        def render_layer_transient(
+            self,
+            *,
+            layer,
+            modules,
+            formats_by_qname,
+            consume_render,
+            consumer_identity,
+        ):
+            del layer
+            self.consumer_identities.append(dict(consumer_identity))
+            offsets = {
+                "NVFP4": 0.03125,
+                "FP8_E4M3": 0.015625,
+            }
+            observed = []
+            previous = None
+            for name, formats in formats_by_qname.items():
+                for fmt in formats:
+                    if previous is not None:
+                        assert previous() is None
+                    rendered = (
+                        modules[name].weight.detach().clone() + offsets[fmt]
+                    )
+                    result = consume_render(
+                        qname=name,
+                        fmt=fmt,
+                        reference_weight=modules[name].weight.data,
+                        rendered_weight=rendered,
+                        render_score={},
+                    )
+                    assert result["operation"] == (
+                        "fp32_subtract_then_store"
+                    )
+                    observed.append((name, fmt))
+                    self.render_count += 1
+                    self.max_live_rendered = max(
+                        self.max_live_rendered, 1
+                    )
+                    previous = weakref.ref(rendered)
+                    del rendered
+            assert previous is None or previous() is None
+            return tuple(observed)
+
+    renderer = _TransientAnchorRenderer(plan)
+    streamed_model, _streamed_context, streamed_runner = _dense_runner(state)
+    streamed = aura.compute_aura_cost_streamed(
+        streamed_runner,
+        torch.tensor([[1, 2, 3, 4]]),
+        ["NVFP4", "FP8_E4M3"],
+        n_probes=2,
+        dw_dtype="bfloat16",
+        formats_by_qname=plan,
+        anchor_renderer=renderer,
+        profile=DefaultProfile(),
+    )
+
+    assert streamed["costs"] == control["costs"]
+    assert renderer.render_count == 3
+    assert renderer.max_live_rendered == 1
+    assert all(
+        identity["schema"]
+        == "prismaquant.aura.production_anchor_delta_consumer.v1"
+        for identity in renderer.consumer_identities
+    )
+    assert streamed_model is streamed_runner.model
+    assert control_model is control_runner.model
+
+
+def test_streamed_aura_releases_bf16_anchors_while_building_bf16_dweights(
     monkeypatch,
 ):
     torch.manual_seed(112)
@@ -479,7 +604,7 @@ def test_streamed_aura_releases_bf16_anchors_while_building_fp32_dweights(
         torch.tensor([[1, 2, 3, 4]]),
         ["NVFP4", "FP8_E4M3"],
         n_probes=2,
-        dw_dtype="float32",
+        dw_dtype="bfloat16",
         formats_by_qname=plan,
         anchor_renderer=_Bf16AnchorRenderer(plan, tracker),
         profile=DefaultProfile(),
@@ -490,9 +615,53 @@ def test_streamed_aura_releases_bf16_anchors_while_building_fp32_dweights(
     assert all(ref() is None for ref in tracker["refs"])
     assert tracker["allocator_release_calls"] == ["cpu"]
     assert tracked["stats"] == control["stats"]
-    assert tracked["costs"] == control["costs"]
+    # BF16 is a deliberately different storage contract, not a byte-identical
+    # FP32 result. It must stay close on every scalar and preserve ordering.
+    for fmt in plan[qname]:
+        tracked_row = tracked["costs"][qname][fmt]
+        control_row = control["costs"][qname][fmt]
+        assert tracked_row["dw_source"] == control_row["dw_source"]
+        assert tracked_row["production_anchor_measured"] is True
+        assert tracked_row["predicted_dloss"] == pytest.approx(
+            control_row["predicted_dloss"], rel=0.01, abs=1e-12
+        )
+    assert sorted(
+        plan[qname],
+        key=lambda fmt: tracked["costs"][qname][fmt]["predicted_dloss"],
+    ) == sorted(
+        plan[qname],
+        key=lambda fmt: control["costs"][qname][fmt]["predicted_dloss"],
+    )
     assert tracked_model is tracked_runner.model
     assert control_model is control_runner.model
+
+
+def test_production_anchor_delta_subtracts_fp32_then_stores_bf16():
+    source = torch.tensor(
+        [[1.00390625, -2.0078125], [0.333251953125, 8.03125]],
+        dtype=torch.bfloat16,
+    )
+    rendered = torch.tensor(
+        [[1.01953125, -1.984375], [0.341796875, 8.09375]],
+        dtype=torch.bfloat16,
+    )
+    original = rendered.clone()
+
+    stored = aura._stored_production_anchor_delta(
+        rendered,
+        source,
+        storage_dtype=torch.bfloat16,
+    )
+
+    assert stored.dtype == torch.bfloat16
+    torch.testing.assert_close(
+        stored.float(),
+        (original.float() - source.float()).to(torch.bfloat16).float(),
+        rtol=0,
+        atol=0,
+    )
+    # The helper must not consume/mutate an injected renderer's tensor.
+    torch.testing.assert_close(rendered, original, rtol=0, atol=0)
 
 
 def test_streamed_anchor_allocator_release_is_cuda_only(monkeypatch):
@@ -768,6 +937,9 @@ def test_production_anchor_cold_render_requires_exact_declared_profile_scope(
         max_act_rows=8,
         producer_git_commit="1" * 40,
         producer_source_sha256="2" * 64,
+        transient_consumer_identity=(
+            aura.AURA_PRODUCTION_ANCHOR_DELTA_CONSUMER_IDENTITY
+        ),
     )
     with pytest.raises(RuntimeError, match="undeclared_missing"):
         streaming.StreamedProductionAnchorRenderer(model, **kwargs)
@@ -793,8 +965,49 @@ def test_production_anchor_cold_render_requires_exact_declared_profile_scope(
         formats_by_qname={qname: ("NVFP4_CB_K12",)},
     )
     assert set(rendered) == {(qname, "NVFP4_CB_K12")}
-    assert calls == [("NVFP4_CB_K12", {}, True)]
-    assert renderer.render_count == 1
+    consumed = []
+
+    def consume_render(**kwargs):
+        consumed.append({
+            "qname": kwargs["qname"],
+            "fmt": kwargs["fmt"],
+            "rendered": kwargs["rendered_weight"].detach().clone(),
+        })
+        return {"consumed": True}
+
+    def refuse_throwaway_tensor_receipt(**_kwargs):
+        raise AssertionError(
+            "non-durable production anchor render hashed a tensor receipt"
+        )
+
+    monkeypatch.setattr(
+        streaming,
+        "_build_cb_transient_consumer_receipt",
+        refuse_throwaway_tensor_receipt,
+    )
+
+    observed = renderer.render_layer_transient(
+        layer=0,
+        modules={qname: model.get_submodule(qname)},
+        formats_by_qname={qname: ("NVFP4_CB_K12",)},
+        consume_render=consume_render,
+        consumer_identity=(
+            aura.AURA_PRODUCTION_ANCHOR_DELTA_CONSUMER_IDENTITY
+        ),
+    )
+    assert observed == ((qname, "NVFP4_CB_K12"),)
+    assert calls == [
+        ("NVFP4_CB_K12", {}, True),
+        ("NVFP4_CB_K12", {}, True),
+    ]
+    assert renderer.render_count == 2
+    assert renderer.max_live_rendered == 1
+    torch.testing.assert_close(
+        consumed[0]["rendered"],
+        rendered[(qname, "NVFP4_CB_K12")],
+        rtol=0,
+        atol=0,
+    )
     assert renderer.cache.weights == {}
     completed = renderer.bind_completed_source_weight_identities({
         qname: renderer.source_weight_identity_for(qname)

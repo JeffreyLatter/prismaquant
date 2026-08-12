@@ -349,6 +349,21 @@ def test_gridbook_card_refuses_missing_or_forged_fixed_reservation(
     )
 
 
+def test_gridbook_card_refuses_missing_weight_stat_attestation(tmp_path):
+    model_dir = _artifact(tmp_path)
+    (model_dir / "quant_config.json").write_text(json.dumps({
+        "quant_method": "gridbook",
+        "format": "nvfp4_cb",
+    }))
+    card = build_shipcard(model_dir, build={"quant_method": "gridbook"})
+    assert "weight_stat_attestation" not in card
+
+    assert any(
+        "lacks the required weight-stat attestation" in problem
+        for problem in verify(card, model_dir=model_dir)
+    )
+
+
 def test_full_card_verifies(tmp_path):
     model_dir = _artifact(tmp_path)
     path = _open_card(tmp_path, model_dir)

@@ -170,6 +170,42 @@ gridbook_runtime_verify_checkout() {
     printf '%s\n' "$resolved"
 }
 
+gridbook_runtime_verify_standalone_checkout() {
+    local checkout=${1:-}
+    local expected_commit=${2:-}
+    local expected_version=${3:-}
+    local resolved git_dir common_dir expected_git_dir
+    local -a safe_git
+
+    resolved="$(gridbook_runtime_verify_checkout "$checkout" \
+        "$expected_commit" "$expected_version")" || return
+    if [[ ! -d "$resolved/.git" || -L "$resolved/.git" ]]; then
+        _gridbook_runtime_error \
+            "cached checkout is not self-contained: $resolved/.git is not a real directory"
+        return
+    fi
+    safe_git=(git -c "safe.directory=$resolved" -C "$resolved")
+    git_dir="$("${safe_git[@]}" rev-parse --git-dir 2>/dev/null)" || return 2
+    common_dir="$("${safe_git[@]}" rev-parse --git-common-dir 2>/dev/null)" \
+        || return 2
+    git_dir="$(cd -- "$resolved" && cd -- "$git_dir" && pwd -P)" || return 2
+    common_dir="$(cd -- "$resolved" && cd -- "$common_dir" && pwd -P)" \
+        || return 2
+    expected_git_dir="$(cd -- "$resolved/.git" && pwd -P)" || return 2
+    if [[ "$git_dir" != "$expected_git_dir" \
+          || "$common_dir" != "$expected_git_dir" ]]; then
+        _gridbook_runtime_error \
+            "cached checkout Git metadata escapes its standalone .git directory"
+        return
+    fi
+    if [[ -e "$expected_git_dir/objects/info/alternates" ]]; then
+        _gridbook_runtime_error \
+            "cached checkout uses an external Git object alternate"
+        return
+    fi
+    printf '%s\n' "$resolved"
+}
+
 _gridbook_runtime_cache_root() {
     local root
     if [[ -n "${GRIDBOOK_RUNTIME_CACHE_DIR:-}" ]]; then
@@ -199,7 +235,7 @@ _gridbook_runtime_fetch_pinned_checkout() (
     destination="${cache_root}/${GRIDBOOK_RUNTIME_COMMIT}"
 
     if [[ -e "$destination" ]]; then
-        gridbook_runtime_verify_checkout "$destination" \
+        gridbook_runtime_verify_standalone_checkout "$destination" \
             "$GRIDBOOK_RUNTIME_COMMIT" "$GRIDBOOK_RUNTIME_VERSION"
         exit
     fi
@@ -226,7 +262,8 @@ _gridbook_runtime_fetch_pinned_checkout() (
         exit 2
     fi
     git -C "$tmp" checkout --quiet --detach "$GRIDBOOK_RUNTIME_COMMIT"
-    gridbook_runtime_verify_checkout "$tmp" "$GRIDBOOK_RUNTIME_COMMIT" \
+    gridbook_runtime_verify_standalone_checkout "$tmp" \
+        "$GRIDBOOK_RUNTIME_COMMIT" \
         "$GRIDBOOK_RUNTIME_VERSION" >/dev/null
 
     if mv -T -- "$tmp" "$destination" 2>/dev/null; then
@@ -236,7 +273,64 @@ _gridbook_runtime_fetch_pinned_checkout() (
             "could not publish fetched checkout at $destination"
         exit 2
     fi
-    gridbook_runtime_verify_checkout "$destination" \
+    gridbook_runtime_verify_standalone_checkout "$destination" \
+        "$GRIDBOOK_RUNTIME_COMMIT" "$GRIDBOOK_RUNTIME_VERSION"
+)
+
+_gridbook_runtime_materialize_checkout() (
+    set -euo pipefail
+    local supplied=${1:-}
+    local source cache_root destination tmp="" fetched
+    source="$(gridbook_runtime_verify_checkout "$supplied" \
+        "$GRIDBOOK_RUNTIME_COMMIT" "$GRIDBOOK_RUNTIME_VERSION")"
+    cache_root="$(_gridbook_runtime_cache_root)"
+    mkdir -p -- "$cache_root"
+    cache_root="$(cd -- "$cache_root" && pwd -P)"
+    destination="${cache_root}/${GRIDBOOK_RUNTIME_COMMIT}"
+
+    # A linked worktree's .git file points outside its own directory.  It is a
+    # valid host input but ceases to be a repository when Docker mounts only
+    # that directory.  Import every override into the same commit-addressed
+    # standalone cache used by the remote-fetch path, so the mounted checkout
+    # is self-contained and independent of host worktree layout.
+    if [[ -e "$destination" ]]; then
+        gridbook_runtime_verify_standalone_checkout "$destination" \
+            "$GRIDBOOK_RUNTIME_COMMIT" "$GRIDBOOK_RUNTIME_VERSION"
+        exit
+    fi
+
+    tmp="$(mktemp -d \
+        "${cache_root}/.materialize-${GRIDBOOK_RUNTIME_COMMIT:0:12}.XXXXXX")"
+    cleanup() {
+        if [[ -n "$tmp" && -d "$tmp" ]]; then
+            chmod -R u+w -- "$tmp" 2>/dev/null || true
+            rm -rf -- "$tmp"
+        fi
+    }
+    trap cleanup EXIT
+
+    git -C "$tmp" init --quiet
+    git -c "safe.directory=$source" -C "$tmp" fetch --quiet --depth=1 \
+        --no-tags "$source" "$GRIDBOOK_RUNTIME_COMMIT"
+    fetched="$(git -C "$tmp" rev-parse 'FETCH_HEAD^{commit}')"
+    if [[ "$fetched" != "$GRIDBOOK_RUNTIME_COMMIT" ]]; then
+        _gridbook_runtime_error \
+            "checkout override returned $fetched for pinned $GRIDBOOK_RUNTIME_COMMIT"
+        exit 2
+    fi
+    git -C "$tmp" checkout --quiet --detach "$GRIDBOOK_RUNTIME_COMMIT"
+    gridbook_runtime_verify_standalone_checkout "$tmp" \
+        "$GRIDBOOK_RUNTIME_COMMIT" \
+        "$GRIDBOOK_RUNTIME_VERSION" >/dev/null
+
+    if mv -T -- "$tmp" "$destination" 2>/dev/null; then
+        tmp=""
+    elif [[ ! -e "$destination" ]]; then
+        _gridbook_runtime_error \
+            "could not publish materialized checkout at $destination"
+        exit 2
+    fi
+    gridbook_runtime_verify_standalone_checkout "$destination" \
         "$GRIDBOOK_RUNTIME_COMMIT" "$GRIDBOOK_RUNTIME_VERSION"
 )
 
@@ -246,8 +340,8 @@ gridbook_runtime_prepare() {
 
     gridbook_runtime_load_pin || return
     if [[ -n "$checkout_override" ]]; then
-        source="$(gridbook_runtime_verify_checkout "$checkout_override" \
-            "$GRIDBOOK_RUNTIME_COMMIT" "$GRIDBOOK_RUNTIME_VERSION")" || return
+        source="$(_gridbook_runtime_materialize_checkout \
+            "$checkout_override")" || return
     else
         source="$(_gridbook_runtime_fetch_pinned_checkout)" || return
     fi
@@ -299,7 +393,7 @@ gridbook_runtime_install_container() {
     local source=${PQ_GRIDBOOK_RUNTIME_SOURCE:-}
     local supplied_commit=${PQ_GRIDBOOK_RUNTIME_COMMIT:-}
     local supplied_version=${PQ_GRIDBOOK_RUNTIME_VERSION:-}
-    local install_source
+    local install_source install_spec
 
     if ! _gridbook_runtime_is_commit "$supplied_commit"; then
         _gridbook_runtime_error \
@@ -326,7 +420,8 @@ gridbook_runtime_install_container() {
         return
     fi
 
-    gridbook_runtime_verify_checkout "$source" "$GRIDBOOK_RUNTIME_COMMIT" \
+    gridbook_runtime_verify_standalone_checkout "$source" \
+        "$GRIDBOOK_RUNTIME_COMMIT" \
         "$GRIDBOOK_RUNTIME_VERSION" >/dev/null || return
     install_source=$(gridbook_runtime_container_install_target) || return
     if [[ -e "$install_source" ]]; then
@@ -335,19 +430,58 @@ gridbook_runtime_install_container() {
         return
     fi
     mkdir -p -- "$install_source"
-    cp -a -- "$source/." "$install_source/"
+    # The host checkout may be owned by a uid that does not exist in the
+    # serving image.  Preserving it makes Git's safe-directory check reject
+    # the copied repository before pip can install the pinned commit.
+    cp -a --no-preserve=ownership -- "$source/." "$install_source/"
     chmod -R u+w -- "$install_source"
 
-    python3 -m pip install --no-deps --no-cache-dir --quiet "$install_source"
-    python3 - "$GRIDBOOK_RUNTIME_VERSION" <<'PY'
+    # Install through the copied checkout's VCS URL, not as a bare local
+    # directory.  Both inputs contain the same verified bytes, but only the
+    # VCS form produces truthful PEP 610 ``vcs_info``.  Gold evidence can then
+    # bind the installed distribution to the exact release commit instead of
+    # trusting a same-version package or the transport environment alone.
+    install_spec="git+file://${install_source}@${GRIDBOOK_RUNTIME_COMMIT}"
+    python3 -m pip install --no-deps --no-build-isolation --no-cache-dir --quiet \
+        --force-reinstall "$install_spec"
+    python3 - "$GRIDBOOK_RUNTIME_VERSION" "$GRIDBOOK_RUNTIME_COMMIT" <<'PY'
 from importlib.metadata import version
+from importlib.metadata import distribution
+import json
+from pathlib import Path
 import sys
 
 expected = sys.argv[1]
+expected_commit = sys.argv[2]
 actual = version("gridbook")
 if actual != expected:
     raise SystemExit(f"installed gridbook {actual!r}, expected {expected!r}")
-print(f"gridbook-runtime: installed gridbook {actual}")
+dist = distribution("gridbook")
+direct_url_files = [
+    file for file in (dist.files or ())
+    if file.name == "direct_url.json" and ".dist-info" in str(file.parent)
+]
+if len(direct_url_files) != 1:
+    raise SystemExit(
+        "installed gridbook must contain exactly one PEP 610 direct_url.json"
+    )
+direct_url_path = Path(dist.locate_file(direct_url_files[0]))
+direct_url = json.loads(direct_url_path.read_text(encoding="utf-8"))
+vcs = direct_url.get("vcs_info") or {}
+expected_vcs = {
+    "vcs": "git",
+    "commit_id": expected_commit,
+    "requested_revision": expected_commit,
+}
+if vcs != expected_vcs:
+    raise SystemExit(
+        f"installed gridbook PEP 610 vcs_info {vcs!r} does not equal "
+        f"the pinned identity {expected_vcs!r}"
+    )
+print(
+    f"gridbook-runtime: installed gridbook {actual} "
+    f"from git commit {expected_commit}"
+)
 PY
 }
 

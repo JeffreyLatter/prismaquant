@@ -2384,6 +2384,11 @@ def export_nvfp4_cb_streaming(
         )
 
     assignment = load_assignment(layer_config_path)
+    # Preserve the allocator's expanded, per-Linear namespace for independent
+    # release-route replay.  The serializer below collapses routed experts to
+    # physical stacks, which is correct for bytes but cannot replace the
+    # certified serving-unit member ledger.
+    finalized_tensor_formats = dict(assignment)
     _recipe_payload = json.loads(Path(layer_config_path).read_text())
     _recipe_cb_context_stamp, _recipe_cb_tensor_stamps = (
         cb_serialization_metadata_from_assignment_payload(_recipe_payload)
@@ -2442,6 +2447,12 @@ def export_nvfp4_cb_streaming(
     # reduction here, once, before anything reads the assignment.
     per_expert_plans: dict[str, dict[str, list[dict[str, object]]]] = {}
     if per_expert_config_path is not None:
+        per_expert_assignment = _load_per_expert_config(per_expert_config_path)
+        finalized_tensor_formats.update({
+            qname: fmt
+            for qname, fmt in per_expert_assignment.items()
+            if ".experts." in qname
+        })
         (
             assignment,
             expert_stack_members,
@@ -2449,7 +2460,7 @@ def export_nvfp4_cb_streaming(
             expert_stack_report,
         ) = _split_per_expert_assignment(
             assignment,
-            _load_per_expert_config(per_expert_config_path),
+            per_expert_assignment,
             expert_groups,
             profile,
         )
@@ -4492,7 +4503,12 @@ def export_nvfp4_cb_streaming(
         excluded_namespaces=excluded_namespaces,
         weight_only_stock_targets=sidecar_stock,
         streaming_provenance=True,
-        include_tensor_formats=False,
+        # Release serving/performance evidence must be reconciled against the
+        # finalized assignment, not a benchmark-authored route claim.  Keep
+        # the compact per-Linear map in the inventory-bound quant_config so a
+        # later validator can derive every serving-unit route independently.
+        include_tensor_formats=True,
+        tensor_formats=finalized_tensor_formats,
     )
     # DSpark is a metadata-only source overlay.  The ordinary copy loop above
     # emitted its physical mtp.* weight/scale pairs byte-verbatim; now remove

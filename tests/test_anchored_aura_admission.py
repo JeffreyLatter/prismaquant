@@ -190,11 +190,16 @@ def test_terminals_keep_the_passthrough_contract_not_the_aura_branch():
     }
     assert not candidates.cost_entry_is_anchored_aura_supersurrogate(terminal)
 
-    fmt = "FP8_BLOCK_UE8M0_SOURCE"
+    fmt = "MXFP4_SOURCE"
     assert not fr.get_format(fmt).act_quant_changes_input
     assert candidates.cost_entry_is_source_passthrough(terminal, fmt)
     assert candidates.cost_entry_activation_pricing_branch(
         {"h_trace": 1.0}, terminal, fmt) == candidates.BRANCH_SOURCE_PASSTHROUGH
+
+    block = "FP8_BLOCK_UE8M0_SOURCE"
+    assert fr.get_format(block).act_quant_changes_input
+    assert block not in candidates.SOURCE_PASSTHROUGH_FORMATS
+    assert not candidates.cost_entry_is_source_passthrough(terminal, block)
 
 
 if __name__ == "__main__":  # pragma: no cover

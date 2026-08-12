@@ -44,7 +44,20 @@ BASE_IMAGE=eugr/spark-vllm@sha256:7bf752a9fa225b528b27c6a1118cb1727cddd7c383096d
 VLLM_VERSION=0.26.1rc1.dev515+g653ebb52d.d20260808
 VLLM_COMMIT=653ebb52d
 GRAPH_COMPILATION_CONFIG='{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[1]}'
-SERVED_MODEL=${SERVED_MODEL:-dsv4-flash-gridbook}
+if [[ -n "${SERVED_MODEL:-}" ]]; then
+  echo "REFUSE: exact DSv4 gate owns the per-run served-model nonce" >&2
+  exit 2
+fi
+if command -v openssl >/dev/null 2>&1; then
+  SERVE_NONCE=$(openssl rand -hex 16)
+else
+  SERVE_NONCE=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
+fi
+if [[ ! "$SERVE_NONCE" =~ ^[0-9a-f]{32}$ ]]; then
+  echo "REFUSE: could not generate a 128-bit served-model session nonce" >&2
+  exit 2
+fi
+SERVED_MODEL=dsv4-flash-gridbook-${SERVE_NONCE}
 PORT=${PORT:-8000}
 EXPECTED_GPU_LOCK=/home/rob/dq-runs/gpu.lock
 LOCK=${GPU_LOCK:-$EXPECTED_GPU_LOCK}
@@ -163,13 +176,32 @@ CID=$(docker create --pull=never --name "$NAME" --gpus all --ipc=host \
   -e "PQ_GRAPH_COMPILATION_CONFIG=$GRAPH_COMPILATION_CONFIG" \
   -e XDG_CACHE_HOME=/opt/gridbook/ext-cache/xdg \
   -e PRISMAQUANT_CB_EXT_DIR=/opt/gridbook/ext-cache \
-  -e PRISMAQUANT_CB_DECODE=cuda \
+  -e PRISMAQUANT_CB_GEMV=inherited \
+  -e PRISMAQUANT_CB_BF16_SM120=0 \
+  -e PRISMAQUANT_CB_FP4_FUSED_MIDM=0 \
+  -e PRISMAQUANT_CB_MOE_PERSISTENT_B=0 \
+  -e PRISMAQUANT_CB_MOE_PERSISTENT_B_CFG=0 \
+  -e PRISMAQUANT_CB_FUSED_MIDM=1 \
+  -e PRISMAQUANT_CB_GROUPED_TRIM=1 \
+  -e PRISMAQUANT_CB_PREFILL_CHUNK_BYTES=1073741824 \
+  -e PRISMAQUANT_CB_DECODE_CONTRACT=v1 \
+  -e PRISMAQUANT_SKIP_CB_CAST_CHECK=0 \
   -e PRISMAQUANT_PRELOAD_FUSED=1 \
   -e GRIDBOOK_MXFP8_DENSE=1 \
   -e VLLM_USE_DEEP_GEMM=0 \
   -e PYTORCH_ALLOC_CONF=expandable_segments:True \
   --entrypoint bash "$BASE_IMAGE" -lc '
     set -euo pipefail
+    # Absence is part of the released environment contract.  In particular,
+    # literal 0 is invalid for both fused-FP4 selectors and expert chunking.
+    unset CUDACXX CXX \
+      PRISMAQUANT_CB_DECODE PRISMAQUANT_CB_EXPAND PRISMAQUANT_CB_PREFILL \
+      PRISMAQUANT_CB_FUSED_FP4 PRISMAQUANT_CB_FUSED_FP4_MOE \
+      PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK \
+      PRISMAQUANT_CB_FP8_SCHED PRISMAQUANT_CB_FP4V2_SCHED \
+      PRISMAQUANT_CB_W2_SCHED PRISMAQUANT_CB_W2_ROWS \
+      PRISMAQUANT_CB_W2_WARPS PRISMAQUANT_CUTLASS_INCLUDE \
+      PRISMAQUANT_DEBUG_PREFIXES
     bash "${PQ_GRIDBOOK_RUNTIME_HELPER:?}" install-container
     test "$(python3 -c '\''from importlib.metadata import version; print(version("gridbook"))'\'')" = "$PQ_GRIDBOOK_RUNTIME_VERSION"
     test "$(python3 -c '\''from importlib.metadata import version; print(version("vllm"))'\'')" = "$PQ_VLLM_VERSION"
@@ -315,7 +347,7 @@ docker logs "$CID" > "$CAPTURE_LOG" 2>&1
 docker exec -e PYTHONPATH=/repo "$CID" \
   python3 /repo/tools/serve_fingerprint.py write \
   --out /evidence/serve_manifest.json --image "$BASE_IMAGE" \
-  --artifact-dir /model
+  --artifact-dir /model --base-url http://127.0.0.1:8000
 test -s "$MANIFEST"
 
 graph_evidence_args=()

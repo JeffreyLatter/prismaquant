@@ -9,6 +9,11 @@ import pytest
 
 import prismaquant.validate_cb_performance as performance_validator
 from prismaquant.gridbook_runtime_pin import load_gridbook_runtime_pin
+from prismaquant.gridbook_environment import (
+    CANONICAL_GOLD_ENVIRONMENT,
+    CANONICAL_GOLD_SET_ENVIRONMENT,
+    GRIDBOOK_ENVIRONMENT_SCHEMA,
+)
 from prismaquant.shipcard import (
     SHIPCARD_RESERVED_BYTES,
     _verify_gridbook_performance_record,
@@ -35,7 +40,15 @@ from prismaquant.validate_cb_performance import (
     TOOL,
     validate_cb_performance,
 )
-from tools.serve_fingerprint import elide_argv_paths, fingerprint
+from tools.serve_fingerprint import (
+    SERVER_ENV_ALLOWLIST,
+    elide_argv_paths,
+    fingerprint,
+    normalize_performance_argv,
+    performance_stack_fingerprint,
+    process_identity_sha256,
+    serve_session_fingerprint,
+)
 
 
 _SOURCE_IDENTITY = {
@@ -114,8 +127,18 @@ def _artifact(root: Path, budget: int) -> tuple[Path, str, int, str]:
     quant_config = {
         "quant_method": "gridbook",
         "format": "nvfp4_cb",
+        "config_groups": {
+            "group_0": {
+                "targets": ["re:^model[.]layers[.]0[.]self_attn[.]q_proj$"],
+                "format": "FP8_CB_K36",
+                "scheme": {"grid": "fp8", "mode": "product", "k": 36},
+            }
+        },
         "provenance": {
             "source_model_identity": dict(_SOURCE_IDENTITY),
+            "tensor_formats": {
+                "model.layers.0.self_attn.q_proj": "FP8_CB_K36"
+            },
             "artifact_inventory": {
                 "schema": "prismaquant.cb_export_artifact_inventory.v1",
                 "scope": "pending_final_write",
@@ -157,9 +180,19 @@ def _displaced_artifact(root: Path, budget: int) -> dict:
     quant_config = {
         "quant_method": "gridbook",
         "format": "nvfp4_cb",
+        "config_groups": {
+            "group_0": {
+                "targets": ["re:^model[.]layers[.]0[.]self_attn[.]q_proj$"],
+                "format": "NVFP4_CB_K32",
+                "scheme": {"grid": "fp4", "mode": "product", "k": 32},
+            }
+        },
         "provenance": {
             "assignment_sha256": assignment_sha,
             "source_model_identity": dict(_SOURCE_IDENTITY),
+            "tensor_formats": {
+                "model.layers.0.self_attn.q_proj": "NVFP4_CB_K32"
+            },
             "weight_content_manifest": build_weight_content_manifest(artifact),
             "artifact_inventory": {
                 "schema": "prismaquant.cb_export_artifact_inventory.v1",
@@ -248,11 +281,23 @@ def _metrics(*, candidate: bool) -> dict:
 
 
 _SERVER_ENVIRONMENT = {
-    "GRIDBOOK_MXFP8_DENSE": "1",
-    "PRISMAQUANT_CB_DECODE": "cuda",
+    **dict(CANONICAL_GOLD_SET_ENVIRONMENT),
+    "PQ_GRIDBOOK_RUNTIME_COMMIT": load_gridbook_runtime_pin().commit,
+    "PQ_GRIDBOOK_RUNTIME_VERSION": load_gridbook_runtime_pin().version,
     "PRISMAQUANT_PRELOAD_FUSED": "1",
-    "VLLM_USE_DEEP_GEMM": "0",
 }
+
+
+def test_performance_environment_is_canonical_plus_preload_override():
+    expected = dict(CANONICAL_GOLD_ENVIRONMENT)
+    expected["PRISMAQUANT_PRELOAD_FUSED"] = "1"
+    assert performance_validator._PERFORMANCE_SERVER_ENVIRONMENT == expected
+    assert performance_validator._REQUIRED_SERVER_ENVIRONMENT == {
+        name: value for name, value in expected.items() if value is not None
+    }
+    assert "PRISMAQUANT_CB_DECODE" not in (
+        performance_validator._REQUIRED_SERVER_ENVIRONMENT
+    )
 
 
 def _server_argv(*, model_id: str, chunked: bool, speculative: bool) -> list[str]:
@@ -288,23 +333,62 @@ def _serve_manifest_attachment(
     identity: dict,
     chunked: bool,
     speculative: bool,
-) -> dict:
+) -> list[dict]:
     pin = load_gridbook_runtime_pin()
     argv = _server_argv(
         model_id=identity["model_id"],
         chunked=chunked,
         speculative=speculative,
     )
+    pid = 11001 if candidate else 22001
+    host_identity = {
+        "hostname": "one-spark",
+        "boot_id": "11111111-2222-3333-4444-555555555555",
+        "machine_id_sha256": "7" * 64,
+        "pid_namespace": "pid:[4026533000]",
+    }
+    process = {
+        "pid": pid,
+        "argv": argv,
+        "cmdline": " ".join(argv),
+        "start_time_ticks": 123456 if candidate else 223456,
+        "pid_namespace": "pid:[4026533000]",
+        "executable": "/usr/local/bin/python3.12",
+    }
+    process["identity_sha256"] = process_identity_sha256(
+        process, boot_id=host_identity["boot_id"]
+    )
+    environment_row = {
+        "pid": pid,
+        "values": dict(_SERVER_ENVIRONMENT),
+        "sha256": hashlib.sha256(
+            json.dumps(
+                _SERVER_ENVIRONMENT,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest(),
+    }
+    listener_row = {
+        "family": "ipv4",
+        "address": "0.0.0.0",
+        "port": 8000,
+        "socket_inode": "98765" if candidate else "87654",
+        "pids": [pid],
+    }
     payload = {
         "schema": "prismaquant.serve_manifest/1",
         "created": "2026-08-12T00:30:00Z",
+        "attestation_phase": "pre",
         "source": "server",
         "hostname": "one-spark",
+        "host_identity": host_identity,
         "image": DSV4_SPARK_VLLM_IMAGE,
         "model": "/model",
         "served_model_name": identity["model_id"],
         "launch_argv": argv,
         "launch_flags": elide_argv_paths(argv),
+        "normalized_performance_argv": normalize_performance_argv(argv),
         "enforce_eager": False,
         "quantization": "gridbook",
         "kv_cache_dtype": "fp8",
@@ -320,32 +404,66 @@ def _serve_manifest_attachment(
         "gridbook_runtime_pin": {"commit": pin.commit, "version": pin.version},
         "resident_extensions": ["prismaquant_cb_v2_ext.test.so"],
         "residency_readable": True,
-        "processes": [
-            {
-                "pid": 11001 if candidate else 22001,
-                "cmdline": " ".join(argv),
-            }
-        ],
+        "processes": [process],
+        "server_process_environment": {
+            "schema": "prismaquant.server_process_environment/1",
+            "allowlist": sorted(SERVER_ENV_ALLOWLIST),
+            "readable_pids": [pid],
+            "unreadable_pids": [],
+            "consistent": True,
+            "values": dict(_SERVER_ENVIRONMENT),
+            "processes": [environment_row],
+        },
         "pq_env": dict(_SERVER_ENVIRONMENT),
+        "listener_census": {
+            "schema": "prismaquant.server_tcp_listeners/1",
+            "tables_readable": True,
+            "unreadable_pids": [],
+            "listeners": [listener_row],
+        },
+        "listener_binding": {
+            "schema": "prismaquant.server_listener_binding/1",
+            "base_url": "http://127.0.0.1:8000",
+            "launch_host": "0.0.0.0",
+            "launch_port": 8000,
+            "listeners": [listener_row],
+        },
         "gpu_name": DSV4_SPARK_GPU_NAME,
+        "gpu_uuid": "GPU-11111111-2222-3333-4444-555555555555",
         "driver_version": "release-driver",
         "gpu_count": 1,
         "artifact_binding": {
             "schema": "prismaquant.served_artifact_binding/1",
+            "resolved_path": "/model",
+            "launch_model": "/model",
             "model_sha": identity["model_sha"],
             "artifact_inventory_sha256": identity["artifact_inventory_sha256"],
             "artifact_bytes": identity["artifact_bytes"],
         },
     }
+    payload["serve_session_id"] = serve_session_fingerprint(payload)
+    payload["performance_stack_fingerprint"] = performance_stack_fingerprint(payload)
     payload["serve_fingerprint"] = fingerprint(payload)
     arm = "candidate" if candidate else "baseline"
-    path = root / "serve-manifests" / f"{cell_id}-{arm}.json"
-    digest = _write_json(path, payload)
-    return {
-        "reference": str(path.relative_to(root)),
-        "sha256": digest,
-        "bytes": path.stat().st_size,
-    }
+    result = []
+    for phase, created in (
+        ("pre", "2026-08-12T00:30:00Z"),
+        ("post", "2026-08-12T01:20:00Z"),
+    ):
+        snapshot = json.loads(json.dumps(payload))
+        snapshot["attestation_phase"] = phase
+        snapshot["created"] = created
+        snapshot["serve_fingerprint"] = fingerprint(snapshot)
+        path = root / "serve-manifests" / f"{cell_id}-{arm}-{phase}.json"
+        digest = _write_json(path, snapshot)
+        result.append(
+            {
+                "reference": str(path.relative_to(root)),
+                "sha256": digest,
+                "bytes": path.stat().st_size,
+            }
+        )
+    return result
 
 
 def _report(
@@ -363,7 +481,7 @@ def _report(
     server_evidence: dict,
 ) -> dict:
     pin = load_gridbook_runtime_pin()
-    base_url = "http://candidate" if candidate else "http://baseline"
+    base_url = "http://127.0.0.1:8000"
     server_argv = _server_argv(
         model_id=model_id,
         chunked=chunked,
@@ -419,13 +537,13 @@ def _report(
                 "byte_scope": "whole served artifact",
             },
             "execution_identity": {
-                "format_rung": "dsv4flash-cb" if candidate else "prior-a-fast-raw-cb",
+                "format_rung": "FP8_CB_K36" if candidate else "NVFP4_CB_K32",
                 "serialization": {
-                    "layout": "cb",
-                    "scale_coding": "mixed",
+                    "layout": "product-codebook-indices-v1",
+                    "scale_coding": "v1",
                 },
-                "quant_contract": "mixed",
-                "kernel_backend": "gridbook",
+                "quant_contract": "W8A8" if candidate else "W4A4",
+                "kernel_backend": "gridbook-cuda-cb-gemv-v2",
                 "tensor_parallel_size": 1,
                 "fallback_state": "none",
                 "manifest": {
@@ -439,10 +557,10 @@ def _report(
                         {
                             "unit": "model.layers.0.self_attn.q_proj",
                             "format_rung": "FP8_CB_K36" if candidate else "NVFP4_CB_K32",
-                            "serialized_layout": "cb",
-                            "scale_coding": "e4m3" if candidate else "ue4m3",
+                            "serialized_layout": "product-codebook-indices-v1",
+                            "scale_coding": "v1",
                             "quant_contract": "W8A8" if candidate else "W4A4",
-                            "kernel_backend": "gridbook",
+                            "kernel_backend": "gridbook-cuda-cb-gemv-v2",
                             "fallback_state": "none",
                         }
                     ],
@@ -485,10 +603,18 @@ def _report(
                 "blocks": 3,
                 "dataset_base_seed": 1234,
                 "dataset_block_seeds": [1234, 1235, 1236],
-                "sampling": {"strategy": "greedy", "temperature": 0.0},
+                "sampling": {
+                    "strategy": "greedy",
+                    "temperature": 0.0,
+                    "sampling_seed": None,
+                },
                 "request_rate": "inf",
                 "request_burstiness": 1.0,
                 "input_range_ratio": input_range_ratio,
+                "ignore_eos": True,
+                "streaming": True,
+                "metrics": ["ttft", "tpot", "itl", "e2el"],
+                "percentiles": [95.0],
                 "speculative_decoding": {
                     "mode": "on" if speculative else "off",
                     "config": {"num_speculative_tokens": 3} if speculative else None,
@@ -515,6 +641,40 @@ def _report(
                     model_id,
                     "--tokenizer",
                     "tokenizer@revision",
+                    "--dataset-name",
+                    "random",
+                    "--random-input-len",
+                    "32",
+                    "--random-output-len",
+                    str(output_len),
+                    "--random-range-ratio",
+                    json.dumps(
+                        {"input": input_range_ratio, "output": 0.0},
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    "--num-prompts",
+                    "16",
+                    "--num-warmups",
+                    "4",
+                    "--max-concurrency",
+                    str(concurrency),
+                    "--request-rate",
+                    "inf",
+                    "--burstiness",
+                    "1.0",
+                    "--seed",
+                    str(1234 + index),
+                    "--temperature",
+                    "0",
+                    "--ignore-eos",
+                    "--disable-shuffle",
+                    "--percentile-metrics",
+                    "ttft,tpot,itl,e2el",
+                    "--metric-percentiles",
+                    "95",
+                    "--save-result",
+                    "--save-detailed",
                 ],
                 "raw_result": {
                     metric: row["values"][index]
@@ -611,7 +771,7 @@ def _comparison(tmp_path: Path) -> dict:
                 input_range_ratio=ratio,
                 chunked=chunked,
                 speculative=spec,
-                server_evidence=candidate_server_evidence,
+                server_evidence=candidate_server_evidence[0],
             ),
         )
         baseline = baselines[phase]
@@ -636,7 +796,7 @@ def _comparison(tmp_path: Path) -> dict:
                 input_range_ratio=ratio,
                 chunked=chunked,
                 speculative=spec,
-                server_evidence=baseline_server_evidence,
+                server_evidence=baseline_server_evidence[0],
             ),
         )
         cells.append(
@@ -651,9 +811,27 @@ def _comparison(tmp_path: Path) -> dict:
                     "path": str(candidate_path.relative_to(tmp_path)),
                     "sha256": candidate_digest,
                 },
+                "candidate_serve_attestations": {
+                    phase: {
+                        "path": attachment["reference"],
+                        "sha256": attachment["sha256"],
+                    }
+                    for phase, attachment in zip(
+                        ("pre", "post"), candidate_server_evidence
+                    )
+                },
                 "baseline_report": {
                     "path": str(baseline_path.relative_to(tmp_path)),
                     "sha256": baseline_digest,
+                },
+                "baseline_serve_attestations": {
+                    phase: {
+                        "path": attachment["reference"],
+                        "sha256": attachment["sha256"],
+                    }
+                    for phase, attachment in zip(
+                        ("pre", "post"), baseline_server_evidence
+                    )
                 },
             }
         )
@@ -676,6 +854,11 @@ def _comparison(tmp_path: Path) -> dict:
                     "candidate@exact"
                     if arm == "candidate"
                     else baselines[phase_by_cell[cell_id]]["model_id"]
+                )
+                exact_identity = (
+                    candidate_identity
+                    if arm == "candidate"
+                    else baselines[phase_by_cell[cell_id]]
                 )
                 layers = []
                 for layer_id in range(43):
@@ -707,7 +890,19 @@ def _comparison(tmp_path: Path) -> dict:
                         )
                     layers.append({"layer_id": layer_id, "steps": [step]})
                 arm_cells.append(
-                    {"cell_id": cell_id, "model_id": model_id, "layers": layers}
+                    {
+                        "cell_id": cell_id,
+                        **{
+                            field: exact_identity[field]
+                            for field in (
+                                "model_id",
+                                "model_sha",
+                                "artifact_inventory_sha256",
+                                "artifact_bytes",
+                            )
+                        },
+                        "layers": layers,
+                    }
                 )
             arms[arm] = {"cells": arm_cells}
         payload = {
@@ -799,7 +994,13 @@ def _bypass_external_native_certificate(monkeypatch) -> None:
         "_validate_native_feasibility",
         lambda *args, **kwargs: (
             "f" * 64,
-            frozenset({"model.layers.0.self_attn.q_proj"}),
+            (
+                {
+                    "kind": "serving",
+                    "name": "model.layers.0.self_attn.q_proj",
+                    "members": ["model.layers.0.self_attn.q_proj"],
+                },
+            ),
         ),
     )
     monkeypatch.setattr(
@@ -853,6 +1054,16 @@ def test_paired_matrix_produces_and_fills_exact_shipcard_record(tmp_path, monkey
     assert record["evidence"]["schema"] == EVIDENCE_SCHEMA
     assert len(record["evidence"]["paired_reports"]) == 32
     assert record["metrics"]["native_baseline_feasibility_sha256"] == "f" * 64
+    assert record["metrics"]["server_environment_contract"] == {
+        "schema": GRIDBOOK_ENVIRONMENT_SCHEMA,
+        "profile": "matched_budget_performance",
+        "base_profile": "canonical_gold",
+        "overrides": {"PRISMAQUANT_PRELOAD_FUSED": "1"},
+        "environment": {
+            **dict(CANONICAL_GOLD_ENVIRONMENT),
+            "PRISMAQUANT_PRELOAD_FUSED": "1",
+        },
+    }
     assert record["evidence"]["displaced_container"]["schema"] == (
         DISPLACED_CONTAINER_SCHEMA
     )
@@ -863,6 +1074,30 @@ def test_paired_matrix_produces_and_fills_exact_shipcard_record(tmp_path, monkey
     assert _verify_gridbook_performance_record(
         SLOT,
         record,
+        model_dir=fixture["shipcard"].parent,
+    ) == []
+
+
+def test_local_source_identity_with_null_resolved_commit_is_release_eligible(
+    tmp_path, monkeypatch,
+):
+    original = _SOURCE_IDENTITY["resolved_commit"]
+    _SOURCE_IDENTITY["resolved_commit"] = None
+    try:
+        fixture = _comparison(tmp_path)
+    finally:
+        _SOURCE_IDENTITY["resolved_commit"] = original
+    _bypass_external_native_certificate(monkeypatch)
+    result = validate_cb_performance(
+        fixture["shipcard"], fixture["manifest"], fill=False
+    )
+    assert result["status"] == "success"
+    assert result["record"]["evidence"]["displaced_container"][
+        "source_model_identity"
+    ]["resolved_commit"] is None
+    assert _verify_gridbook_performance_record(
+        SLOT,
+        result["record"],
         model_dir=fixture["shipcard"].parent,
     ) == []
 
@@ -917,6 +1152,9 @@ def test_report_requires_digest_bound_structured_serve_manifest(tmp_path, monkey
     attachment = report["metadata"]["server"]["evidence"]["attachments"][0]
     attachment["sha256"] = hashlib.sha256(serve_path.read_bytes()).hexdigest()
     attachment["bytes"] = serve_path.stat().st_size
+    fixture["manifest_payload"]["cells"][0]["candidate_serve_attestations"][
+        "pre"
+    ]["sha256"] = attachment["sha256"]
     _rewrite_report_and_comparison(
         fixture,
         cell_index=0,
@@ -925,7 +1163,7 @@ def test_report_requires_digest_bound_structured_serve_manifest(tmp_path, monkey
         report=report,
     )
 
-    with pytest.raises(CBPerformanceValidationError, match="exactly one structured"):
+    with pytest.raises(CBPerformanceValidationError, match="cannot read.*pre serve"):
         validate_cb_performance(fixture["shipcard"], fixture["manifest"], fill=False)
 
 
@@ -942,28 +1180,17 @@ def test_serve_manifest_attachment_is_reread_at_parity_time(tmp_path, monkeypatc
 def test_candidate_report_cannot_attach_baseline_artifact_server(tmp_path, monkeypatch):
     fixture = _comparison(tmp_path)
     _bypass_external_native_certificate(monkeypatch)
-    report, report_path, serve_manifest, serve_path = _report_and_serve_manifest(
-        fixture, tmp_path
-    )
-    serve_manifest["artifact_binding"] = {
-        "schema": "prismaquant.served_artifact_binding/1",
-        "model_sha": fixture["displaced"]["identity"]["model_sha"],
-        "artifact_inventory_sha256": fixture["displaced"]["identity"][
-            "artifact_inventory_sha256"
-        ],
-        "artifact_bytes": fixture["displaced"]["identity"]["artifact_bytes"],
-    }
-    serve_manifest["serve_fingerprint"] = fingerprint(serve_manifest)
-    attachment = report["metadata"]["server"]["evidence"]["attachments"][0]
-    attachment["sha256"] = _write_json(serve_path, serve_manifest)
-    attachment["bytes"] = serve_path.stat().st_size
-    _rewrite_report_and_comparison(
-        fixture,
-        cell_index=0,
-        arm="candidate",
-        report_path=report_path,
-        report=report,
-    )
+    def mutate(serve_manifest):
+        serve_manifest["artifact_binding"].update(
+            {
+                "model_sha": fixture["displaced"]["identity"]["model_sha"],
+                "artifact_inventory_sha256": fixture["displaced"]["identity"][
+                    "artifact_inventory_sha256"
+                ],
+                "artifact_bytes": fixture["displaced"]["identity"]["artifact_bytes"],
+            }
+        )
+    _rewrite_serve_pair(fixture, tmp_path, mutate)
 
     with pytest.raises(CBPerformanceValidationError, match="exact expected artifact"):
         validate_cb_performance(fixture["shipcard"], fixture["manifest"], fill=False)
@@ -972,15 +1199,231 @@ def test_candidate_report_cannot_attach_baseline_artifact_server(tmp_path, monke
 def test_candidate_and_baseline_cannot_reuse_one_server_process(tmp_path, monkeypatch):
     fixture = _comparison(tmp_path)
     _bypass_external_native_certificate(monkeypatch)
-    candidate = _report_and_serve_manifest(fixture, tmp_path, arm="candidate")[2]
-    report, report_path, baseline, serve_path = _report_and_serve_manifest(
+    candidate_refs = fixture["manifest_payload"]["cells"][0][
+        "candidate_serve_attestations"
+    ]
+
+    def mutate(baseline):
+        phase = baseline["attestation_phase"]
+        candidate = json.loads(
+            (tmp_path / candidate_refs[phase]["path"]).read_text()
+        )
+        for key in (
+            "host_identity",
+            "gpu_uuid",
+            "processes",
+            "server_process_environment",
+            "listener_census",
+            "listener_binding",
+        ):
+            baseline[key] = candidate[key]
+    _rewrite_serve_pair(fixture, tmp_path, mutate, arm="baseline")
+
+    with pytest.raises(
+        CBPerformanceValidationError,
+        match="one live server process|one concrete vLLM process",
+    ):
+        validate_cb_performance(fixture["shipcard"], fixture["manifest"], fill=False)
+
+
+def test_reported_server_argv_must_equal_live_server_argv(tmp_path, monkeypatch):
+    fixture = _comparison(tmp_path)
+    _bypass_external_native_certificate(monkeypatch)
+    def mutate(serve_manifest):
+        serve_manifest["launch_argv"].append("--unreported-switch")
+        serve_manifest["launch_flags"] = elide_argv_paths(
+            serve_manifest["launch_argv"]
+        )
+        serve_manifest["normalized_performance_argv"] = normalize_performance_argv(
+            serve_manifest["launch_argv"]
+        )
+        process = serve_manifest["processes"][0]
+        process["argv"] = serve_manifest["launch_argv"]
+        process["cmdline"] = " ".join(process["argv"])
+        process["identity_sha256"] = process_identity_sha256(
+            process, boot_id=serve_manifest["host_identity"]["boot_id"]
+        )
+    _rewrite_serve_pair(fixture, tmp_path, mutate)
+
+    with pytest.raises(CBPerformanceValidationError, match="exact live-server launch argv"):
+        validate_cb_performance(fixture["shipcard"], fixture["manifest"], fill=False)
+
+
+def _rewrite_serve_pair(
+    fixture: dict,
+    tmp_path: Path,
+    mutate,
+    *,
+    cell_index: int = 0,
+    arm: str = "candidate",
+) -> None:
+    report, report_path, _, _ = _report_and_serve_manifest(
+        fixture, tmp_path, cell_index=cell_index, arm=arm
+    )
+    cell = fixture["manifest_payload"]["cells"][cell_index]
+    attestation_refs = cell[f"{arm}_serve_attestations"]
+    report_attachment = report["metadata"]["server"]["evidence"]["attachments"][0]
+    for phase in ("pre", "post"):
+        reference = attestation_refs[phase]
+        path = tmp_path / reference["path"]
+        payload = json.loads(path.read_text())
+        mutate(payload)
+        payload["performance_stack_fingerprint"] = performance_stack_fingerprint(
+            payload
+        )
+        payload["serve_session_id"] = serve_session_fingerprint(payload)
+        payload["serve_fingerprint"] = fingerprint(payload)
+        digest = _write_json(path, payload)
+        reference["sha256"] = digest
+        if phase == "pre":
+            report_attachment["sha256"] = digest
+            report_attachment["bytes"] = path.stat().st_size
+    _rewrite_report_and_comparison(
+        fixture,
+        cell_index=cell_index,
+        arm=arm,
+        report_path=report_path,
+        report=report,
+    )
+
+
+def test_server_process_environment_must_equal_reported_closed_contract(
+    tmp_path, monkeypatch,
+):
+    fixture = _comparison(tmp_path)
+    _bypass_external_native_certificate(monkeypatch)
+
+    def mutate(payload):
+        payload["server_process_environment"]["values"][
+            "PRISMAQUANT_CB_DECODE"
+        ] = "cuda"
+        payload["pq_env"]["PRISMAQUANT_CB_DECODE"] = "cuda"
+
+    _rewrite_serve_pair(fixture, tmp_path, mutate)
+    with pytest.raises(CBPerformanceValidationError, match="live-server environment"):
+        validate_cb_performance(fixture["shipcard"], fixture["manifest"], fill=False)
+
+
+def test_per_process_environment_rows_are_replayed(tmp_path, monkeypatch):
+    fixture = _comparison(tmp_path)
+    _bypass_external_native_certificate(monkeypatch)
+
+    def mutate(payload):
+        payload["server_process_environment"]["processes"][0]["values"][
+            "PRISMAQUANT_CB_DECODE"
+        ] = "cuda"
+
+    _rewrite_serve_pair(fixture, tmp_path, mutate)
+    with pytest.raises(
+        CBPerformanceValidationError,
+        match="environment row.*differs|environment row.*digest",
+    ):
+        validate_cb_performance(fixture["shipcard"], fixture["manifest"], fill=False)
+
+
+def test_candidate_and_baseline_must_share_host_boot_and_gpu(tmp_path, monkeypatch):
+    fixture = _comparison(tmp_path)
+    _bypass_external_native_certificate(monkeypatch)
+
+    def mutate(payload):
+        payload["host_identity"]["boot_id"] = (
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        )
+        for process in payload["processes"]:
+            process["identity_sha256"] = process_identity_sha256(
+                process, boot_id=payload["host_identity"]["boot_id"]
+            )
+
+    _rewrite_serve_pair(fixture, tmp_path, mutate, arm="baseline")
+    with pytest.raises(CBPerformanceValidationError, match="same Spark host session"):
+        validate_cb_performance(fixture["shipcard"], fixture["manifest"], fill=False)
+
+
+def test_process_cmdline_cannot_contradict_argv(tmp_path, monkeypatch):
+    fixture = _comparison(tmp_path)
+    _bypass_external_native_certificate(monkeypatch)
+
+    def mutate(payload):
+        payload["processes"][0]["cmdline"] = "vllm serve /different-model"
+
+    _rewrite_serve_pair(fixture, tmp_path, mutate)
+    with pytest.raises(CBPerformanceValidationError, match="process 0 is malformed"):
+        validate_cb_performance(fixture["shipcard"], fixture["manifest"], fill=False)
+
+
+def test_listener_census_cannot_name_an_alien_process(tmp_path, monkeypatch):
+    fixture = _comparison(tmp_path)
+    _bypass_external_native_certificate(monkeypatch)
+
+    def mutate(payload):
+        payload["listener_census"]["listeners"][0]["pids"] = [999999]
+        payload["listener_binding"]["listeners"][0]["pids"] = [999999]
+
+    _rewrite_serve_pair(fixture, tmp_path, mutate)
+    with pytest.raises(CBPerformanceValidationError, match="listener binding"):
+        validate_cb_performance(fixture["shipcard"], fixture["manifest"], fill=False)
+
+
+def test_serve_attestations_must_bracket_benchmark(tmp_path, monkeypatch):
+    fixture = _comparison(tmp_path)
+    _bypass_external_native_certificate(monkeypatch)
+    reference = fixture["manifest_payload"]["cells"][0][
+        "candidate_serve_attestations"
+    ]["post"]
+    path = tmp_path / reference["path"]
+    payload = json.loads(path.read_text())
+    payload["created"] = "2026-08-12T01:05:00Z"
+    payload["serve_fingerprint"] = fingerprint(payload)
+    reference["sha256"] = _write_json(path, payload)
+    _write_json(fixture["manifest"], fixture["manifest_payload"])
+    with pytest.raises(CBPerformanceValidationError, match="does not bracket"):
+        validate_cb_performance(fixture["shipcard"], fixture["manifest"], fill=False)
+
+
+def test_post_attestation_cannot_hide_new_server_state(tmp_path, monkeypatch):
+    fixture = _comparison(tmp_path)
+    _bypass_external_native_certificate(monkeypatch)
+    reference = fixture["manifest_payload"]["cells"][0][
+        "candidate_serve_attestations"
+    ]["post"]
+    path = tmp_path / reference["path"]
+    payload = json.loads(path.read_text())
+    extra_listener = dict(payload["listener_census"]["listeners"][0])
+    extra_listener["port"] = 8001
+    extra_listener["socket_inode"] = "54322"
+    payload["listener_census"]["listeners"].append(extra_listener)
+    payload["serve_fingerprint"] = fingerprint(payload)
+    reference["sha256"] = _write_json(path, payload)
+    _write_json(fixture["manifest"], fixture["manifest_payload"])
+
+    with pytest.raises(CBPerformanceValidationError, match="identity changed"):
+        validate_cb_performance(fixture["shipcard"], fixture["manifest"], fill=False)
+
+
+def test_candidate_and_baseline_must_have_same_normalized_serving_stack(
+    tmp_path, monkeypatch,
+):
+    fixture = _comparison(tmp_path)
+    _bypass_external_native_certificate(monkeypatch)
+
+    def mutate(payload):
+        payload["launch_argv"].append("--enforce-eager")
+        payload["launch_flags"] = elide_argv_paths(payload["launch_argv"])
+        payload["normalized_performance_argv"] = normalize_performance_argv(
+            payload["launch_argv"]
+        )
+        process = payload["processes"][0]
+        process["argv"] = payload["launch_argv"]
+        process["cmdline"] = " ".join(process["argv"])
+        process["identity_sha256"] = process_identity_sha256(
+            process, boot_id=payload["host_identity"]["boot_id"]
+        )
+
+    _rewrite_serve_pair(fixture, tmp_path, mutate, arm="baseline")
+    report, report_path, _, _ = _report_and_serve_manifest(
         fixture, tmp_path, arm="baseline"
     )
-    baseline["processes"] = candidate["processes"]
-    baseline["serve_fingerprint"] = fingerprint(baseline)
-    attachment = report["metadata"]["server"]["evidence"]["attachments"][0]
-    attachment["sha256"] = _write_json(serve_path, baseline)
-    attachment["bytes"] = serve_path.stat().st_size
+    report["metadata"]["server"]["recorded_args"].append("--enforce-eager")
     _rewrite_report_and_comparison(
         fixture,
         cell_index=0,
@@ -988,23 +1431,19 @@ def test_candidate_and_baseline_cannot_reuse_one_server_process(tmp_path, monkey
         report_path=report_path,
         report=report,
     )
-
-    with pytest.raises(CBPerformanceValidationError, match="one live server process"):
+    with pytest.raises(
+        CBPerformanceValidationError,
+        match="server argv differs|serving stacks differ",
+    ):
         validate_cb_performance(fixture["shipcard"], fixture["manifest"], fill=False)
 
 
-def test_reported_server_argv_must_equal_live_server_argv(tmp_path, monkeypatch):
+def test_benchmark_workload_command_must_equal_metadata(tmp_path, monkeypatch):
     fixture = _comparison(tmp_path)
     _bypass_external_native_certificate(monkeypatch)
-    report, report_path, serve_manifest, serve_path = _report_and_serve_manifest(
-        fixture, tmp_path
-    )
-    serve_manifest["launch_argv"].append("--unreported-switch")
-    serve_manifest["launch_flags"] = elide_argv_paths(serve_manifest["launch_argv"])
-    serve_manifest["serve_fingerprint"] = fingerprint(serve_manifest)
-    attachment = report["metadata"]["server"]["evidence"]["attachments"][0]
-    attachment["sha256"] = _write_json(serve_path, serve_manifest)
-    attachment["bytes"] = serve_path.stat().st_size
+    report, report_path, _, _ = _report_and_serve_manifest(fixture, tmp_path)
+    command = report["blocks"][0]["command"]
+    command[command.index("--max-concurrency") + 1] = "999"
     _rewrite_report_and_comparison(
         fixture,
         cell_index=0,
@@ -1012,9 +1451,318 @@ def test_reported_server_argv_must_equal_live_server_argv(tmp_path, monkeypatch)
         report_path=report_path,
         report=report,
     )
-
-    with pytest.raises(CBPerformanceValidationError, match="exact live-server launch argv"):
+    with pytest.raises(CBPerformanceValidationError, match="--max-concurrency"):
         validate_cb_performance(fixture["shipcard"], fixture["manifest"], fill=False)
+
+
+def test_execution_backend_must_be_concrete_gridbook_kernel_id(
+    tmp_path, monkeypatch,
+):
+    fixture = _comparison(tmp_path)
+    _bypass_external_native_certificate(monkeypatch)
+    report, report_path, _, _ = _report_and_serve_manifest(fixture, tmp_path)
+    execution = report["metadata"]["execution_identity"]
+    execution["kernel_backend"] = "gridbook"
+    execution["manifest"]["assignments"][0]["kernel_backend"] = "gridbook"
+    _rewrite_report_and_comparison(
+        fixture,
+        cell_index=0,
+        arm="candidate",
+        report_path=report_path,
+        report=report,
+    )
+    with pytest.raises(CBPerformanceValidationError, match="non-Gridbook"):
+        validate_cb_performance(fixture["shipcard"], fixture["manifest"], fill=False)
+
+
+def _artifact_route_config(fmt: str, *, wire: str | None = None) -> dict:
+    unit = "model.layers.0.self_attn.q_proj"
+    if fmt.startswith(("NVFP4_CB_", "FP8_CB_")):
+        grid = "fp4" if fmt.startswith("NVFP4_CB_") else "fp8"
+        group = {
+            "targets": ["re:^model[.]layers[.]0[.]self_attn[.]q_proj$"],
+            "format": fmt,
+            "scheme": {"grid": grid, "mode": "product", "k": int(fmt.rsplit("K", 1)[1])},
+        }
+    else:
+        group = {
+            "targets": ["re:^model[.]layers[.]0[.]self_attn[.]q_proj$"],
+            "format": "source-passthrough",
+            "source_format": fmt,
+        }
+    return {
+        "config_groups": {"group_0": group},
+        "provenance": {"tensor_formats": {unit: fmt}},
+        **(
+            {"source_passthrough": {"version": 1, "units": {unit: wire}}}
+            if wire is not None
+            else {}
+        ),
+    }
+
+
+def _one_certified_route() -> tuple[dict, ...]:
+    unit = "model.layers.0.self_attn.q_proj"
+    return ({"kind": "serving", "name": unit, "members": [unit]},)
+
+
+@pytest.mark.parametrize(
+    "fmt,wire,backend",
+    (
+        ("MXFP4_SOURCE", "mxfp4_e2m1_ue8m0_g32", "vllm-marlin"),
+        (
+            "FP8_BLOCK_UE8M0_SOURCE",
+            "fp8_e4m3_ue8m0_block128",
+            "gridbook",
+        ),
+        (
+            "MXFP8_UE8M0_G32",
+            "mxfp8_e4m3_e8m0_g32",
+            "gridbook",
+        ),
+    ),
+)
+def test_artifact_derived_native_routes_require_the_sanctioned_backend(
+    fmt, wire, backend,
+):
+    expected = performance_validator._derive_expected_execution_assignments(
+        _artifact_route_config(fmt, wire=wire),
+        _one_certified_route(),
+        label="test artifact",
+    )
+    assert expected[0]["backend_policy"] == backend
+    assignment = {
+        key: value
+        for key, value in expected[0].items()
+        if key != "backend_policy"
+    }
+    concrete_backend = (
+        "gridbook-mxfp8-dense-sm120-v1" if backend == "gridbook" else backend
+    )
+    assignment.update(
+        kernel_backend=concrete_backend, fallback_state="none-observed"
+    )
+    report = {
+        "metadata": {
+            "execution_identity": {
+                "format_rung": assignment["format_rung"],
+                "serialization": {
+                    "layout": assignment["serialized_layout"],
+                    "scale_coding": assignment["scale_coding"],
+                },
+                "quant_contract": assignment["quant_contract"],
+                "kernel_backend": concrete_backend,
+                "fallback_state": "none-observed",
+                "manifest": {"assignments": [assignment]},
+            }
+        }
+    }
+    performance_validator._validate_execution_routes(
+        report, expected, label="test report"
+    )
+    assignment["kernel_backend"] = (
+        "vllm-cutlass"
+        if backend == "gridbook"
+        else "gridbook-cuda-cb-gemv-v2"
+    )
+    report["metadata"]["execution_identity"]["kernel_backend"] = assignment[
+        "kernel_backend"
+    ]
+    with pytest.raises(
+        CBPerformanceValidationError, match="expected route|non-Gridbook"
+    ):
+        performance_validator._validate_execution_routes(
+            report, expected, label="test report"
+        )
+
+
+def test_artifact_route_map_is_required_and_format_claims_are_exact():
+    config = _artifact_route_config("FP8_CB_K36")
+    del config["provenance"]["tensor_formats"]
+    with pytest.raises(CBPerformanceValidationError, match="tensor_formats"):
+        performance_validator._derive_expected_execution_assignments(
+            config, _one_certified_route(), label="test artifact"
+        )
+
+    config = _artifact_route_config("FP8_CB_K36")
+    config["provenance"]["tensor_formats"][
+        "model.layers.0.self_attn.q_proj"
+    ] = "NVFP4_CB_K16"
+    with pytest.raises(CBPerformanceValidationError, match="matching CB config group"):
+        performance_validator._derive_expected_execution_assignments(
+            config, _one_certified_route(), label="test artifact"
+        )
+
+
+def test_mixed_execution_summary_is_allowed_only_for_concrete_route_differences():
+    cb_unit = "model.layers.0.self_attn.q_proj"
+    native_unit = "model.layers.0.self_attn.k_proj"
+    config = _artifact_route_config("FP8_CB_K36")
+    config["config_groups"]["group_1"] = {
+        "targets": ["re:^model[.]layers[.]0[.]self_attn[.]k_proj$"],
+        "format": "source-passthrough",
+        "source_format": "MXFP4_SOURCE",
+    }
+    config["provenance"]["tensor_formats"][native_unit] = "MXFP4_SOURCE"
+    config["source_passthrough"] = {
+        "version": 1,
+        "units": {native_unit: "mxfp4_e2m1_ue8m0_g32"},
+    }
+    certified = (
+        {"kind": "serving", "name": cb_unit, "members": [cb_unit]},
+        {"kind": "serving", "name": native_unit, "members": [native_unit]},
+    )
+    expected = performance_validator._derive_expected_execution_assignments(
+        config, certified, label="test artifact"
+    )
+    assignments = []
+    for row in expected:
+        backend = (
+            "gridbook-cuda-cb-gemv-v2"
+            if row["backend_policy"] == "gridbook"
+            else row["backend_policy"]
+        )
+        assignments.append({
+            **{key: value for key, value in row.items() if key != "backend_policy"},
+            "kernel_backend": backend,
+            "fallback_state": "none",
+        })
+    report = {
+        "metadata": {
+            "execution_identity": {
+                "format_rung": "mixed",
+                "serialization": {"layout": "mixed", "scale_coding": "mixed"},
+                "quant_contract": "mixed",
+                "kernel_backend": "mixed",
+                "fallback_state": "none",
+                "manifest": {"assignments": assignments},
+            }
+        }
+    }
+    performance_validator._validate_execution_routes(
+        report, expected, label="mixed report"
+    )
+    report["metadata"]["execution_identity"]["format_rung"] = "FP8_CB_K36"
+    with pytest.raises(CBPerformanceValidationError, match="execution summary"):
+        performance_validator._validate_execution_routes(
+            report, expected, label="mixed report"
+        )
+
+
+def test_per_expert_route_partition_must_equal_final_tensor_formats():
+    members = [
+        f"model.layers.0.mlp.experts.{expert}.{projection}"
+        for expert in range(2)
+        for projection in ("down_proj", "gate_proj", "up_proj")
+    ]
+    formats = {member: "FP8_CB_K36" for member in members}
+    formats["model.layers.0.mlp.experts.1.down_proj"] = "MXFP4_SOURCE"
+    config = {
+        "config_groups": {
+            "group_0": {
+                "targets": ["model.layers.0.mlp.experts.gate_up_proj"],
+                "format": "FP8_CB_K36",
+                "scheme": {"grid": "fp8", "mode": "product", "k": 36},
+            }
+        },
+        "provenance": {"tensor_formats": formats},
+        "per_expert_format_groups": {
+            "version": 1,
+            "layers": {
+                "0": {
+                    "w13": [
+                        {
+                            "format_wire_id": "FP8_CB_K36",
+                            "expert_ids": [0, 1],
+                            "tensor_prefix": "layers.0.ffn.experts.gate_up.fp8",
+                        }
+                    ],
+                    "w2": [
+                        {
+                            "format_wire_id": "FP8_CB_K36",
+                            "expert_ids": [0],
+                            "tensor_prefix": "layers.0.ffn.experts.down.fp8",
+                        },
+                        {
+                            "format_wire_id": "mxfp4_e2m1_ue8m0_g32",
+                            "expert_ids": [1],
+                            "tensor_prefix": "layers.0.ffn.experts",
+                        },
+                    ],
+                }
+            },
+        },
+    }
+    certified = ({
+        "kind": "serving",
+        "name": "group:model.layers.0.mlp.experts.0.down_proj",
+        "members": sorted(members),
+    },)
+    expected = performance_validator._derive_expected_execution_assignments(
+        config, certified, label="mixed expert artifact"
+    )
+    assert {row["backend_policy"] for row in expected} == {
+        "gridbook", "vllm-marlin"
+    }
+
+    # One source expert may legitimately retain MXFP4 in both independently
+    # routed families.  Both declarations share the physical tensor prefix,
+    # so the execution census must use Gridbook's family/format lane identity
+    # rather than rejecting the artifact as duplicate-unit evidence.
+    source_both = json.loads(json.dumps(config))
+    source_both["provenance"]["tensor_formats"][
+        "model.layers.0.mlp.experts.1.gate_proj"
+    ] = "MXFP4_SOURCE"
+    source_both["provenance"]["tensor_formats"][
+        "model.layers.0.mlp.experts.1.up_proj"
+    ] = "MXFP4_SOURCE"
+    source_both["per_expert_format_groups"]["layers"]["0"]["w13"] = [
+        {
+            "format_wire_id": "FP8_CB_K36",
+            "expert_ids": [0],
+            "tensor_prefix": "layers.0.ffn.experts.gate_up.fp8",
+        },
+        {
+            "format_wire_id": "mxfp4_e2m1_ue8m0_g32",
+            "expert_ids": [1],
+            "tensor_prefix": "layers.0.ffn.experts",
+        },
+    ]
+    expected_source_both = (
+        performance_validator._derive_expected_execution_assignments(
+            source_both, certified, label="mixed expert artifact"
+        )
+    )
+    source_units = {
+        row["unit"]
+        for row in expected_source_both
+        if row["format_rung"] == "MXFP4_SOURCE"
+    }
+    assert source_units == {
+        "layers.0.ffn.experts/w13/mxfp4_e2m1_ue8m0_g32",
+        "layers.0.ffn.experts/w2/mxfp4_e2m1_ue8m0_g32",
+    }
+    assert len(expected_source_both) == len(
+        {row["unit"] for row in expected_source_both}
+    )
+
+    config["provenance"]["tensor_formats"][
+        "model.layers.0.mlp.experts.1.up_proj"
+    ] = "MXFP4_SOURCE"
+    with pytest.raises(CBPerformanceValidationError, match="per-expert declaration"):
+        performance_validator._derive_expected_execution_assignments(
+            config, certified, label="mixed expert artifact"
+        )
+    config["provenance"]["tensor_formats"][
+        "model.layers.0.mlp.experts.1.up_proj"
+    ] = "FP8_CB_K36"
+    config["provenance"]["tensor_formats"][
+        "model.layers.0.mlp.experts.1.down_proj"
+    ] = "FP8_CB_K36"
+    with pytest.raises(CBPerformanceValidationError, match="per-expert declaration"):
+        performance_validator._derive_expected_execution_assignments(
+            config, certified, label="mixed expert artifact"
+        )
 
 
 def test_quant_config_file_digest_cannot_impersonate_inventory_identity(

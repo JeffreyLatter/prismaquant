@@ -11,16 +11,22 @@ the gridbook `.so` was resident during the dump.
     python3 tools/kl_ab.py A.json B.json --metric ppl
     python3 tools/kl_ab.py A.json B.json --allow-cross-fingerprint
 
-Behaviour by provenance:
+Current result JSONs carry two deliberately different identities:
 
-* **same `serve_fingerprint`** — report the delta. This is the only state in
-  which a delta is evidence.
-* **different fingerprints** — exit 3 without a delta, and name the manifest keys
-  that differ. `--allow-cross-fingerprint` downgrades the report to a **range**:
-  it prints the +-20% band, says whether the measured delta clears it, and never
-  calls a within-band difference a win.
-* **missing fingerprints** (legacy JSONs) — compare as before with a printed
-  warning; the numbers predate the mechanism and cannot be checked.
+* ``performance_stack_fingerprint`` is the comparable stack projection.  It
+  intentionally omits arm artifact and live-session identity, and it must match
+  before a delta is evidence.
+* ``serve_fingerprint`` binds each individual result to its artifact and live
+  session.  It is recomputed and validated for each arm, but it is *not* the
+  cross-arm equality key and normally differs in a legitimate A/B.
+
+Different performance-stack fingerprints exit 3 without a delta and name the
+stack keys that differ. ``--allow-cross-fingerprint`` downgrades the report to
+a **range**: it prints the +-20% band, says whether the measured difference
+clears it, and never calls a within-band difference a win. A current-looking
+record with a missing or stale manifest fingerprint also exits 3. Two genuinely
+legacy bare metric JSONs (no manifest or fingerprints) compare as before with a
+warning because there is no attestation to replay.
 """
 from __future__ import annotations
 
@@ -34,9 +40,17 @@ from typing import Any, Mapping
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 try:  # package mode (`python -m tools.kl_ab`)
-    from .serve_fingerprint import manifest_differences
+    from .serve_fingerprint import (
+        fingerprint,
+        performance_stack_fingerprint,
+        performance_stack_payload,
+    )
 except ImportError:  # script mode (`python tools/kl_ab.py`)
-    from serve_fingerprint import manifest_differences  # type: ignore
+    from serve_fingerprint import (  # type: ignore
+        fingerprint,
+        performance_stack_fingerprint,
+        performance_stack_payload,
+    )
 
 #: §7.4: below this relative delta, a cross-stack comparison is not evidence.
 CROSS_STACK_BAND = 0.20
@@ -80,19 +94,86 @@ def _finite(value: Any) -> bool:
         return False
 
 
-def _fingerprint(payload: Mapping[str, Any]) -> str | None:
-    fp = payload.get("serve_fingerprint")
-    if fp:
-        return str(fp)
-    manifest = payload.get("serve_manifest")
-    if isinstance(manifest, dict) and manifest.get("serve_fingerprint"):
-        return str(manifest["serve_fingerprint"])
-    return None
-
-
 def _manifest(payload: Mapping[str, Any]) -> Mapping[str, Any] | None:
     manifest = payload.get("serve_manifest")
     return manifest if isinstance(manifest, dict) else None
+
+
+def _sha256(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(char in "0123456789abcdef" for char in value)
+    )
+
+
+def _validated_attestation(
+    payload: Mapping[str, Any],
+    *,
+    label: str,
+) -> tuple[str | None, str | None, Mapping[str, Any] | None, str | None]:
+    """Return ``(performance, serve, manifest, problem)`` for one arm.
+
+    Fingerprint strings are evidence only after replaying their canonical
+    projections from the embedded manifest.  A bare metric JSON with no trace
+    of either attestation remains the explicitly supported legacy case.
+    """
+    manifest = _manifest(payload)
+    root_performance = payload.get("performance_stack_fingerprint")
+    root_serve = payload.get("serve_fingerprint")
+    if manifest is None:
+        if root_performance is None and root_serve is None:
+            return None, None, None, None
+        return None, None, None, (
+            f"{label} carries a fingerprint without an embedded serve_manifest; "
+            "it cannot be validated"
+        )
+
+    recorded_performance = manifest.get("performance_stack_fingerprint")
+    recorded_serve = manifest.get("serve_fingerprint")
+    if not _sha256(recorded_performance):
+        return None, None, manifest, (
+            f"{label} serve_manifest has no valid performance_stack_fingerprint"
+        )
+    if not _sha256(recorded_serve):
+        return None, None, manifest, (
+            f"{label} serve_manifest has no valid serve_fingerprint"
+        )
+
+    try:
+        expected_performance = performance_stack_fingerprint(manifest)
+        expected_serve = fingerprint(manifest)
+    except Exception as exc:
+        return None, None, manifest, (
+            f"{label} serve_manifest cannot be canonicalized: {exc}"
+        )
+    if recorded_performance != expected_performance:
+        return None, None, manifest, (
+            f"{label} performance_stack_fingerprint is stale"
+        )
+    if recorded_serve != expected_serve:
+        return None, None, manifest, f"{label} serve_fingerprint is stale"
+    if root_performance is not None and root_performance != recorded_performance:
+        return None, None, manifest, (
+            f"{label} top-level performance_stack_fingerprint differs from "
+            "its serve_manifest"
+        )
+    if root_serve is not None and root_serve != recorded_serve:
+        return None, None, manifest, (
+            f"{label} top-level serve_fingerprint differs from its serve_manifest"
+        )
+    return recorded_performance, recorded_serve, manifest, None
+
+
+def _performance_stack_differences(
+    left: Mapping[str, Any] | None,
+    right: Mapping[str, Any] | None,
+) -> list[str]:
+    if left is None or right is None:
+        return []
+    a = performance_stack_payload(left)
+    b = performance_stack_payload(right)
+    return sorted(key for key in set(a) | set(b) if a.get(key) != b.get(key))
 
 
 def compare(
@@ -109,7 +190,6 @@ def compare(
     delta = vb - va
     rel = (delta / va) if va else float("nan")
 
-    fa, fb = _fingerprint(a), _fingerprint(b)
     lines = [
         f"metric: {metric}",
         f"  {label_a}: {va:.6g}   ({a.get('model')})",
@@ -122,15 +202,39 @@ def compare(
                 f"  !! {label} reports spec_decode_detected=true — that number "
                 "is the DRAFT model's, not the artifact's (§7.5)")
 
-    if fa and fb and fa != fb:
-        differing = manifest_differences(_manifest(a), _manifest(b))
+    pa, sa, ma, problem_a = _validated_attestation(a, label=label_a)
+    pb, sb, mb, problem_b = _validated_attestation(b, label=label_b)
+    problems = [problem for problem in (problem_a, problem_b) if problem]
+    if problems:
         lines.append("")
-        lines.append(f"serve_fingerprint {label_a}: {fa[:16]}")
-        lines.append(f"serve_fingerprint {label_b}: {fb[:16]}")
+        lines.extend(f"INVALID ATTESTATION: {problem}" for problem in problems)
         lines.append(
-            "  differing manifest keys: "
+            "REFUSED: re-create the affected result with the current gold-lane "
+            "tool; no A/B delta can be derived from stale or unverifiable "
+            "fingerprints.")
+        return 3, lines
+
+    legacy_a = ma is None
+    legacy_b = mb is None
+    if legacy_a != legacy_b:
+        lines.append("")
+        lines.append(
+            "REFUSED: one arm is an unattested legacy metric and the other is "
+            "a current attested result. Re-measure both arms under one current "
+            "performance stack.")
+        return 3, lines
+
+    if pa and pb and pa != pb:
+        differing = _performance_stack_differences(ma, mb)
+        lines.append("")
+        lines.append(f"performance_stack_fingerprint {label_a}: {pa[:16]}")
+        lines.append(f"performance_stack_fingerprint {label_b}: {pb[:16]}")
+        lines.append(
+            "  differing performance-stack keys: "
             + (", ".join(differing) if differing
                else "(manifests not embedded in the result JSONs)"))
+        lines.append(f"  serve_fingerprint {label_a}: {sa[:16]} (validated)")
+        lines.append(f"  serve_fingerprint {label_b}: {sb[:16]} (validated)")
         if not allow_cross_fingerprint:
             lines.append("")
             lines.append(
@@ -162,19 +266,24 @@ def compare(
                 "differing keys above, not as a measured delta.")
         return 0, lines
 
-    if not fa or not fb:
-        missing = [
-            label for label, fp in ((label_a, fa), (label_b, fb)) if not fp
-        ]
+    if legacy_a and legacy_b:
         lines.append("")
         lines.append(
-            f"WARNING: no serve_fingerprint on {', '.join(missing)} (legacy "
-            "JSON). Comparing anyway, but nothing verified that these ran on "
-            "the same serving stack — the ±17% residency drift is invisible "
-            "here. Re-measure with a current tool to get a checked delta.")
+            "WARNING: neither JSON has a serve manifest or fingerprints "
+            "(legacy JSONs). Comparing anyway, but nothing verified that "
+            "these ran on the same serving stack — the ±17% residency drift "
+            "is invisible here. Re-measure with a current tool to get a "
+            "checked delta.")
     else:
         lines.append("")
-        lines.append(f"serve_fingerprint: {fa[:16]} (matched)")
+        lines.append(
+            f"performance_stack_fingerprint: {pa[:16]} (matched, validated)")
+        lines.append(
+            f"  serve_fingerprint {label_a}: {sa[:16]} "
+            "(validated per-run attestation)")
+        lines.append(
+            f"  serve_fingerprint {label_b}: {sb[:16]} "
+            "(validated per-run attestation)")
 
     ca = (a.get("git_commit") or "")[:12]
     cb = (b.get("git_commit") or "")[:12]

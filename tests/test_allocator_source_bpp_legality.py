@@ -120,28 +120,19 @@ def test_dsv4_mxfp4_packed_expert_boundary_and_audit_are_byte_exact():
     assert audit["eliminated_candidates"][0]["candidate_bpp"] == 4.265625
 
 
-@pytest.mark.parametrize(
-    ("source_kind", "source_format"),
-    [
-        ("fp8", "FP8_SOURCE"),
-        ("fp8_ue8m0", "FP8_BLOCK_UE8M0_SOURCE"),
-    ],
-)
-def test_dense_fp8_source_allows_k48_and_its_equal_source_format(
-    source_kind: str,
-    source_format: str,
-):
-    qname = f"model.layers.0.self_attn.o_proj.{source_kind}"
+def test_dense_fp8_source_allows_k48_and_its_measured_equal_source_format():
+    source_kind = "fp8"
+    source_format = "FP8_SOURCE"
+    qname = "model.layers.0.self_attn.o_proj.fp8"
     shape = (8192, 4096)
-    costs = {"FP8_CB_K48": _measured_cost()}
-    # FP8_SOURCE has measured rows; the UE8M0 passthrough is synthesized by
-    # construction when its cost row is absent.
-    if source_format == "FP8_SOURCE":
-        costs[source_format] = {
+    costs = {
+        "FP8_CB_K48": _measured_cost(),
+        source_format: {
             "weight_mse": 0.0,
             "output_mse": 0.0,
             "output_mse_measured": True,
-        }
+        },
+    }
     records: list[dict] = []
 
     candidates = build_candidates(
@@ -165,6 +156,34 @@ def test_dense_fp8_source_allows_k48_and_its_equal_source_format(
     assert by_format["FP8_CB_K48"].memory_bytes < (
         by_format[source_format].memory_bytes
     )
+
+
+def test_dense_ue8m0_source_excludes_unmeasured_activation_changing_terminal():
+    """Weight-exact W8A8 source bytes are not a free dW-only candidate."""
+    qname = "model.layers.0.self_attn.o_proj.fp8_ue8m0"
+    shape = (8192, 4096)
+    source_format = "FP8_BLOCK_UE8M0_SOURCE"
+    records: list[dict] = []
+
+    candidates = build_candidates(
+        {qname: _stats(shape)},
+        {qname: {"FP8_CB_K48": _measured_cost()}},
+        [fr.get_format("FP8_CB_K48"), fr.get_format(source_format)],
+        source_manifest={qname: "fp8_ue8m0"},
+        mask_records=records,
+        cb_serialization_context=_LATTICE_CONTEXT,
+    )
+
+    resolved_source = source_format_for_kind("fp8_ue8m0")
+    assert resolved_source is not None
+    assert resolved_source.name == source_format
+    assert resolved_source.act_quant_changes_input
+    assert [candidate.fmt for candidate in candidates[qname]] == [
+        "FP8_CB_K48"
+    ]
+    # It is absent because no activation-inclusive cost row exists, not
+    # because its exact source payload exceeds itself.
+    assert records == []
 
 
 def test_unknown_source_kind_fails_closed_before_candidate_construction():

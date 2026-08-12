@@ -25,6 +25,7 @@ import pickle
 import re
 
 from prismaquant import format_registry as fr
+from prismaquant.allocator_candidates import SOURCE_PASSTHROUGH_CONTRACTS
 from prismaquant.anchored_cost import (
     AURA_CURRENCY,
     AnchorScalar,
@@ -407,6 +408,23 @@ def build_cb_units(
                 coordinate=float(rung),
             ))
         terminal_payload = payloads[terminal]
+        try:
+            terminal_contract = SOURCE_PASSTHROUGH_CONTRACTS[terminal]
+        except KeyError as exc:
+            raise AnchoredCostError(
+                f"{declaration.qname}: terminal {terminal!r} has no exact "
+                "source-passthrough contract"
+            ) from exc
+        terminal_spec = fr.get_format(terminal)
+        # ``zero_cost_by_construction`` controls whether the generic cost
+        # loader synthesizes a missing column; it is not the terminal's
+        # end-to-end eligibility bit.  BF16 and FP8_SOURCE deliberately carry
+        # measured columns in ordinary campaigns, yet an exact-source terminal
+        # remains honest when its activation path is the identity.  The A-side
+        # contract is the decisive gate here: it preserves those terminals and
+        # excludes Gridbook's W8A8 block-FP8 terminal until activation-side
+        # AURA exists.
+        terminal_selectable = not terminal_spec.act_quant_changes_input
         candidates.append(CandidateSpec(
             format_name=terminal,
             bits=8.0 * terminal_payload / int(declaration.n_params),
@@ -416,6 +434,7 @@ def build_cb_units(
             shape_features=(),
             coordinate=0.0,
             terminal=True,
+            allocator_selectable=terminal_selectable,
         ))
         units.append(UnitSpec(
             qname=declaration.qname,
@@ -1443,11 +1462,31 @@ def run_streamed_cb_anchor_aura(
     """Wire the exact bounded plan into the existing one-pass AURA runner."""
     from prismaquant.aura_cost import run_streamed_production_anchor_aura
 
+    unmeasured_terminals: dict[str, tuple[str, ...]] = {}
+    for raw_qname, raw_formats in formats_by_qname.items():
+        qname = str(raw_qname)
+        rendered = {
+            fr.canonical_format_name(fmt)
+            for fmt in purposes_by_qname.get(qname, {})
+        }
+        retained = tuple(
+            fr.canonical_format_name(fmt)
+            for fmt in raw_formats
+            if fr.canonical_format_name(fmt) not in rendered
+        )
+        if len(retained) != 1:
+            raise AnchoredCostError(
+                f"{qname}: streamed CB plan must retain exactly one "
+                f"unmeasured terminal, found {list(retained)}"
+            )
+        unmeasured_terminals[qname] = retained
+
     payload = run_streamed_production_anchor_aura(
         runner,
         calibration_ids,
         formats_by_qname=formats_by_qname,
         render_purposes_by_qname=purposes_by_qname,
+        unmeasured_formats_by_qname=unmeasured_terminals,
         activation_index=activation_index,
         render_levers=render_levers,
         col_weights=col_weights,

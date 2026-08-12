@@ -961,22 +961,31 @@ register_format(FormatSpec(
 #     tensor the checkpoint's own loader does not expect — the opposite of a
 #     passthrough.
 #
-# Serving: this is how the released checkpoint already serves, so the route is
-# native and BACKED today (allocator_candidates.SOURCE_PASSTHROUGH_CONTRACTS).
+# Serving: Gridbook 0.8.4 owns this route through
+# ``Mxfp8DenseLinearMethod``.  It embeds the block-128 scale plane exactly into
+# per-32 MXFP8 weight scales, then dynamically quantizes the activation to the
+# same per-32 MXFP8 grid.  Consequently the SOURCE bytes remain weight-exact,
+# but the layer is W8A8 and its output is not an identity transform.  This is
+# the same activation contract as ``MXFP8_UE8M0_G32`` above; declaring A16 here
+# would let a weight-only cost path turn an unmeasured A-side perturbation into
+# an unbeatable zero-cost allocator candidate.
 register_format(FormatSpec(
     name="FP8_BLOCK_UE8M0_SOURCE",
     weight_bits=8, group_size=128, scale_bits=8,
     scale_dtype_name="uint8_e8m0",
     weight_element_dtype="fp8_e4m3",
     scale_block_shape=(128, 128),
-    act_bits=None,
+    act_bits=8, act_dtype_name="fp8_e4m3", act_group_size=32,
     family="fp", min_capability_sm=89,
     autoround_config=lambda: dict(bits=8, group_size=128,
                                    data_type="fp8_e4m3", sym=True,
                                    scale_fmt="ue8m0",
-                                   act_bits=16, act_data_type="float"),
+                                   act_bits=8, act_group_size=32,
+                                   act_sym=True, act_data_type="mx_fp",
+                                   act_element_dtype="fp8_e4m3",
+                                   act_scale_fmt="ue8m0", act_dynamic=True),
     quantize_dequantize=lambda w: w.clone(),
-    activation_quantize_dequantize=lambda x: x.clone(),
+    activation_quantize_dequantize=_mxfp8_ue8m0_activation_rtn,
 ))
 
 # Source-MXFP4 passthrough — the OCP-MX sibling of FP8_SOURCE, for models whose
