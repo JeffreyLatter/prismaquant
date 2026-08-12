@@ -1,0 +1,759 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import subprocess
+from pathlib import Path
+
+import pytest
+
+import prismaquant.validate_cb_endpoint as cbv
+from prismaquant.lane_spec import load_lane_spec
+from prismaquant.shipcard import (
+    _verify_gridbook_native_record,
+    build_shipcard,
+    build_weight_content_manifest,
+    load_shipcard,
+    write_shipcard,
+)
+from tools.serve_fingerprint import (
+    MANIFEST_SCHEMA,
+    collect_manifest,
+    elide_argv_paths,
+    fingerprint,
+)
+
+
+ROOT = Path(__file__).resolve().parents[1]
+DRIVER = ROOT / "scripts" / "serve_dsv4_cb_validate.sh"
+_RESOLVED_GRAPH_CONFIG = (
+    "Initializing a V1 LLM engine (test) with config: model='/model', "
+    "compilation_config={'mode': <CompilationMode.NONE: 0>, "
+    "'cudagraph_mode': <CUDAGraphMode.FULL_DECODE_ONLY: (2, 0)>, "
+    "'cudagraph_capture_sizes': [1], 'max_cudagraph_capture_size': 1}\n"
+)
+
+
+def _write_bound_manifest(path: Path, arm: str, artifact: Path) -> dict:
+    manifest = _manifest(arm)
+    manifest["artifact_binding"] = {
+        "schema": "prismaquant.served_artifact_binding/1",
+        "model_sha": load_shipcard(artifact / "shipcard.json")["model_sha"],
+        "artifact_inventory_sha256": "9" * 64,
+        "artifact_bytes": sum(
+            item.stat().st_size for item in artifact.iterdir() if item.is_file()
+        ),
+    }
+    manifest["serve_fingerprint"] = fingerprint(manifest)
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+    return manifest
+
+
+def _manifest(
+    arm: str,
+    *,
+    requires_marlin: bool = False,
+    model_sha: str = "c" * 64,
+) -> dict:
+    pin = cbv._gridbook_runtime_pin()
+    argv = [
+        "/usr/local/bin/vllm", "serve", "/model",
+        "--served-model-name", "dsv4",
+        "--host", "0.0.0.0",
+        "--port", "8000",
+        "--trust-remote-code",
+        "--tokenizer-mode", "deepseek_v4",
+        "--generation-config", "vllm",
+        "--quantization", "gridbook",
+        "--tensor-parallel-size", "1",
+        "--kv-cache-dtype", "fp8",
+        "--kv-cache-memory-bytes", "1073741824",
+        "--max-model-len", "8192",
+        "--max-num-seqs", "1",
+        "--max-num-batched-tokens", "512",
+        "--no-enable-prefix-caching",
+        "--gpu-memory-utilization", "0.90",
+    ]
+    if arm == "eager":
+        argv.append("--enforce-eager")
+    else:
+        argv.extend([
+            "--compilation-config", cbv.DSV4_GRAPH_COMPILATION_CONFIG,
+        ])
+    if requires_marlin:
+        argv.extend(["--moe-backend", "marlin"])
+    payload = {
+        "schema": MANIFEST_SCHEMA,
+        "source": "server",
+        "image": cbv.DSV4_SPARK_VLLM_IMAGE,
+        "model": "/model",
+        "served_model_name": "dsv4",
+        "launch_argv": argv,
+        "launch_flags": elide_argv_paths(argv),
+        "enforce_eager": arm == "eager",
+        "quantization": "gridbook",
+        "kv_cache_dtype": "fp8",
+        "speculative_config": None,
+        "package_versions": {
+            "gridbook": pin["version"],
+            "vllm": cbv.DSV4_SPARK_VLLM_VERSION,
+        },
+        "gridbook_runtime_pin": {
+            "commit": pin["commit"],
+            "version": pin["version"],
+        },
+        "resident_extensions": ["prismaquant_cb_ext.so"],
+        "residency_readable": True,
+        "gpu_name": cbv.DSV4_SPARK_GPU_NAME,
+        "gpu_count": 1,
+        "pq_env": {
+            "PRISMAQUANT_CB_DECODE": "cuda",
+            "PRISMAQUANT_PRELOAD_FUSED": "1",
+            "GRIDBOOK_MXFP8_DENSE": "1",
+            "VLLM_USE_DEEP_GEMM": "0",
+        },
+        "artifact_binding": {
+            "schema": "prismaquant.served_artifact_binding/1",
+            "model_sha": model_sha,
+            "artifact_inventory_sha256": "9" * 64,
+            "artifact_bytes": 1234,
+        },
+    }
+    payload["serve_fingerprint"] = fingerprint(payload)
+    return payload
+
+
+def _artifact_decode_record(*, requires_marlin: bool = False) -> dict:
+    overlay = {
+        "schema": "prismaquant.dspark_source_overlay.v1",
+        "physical_namespace": "mtp.{stage}",
+        "construction_namespace": "model.layers.{num_hidden_layers+stage}",
+        "num_hidden_layers": 43,
+        "n_mtp_layers": 3,
+        "physical_stage_ids": [0, 1, 2],
+        "construction_layer_ids": [43, 44, 45],
+        "physical_target_counts": {
+            "FP8_BLOCK_UE8M0_SOURCE": 25,
+            "MXFP4_SOURCE": 2304,
+        },
+        "construction_unit_count": 22,
+        "tensor_bytes_rewritten": 0,
+    }
+    evidence = {
+        "schema": cbv.ARTIFACT_DECODE_CONTRACT_SCHEMA,
+        "complete": True,
+        "completeness_sha256": "a" * 64,
+        "declared_unit_count": 1,
+        "cb_unit_count": 1,
+        "passthrough_unit_count": 1,
+        "verbatim_namespace_unit_count": 1,
+        "classified_unit_count": 3,
+        "route_pending_acknowledged": ["FP8_BLOCK_UE8M0_SOURCE"],
+        "excluded_namespaces": [],
+        "dspark_overlay": overlay,
+        "dspark_overlay_sha256": "b" * 64,
+        "requires_moe_backend_marlin": requires_marlin,
+    }
+    evidence["evidence_sha256"] = cbv._canonical_json_sha256(evidence)
+    return evidence
+
+
+def _smoke_metrics() -> dict:
+    generated = b" Paris."
+    return {
+        "served_model": "dsv4",
+        "generated_chars": len(generated.decode("utf-8")),
+        "generated_utf8_bytes": len(generated),
+        "output_sha256": hashlib.sha256(generated).hexdigest(),
+        "prompt_sha256": hashlib.sha256(
+            cbv.DEFAULT_PROMPT.encode("utf-8")
+        ).hexdigest(),
+        "deterministic_repeats": 2,
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "seed": 0,
+        "n": 1,
+        "stream": False,
+        "max_tokens": cbv.DEFAULT_MAX_TOKENS,
+    }
+
+
+@pytest.mark.parametrize("arm", ["eager", "graph"])
+def test_manifest_validation_binds_each_arm_to_exact_stack(arm):
+    manifest = _manifest(arm)
+    assert cbv.validate_serve_manifest(
+        manifest,
+        arm=arm,
+        expected_served_model="dsv4",
+        requires_moe_marlin=False,
+        expected_model_sha="c" * 64,
+    ) == (
+        manifest["serve_fingerprint"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (lambda m: m.update(speculative_config="{}"), "speculative"),
+        (lambda m: m.update(quantization="compressed-tensors"), "gridbook"),
+        (lambda m: m.update(kv_cache_dtype="auto"), "fp8"),
+        (lambda m: m.update(residency_readable=False), "address space"),
+        (lambda m: m.update(image="eugr/spark-vllm:latest"), "exact DSv4 image"),
+        (lambda m: m.update(gpu_count=2), "one NVIDIA GB10"),
+        (lambda m: m.update(model="/different"), "exact /model"),
+        (lambda m: m.update(resident_extensions=[]), "Gridbook-native CUDA extension"),
+        (
+            lambda m: m["pq_env"].pop("GRIDBOOK_MXFP8_DENSE"),
+            "GRIDBOOK_MXFP8_DENSE",
+        ),
+    ],
+)
+def test_manifest_validation_fails_closed(mutation, message):
+    manifest = _manifest("eager")
+    mutation(manifest)
+    manifest["serve_fingerprint"] = fingerprint(manifest)
+    with pytest.raises(cbv.CBEndpointValidationError, match=message):
+        cbv.validate_serve_manifest(
+            manifest,
+            arm="eager",
+            expected_served_model="dsv4",
+            requires_moe_marlin=False,
+            expected_model_sha="c" * 64,
+        )
+
+
+def test_manifest_fingerprint_cannot_be_stale():
+    manifest = _manifest("graph")
+    manifest["package_versions"]["vllm"] = "different"
+    with pytest.raises(cbv.CBEndpointValidationError, match="fingerprint"):
+        cbv.validate_serve_manifest(
+            manifest,
+            arm="graph",
+            expected_served_model="dsv4",
+            requires_moe_marlin=False,
+        )
+
+
+def test_manifest_requires_explicit_tp1_in_launch_argv():
+    manifest = _manifest("graph")
+    index = manifest["launch_argv"].index("--tensor-parallel-size")
+    manifest["launch_argv"][index + 1] = "2"
+    manifest["serve_fingerprint"] = fingerprint(manifest)
+    with pytest.raises(cbv.CBEndpointValidationError, match="tensor-parallel-size"):
+        cbv.validate_serve_manifest(
+            manifest,
+            arm="graph",
+            expected_served_model="dsv4",
+            requires_moe_marlin=False,
+        )
+
+
+def test_manifest_requires_prefix_caching_off():
+    manifest = _manifest("eager")
+    manifest["launch_argv"].remove("--no-enable-prefix-caching")
+    manifest["serve_fingerprint"] = fingerprint(manifest)
+    with pytest.raises(cbv.CBEndpointValidationError, match="switch contract"):
+        cbv.validate_serve_manifest(
+            manifest,
+            arm="eager",
+            expected_served_model="dsv4",
+            requires_moe_marlin=False,
+        )
+
+
+def test_manifest_binds_memory_and_batch_launch_contract():
+    manifest = _manifest("graph")
+    index = manifest["launch_argv"].index("--max-num-batched-tokens")
+    manifest["launch_argv"][index + 1] = "1024"
+    manifest["serve_fingerprint"] = fingerprint(manifest)
+    with pytest.raises(cbv.CBEndpointValidationError, match="max-num-batched-tokens"):
+        cbv.validate_serve_manifest(
+            manifest,
+            arm="graph",
+            expected_served_model="dsv4",
+            requires_moe_marlin=False,
+        )
+
+
+def test_manifest_rejects_unknown_or_duplicate_launch_switches():
+    unknown = _manifest("eager")
+    unknown["launch_argv"].append("--disable-custom-all-reduce")
+    unknown["serve_fingerprint"] = fingerprint(unknown)
+    with pytest.raises(cbv.CBEndpointValidationError, match="undeclared option"):
+        cbv.validate_serve_manifest(
+            unknown,
+            arm="eager",
+            expected_served_model="dsv4",
+            requires_moe_marlin=False,
+        )
+
+    duplicate = _manifest("eager")
+    duplicate["launch_argv"].append("--trust-remote-code")
+    duplicate["serve_fingerprint"] = fingerprint(duplicate)
+    with pytest.raises(cbv.CBEndpointValidationError, match="duplicates"):
+        cbv.validate_serve_manifest(
+            duplicate,
+            arm="eager",
+            expected_served_model="dsv4",
+            requires_moe_marlin=False,
+        )
+
+
+def test_manifest_requires_canonical_launch_flags():
+    manifest = _manifest("eager")
+    manifest["launch_flags"] = list(manifest["launch_flags"]) + ["--invented"]
+    manifest["serve_fingerprint"] = fingerprint(manifest)
+    with pytest.raises(cbv.CBEndpointValidationError, match="launch_flags"):
+        cbv.validate_serve_manifest(
+            manifest,
+            arm="eager",
+            expected_served_model="dsv4",
+            requires_moe_marlin=False,
+        )
+
+
+def test_manifest_marlin_route_is_exactly_artifact_conditional():
+    present = _manifest("graph", requires_marlin=True)
+    cbv.validate_serve_manifest(
+        present,
+        arm="graph",
+        expected_served_model="dsv4",
+        requires_moe_marlin=True,
+    )
+    with pytest.raises(cbv.CBEndpointValidationError, match="moe-backend"):
+        cbv.validate_serve_manifest(
+            _manifest("graph"),
+            arm="graph",
+            expected_served_model="dsv4",
+            requires_moe_marlin=True,
+        )
+    with pytest.raises(cbv.CBEndpointValidationError, match="moe-backend"):
+        cbv.validate_serve_manifest(
+            present,
+            arm="graph",
+            expected_served_model="dsv4",
+            requires_moe_marlin=False,
+        )
+
+
+def test_manifest_requires_deep_gemm_disabled():
+    manifest = _manifest("eager")
+    manifest["pq_env"].pop("VLLM_USE_DEEP_GEMM")
+    manifest["serve_fingerprint"] = fingerprint(manifest)
+    with pytest.raises(cbv.CBEndpointValidationError, match="VLLM_USE_DEEP_GEMM"):
+        cbv.validate_serve_manifest(
+            manifest,
+            arm="eager",
+            expected_served_model="dsv4",
+            requires_moe_marlin=False,
+        )
+
+
+def test_serve_fingerprint_captures_deep_gemm_environment(monkeypatch):
+    monkeypatch.setenv("VLLM_USE_DEEP_GEMM", "0")
+    manifest = collect_manifest(
+        pids=[__import__("os").getpid()],
+        launch_argv=["vllm", "serve", "/model"],
+    )
+    assert manifest["pq_env"]["VLLM_USE_DEEP_GEMM"] == "0"
+
+
+def test_endpoint_smoke_is_greedy_repeated_and_nonempty():
+    requests = []
+
+    def request(method, url, payload, timeout):
+        requests.append((method, url, payload, timeout))
+        if method == "GET":
+            return {"data": [{"id": "dsv4"}]}
+        return {"choices": [{"text": " Paris."}]}
+
+    metrics = cbv.run_endpoint_smoke(
+        base_url="http://127.0.0.1:8000/v1",
+        model_name="dsv4",
+        requester=request,
+    )
+    assert [row[0] for row in requests] == ["GET", "POST", "POST"]
+    assert requests[1][2] == requests[2][2]
+    assert requests[1][2]["temperature"] == 0.0
+    assert requests[1][2]["seed"] == 0
+    assert metrics["deterministic_repeats"] == 2
+    assert metrics["generated_chars"] > 0
+    assert "perplexity" not in metrics and "throughput" not in metrics
+
+
+@pytest.mark.parametrize("memory", ["3.25", "-0.05"])
+def test_graph_capture_log_requires_positive_marker_not_positive_delta(
+    tmp_path, memory,
+):
+    log = tmp_path / "serve.log"
+    log.write_text(
+        _RESOLVED_GRAPH_CONFIG
+        + f"Graph capturing finished in 1 secs, took {memory} GiB\n",
+        encoding="utf-8",
+    )
+    result = cbv.validate_graph_capture_log(log)
+    assert result["capture_marker"].startswith("Graph capturing finished")
+    assert len(result["serve_log_sha256"]) == 64
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "server ready without a capture marker\n",
+        _RESOLVED_GRAPH_CONFIG
+        + "Skipping CUDA graph capture. To turn on CUDA graph capture...\n",
+        _RESOLVED_GRAPH_CONFIG.replace(
+            "FULL_DECODE_ONLY: (2, 0)", "PIECEWISE: 1"
+        )
+        + "Graph capturing finished in 1 secs, took 1.00 GiB\n",
+        _RESOLVED_GRAPH_CONFIG
+        + "Overriding cudagraph_mode to PIECEWISE.\n"
+        + "Graph capturing finished in 1 secs, took 1.00 GiB\n",
+    ],
+)
+def test_graph_capture_log_refuses_missing_or_skipped_capture(tmp_path, body):
+    log = tmp_path / "serve.log"
+    log.write_text(body, encoding="utf-8")
+    with pytest.raises(cbv.CBEndpointValidationError):
+        cbv.validate_graph_capture_log(log)
+
+
+@pytest.mark.parametrize("texts", [("", ""), (" Paris", " Lyon")])
+def test_endpoint_smoke_refuses_empty_or_nondeterministic_generation(texts):
+    responses = iter(texts)
+
+    def request(method, url, payload, timeout):
+        if method == "GET":
+            return {"data": [{"id": "dsv4"}]}
+        return {"choices": [{"text": next(responses)}]}
+
+    with pytest.raises(cbv.CBEndpointValidationError):
+        cbv.run_endpoint_smoke(
+            base_url="http://127.0.0.1:8000/v1",
+            model_name="dsv4",
+            requester=request,
+        )
+
+
+def _artifact_and_card(tmp_path: Path) -> tuple[Path, Path]:
+    artifact = tmp_path / "artifact"
+    artifact.mkdir()
+    (artifact / "config.json").write_text(
+        '{"model_type":"deepseek_v4"}\n', encoding="utf-8"
+    )
+    (artifact / "model.safetensors").write_bytes(b"weights")
+    (artifact / "codebooks.pqcb").write_bytes(b"codebooks")
+    quant_config = {
+        "quant_method": "gridbook",
+        "format": "nvfp4_cb",
+        "config_groups": {
+            "group_0": {"targets": ["model.layers.0"]},
+            "group_1": {
+                "format": "source-passthrough",
+                "source_format": "FP8_BLOCK_UE8M0_SOURCE",
+                "targets": ["model.main_proj"],
+            },
+        },
+        "codebook_file": "codebooks.pqcb",
+        "provenance": {
+            "route_pending_passthrough_acknowledged": [
+                "FP8_BLOCK_UE8M0_SOURCE"
+            ],
+        },
+    }
+    quant_config["provenance"]["weight_content_manifest"] = (
+        build_weight_content_manifest(artifact)
+    )
+    (artifact / "quant_config.json").write_text(
+        json.dumps(quant_config), encoding="utf-8"
+    )
+    shipcard = artifact / "shipcard.json"
+    write_shipcard(shipcard, build_shipcard(
+        artifact, build={"quant_method": "gridbook"}
+    ))
+    return artifact, shipcard
+
+
+def test_artifact_gate_requires_explicit_block_fp8_acknowledgement(tmp_path):
+    artifact, _shipcard = _artifact_and_card(tmp_path)
+    quant_path = artifact / "quant_config.json"
+    payload = json.loads(quant_path.read_text(encoding="utf-8"))
+    payload["provenance"].pop("route_pending_passthrough_acknowledged")
+    quant_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(cbv.CBEndpointValidationError, match="acknowledgement"):
+        cbv.validate_cb_artifact(artifact)
+
+
+def test_artifact_decode_contract_binds_completeness_and_dspark_overlay(
+    tmp_path, monkeypatch,
+):
+    from types import SimpleNamespace
+
+    import prismaquant.artifact_completeness as completeness_module
+    import prismaquant.dspark_source_metadata as dspark_module
+
+    report = completeness_module.CompletenessReport(
+        declared_units={"model.main_proj": "FP8_BLOCK_UE8M0_SOURCE"},
+        cb_units=["model.layers.0.mlp"],
+        passthrough_units=["model.main_proj"],
+        verbatim_namespace_units=["mtp.0.attn.wq_a"],
+        route_pending_acknowledged=["FP8_BLOCK_UE8M0_SOURCE"],
+    )
+    overlay_provenance = _artifact_decode_record()["dspark_overlay"]
+    overlay = SimpleNamespace(
+        provenance=lambda: overlay_provenance,
+        physical_targets={"mtp.0.main_proj": "FP8_BLOCK_UE8M0_SOURCE"},
+        construction_units={"model.main_proj": "FP8_BLOCK_UE8M0_SOURCE"},
+        physical_to_construction_unit={
+            "mtp.0.main_proj": "model.main_proj"
+        },
+    )
+    monkeypatch.setattr(
+        completeness_module,
+        "assert_artifact_complete",
+        lambda root: report,
+    )
+    monkeypatch.setattr(
+        dspark_module,
+        "discover_dspark_source_overlay_from_artifact",
+        lambda root: overlay,
+    )
+    quant_config = {
+        "provenance": {"dspark_source_overlay": overlay_provenance},
+        "route": {"wire_id": cbv.DSV4_MXFP4_WIRE_ID},
+    }
+
+    evidence = cbv.validate_cb_artifact_decode_contract(
+        tmp_path, quant_config
+    )
+    assert evidence["complete"] is True
+    assert evidence["classified_unit_count"] == 3
+    assert evidence["requires_moe_backend_marlin"] is True
+    cbv._validate_artifact_decode_record(evidence)
+
+    quant_config["provenance"]["dspark_source_overlay"] = {"schema": "wrong"}
+    with pytest.raises(cbv.CBEndpointValidationError, match="does not match"):
+        cbv.validate_cb_artifact_decode_contract(tmp_path, quant_config)
+
+
+def test_endpoint_contract_is_self_hashing_and_replayable():
+    model_sha = "c" * 64
+    manifest = _manifest("eager", model_sha=model_sha)
+    contract = cbv.build_endpoint_contract(
+        arm="eager",
+        model_sha=model_sha,
+        manifest=manifest,
+        manifest_sha256="d" * 64,
+        artifact_decode=_artifact_decode_record(),
+        endpoint_smoke=_smoke_metrics(),
+        cuda_graph=None,
+    )
+    cbv.validate_endpoint_contract_record(
+        contract,
+        arm="eager",
+        model_sha=model_sha,
+        serve_fingerprint=manifest["serve_fingerprint"],
+    )
+    contract["environment"]["VLLM_USE_DEEP_GEMM"] = "1"
+    with pytest.raises(cbv.CBEndpointValidationError, match="VLLM_USE_DEEP_GEMM"):
+        cbv.validate_endpoint_contract_record(
+            contract,
+            arm="eager",
+            model_sha=model_sha,
+            serve_fingerprint=manifest["serve_fingerprint"],
+        )
+
+
+def test_cli_fills_only_the_requested_native_export_slot(tmp_path, monkeypatch):
+    artifact, shipcard = _artifact_and_card(tmp_path)
+    manifest_path = tmp_path / "serve_manifest.json"
+    manifest = _write_bound_manifest(manifest_path, "graph", artifact)
+    serve_log = tmp_path / "serve.log"
+    serve_log.write_text(
+        _RESOLVED_GRAPH_CONFIG
+        + "Graph capturing finished in 12 secs, took 3.25 GiB\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        cbv,
+        "run_endpoint_smoke",
+        lambda **kwargs: _smoke_metrics(),
+    )
+    monkeypatch.setattr(
+        cbv,
+        "validate_cb_artifact_decode_contract",
+        lambda *args, **kwargs: _artifact_decode_record(),
+    )
+
+    assert cbv.main([
+        "--arm", "graph",
+        "--base-url", "http://127.0.0.1:8000/v1",
+        "--model-dir", str(artifact),
+        "--model-name", "dsv4",
+        "--serve-manifest", str(manifest_path),
+        "--serve-log", str(serve_log),
+        "--shipcard", str(shipcard),
+    ]) == 0
+
+    card = load_shipcard(shipcard)
+    assert card["slots"]["native_export.eager"] is None
+    record = card["slots"]["native_export.graph"]
+    assert record["passed"] is True
+    assert record["serve_fingerprint"] == manifest["serve_fingerprint"]
+    assert record["model_sha"] == card["model_sha"]
+    assert record["spec_decode_detected"] is False
+    assert record["metrics"]["tensor_parallel_size"] == 1
+    assert record["metrics"]["cuda_graph"]["serve_log_sha256"]
+    assert _verify_gridbook_native_record(
+        "native_export.graph", record
+    ) == []
+
+    record["metrics"]["endpoint_contract"]["environment"][
+        "VLLM_USE_DEEP_GEMM"
+    ] = "1"
+    assert any(
+        "invalid endpoint contract" in problem
+        for problem in _verify_gridbook_native_record(
+            "native_export.graph", record
+        )
+    )
+
+
+def test_deferred_result_closes_slot_only_when_committed(tmp_path, monkeypatch):
+    artifact, shipcard = _artifact_and_card(tmp_path)
+    manifest_path = tmp_path / "serve_manifest.json"
+    _write_bound_manifest(manifest_path, "eager", artifact)
+    result_path = tmp_path / "result.json"
+    monkeypatch.setattr(
+        cbv,
+        "run_endpoint_smoke",
+        lambda **kwargs: _smoke_metrics(),
+    )
+    monkeypatch.setattr(
+        cbv,
+        "validate_cb_artifact_decode_contract",
+        lambda *args, **kwargs: _artifact_decode_record(),
+    )
+
+    assert cbv.main([
+        "--arm", "eager",
+        "--base-url", "http://127.0.0.1:8000/v1",
+        "--model-dir", str(artifact),
+        "--model-name", "dsv4",
+        "--serve-manifest", str(manifest_path),
+        "--shipcard", str(shipcard),
+        "--output-json", str(result_path),
+        "--defer-shipcard-fill",
+    ]) == 0
+    assert load_shipcard(shipcard)["slots"]["native_export.eager"] is None
+
+    cbv.commit_deferred_result(result_path, shipcard, artifact)
+    assert load_shipcard(shipcard)["slots"]["native_export.eager"]["passed"] is True
+
+
+@pytest.mark.parametrize("arm", ["eager", "graph"])
+def test_deferred_commit_refuses_mutated_hashed_evidence(
+    tmp_path, monkeypatch, arm,
+):
+    artifact, shipcard = _artifact_and_card(tmp_path)
+    manifest_path = tmp_path / "serve_manifest.json"
+    _write_bound_manifest(manifest_path, arm, artifact)
+    result_path = tmp_path / "result.json"
+    serve_log = tmp_path / "serve.log"
+    if arm == "graph":
+        serve_log.write_text(
+            _RESOLVED_GRAPH_CONFIG
+            + "Graph capturing finished in 12 secs, took 3.25 GiB\n",
+            encoding="utf-8",
+        )
+    monkeypatch.setattr(
+        cbv, "run_endpoint_smoke", lambda **kwargs: _smoke_metrics()
+    )
+    monkeypatch.setattr(
+        cbv,
+        "validate_cb_artifact_decode_contract",
+        lambda *args, **kwargs: _artifact_decode_record(),
+    )
+    args = [
+        "--arm", arm,
+        "--base-url", "http://127.0.0.1:8000/v1",
+        "--model-dir", str(artifact),
+        "--model-name", "dsv4",
+        "--serve-manifest", str(manifest_path),
+        "--shipcard", str(shipcard),
+        "--output-json", str(result_path),
+        "--defer-shipcard-fill",
+    ]
+    if arm == "graph":
+        args.extend(["--serve-log", str(serve_log)])
+    assert cbv.main(args) == 0
+
+    evidence = manifest_path if arm == "eager" else serve_log
+    evidence.write_bytes(evidence.read_bytes() + b"post-validation mutation\n")
+    with pytest.raises(cbv.CBEndpointValidationError, match="differs"):
+        cbv.commit_deferred_result(result_path, shipcard, artifact)
+    assert load_shipcard(shipcard)["slots"][f"native_export.{arm}"] is None
+
+
+def test_driver_and_lane_declare_two_isolated_arms_and_guards():
+    text = DRIVER.read_text(encoding="utf-8")
+    subprocess.run(["bash", "-n", str(DRIVER)], check=True)
+    assert cbv.DSV4_SPARK_VLLM_IMAGE in text
+    assert cbv.DSV4_SPARK_VLLM_VERSION in text
+    assert cbv.DSV4_SPARK_VLLM_COMMIT in text
+    assert 'install-container' in text
+    assert '${VLLM_COMMIT}-${ARM}' in text
+    assert 'NAME=${NAME:-pq-dsv4-cb-${ARM}}' in text
+    assert '--quantization gridbook' in text
+    assert '--tensor-parallel-size 1' in text
+    assert '--kv-cache-dtype fp8' in text
+    assert '--no-enable-prefix-caching' in text
+    assert '--speculative-config' not in text
+    assert cbv.DSV4_GRAPH_COMPILATION_CONFIG in text
+    assert 'WATCHDOG_GIB' in text and 'READY_FLOOR_GIB' in text
+    assert 'START_FLOOR_GIB < 110' in text
+    assert 'serve_fingerprint.py write' in text
+    assert 'prismaquant.validate_cb_endpoint' in text
+    assert '--defer-shipcard-fill' in text
+    assert 'commit_deferred_result' in text
+    assert 'docker stop -t 30 "$CID"' in text
+    assert text.rindex('docker stop -t 30 "$CID"') < text.index(
+        'commit_deferred_result'
+    )
+    assert 'contains_mxfp4_wire' in text
+    assert '-e GRIDBOOK_MXFP8_DENSE=1' in text
+    assert '-e VLLM_USE_DEEP_GEMM=0' in text
+    assert 'validate_cb_artifact_decode_contract' in text
+    assert 'EVIDENCE must be outside the immutable MODEL tree' in text
+    assert 'EXT_CACHE must be outside the immutable MODEL tree' in text
+
+    lane = load_lane_spec("nvfp4_cb")
+    eager = lane.gate("load_generate.eager")
+    graph = lane.gate("load_generate.graph")
+    assert eager is not None and eager.shipcard_slot == "native_export.eager"
+    assert graph is not None and graph.shipcard_slot == "native_export.graph"
+    assert "serve_dsv4_cb_validate.sh eager" in eager.runner
+    assert "serve_dsv4_cb_validate.sh graph" in graph.runner
+
+
+@pytest.mark.parametrize(
+    "extension",
+    [
+        "prismaquant_cb_ext.so",
+        "prismaquant_cb_v2_ext.so",
+        "pq_cb_fused_fp4_deadbeef.so",
+        "pq_mxfp8_dense_deadbeef.so",
+    ],
+)
+def test_manifest_accepts_reviewed_gridbook_native_extension_families(extension):
+    manifest = _manifest("eager")
+    manifest["resident_extensions"] = [extension]
+    manifest["serve_fingerprint"] = fingerprint(manifest)
+    cbv.validate_serve_manifest(
+        manifest,
+        arm="eager",
+        expected_served_model="dsv4",
+        requires_moe_marlin=False,
+    )

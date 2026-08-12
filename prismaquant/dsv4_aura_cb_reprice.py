@@ -73,6 +73,10 @@ DSV4_NONEXPERT_UNITS = 301
 DSV4_EXPECTED_ANCHORS = 66_951
 DSV4_BUDGET_BYTES = 112_690_000_000
 DSV4_ARTIFACT_RESERVE_BYTES = 268_435_456
+# Spark has one unified CPU/GPU memory pool.  The worst DSv4 anchor layer's
+# exact FP32 dW plane is 51.3 GiB, so source weights must never retain or
+# speculatively load a second decoder layer during that reverse window.
+DSV4_STREAMING_CACHE_MAX_SLOTS = 1
 # One profile id for the whole campaign: it bounds the source-class plan's
 # family to the rungs the pinned runtime's fused mid-M lane instantiates, and
 # it is the allocator's --target-profile.  Splitting these would let the
@@ -85,10 +89,9 @@ DSV4_TARGET_PROFILE = "nvfp4_cb"
 # and the fused mainloop's single CbSubW = k/4 sub-table width is the format's
 # real layout only on those rungs -- a uniform decode at, say, k37 would be
 # *wrong*, not merely unaligned.  serving_profile_specs/nvfp4_cb.json backs
-# [28, 32, 36, 40, 44, 48] for every runtime 0.5.0..0.8.3 (the pin is 0.8.3,
-# version_is_release; advanced from 0.8.2 together with the matching backed-set
-# key, because 0.8.2 refuses a learned codebook on any routed-MoE stack), so
-# this is the served set, not an aspiration.  NVFP4-CB
+# [28, 32, 36, 40, 44, 48] for every runtime 0.5.0..0.8.4 (the pin is 0.8.4,
+# version_is_release, and its packaged contract explicitly attests the routed
+# per-role LUT ABI), so this is the served set, not an aspiration. NVFP4-CB
 # is outside that law -- its lane backs no fused mid-M rungs at any version --
 # so K12..K18 stays contiguous.
 NVFP4_FORMATS = tuple(f"NVFP4_CB_K{k}" for k in range(12, 19))
@@ -761,6 +764,10 @@ def prepare_dsv4_campaign(args: argparse.Namespace) -> PreparedDSv4Campaign:
         "format_plan_identity_sha256": format_plan.identity_sha256,
         "format_plan_path": str(format_plan_path),
         "cold_expert_render_units": len(missing_activations),
+        "streaming_source_cache": {
+            "max_cache_slots": DSV4_STREAMING_CACHE_MAX_SLOTS,
+            "effective_prefetch_lookahead": 0,
+        },
     }
     return PreparedDSv4Campaign(
         args=args,
@@ -848,8 +855,18 @@ def _measure_streamed(prepared: PreparedDSv4Campaign) -> dict[str, object]:
         dtype=torch.bfloat16,
         offload_folder=str(checkpoint_root / "streamed-model-offload"),
         profile=prepared.profile,
+        max_cache_slots=DSV4_STREAMING_CACHE_MAX_SLOTS,
     )
     try:
+        if (
+            runner.context.max_cache_slots != DSV4_STREAMING_CACHE_MAX_SLOTS
+            or runner.prefetch_lookahead != 0
+        ):
+            raise DSv4CampaignError(
+                "DSv4 streamed source-cache policy is not fail-closed "
+                f"(max_cache_slots={runner.context.max_cache_slots}, "
+                f"prefetch_lookahead={runner.prefetch_lookahead})"
+            )
         model_identity = build_streamed_model_identity(
             runner,
             args.model,
@@ -892,6 +909,10 @@ def _measure_streamed(prepared: PreparedDSv4Campaign) -> dict[str, object]:
                     "family", "role", "equivalence_class"
                 ],
                 "equivalence_vocabulary_name": "codebook_basis",
+                "streaming_source_cache": {
+                    "max_cache_slots": DSV4_STREAMING_CACHE_MAX_SLOTS,
+                    "effective_prefetch_lookahead": 0,
+                },
             },
         )
     finally:

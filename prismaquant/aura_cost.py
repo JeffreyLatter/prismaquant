@@ -520,6 +520,23 @@ def _free_gib() -> float:
         return float("inf")
 
 
+def _release_streamed_anchor_allocator_cache(device: object) -> None:
+    """Return consumed production anchors to Spark unified memory.
+
+    Dropping the final tensor reference only moves its CUDA allocation into
+    PyTorch's reusable cache.  On the single-GPU GB10 path that memory still
+    overlaps the much larger FP32 adjoint deltas unless the cache is returned
+    to the unified host/device pool before backward begins.  This is once per
+    streamed layer, outside the probe loop; non-CUDA test/research paths stay a
+    no-op.
+    """
+    resolved = torch.device(device)
+    if resolved.type != "cuda":
+        return
+    torch.cuda.synchronize(resolved)
+    torch.cuda.empty_cache()
+
+
 def _target_linears(
     model: nn.Module,
     *,
@@ -2385,6 +2402,7 @@ def compute_aura_cost_streamed(
                             x2_probe[key] = []
                             del rendered
                     del rendered_anchor_pool
+                    _release_streamed_anchor_allocator_cache(device)
                 else:
                     for name in pending:
                         for fmt in render_formats[name]:

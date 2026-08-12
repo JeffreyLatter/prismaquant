@@ -181,11 +181,11 @@ def test_declared_serve_scripts_exist():
 
 
 def test_shipcard_slots_are_real_slots():
-    from prismaquant.shipcard import REQUIRED_SLOTS
+    from prismaquant.shipcard import ALL_SLOTS
 
     for spec in all_lane_specs():
         for slot in spec.shipcard_slots():
-            assert slot in REQUIRED_SLOTS, f"{spec.id}: unknown slot {slot}"
+            assert slot in ALL_SLOTS, f"{spec.id}: unknown slot {slot}"
 
 
 def test_gate_report_reads_shipcard_fill():

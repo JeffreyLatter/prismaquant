@@ -233,9 +233,10 @@ def test_advancing_the_pin_adds_a_version_key_and_never_edits_an_old_one():
                 if l.id == "fp8_cb_fused_mid_m")
     declared = dict(lane.fused_mid_m_rungs_by_runtime_version)
     assert {"0.5.0", "0.6.0", "0.7.0", "0.8.0", "0.8.1",
-            "0.8.2"} <= set(declared)
+            "0.8.2", "0.8.3", "0.8.4"} <= set(declared)
     assert (declared["0.5.0"] == declared["0.6.0"] == declared["0.7.0"]
             == declared["0.8.0"] == declared["0.8.1"] == declared["0.8.2"]
+            == declared["0.8.3"] == declared["0.8.4"]
             == tuple(range(28, 49, 4)))
 
     for old_version in ("0.5.0", "0.6.0"):

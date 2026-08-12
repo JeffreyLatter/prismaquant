@@ -223,7 +223,7 @@ laid out exactly as the 2-D case; expert `e` = `cb_qweight[e]`), and the fp8
 `(E, 1, in)` when provided (a single `(in,)` vector is broadcast to all
 experts). A uniform stack shares one format; the existing per-expert-format
 declaration may instead partition its experts into physical rung sub-stacks.
-With the unreleased Gridbook 0.8.3 preparation pin, learned FP8-CB stacks may
+With released Gridbook 0.8.4, learned FP8-CB stacks may
 carry one pooled book per logical gate/up/down role: `gate_up_proj` stays one physical
 tensor, while ordinary logical `gate_proj` and `up_proj` config targets carry
 distinct refs and select row-offset blocks. Split logical targets retain their
@@ -233,10 +233,10 @@ bundle cell. **Served** by
 w13/w2 buffers at these exact shapes so loading is a plain `copy_`; archs that
 map experts at the top level additionally need a loader line in
 Gridbook's packaged runtime contract and loader table (see `moe_cb_design.md` §4).
-The producer version-gates this path: pins older than 0.8.3, malformed pins,
-and non-final version strings retain the routed/rank-3 refusal. The new runtime
-path is also opt-in (`PRISMAQUANT_CB_MOE_PER_ROLE_LUT=1`) until device serving
-validation completes. There is no lattice fallback under a learned identity;
+The producer version-gates this path: pins older than 0.8.4, malformed pins,
+non-final versions, or a missing packaged ABI marker retain the routed/rank-3
+refusal. The released capability does not waive artifact-specific device
+validation. There is no lattice fallback under a learned identity;
 the exact ABI and ship gate are recorded in `MOE_LEARNED_CODEBOOK_SPEC.md`.
 
 **Codebooks — shipped once per `(ref, format)`, never per tensor:**
@@ -475,11 +475,12 @@ plain NVFP4/FP8 groups → the pinned runtime's delegated native route. Dense
 fusion does **not** require one ref across sibling roles: Gridbook reads
 each role's `codebook_ref`, interns distinct reference tuples, concatenates the
 blocks, and supplies a per-row `cb_row_offset`, so gate≠up and q≠k≠v are valid
-(external Gridbook `gridbook/linear.py:405-437`). Gridbook 0.8.3 ports that
-mechanism to routed MoE behind its per-role-LUT opt-in. PrismaQuant emits three
+(external Gridbook `gridbook/linear.py:405-437`). Gridbook 0.8.4 carries that
+mechanism for routed MoE. PrismaQuant emits three
 ordinary logical config targets (`gate_proj`, `up_proj`, `down_proj`) with
 independent refs while retaining the two physical `gate_up_proj`/`down_proj`
-payloads. An older pin still refuses before those refs can be emitted.
+payloads. A pin without the released feature attestation refuses before those
+refs can be emitted.
 
 ---
 
@@ -506,7 +507,7 @@ for each row, each superblock s:
 This reproduces the emulation render bit-for-bit; the two are pinned equal by
 `test_nvfp4_cb_pack_unpack_matches_emulation`.
 For a fused dense module, `codebook` above means the role block selected by that
-output row's `cb_row_offset`. The 0.8.3 routed opt-in applies the same rule to
+output row's `cb_row_offset`. The 0.8.4 routed path applies the same rule to
 each expert: the first `w13` row segment selects gate, the second selects up,
 and `w2` selects down. The offset vector is resident and captured with the
 decode route; it is not recomputed or read from host state per token.

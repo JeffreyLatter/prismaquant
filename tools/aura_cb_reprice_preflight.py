@@ -43,7 +43,7 @@ DSV4_NVFP4_RUNGS = tuple(range(12, 19))
 # FP8-CB is legal only at k % 4 == 0 (gridbook K1.2 fused mid-M kernel law:
 # type_size = 4k must stay a 16-byte-multiple TMA extent and CbSubW = k/4 is
 # the real sub-table width only there).  serving_profile_specs/nvfp4_cb.json
-# backs [28, 32, 36, 40, 44, 48] for runtimes 0.5.0..0.8.2.  Routed experts
+# backs [28, 32, 36, 40, 44, 48] for runtimes 0.5.0..0.8.4. Routed experts
 # are additionally capped at K33 by the byte-exact source-payload ceiling,
 # leaving two rungs.  NVFP4-CB is outside the law and stays contiguous.
 DSV4_EXPERT_FP8_RUNGS = (28, 32)

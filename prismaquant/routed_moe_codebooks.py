@@ -1,7 +1,7 @@
 """Producer-side logical-role plan for learned routed-MoE codebooks.
 
 Gridbook keeps the physical expert checkpoint tensors fused as ``w13``
-(``gate_up_proj``), but its 0.8.3 opt-in ABI resolves ordinary logical
+(``gate_up_proj``), but the ABI attested by Gridbook 0.8.4 resolves ordinary logical
 ``gate_proj`` and ``up_proj`` config targets independently.  This module owns
 that small producer naming bridge; it contains no Gridbook runtime code.
 """

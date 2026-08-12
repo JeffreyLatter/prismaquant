@@ -63,12 +63,13 @@ def test_strict_parser_rejects_missing_and_unknown_members():
     "version,version_is_release,expected",
     (
         ("0.8.2", True, False),
-        ("0.8.3", False, True),
-        ("0.8.3", True, True),
+        ("0.8.3", False, False),
+        ("0.8.3", True, False),
+        ("0.8.4", False, True),
         ("0.8.4", True, True),
         ("0.9.0", True, True),
-        ("0.8.3rc1", False, False),
-        ("0.8.3+local", False, False),
+        ("0.8.4rc1", False, False),
+        ("0.8.4+local", False, False),
     ),
 )
 def test_routed_moe_per_role_lut_gate_is_final_numeric_versioned(

@@ -407,10 +407,9 @@ def test_report_records_serving_lanes_per_arm(tmp_path):
 
     # Which side of that split K36 lands on is a function of the pin, so it is
     # asserted against the pin rather than hardcoded. The repo currently pins
-    # 0.8.3 with ``version_is_release: false`` and the spec attests through
-    # 0.8.2, so K36 is on the fallback route today. Declaring a 0.8.3 backed
-    # set is a SERVING PROMOTION needing measured evidence, never an edit made
-    # to turn this assertion green.
+    # Whether K36 is backed is resolved from the immutable released-runtime
+    # table; a future pin with no key must fall back rather than inheriting a
+    # prior release's evidence.
     if 36 in serving_profile_backed_rungs("nvfp4_cb"):
         assert cb["units_on_backed_fused_mid_m_lane"] == len(_DENSE)
         assert cb["selected_rungs_fused_mid_m_backed"] == [36]

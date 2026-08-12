@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 
 import pytest
 import torch
@@ -290,20 +291,27 @@ _ROUTED_DETECTORS = (
 
 
 @pytest.mark.parametrize("qname,routed_flag,shape", _ROUTED_DETECTORS)
+@pytest.mark.parametrize(
+    "version,commit",
+    (
+        ("0.8.2", "9f915dd868eab2e13ab7847a67c594e2c5c8955c"),
+        ("0.8.3", "60d9592c97c9b25340709751229eac05dedf3fc1"),
+    ),
+)
 def test_routed_moe_learned_ref_fails_with_old_gridbook_pin(
-    monkeypatch, qname, routed_flag, shape
+    monkeypatch, qname, routed_flag, shape, version, commit
 ):
     old = _gridbook_pin(
-        "0.8.2",
-        commit="9f915dd868eab2e13ab7847a67c594e2c5c8955c",
+        version,
+        commit=commit,
         version_is_release=True,
     )
     monkeypatch.setattr(bundle, "load_gridbook_runtime_pin", lambda: old)
     with pytest.raises(
         ValueError,
         match=(
-            r"Gridbook 0\.8\.2.*9f915dd868eab2e13ab7847a67c594e2c5c8955c"
-            r".*per-row/per-role LUT offset ABI.*Gridbook >=0\.8\.3"
+            rf"Gridbook {re.escape(version)}.*{commit}"
+            r".*per-row/per-role LUT offset ABI.*Gridbook >=0\.8\.4"
         ),
     ):
         bundle.refuse_routed_moe_learned(
@@ -314,10 +322,10 @@ def test_routed_moe_learned_ref_fails_with_old_gridbook_pin(
 
 
 @pytest.mark.parametrize("qname,routed_flag,shape", _ROUTED_DETECTORS)
-def test_routed_moe_learned_ref_lifts_at_gridbook_0_8_3_even_before_tag(
+def test_routed_moe_learned_ref_lifts_at_attested_gridbook_0_8_4_even_before_tag(
     monkeypatch, qname, routed_flag, shape
 ):
-    supported = _gridbook_pin("0.8.3", version_is_release=False)
+    supported = _gridbook_pin("0.8.4", version_is_release=False)
     monkeypatch.setattr(
         bundle, "load_gridbook_runtime_pin", lambda: supported
     )
@@ -335,7 +343,7 @@ def test_routed_moe_learned_ref_fails_closed_on_invalid_pin(monkeypatch):
     monkeypatch.setattr(bundle, "load_gridbook_runtime_pin", invalid_pin)
     with pytest.raises(
         ValueError,
-        match=r"runtime pin is invalid.*malformed pin fixture.*Gridbook >=0\.8\.3",
+        match=r"runtime pin is invalid.*malformed pin fixture.*Gridbook >=0\.8\.4",
     ):
         bundle.refuse_routed_moe_learned(
             "model.layers.2.mlp.experts.gate_up_proj",

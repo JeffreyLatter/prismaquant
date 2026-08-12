@@ -21,6 +21,7 @@ from prismaquant import nvfp4_cb_formats as cb  # noqa: E402
 from prismaquant.export_nvfp4_cb_streaming import (  # noqa: E402
     export_nvfp4_cb_streaming,
 )
+from prismaquant.shipcard import load_shipcard  # noqa: E402
 
 
 HIDDEN = 256
@@ -338,7 +339,23 @@ def test_uniform_per_expert_mode_is_byte_identical_to_legacy(tmp_path):
         path.relative_to(tmp_path / "uniform"): path.read_bytes()
         for path in (tmp_path / "uniform").rglob("*") if path.is_file()
     }
+    legacy_card_bytes = legacy_files.pop(Path("shipcard.json"))
+    uniform_card_bytes = uniform_files.pop(Path("shipcard.json"))
     assert uniform_files == legacy_files
+    assert len(uniform_card_bytes) == len(legacy_card_bytes)
+
+    legacy_card = load_shipcard(tmp_path / "legacy" / "shipcard.json")
+    uniform_card = load_shipcard(tmp_path / "uniform" / "shipcard.json")
+    for key in (
+        "model_sha",
+        "artifact_bytes",
+        "reserved_file_bytes",
+        "build",
+        "slots",
+    ):
+        assert uniform_card[key] == legacy_card[key]
+    assert legacy_card["model_dir"] == str(tmp_path / "legacy")
+    assert uniform_card["model_dir"] == str(tmp_path / "uniform")
     assert "per_expert_format_groups" not in json.loads(
         (tmp_path / "uniform" / "quant_config.json").read_text()
     )

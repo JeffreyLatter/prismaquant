@@ -38,6 +38,16 @@ from prismaquant.export_native_compressed import (  # noqa: E402
     compute_nvfp4_global_real,
 )
 from prismaquant.model_profiles import detect_profile  # noqa: E402
+from prismaquant.shipcard import (  # noqa: E402
+    ALL_SLOTS,
+    GOLD_SLOTS,
+    REQUIRED_SLOTS,
+    compute_model_sha,
+    fill_slot,
+    load_shipcard,
+    make_record,
+    verify,
+)
 
 
 def export_nvfp4_cb(*args, **kwargs):
@@ -316,16 +326,89 @@ def test_streaming_byte_identical_dense_and_stacked(workdir):
     assert qm["ignore"] == qs["ignore"]
     assert qs["provenance"]["streaming"] is True
     for root, config in ((workdir / "m", qm), (workdir / "s", qs)):
+        card = load_shipcard(root / "shipcard.json")
+        assert Path(card["model_dir"]) == root.resolve()
+        assert card["model_sha"] == compute_model_sha(root)
+        assert verify(card, model_dir=root) == [
+            f"{slot}: UNFILLED" for slot in ALL_SLOTS
+        ]
+        assert card["build"]["quant_method"] == "gridbook"
+        assert card["artifact_bytes"] == sum(
+            path.stat().st_size
+            for pattern in ("*.safetensors", "*.pqcb")
+            for path in root.glob(pattern)
+        )
         inventory = config["provenance"]["artifact_inventory"]
         files = {
             path.relative_to(root).as_posix(): path.stat().st_size
             for path in root.rglob("*") if path.is_file()
         }
         assert inventory["file_bytes"] == files
+        assert inventory["file_bytes"]["shipcard.json"] == (
+            root / "shipcard.json"
+        ).stat().st_size
+        assert inventory["file_bytes"]["shipcard.json"] == card[
+            "reserved_file_bytes"
+        ]
         assert inventory["export_directory_bytes"] == sum(files.values())
         assert inventory["cb_serialized_payload_bytes"] == (
             config["provenance"]["serialized_payload"]["total_bytes"]
         )
+        # Every serve/gold verdict mutates the refusal receipt, but its fixed
+        # reservation keeps the export-time recursive inventory and exact hard
+        # budget valid through the fully closed card.
+        pin = json.loads((
+            Path(__file__).resolve().parents[1]
+            / "prismaquant/gridbook_runtime/gridbook_runtime_pin.json"
+        ).read_text())
+        for slot in REQUIRED_SLOTS:
+            arm = slot.rsplit(".", 1)[-1] if slot.startswith(
+                "native_export."
+            ) else None
+            metrics = {"detail": "served"}
+            tool = "inventory-stability-test"
+            fingerprint = None
+            if arm is not None:
+                tool = "validate_cb_endpoint.py"
+                fingerprint = "f" * 64
+                metrics.update({
+                    "arm": arm,
+                    "enforce_eager": arm == "eager",
+                    "quantization": "gridbook",
+                    "kv_cache_dtype": "fp8",
+                    "tensor_parallel_size": 1,
+                    "gridbook_runtime_commit": pin["commit"],
+                    "gridbook_runtime_version": pin["version"],
+                })
+                if arm == "graph":
+                    metrics["cuda_graph"] = {
+                        "capture_marker": (
+                            "Graph capturing finished in 1 secs, took 1.00 GiB"
+                        ),
+                        "serve_log_sha256": "a" * 64,
+                    }
+            fill_slot(root / "shipcard.json", slot, make_record(
+                slot=slot,
+                tool=tool,
+                passed=True,
+                model_sha=card["model_sha"],
+                metrics=metrics,
+                spec_decode_detected=(
+                    False if slot in GOLD_SLOTS or arm is not None else None
+                ),
+                serve_fingerprint=fingerprint,
+            ))
+        final_files = {
+            path.relative_to(root).as_posix(): path.stat().st_size
+            for path in root.rglob("*") if path.is_file()
+        }
+        assert final_files == inventory["file_bytes"]
+        assert sum(final_files.values()) == inventory["export_directory_bytes"]
+        assert compute_model_sha(root) == card["model_sha"]
+        # This test owns byte identity and the fixed-size inventory
+        # reservation.  Canonical Gridbook release-record semantics are
+        # exercised by test_shipcard.py and the slot-specific validators; do
+        # not duplicate that evolving policy in a streaming exporter fixture.
     # codebook sidecars identical
     cbm = load_file(str(workdir / "m" / "cm.pqcb")) if (
         workdir / "m" / "cm.pqcb").exists() else None
@@ -496,6 +579,26 @@ def test_stream_writer_removes_owned_temp_before_publish(workdir, failure_stage)
         writer.write(output, before_publish=before_publish)
     assert not output.exists()
     assert not (workdir / ".model.safetensors.tmp").exists()
+    assert writer.last_content_sha256 is None
+    assert writer.last_content_bytes is None
+
+
+def test_stream_writer_attests_exact_published_bytes_without_a_reread(workdir):
+    output = workdir / "model.safetensors"
+    writer = _StreamWriter()
+    writer.add(
+        "value",
+        torch.float32,
+        (4,),
+        lambda: torch.tensor([1.0, 2.0, 3.0, 4.0]),
+    )
+
+    writer.write(output)
+
+    assert writer.last_content_bytes == output.stat().st_size
+    assert writer.last_content_sha256 == hashlib.sha256(
+        output.read_bytes()
+    ).hexdigest()
 
 
 # --- per-expert -> stacked bridging (Hy3 layout) ---------------------------

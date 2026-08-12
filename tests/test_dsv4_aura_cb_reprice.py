@@ -685,6 +685,11 @@ def test_exportable_artifacts_preserve_render_imatrix_and_refuse_overwrite(
         "predicted_dloss": 12.5,
         "budget_bytes": 112_690_000_000,
     }))
+    pareto_knees = {
+        "primary": "log_error",
+        "log_error": {"achieved_bits": 2.75, "target_bits": 2.75},
+    }
+    (allocator / "pareto.knees.json").write_text(json.dumps(pareto_knees))
     col_weights = tmp_path / "cb_col_weights.pkl"
     col_weights.write_bytes(b"render-input-only")
     destination = tmp_path / "new-artifacts"
@@ -709,12 +714,15 @@ def test_exportable_artifacts_preserve_render_imatrix_and_refuse_overwrite(
     assert stamp["route_flip_limitation"] == ROUTE_FLIP_LIMITATION
     assert selection["aura_cb_reprice"] == stamp
     assert selection["feasible"] is True
+    assert json.loads(
+        (destination / "pareto.knees.json").read_text()
+    ) == pareto_knees
 
     before = {
         name: (destination / name).stat().st_mtime_ns
         for name in (
-            "layer_config.json", "selection.json", "cb_col_weights.pkl",
-            ".anchored_publish.json",
+            "layer_config.json", "selection.json", "pareto.knees.json",
+            "cb_col_weights.pkl", ".anchored_publish.json",
         )
     }
     assert write_exportable_artifacts(
@@ -748,6 +756,20 @@ def test_exportable_artifacts_preserve_render_imatrix_and_refuse_overwrite(
             provenance={"campaign": "test"},
         )
 
+    (allocator / "pareto.knees.json").write_text(json.dumps({
+        "primary": "log_error",
+        "log_error": {"achieved_bits": None},
+    }))
+    with pytest.raises(
+        AnchoredCostError, match="Pareto knees lack a primary achieved-bpp",
+    ):
+        write_exportable_artifacts(
+            tmp_path / "invalid-pareto-artifacts",
+            allocator_output_dir=allocator,
+            cb_col_weights_path=col_weights,
+            provenance={"campaign": "test"},
+        )
+
 
 def test_exportable_artifact_resume_safely_finishes_interrupted_publish(
     tmp_path, monkeypatch,
@@ -764,6 +786,10 @@ def test_exportable_artifact_resume_safely_finishes_interrupted_publish(
         "chosen_achieved_bits": 2.75,
         "predicted_dloss": 12.5,
         "budget_bytes": 112_690_000_000,
+    }))
+    (allocator / "pareto.knees.json").write_text(json.dumps({
+        "primary": "log_error",
+        "log_error": {"achieved_bits": 2.75, "target_bits": 2.75},
     }))
     col_weights = tmp_path / "cb_col_weights.pkl"
     col_weights.write_bytes(b"render-input-only")

@@ -63,7 +63,7 @@ class StreamedCausalLM:
         self.device = torch.device(context.device)
         self.dtype = context.dtype
         self.profile = profile
-        self.prefetch_lookahead = max(1, int(prefetch_lookahead))
+        self.prefetch_lookahead = max(0, int(prefetch_lookahead))
         self._pinned_layer: int | None = None
 
     def layer_index_for_qname(self, qname: str) -> int:
@@ -246,6 +246,7 @@ def build_streamed_causal_lm(
     offload_folder: str,
     profile,
     cache_headroom_gb: float | None = None,
+    max_cache_slots: int | None = None,
     prefetch_workers: int | str | None = None,
     prefetch_min_available_gb: float | str | None = None,
     prefetch_lookahead: int = 2,
@@ -259,12 +260,19 @@ def build_streamed_causal_lm(
         dtype=dtype,
         offload_folder=offload_folder,
         cache_headroom_gb=cache_headroom_gb,
+        max_cache_slots=max_cache_slots,
         prefetch_workers=prefetch_workers,
         prefetch_min_available_gb=prefetch_min_available_gb,
         log_prefix="[cost-streaming]",
     )
+    effective_lookahead = max(0, int(prefetch_lookahead))
+    if context.max_cache_slots is not None:
+        effective_lookahead = min(
+            effective_lookahead,
+            max(0, context.max_cache_slots - 1),
+        )
     return StreamedCausalLM(
-        context, profile, prefetch_lookahead=prefetch_lookahead
+        context, profile, prefetch_lookahead=effective_lookahead
     )
 
 
@@ -277,6 +285,114 @@ def _file_sha256(path: Path) -> str:
                 break
             digest.update(block)
     return digest.hexdigest()
+
+
+def _streamed_identity_stat_fingerprint(path: Path) -> dict[str, object]:
+    """Return the mutation-sensitive local cache key for one source shard."""
+    stat = path.stat()
+    return {
+        "path": str(path.resolve()),
+        "device": int(stat.st_dev),
+        "inode": int(stat.st_ino),
+        "size": int(stat.st_size),
+        "mtime_ns": int(stat.st_mtime_ns),
+        # Unlike mtime, ctime cannot be restored with utime after a same-size
+        # rewrite.  Matching all six fields makes a previously computed
+        # content SHA safe to reuse without rereading a multi-hundred-GB
+        # checkpoint.
+        "ctime_ns": int(stat.st_ctime_ns),
+    }
+
+
+def _local_checkpoint_shards(
+    source_model: str | Path,
+) -> tuple[dict[str, str] | None, list[Path] | None]:
+    """Resolve the exact safetensors file set consumed by a local checkpoint.
+
+    The streaming model omits auxiliary decoder namespaces it does not execute
+    (DSv4's MTP towers are one example), while the exporter copies those
+    tensors byte-verbatim.  The Hugging Face index is therefore the authority
+    for complete source-byte coverage, not only ``context.weight_shard``.
+    """
+    root = Path(source_model)
+    if not root.is_dir():
+        return None, None
+    index_path = root / "model.safetensors.index.json"
+    if index_path.is_file():
+        try:
+            payload = json.loads(index_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"streamed model identity cannot read {index_path}"
+            ) from exc
+        weight_map = payload.get("weight_map") if isinstance(
+            payload, dict
+        ) else None
+        if not isinstance(weight_map, dict) or not weight_map:
+            raise RuntimeError(
+                f"streamed model identity requires a non-empty weight_map in "
+                f"{index_path}"
+            )
+        canonical_map: dict[str, str] = {}
+        shard_names: set[str] = set()
+        for tensor_name, shard_name in weight_map.items():
+            if not isinstance(tensor_name, str) or not tensor_name:
+                raise RuntimeError(
+                    f"streamed model identity found an invalid tensor name in "
+                    f"{index_path}"
+                )
+            if (
+                not isinstance(shard_name, str)
+                or not shard_name
+                or Path(shard_name).name != shard_name
+            ):
+                raise RuntimeError(
+                    f"streamed model identity found an unsafe shard name "
+                    f"{shard_name!r} in {index_path}"
+                )
+            canonical_map[tensor_name] = shard_name
+            shard_names.add(shard_name)
+        shard_paths = sorted(
+            ((root / name).resolve() for name in shard_names), key=str
+        )
+        missing = [str(path) for path in shard_paths if not path.is_file()]
+        if missing:
+            raise RuntimeError(
+                "streamed model identity checkpoint index references missing "
+                f"shards: {missing[:8]}"
+            )
+        return dict(sorted(canonical_map.items())), shard_paths
+    single = root / "model.safetensors"
+    if single.is_file():
+        return None, [single.resolve()]
+    return None, None
+
+
+def _read_streamed_model_identity_cache(
+    cache_path: Path,
+    *,
+    source_model: str,
+) -> tuple[dict[str, object], dict[str, object]]:
+    try:
+        cached = json.loads(cache_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError(
+            f"streamed model identity cache {cache_path} is corrupt; "
+            "refusing identity reuse"
+        ) from exc
+    if (
+        not isinstance(cached, dict)
+        or cached.get("schema") != STREAMED_MODEL_IDENTITY_CACHE_SCHEMA
+        or cached.get("source") != str(source_model)
+    ):
+        raise RuntimeError(
+            f"streamed model identity cache {cache_path} does not bind source "
+            f"{source_model!r}"
+        )
+    identity = validate_streamed_model_identity(
+        cached.get("identity"), where="streamed model identity cache"
+    )
+    return cached, identity
 
 
 def build_streamed_model_identity(
@@ -305,67 +421,101 @@ def build_streamed_model_identity(
         str(live): str(checkpoint)
         for live, checkpoint in sorted(runner.context.weight_ckpt.items())
     }
-    shard_paths = sorted({
+    runner_shard_paths = {
         Path(path).resolve()
         for path in runner.context.weight_shard.values()
-    }, key=str)
+    }
+    checkpoint_weight_map, checkpoint_shard_paths = (
+        _local_checkpoint_shards(source_model)
+    )
+    shard_paths = sorted(
+        runner_shard_paths | set(checkpoint_shard_paths or ()), key=str
+    )
     if not shard_paths:
         raise RuntimeError(
             "streamed model identity found no source checkpoint shards"
         )
-    fingerprints: list[dict[str, object]] = []
-    for path in shard_paths:
-        stat = path.stat()
-        fingerprints.append({
-            "path": str(path),
-            "device": int(stat.st_dev),
-            "inode": int(stat.st_ino),
-            "size": int(stat.st_size),
-            "mtime_ns": int(stat.st_mtime_ns),
-            # Unlike mtime, ctime cannot be restored with utime after a
-            # same-size rewrite. It makes this a safe local hash-cache key:
-            # any ordinary content mutation forces the exact rehash below.
-            "ctime_ns": int(stat.st_ctime_ns),
-        })
+    fingerprints = [
+        _streamed_identity_stat_fingerprint(path) for path in shard_paths
+    ]
     cache_path = Path(identity_cache_path) if identity_cache_path else None
+    cached: dict[str, object] | None = None
+    cached_identity: dict[str, object] | None = None
     if cache_path is not None and cache_path.is_file():
-        try:
-            cached = json.loads(cache_path.read_text())
-        except Exception as exc:
-            raise RuntimeError(
-                f"streamed model identity cache {cache_path} is corrupt; "
-                "refusing identity reuse"
-            ) from exc
-        if (
-            isinstance(cached, dict)
-            and cached.get("schema") == STREAMED_MODEL_IDENTITY_CACHE_SCHEMA
-            and cached.get("source") == str(source_model)
-            and cached.get("fingerprints") == fingerprints
-        ):
-            identity = validate_streamed_model_identity(
-                cached.get("identity"), where="streamed model identity cache"
-            )
+        cached, cached_identity = _read_streamed_model_identity_cache(
+            cache_path, source_model=str(source_model)
+        )
+        if cached.get("fingerprints") == fingerprints:
             if (
-                identity.get("config") == canonical_json(
+                cached_identity.get("config") == canonical_json(
                     config_dict, where="streamed model config"
                 )
-                and identity.get("weight_map") == mapping
+                and cached_identity.get("weight_map") == mapping
+                and cached_identity.get("checkpoint_weight_map")
+                == checkpoint_weight_map
             ):
-                return identity
+                return cached_identity
+
+    # A schema-valid old cache may cover only the executable decoder shards.
+    # Reuse each digest whose complete stat fingerprint still matches, and
+    # hash only newly covered files (for DSv4 this upgrades 45 cached body
+    # shards by reading the three MTP shards, rather than rereading 156 GB).
+    reusable_sha: dict[str, str] = {}
+    if cached is not None and cached_identity is not None:
+        cached_fingerprints = cached.get("fingerprints")
+        cached_shards = cached_identity.get("shards")
+        if isinstance(cached_fingerprints, list) and isinstance(
+            cached_shards, list
+        ):
+            cached_fp_by_path = {
+                str(row.get("path")): row
+                for row in cached_fingerprints
+                if isinstance(row, dict) and isinstance(row.get("path"), str)
+            }
+            cached_shard_by_path = {
+                str(row.get("path")): row
+                for row in cached_shards
+                if isinstance(row, dict) and isinstance(row.get("path"), str)
+            }
+            for fingerprint in fingerprints:
+                path_key = str(fingerprint["path"])
+                prior_fp = cached_fp_by_path.get(path_key)
+                prior_shard = cached_shard_by_path.get(path_key)
+                if (
+                    prior_fp == fingerprint
+                    and isinstance(prior_shard, dict)
+                    and prior_shard.get("size") == fingerprint["size"]
+                    and re.fullmatch(
+                        r"[0-9a-f]{64}",
+                        str(prior_shard.get("sha256", "")).lower(),
+                    )
+                ):
+                    reusable_sha[path_key] = str(
+                        prior_shard["sha256"]
+                    ).lower()
 
     shards: list[dict[str, object]] = []
-    for path in shard_paths:
-        stat = path.stat()
+    for path, fingerprint in zip(shard_paths, fingerprints, strict=True):
+        path_key = str(path.resolve())
+        digest = reusable_sha.get(path_key)
+        if digest is None:
+            digest = _file_sha256(path)
+            if _streamed_identity_stat_fingerprint(path) != fingerprint:
+                raise RuntimeError(
+                    f"source checkpoint shard changed while hashing: {path}"
+                )
         shards.append({
-            "path": str(path),
-            "size": int(stat.st_size),
-            "sha256": _file_sha256(path),
+            "path": path_key,
+            "size": int(fingerprint["size"]),
+            "sha256": digest,
         })
     value_bearing = {
         "config": canonical_json(config_dict, where="streamed model config"),
         "weight_map": mapping,
         "shards": shards,
     }
+    if checkpoint_weight_map is not None:
+        value_bearing["checkpoint_weight_map"] = checkpoint_weight_map
     identity = {
         "schema": STREAMED_MODEL_IDENTITY_SCHEMA,
         "source": str(source_model),
@@ -432,13 +582,26 @@ def validate_streamed_model_identity(
                 f"{where} model shard {index} lacks content sha256"
             )
     canonical = canonical_json(identity, where=f"{where} model identity")
+    value_bearing = {
+        "config": canonical.get("config"),
+        "weight_map": canonical.get("weight_map"),
+        "shards": canonical.get("shards"),
+    }
+    if "checkpoint_weight_map" in canonical:
+        checkpoint_weight_map = canonical.get("checkpoint_weight_map")
+        if not isinstance(checkpoint_weight_map, dict) or not all(
+            isinstance(name, str)
+            and name
+            and isinstance(shard, str)
+            and shard
+            for name, shard in checkpoint_weight_map.items()
+        ):
+            raise RuntimeError(
+                f"{where} model checkpoint_weight_map is malformed"
+            )
+        value_bearing["checkpoint_weight_map"] = checkpoint_weight_map
     expected = canonical_json_sha256(
-        {
-            "config": canonical.get("config"),
-            "weight_map": canonical.get("weight_map"),
-            "shards": canonical.get("shards"),
-        },
-        where=f"{where} model content identity",
+        value_bearing, where=f"{where} model content identity"
     )
     if digest != expected:
         raise RuntimeError(
@@ -446,3 +609,104 @@ def validate_streamed_model_identity(
             "identity"
         )
     return canonical
+
+
+def validate_cached_streamed_model_identity(
+    source_model: str | Path,
+    identity_cache_path: str | Path,
+    *,
+    require_complete_checkpoint: bool = True,
+) -> dict[str, object]:
+    """Validate a cached full-checkpoint identity without rereading weights.
+
+    Exact per-shard SHA-256 values remain valid only while every mutation-
+    sensitive stat fingerprint matches.  For a local indexed checkpoint the
+    validator also requires coverage of the complete index shard set (not just
+    the decoder shards loaded by a calibration runner) and binds the complete
+    tensor-to-shard map.  This is the cheap, fail-closed handoff used before a
+    large streaming export.
+    """
+    source = str(source_model)
+    cache_path = Path(identity_cache_path)
+    cached, identity = _read_streamed_model_identity_cache(
+        cache_path, source_model=source
+    )
+    fingerprints = cached.get("fingerprints")
+    if not isinstance(fingerprints, list) or not fingerprints:
+        raise RuntimeError(
+            f"streamed model identity cache {cache_path} has no fingerprints"
+        )
+    fingerprint_by_path: dict[str, dict[str, object]] = {}
+    for index, row in enumerate(fingerprints):
+        if not isinstance(row, dict) or not isinstance(row.get("path"), str):
+            raise RuntimeError(
+                f"streamed model identity cache fingerprint {index} is malformed"
+            )
+        path = str(Path(row["path"]).resolve())
+        if path in fingerprint_by_path:
+            raise RuntimeError(
+                f"streamed model identity cache repeats shard path {path}"
+            )
+        fingerprint_by_path[path] = row
+
+    identity_shards = identity.get("shards")
+    assert isinstance(identity_shards, list)  # validated above
+    shard_by_path: dict[str, dict[str, object]] = {}
+    for index, row in enumerate(identity_shards):
+        if not isinstance(row, dict) or not isinstance(row.get("path"), str):
+            raise RuntimeError(
+                f"streamed model identity shard {index} has no exact path"
+            )
+        path = str(Path(row["path"]).resolve())
+        if path in shard_by_path:
+            raise RuntimeError(
+                f"streamed model identity repeats shard path {path}"
+            )
+        shard_by_path[path] = row
+    if set(shard_by_path) != set(fingerprint_by_path):
+        raise RuntimeError(
+            "streamed model identity cache fingerprint coverage differs from "
+            "its value-bearing shard identity"
+        )
+
+    checkpoint_weight_map, checkpoint_paths = _local_checkpoint_shards(source)
+    if require_complete_checkpoint:
+        if checkpoint_paths is None:
+            raise RuntimeError(
+                "complete streamed model identity validation requires a local "
+                "safetensors checkpoint"
+            )
+        expected_paths = {str(path.resolve()) for path in checkpoint_paths}
+        if set(shard_by_path) != expected_paths:
+            missing = sorted(expected_paths - set(shard_by_path))
+            extra = sorted(set(shard_by_path) - expected_paths)
+            raise RuntimeError(
+                "streamed model identity does not cover the complete source "
+                f"checkpoint: missing={missing[:8]}, extra={extra[:8]}"
+            )
+        if checkpoint_weight_map is not None and identity.get(
+            "checkpoint_weight_map"
+        ) != checkpoint_weight_map:
+            raise RuntimeError(
+                "streamed model identity tensor-to-shard map differs from the "
+                "current source checkpoint index"
+            )
+
+    for path_key, expected in fingerprint_by_path.items():
+        path = Path(path_key)
+        if not path.is_file():
+            raise RuntimeError(
+                f"streamed model identity source shard is missing: {path}"
+            )
+        observed = _streamed_identity_stat_fingerprint(path)
+        if observed != expected:
+            raise RuntimeError(
+                "streamed model identity source shard stat drifted; refusing "
+                f"cached content SHA for {path}"
+            )
+        shard = shard_by_path[path_key]
+        if shard.get("size") != observed["size"]:
+            raise RuntimeError(
+                f"streamed model identity shard size disagrees for {path}"
+            )
+    return identity

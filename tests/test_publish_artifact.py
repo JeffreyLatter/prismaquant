@@ -20,6 +20,7 @@ if not (pathlib.Path(__file__).resolve().parents[1] / "tools").is_dir():
                 allow_module_level=True)
 
 from prismaquant.shipcard import (
+    CB_REQUIRED_SLOTS,
     GOLD_SLOTS,
     REQUIRED_SLOTS,
     build_shipcard,
@@ -80,6 +81,35 @@ def test_unfilled_card_refuses_and_prints_no_upload_command(tmp_path, capsys):
     for slot in REQUIRED_SLOTS:
         assert f"{slot}: UNFILLED" in captured.err
     # A refusal that still hands over the command is not a refusal.
+    assert "hf upload" not in captured.out + captured.err
+
+
+def test_gridbook_card_cannot_publish_without_matched_budget_parity(
+    tmp_path, capsys,
+):
+    model_dir = tmp_path / "gridbook-exported"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text('{"model_type":"deepseek_v4"}')
+    (model_dir / "model.safetensors").write_bytes(b"weights")
+    (model_dir / "quant_config.json").write_text(json.dumps({
+        "quant_method": "gridbook",
+        "format": "nvfp4_cb",
+    }))
+    card = build_shipcard(model_dir, build={"quant_method": "gridbook"})
+    write_shipcard(model_dir / "shipcard.json", card)
+    sha = compute_model_sha(model_dir)
+    for slot in REQUIRED_SLOTS:
+        fill_slot(model_dir / "shipcard.json", slot, make_record(
+            slot=slot,
+            tool="test",
+            passed=True,
+            model_sha=sha,
+            spec_decode_detected=False if slot in GOLD_SLOTS else None,
+        ))
+
+    assert publish_cli(_argv(model_dir)) == 1
+    captured = capsys.readouterr()
+    assert f"{CB_REQUIRED_SLOTS[0]}: UNFILLED" in captured.err
     assert "hf upload" not in captured.out + captured.err
 
 

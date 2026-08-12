@@ -1280,17 +1280,24 @@ class LayerCache:
     Values are dicts `{model_name: tensor}` returned by the layer-read
     helper. In the current streaming path those tensors live on the
     execution device, not on a detached CPU-only cache. Cache size is
-    bounded by bytes, not entries, so the same path degenerates to
-    "keep everything resident" when enough memory is available.
+    bounded by bytes and, when ``max_entries`` is supplied, by entries.
+    Without an entry cap the same path degenerates to "keep everything
+    resident" when enough memory is available.
     Eviction is LRU, which matches the forward-then-reverse access
     pattern used by the streaming probe.
     """
 
-    def __init__(self, max_bytes: int):
+    def __init__(self, max_bytes: int, max_entries: int | None = None):
         from collections import OrderedDict as _OD
+        if max_entries is not None:
+            if isinstance(max_entries, bool) or not isinstance(max_entries, int):
+                raise ValueError("LayerCache max_entries must be an integer or None")
+            if max_entries < 1:
+                raise ValueError("LayerCache max_entries must be >= 1")
         self._cache: "_OD[int, dict[str, torch.Tensor]]" = _OD()
         self._bytes: dict[int, int] = {}
         self.max_bytes = max_bytes
+        self.max_entries = max_entries
         self.total_bytes = 0
         self.hits = 0
         self.misses = 0
@@ -1413,12 +1420,21 @@ class LayerCache:
         # In-scope priority eviction (Task #4): when full, prefer evicting
         # out-of-scope (non-priority) entries before in-scope ones. Falls
         # back to LRU order if all candidates are in-scope.
-        while (self.total_bytes + size > effective_max
-               and len(self._cache) > 0):
+        while (
+            len(self._cache) > 0
+            and (
+                self.total_bytes + size > effective_max
+                or (
+                    self.max_entries is not None
+                    and len(self._cache) >= self.max_entries
+                )
+            )
+        ):
             evict_idx = self._pick_evict_candidate()
             if evict_idx is None:
                 break  # only priority entries left, can't evict any
             self._cache.pop(evict_idx, None)
+            self._pinned_until_read.discard(evict_idx)
             self.total_bytes -= self._bytes.pop(evict_idx, 0)
             evicted = True
         self._cache[layer_idx] = tensors
@@ -1562,13 +1578,23 @@ class LayerCache:
         self._maybe_pressure_shrink()
         effective_max = self._effective_max()
         target_total = max(0, effective_max - max(0, size_hint))
+        target_entries = (
+            self.max_entries - 1 if self.max_entries is not None else None
+        )
         freed = 0
-        while self.total_bytes > target_total and self._cache:
+        while self._cache and (
+            self.total_bytes > target_total
+            or (
+                target_entries is not None
+                and len(self._cache) > target_entries
+            )
+        ):
             evict_idx = self._pick_evict_candidate()
             if evict_idx is None:
                 break
             size = self._bytes.get(evict_idx, 0)
             self._cache.pop(evict_idx, None)
+            self._pinned_until_read.discard(evict_idx)
             self.total_bytes -= self._bytes.pop(evict_idx, 0)
             freed += size
         if freed and torch.cuda.is_available():
@@ -1658,6 +1684,7 @@ class LayerCache:
         return (f"LayerCache: {len(self._cache)} layers, "
                 f"{self.total_bytes / (1024**3):.1f} GB / "
                 f"{self.max_bytes / (1024**3):.1f} GB, "
+                f"max_entries={self.max_entries} "
                 f"residency={self.residency_summary()} "
                 f"hits={self.hits} misses={self.misses} "
                 f"hit_rate={(self.hits/tot*100 if tot else 0):.0f}% "

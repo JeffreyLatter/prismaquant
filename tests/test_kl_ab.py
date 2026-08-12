@@ -117,6 +117,14 @@ def test_external_gridbook_pin_is_recorded_in_the_stack(monkeypatch):
     assert manifest["gridbook_runtime_pin"] == gridbook_runtime_pin()
 
 
+def test_gridbook_mxfp8_lane_opt_in_is_fingerprinted(monkeypatch):
+    monkeypatch.setenv("GRIDBOOK_MXFP8_DENSE", "1")
+    manifest = collect_manifest(
+        pids=[__import__("os").getpid()], launch_argv=["vllm", "serve", "/m"]
+    )
+    assert manifest["pq_env"]["GRIDBOOK_MXFP8_DENSE"] == "1"
+
+
 def test_self_manifest_reads_this_process(tmp_path):
     manifest = self_manifest(image="test-image")
     assert manifest["source"] == "in_process"

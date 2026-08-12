@@ -175,13 +175,67 @@ def git_commit(repo: str | os.PathLike | None = None) -> str | None:
     the surrogate KL JSONs, which have had `_git_provenance` for a year.
     """
     root = Path(repo) if repo is not None else Path(__file__).resolve().parents[1]
+    override = os.environ.get("PRISMAQUANT_IDENTITY_GIT_COMMIT", "").strip().lower()
+    if override and re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", override) is None:
+        raise ValueError(
+            "PRISMAQUANT_IDENTITY_GIT_COMMIT must be a full 40- or 64-hex commit"
+        )
     try:
-        return subprocess.run(
+        observed = subprocess.run(
             ["git", "rev-parse", "HEAD"], cwd=root, check=True, text=True,
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=30,
         ).stdout.strip()
     except Exception:
-        return None
+        observed = None
+    if override and observed is not None and override != observed.lower():
+        raise ValueError(
+            "PRISMAQUANT_IDENTITY_GIT_COMMIT contradicts the mounted checkout"
+        )
+    return override or observed
+
+
+def artifact_binding(model_dir: str | os.PathLike) -> dict[str, Any]:
+    """Bind a live server manifest to the exact mounted CB artifact."""
+    root = Path(model_dir)
+    from prismaquant.shipcard import compute_model_sha
+
+    quant_path = root / "quant_config.json"
+    payload = json.loads(quant_path.read_text(encoding="utf-8"))
+    provenance = payload.get("provenance") if isinstance(payload, dict) else None
+    inventory = provenance.get("artifact_inventory") if isinstance(
+        provenance, dict
+    ) else None
+    if (
+        not isinstance(inventory, dict)
+        or inventory.get("schema")
+        != "prismaquant.cb_export_artifact_inventory.v1"
+        or inventory.get("scope") != "all_regular_files_recursive"
+    ):
+        raise ValueError("served artifact has no finalized recursive CB inventory")
+    file_bytes = inventory.get("file_bytes")
+    if not isinstance(file_bytes, dict) or not file_bytes:
+        raise ValueError("served artifact inventory has no file ledger")
+    observed: dict[str, int] = {}
+    for path in sorted(root.rglob("*")):
+        if path.is_symlink():
+            raise ValueError(
+                f"served artifact contains symlink {path.relative_to(root)}"
+            )
+        if path.is_file():
+            observed[path.relative_to(root).as_posix()] = int(path.stat().st_size)
+    if observed != file_bytes or sum(observed.values()) != inventory.get(
+        "export_directory_bytes"
+    ):
+        raise ValueError("served artifact files differ from finalized inventory")
+    canonical = json.dumps(
+        inventory, sort_keys=True, separators=(",", ":"), allow_nan=False
+    ).encode("utf-8")
+    return {
+        "schema": "prismaquant.served_artifact_binding/1",
+        "model_sha": compute_model_sha(root),
+        "artifact_inventory_sha256": hashlib.sha256(canonical).hexdigest(),
+        "artifact_bytes": sum(observed.values()),
+    }
 
 
 def gpu_identity() -> dict[str, Any]:
@@ -255,6 +309,7 @@ def collect_manifest(
     image: str | None = None,
     source: str = "server",
     extra: Mapping[str, Any] | None = None,
+    artifact_dir: str | os.PathLike | None = None,
 ) -> dict[str, Any]:
     """Build the manifest for a live serving (or measuring) process."""
     if pids is None:
@@ -303,10 +358,15 @@ def collect_manifest(
         ],
         "pq_env": {
             key: value for key, value in sorted(os.environ.items())
-            if key.startswith("PRISMAQUANT_") and value
+            if (
+                key.startswith("PRISMAQUANT_")
+                or key in {"GRIDBOOK_MXFP8_DENSE", "VLLM_USE_DEEP_GEMM"}
+            ) and value
         },
     }
     manifest.update(gpu_identity())
+    if artifact_dir is not None:
+        manifest["artifact_binding"] = artifact_binding(artifact_dir)
     if extra:
         manifest.update(dict(extra))
     manifest["serve_fingerprint"] = fingerprint(manifest)
@@ -379,6 +439,7 @@ def _cmd_write(args: argparse.Namespace) -> int:
     manifest = collect_manifest(
         pids=[args.pid] if args.pid else None,
         image=args.image,
+        artifact_dir=args.artifact_dir,
     )
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -414,6 +475,11 @@ def main(argv: list[str] | None = None) -> int:
     p_write.add_argument("--pid", type=int, default=None,
                          help="inspect only this pid (default: auto-discover "
                               "the vLLM server + engine processes)")
+    p_write.add_argument(
+        "--artifact-dir",
+        default=None,
+        help="exact mounted CB artifact served by this process",
+    )
     p_write.set_defaults(func=_cmd_write)
 
     p_show = sub.add_parser("show", help="pretty-print a manifest")

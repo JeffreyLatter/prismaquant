@@ -58,7 +58,8 @@ CB_ARTIFACT_PUBLISH_SCHEMA = (
 )
 _CB_ARTIFACT_PUBLISH_MANIFEST = ".anchored_publish.json"
 _CB_ARTIFACT_OUTPUT_NAMES = (
-    "layer_config.json", "selection.json", "cb_col_weights.pkl",
+    "layer_config.json", "selection.json", "pareto.knees.json",
+    "cb_col_weights.pkl",
 )
 GENERIC_SEGMENT_FIELDS = ("family", "role", "equivalence_class")
 CB_SEGMENT_FIELDS = ("family", "role", "basis")
@@ -1693,8 +1694,12 @@ def write_exportable_artifacts(
         allocator_selection_bytes = (
             allocator_root / "selection.json"
         ).read_bytes()
+        allocator_pareto_bytes = (
+            allocator_root / "pareto.knees.json"
+        ).read_bytes()
         layer_config = json.loads(allocator_layer_bytes)
         selection = json.loads(allocator_selection_bytes)
+        pareto_knees = json.loads(allocator_pareto_bytes)
     except Exception as exc:
         raise AnchoredCostError("allocator outputs are unreadable") from exc
     required = {
@@ -1703,6 +1708,24 @@ def write_exportable_artifacts(
     if selection.get("feasible") is not True or not required.issubset(selection):
         raise AnchoredCostError(
             "allocator selection is infeasible or lacks export contract keys"
+        )
+    primary_knee = (
+        pareto_knees.get(pareto_knees.get("primary"))
+        if isinstance(pareto_knees, Mapping)
+        and isinstance(pareto_knees.get("primary"), str)
+        else None
+    )
+    primary_achieved_bits = (
+        primary_knee.get("achieved_bits")
+        if isinstance(primary_knee, Mapping) else None
+    )
+    if (
+        isinstance(primary_achieved_bits, bool)
+        or not isinstance(primary_achieved_bits, (int, float))
+        or not math.isfinite(float(primary_achieved_bits))
+    ):
+        raise AnchoredCostError(
+            "allocator Pareto knees lack a primary achieved-bpp record"
         )
     col_path = Path(cb_col_weights_path)
     if not col_path.is_file():
@@ -1734,6 +1757,10 @@ def write_exportable_artifacts(
         "selection.json": json.dumps(
             selection, indent=2, sort_keys=True, allow_nan=False
         ).encode(),
+        # Preserve the allocator's own bpp-accounting sidecar next to the
+        # AURA-stamped recipe.  The shipcard deliberately reads this number
+        # instead of recomputing it under a potentially different convention.
+        "pareto.knees.json": allocator_pareto_bytes,
         "cb_col_weights.pkl": col_payload,
     }
     expected_outputs = {
@@ -1757,6 +1784,9 @@ def write_exportable_artifacts(
         ).hexdigest(),
         "allocator_selection_sha256": hashlib.sha256(
             allocator_selection_bytes
+        ).hexdigest(),
+        "allocator_pareto_knees_sha256": hashlib.sha256(
+            allocator_pareto_bytes
         ).hexdigest(),
         "cb_col_weights_sha256": expected_outputs[
             "cb_col_weights.pkl"

@@ -1,7 +1,9 @@
 # Source passthrough in the nvfp4-cb container
 
-Status: producer side implemented; the `delegated_native_mxfp4` serve route is
-pending its cross-repo audit (see [Route status](#route-status)).
+Status: producer and delegated-native MXFP4 route implemented. The released
+Gridbook 0.8.4 MXFP8 dense route is available but remains opt-in and unbacked;
+the exact DSV4 endpoint explicitly enables it (see
+[Route status](#route-status)).
 
 ## The rule
 
@@ -74,7 +76,7 @@ probe inventory: 33,325 Linears
 | Format | Wire id | Source kind | bpw | Synth. | Route status on sm121 |
 |---|---|---|---|---|---|
 | `MXFP4_SOURCE` | `mxfp4_e2m1_ue8m0_g32` | `mxfp4` | 4.25 | yes | **backed — requires `--moe-backend marlin`** |
-| `FP8_BLOCK_UE8M0_SOURCE` | `fp8_e4m3_ue8m0_block128` | `fp8_ue8m0` | 8.00049 | yes | **blocked (measured)** |
+| `FP8_BLOCK_UE8M0_SOURCE` | `fp8_e4m3_ue8m0_block128` | `fp8_ue8m0` | 8.00049 | yes | **available, opt-in/unbacked — Gridbook MXFP8 dense; exact DSV4 endpoint sets `GRIDBOOK_MXFP8_DENSE=1`** |
 | `FP8_SOURCE` | — | `fp8` | 8.00195 | no | backed (other checkpoints) |
 | `BF16` | — | `bf16` | 16 | no | backed |
 
@@ -85,7 +87,7 @@ which is not a passthrough and has no source kind (it is legal on any):
 |---|---|---|---|
 | `MXFP8_UE8M0_G32` | `mxfp8_e4m3_e8m0_g32` | 8.25 | **unbacked — consumer lane exists but is opt-in (`GRIDBOOK_MXFP8_DENSE=1`), serve-parity bench pending** |
 
-### The route verdicts came out the opposite way round
+### The stock-route verdicts came out the opposite way round
 
 Both were measured on GB10/sm121, 2026-08-03. The intuition "the released
 checkpoint already serves this way, so a route must exist" is **false**:
@@ -96,14 +98,21 @@ checkpoint already serves this way, so a route must exist" is **false**:
   Triton path is hard-excluded on SM12x (0/15 kernels). `--moe-backend marlin`
   is therefore **part of the serving contract, not a tuning hint**, and it
   travels with the artifact.
-* **`FP8_BLOCK_UE8M0_SOURCE` is blocked** — every route measured dead:
+* **Every stock route for `FP8_BLOCK_UE8M0_SOURCE` was measured dead**:
   `deep_gemm` assert, cutlass `scaled_mm` rejects the block layout, triton
   `KeyError: float8_e8m0fnu`, flashinfer's gate is sm90-exact, marlin-linear
-  tops out at sm89.
+  tops out at sm89. Gridbook subsequently supplied its own sm120 MXFP8 dense
+  route. In released 0.8.4 that route is correctness-audited and available,
+  but remains opt-in behind `GRIDBOOK_MXFP8_DENSE=1` and unbacked until its
+  served NATIVE-PARITY bench passes.
 
-**The architectural consequence: CB re-encoding of the body is the only way
-DSV4-Flash serves on this box at all.** The body's CB rungs are load-bearing,
-not merely economical.
+**The architectural consequence:** CB re-encoding remains the only
+default-on body route, but it is no longer the only route that can serve on
+this box. The exact DSV4 endpoint hard-enables `GRIDBOOK_MXFP8_DENSE=1`, so a
+body unit may use the opt-in Gridbook MXFP8 dense route. That makes the route
+available, not backed: route-pending acknowledgement and the served parity
+gate remain mandatory, and the body's CB rungs remain load-bearing rather than
+merely economical.
 
 A blocked or pending rung still stays **on the menu** — if the DP wants it,
 that is the serving gap surfacing in the allocation rather than at deploy
@@ -115,6 +124,8 @@ time — but the exporter refuses to ship a selection containing one without
     --moe-backend marlin        (MXFP4 experts; the default backend asserts)
     --kv-cache-dtype fp8        (the SM120 MLA backend asserts otherwise)
     VLLM_USE_DEEP_GEMM=0        (the hyper-connections path breaks otherwise)
+    GRIDBOOK_MXFP8_DENSE=1      (exact DSV4 endpoint; available opt-in route,
+                                 not a backed/default promotion)
 
 "Synthesized candidate" means the allocator *manufactures* the cost row rather
 than requiring a column in the cost table. No cost run will ever have a column

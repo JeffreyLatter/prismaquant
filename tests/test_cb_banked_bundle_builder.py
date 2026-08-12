@@ -23,10 +23,9 @@ def _pretend_gridbook_supports_routed_lut(monkeypatch):
     """Supply the routed per-role LUT capability explicitly.
 
     The banked builder writes routed-MoE learned cells, gated on
-    ``GRIDBOOK_ROUTED_MOE_PER_ROLE_CODEBOOK_LUT_MIN_VERSION``. The shipped pin
-    is the released 0.8.2, which correctly refuses that path — no released
-    Gridbook carries the ABI yet. Reading the shipped pin here would let a pin
-    move decide whether the builder's own tests run their subject.
+    ``GRIDBOOK_ROUTED_MOE_PER_ROLE_CODEBOOK_LUT_MIN_VERSION``. Supply that
+    capability explicitly so a pin move never decides whether the builder's
+    own tests run their subject.
     """
     from prismaquant import gridbook_runtime_pin as runtime_pin
 

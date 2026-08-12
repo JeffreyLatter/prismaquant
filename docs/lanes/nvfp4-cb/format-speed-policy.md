@@ -32,17 +32,29 @@ They are not final evidence. A selected assignment still requires same-session
 end-to-end timing plus served KL/PPL/tasks, because routing, scheduler batching,
 graphs, scratch pressure, and fallback can change the global rank.
 
-When reporting a relative speed tax, the reference is the fastest **globally
-feasible assignment under the same whole-artifact byte budget**, memory limits,
-legality rules, and serving-unit coupling. Summing each unit's independently
-fastest format is invalid: that combination can exceed the byte budget,
-especially below 4.5 bpp. Define the fastest feasible reference independently
-for prefill and decode; do not blend the phases.
+Two denominators have different jobs and must not be conflated:
+
+- An allocator study that claims a *relative speed tax* against the best
+  attainable assignment uses the fastest **globally feasible assignment under
+  the same whole-artifact byte budget**, memory limits, legality rules, and
+  serving-unit coupling. Summing independently fastest units is invalid, and a
+  bounded probe set cannot claim global optimality.
+- A production release must meet served-speed parity with the exact container
+  it displaces (repository rule 4). The manifest names that prior artifact,
+  why it is the displaced deployment, its complete content identity and byte
+  budget, and benchmarks it afresh in the same image/runtime/hardware/workload
+  session. This is a release-comparison claim, not a claim that the displaced
+  artifact is globally fastest.
+
+Both comparisons remain phase-specific for prefill and decode; neither blends
+the phases. A proof that an all-native assignment exceeds the byte budget only
+rules out that class. It neither proves global optimality nor chooses the
+release comparator.
 
 ### What is implemented, and what still gates promotion
 
-The constrained Pareto solver described here **is implemented** as of the
-ultraplan P5c producer work (gridbook
+The constrained Pareto solver described here **is implemented** as proposal
+machinery as of the ultraplan P5c producer work (gridbook
 `docs/audits/ultraplan_perf_2026-08-01.md` §6). Concretely:
 
 - **The constraints are hard and separate.** `prismaquant/serve_constraints.py`
@@ -131,7 +143,7 @@ encodes:
   fallback route it takes when it does not. The backed rung set is spec data
   keyed by the pinned Gridbook version in
   `prismaquant/gridbook_runtime/gridbook_runtime_pin.json`; a pinned version
-  the spec does not declare backs nothing. Gridbook 0.7.0 instantiates
+  the spec does not declare backs nothing. Gridbook 0.8.4 instantiates
   FP8-CB fused mid-M for K ∈ {28,32,36,40,44,48} while production permits
   every K28..K48, so the allocator can no longer price an unbacked fast path
   without recording that it did (the producer-side mirror of gridbook K1.2).

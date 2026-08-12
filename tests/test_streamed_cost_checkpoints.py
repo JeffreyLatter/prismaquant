@@ -391,7 +391,9 @@ def test_streamed_aura_production_anchors_are_sparse_and_never_use_rtn(
     assert model is runner.model
 
 
-def test_streamed_aura_releases_bf16_anchors_while_building_fp32_dweights():
+def test_streamed_aura_releases_bf16_anchors_while_building_fp32_dweights(
+    monkeypatch,
+):
     torch.manual_seed(112)
     seed_model = _DenseTinyLM().eval()
     state = {
@@ -457,7 +459,20 @@ def test_streamed_aura_releases_bf16_anchors_while_building_fp32_dweights():
         "refs": [],
         "prior_released_before_next_pop": [],
         "remaining_after_pop": [],
+        "allocator_release_calls": [],
     }
+
+    def release_allocator_cache(device):
+        # The allocator release must happen only after the last BF16 anchor
+        # reference is gone, and before the adjoint probe loop starts.
+        assert all(ref() is None for ref in tracker["refs"])
+        tracker["allocator_release_calls"].append(str(device))
+
+    monkeypatch.setattr(
+        aura,
+        "_release_streamed_anchor_allocator_cache",
+        release_allocator_cache,
+    )
     tracked_model, _tracked_context, tracked_runner = _dense_runner(state)
     tracked = aura.compute_aura_cost_streamed(
         tracked_runner,
@@ -473,10 +488,28 @@ def test_streamed_aura_releases_bf16_anchors_while_building_fp32_dweights():
     assert tracker["remaining_after_pop"] == [1, 0]
     assert tracker["prior_released_before_next_pop"] == [True]
     assert all(ref() is None for ref in tracker["refs"])
+    assert tracker["allocator_release_calls"] == ["cpu"]
     assert tracked["stats"] == control["stats"]
     assert tracked["costs"] == control["costs"]
     assert tracked_model is tracked_runner.model
     assert control_model is control_runner.model
+
+
+def test_streamed_anchor_allocator_release_is_cuda_only(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        torch.cuda, "synchronize", lambda device: calls.append(("sync", device))
+    )
+    monkeypatch.setattr(
+        torch.cuda, "empty_cache", lambda: calls.append(("empty", None))
+    )
+
+    aura._release_streamed_anchor_allocator_cache(torch.device("cpu"))
+    assert calls == []
+
+    cuda = torch.device("cuda")
+    aura._release_streamed_anchor_allocator_cache(cuda)
+    assert calls == [("sync", cuda), ("empty", None)]
 
 
 def _run_checkpointed_anchor_diagnostic(

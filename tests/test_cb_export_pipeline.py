@@ -22,6 +22,7 @@ from prismaquant.export_nvfp4_cb_streaming import (  # noqa: E402
     _StreamWriter,
     export_nvfp4_cb_streaming,
 )
+from prismaquant.shipcard import load_shipcard  # noqa: E402
 
 
 def _fake_writer(
@@ -194,4 +195,20 @@ def test_gpu_streaming_export_pipeline_identity(
         allow_unstamped_research=True,
     )
 
-    assert _tree_bytes(serial) == _tree_bytes(pipelined)
+    serial_tree = _tree_bytes(serial)
+    pipelined_tree = _tree_bytes(pipelined)
+    # The value-bearing artifact must be byte-identical.  The refusal record
+    # intentionally binds its own final publication path and caches each
+    # freshly written weight file's mtime/ctime, so two independently exported
+    # directories cannot have byte-identical shipcards.
+    serial_card_bytes = serial_tree.pop("shipcard.json")
+    pipelined_card_bytes = pipelined_tree.pop("shipcard.json")
+    assert serial_tree == pipelined_tree
+    assert len(serial_card_bytes) == len(pipelined_card_bytes)
+
+    serial_card = load_shipcard(serial / "shipcard.json")
+    pipelined_card = load_shipcard(pipelined / "shipcard.json")
+    for key in ("model_sha", "artifact_bytes", "reserved_file_bytes", "build", "slots"):
+        assert serial_card[key] == pipelined_card[key]
+    assert serial_card["model_dir"] == str(serial)
+    assert pipelined_card["model_dir"] == str(pipelined)
