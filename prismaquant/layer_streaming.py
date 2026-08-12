@@ -1748,6 +1748,7 @@ def _embed_prefix(base_model: nn.Module, full_path: str) -> str:
 def _layer_attention_type(layer: nn.Module):
     lt = (
         getattr(layer, "layer_type", None)
+        or getattr(layer, "block_type", None)
         or getattr(getattr(layer, "self_attn", None), "layer_type", None)
         or getattr(getattr(layer, "attention", None), "layer_type", None)
     )
@@ -1772,6 +1773,18 @@ def _layer_attention_type(layer: nn.Module):
     lts = getattr(cfg, "layer_types", None) if cfg is not None else None
     if idx is not None and lts is not None and 0 <= int(idx) < len(lts):
         return lts[int(idx)]
+    # Qwen3.5/Qwen3.6 DeltaNet convention (transformers>=5.15.0): the
+    # decoder layer exposes no `layer_type`/`block_type`-driven idx match
+    # reachable above for its recurrent layers (no `self_attn`/`attention`
+    # at all on those layers, so the idx-fallback above can't fire either).
+    # Detect structurally instead: `.linear_attn` present -> recurrent
+    # (Qwen3_5GatedDeltaNet); `.self_attn`/`.attention` present -> dense.
+    # Unambiguous for this family; does not change resolution for any
+    # model that doesn't expose `.linear_attn`.
+    if hasattr(layer, "linear_attn"):
+        return "linear_attention"
+    if hasattr(layer, "self_attn") or hasattr(layer, "attention"):
+        return "full_attention"
     return None
 
 
@@ -1932,14 +1945,37 @@ def _compute_attention_mask(
 ):
     """Return the streaming attention mask for a full forward pass.
 
-    Most models use one full causal mask. Gemma3/Gemma4-style hybrid models
-    declare ``config.layer_types`` with both ``full_attention`` and
-    ``sliding_attention``; those must receive the same per-type mask mapping
-    that HuggingFace's model.forward builds.
+    Most models use one full causal mask. Hybrid models declare
+    ``config.layer_types`` mixing ``full_attention`` with one of:
+
+    - ``sliding_attention`` (Gemma3/Gemma4-style windowed attention) — needs
+      the dense additive mask from HuggingFace's own ``masking_utils``
+      (``create_sliding_window_causal_mask``), same family as
+      ``full_attention``'s ``create_causal_mask``, just windowed.
+    - ``linear_attention`` (Qwen3.5/Qwen3.6 DeltaNet-style recurrent
+      hybrids) — NOT a variant of causal attention at all. The recurrence
+      is already causal by construction, so the "mask" HuggingFace's
+      ``apply_mask_to_padding_states()`` wants is the RAW 2D
+      ``[batch, seq_len]`` padding mask (or ``None`` for an unpadded
+      batch), used only to zero padding positions before the scan. This
+      mirrors ``Qwen3_5TextModel._update_linear_attn_mask()`` (minus its
+      cache-position/all-ones fast path — a pure no-op already subsumed by
+      ``apply_mask_to_padding_states``'s own ``shape[0] > 1 and
+      shape[1] > 1`` guard). Feeding it the dense ``[1, 1, T, T]`` causal
+      mask instead — the bug this branch fixes — broadcasts wrongly
+      against ``hidden_states`` inside ``apply_mask_to_padding_states``
+      (``hidden_states * attention_mask[:, :, None]``) and raises a
+      tensor-size mismatch on the last dim (hidden_size vs. seqlen).
+
+    Both hybrid kinds return the same ``{layer_type: mask}`` mapping shape;
+    ``_call_layer`` selects the right entry per layer via its
+    ``layer.layer_type``.
     """
     cfg = getattr(base_model, "config", None)
     layer_types = tuple(getattr(cfg, "layer_types", ()) or ())
-    if cfg is None or "sliding_attention" not in layer_types:
+    has_sliding = "sliding_attention" in layer_types
+    has_linear = "linear_attention" in layer_types
+    if cfg is None or not (has_sliding or has_linear):
         return _make_causal_mask(hidden.size(1), hidden.device, hidden.dtype)
 
     try:
@@ -1949,7 +1985,8 @@ def _compute_attention_mask(
         )
     except Exception as exc:
         raise RuntimeError(
-            "sliding-window layer_types require transformers masking_utils"
+            "sliding-window/linear-attention layer_types require "
+            "transformers masking_utils"
         ) from exc
 
     mask_kwargs = {
@@ -1960,7 +1997,7 @@ def _compute_attention_mask(
         "position_ids": position_ids,
     }
     sliding_mask_kwargs = dict(mask_kwargs)
-    if getattr(cfg, "use_bidirectional_attention", False):
+    if has_sliding and getattr(cfg, "use_bidirectional_attention", False):
         try:
             from transformers.models.gemma3.modeling_gemma3 import (
                 _bidirectional_window_overlay,
@@ -1977,23 +2014,34 @@ def _compute_attention_mask(
             cfg.sliding_window
         )
 
-    masks = {
-        "full_attention": create_causal_mask(**mask_kwargs),
-        "sliding_attention": create_sliding_window_causal_mask(
+    masks = {"full_attention": create_causal_mask(**mask_kwargs)}
+
+    if has_sliding:
+        masks["sliding_attention"] = create_sliding_window_causal_mask(
             **sliding_mask_kwargs
-        ),
-    }
-    # DSv4-Flash: the compress-ratio ladder yields layer types beyond the
-    # Gemma pair — compressed_sparse_attention (ratio 4) and
-    # heavily_compressed_attention (ratio 128). In probe mode every
-    # compressed variant degrades to sliding-window-only attention (the
-    # vendored layer stubs out the compressor and skips the long-range
-    # branch), and the vendored root feeds one sliding-window mask to all
-    # layers. Alias exactly those two types to the sliding mask; any
-    # other unknown layer type still fails loudly downstream.
-    for lt in ("compressed_sparse_attention", "heavily_compressed_attention"):
-        if lt in layer_types and lt not in masks:
-            masks[lt] = masks["sliding_attention"]
+        )
+        # DSv4-Flash: the compress-ratio ladder yields layer types beyond
+        # the Gemma pair — compressed_sparse_attention (ratio 4) and
+        # heavily_compressed_attention (ratio 128). In probe mode every
+        # compressed variant degrades to sliding-window-only attention
+        # (the vendored layer stubs out the compressor and skips the
+        # long-range branch), and the vendored root feeds one
+        # sliding-window mask to all layers. Alias exactly those two types
+        # to the sliding mask; any other unknown layer type still fails
+        # loudly downstream.
+        for lt in ("compressed_sparse_attention", "heavily_compressed_attention"):
+            if lt in layer_types and lt not in masks:
+                masks[lt] = masks["sliding_attention"]
+
+    if has_linear:
+        # DeltaNet/Mamba-style linear-attention layers: pass the raw
+        # incoming padding mask through untouched (see docstring). This is
+        # deliberately *not* `_make_causal_mask(...)` — linear-attention
+        # layers must never receive a dense additive mask, only the 2D
+        # padding mask (or None) that `apply_mask_to_padding_states`
+        # expects.
+        masks["linear_attention"] = attention_mask
+
     return masks
 
 
