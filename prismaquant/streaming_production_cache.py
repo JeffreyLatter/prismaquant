@@ -41,7 +41,7 @@ from prismaquant import format_registry as fr
 from prismaquant.build_rtn_cache import iter_quantizable_tensors
 from prismaquant.measure_quant_cost import (
     ActivationIndex,
-    canonical_linear_name,
+    resolve_cost_target_name,
 )
 from prismaquant.production_weight_cache import (
     CB_CACHE_PAIR_IDENTITY_SCHEMA,
@@ -340,7 +340,7 @@ def _render_dense_layer(
     if needs_nvfp4:
         per_qname_max_abs: dict[str, float] = {}
         for qname in qname_to_module:
-            canonical = canonical_linear_name(qname, profile)
+            canonical = resolve_cost_target_name(qname, act_index, profile)
             if canonical not in act_index:
                 continue
             X, _ = act_index.load_with_row_indices(canonical)
@@ -368,7 +368,7 @@ def _render_dense_layer(
         if not pending_formats:
             continue
         weight = mod.weight.data
-        canonical = canonical_linear_name(qname, profile)
+        canonical = resolve_cost_target_name(qname, act_index, profile)
         cold_declared = qname in declared_cold_qnames
         if canonical not in act_index and not cold_declared:
             raise RuntimeError(
@@ -696,10 +696,16 @@ class StreamedProductionAnchorRenderer:
                 f"declared routed experts; sample={not_routed[:8]}"
             )
 
+        # Probe-side key, not the live module name: DSv4-Flash keys its probe
+        # and activation cache under the RAW per-expert names, so resolving
+        # through canonical_linear_name alone reports every routed expert as
+        # missing.  resolve_cost_target_name is the one rule both conventions
+        # go through, and it stays fail-closed when neither spelling is cached.
         missing_activations = {
             qname
             for qname in canonical_plan
-            if canonical_linear_name(qname, profile) not in act_index
+            if resolve_cost_target_name(qname, act_index, profile)
+            not in act_index
         }
         if missing_activations != set(cold_qnames):
             undeclared = sorted(missing_activations - set(cold_qnames))

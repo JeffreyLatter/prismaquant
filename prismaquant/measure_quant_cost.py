@@ -31,7 +31,7 @@ import re
 import signal
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Container, Sequence
 from pathlib import Path
 
 import torch
@@ -399,9 +399,9 @@ def canonical_linear_name(name: str, profile=None) -> str:
     return f"{prefix}.{parent}.{expert_id}"
 
 
-def resolve_cost_target_name(name: str, target_names: set[str],
+def resolve_cost_target_name(name: str, target_names: Container[str],
                              profile=None) -> str:
-    """Cost-row key for a live module name, honoring raw-name probes.
+    """Probe-side key for a live module name, honoring raw-name probes.
 
     ``canonical_linear_name`` remaps per-expert live names to packed-style
     names (``experts.gate_up_proj.E`` / ``experts.down_proj.E``). Models
@@ -409,6 +409,14 @@ def resolve_cost_target_name(name: str, target_names: set[str],
     (DSv4-Flash) would then miss ``target_names`` and every routed expert
     would be silently skipped. Fall back to the raw live name when the
     remapped name misses but the raw name is a target.
+
+    ``target_names`` is any container of probe-side keys: the cost-row key
+    set, or an :class:`ActivationIndex`, whose ``__contains__`` answers the
+    same question for the activation cache written alongside those rows.
+    Both conventions come from the same probe, so they resolve by the same
+    rule. Resolution is fail-closed: when neither spelling is present the
+    canonical name is returned, so the caller's own missing-branch fires
+    (and reports the canonical spelling) rather than a silent skip.
     """
     canonical = canonical_linear_name(name, profile)
     if canonical not in target_names and name in target_names:

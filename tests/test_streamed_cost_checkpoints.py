@@ -684,6 +684,86 @@ def test_production_anchor_cold_render_requires_exact_declared_profile_scope(
     )
 
 
+def test_production_anchor_resolves_raw_named_expert_activation_cache(
+    monkeypatch,
+):
+    """DSv4-Flash keys its activation cache under RAW per-expert names.
+
+    ``canonical_linear_name`` remaps those onto the packed Qwen-style
+    spelling, which is cached for nobody here -- so resolving through it
+    alone reports every routed expert as an undeclared activation miss, and
+    (had the coverage gate not been fail-closed) would have rendered 66k
+    experts against the never-routed neutral prior instead of their real
+    activations.
+    """
+    import prismaquant.streaming_production_cache as streaming
+    from prismaquant.measure_quant_cost import canonical_linear_name
+    from prismaquant.nvfp4_cb_footprint import CBSerializationContext
+
+    torch.manual_seed(111)
+    model = _ExpertTinyLM().eval()
+    profile = DeepseekV4Profile()
+    qname = "model.layers.0.mlp.experts.1.gate_proj"
+    # The remap is real for this profile: without the raw-name fallback the
+    # renderer would look up a key the cache has never held.
+    assert canonical_linear_name(qname, profile) != qname
+
+    class _RawNamedActivations:
+        def __init__(self, names):
+            self._names = set(names)
+            self.loaded: list[str] = []
+
+        def __contains__(self, name):
+            return name in self._names
+
+        def load_with_row_indices(self, name):
+            if name not in self._names:
+                raise KeyError(name)
+            self.loaded.append(name)
+            cols = int(model.get_submodule(qname).weight.shape[1])
+            return torch.ones(4, cols), None
+
+    act_index = _RawNamedActivations([qname])
+    calls = []
+
+    def render(weight, fmt, *, activations, **_kw):
+        calls.append((fmt, sorted(activations)))
+        return weight.detach().clone() + 0.03125
+
+    monkeypatch.setattr(streaming, "render_production_weight", render)
+    # No cold declaration: the expert IS cached, just under the raw name.
+    renderer = streaming.StreamedProductionAnchorRenderer(
+        model,
+        act_index=act_index,
+        formats_by_qname={qname: ("NVFP4_CB_K12",)},
+        levers={"gptq": True, "weighted_vq": True},
+        profile=profile,
+        device="cpu",
+        col_weights={qname: torch.ones(16)},
+        cb_serialization_context=CBSerializationContext.production(
+            scale_sweep=True,
+            ldlq=True,
+            codebook_source="lattice",
+        ),
+        calibration_hash="b" * 64,
+        arm_identity={"arm": "fixture-raw-named-acts"},
+        model_identity=_model_identity("raw-named-act-source"),
+        max_act_rows=8,
+        producer_git_commit="3" * 40,
+        producer_source_sha256="4" * 64,
+    )
+    rendered = renderer.render_layer(
+        layer=0,
+        modules={qname: model.get_submodule(qname)},
+        formats_by_qname={qname: ("NVFP4_CB_K12",)},
+    )
+    assert set(rendered) == {(qname, "NVFP4_CB_K12")}
+    # Loaded under the raw name, and the render saw the REAL activations
+    # rather than the empty cold-prior mapping.
+    assert act_index.loaded == [qname]
+    assert calls == [("NVFP4_CB_K12", [qname])]
+
+
 def test_streamed_expert_cost_rows_are_exactly_resident_rows():
     torch.manual_seed(106)
     seed_model = _ExpertTinyLM().eval()
