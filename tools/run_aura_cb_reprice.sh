@@ -248,14 +248,39 @@ if [[ "$TARGET" == "dsv4" ]]; then
     -e "RUN_ROOT=$RUN_ROOT"
     -e "CB_ROUTED_MOE_BOOK_SELECTION=$CB_ROUTED_MOE_BOOK_SELECTION"
   )
-  case "$CB_ROUTED_MOE_BOOK_SELECTION" in
-    "$WORK_DIR"/*|"$RUN_ROOT"/*) ;;
-    *)
-      docker_args+=(
-        -v "$CB_ROUTED_MOE_BOOK_SELECTION:$CB_ROUTED_MOE_BOOK_SELECTION:ro"
-      )
-      ;;
-  esac
+  # A routed selection is not one file: load_routed_moe_cbl_selection requires
+  # `book_root` to be a real directory, and load_banked_cbl_book opens each
+  # named burn shard. Those live under $RUN_ROOT/cost-ldlq, which nothing
+  # mounts -- only $RUN_ROOT/prod-cal-0p7 is bound. The old case statement made
+  # that invisible: it treated any path under $RUN_ROOT as already mounted and
+  # skipped the bind, so a selection in the natural place resolved on the host
+  # during preflight and then vanished inside the container.
+  #
+  # Derive the mounts from the selection itself rather than hardcoding a tree,
+  # so moving the bank or the shards cannot silently unmount them.
+  if [[ -n "$CB_ROUTED_MOE_BOOK_SELECTION" ]]; then
+    while IFS= read -r mount_path; do
+      [[ -n "$mount_path" ]] || continue
+      case "$mount_path" in
+        "$WORK_DIR"|"$WORK_DIR"/*) continue ;;
+      esac
+      docker_args+=(-v "$mount_path:$mount_path:ro")
+    done < <("$PYTHON_BIN" - "$CB_ROUTED_MOE_BOOK_SELECTION" <<'PY'
+import json, os, sys
+path = os.path.realpath(sys.argv[1])
+payload = json.load(open(path))
+roots = {os.path.realpath(payload["book_root"]), os.path.dirname(path)}
+roots.update(
+    os.path.dirname(os.path.realpath(cell["burn_shard"]))
+    for cell in payload.get("cells", ())
+)
+# Drop any root already covered by an ancestor so docker gets no redundant binds.
+keep = [r for r in sorted(roots)
+        if not any(r != o and r.startswith(o + os.sep) for o in roots)]
+print("\n".join(keep))
+PY
+    )
+  fi
 fi
 
 container_started=1
