@@ -4,6 +4,7 @@ import hashlib
 import json
 from pathlib import Path
 import pickle
+import sys
 
 import pytest
 
@@ -304,6 +305,24 @@ def test_outer_waiter_refuses_dirty_release_tree(monkeypatch):
     with pytest.raises(waiter.WaiterError, match="must be clean"):
         waiter._outer_reexec(["wait"])
     assert calls[-1] == ("status", "--porcelain", "--untracked-files=all")
+
+
+def test_waiter_loads_completion_logic_without_package_startup(monkeypatch):
+    repo = Path(waiter.__file__).resolve().parent.parent
+    closure = "6" * 64
+    module_name = f"_prismaquant_release_dsv4_campaign_completion_{closure}"
+    monkeypatch.setitem(sys.modules, "prismaquant", None)
+    try:
+        completion = waiter._load_completion_module({
+            "snapshot": str(repo),
+            "closure_sha256": closure,
+        })
+        assert Path(completion.__file__).resolve() == (
+            repo / "prismaquant" / "dsv4_campaign_completion.py"
+        )
+        assert completion.PRODUCER_SCHEMA == PRODUCER_SCHEMA
+    finally:
+        sys.modules.pop(module_name, None)
 
 
 def test_systemd_waiter_refs_before_capture_and_always_cleans_up(monkeypatch):

@@ -177,27 +177,63 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _inner_main(args: argparse.Namespace) -> dict[str, Any]:
-    snapshot_identity = _verify_inner_snapshot()
-    expected_init = (
-        Path(str(snapshot_identity["snapshot"])) / "prismaquant" / "__init__.py"
-    ).resolve(strict=True)
+def _load_completion_module(snapshot_identity: dict[str, Any]) -> Any:
+    """Load the receipt implementation without importing package startup code.
+
+    This host-side waiter only needs the stdlib plus D-Bus/GLib.  Importing the
+    ``prismaquant`` package first would also import the format registry and
+    PyTorch, needlessly coupling terminal receipt publication to the full GPU
+    runtime dependency set.  Load the reviewed file directly from the already
+    verified content-addressed snapshot instead.
+    """
     import importlib.util
 
-    spec = importlib.util.find_spec("prismaquant")
-    if spec is None or spec.origin is None or Path(spec.origin).resolve() != expected_init:
-        raise WaiterError("Python resolves PrismaQuant outside the reviewed snapshot")
-    from prismaquant.dsv4_campaign_completion import (
-        CampaignCompletionError,
-        PRODUCER_SCHEMA,
-        audit_campaign_closure,
-        build_completion_receipt,
-        completion_receipt_path,
-        load_completion_receipt,
-        publish_completion_receipt,
-        verify_receipt_against_current_campaign,
-        wait_for_bound_systemd_service,
+    snapshot = Path(str(snapshot_identity["snapshot"])).resolve(strict=True)
+    module_path = snapshot / "prismaquant" / "dsv4_campaign_completion.py"
+    if module_path.is_symlink() or not module_path.is_file():
+        raise WaiterError("reviewed runtime snapshot lacks completion logic")
+    module_path = module_path.resolve(strict=True)
+    if module_path.parent.parent != snapshot:
+        raise WaiterError("completion logic resolves outside the runtime snapshot")
+    module_name = (
+        "_prismaquant_release_dsv4_campaign_completion_"
+        f"{snapshot_identity['closure_sha256']}"
     )
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    if spec is None or spec.loader is None or spec.origin is None:
+        raise WaiterError("cannot load completion logic from the runtime snapshot")
+    if Path(spec.origin).resolve(strict=True) != module_path:
+        raise WaiterError("completion module origin differs from the reviewed file")
+    module = importlib.util.module_from_spec(spec)
+    previous = sys.modules.get(module_name)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        if previous is None:
+            sys.modules.pop(module_name, None)
+        else:
+            sys.modules[module_name] = previous
+        raise
+    if Path(str(module.__file__)).resolve(strict=True) != module_path:
+        raise WaiterError("loaded completion logic has an unexpected origin")
+    return module
+
+
+def _inner_main(args: argparse.Namespace) -> dict[str, Any]:
+    snapshot_identity = _verify_inner_snapshot()
+    completion = _load_completion_module(snapshot_identity)
+    CampaignCompletionError = completion.CampaignCompletionError
+    PRODUCER_SCHEMA = completion.PRODUCER_SCHEMA
+    audit_campaign_closure = completion.audit_campaign_closure
+    build_completion_receipt = completion.build_completion_receipt
+    completion_receipt_path = completion.completion_receipt_path
+    load_completion_receipt = completion.load_completion_receipt
+    publish_completion_receipt = completion.publish_completion_receipt
+    verify_receipt_against_current_campaign = (
+        completion.verify_receipt_against_current_campaign
+    )
+    wait_for_bound_systemd_service = completion.wait_for_bound_systemd_service
 
     receipt_path = completion_receipt_path(WORK_DIR)
     producer = {
