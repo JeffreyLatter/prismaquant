@@ -80,8 +80,10 @@ DSV4_ARTIFACT_RESERVE_BYTES = 268_435_456
 # and the fused mainloop's single CbSubW = k/4 sub-table width is the format's
 # real layout only on those rungs -- a uniform decode at, say, k37 would be
 # *wrong*, not merely unaligned.  serving_profile_specs/nvfp4_cb.json backs
-# [28, 32, 36, 40, 44, 48] for every runtime 0.5.0..0.8.2 (the pin is 0.8.2,
-# version_is_release), so this is the served set, not an aspiration.  NVFP4-CB
+# [28, 32, 36, 40, 44, 48] for every runtime 0.5.0..0.8.3 (the pin is 0.8.3,
+# version_is_release; advanced from 0.8.2 together with the matching backed-set
+# key, because 0.8.2 refuses a learned codebook on any routed-MoE stack), so
+# this is the served set, not an aspiration.  NVFP4-CB
 # is outside that law -- its lane backs no fused mid-M rungs at any version --
 # so K12..K18 stays contiguous.
 NVFP4_FORMATS = tuple(f"NVFP4_CB_K{k}" for k in range(12, 19))

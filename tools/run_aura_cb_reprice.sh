@@ -79,10 +79,22 @@ fp8_menu() {
 #      codebook_for() raises ValueError on an untrained rung, mid-render.
 #   2. A cached-menu rung costs 2.002 bytes/qparam of disk, K-independent, so a
 #      21-rung menu on a 27B is ~619 GiB against ~281 GB free.
-# Defaults are the DSv4 values: unexported env reproduces the prior behaviour
-# byte-for-byte.
-EXPERT_FORMATS="${EXPERT_FORMATS:-$(fp8_menu 28 33)}"
-NONEXPERT_FORMATS="${NONEXPERT_FORMATS:-$(fp8_menu 28 48)}"
+# The DSv4 defaults are the ON-LAW rungs, matching prismaquant.dsv4_aura_cb_reprice's
+# FP8_EXPERT_FORMATS / FP8_NONEXPERT_FORMATS. That module raises
+# "frozen CLI menus differ from the DSv4 on-law contract" on anything else, so the
+# old contiguous K28..K33 / K28..K48 defaults could not run a dsv4 campaign at all --
+# they aborted it at prepare time and every invocation had to override them. The
+# contract lives in the module; these defaults now agree with it instead of
+# contradicting it. (k % 4 == 0 is gridbook K1.2's fused mid-M prefill law; routed
+# experts are additionally capped at K33 by the byte-exact source-payload ceiling,
+# leaving exactly K28/K32.)
+if [[ "$TARGET" == "dsv4" ]]; then
+  EXPERT_FORMATS="${EXPERT_FORMATS:-FP8_CB_K28,FP8_CB_K32}"
+  NONEXPERT_FORMATS="${NONEXPERT_FORMATS:-FP8_CB_K28,FP8_CB_K32,FP8_CB_K36,FP8_CB_K40,FP8_CB_K44,FP8_CB_K48}"
+else
+  EXPERT_FORMATS="${EXPERT_FORMATS:-$(fp8_menu 28 33)}"
+  NONEXPERT_FORMATS="${NONEXPERT_FORMATS:-$(fp8_menu 28 48)}"
+fi
 DENSE_FORMATS="${DENSE_FORMATS:-$NONEXPERT_FORMATS}"
 CALIB_NSAMPLES="${CALIB_NSAMPLES:-16}"
 CALIB_SEQLEN="${CALIB_SEQLEN:-512}"
