@@ -45,12 +45,45 @@ predecessor, so the free (CBL) arm is the only arm and every banked cell is the
 certified pooled-Lloyd product book.  The weights are loaded once per
 (layer, projection) and reused across both rungs, so this costs I/O nothing.
 
+CALIBRATION REBASE (--col-weights / --act-root)
+-----------------------------------------------
+A book is learned FROM an imatrix and an activation cache, so the calibration is
+part of its identity, not a setting: `_book_key` hashes `col_weights_digest`,
+and `load_banked_cbl_book` refuses a shard whose digest differs from the role
+tensor the exporter is holding.
+
+The a-fast burn ran under `prod-cal-0p6` (md5 fe1492f6).  This artifact's
+campaign is pinned to `prod-cal-0p7` -- `run_aura_cb_reprice.sh` hard-codes
+`--probe prod-cal-0p7/artifacts/probe.pkl` and defaults `CB_COL_WEIGHTS` to the
+0p7 imatrix (md5 746f76fa), which is also what the dense learned bundle was
+built from.  0p7 is the stronger calibration besides: 51 unrouted-expert
+neutral-prior names against 0p6's thousands.  So the routed books are the one
+thing on the wrong side of the campaign's calibration, and they get re-burned
+rather than the campaign getting re-based around them.
+
+Rebasing needs both halves and refuses either alone, because supplying one
+silently learns books from one calibration's activations under another's
+weighting:
+
+  * `--col-weights`  the imatrix the exporter will hold;
+  * `--act-root`     the activation cache it was harvested from.
+
+The verified by-layer store stays the SOURCE-WEIGHT identity oracle -- those
+digests are of the model's own FP8 tensors and no calibration moves them -- but
+its imatrix fields are restated from the tensors actually in hand, and nothing
+else in the identity is allowed to move.  The proof this was done right is a
+check already in `load_projection`: it asserts `x.square().mean(0) == cw` per
+qname, so a mismatched (imatrix, activations) pair aborts at layer 0 instead of
+producing 258 quietly-wrong books.
+
 RESUME
 ------
 `_run_chain` validates and reuses any existing cell whose identity still
 matches, so re-running is safe and skips completed work.  Cells are keyed on the
 full 256-expert stack (`expert_ids=all_experts`, `full_encode_rungs=rung`),
-which is exactly the digest the exporter computes.
+which is exactly the digest the exporter computes.  Books are content-addressed
+under `bucket-books/` by a key that includes the imatrix digest, so a rebased
+burn writes new addresses and can never overwrite the 0p6 generation.
 """
 from __future__ import annotations
 
@@ -63,7 +96,15 @@ from pathlib import Path
 
 import torch
 
+# The single source of truth for the canonical imatrix identity triple.  It is
+# private, and imported anyway on purpose: re-deriving the byte framing here is
+# how a producer and a consumer drift into disagreeing about the same tensors.
+from prismaquant.production_weight_cache import (
+    _canonical_cb_col_weights_identity,
+    validate_cb_render_identity_metadata,
+)
 from tools import dsv4_afast_burn as burn
+from tools import dsv4_ldlq_cost_campaign as ldlq_campaign
 from tools.dsv4_afast_campaign import load_layer_identity, load_projection
 
 # The two on-law, bankable routed rungs.  Not configurable by accident: any
@@ -72,6 +113,14 @@ from tools.dsv4_afast_campaign import load_layer_identity, load_projection
 # time, never to introduce a third.
 ONLAW_ROUTED_RUNGS = (28, 32)
 PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
+
+# Exactly the fields `_canonical_cb_col_weights_identity` produces.  A
+# calibration rebase may restate these three and nothing else.
+_IMATRIX_IDENTITY_FIELDS = [
+    "col_weights_content_sha256",
+    "col_weights_sha256",
+    "col_weights_shapes",
+]
 
 
 def acceptable_cell(path: Path) -> bool:
@@ -129,6 +178,52 @@ def _missing_rungs(layer: int, projection: str, rungs) -> tuple[int, ...]:
     )
 
 
+def _rebased_identity(layer: int, all_col_weights) -> dict:
+    """Layer identity whose imatrix fields describe the imatrix in hand.
+
+    `load_layer_identity` runs FIRST and with the store's own activation root,
+    because it validates the by-layer cost store as the artifact it is: its
+    `meta` records the cache it was built against, and a store that fails its
+    own provenance must not be trusted for source digests either.  Only after
+    it has passed are the three imatrix fields restated.
+
+    The restatement is bounded by an equality check on every other key, which
+    is the `rekey_shards.py` discipline: restate exactly the fields whose
+    inputs deliberately changed, and abort if anything else moved.  Re-running
+    the full metadata validator against the new tensors is what makes the
+    result an identity rather than an edit.
+    """
+    _, verified = load_layer_identity(layer)
+    identity = verified["identity"]
+    digest, shapes, content = _canonical_cb_col_weights_identity(
+        all_col_weights, identity["col_weights_qnames"],
+    )
+    rebased = dict(identity)
+    rebased["col_weights_sha256"] = digest
+    rebased["col_weights_shapes"] = shapes
+    rebased["col_weights_content_sha256"] = content
+    # A SUBSET is expected, not the whole set: `col_weights_shapes` is a
+    # property of the model, so two imatrices over the same tensors restate it
+    # unchanged.  What must never happen is a key outside the set moving.
+    escaped = sorted(
+        key for key in set(identity) | set(rebased)
+        if identity.get(key) != rebased.get(key)
+        and key not in _IMATRIX_IDENTITY_FIELDS
+    )
+    if escaped:
+        raise AssertionError(
+            f"layer {layer}: calibration rebase moved {escaped}, which is "
+            f"outside the imatrix fields {_IMATRIX_IDENTITY_FIELDS}"
+        )
+    validate_cb_render_identity_metadata(
+        rebased,
+        col_weights=all_col_weights,
+        require_source_complete=True,
+        where=f"DSV4 on-law book burn layer {layer} (rebased imatrix)",
+    )
+    return rebased
+
+
 def _burn_cell(*, layer, projection, data, rung) -> dict:
     """One single-rung chain -> one accepted, full-stack-keyed CBL cell."""
     cells = burn._run_chain(
@@ -152,15 +247,50 @@ def main() -> int:
     )
     parser.add_argument("--start-layer", type=int, default=0)
     parser.add_argument("--end-layer", type=int, default=burn.LAYER_COUNT)
-    parser.add_argument(
-        "--manifest",
-        default=str(burn.RUN_ROOT / "onlaw-books" / "ONLAW_BOOK_BURN.jsonl"),
-    )
+    parser.add_argument("--manifest", default=None)
     parser.add_argument(
         "--dry-run", action="store_true",
         help="report the work list and exit without touching the GPU",
     )
+    # See CALIBRATION REBASE above.  Both halves or neither: an imatrix without
+    # its activations weights one calibration's rows by another's second moment,
+    # and `load_projection`'s x.square().mean(0) == cw assertion would be the
+    # only thing standing between that and 258 wrong books.
+    parser.add_argument(
+        "--col-weights", default=None,
+        help="imatrix pickle the exporter will hold; requires --act-root",
+    )
+    parser.add_argument(
+        "--act-root", default=None,
+        help="activation cache that imatrix was harvested from",
+    )
+    # A separate shard root per calibration generation. Without it the resume
+    # scan would happily reuse cells burned under the other imatrix -- they are
+    # structurally valid and differ only in a digest the scan does not check.
+    parser.add_argument(
+        "--shard-root", default=None,
+        help="burn-cell directory; defaults to the campaign's burn-shards",
+    )
     args = parser.parse_args()
+
+    if bool(args.col_weights) != bool(args.act_root):
+        raise SystemExit(
+            "REFUSE: --col-weights and --act-root are one calibration and must "
+            "be given together; supplying either alone learns books from one "
+            "calibration's activations under another's weighting"
+        )
+    if args.shard_root:
+        burn.BURN_CELL_ROOT = Path(args.shard_root)
+        burn.BURN_CELL_ROOT.mkdir(parents=True, exist_ok=True)
+    if args.col_weights:
+        burn.COL_WEIGHTS = Path(args.col_weights)
+
+    # Default the manifest INTO the shard root so a rebased generation cannot
+    # append into the previous one's log and read back as one burn.
+    manifest_path = Path(args.manifest) if args.manifest else (
+        burn.BURN_CELL_ROOT / "ONLAW_BOOK_BURN.jsonl" if args.shard_root
+        else burn.RUN_ROOT / "onlaw-books" / "ONLAW_BOOK_BURN.jsonl"
+    )
 
     rungs = tuple(int(r) for r in args.rungs.split(",") if r.strip())
     illegal = [r for r in rungs if r not in ONLAW_ROUTED_RUNGS]
@@ -205,11 +335,30 @@ def main() -> int:
     # (batch-experts on, expert-batch 16, one stream) are already canonical.
     os.environ["PRISMAQUANT_CB_LDLQ_FEEDER_THREADS"] = "0"
 
-    manifest_path = Path(args.manifest)
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
 
     with burn.COL_WEIGHTS.open("rb") as handle:
         all_col_weights = pickle.load(handle)
+
+    # Identities are resolved FIRST, while ACT_ROOT is still the by-layer
+    # store's own cache -- `load_layer_identity` asserts the store was built
+    # against it, and a store that fails its own provenance must not be trusted
+    # for source digests either.  The burn's activation root is then installed
+    # once and one-way, for `load_projection` only.
+    identities = {
+        layer: _rebased_identity(layer, all_col_weights)
+        for layer in sorted({layer for layer, _, _ in worklist})
+    }
+    if args.act_root:
+        ldlq_campaign.ACT_ROOT = Path(args.act_root)
+    print(
+        f"[onlaw-books] imatrix={burn.COL_WEIGHTS}\n"
+        f"[onlaw-books] activations={ldlq_campaign.ACT_ROOT}\n"
+        f"[onlaw-books] shards={burn.BURN_CELL_ROOT}\n"
+        f"[onlaw-books] manifest={manifest_path}",
+        flush=True,
+    )
+
     model_to_shard, model_to_ckpt = burn._build_weight_map(str(burn.SOURCE))
     scale_map = burn._build_fp8_scale_inv_map(str(burn.SOURCE))
 
@@ -217,10 +366,9 @@ def main() -> int:
     done = 0
     with manifest_path.open("a") as manifest:
         for layer, projection, missing in worklist:
-            _, verified = load_layer_identity(layer)
             data = load_projection(
                 layer, projection, device=torch.device("cuda:0"),
-                identity=verified["identity"], all_col_weights=all_col_weights,
+                identity=identities[layer], all_col_weights=all_col_weights,
                 model_to_shard=model_to_shard, model_to_ckpt=model_to_ckpt,
                 scale_map=scale_map,
             )
