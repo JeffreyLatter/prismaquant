@@ -393,6 +393,43 @@ def test_routed_roles_declare_supplied_lattice_cells(tmp_path, monkeypatch):
     }
 
 
+def test_routed_roles_do_not_pick_up_off_menu_fp8_lattice_rungs(
+    tmp_path, monkeypatch
+):
+    """The lattice declaration is family-scoped, not "everything supplied".
+
+    A routed role's FP8 menu IS its burn selection: the on-law contract gives
+    routed experts K28/K32 only, so an FP8 rung outside the selection is either
+    unlearnable here or off-menu entirely.  K47/K48 are supplied to the build
+    because they witness the learned<=K46 / lattice>K46 rung-policy boundary on
+    the DENSE qnames; they must not leak onto routed roles, where no allocation
+    can reach them and their presence would turn a fail-closed refusal into a
+    silent lattice render.
+    """
+    model_dir, col, selection, _expected, _shards = _fixture(tmp_path)
+
+    def forbidden_train(*_args, **_kwargs):
+        raise AssertionError("routed bundle must not retrain pooled-Lloyd books")
+
+    monkeypatch.setattr(learned, "learn_pool", forbidden_train)
+    bundle = build_bundle_from_model(
+        model_dir=model_dir,
+        col_weights=col,
+        formats=["FP8_CB_K28", "FP8_CB_K48", "NVFP4_CB_K15"],
+        output=tmp_path / "bundle.pqcb",
+        device="cpu",
+        routed_moe_book_selection=selection,
+    )
+    for projection in _PROJECTIONS:
+        role = f"model.layers.{_LAYER}.mlp.experts.{projection}"
+        declared = set(bundle.manifest["cells"][role])
+        assert declared == {"FP8_CB_K28", "NVFP4_CB_K15"}, declared
+        assert "FP8_CB_K48" not in declared
+        member = f"model.layers.{_LAYER}.mlp.experts.0.{projection}"
+        with pytest.raises(ValueError, match="no FP8_CB_K48 cell"):
+            bundle.cell(member, "FP8_CB_K48")
+
+
 def test_routed_lattice_cell_absent_when_the_rung_is_not_supplied(tmp_path):
     """The refusal is real: no cell exists for a rung outside the menu."""
     model_dir, col, selection, _expected, _shards = _fixture(tmp_path)

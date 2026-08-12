@@ -37,7 +37,7 @@ from .export_nvfp4_cb_streaming import (
     _plan_expert_stacks,
 )
 from .model_profiles import detect_profile
-from .nvfp4_cb_footprint import is_cb_format
+from .nvfp4_cb_footprint import _cb_scope_family, is_cb_format
 from .routed_moe_codebooks import (
     logical_role_qname,
     stacked_role_col_weights,
@@ -181,9 +181,12 @@ def build_bundle_from_model(
     and their books are loaded after the current role weight/imatrix identities
     are available.  No directory search, retraining, or lattice fallback is
     reachable for those cells.  Routed roles additionally carry a declaration
-    for every supplied *lattice* format, which needs no book and no training:
-    the bundle is the authoritative per-(qname, format) cell map, so a legal
-    lattice rung with no cell is simply unrenderable.
+    for the supplied *lattice* formats of any family they hold no learned
+    selection in, which needs no book and no training: the bundle is the
+    authoritative per-(qname, format) cell map, so a legal lattice rung with no
+    cell is simply unrenderable.  The family scoping matters -- a routed role's
+    FP8 menu *is* its burn selection, so it must not pick up FP8 lattice rungs
+    no allocation can legally reach.
     """
 
     canonical_formats = _canonical_cb_formats(formats)
@@ -382,8 +385,25 @@ def build_bundle_from_model(
     # "immutable learned bundle has no NVFP4_CB_K15 cell; refusing lattice
     # fallback".  The per-rung basis map is unchanged either way; this makes
     # cell-level resolution agree with it.
+    # Scope the addition to what a routed role can LEGALLY be rendered at, not
+    # to everything the build was handed.  A routed role's FP8 menu *is* its
+    # burn selection -- the on-law contract gives routed experts K28/K32 only,
+    # and an FP8 rung outside the selection is either unlearnable here (no
+    # accepted shard) or off-menu entirely.  So exclude any family the role
+    # already has a learned selection in, and declare the lattice rungs only
+    # for families where it has none.  Declaring an unreachable cell would be
+    # inert today but would soften a fail-closed edge: a later path asking a
+    # routed expert for, say, FP8_CB_K47 would get a lattice render instead of
+    # a refusal.  ``--formats`` still carries K47/K48 for the DENSE qnames,
+    # which is what witnesses the learned<=K46 / lattice>K46 rung-policy
+    # boundary in the bundle-authoritative per-rung map.
+    learned_families = {
+        _cb_scope_family(name) for name in learned_formats
+    }
     lattice_formats = tuple(
-        name for name in canonical_formats if name not in set(learned_formats)
+        name for name in canonical_formats
+        if name not in set(learned_formats)
+        and _cb_scope_family(name) not in learned_families
     )
     formats_by_qname.update({
         qname: tuple(sorted(set(plan.selected_cells) | set(lattice_formats)))
