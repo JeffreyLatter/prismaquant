@@ -224,6 +224,24 @@ def _rebased_identity(layer: int, all_col_weights) -> dict:
     return rebased
 
 
+def resolve_identities(layers, all_col_weights, *, act_root=None) -> dict:
+    """Rebased identities for `layers`, THEN install the burn activation root.
+
+    The ordering is the whole function.  `load_layer_identity` asserts the
+    by-layer store was built against the current `ACT_ROOT`, so every identity
+    has to be resolved while that is still the store's own cache; the burn's
+    root is installed once afterwards, one-way, for `load_projection`.  Callers
+    that did this by hand would get it right until one of them didn't.
+    """
+    identities = {
+        layer: _rebased_identity(layer, all_col_weights)
+        for layer in sorted(set(layers))
+    }
+    if act_root is not None:
+        ldlq_campaign.ACT_ROOT = Path(act_root)
+    return identities
+
+
 def _burn_cell(*, layer, projection, data, rung) -> dict:
     """One single-rung chain -> one accepted, full-stack-keyed CBL cell."""
     cells = burn._run_chain(
@@ -340,17 +358,11 @@ def main() -> int:
     with burn.COL_WEIGHTS.open("rb") as handle:
         all_col_weights = pickle.load(handle)
 
-    # Identities are resolved FIRST, while ACT_ROOT is still the by-layer
-    # store's own cache -- `load_layer_identity` asserts the store was built
-    # against it, and a store that fails its own provenance must not be trusted
-    # for source digests either.  The burn's activation root is then installed
-    # once and one-way, for `load_projection` only.
-    identities = {
-        layer: _rebased_identity(layer, all_col_weights)
-        for layer in sorted({layer for layer, _, _ in worklist})
-    }
-    if args.act_root:
-        ldlq_campaign.ACT_ROOT = Path(args.act_root)
+    identities = resolve_identities(
+        {layer for layer, _, _ in worklist},
+        all_col_weights,
+        act_root=args.act_root,
+    )
     print(
         f"[onlaw-books] imatrix={burn.COL_WEIGHTS}\n"
         f"[onlaw-books] activations={ldlq_campaign.ACT_ROOT}\n"

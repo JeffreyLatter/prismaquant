@@ -20,6 +20,12 @@ Cross-rung consistency is checked in every mode and needs no GPU: the two rungs
 of one (layer, projection) must carry byte-identical source and col_weights
 digests, because they are the same tensors.  A mismatch means the two cells were
 burned against different source state and the pair must not ship.
+
+`--shard-root` / `--col-weights` / `--act-root` must name the SAME calibration
+generation the burn used (see the CALIBRATION REBASE section of
+dsv4_onlaw_book_burn).  Verification is exactly the check that fails when they
+do not: `col_weights_digest` is derived from the imatrix passed here and
+compared against the one the book was learned under.
 """
 from __future__ import annotations
 
@@ -37,8 +43,9 @@ from prismaquant.cb_banked_books import (
     load_routed_moe_cbl_selection,
 )
 from tools import dsv4_afast_burn as burn
+from tools import dsv4_ldlq_cost_campaign as ldlq_campaign
 from tools import dsv4_onlaw_book_burn as ob
-from tools.dsv4_afast_campaign import load_layer_identity, load_projection
+from tools.dsv4_afast_campaign import load_projection
 
 BOOK_ROOT = burn.RUN_ROOT / "bucket-books"
 
@@ -52,17 +59,46 @@ def _guard(path: Path) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--rungs", default="28,32")
-    parser.add_argument(
-        "--out",
-        default=str(burn.RUN_ROOT / "onlaw-books"
-                    / "CB_ROUTED_MOE_BOOK_SELECTION.json"),
-    )
+    parser.add_argument("--out", default=None)
     parser.add_argument(
         "--verify", choices=("none", "sample", "full"), default="sample",
     )
     parser.add_argument("--sample-size", type=int, default=8)
+    # Must match the burn's calibration generation; see the module docstring.
+    parser.add_argument("--shard-root", default=None)
+    parser.add_argument("--col-weights", default=None)
+    parser.add_argument("--act-root", default=None)
+    # Restrict the census to a layer subset.  The use for this is checking the
+    # first cells of a running burn end-to-end, so a wrong-digest generation is
+    # caught at minute two rather than after the whole bank is written.
+    parser.add_argument(
+        "--layers", default=None,
+        help="comma-separated layer subset; default every layer",
+    )
     args = parser.parse_args()
 
+    if bool(args.col_weights) != bool(args.act_root):
+        raise SystemExit(
+            "REFUSE: --col-weights and --act-root are one calibration and must "
+            "be given together"
+        )
+    if args.shard_root:
+        burn.BURN_CELL_ROOT = Path(args.shard_root)
+    if args.col_weights:
+        burn.COL_WEIGHTS = Path(args.col_weights)
+    # ACT_ROOT is NOT installed here: it is installed by `resolve_identities`,
+    # after the by-layer stores have validated against their own cache.
+    # Keep a rebased selection out of the previous generation's filename.
+    out = Path(args.out) if args.out else (
+        burn.BURN_CELL_ROOT / "CB_ROUTED_MOE_BOOK_SELECTION.json"
+        if args.shard_root
+        else burn.RUN_ROOT / "onlaw-books" / "CB_ROUTED_MOE_BOOK_SELECTION.json"
+    )
+
+    layers = (
+        [int(v) for v in args.layers.split(",") if v.strip()]
+        if args.layers else list(range(burn.LAYER_COUNT))
+    )
     rungs = tuple(int(r) for r in args.rungs.split(",") if r.strip())
     illegal = [r for r in rungs if r not in ob.ONLAW_ROUTED_RUNGS]
     if illegal:
@@ -72,7 +108,7 @@ def main() -> int:
 
     cells: list[dict] = []
     missing: list[str] = []
-    for layer in range(burn.LAYER_COUNT):
+    for layer in layers:
         for projection in ob.PROJECTIONS:
             for rung in rungs:
                 shard = ob.accepted_shard(layer, projection, rung)
@@ -83,7 +119,7 @@ def main() -> int:
                     "layer": layer, "projection": projection,
                     "rung": rung, "burn_shard": str(shard),
                 })
-    expected = burn.LAYER_COUNT * len(ob.PROJECTIONS) * len(rungs)
+    expected = len(layers) * len(ob.PROJECTIONS) * len(rungs)
     print(f"[select] {len(cells)}/{expected} cells have an acceptable shard")
     if missing:
         print(f"[select] REFUSE: {len(missing)} cells unbanked, e.g. "
@@ -93,7 +129,7 @@ def main() -> int:
     # Cross-rung digest consistency (no GPU): same tensors, same digests.
     by_cell = {(c["layer"], c["projection"], c["rung"]): c for c in cells}
     inconsistent = []
-    for layer in range(burn.LAYER_COUNT):
+    for layer in layers:
         for projection in ob.PROJECTIONS:
             guards = [
                 _guard(Path(by_cell[(layer, projection, r)]["burn_shard"]))
@@ -110,18 +146,24 @@ def main() -> int:
               f"disagree on source digest across rungs: {inconsistent[:5]}")
         return 1
     print(f"[select] cross-rung digest consistency OK "
-          f"({burn.LAYER_COUNT * len(ob.PROJECTIONS)} pairs)")
+          f"({len(layers) * len(ob.PROJECTIONS)} pairs)")
 
-    out = Path(args.out)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps({
-        "schema": ROUTED_MOE_CBL_SELECTION_SCHEMA,
-        "book_root": str(BOOK_ROOT),
-        "cells": cells,
-    }, indent=2, sort_keys=True) + "\n")
-    selection = load_routed_moe_cbl_selection(out)
-    print(f"[select] wrote {out}")
-    print(f"[select] selection sha256: {selection.content_sha256}")
+    # A partial census must never be written: a selection file is read as the
+    # complete accepted set, and one covering 3 of 129 pairs would render the
+    # rest by silently missing rather than by refusing.
+    if len(layers) == burn.LAYER_COUNT:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps({
+            "schema": ROUTED_MOE_CBL_SELECTION_SCHEMA,
+            "book_root": str(BOOK_ROOT),
+            "cells": cells,
+        }, indent=2, sort_keys=True) + "\n")
+        selection = load_routed_moe_cbl_selection(out)
+        print(f"[select] wrote {out}")
+        print(f"[select] selection sha256: {selection.content_sha256}")
+    else:
+        print(f"[select] layer subset ({len(layers)}/{burn.LAYER_COUNT}); "
+              "verifying only, no selection written")
 
     if args.verify == "none":
         return 0
@@ -143,12 +185,17 @@ def main() -> int:
     model_to_shard, model_to_ckpt = burn._build_weight_map(str(burn.SOURCE))
     scale_map = burn._build_fp8_scale_inv_map(str(burn.SOURCE))
 
+    identities = ob.resolve_identities(
+        {layer for layer, _ in targets},
+        all_col_weights,
+        act_root=args.act_root,
+    )
+
     verified = 0
     for layer, projection in targets:
-        _, ver = load_layer_identity(layer)
         data = load_projection(
             layer, projection, device=torch.device("cuda:0"),
-            identity=ver["identity"], all_col_weights=all_col_weights,
+            identity=identities[layer], all_col_weights=all_col_weights,
             model_to_shard=model_to_shard, model_to_ckpt=model_to_ckpt,
             scale_map=scale_map,
         )
