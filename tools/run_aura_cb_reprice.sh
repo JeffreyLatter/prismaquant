@@ -192,6 +192,22 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+# Producer identity for resumable pair shards.  The image ships no git binary
+# and /pq is an immutable read-only mount, so the in-container producer cannot
+# resolve its own commit -- which is the case PRISMAQUANT_IDENTITY_GIT_COMMIT
+# documents ("for immutable/container source mounts whose checkout metadata is
+# unavailable").  Resolve it on the host, where the preflight has just bound
+# this exact commit to the launch receipt and asserted a clean tree over
+# prismaquant/ tools/ tests/, and hand the value in.  Fail closed: an
+# unresolvable commit is not a useful identity.
+IDENTITY_GIT_COMMIT="$(
+  git -C "$REPO_ROOT" rev-parse --verify 'HEAD^{commit}' 2>/dev/null || true
+)"
+if [[ ! "$IDENTITY_GIT_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "[aura-cb] BLOCK: cannot resolve $REPO_ROOT HEAD for producer identity" >&2
+  exit 2
+fi
+
 docker_args=(
   run --rm --name "$CONTAINER_NAME" --gpus all --ipc=host
   -v "$REPO_ROOT:/pq:ro"
@@ -200,6 +216,7 @@ docker_args=(
   -v "$DATASET:$DATASET:ro"
   -e "PYTHONPATH=/pq"
   -e "PYTHONDONTWRITEBYTECODE=1"
+  -e "PRISMAQUANT_IDENTITY_GIT_COMMIT=$IDENTITY_GIT_COMMIT"
   -e "MODEL_PATH=$MODEL_PATH"
   -e "WORK_DIR=$WORK_DIR"
   -e "DATASET=$DATASET"
