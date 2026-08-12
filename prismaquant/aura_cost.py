@@ -32,7 +32,7 @@ requires); memory-safe (one autograd graph at a time, watchdog-gated).
 from __future__ import annotations
 
 import argparse
-from collections.abc import Mapping
+from collections.abc import Mapping, MutableMapping
 import hashlib
 import json
 import math
@@ -2320,6 +2320,15 @@ def compute_aura_cost_streamed(
                             f"missing={sorted(expected_pairs - observed_pairs)[:8]} "
                             f"unexpected={sorted(observed_pairs - expected_pairs)[:8]}"
                         )
+                    # A routed layer's canonical BF16 anchors can be tens of
+                    # GiB.  Consume them as each FP32 dW is built instead of
+                    # retaining both complete planes until backward starts.
+                    rendered_anchor_pool = (
+                        rendered_anchors
+                        if isinstance(rendered_anchors, MutableMapping)
+                        else dict(rendered_anchors)
+                    )
+                    del rendered_anchors
                     for name in pending:
                         weight = linears[name].weight.data
                         source_lookup = getattr(
@@ -2348,7 +2357,7 @@ def compute_aura_cost_streamed(
                             }
                         for fmt in render_formats[name]:
                             key = (name, fmt)
-                            rendered = rendered_anchors[key]
+                            rendered = rendered_anchor_pool.pop(key)
                             if not isinstance(rendered, torch.Tensor):
                                 raise TypeError(
                                     "streamed production anchor renderer "
@@ -2374,7 +2383,8 @@ def compute_aura_cost_streamed(
                             s2[key] = 0.0
                             s4[key] = 0.0
                             x2_probe[key] = []
-                    del rendered_anchors
+                            del rendered
+                    del rendered_anchor_pool
                 else:
                     for name in pending:
                         for fmt in render_formats[name]:

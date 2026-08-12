@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from types import SimpleNamespace
+import weakref
 
 import pytest
 import torch
@@ -388,6 +389,94 @@ def test_streamed_aura_production_anchors_are_sparse_and_never_use_rtn(
             assert row["dw_source"] == "production_render"
             assert row["production_anchor_measured"] is True
     assert model is runner.model
+
+
+def test_streamed_aura_releases_bf16_anchors_while_building_fp32_dweights():
+    torch.manual_seed(112)
+    seed_model = _DenseTinyLM().eval()
+    state = {
+        name: tensor.detach().clone()
+        for name, tensor in seed_model.state_dict().items()
+    }
+    qname = "model.layers.0.proj"
+    plan = {qname: ("NVFP4", "FP8_E4M3")}
+
+    class _LifetimePool(dict):
+        def __init__(self, values, tracker):
+            super().__init__(values)
+            self._tracker = tracker
+            self._previous = None
+            tracker["refs"].extend(weakref.ref(value) for value in values.values())
+
+        def pop(self, key):
+            if self._previous is not None:
+                self._tracker["prior_released_before_next_pop"].append(
+                    self._previous() is None
+                )
+            value = super().pop(key)
+            self._previous = weakref.ref(value)
+            self._tracker["remaining_after_pop"].append(len(self))
+            return value
+
+    class _Bf16AnchorRenderer(_ExactAnchorRenderer):
+        def __init__(self, formats_by_qname, tracker=None):
+            super().__init__(formats_by_qname)
+            self._tracker = tracker
+
+        def render_layer(self, *, layer, modules, formats_by_qname):
+            del layer
+            offsets = {"NVFP4": 0.03125, "FP8_E4M3": 0.015625}
+            rendered = {
+                (name, fmt): (
+                    modules[name].weight.detach().to(torch.bfloat16)
+                    + torch.tensor(offsets[fmt], dtype=torch.bfloat16)
+                )
+                for name, formats in formats_by_qname.items()
+                for fmt in formats
+            }
+            assert all(value.dtype == torch.bfloat16 for value in rendered.values())
+            self.render_count += len(rendered)
+            self.max_live_rendered = max(self.max_live_rendered, len(rendered))
+            if self._tracker is None:
+                return rendered
+            return _LifetimePool(rendered, self._tracker)
+
+    control_model, _control_context, control_runner = _dense_runner(state)
+    control = aura.compute_aura_cost_streamed(
+        control_runner,
+        torch.tensor([[1, 2, 3, 4]]),
+        ["NVFP4", "FP8_E4M3"],
+        n_probes=2,
+        dw_dtype="float32",
+        formats_by_qname=plan,
+        anchor_renderer=_Bf16AnchorRenderer(plan),
+        profile=DefaultProfile(),
+    )
+
+    tracker = {
+        "refs": [],
+        "prior_released_before_next_pop": [],
+        "remaining_after_pop": [],
+    }
+    tracked_model, _tracked_context, tracked_runner = _dense_runner(state)
+    tracked = aura.compute_aura_cost_streamed(
+        tracked_runner,
+        torch.tensor([[1, 2, 3, 4]]),
+        ["NVFP4", "FP8_E4M3"],
+        n_probes=2,
+        dw_dtype="float32",
+        formats_by_qname=plan,
+        anchor_renderer=_Bf16AnchorRenderer(plan, tracker),
+        profile=DefaultProfile(),
+    )
+
+    assert tracker["remaining_after_pop"] == [1, 0]
+    assert tracker["prior_released_before_next_pop"] == [True]
+    assert all(ref() is None for ref in tracker["refs"])
+    assert tracked["stats"] == control["stats"]
+    assert tracked["costs"] == control["costs"]
+    assert tracked_model is tracked_runner.model
+    assert control_model is control_runner.model
 
 
 def _run_checkpointed_anchor_diagnostic(
