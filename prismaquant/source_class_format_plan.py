@@ -12,6 +12,21 @@ first derives the complete legal family from the format registry, then
 requires that set to equal one of the two declared menus.  A third source
 class therefore fails before any render instead of doing illegal work or
 truncating a legal candidate set.
+
+``serving_backed_profile`` is the one declared narrowing of "complete
+family", and it is a *serving-legality* restriction, never a demand or disk
+one.  A caller that names a serving profile restricts the family to the
+rungs that profile's fused mid-M lane actually instantiates under the pinned
+Gridbook runtime (``serving_profile_specs/*.json`` ->
+``fused_mid_m.rungs_by_runtime_version``, resolved through
+``serving_profiles.serving_lane_route``).  Nothing about the caller's budget,
+cache or preference enters: the set is read off the same immutable pin the
+serving lane is declared against, an empty result is an error rather than a
+silent truncation, and the resolved rungs are stamped into the plan body so
+they land in ``identity_sha256`` and are re-verified on load.  Principle 9 --
+a format is production-eligible only when it routes to a performant kernel --
+is what licenses it; principle 2 is why it is read from an explicit table
+instead of a ``k % 4`` literal here.
 """
 from __future__ import annotations
 
@@ -31,11 +46,17 @@ from prismaquant.allocator_candidates import (
 from prismaquant.allocator_solver import _shape_from_stats
 from prismaquant.cost_stage_checkpoint import atomic_write_bytes, canonical_json
 from prismaquant.nvfp4_cb_footprint import is_cb_format
+from prismaquant.serving_profiles import serving_lane_route
 
 
 FORMAT_PLAN_SCHEMA = "prismaquant.source_class_format_plan.v1"
 FORMAT_PLAN_SELECTION_RULE = (
     "complete registered family filtered only by exact integer source payload; "
+    "derived set must equal one declared menu"
+)
+FORMAT_PLAN_SELECTION_RULE_SERVING_BACKED = (
+    "registered family restricted to the fused mid-M rungs the pinned runtime "
+    "instantiates, then filtered only by exact integer source payload; "
     "derived set must equal one declared menu"
 )
 EXPERT_MENU = "expert"
@@ -67,6 +88,10 @@ class SourceClassFormatPlan:
     units: Mapping[str, UnitFormatPlan]
     serving_groups: tuple[tuple[str, ...], ...]
     identity_sha256: str
+    # Present only when the caller declared a serving-backed restriction.
+    # Absent keeps the body byte-identical to an unrestricted plan, so the
+    # DECLARATION -- not merely its effect -- is part of plan identity.
+    serving_backed_restriction: Mapping[str, object] | None = None
 
     def formats_for(self, qname: str) -> tuple[str, ...]:
         try:
@@ -105,7 +130,11 @@ class SourceClassFormatPlan:
     def to_dict(self) -> dict[str, object]:
         body: dict[str, object] = {
             "schema": FORMAT_PLAN_SCHEMA,
-            "selection_rule": FORMAT_PLAN_SELECTION_RULE,
+            "selection_rule": (
+                FORMAT_PLAN_SELECTION_RULE
+                if self.serving_backed_restriction is None
+                else FORMAT_PLAN_SELECTION_RULE_SERVING_BACKED
+            ),
             "menus": {
                 menu_id: list(self.menus[menu_id]) for menu_id in _MENU_IDS
             },
@@ -126,6 +155,11 @@ class SourceClassFormatPlan:
                 list(component) for component in self.serving_groups
             ],
         }
+        if self.serving_backed_restriction is not None:
+            body["serving_backed_restriction"] = canonical_json(
+                dict(self.serving_backed_restriction),
+                where="serving-backed restriction",
+            )
         body["identity_sha256"] = _plan_digest(body)
         return body
 
@@ -168,10 +202,72 @@ def parse_format_menu(raw: str | Sequence[str], *, where: str) -> tuple[str, ...
     return tuple(canonical)
 
 
+def _serving_backed_family(
+    family: str,
+    registered: tuple[str, ...],
+    profile_id: str,
+) -> tuple[tuple[str, ...], dict[str, object]]:
+    """The registered family restricted to fused-mid-M-backed rungs.
+
+    Resolution goes through ``serving_lane_route`` -- the same entry point
+    ``allocator_candidates`` already attaches routes with -- rather than
+    reading ``serving_lanes[i]`` out of the spec JSON, so there is exactly one
+    mechanism deciding what the pinned runtime backs and no lane index to get
+    wrong.  Fail-closed throughout: an unroutable format, a disagreeing lane
+    set and an empty backed set are all errors, because every one of them
+    would otherwise silently shrink a candidate set.
+    """
+    backed: list[str] = []
+    dropped: list[str] = []
+    lanes = []
+    for name in registered:
+        lane = serving_lane_route(profile_id, name)
+        if lane is None:
+            raise ValueError(
+                f"serving profile {profile_id!r} declares no lane for "
+                f"{name!r}; a serving-backed restriction cannot be resolved "
+                "for the whole family"
+            )
+        lanes.append(lane)
+        (backed if lane.fused_mid_m_backed else dropped).append(name)
+    lane_ids = sorted({lane.lane_id for lane in lanes})
+    sources = sorted({lane.rungs_source for lane in lanes})
+    versions = sorted({lane.runtime_version for lane in lanes})
+    if len(lane_ids) != 1 or len(sources) != 1 or len(versions) != 1:
+        raise ValueError(
+            f"family {family!r} resolves to more than one serving lane under "
+            f"{profile_id!r} (lanes={lane_ids} sources={sources} "
+            f"runtimes={versions}); a serving-backed restriction must be one "
+            "declaration"
+        )
+    if not backed:
+        raise ValueError(
+            f"serving profile {profile_id!r} backs no fused mid-M rung of "
+            f"family {family!r} at pinned runtime {versions[0]!r} "
+            f"(source={sources[0]!r}). Refusing an empty menu: declare no "
+            "restriction, or advance the pin together with its backed-set key."
+        )
+    rungs = sorted({int(lane.rung) for lane in lanes
+                    if lane.fused_mid_m_backed and lane.rung is not None})
+    provenance: dict[str, object] = {
+        "profile_id": str(profile_id),
+        "family": str(family),
+        "lane_id": lane_ids[0],
+        "runtime_version": versions[0],
+        "rungs_source": sources[0],
+        "fused_mid_m_rungs": rungs,
+        "backed_formats": list(backed),
+        "restricted_out": list(dropped),
+    }
+    return tuple(backed), provenance
+
+
 def _complete_family(
     expert_formats: tuple[str, ...],
     nonexpert_formats: tuple[str, ...],
-) -> tuple[str, ...]:
+    *,
+    serving_backed_profile: str | None = None,
+) -> tuple[tuple[str, ...], dict[str, object] | None]:
     declared = tuple(dict.fromkeys((*expert_formats, *nonexpert_formats)))
     families = {fr.get_format(name).family for name in declared}
     if len(families) != 1:
@@ -181,20 +277,33 @@ def _complete_family(
         )
     family = next(iter(families))
     registered = tuple(spec.name for spec in fr.list_formats(family))
+    restriction: dict[str, object] | None = None
+    if serving_backed_profile is not None:
+        registered, restriction = _serving_backed_family(
+            family, registered, serving_backed_profile
+        )
     registered_set = set(registered)
     declared_set = set(declared)
     if declared_set != registered_set:
         missing = sorted(registered_set - declared_set)
         extra = sorted(declared_set - registered_set)
+        scope = "the complete registered family"
+        if restriction is not None:
+            scope = (
+                "the complete registered family backed by the pinned serving "
+                f"runtime (profile={restriction['profile_id']!r} "
+                f"runtime={restriction['runtime_version']!r} "
+                f"rungs={restriction['fused_mid_m_rungs']})"
+            )
         raise ValueError(
-            "source-class menus must cover the complete registered family; "
+            f"source-class menus must cover {scope}; "
             f"family={family!r} missing={missing} extra={extra}. Refusing "
             "demand- or disk-driven candidate truncation."
         )
     # The registry sorts by effective rate.  Use it as the canonical ordering
     # so plan identity cannot depend on how two equivalent CLI strings happen
     # to interleave their shared formats.
-    return registered
+    return registered, restriction
 
 
 def _validate_declared_menus(
@@ -298,6 +407,7 @@ def build_source_class_format_plan(
     expert_formats: str | Sequence[str],
     nonexpert_formats: str | Sequence[str],
     cb_serialization_context,
+    serving_backed_profile: str | None = None,
 ) -> SourceClassFormatPlan:
     """Derive one exact full-family menu per source-payload class.
 
@@ -305,12 +415,21 @@ def build_source_class_format_plan(
     complete checkpoint census in the allocator's recipe namespace.  The
     existing allocator source-rate predicate is called for every registered
     family member; this module intentionally contains no bpp formula.
+
+    ``serving_backed_profile`` names a serving profile whose fused mid-M lane
+    bounds the family under the pinned Gridbook runtime (see the module
+    docstring).  ``None`` -- the default -- keeps the unrestricted contract and
+    an unchanged plan body.
     """
     expert_menu = parse_format_menu(expert_formats, where="expert-formats")
     nonexpert_menu = parse_format_menu(
         nonexpert_formats, where="nonexpert-formats"
     )
-    family_formats = _complete_family(expert_menu, nonexpert_menu)
+    family_formats, restriction = _complete_family(
+        expert_menu,
+        nonexpert_menu,
+        serving_backed_profile=serving_backed_profile,
+    )
     _validate_declared_menus(expert_menu, nonexpert_menu, family_formats)
     if any(is_cb_format(name) for name in family_formats):
         if cb_serialization_context is None:
@@ -451,6 +570,7 @@ def build_source_class_format_plan(
         units=units,
         serving_groups=serving_groups,
         identity_sha256="",
+        serving_backed_restriction=restriction,
     )
     body = provisional.to_dict()
     return SourceClassFormatPlan(
@@ -458,6 +578,7 @@ def build_source_class_format_plan(
         units=provisional.units,
         serving_groups=provisional.serving_groups,
         identity_sha256=str(body["identity_sha256"]),
+        serving_backed_restriction=provisional.serving_backed_restriction,
     )
 
 
@@ -507,9 +628,35 @@ def load_format_plan(path: str | Path) -> SourceClassFormatPlan:
         )
         for menu_id in _MENU_IDS
     }
-    family_formats = _complete_family(
-        menus[EXPERT_MENU], menus[NONEXPERT_MENU]
+    # A restricted plan carries its own restriction, so the load path
+    # re-derives it from the CURRENT pin and refuses on drift: a plan written
+    # under one Gridbook backed set must not be silently reused under another.
+    stored_restriction = raw.get("serving_backed_restriction")
+    if stored_restriction is not None and not isinstance(
+        stored_restriction, Mapping
+    ):
+        raise ValueError(
+            f"format plan {plan_path} has a non-object "
+            "serving_backed_restriction"
+        )
+    family_formats, restriction = _complete_family(
+        menus[EXPERT_MENU],
+        menus[NONEXPERT_MENU],
+        serving_backed_profile=(
+            None if stored_restriction is None
+            else str(stored_restriction.get("profile_id", ""))
+        ),
     )
+    if restriction is not None and canonical_json(
+        dict(restriction), where="serving-backed restriction"
+    ) != canonical_json(
+        dict(stored_restriction), where="stored serving-backed restriction"
+    ):
+        raise ValueError(
+            f"format plan {plan_path} was written under a different "
+            "serving-backed restriction than the current pin resolves: "
+            f"stored={dict(stored_restriction)} current={dict(restriction)}"
+        )
     _validate_declared_menus(
         menus[EXPERT_MENU], menus[NONEXPERT_MENU], family_formats
     )
@@ -587,6 +734,7 @@ def load_format_plan(path: str | Path) -> SourceClassFormatPlan:
         units=units,
         serving_groups=tuple(serving_groups),
         identity_sha256=expected_digest,
+        serving_backed_restriction=restriction,
     )
 
 

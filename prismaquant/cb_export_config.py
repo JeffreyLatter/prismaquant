@@ -738,6 +738,7 @@ def build_quant_config(
     weight_only_stock_targets: Iterable[str] = (),
     streaming_provenance: bool | None = None,
     include_tensor_formats: bool = False,
+    tensor_formats: Mapping[str, str] | None = None,
     post_allocation_refinement: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the complete producer-owned ``quant_config.json`` payload.
@@ -981,13 +982,23 @@ def build_quant_config(
     if cb_render_identity is not None:
         provenance["cb_render_identity"] = cb_render_identity
     if include_tensor_formats:
-        provenance["tensor_formats"] = {
-            qname: assignment[qname]
-            for qname in sorted(
+        if tensor_formats is None:
+            routed_names = (
                 set(cb_targets) | set(stock_targets) | set(source_targets)
-                | set(native_source_targets)
+                | set(native_source_targets) | set(requant_targets)
             )
-        }
+            tensor_formats = {
+                qname: assignment[qname] for qname in routed_names
+            }
+        if any(
+            not isinstance(qname, str)
+            or not qname
+            or not isinstance(fmt, str)
+            or not fmt
+            for qname, fmt in tensor_formats.items()
+        ):
+            raise ValueError("tensor_formats must map concrete names to formats")
+        provenance["tensor_formats"] = dict(sorted(tensor_formats.items()))
 
     quant_config: dict[str, Any] = {
         "quant_method": "gridbook",

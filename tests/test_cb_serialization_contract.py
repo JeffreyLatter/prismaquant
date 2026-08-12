@@ -1003,3 +1003,107 @@ def test_fp8_rate_helper_reflects_in_features_row_scale_amortization():
         [spec], {"w": _stats((512, 5120))}, context
     )[spec.name]
     assert narrow > wide
+
+
+# --- rate vs identity at the source-payload gate ---------------------------
+#
+# A learned book is banked only for the rungs a unit may actually use, so the
+# legality probe evaluates cells whose book will never exist: a routed expert
+# against K36 when the byte-exact source ceiling already stops it at K33. That
+# verdict is a byte count and must not depend on which books happen to have
+# been built -- otherwise the same menu answers differently before and after a
+# bundle rebuild. Identity is still required of every candidate that survives.
+
+
+def _routed_expert_learned_context(fmt, *roles):
+    return CBSerializationContext(
+        scale_coding="two_tier",
+        codebook_source="learned",
+        codebook_source_scope="fp8",
+        codebook_content_digests=_learned_digests(fmt, *roles),
+    )
+
+
+def test_source_rate_gate_prices_an_unbanked_rung_as_exceeded():
+    from prismaquant.allocator_candidates import (
+        SOURCE_BPP_EXCEEDED_REASON,
+        _source_bpp_applicability,
+    )
+
+    qname = "model.layers.0.mlp.experts.0.down_proj"
+    shape = (2048, 4096)
+    # Books exist for the on-law rungs only; K36 was deliberately never learned.
+    context = _routed_expert_learned_context("FP8_CB_K32", "down_proj")
+
+    banked = _source_bpp_applicability(
+        shape,
+        fr.get_format("FP8_CB_K32"),
+        qname=qname,
+        source_kind="mxfp4",
+        cb_serialization_context=context,
+    )
+    assert banked.legal
+
+    unbanked = _source_bpp_applicability(
+        shape,
+        fr.get_format("FP8_CB_K36"),
+        qname=qname,
+        source_kind="mxfp4",
+        cb_serialization_context=context,
+    )
+    assert not unbanked.legal
+    assert unbanked.reason == SOURCE_BPP_EXCEEDED_REASON
+
+
+def test_source_rate_gate_still_requires_identity_for_a_legal_cell():
+    from prismaquant.allocator_candidates import _source_bpp_applicability
+
+    qname = "model.layers.0.self_attn.o_proj"
+    shape = (8192, 4096)
+    # A dense row can legally reach K36, so an unbanked book here is a real
+    # defect and must fail at the gate rather than first at export.
+    context = _routed_expert_learned_context("FP8_CB_K32", "o_proj")
+    with pytest.raises(ValueError, match="missing materialized SHA-256"):
+        _source_bpp_applicability(
+            shape,
+            fr.get_format("FP8_CB_K36"),
+            qname=qname,
+            source_kind="fp8_ue8m0",
+            cb_serialization_context=context,
+        )
+
+
+def test_sizing_mode_matches_banked_bytes_and_marks_identity_unproven():
+    from prismaquant.nvfp4_cb_footprint import (
+        cb_tensor_payload_breakdown,
+        codebook_sidecar_payload_bytes,
+    )
+
+    qname = "model.layers.0.mlp.experts.0.down_proj"
+    shape = (2048, 4096)
+    fmt = "FP8_CB_K32"
+    context = _routed_expert_learned_context(fmt, "down_proj")
+
+    strict = cb_tensor_payload_breakdown(
+        fmt, shape, qname=qname, context=context
+    )
+    sized = cb_tensor_payload_breakdown(
+        fmt, shape, qname=qname, context=context,
+        require_materialized_codebook_identity=False,
+    )
+    # A banked cell is byte-identical in both modes, identity included.
+    assert sized == strict
+
+    unbanked = cb_tensor_payload_breakdown(
+        "FP8_CB_K36", shape, qname=qname, context=context,
+        require_materialized_codebook_identity=False,
+    )
+    assert unbanked["tensor_payload_bytes"] > 0
+    assert unbanked["sidecar_identity"]["content_sha256"] is None
+    assert unbanked["sidecar_identity"]["materialized_identity"] is False
+    # The sidecar's size is a function of the rung, which is exactly why the
+    # rate question is answerable without the book.
+    assert unbanked["sidecar_payload_bytes"] == codebook_sidecar_payload_bytes(
+        "FP8_CB_K36"
+    )
+    assert unbanked["sidecar_payload_bytes"] > strict["sidecar_payload_bytes"]

@@ -7,6 +7,7 @@ tainted gold number — plus the fill path the serve-lane tools use.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import pathlib
 
@@ -17,14 +18,20 @@ if not (pathlib.Path(__file__).resolve().parents[1] / "tools").is_dir():
                 allow_module_level=True)
 
 from prismaquant.shipcard import (
+    ALL_SLOTS,
+    CB_REQUIRED_SLOTS,
     GOLD_SLOTS,
     REQUIRED_SLOTS,
+    SHIPCARD_RESERVED_BYTES,
+    artifact_bytes,
     build_shipcard,
     compute_model_sha,
     fill_slot,
     kv_shared_fisher_echo,
     load_shipcard,
     make_record,
+    open_cb_export_shipcard,
+    required_slots,
     unfilled_slots,
     verify,
     write_shipcard,
@@ -73,6 +80,213 @@ def test_model_sha_is_stable_and_content_sensitive(tmp_path):
     assert compute_model_sha(a) != compute_model_sha(c)
 
 
+def test_native_card_remains_verifiable_after_legitimate_copy(tmp_path):
+    import shutil
+
+    source = _artifact(tmp_path, name="native-source")
+    source_card = _open_card(tmp_path, source)
+    assert "weight_stat_attestation" not in load_shipcard(source_card)
+
+    copied = tmp_path / "native-copy"
+    shutil.copytree(source, copied)
+    problems = verify(load_shipcard(copied / "shipcard.json"), model_dir=copied)
+    assert all("artifact changed" not in problem for problem in problems)
+
+
+def test_cb_identity_binds_canonical_config_and_codebook_not_inventory(
+    tmp_path,
+):
+    model_dir = _artifact(tmp_path)
+    codebook = model_dir / "cb_codebooks.pqcb"
+    codebook.write_bytes(b"codebook-A")
+    quant_config = {
+        "config_groups": {
+            "cb": {
+                "scheme": {"grid": "fp4", "k": 16},
+                "targets": ["model.layers.0.mlp.up_proj"],
+            }
+        },
+        "provenance": {
+            "producer": "resident",
+            "artifact_inventory": {"export_directory_bytes": 123},
+        },
+    }
+    quant_path = model_dir / "quant_config.json"
+    quant_path.write_text(json.dumps(quant_config, indent=2))
+    baseline = compute_model_sha(model_dir)
+
+    # Formatting and the self-sized final inventory are not model semantics.
+    quant_config["provenance"]["artifact_inventory"] = {
+        "export_directory_bytes": 987654,
+        "file_bytes": {"quant_config.json": 456},
+    }
+    quant_path.write_text(json.dumps(
+        quant_config, sort_keys=True, separators=(",", ":")
+    ))
+    assert compute_model_sha(model_dir) == baseline
+
+    # Every other quant-config field remains identity-bearing.
+    quant_config["config_groups"]["cb"]["scheme"]["k"] = 17
+    quant_path.write_text(json.dumps(quant_config))
+    assert compute_model_sha(model_dir) != baseline
+
+    # Restore the config, then change same-length codebook bytes. Content, not
+    # just the sidecar's size, must distinguish the served model.
+    quant_config["config_groups"]["cb"]["scheme"]["k"] = 16
+    quant_path.write_text(json.dumps(quant_config))
+    codebook.write_bytes(b"codebook-B")
+    assert compute_model_sha(model_dir) != baseline
+    assert artifact_bytes(model_dir) == (
+        (model_dir / "model-00001-of-00001.safetensors").stat().st_size
+        + codebook.stat().st_size
+    )
+
+
+def test_cb_identity_binds_same_size_weight_content_via_export_manifest(tmp_path):
+    from prismaquant.shipcard import build_weight_content_manifest
+
+    model_dir = _artifact(tmp_path, weight_bytes=b"weights-A")
+    quant_config = {
+        "quant_method": "gridbook",
+        "format": "nvfp4_cb",
+        "provenance": {
+            "weight_content_manifest": build_weight_content_manifest(model_dir),
+        },
+    }
+    (model_dir / "quant_config.json").write_text(json.dumps(quant_config))
+    baseline = compute_model_sha(model_dir)
+
+    # The immutable content claim is part of model_sha even though routine
+    # verification need not reread the large shard. A changed same-size shard
+    # trips the card's cheap stat attestation immediately.
+    path = _open_card(tmp_path, model_dir)
+    weight = model_dir / "model-00001-of-00001.safetensors"
+    weight.write_bytes(b"weights-B")
+    problems = verify(load_shipcard(path), model_dir=model_dir)
+    assert any("artifact changed since the shipcard was opened" in p for p in problems)
+    assert compute_model_sha(model_dir) == baseline
+
+
+def test_cb_identity_binds_auxiliary_serving_files(tmp_path):
+    from prismaquant.shipcard import build_weight_content_manifest
+
+    model_dir = _artifact(tmp_path)
+    tokenizer = model_dir / "tokenizer.json"
+    tokenizer.write_bytes(b"tokenizer-A")
+    quant_config = {
+        "quant_method": "gridbook",
+        "format": "nvfp4_cb",
+        "provenance": {
+            "weight_content_manifest": build_weight_content_manifest(model_dir),
+        },
+    }
+    (model_dir / "quant_config.json").write_text(json.dumps(quant_config))
+    baseline = compute_model_sha(model_dir)
+    tokenizer.write_bytes(b"tokenizer-B")
+    assert compute_model_sha(model_dir) != baseline
+
+
+def test_reattest_accepts_copy_but_refuses_changed_weight_content(tmp_path):
+    import shutil
+
+    from prismaquant.shipcard import (
+        build_weight_content_manifest,
+        reattest_weight_stats,
+    )
+
+    source = _artifact(tmp_path, name="source", weight_bytes=b"weights-A")
+    quant_config = {
+        "quant_method": "gridbook",
+        "format": "nvfp4_cb",
+        "provenance": {
+            "weight_content_manifest": build_weight_content_manifest(source),
+        },
+    }
+    (source / "quant_config.json").write_text(json.dumps(quant_config))
+    source_card = _open_card(tmp_path, source)
+
+    copied = tmp_path / "copied"
+    shutil.copytree(source, copied)
+    copied_card = copied / source_card.name
+    assert verify(load_shipcard(copied_card), model_dir=copied)
+    reattest_weight_stats(copied_card, copied)
+    assert not any(
+        "artifact changed since the shipcard was opened" in problem
+        for problem in verify(load_shipcard(copied_card), model_dir=copied)
+    )
+
+    (copied / "model-00001-of-00001.safetensors").write_bytes(b"weights-B")
+    with pytest.raises(ValueError, match="content differs"):
+        reattest_weight_stats(copied_card, copied)
+
+
+def test_cb_shipcard_accepts_in_stream_digest_without_rereading_weight(
+    tmp_path, monkeypatch,
+):
+    import prismaquant.shipcard as shipcard_module
+
+    model_dir = _artifact(tmp_path, weight_bytes=b"streamed-weights")
+    weight = model_dir / "model-00001-of-00001.safetensors"
+    layer_config = tmp_path / "layer_config.json"
+    layer_config.write_text("{}")
+
+    def refuse_second_read(_model_dir):
+        raise AssertionError("finished weight was read a second time")
+
+    monkeypatch.setattr(
+        shipcard_module, "build_weight_content_manifest", refuse_second_read
+    )
+    digest = hashlib.sha256(weight.read_bytes()).hexdigest()
+    path, _card = open_cb_export_shipcard(
+        model_dir,
+        {"quant_method": "gridbook", "format": "nvfp4_cb"},
+        source_model=tmp_path / "source",
+        layer_config_path=layer_config,
+        exporter="test_streaming_exporter",
+        weight_content_manifest={
+            "schema": "prismaquant.weight_content_manifest/1",
+            "algorithm": "sha256",
+            "files": {
+                weight.name: {
+                    "bytes": weight.stat().st_size,
+                    "sha256": digest,
+                },
+            },
+        },
+    )
+
+    quant_config = json.loads((model_dir / "quant_config.json").read_text())
+    assert quant_config["provenance"]["weight_content_manifest"]["files"] == {
+        weight.name: {"bytes": weight.stat().st_size, "sha256": digest},
+    }
+    assert load_shipcard(path)["weight_stat_attestation"]["files"][weight.name]
+
+
+def test_cb_shipcard_rejects_in_stream_digest_for_the_wrong_file_set(tmp_path):
+    model_dir = _artifact(tmp_path)
+    layer_config = tmp_path / "layer_config.json"
+    layer_config.write_text("{}")
+
+    with pytest.raises(ValueError, match="manifest file set differs"):
+        open_cb_export_shipcard(
+            model_dir,
+            {"quant_method": "gridbook", "format": "nvfp4_cb"},
+            source_model=tmp_path / "source",
+            layer_config_path=layer_config,
+            exporter="test_streaming_exporter",
+            weight_content_manifest={
+                "schema": "prismaquant.weight_content_manifest/1",
+                "algorithm": "sha256",
+                "files": {
+                    "wrong.safetensors": {
+                        "bytes": 7,
+                        "sha256": "0" * 64,
+                    },
+                },
+            },
+        )
+
+
 # ---------------------------------------------------------------------------
 # Refusal
 # ---------------------------------------------------------------------------
@@ -85,11 +299,109 @@ def test_fresh_card_refuses_every_slot(tmp_path):
     assert all("UNFILLED" in p for p in problems)
 
 
+def test_gridbook_card_opens_plugin_performance_refusal_slot(tmp_path):
+    model_dir = _artifact(tmp_path)
+    (model_dir / "quant_config.json").write_text(json.dumps({
+        "quant_method": "gridbook",
+        "format": "nvfp4_cb",
+    }))
+    card = build_shipcard(model_dir, build={"quant_method": "gridbook"})
+
+    assert tuple(card["slots"]) == ALL_SLOTS
+    assert required_slots(card, model_dir=model_dir) == ALL_SLOTS
+    assert unfilled_slots(card) == list(ALL_SLOTS)
+    problems = verify(card, model_dir=model_dir)
+    assert any(
+        problem == f"{CB_REQUIRED_SLOTS[0]}: UNFILLED"
+        for problem in problems
+    )
+
+
+def test_on_disk_gridbook_identity_prevents_receipt_slot_erasure(tmp_path):
+    model_dir = _artifact(tmp_path)
+    (model_dir / "quant_config.json").write_text(json.dumps({
+        "quant_method": "gridbook",
+        "format": "nvfp4_cb",
+    }))
+    card = build_shipcard(model_dir, build={"quant_method": "gridbook"})
+    card["build"]["quant_method"] = "compressed-tensors"
+    card["slots"].pop(CB_REQUIRED_SLOTS[0])
+
+    problems = verify(card, model_dir=model_dir)
+    assert f"{CB_REQUIRED_SLOTS[0]}: UNFILLED" in problems
+
+
+@pytest.mark.parametrize("reserved", [None, 4096, "262144"])
+def test_gridbook_card_refuses_missing_or_forged_fixed_reservation(
+    tmp_path, reserved,
+):
+    model_dir = _artifact(tmp_path)
+    (model_dir / "quant_config.json").write_text(json.dumps({
+        "quant_method": "gridbook",
+        "format": "nvfp4_cb",
+    }))
+    card = build_shipcard(model_dir, build={"quant_method": "gridbook"})
+    card["reserved_file_bytes"] = reserved
+
+    assert any(
+        "reserved_file_bytes" in problem
+        for problem in verify(card, model_dir=model_dir)
+    )
+
+
+def test_gridbook_card_refuses_missing_weight_stat_attestation(tmp_path):
+    model_dir = _artifact(tmp_path)
+    (model_dir / "quant_config.json").write_text(json.dumps({
+        "quant_method": "gridbook",
+        "format": "nvfp4_cb",
+    }))
+    card = build_shipcard(model_dir, build={"quant_method": "gridbook"})
+    assert "weight_stat_attestation" not in card
+
+    assert any(
+        "lacks the required weight-stat attestation" in problem
+        for problem in verify(card, model_dir=model_dir)
+    )
+
+
 def test_full_card_verifies(tmp_path):
     model_dir = _artifact(tmp_path)
     path = _open_card(tmp_path, model_dir)
     _fill_all(path, compute_model_sha(model_dir))
     assert verify(load_shipcard(path), model_dir=model_dir) == []
+
+
+def test_shipcard_fixed_reservation_survives_every_slot_fill(tmp_path):
+    model_dir = _artifact(tmp_path)
+    path = _open_card(tmp_path, model_dir)
+    assert path.stat().st_size == SHIPCARD_RESERVED_BYTES
+
+    model_sha = compute_model_sha(model_dir)
+    for slot in REQUIRED_SLOTS:
+        fill_slot(path, slot, make_record(
+            slot=slot,
+            tool="fixed-size-test",
+            passed=True,
+            model_sha=model_sha,
+            metrics={"detail": "x" * 4096},
+            spec_decode_detected=False if slot in GOLD_SLOTS else None,
+        ))
+        assert path.stat().st_size == SHIPCARD_RESERVED_BYTES
+
+    assert verify(load_shipcard(path), model_dir=model_dir) == []
+
+
+def test_shipcard_reservation_overflow_preserves_previous_record(tmp_path):
+    model_dir = _artifact(tmp_path)
+    path = _open_card(tmp_path, model_dir)
+    before = path.read_bytes()
+    card = load_shipcard(path)
+    card["build"]["oversized"] = "x" * SHIPCARD_RESERVED_BYTES
+
+    with pytest.raises(ValueError, match="fixed reservation"):
+        write_shipcard(path, card)
+
+    assert path.read_bytes() == before
 
 
 def test_record_from_another_build_is_refused(tmp_path):
@@ -210,7 +522,7 @@ def test_cli_verify_exit_codes(tmp_path, capsys):
     assert "REFUSED" in capsys.readouterr().out
 
     _fill_all(path, compute_model_sha(model_dir))
-    assert shipcard_cli(["verify", str(path), "--model-dir", str(model_dir)]) == 0
+    assert shipcard_cli(["verify", str(path)]) == 0
     assert "OK" in capsys.readouterr().out
 
 
@@ -223,10 +535,11 @@ def test_cli_fill_from_a_gold_result_json(tmp_path, capsys):
         "kl_confident_mean": 0.0143,
         "kl_mean": 0.0201,
         "n_samples": 8,
+        "n_positions": 4096,
         "seqlen": 512,
         "spec_decode_detected": False,
         "serve_fingerprint": "f" * 64,
-        "git_commit": "abc123",
+        "git_commit": "a" * 40,
     }))
 
     assert shipcard_cli([
@@ -237,7 +550,7 @@ def test_cli_fill_from_a_gold_result_json(tmp_path, capsys):
     assert record["model_sha"] == compute_model_sha(model_dir)
     assert record["metrics"]["kl_confident_mean"] == pytest.approx(0.0143)
     assert record["serve_fingerprint"] == "f" * 64
-    assert record["git_commit"] == "abc123"
+    assert record["git_commit"] == "a" * 40
     assert "gold.ppl" in capsys.readouterr().out  # still-unfilled list
 
 

@@ -1216,24 +1216,29 @@ class TestRoundTrip(unittest.TestCase):
 
                     from prismaquant.allocator_candidates import (
                         PASSTHROUGH_SOURCE_REQUIREMENTS,
+                        SOURCE_PASSTHROUGH_CONTRACTS,
                     )
                     if fmt in PASSTHROUGH_SOURCE_REQUIREMENTS:
                         # The rest of the SOURCE-PASSTHROUGH family
                         # (FP8_BLOCK_UE8M0_SOURCE, MXFP4_SOURCE, ...). There
                         # is no render to compare against a serve: the
-                        # exporter copies the checkpoint's own bytes, so the
-                        # served values ARE the source values. The invariant
-                        # that must hold — and that would break if someone
-                        # gave one of these a real codec — is that BOTH sides
-                        # of the format are the identity, which is what makes
-                        # its Δloss exactly 0 by construction rather than by
-                        # measurement.
+                        # exporter copies the checkpoint's own weight bytes.
+                        # Only contracts whose activation path is also the
+                        # identity may claim zero end-to-end loss.  Gridbook's
+                        # block-FP8 route deliberately exercises the other
+                        # branch: weight-exact W8A8 with measured MXFP8 A-side
+                        # quantization.
                         spec = fr.get_format(fmt)
                         torch.testing.assert_close(
                             spec.quantize_dequantize(W), W)
-                        torch.testing.assert_close(
-                            spec.activation_quantize_dequantize(W), W)
-                        self.assertFalse(spec.act_quant_changes_input, fmt)
+                        activation = spec.activation_quantize_dequantize(W)
+                        contract = SOURCE_PASSTHROUGH_CONTRACTS[fmt]
+                        if contract.zero_cost_by_construction:
+                            torch.testing.assert_close(activation, W)
+                            self.assertFalse(spec.act_quant_changes_input, fmt)
+                        else:
+                            self.assertFalse(torch.equal(activation, W), fmt)
+                            self.assertTrue(spec.act_quant_changes_input, fmt)
                         continue
 
                     self.fail(f"unhandled registered format {fmt}")

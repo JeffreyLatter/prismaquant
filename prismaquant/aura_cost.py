@@ -32,7 +32,7 @@ requires); memory-safe (one autograd graph at a time, watchdog-gated).
 from __future__ import annotations
 
 import argparse
-from collections.abc import Mapping
+from collections.abc import Mapping, MutableMapping
 import hashlib
 import json
 import math
@@ -68,6 +68,14 @@ SCHEMA = "prismaquant.aura_cost.v1"
 AURA_CHECKPOINT_IDENTITY_SCHEMA = "prismaquant.aura_checkpoint.identity.v1"
 AURA_CHECKPOINT_MANIFEST_SCHEMA = "prismaquant.aura_checkpoint.manifest.v1"
 AURA_CHECKPOINT_UNIT_SCHEMA = "prismaquant.aura_checkpoint.unit.v1"
+AURA_PRODUCTION_ANCHOR_DELTA_CONSUMER_IDENTITY = {
+    "schema": "prismaquant.aura.production_anchor_delta_consumer.v1",
+    "canonical_input": "production_weight_cache_canonical_cpu_tensor",
+    "operation": "fp32_subtract_then_store",
+    "subtraction_dtype": "torch.float32",
+    "storage_dtype": "torch.bfloat16",
+    "output_residency": "source_weight_device",
+}
 
 
 def _git_commit() -> str | None:
@@ -426,7 +434,6 @@ def _prepare_aura_checkpoints(
 _ZERO_COST_FORMATS = {
     "BF16",
     "FP8_SOURCE",
-    "FP8_BLOCK_UE8M0_SOURCE",
     "MXFP4_SOURCE",
 }
 
@@ -518,6 +525,49 @@ def _free_gib() -> float:
         return torch.cuda.mem_get_info()[0] / (1024 ** 3)
     except Exception:
         return float("inf")
+
+
+def _release_streamed_anchor_allocator_cache(device: object) -> None:
+    """Return consumed production anchors to Spark unified memory.
+
+    Dropping the final tensor reference only moves its CUDA allocation into
+    PyTorch's reusable cache.  On the single-GPU GB10 path that memory still
+    overlaps the much larger FP32 adjoint deltas unless the cache is returned
+    to the unified host/device pool before backward begins.  This is once per
+    streamed layer, outside the probe loop; non-CUDA test/research paths stay a
+    no-op.
+    """
+    resolved = torch.device(device)
+    if resolved.type != "cuda":
+        return
+    torch.cuda.synchronize(resolved)
+    torch.cuda.empty_cache()
+
+
+def _stored_production_anchor_delta(
+    rendered: torch.Tensor,
+    source: torch.Tensor,
+    *,
+    storage_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Subtract production anchors in FP32, then store the configured dW.
+
+    The projection consumer always upcasts dW to FP32. Keeping every routed
+    layer's two anchor deltas in FP32 therefore doubles residency without
+    changing the accumulator. Subtract in FP32 to preserve cancellation, then
+    use the same validated BF16 storage contract as ordinary cached-menu AURA.
+    ``copy=True`` prevents an FP32 injected/test render from being mutated by
+    the in-place subtraction.
+    """
+    delta_fp32 = rendered.to(
+        device=source.device,
+        dtype=torch.float32,
+        copy=True,
+    )
+    delta_fp32.sub_(source)
+    if storage_dtype == torch.float32:
+        return delta_fp32
+    return delta_fp32.to(dtype=storage_dtype)
 
 
 def _target_linears(
@@ -1644,6 +1694,7 @@ def _assemble_streamed_aura_payload(
     names: Sequence[str],
     formats: Sequence[str],
     formats_by_qname: Mapping[str, Sequence[str]],
+    unmeasured_formats_by_qname: Mapping[str, Sequence[str]],
     n_probes: int,
     token_scope: str,
     seed_base: int,
@@ -1688,6 +1739,11 @@ def _assemble_streamed_aura_payload(
                     "output_mse_measured": False,
                     "cost_source": "aura_passthrough_zero",
                 }
+                continue
+            if fmt in unmeasured_formats_by_qname.get(name, ()):
+                # Identity-bearing terminals can be semantically real yet
+                # outside this measurement currency.  Retain them in the
+                # exact streamed plan, but never invent a scalar row.
                 continue
             key = (name, fmt)
             if key not in s2:
@@ -1761,6 +1817,11 @@ def _assemble_streamed_aura_payload(
             )),
             "git_commit": checkpoint_git_commit or _git_commit(),
             "streaming": True,
+            "streamed_gradient_harvest": (
+                "post_accumulate_per_parameter"
+            ),
+            "streamed_cotangent_rollover": "in_place_per_probe",
+            "streamed_boundary_release": "progressive_reverse",
             **(
                 dict(cb_provenance)
                 if cb_provenance
@@ -1793,6 +1854,7 @@ def compute_aura_cost_streamed(
     model_identity: Mapping[str, object] | None = None,
     checkpoint_identity_extra: Mapping[str, object] | None = None,
     formats_by_qname: Mapping[str, Sequence[str]] | None = None,
+    unmeasured_formats_by_qname: Mapping[str, Sequence[str]] | None = None,
     anchor_renderer: object | None = None,
     include_routed_experts: bool = False,
     diagnostic_weight_mse_pairs: Sequence[tuple[str, str]] | None = None,
@@ -1883,6 +1945,32 @@ def compute_aura_cost_streamed(
         linears = {
             name: linears[name] for name in raw_plan
         }
+    raw_unmeasured: dict[str, tuple[str, ...]] = {}
+    if unmeasured_formats_by_qname is not None:
+        if raw_plan is None:
+            raise ValueError(
+                "unmeasured streamed formats require formats_by_qname"
+            )
+        for raw_name, raw_formats in unmeasured_formats_by_qname.items():
+            name = str(raw_name)
+            if name not in raw_plan:
+                raise ValueError(
+                    f"unmeasured streamed format plan has unknown qname {name!r}"
+                )
+            if isinstance(raw_formats, (str, bytes)):
+                raise TypeError(
+                    f"unmeasured streamed formats for {name!r} must be a sequence"
+                )
+            values = tuple(dict.fromkeys(
+                fr.canonical_format_name(fmt) for fmt in raw_formats
+            ))
+            unexpected = sorted(set(values) - set(raw_plan[name]))
+            if unexpected:
+                raise ValueError(
+                    f"unmeasured streamed formats for {name} are outside "
+                    f"its exact plan: {unexpected}"
+                )
+            raw_unmeasured[name] = values
     if unit_filter:
         try:
             pattern = re.compile(str(unit_filter))
@@ -1903,15 +1991,16 @@ def compute_aura_cost_streamed(
         layer = runner.layer_index_for_qname(name)
         names_by_layer.setdefault(layer, []).append(name)
 
-    zero_fmts = tuple(fmt for fmt in fmts if fmt in _ZERO_COST_FORMATS)
     unit_formats: dict[str, tuple[str, ...]] = {}
     render_formats: dict[str, tuple[str, ...]] = {}
     for name in names:
         planned = raw_plan[name] if raw_plan is not None else tuple(fmts)
+        unmeasured = set(raw_unmeasured.get(name, ()))
         measured = tuple(
-            fmt for fmt in planned if fmt not in _ZERO_COST_FORMATS
+            fmt for fmt in planned
+            if fmt not in _ZERO_COST_FORMATS and fmt not in unmeasured
         )
-        unit_formats[name] = tuple(dict.fromkeys((*planned, *zero_fmts)))
+        unit_formats[name] = tuple(planned)
         render_formats[name] = measured
     nonzero_fmts = list(dict.fromkeys(
         fmt for name in names for fmt in render_formats[name]
@@ -1929,9 +2018,10 @@ def compute_aura_cost_streamed(
                 "streamed production anchors require an exact "
                 "formats_by_qname anchor plan"
             )
-        if str(dw_dtype) != "float32":
+        if str(dw_dtype) not in {"bfloat16", "float32"}:
             raise ValueError(
-                "streamed production-anchor AURA requires dw_dtype='float32'"
+                "streamed production-anchor AURA requires dw_dtype to be "
+                "'bfloat16' or 'float32'"
             )
         empty = sorted(name for name in names if not render_formats[name])
         if empty:
@@ -2065,9 +2155,13 @@ def compute_aura_cost_streamed(
         extra = dict(checkpoint_identity_extra or {})
         reserved = {
             "streamed_formats_by_qname",
+            "unmeasured_streamed_formats_by_qname",
             "production_anchor_renderer",
             "include_routed_experts",
             "diagnostic_weight_mse_pairs",
+            "streamed_gradient_harvest",
+            "streamed_cotangent_rollover",
+            "streamed_boundary_release",
         } & set(extra)
         if reserved:
             raise ValueError(
@@ -2079,10 +2173,18 @@ def compute_aura_cost_streamed(
         extra["streamed_formats_by_qname"] = {
             name: list(unit_formats[name]) for name in names
         }
+        extra["unmeasured_streamed_formats_by_qname"] = {
+            name: list(raw_unmeasured.get(name, ())) for name in names
+        }
         extra["include_routed_experts"] = bool(include_routed_experts)
         extra["diagnostic_weight_mse_pairs"] = [
             [name, fmt] for name, fmt in sorted(diagnostic_pairs)
         ]
+        extra["streamed_gradient_harvest"] = (
+            "post_accumulate_per_parameter"
+        )
+        extra["streamed_cotangent_rollover"] = "in_place_per_probe"
+        extra["streamed_boundary_release"] = "progressive_reverse"
         if anchor_identity is not None:
             extra["production_anchor_renderer"] = dict(anchor_identity)
         identity = _build_aura_checkpoint_identity(
@@ -2145,6 +2247,7 @@ def compute_aura_cost_streamed(
             names=names,
             formats=fmts,
             formats_by_qname=unit_formats,
+            unmeasured_formats_by_qname=raw_unmeasured,
             n_probes=n_probes,
             token_scope=token_scope,
             seed_base=seed_base,
@@ -2266,6 +2369,9 @@ def compute_aura_cost_streamed(
             raise RuntimeError("streamed AURA tail produced no cotangent")
         grad_outs.append(tail.grad.detach().to("cpu"))
         del logits, probe, tail
+    # The tail cotangents are now independent CPU tensors. Its source output
+    # boundary will not be read again during the reverse sweep.
+    batch.activations_cpu[-1] = torch.empty(0)
 
     for layer in reversed(range(runner.num_layers)):
         runner.context.install(layer)
@@ -2292,27 +2398,123 @@ def compute_aura_cost_streamed(
                         name: linears[name]
                         for name in names_by_layer.get(layer, [])
                     }
-                    rendered_anchors = render_layer(
-                        layer=layer,
-                        modules=layer_modules,
-                        formats_by_qname={
-                            name: render_formats[name] for name in pending
-                        },
-                    )
-                    if not isinstance(rendered_anchors, Mapping):
-                        raise TypeError(
-                            "streamed production anchor render_layer() must "
-                            "return a Mapping"
-                        )
                     expected_pairs = {
                         (name, fmt)
                         for name in pending
                         for fmt in render_formats[name]
                     }
-                    observed_pairs = {
-                        (str(name), fr.canonical_format_name(fmt))
-                        for name, fmt in rendered_anchors
-                    }
+                    transient_render = getattr(
+                        anchor_renderer, "render_layer_transient", None
+                    )
+
+                    def _consume_anchor(
+                        *, qname, fmt, reference_weight, rendered_weight,
+                        render_score,
+                    ):
+                        del render_score
+                        name = str(qname)
+                        canonical_fmt = fr.canonical_format_name(fmt)
+                        key = (name, canonical_fmt)
+                        if key not in expected_pairs:
+                            raise RuntimeError(
+                                "streamed production anchor consumer received "
+                                f"unexpected pair {key}"
+                            )
+                        if key in d_weights:
+                            raise RuntimeError(
+                                "streamed production anchor consumer received "
+                                f"duplicate pair {key}"
+                            )
+                        if not isinstance(rendered_weight, torch.Tensor):
+                            raise TypeError(
+                                "streamed production anchor renderer returned "
+                                f"{type(rendered_weight).__name__} for "
+                                f"{name}@{canonical_fmt}, expected Tensor"
+                            )
+                        if tuple(rendered_weight.shape) != tuple(
+                            reference_weight.shape
+                        ):
+                            raise RuntimeError(
+                                "streamed production anchor shape differs for "
+                                f"{name}@{canonical_fmt}: rendered="
+                                f"{tuple(rendered_weight.shape)} source="
+                                f"{tuple(reference_weight.shape)}"
+                            )
+                        d_weights[key] = _stored_production_anchor_delta(
+                            rendered_weight,
+                            reference_weight,
+                            storage_dtype=dw_torch_dtype,
+                        )
+                        if key in diagnostic_pairs:
+                            weight_mse_diagnostic[key] = float(
+                                d_weights[key].float().pow(2).mean().item()
+                            )
+                        dw_src[key] = "production_render"
+                        s2[key] = 0.0
+                        s4[key] = 0.0
+                        x2_probe[key] = []
+                        return {
+                            "operation": "fp32_subtract_then_store",
+                            "storage_dtype": str(dw_torch_dtype),
+                        }
+
+                    if callable(transient_render):
+                        observed_pairs = {
+                            (str(name), fr.canonical_format_name(fmt))
+                            for name, fmt in transient_render(
+                                layer=layer,
+                                modules=layer_modules,
+                                formats_by_qname={
+                                    name: render_formats[name]
+                                    for name in pending
+                                },
+                                consume_render=_consume_anchor,
+                                consumer_identity=(
+                                    AURA_PRODUCTION_ANCHOR_DELTA_CONSUMER_IDENTITY
+                                ),
+                            )
+                        }
+                    else:
+                        rendered_anchors = render_layer(
+                            layer=layer,
+                            modules=layer_modules,
+                            formats_by_qname={
+                                name: render_formats[name]
+                                for name in pending
+                            },
+                        )
+                        if not isinstance(rendered_anchors, Mapping):
+                            raise TypeError(
+                                "streamed production anchor render_layer() "
+                                "must return a Mapping"
+                            )
+                        observed_pairs = {
+                            (str(name), fr.canonical_format_name(fmt))
+                            for name, fmt in rendered_anchors
+                        }
+                        # Compatibility for injected/research renderers. The
+                        # production renderer above consumes each pair before
+                        # the next pair is materialized.
+                        rendered_anchor_pool = (
+                            rendered_anchors
+                            if isinstance(rendered_anchors, MutableMapping)
+                            else dict(rendered_anchors)
+                        )
+                        del rendered_anchors
+                        for name in pending:
+                            weight = linears[name].weight.data
+                            for fmt in render_formats[name]:
+                                key = (name, fmt)
+                                rendered = rendered_anchor_pool.pop(key)
+                                _consume_anchor(
+                                    qname=name,
+                                    fmt=fmt,
+                                    reference_weight=weight,
+                                    rendered_weight=rendered,
+                                    render_score={},
+                                )
+                                del rendered
+                        del rendered_anchor_pool
                     if observed_pairs != expected_pairs:
                         raise RuntimeError(
                             "streamed production anchor renderer returned a "
@@ -2346,35 +2548,7 @@ def compute_aura_cost_streamed(
                                 "shape": source_shape,
                                 "sha256": source_sha256,
                             }
-                        for fmt in render_formats[name]:
-                            key = (name, fmt)
-                            rendered = rendered_anchors[key]
-                            if not isinstance(rendered, torch.Tensor):
-                                raise TypeError(
-                                    "streamed production anchor renderer "
-                                    f"returned {type(rendered).__name__} for "
-                                    f"{name}@{fmt}, expected Tensor"
-                                )
-                            if tuple(rendered.shape) != tuple(weight.shape):
-                                raise RuntimeError(
-                                    "streamed production anchor shape differs "
-                                    f"for {name}@{fmt}: rendered="
-                                    f"{tuple(rendered.shape)} source="
-                                    f"{tuple(weight.shape)}"
-                                )
-                            d_weights[key] = (
-                                rendered.to(device=weight.device, dtype=torch.float32)
-                                - weight.float()
-                            )
-                            if key in diagnostic_pairs:
-                                weight_mse_diagnostic[key] = float(
-                                    d_weights[key].float().pow(2).mean().item()
-                                )
-                            dw_src[key] = "production_render"
-                            s2[key] = 0.0
-                            s4[key] = 0.0
-                            x2_probe[key] = []
-                    del rendered_anchors
+                    _release_streamed_anchor_allocator_cache(device)
                 else:
                     for name in pending:
                         for fmt in render_formats[name]:
@@ -2399,55 +2573,32 @@ def compute_aura_cost_streamed(
                 if callable(compact):
                     compact()
 
-            next_grad_outs: list[torch.Tensor] = []
-            for probe_index in range(n_probes):
-                x_in = batch.activations_cpu[layer].to(
-                    device=device, dtype=dtype
-                ).detach().requires_grad_(True)
-                isolated = profile.isolated_layer_pass_state(
-                    batch.shared_pass_state, runner.layers[layer]
-                )
-                isolated = cotangents[probe_index].graft(isolated)
-                out = runner.isolated_layer(
-                    batch, layer, x_in, pass_state=isolated
-                )
-                roots, root_grads = cotangents[probe_index].produced_roots()
-                if roots:
-                    torch.autograd.backward(
-                        [out, *roots],
-                        [grad_outs[probe_index].to(device), *root_grads],
-                    )
-                else:
-                    out.backward(grad_outs[probe_index].to(device))
-                cotangents[probe_index].harvest()
-                if x_in.grad is None:
+            # Project each fully accumulated parameter gradient from its
+            # post-accumulate hook, then clear ``param.grad`` immediately.
+            # A routed layer can otherwise retain another complete 12-GiB
+            # BF16 parameter plane on top of its source weights and dW menu.
+            # Each reduction below is per parameter, so performing it when
+            # that parameter's AccumulateGrad node completes is numerically
+            # identical to the old post-backward qname loop.
+            harvested: set[str] = set()
+
+            def _harvest_streamed_gradient(
+                name: str, gradient: torch.Tensor
+            ) -> None:
+                if name in harvested:
                     raise RuntimeError(
-                        f"streamed AURA layer {layer} produced no input "
-                        "cotangent"
+                        "streamed AURA harvested a parameter twice in one "
+                        f"probe: {name}"
                     )
-                next_grad_outs.append(x_in.grad.detach().to("cpu"))
-                for name in pending:
-                    gradient = linears[name].weight.grad
-                    if gradient is None:
-                        # A routed expert not selected by this probe's routed
-                        # tokens has an exact zero projection.  Record the
-                        # sample explicitly so route-sparse and never-routed
-                        # experts remain valid K-probe AURA rows; this models
-                        # the smooth path only and does not claim route-flip
-                        # sensitivity.
-                        for fmt in render_formats[name]:
-                            key = (name, fmt)
-                            if key in d_weights:
-                                x2_probe[key].append(0.0)
-                        continue
-                    # Load-bearing numerical contract: both the Fisher energy
-                    # and every <g,dW> projection accumulate in fp32.
+                with torch.no_grad():
                     gradient_fp32 = gradient.float()
                     g_trace[name] += float(
                         (gradient_fp32 * gradient_fp32).sum().item()
                     )
                     if collect_col_energy:
-                        energy = (gradient_fp32 * gradient_fp32).sum(dim=0)
+                        energy = (
+                            gradient_fp32 * gradient_fp32
+                        ).sum(dim=0)
                         previous = col_energy.get(name)
                         col_energy[name] = (
                             energy if previous is None else previous + energy
@@ -2466,9 +2617,103 @@ def compute_aura_cost_streamed(
                         s2[key] += value
                         s4[key] += value * value
                         x2_probe[key].append(value)
-                    linears[name].weight.grad = None
-                del out, x_in
-            grad_outs = next_grad_outs
+                harvested.add(name)
+
+            def _make_streamed_gradient_hook(name: str):
+                def _hook(parameter: torch.Tensor) -> None:
+                    gradient = parameter.grad
+                    if gradient is None or name in harvested:
+                        return
+                    _harvest_streamed_gradient(name, gradient)
+                    parameter.grad = None
+
+                return _hook
+
+            hook_handles = []
+            try:
+                for name in pending:
+                    hook_handles.append(
+                        linears[name].weight.register_post_accumulate_grad_hook(
+                            _make_streamed_gradient_hook(name)
+                        )
+                    )
+                for probe_index in range(n_probes):
+                    available_gib = _free_gib()
+                    if available_gib < min_free_gib:
+                        raise RuntimeError(
+                            f"free UMA {available_gib:.1f} < floor "
+                            f"{min_free_gib:.1f}; abort before streamed "
+                            f"layer {layer} probe {probe_index + 1}"
+                        )
+                    harvested.clear()
+                    incoming_grad = grad_outs[probe_index].to(device)
+                    x_in = batch.activations_cpu[layer].to(
+                        device=device, dtype=dtype
+                    ).detach().requires_grad_(True)
+                    isolated = profile.isolated_layer_pass_state(
+                        batch.shared_pass_state, runner.layers[layer]
+                    )
+                    isolated = cotangents[probe_index].graft(isolated)
+                    out = runner.isolated_layer(
+                        batch, layer, x_in, pass_state=isolated
+                    )
+                    roots, root_grads = cotangents[probe_index].produced_roots()
+                    if roots:
+                        torch.autograd.backward(
+                            [out, *roots],
+                            [incoming_grad, *root_grads],
+                        )
+                    else:
+                        out.backward(incoming_grad)
+                    cotangents[probe_index].harvest()
+                    if x_in.grad is None:
+                        raise RuntimeError(
+                            f"streamed AURA layer {layer} produced no input "
+                            "cotangent"
+                        )
+                    # Replace this probe's consumed incoming cotangent now.
+                    # The former next_grad_outs list retained all 32 incoming
+                    # CPU tensors while growing a second complete outgoing
+                    # plane. In-place rollover bounds the CPU plane to 32
+                    # tensors plus the one result currently being copied.
+                    grad_outs[probe_index] = x_in.grad.detach().to("cpu")
+                    for name in pending:
+                        if name in harvested:
+                            continue
+                        gradient = linears[name].weight.grad
+                        if gradient is not None:
+                            # Defensive straggler path for a backend that did
+                            # not invoke the post-accumulate hook. It performs
+                            # the identical reduction and still frees the
+                            # gradient before the next probe.
+                            _harvest_streamed_gradient(name, gradient)
+                            linears[name].weight.grad = None
+                            continue
+                        # A routed expert not selected by this probe has an
+                        # exact zero projection. Record the sample explicitly
+                        # so route-sparse and never-routed experts retain the
+                        # same K-probe rows as the legacy post-backward loop.
+                        for fmt in render_formats[name]:
+                            key = (name, fmt)
+                            if key in d_weights:
+                                x2_probe[key].append(0.0)
+                    del (
+                        out,
+                        x_in,
+                        incoming_grad,
+                        isolated,
+                        roots,
+                        root_grads,
+                    )
+            finally:
+                for handle in hook_handles:
+                    handle.remove()
+
+            # This layer's input boundary will not be read again in the reverse
+            # sweep (the next iteration consumes boundary ``layer - 1``).
+            # Release it progressively instead of retaining all 44 DSv4
+            # hc_mult=4 boundary snapshots to the end.
+            batch.activations_cpu[layer] = torch.empty(0)
 
             if checkpoint_root is not None:
                 assert checkpoint_identity_sha256 is not None
@@ -2508,6 +2753,7 @@ def run_streamed_production_anchor_aura(
     render_purposes_by_qname: Mapping[
         str, Mapping[str, str | Sequence[str]]
     ] | None = None,
+    unmeasured_formats_by_qname: Mapping[str, Sequence[str]] | None = None,
     activation_index,
     render_levers: Mapping[str, object],
     col_weights: Mapping[str, torch.Tensor],
@@ -2533,9 +2779,11 @@ def run_streamed_production_anchor_aura(
 
     This is the concrete campaign API. ``formats_by_qname`` may contain
     several measured CB anchors for a unit (anchor, fitting-panel, and held-out
-    validation cells) plus its exact passthrough terminal.  Terminals are
-    emitted at zero cost but never sent to the renderer.  Every other listed
-    cell is rendered in the fixed production arm exactly once unless its
+    validation cells) plus an exact identity-bearing terminal.  A terminal
+    declared in ``unmeasured_formats_by_qname`` is never sent to the renderer
+    and receives no synthetic scalar unless it is independently covered by
+    the exact zero-cost passthrough contract.  Every other listed cell is
+    rendered in the fixed production arm exactly once unless its
     identity-bound per-unit AURA shard is resumed.
 
     The returned ordinary AURA payload carries scalar ``predicted_dloss`` rows
@@ -2551,6 +2799,7 @@ def run_streamed_production_anchor_aura(
     )
     canonical_plan: dict[str, tuple[str, ...]] = {}
     render_plan: dict[str, tuple[str, ...]] = {}
+    canonical_unmeasured: dict[str, tuple[str, ...]] = {}
     format_union: list[str] = []
     for raw_name, raw_formats in formats_by_qname.items():
         name = str(raw_name)
@@ -2565,8 +2814,26 @@ def run_streamed_production_anchor_aura(
             raise ValueError(
                 f"production-anchor formats are empty for {name}"
             )
+        raw_unmeasured = (
+            unmeasured_formats_by_qname.get(name, ())
+            if isinstance(unmeasured_formats_by_qname, Mapping) else ()
+        )
+        if isinstance(raw_unmeasured, (str, bytes)):
+            raise TypeError(
+                f"unmeasured production-anchor formats for {name} must be a sequence"
+            )
+        retained = tuple(dict.fromkeys(
+            fr.canonical_format_name(fmt) for fmt in raw_unmeasured
+        ))
+        unexpected_retained = sorted(set(retained) - set(formats))
+        if unexpected_retained:
+            raise ValueError(
+                f"unmeasured production-anchor formats for {name} are "
+                f"outside its exact plan: {unexpected_retained}"
+            )
         measured = tuple(
-            fmt for fmt in formats if fmt not in _ZERO_COST_FORMATS
+            fmt for fmt in formats
+            if fmt not in _ZERO_COST_FORMATS and fmt not in set(retained)
         )
         if not measured:
             raise ValueError(
@@ -2574,9 +2841,19 @@ def run_streamed_production_anchor_aura(
             )
         canonical_plan[name] = formats
         render_plan[name] = measured
+        canonical_unmeasured[name] = retained
         for fmt in formats:
             if fmt not in format_union:
                 format_union.append(fmt)
+    if isinstance(unmeasured_formats_by_qname, Mapping):
+        unexpected_names = sorted(
+            set(unmeasured_formats_by_qname) - set(canonical_plan)
+        )
+        if unexpected_names:
+            raise ValueError(
+                "unmeasured production-anchor formats contain unplanned "
+                f"qnames; sample={unexpected_names[:8]}"
+            )
 
     allowed_purposes = frozenset({"anchor", "panel", "validation"})
     canonical_purposes: dict[str, dict[str, list[str]]] = {}
@@ -2636,14 +2913,25 @@ def run_streamed_production_anchor_aura(
         cold_expert_provenance=cold_expert_provenance,
         max_act_rows=max_act_rows,
         h_detail_dir=h_detail_dir,
+        transient_consumer_identity=(
+            AURA_PRODUCTION_ANCHOR_DELTA_CONSUMER_IDENTITY
+        ),
     )
     extra = dict(checkpoint_identity_extra or {})
-    if "production_anchor_render_purposes" in extra:
+    reserved_extra = {
+        "production_anchor_render_purposes",
+        "production_anchor_unmeasured_formats_by_qname",
+    } & set(extra)
+    if reserved_extra:
         raise ValueError(
-            "checkpoint_identity_extra cannot override "
-            "production_anchor_render_purposes"
+            "checkpoint_identity_extra cannot override production-anchor "
+            f"plan identity fields: {sorted(reserved_extra)}"
         )
     extra["production_anchor_render_purposes"] = canonical_purposes
+    extra["production_anchor_unmeasured_formats_by_qname"] = {
+        name: list(values)
+        for name, values in sorted(canonical_unmeasured.items())
+    }
     payload = compute_aura_cost_streamed(
         runner,
         calib_ids,
@@ -2654,7 +2942,11 @@ def run_streamed_production_anchor_aura(
         production_cache=None,
         seed_base=seed_base,
         require_production_cache=True,
-        dw_dtype="float32",
+        # DSv4's worst routed layer carries two full anchor planes. FP32
+        # subtraction + BF16 storage retains the validated AURA contract
+        # (the projection below upcasts) while keeping Spark above the host's
+        # 3-GiB guardian floor.
+        dw_dtype="bfloat16",
         include_lm_head=False,
         allow_packed_expert_omission=False,
         collect_col_energy=collect_col_energy,
@@ -2663,6 +2955,7 @@ def run_streamed_production_anchor_aura(
         model_identity=model_identity,
         checkpoint_identity_extra=extra,
         formats_by_qname=canonical_plan,
+        unmeasured_formats_by_qname=canonical_unmeasured,
         anchor_renderer=renderer,
         include_routed_experts=include_routed_experts,
         diagnostic_weight_mse_pairs=[
@@ -2683,6 +2976,10 @@ def run_streamed_production_anchor_aura(
     }
     payload["provenance"].update({
         "production_anchor_render_purposes": canonical_purposes,
+        "production_anchor_unmeasured_formats_by_qname": {
+            name: list(values)
+            for name, values in sorted(canonical_unmeasured.items())
+        },
         "production_anchor_purpose_counts": counts,
         "production_anchor_union_render_count": sum(
             len(rows) for rows in canonical_purposes.values()

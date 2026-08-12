@@ -26,12 +26,15 @@ import sys
 from pathlib import Path
 
 from prismaquant.shipcard import (
+    ALL_SLOTS,
     GOLD_SLOTS,
-    REQUIRED_SLOTS,
+    _verify_gold_record,
     compute_model_sha,
     fill_slot,
     load_shipcard,
     make_record,
+    required_slots,
+    reattest_weight_stats,
     verify,
 )
 
@@ -47,7 +50,13 @@ PRIMARY_METRIC_KEYS = (
 
 CARRIED_METRIC_KEYS = PRIMARY_METRIC_KEYS + (
     "kl_p99", "kl_max", "n_positions", "n_confident", "n_samples", "seqlen",
-    "n_tokens_scored", "max_chunk_mean_nll", "quantization", "score_positions",
+    "n_tokens_scored", "per_chunk_mean_nll", "max_chunk_mean_nll",
+    "quantization", "score_positions",
+    "dsv4_gridbook_contract", "serve_manifest",
+    "dsv4_gridbook_contract_sha256",
+    "teacher_evidence", "mode", "prompt_top_k", "vocab_size",
+    "split", "n_tokens_requested", "calibration_contract",
+    "calibration_contract_sha256",
 )
 
 
@@ -60,6 +69,9 @@ def _finite(value: object) -> bool:
 
 def _cmd_show(args: argparse.Namespace) -> int:
     card = load_shipcard(args.shipcard)
+    slots_required = required_slots(
+        card, model_dir=Path(args.shipcard).resolve().parent
+    )
     print(f"shipcard: {args.shipcard}")
     print(f"  model_dir:      {card.get('model_dir')}")
     print(f"  model_sha:      {str(card.get('model_sha'))[:16]}")
@@ -69,7 +81,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
           f"  ({(build.get('achieved_bpp') or {}).get('source')})")
     print(f"  artifact_bytes: {card.get('artifact_bytes')}")
     print("  slots:")
-    for slot in REQUIRED_SLOTS:
+    for slot in slots_required:
         record = (card.get("slots") or {}).get(slot)
         if not record:
             print(f"    [ ] {slot}  UNFILLED")
@@ -82,9 +94,15 @@ def _cmd_show(args: argparse.Namespace) -> int:
 
 def _cmd_verify(args: argparse.Namespace) -> int:
     card = load_shipcard(args.shipcard)
-    problems = verify(card, model_dir=args.model_dir)
+    # The card lives inside the artifact.  Its parent is authoritative when
+    # --model-dir is omitted, so moving an intact artifact does not weaken or
+    # break verification and a stale path embedded before publication cannot
+    # suppress the on-disk identity check.
+    model_dir = args.model_dir or str(Path(args.shipcard).resolve().parent)
+    slots_required = required_slots(card, model_dir=model_dir)
+    problems = verify(card, model_dir=model_dir)
     if not problems:
-        print(f"[shipcard] OK — {len(REQUIRED_SLOTS)}/{len(REQUIRED_SLOTS)} "
+        print(f"[shipcard] OK — {len(slots_required)}/{len(slots_required)} "
               f"slots filled and matching for {card.get('model_dir')}")
         return 0
     print(f"[shipcard] REFUSED — {len(problems)} problem(s) with "
@@ -92,6 +110,16 @@ def _cmd_verify(args: argparse.Namespace) -> int:
     for problem in problems:
         print(f"  - {problem}")
     return 1
+
+
+def _cmd_reattest(args: argparse.Namespace) -> int:
+    model_dir = args.model_dir or str(Path(args.shipcard).resolve().parent)
+    reattest_weight_stats(args.shipcard, model_dir)
+    print(
+        f"[shipcard] exact weight content matches; refreshed stat attestation "
+        f"for {model_dir}"
+    )
+    return 0
 
 
 def _cmd_fill(args: argparse.Namespace) -> int:
@@ -126,15 +154,52 @@ def _cmd_fill(args: argparse.Namespace) -> int:
               "the card; verify will refuse it", file=sys.stderr)
 
     metrics = {k: payload[k] for k in CARRIED_METRIC_KEYS if k in payload}
-    primary = next(
-        (payload[k] for k in PRIMARY_METRIC_KEYS
-         if k in payload and _finite(payload[k])),
+    if args.slot == "gold.kl":
+        slot_primary_keys = ("kl_confident_mean", "kl_mean")
+        count_ok = any(
+            isinstance(payload.get(key), int)
+            and not isinstance(payload.get(key), bool)
+            and payload.get(key, 0) > 0
+            for key in ("n_positions", "n_samples")
+        )
+    else:
+        slot_primary_keys = ("ppl", "mean_nll")
+        count_ok = (
+            isinstance(payload.get("n_tokens_scored"), int)
+            and not isinstance(payload.get("n_tokens_scored"), bool)
+            and payload.get("n_tokens_scored", 0) > 0
+        )
+    slot_primary = next(
+        (payload[key] for key in slot_primary_keys if key in payload and _finite(payload[key])),
         None,
     )
-    passed = primary is not None if args.passed is None else args.passed
-    if primary is None and args.passed is None:
-        print(f"[shipcard] WARN {args.record} carries no finite metric in "
-              f"{PRIMARY_METRIC_KEYS}; recording passed=false", file=sys.stderr)
+    fingerprint = payload.get("serve_fingerprint")
+    commit = payload.get("git_commit") or (payload.get("git") or {}).get("commit")
+    structurally_valid = (
+        slot_primary is not None
+        and float(slot_primary) >= 0
+        and count_ok
+        and isinstance(fingerprint, str)
+        and len(fingerprint) == 64
+        and all(character in "0123456789abcdef" for character in fingerprint)
+        and isinstance(commit, str)
+        and len(commit) in {40, 64}
+        and all(character in "0123456789abcdef" for character in commit)
+    )
+    if args.passed is True and not structurally_valid:
+        print(
+            f"[shipcard] REFUSED: --passed cannot override missing or malformed "
+            f"{args.slot} metric/count/fingerprint/git identity",
+            file=sys.stderr,
+        )
+        return 2
+    passed = structurally_valid if args.passed is None else args.passed
+    if not structurally_valid:
+        print(
+            f"[shipcard] WARN {args.record} lacks complete {args.slot} "
+            "metric/count/fingerprint/git evidence; recording passed=false",
+            file=sys.stderr,
+        )
 
     record = make_record(
         slot=args.slot,
@@ -144,17 +209,45 @@ def _cmd_fill(args: argparse.Namespace) -> int:
         metrics=metrics,
         detail=args.detail or f"from {args.record}",
         spec_decode_detected=spec,
-        serve_fingerprint=payload.get("serve_fingerprint"),
-        git_commit=(payload.get("git_commit")
-                    or (payload.get("git") or {}).get("commit")),
+        serve_fingerprint=fingerprint,
+        git_commit=commit,
         extra={"record_path": str(Path(args.record).resolve()),
                "measured_model": payload.get("model")},
     )
+    is_gridbook = required_slots(
+        card, model_dir=model_dir
+    ) == ALL_SLOTS
+    replay_problems = (
+        _verify_gold_record(
+            args.slot,
+            record,
+            model_dir=model_dir,
+            require_dsv4_gridbook_contract=True,
+            require_current_artifact_path=True,
+        )
+        if is_gridbook and structurally_valid
+        else []
+    )
+    if replay_problems:
+        if args.passed is True:
+            print(
+                "[shipcard] REFUSED: --passed cannot override invalid DSv4 "
+                "Gridbook gold evidence: " + "; ".join(replay_problems),
+                file=sys.stderr,
+            )
+            return 2
+        record["passed"] = False
+        print(
+            "[shipcard] WARN DSv4 Gridbook gold evidence did not replay; "
+            "recording passed=false: " + "; ".join(replay_problems),
+            file=sys.stderr,
+        )
     fill_slot(args.shipcard, args.slot, record)
     print(f"[shipcard] filled {args.slot} from {args.record} "
-          f"(passed={bool(passed)}, primary={primary})")
-    unfilled = [s for s in REQUIRED_SLOTS
-                if not (load_shipcard(args.shipcard)["slots"].get(s))]
+          f"(passed={record['passed']}, primary={slot_primary})")
+    updated_card = load_shipcard(args.shipcard)
+    unfilled = [s for s in required_slots(updated_card, model_dir=model_dir)
+                if not updated_card["slots"].get(s)]
     print(f"[shipcard] remaining unfilled: {unfilled or 'none'}")
     return 0
 
@@ -175,9 +268,20 @@ def main(argv: list[str] | None = None) -> int:
                                "require the records to match it")
     p_verify.set_defaults(func=_cmd_verify)
 
+    p_reattest = sub.add_parser(
+        "reattest",
+        help="full-hash a legitimately copied CB artifact and refresh its stat cache",
+    )
+    p_reattest.add_argument("shipcard")
+    p_reattest.add_argument("--model-dir", default=None)
+    p_reattest.set_defaults(func=_cmd_reattest)
+
     p_fill = sub.add_parser("fill", help="close a slot from a result JSON")
     p_fill.add_argument("shipcard")
-    p_fill.add_argument("--slot", required=True, choices=list(REQUIRED_SLOTS))
+    # Native/ship-gate slots carry structured evidence and may only be closed
+    # by their validators.  The generic record importer is deliberately
+    # limited to the two metric slots it owns.
+    p_fill.add_argument("--slot", required=True, choices=sorted(GOLD_SLOTS))
     p_fill.add_argument("--record", required=True,
                         help="result JSON written by the serve-lane tool")
     p_fill.add_argument("--model-dir", default=None,

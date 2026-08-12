@@ -181,11 +181,11 @@ def test_declared_serve_scripts_exist():
 
 
 def test_shipcard_slots_are_real_slots():
-    from prismaquant.shipcard import REQUIRED_SLOTS
+    from prismaquant.shipcard import ALL_SLOTS
 
     for spec in all_lane_specs():
         for slot in spec.shipcard_slots():
-            assert slot in REQUIRED_SLOTS, f"{spec.id}: unknown slot {slot}"
+            assert slot in ALL_SLOTS, f"{spec.id}: unknown slot {slot}"
 
 
 def test_gate_report_reads_shipcard_fill():
@@ -233,3 +233,10 @@ def test_native_and_cb_share_the_endpoint_agnostic_ship_gate():
     assert native.endpoint.kind == cb.endpoint.kind == "openai"
     assert (native.gate("ship_gate.ppl_p99nll").runner
             == cb.gate("ship_gate.ppl_p99nll").runner)
+
+
+def test_cb_gold_ppl_runner_names_offline_wikitext_input():
+    cb = load_lane_spec("nvfp4_cb")
+    runner = cb.gate("gold.ppl").runner
+    assert "--dsv4-gridbook-contract" in runner
+    assert "--wikitext-inputs <gold-inputs.json>" in runner

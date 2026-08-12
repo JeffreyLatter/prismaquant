@@ -81,11 +81,9 @@ def _pretend_gridbook_supports_routed_lut(monkeypatch):
     """Patch the pin to a version that carries the routed per-role LUT ABI.
 
     These tests exercise the routed learned-book PRODUCER, which is gated on
-    ``GRIDBOOK_ROUTED_MOE_PER_ROLE_CODEBOOK_LUT_MIN_VERSION``. The shipped pin
-    is the released 0.8.2, which correctly refuses that path — no released
-    Gridbook carries the ABI yet. Reading the shipped pin here would make the
-    producer's own tests silently vanish the day the pin is right and fail the
-    day it is not, so supply the capability explicitly instead.
+    ``GRIDBOOK_ROUTED_MOE_PER_ROLE_CODEBOOK_LUT_MIN_VERSION``. Supply that
+    capability explicitly so the producer mechanics remain isolated from the
+    ambient release pin and its external compatibility job.
     """
     supported = runtime_pin.parse_gridbook_runtime_pin({
         "schema": runtime_pin.GRIDBOOK_RUNTIME_PIN_SCHEMA,

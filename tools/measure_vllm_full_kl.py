@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import random
@@ -13,13 +14,32 @@ from pathlib import Path
 
 import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+_TOOLS_ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(_TOOLS_ROOT))
+from prismaquant_source_bootstrap import activate_prismaquant_source
+
+activate_prismaquant_source()
 
 try:  # package mode (`python -m tools.measure_vllm_full_kl`)
-    from .serve_fingerprint import git_commit, self_manifest
+    from .dsv4_gridbook_contract import exact_llm_contract
+    from .full_kl_teacher_payload import (
+        EXPECTED_POSITIONS,
+        load_teacher_evidence,
+        safe_load_torch_payload,
+    )
+    from .serve_fingerprint import gold_producer_identity, self_manifest
     from .spec_decode_guard import refuse_if_spec_decode
 except ImportError:  # script mode (`python /repo/tools/measure_vllm_full_kl.py`)
-    from serve_fingerprint import git_commit, self_manifest  # type: ignore
+    from dsv4_gridbook_contract import exact_llm_contract  # type: ignore
+    from full_kl_teacher_payload import (  # type: ignore
+        EXPECTED_POSITIONS,
+        load_teacher_evidence,
+        safe_load_torch_payload,
+    )
+    from serve_fingerprint import (  # type: ignore
+        gold_producer_identity,
+        self_manifest,
+    )
     from spec_decode_guard import refuse_if_spec_decode  # type: ignore
 
 # vLLM / datasets / transformers are imported lazily inside the functions
@@ -30,6 +50,36 @@ except ImportError:  # script mode (`python /repo/tools/measure_vllm_full_kl.py`
 #: `None` means "could not inspect", which the shipcard refuses — an unverified
 #: negative is exactly what the draft-logprobs trap looked like.
 _SPEC_DECODE_DETECTED: bool | None = None
+_DSV4_GRIDBOOK_CONTRACT: dict | None = None
+_DSV4_GRIDBOOK_KWARGS: dict | None = None
+
+
+def _strict_json_text(value: object) -> str:
+    """Serialize release evidence without JavaScript NaN/Infinity tokens."""
+    try:
+        return json.dumps(value, indent=2, allow_nan=False)
+    except ValueError as exc:
+        raise RuntimeError(
+            "refusing to serialize non-finite full-KL evidence"
+        ) from exc
+
+
+def _activate_dsv4_gridbook_contract(args) -> dict:
+    """Apply the closed environment/kwargs before importing the runtime."""
+    global _DSV4_GRIDBOOK_CONTRACT, _DSV4_GRIDBOOK_KWARGS
+    if not args.dsv4_gridbook_contract:
+        return {}
+    if _DSV4_GRIDBOOK_KWARGS is None:
+        exact_kwargs, receipt = exact_llm_contract(args.model)
+        _DSV4_GRIDBOOK_KWARGS = dict(exact_kwargs)
+        _DSV4_GRIDBOOK_CONTRACT = dict(receipt)
+    args.quantization = "gridbook"
+    args.dtype = "bfloat16"
+    args.gpu_memory_utilization = 0.84
+    args.enforce_eager = True
+    args.max_num_batched_tokens = 512
+    args.max_logprobs = 248_320
+    return dict(_DSV4_GRIDBOOK_KWARGS)
 
 
 def _provenance(args) -> dict:
@@ -40,12 +90,43 @@ def _provenance(args) -> dict:
     result JSONs whose `serve_fingerprint` differs are not comparable as a
     delta (`tools/kl_ab.py` refuses them).
     """
-    manifest = self_manifest(extra={"measurement_tool": "measure_vllm_full_kl"})
+    contract_sha = (
+        hashlib.sha256(json.dumps(
+            _DSV4_GRIDBOOK_CONTRACT,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")).hexdigest()
+        if _DSV4_GRIDBOOK_CONTRACT is not None else None
+    )
+    from prismaquant.gridbook_runtime_pin import load_gridbook_runtime_pin
+    from prismaquant.validate_cb_endpoint import DSV4_SPARK_VLLM_IMAGE
+
+    pin = load_gridbook_runtime_pin()
+    producer = gold_producer_identity("measure_vllm_full_kl")
+    manifest = self_manifest(
+        extra={
+            "measurement_tool": "measure_vllm_full_kl",
+            "producer_identity": producer,
+            "effective_llm_kwargs": _DSV4_GRIDBOOK_KWARGS,
+            "dsv4_gridbook_contract_sha256": contract_sha,
+        },
+        image=DSV4_SPARK_VLLM_IMAGE if args.dsv4_gridbook_contract else None,
+        artifact_dir=(args.model if args.dsv4_gridbook_contract else None),
+        require_engine_descendant=bool(args.dsv4_gridbook_contract),
+        gridbook_pin_attestation={
+            "repository": pin.repository,
+            "commit": pin.commit,
+            "version": pin.version,
+        } if args.dsv4_gridbook_contract else None,
+    )
     return {
-        "git_commit": git_commit(),
+        "git_commit": producer["git_commit"],
         "serve_fingerprint": manifest["serve_fingerprint"],
         "serve_manifest": manifest,
         "spec_decode_detected": _SPEC_DECODE_DETECTED,
+        "dsv4_gridbook_contract": _DSV4_GRIDBOOK_CONTRACT,
+        "dsv4_gridbook_contract_sha256": contract_sha,
     }
 
 
@@ -87,8 +168,6 @@ def _load_wikitext_calibration(
 
 
 def _load_llm(args, *, max_model_len: int) -> "LLM":
-    from vllm import LLM
-
     kwargs = {
         "model": args.model,
         "trust_remote_code": True,
@@ -108,6 +187,11 @@ def _load_llm(args, *, max_model_len: int) -> "LLM":
         # max_num_batched_tokens >= their chunk-alignment floor (~2096);
         # the seqlen+16 max_model_len alone can drive it below that.
         kwargs["max_num_batched_tokens"] = args.max_num_batched_tokens
+    if args.dsv4_gridbook_contract:
+        kwargs.update(_activate_dsv4_gridbook_contract(args))
+    # Environment/bootstrap above must precede the first Gridbook/vLLM import.
+    from vllm import LLM
+
     llm = LLM(**kwargs)
     global _SPEC_DECODE_DETECTED
     _SPEC_DECODE_DETECTED = refuse_if_spec_decode(
@@ -130,10 +214,20 @@ def _resolve_vocab_size(llm: LLM, tokenizer) -> int:
 
 def _logprob_vector(logprobs, *, vocab_size: int) -> torch.Tensor:
     vec = torch.full((vocab_size,), float("-inf"), dtype=torch.float32)
+    seen_token_ids: set[int] = set()
     for key, value in logprobs.items():
         token_id = int(key)
+        if token_id < 0:
+            raise RuntimeError(
+                f"vLLM returned negative token id {token_id} in full-vocab logprobs"
+            )
         if token_id >= vocab_size:
             continue
+        if token_id in seen_token_ids:
+            raise RuntimeError(
+                f"vLLM returned duplicate token id {token_id} in full-vocab logprobs"
+            )
+        seen_token_ids.add(token_id)
         logprob = getattr(value, "logprob", None)
         if logprob is None and isinstance(value, dict):
             logprob = value.get("logprob")
@@ -141,7 +235,16 @@ def _logprob_vector(logprobs, *, vocab_size: int) -> torch.Tensor:
             logprob = value[0]
         if logprob is None:
             logprob = value
-        vec[token_id] = float(logprob)
+        logprob = float(logprob)
+        if not math.isfinite(logprob):
+            raise RuntimeError(
+                f"vLLM returned non-finite logprob for token id {token_id}"
+            )
+        if logprob > 0.0:
+            raise RuntimeError(
+                f"vLLM returned positive logprob for token id {token_id}: {logprob}"
+            )
+        vec[token_id] = logprob
     missing = int(torch.isneginf(vec).sum().item())
     if missing:
         raise RuntimeError(
@@ -325,8 +428,9 @@ def _teacher(args) -> int:
             "elapsed_s": time.monotonic() - started,
             **_provenance(args),
         }
-        Path(args.meta_output).write_text(json.dumps(meta, indent=2))
-        print(json.dumps(meta, indent=2), flush=True)
+        meta_text = _strict_json_text(meta)
+        Path(args.meta_output).write_text(meta_text)
+        print(meta_text, flush=True)
         return 0
     logprobs = _measure_logprobs(llm, prompts, vocab_size=vocab_size)
     payload = {
@@ -352,9 +456,51 @@ def _teacher(args) -> int:
         "elapsed_s": time.monotonic() - started,
         **_provenance(args),
     }
-    Path(args.meta_output).write_text(json.dumps(meta, indent=2))
-    print(json.dumps(meta, indent=2), flush=True)
+    meta_text = _strict_json_text(meta)
+    Path(args.meta_output).write_text(meta_text)
+    print(meta_text, flush=True)
     return 0
+
+
+def _validated_topk_entries(ids_row, lps_row, *, role: str) -> list[tuple[int, float]]:
+    """Return one strict top-K row, excluding only canonical pad entries."""
+    token_ids = ids_row.tolist()
+    logprobs = lps_row.tolist()
+    if len(token_ids) != len(logprobs):
+        raise RuntimeError(f"{role} top-K token/logprob lengths differ")
+
+    entries: list[tuple[int, float]] = []
+    seen: set[int] = set()
+    for raw_token_id, raw_logprob in zip(token_ids, logprobs):
+        token_id = int(raw_token_id)
+        logprob = float(raw_logprob)
+        if token_id == -1:
+            if not math.isinf(logprob) or logprob > 0.0:
+                raise RuntimeError(
+                    f"{role} top-K padding must be the canonical (-1, -inf) pair"
+                )
+            continue
+        if token_id < 0:
+            raise RuntimeError(f"{role} top-K token id {token_id} is invalid")
+        if token_id in seen:
+            raise RuntimeError(
+                f"{role} top-K row contains duplicate token id {token_id}"
+            )
+        seen.add(token_id)
+        if not math.isfinite(logprob):
+            raise RuntimeError(
+                f"{role} top-K row contains a non-finite logprob for token id "
+                f"{token_id}"
+            )
+        if logprob > 0.0:
+            raise RuntimeError(
+                f"{role} top-K row contains a positive logprob for token id "
+                f"{token_id}: {logprob}"
+            )
+        entries.append((token_id, logprob))
+    if not entries:
+        raise RuntimeError(f"{role} position carries no finite top-K entries")
+    return entries
 
 
 def _position_kl(t_ids_row, t_lps_row, s_ids_row, s_lps_row) -> tuple[float, float]:
@@ -372,21 +518,10 @@ def _position_kl(t_ids_row, t_lps_row, s_ids_row, s_lps_row) -> tuple[float, flo
     documented relative-compare-only convention (shared across arms); they
     are deliberately left as-is.
     """
-    smap = {
-        int(a): float(b)
-        for a, b in zip(s_ids_row.tolist(), s_lps_row.tolist())
-        if int(a) >= 0 and math.isfinite(float(b))
-    }
-    if not smap:
-        raise RuntimeError("student position carries no finite top-K entries")
+    student = _validated_topk_entries(s_ids_row, s_lps_row, role="student")
+    smap = dict(student)
     floor = min(smap.values())                        # kl_ab.py convention
-    valid = [
-        (int(t), float(lp))
-        for t, lp in zip(t_ids_row.tolist(), t_lps_row.tolist())
-        if int(t) >= 0 and math.isfinite(float(lp))
-    ]
-    if not valid:
-        raise RuntimeError("teacher position carries no finite top-K entries")
+    valid = _validated_topk_entries(t_ids_row, t_lps_row, role="teacher")
     tlp = torch.tensor([lp for _t, lp in valid], dtype=torch.float64)
     q = torch.tensor([smap.get(t, floor) for t, _lp in valid],
                      dtype=torch.float64)
@@ -396,10 +531,42 @@ def _position_kl(t_ids_row, t_lps_row, s_ids_row, s_lps_row) -> tuple[float, flo
     pt = max(1.0 - float(p.sum()), 1e-12)
     qt = max(1.0 - float(q.exp().sum()), 1e-12)
     kl += pt * (math.log(pt) - math.log(qt))
-    return kl, float(p.max())
+    top1 = float(p.max())
+    if not math.isfinite(kl) or not math.isfinite(top1):
+        raise RuntimeError(
+            f"non-finite KL output: kl={kl!r}, teacher_top1_prob={top1!r}"
+        )
+    return kl, top1
 
 
-def _student_all_positions(args, payload) -> int:
+def _assert_teacher_matches_candidate_source(args, teacher_evidence) -> None:
+    """Bind streamed BF16 teacher identity to the candidate's exact source."""
+    if not args.dsv4_gridbook_contract:
+        return
+    if not isinstance(teacher_evidence, dict):
+        raise RuntimeError(
+            "DSv4 Gridbook KL requires digest-bound streamed teacher evidence"
+        )
+    quant_path = Path(args.model).resolve(strict=True) / "quant_config.json"
+    try:
+        quant_config = json.loads(quant_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError(
+            f"could not read candidate source identity from {quant_path}"
+        ) from exc
+    provenance = quant_config.get("provenance") if isinstance(
+        quant_config, dict
+    ) else None
+    candidate_source = provenance.get("source_model_identity") if isinstance(
+        provenance, dict
+    ) else None
+    if candidate_source != teacher_evidence.get("source_model"):
+        raise RuntimeError(
+            "streamed teacher source identity differs from candidate provenance"
+        )
+
+
+def _student_all_positions(args, payload, teacher_evidence=None) -> int:
     started = time.monotonic()
     prompts = payload["calib_ids"].tolist()
     vocab_size = int(payload["vocab_size"])
@@ -415,6 +582,11 @@ def _student_all_positions(args, payload) -> int:
     s_ids, s_lps = _measure_prompt_topk(llm, prompts, top_k=top_k)
 
     n, pm1, k = t_ids.shape
+    if args.dsv4_gridbook_contract and n * pm1 != EXPECTED_POSITIONS:
+        raise RuntimeError(
+            f"DSv4 gold workload requires {EXPECTED_POSITIONS} positions, "
+            f"got {n * pm1}"
+        )
     kl_pos = torch.zeros((n, pm1), dtype=torch.float64)
     t_top1 = torch.zeros((n, pm1), dtype=torch.float64)
     for i in range(n):
@@ -424,6 +596,8 @@ def _student_all_positions(args, payload) -> int:
             )
             kl_pos[i, j] = kl
             t_top1[i, j] = top1
+    if not torch.isfinite(kl_pos).all() or not torch.isfinite(t_top1).all():
+        raise RuntimeError("non-finite all-position KL output")
     confident = t_top1 > 0.5
     flat = kl_pos.flatten()
     result = {
@@ -446,18 +620,27 @@ def _student_all_positions(args, payload) -> int:
         "n_confident": int(confident.sum()),
         "kl_per_sample": [float(x) for x in kl_pos.mean(dim=1).tolist()],
         "elapsed_s": time.monotonic() - started,
+        "teacher_evidence": teacher_evidence,
         **_provenance(args),
     }
-    Path(args.output).write_text(json.dumps(result, indent=2))
-    print(json.dumps(result, indent=2), flush=True)
+    result_text = _strict_json_text(result)
+    Path(args.output).write_text(result_text)
+    print(result_text, flush=True)
     return 0
 
 
 def _student(args) -> int:
     started = time.monotonic()
-    payload = torch.load(args.teacher_payload, map_location="cpu")
+    teacher_evidence = None
+    if args.teacher_meta:
+        payload, teacher_evidence = load_teacher_evidence(
+            args.teacher_payload, args.teacher_meta
+        )
+    else:
+        payload = safe_load_torch_payload(args.teacher_payload)
+    _assert_teacher_matches_candidate_source(args, teacher_evidence)
     if payload.get("score_positions") == "all":
-        return _student_all_positions(args, payload)
+        return _student_all_positions(args, payload, teacher_evidence)
     teacher = payload["teacher_logprobs"].float()
     prompts = payload["calib_ids"].tolist()
     vocab_size = int(payload["vocab_size"])
@@ -488,8 +671,9 @@ def _student(args) -> int:
         "elapsed_s": time.monotonic() - started,
         **_provenance(args),
     }
-    Path(args.output).write_text(json.dumps(result, indent=2))
-    print(json.dumps(result, indent=2), flush=True)
+    result_text = _strict_json_text(result)
+    Path(args.output).write_text(result_text)
+    print(result_text, flush=True)
     return 0
 
 
@@ -500,6 +684,11 @@ def main() -> int:
     parser.add_argument("--output", required=True)
     parser.add_argument("--meta-output", default="teacher_meta.json")
     parser.add_argument("--teacher-payload")
+    parser.add_argument(
+        "--teacher-meta",
+        help="metadata JSON emitted beside the streamed teacher payload; "
+        "required by the DSv4 Gridbook release contract",
+    )
     parser.add_argument("--dataset-cache-dir", default="/hfcache/datasets")
     parser.add_argument("--n-samples", type=int, default=8)
     parser.add_argument("--seqlen", type=int, default=512)
@@ -521,12 +710,35 @@ def main() -> int:
         "refuses such a record (see tools/spec_decode_guard.py).")
     parser.add_argument("--max-num-batched-tokens", type=int, default=None)
     parser.add_argument(
+        "--dsv4-gridbook-contract",
+        action="store_true",
+        help="force the exact one-Spark DSv4 Gridbook gold-measurement "
+        "runtime contract (FP8 KV, conditional Marlin MoE, closed env, "
+        "eager/no-spec)",
+    )
+    parser.add_argument(
         "--window-seed", type=int, default=42,
         help="RNG seed for the WikiText window draw (teacher mode only; "
         "students replay the windows stored in the teacher payload)")
     args = parser.parse_args()
     if args.mode == "student" and not args.teacher_payload:
         parser.error("--teacher-payload is required in student mode")
+    if args.mode == "teacher" and args.dsv4_gridbook_contract:
+        parser.error(
+            "DSv4 Gridbook teacher mode is streamed-only; use "
+            "tools/build_streamed_full_kl_teacher.py with "
+            "--wikitext-inputs"
+        )
+    if (
+        args.mode == "student"
+        and args.dsv4_gridbook_contract
+        and not args.teacher_meta
+    ):
+        parser.error(
+            "--teacher-meta is required for DSv4 Gridbook student evidence"
+        )
+    if args.dsv4_gridbook_contract:
+        _activate_dsv4_gridbook_contract(args)
     if args.mode == "teacher":
         return _teacher(args)
     return _student(args)

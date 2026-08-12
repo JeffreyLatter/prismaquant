@@ -17,11 +17,13 @@ from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 import hashlib
+import importlib.util
 import json
 import math
 import os
 from pathlib import Path
 import pickle
+import re
 import shutil
 import sys
 
@@ -47,6 +49,7 @@ from prismaquant.cb_anchored_cost import (
     build_cb_allocator_cost_payload,
     build_cb_units,
     build_streamed_cb_render_plan,
+    cb_rung,
     fit_all_cb_segments,
     fitted_cb_hull_report,
     heldout_validation_report,
@@ -62,20 +65,59 @@ from prismaquant.cost_stage_checkpoint import (
     canonical_json,
     canonical_json_sha256,
 )
+from prismaquant.dsv4_campaign_completion import (
+    CampaignCompletionError,
+    assert_replay_matches_completion_receipt,
+    completion_receipt_path,
+    historical_checkpoint_root,
+    verify_receipt_for_replay,
+)
 
 
 DSV4_BOUNDED_CAMPAIGN_WORKER = True
 DSV4_CAMPAIGN_SCHEMA = "prismaquant.dsv4_cb_anchored_aura.v1"
+DSV4_CPU_REPLAY_SCHEMA = "prismaquant.dsv4_cb_anchored_aura.cpu_replay.v1"
 DSV4_TOTAL_UNITS = 33_325
 DSV4_EXPERT_UNITS = 43 * 256 * 3
 DSV4_NONEXPERT_UNITS = 301
 DSV4_EXPECTED_ANCHORS = 66_951
 DSV4_BUDGET_BYTES = 112_690_000_000
 DSV4_ARTIFACT_RESERVE_BYTES = 268_435_456
+# Spark has one unified CPU/GPU memory pool.  The worst DSv4 anchor layer's
+# exact FP32 dW plane is 51.3 GiB, so source weights must never retain or
+# speculatively load a second decoder layer during that reverse window.
+DSV4_STREAMING_CACHE_MAX_SLOTS = 1
+# One profile id for the whole campaign: it bounds the source-class plan's
+# family to the rungs the pinned runtime's fused mid-M lane instantiates, and
+# it is the allocator's --target-profile.  Splitting these would let the
+# campaign price a menu the artifact is not allowed to ship.
+DSV4_TARGET_PROFILE = "nvfp4_cb"
+_FULL_GIT_COMMIT = re.compile(r"[0-9a-f]{40}")
+_FULL_SHA256 = re.compile(r"[0-9a-f]{64}")
 
+# The FP8-CB menus are the on-law rungs only.  gridbook K1.2's fused mid-M
+# kernel law admits FP8-CB at k % 4 == 0 and nothing else: type_size = 4k is
+# the packed-B TMA box's contiguous extent and must stay a 16-byte multiple,
+# and the fused mainloop's single CbSubW = k/4 sub-table width is the format's
+# real layout only on those rungs -- a uniform decode at, say, k37 would be
+# *wrong*, not merely unaligned.  serving_profile_specs/nvfp4_cb.json backs
+# [28, 32, 36, 40, 44, 48] for every runtime 0.5.0..0.8.4 (the pin is 0.8.4,
+# version_is_release, and its packaged contract explicitly attests the routed
+# per-role LUT ABI), so this is the served set, not an aspiration. NVFP4-CB
+# is outside that law -- its lane backs no fused mid-M rungs at any version --
+# so K12..K18 stays contiguous.
 NVFP4_FORMATS = tuple(f"NVFP4_CB_K{k}" for k in range(12, 19))
-FP8_EXPERT_FORMATS = tuple(f"FP8_CB_K{k}" for k in range(28, 34))
-FP8_NONEXPERT_FORMATS = tuple(f"FP8_CB_K{k}" for k in range(28, 49))
+# Routed experts are additionally capped by the byte-exact source-payload
+# ceiling at K33, so on-law + legal leaves exactly two rungs.
+FP8_EXPERT_FORMATS = ("FP8_CB_K28", "FP8_CB_K32")
+FP8_NONEXPERT_FORMATS = (
+    "FP8_CB_K28", "FP8_CB_K32", "FP8_CB_K36",
+    "FP8_CB_K40", "FP8_CB_K44", "FP8_CB_K48",
+)
+# Derived so the routed-book coverage contracts and the basis map can never
+# drift from the menus above.
+FP8_EXPERT_RUNGS = tuple(cb_rung(name) for name in FP8_EXPERT_FORMATS)
+FP8_NONEXPERT_RUNGS = tuple(cb_rung(name) for name in FP8_NONEXPERT_FORMATS)
 
 _ALL_ROLES = (
     "gate_proj", "up_proj", "down_proj",
@@ -104,16 +146,16 @@ DSV4_PANEL_POLICY = CBPanelPolicy(
             )
             for role in _ALL_ROLES
         },
+        # Spans the full dense learned ladder and includes both rungs a routed
+        # expert can legally take, so routed cells are priced by interpolation
+        # inside the panel range rather than off its end.  FP8-CB lattice
+        # declares one legal rung (K48) and is therefore absent by contract:
+        # it is priced by its own anchor, and plan_cb_panel_and_validation
+        # refuses a panel it could not use.
         **{
             ("fp8_cb", role, LEARNED_BASIS): (
-                "FP8_CB_K28", "FP8_CB_K33",
-                "FP8_CB_K41", "FP8_CB_K46",
-            )
-            for role in _ALL_ROLES
-        },
-        **{
-            ("fp8_cb", role, LATTICE_BASIS): (
-                "FP8_CB_K47", "FP8_CB_K48",
+                "FP8_CB_K28", "FP8_CB_K32",
+                "FP8_CB_K40", "FP8_CB_K44",
             )
             for role in _ALL_ROLES
         },
@@ -121,7 +163,7 @@ DSV4_PANEL_POLICY = CBPanelPolicy(
     validation_rungs_by_segment={
         **{
             ("fp8_cb", role, LEARNED_BASIS): (
-                "FP8_CB_K28", "FP8_CB_K46",
+                "FP8_CB_K28", "FP8_CB_K44",
             )
             for role in _ALL_ROLES
         },
@@ -130,6 +172,19 @@ DSV4_PANEL_POLICY = CBPanelPolicy(
     validation_units_per_role=4,
     seed=42,
 )
+# One anchor format per (family, basis) is rendered for *every* unit in that
+# segment, so an anchor must be legal everywhere the segment reaches.  Routed
+# experts stop at K32 and dense units run to K48, so the FP8 learned anchor
+# has to come from the {K28, K32} intersection; K32 is the interior choice,
+# halving the worst extrapolation distance on the dense ladder (K32->K44 is
+# 12 rungs, K28->K44 is 16) at no cost on the 2-rung routed ladder.  FP8
+# lattice declares exactly one legal rung, so its anchor is that rung and
+# pricing there is measured rather than extrapolated.
+DSV4_ANCHOR_FORMATS = {
+    ("nvfp4_cb", LATTICE_BASIS): "NVFP4_CB_K15",
+    ("fp8_cb", LEARNED_BASIS): "FP8_CB_K32",
+    ("fp8_cb", LATTICE_BASIS): "FP8_CB_K48",
+}
 _TERMINAL_BY_SOURCE_KIND = {
     "mxfp4": "MXFP4_SOURCE",
     "fp8_ue8m0": "FP8_BLOCK_UE8M0_SOURCE",
@@ -139,6 +194,128 @@ _TERMINAL_BY_SOURCE_KIND = {
 
 class DSv4CampaignError(RuntimeError):
     """A DSv4 inventory, identity, or orchestration refusal."""
+
+
+def _release_runtime_identity() -> dict[str, str]:
+    commit = os.environ.get("PRISMAQUANT_IDENTITY_GIT_COMMIT", "")
+    if _FULL_GIT_COMMIT.fullmatch(commit) is None:
+        raise DSv4CampaignError(
+            "activation-safe replay requires the full immutable PrismaQuant "
+            "runtime commit identity"
+        )
+    if os.environ.get("PRISMAQUANT_IDENTITY_GIT_DIRTY") != "0":
+        raise DSv4CampaignError(
+            "activation-safe replay requires a clean immutable runtime identity"
+        )
+    if "PYTHONPATH" in os.environ:
+        raise DSv4CampaignError(
+            "activation-safe replay requires PYTHONPATH to be absent"
+        )
+    if (
+        os.environ.get("PYTHONSAFEPATH") != "1"
+        or not sys.flags.safe_path
+    ):
+        raise DSv4CampaignError(
+            "activation-safe replay requires Python safe-path mode"
+        )
+    if (
+        os.environ.get("PYTHONDONTWRITEBYTECODE") != "1"
+        or not sys.dont_write_bytecode
+    ):
+        raise DSv4CampaignError(
+            "activation-safe replay requires bytecode writes to be disabled"
+        )
+    if (
+        os.environ.get("PYTHONNOUSERSITE") != "1"
+        or not sys.flags.no_user_site
+    ):
+        raise DSv4CampaignError(
+            "activation-safe replay requires disabled Python user-site imports"
+        )
+    root_raw = os.environ.get("PQ_RUNTIME_PRISMAQUANT_ROOT", "")
+    tree = os.environ.get("PQ_RUNTIME_PRISMAQUANT_TREE", "")
+    closure = os.environ.get(
+        "PQ_RUNTIME_PRISMAQUANT_CLOSURE_SHA256", ""
+    )
+    root = Path(root_raw)
+    if (
+        not root_raw
+        or not root.is_absolute()
+        or root.is_symlink()
+        or _FULL_GIT_COMMIT.fullmatch(tree) is None
+        or _FULL_SHA256.fullmatch(closure) is None
+    ):
+        raise DSv4CampaignError(
+            "activation-safe replay lacks a complete runtime snapshot identity"
+        )
+    try:
+        resolved_root = root.resolve(strict=True)
+        expected_module = (
+            resolved_root / "prismaquant" / "dsv4_aura_cb_reprice.py"
+        ).resolve(strict=True)
+        observed_module = Path(__file__).resolve(strict=True)
+        verifier_path = (
+            resolved_root / "tools" / "prismaquant_runtime_snapshot.py"
+        )
+        if verifier_path.is_symlink() or not verifier_path.is_file():
+            raise ValueError("runtime snapshot verifier is absent or unsafe")
+        if observed_module != expected_module:
+            raise ValueError(
+                "loaded DSv4 replay module is outside the selected snapshot"
+            )
+        spec = importlib.util.spec_from_file_location(
+            "_prismaquant_replay_runtime_snapshot", verifier_path
+        )
+        if spec is None or spec.loader is None:
+            raise ValueError("runtime snapshot verifier cannot be loaded")
+        verifier = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(verifier)
+        identity = verifier.verify_snapshot(
+            resolved_root,
+            expected_commit=commit,
+            expected_tree=tree,
+            expected_closure_sha256=closure,
+        )
+    except Exception as exc:
+        raise DSv4CampaignError(
+            f"activation-safe replay runtime snapshot failed verification: {exc}"
+        ) from exc
+    if (
+        identity.get("snapshot") != str(resolved_root)
+        or identity.get("commit") != commit
+        or identity.get("tree") != tree
+        or identity.get("closure_sha256") != closure
+    ):
+        raise DSv4CampaignError(
+            "activation-safe replay runtime snapshot identity differs"
+        )
+    return {
+        "snapshot": str(resolved_root),
+        "commit": commit,
+        "tree": tree,
+        "closure_sha256": closure,
+    }
+
+
+def _release_runtime_commit() -> str:
+    """Compatibility projection of the full replay runtime proof."""
+    return _release_runtime_identity()["commit"]
+
+
+def _bind_completion_receipt_to_runtime(
+    receipt: Mapping[str, object], runtime: Mapping[str, str]
+) -> None:
+    producer = receipt.get("producer")
+    if not isinstance(producer, Mapping):
+        raise DSv4CampaignError(
+            "campaign completion receipt lacks its runtime producer identity"
+        )
+    for key in ("commit", "tree", "closure_sha256"):
+        if producer.get(key) != runtime.get(key):
+            raise DSv4CampaignError(
+                "activation-safe replay runtime differs from the completion "
+                f"receipt at producer.{key}"
+            )
 
 
 @dataclass(frozen=True)
@@ -248,7 +425,8 @@ def _validate_routed_selection(path: str | Path) -> str:
         (layer, projection, rung)
         for layer in range(43)
         for projection in ("gate_proj", "up_proj", "down_proj")
-        for rung in range(28, 34)
+        # 43 layers x 3 projections x the 2 on-law routed rungs = 258 cells.
+        for rung in FP8_EXPERT_RUNGS
     }
     if observed != expected:
         raise DSv4CampaignError(
@@ -275,7 +453,8 @@ def _validate_routed_bundle_selection_identity(
         (layer, projection, rung)
         for layer in range(43)
         for projection in ("gate_proj", "up_proj", "down_proj")
-        for rung in range(28, 34)
+        # 43 layers x 3 projections x the 2 on-law routed rungs = 258 cells.
+        for rung in FP8_EXPERT_RUNGS
     }
     observed: dict[tuple[int, str, int], tuple[str, str]] = {}
     wrong_selection: list[tuple[str, str, str]] = []
@@ -513,7 +692,7 @@ def _assert_authoritative_dsv4_basis_map(
             f"FP8_CB_K{k}": (
                 LEARNED_BASIS if k <= 46 else LATTICE_BASIS
             )
-            for k in range(28, 49)
+            for k in FP8_NONEXPERT_RUNGS
         },
     }
     missing = sorted(set(expected) - set(source_map))
@@ -573,7 +752,11 @@ def assert_dsv4_anchor_accounting(
     return dict(counts)
 
 
-def prepare_dsv4_campaign(args: argparse.Namespace) -> PreparedDSv4Campaign:
+def prepare_dsv4_campaign(
+    args: argparse.Namespace,
+    *,
+    publish_format_plan: bool = True,
+) -> PreparedDSv4Campaign:
     """Complete every CPU identity/legality check before the P0 GPU pass."""
     work_dir = _safe_work_dir(args.work_dir)
     stats, probe_meta = _load_probe(args)
@@ -581,6 +764,7 @@ def prepare_dsv4_campaign(args: argparse.Namespace) -> PreparedDSv4Campaign:
     from prismaquant.allocator_candidates import _scan_source_dtype_manifest
     from prismaquant.source_class_format_plan import (
         build_source_class_format_plan,
+        load_format_plan,
         write_format_plan,
     )
     from prismaquant.nvfp4_cb_footprint import (
@@ -636,16 +820,51 @@ def prepare_dsv4_campaign(args: argparse.Namespace) -> PreparedDSv4Campaign:
         expert_formats=args.expert_formats,
         nonexpert_formats=args.nonexpert_formats,
         cb_serialization_context=cb_context,
+        # The on-law menu is not a CLI opinion: it is the fused mid-M rung set
+        # nvfp4_cb declares for the pinned Gridbook release, resolved through
+        # the serving lane.  Passing it here is what lets the planner's
+        # complete-family contract and the frozen menus above be the same
+        # statement -- without it the planner demands all 21 registered
+        # FP8-CB rungs, including the fifteen k % 4 != 0 ones this campaign
+        # exists to exclude.  DSV4_TARGET_PROFILE also drives --target-profile
+        # on the allocator run below, so producer and consumer read one table.
+        serving_backed_profile=DSV4_TARGET_PROFILE,
     )
+    restriction = format_plan.serving_backed_restriction or {}
+    if tuple(restriction.get("fused_mid_m_rungs", ())) != FP8_NONEXPERT_RUNGS:
+        raise DSv4CampaignError(
+            "the pinned serving runtime does not back the DSv4 on-law rung "
+            f"set: profile={restriction.get('profile_id')!r} "
+            f"runtime={restriction.get('runtime_version')!r} "
+            f"backs {list(restriction.get('fused_mid_m_rungs', ()))}, "
+            f"campaign requires {list(FP8_NONEXPERT_RUNGS)}"
+        )
     if tuple(format_plan.menus["expert"]) != FP8_EXPERT_FORMATS or tuple(
         format_plan.menus["nonexpert"]
     ) != FP8_NONEXPERT_FORMATS:
         raise DSv4CampaignError(
-            "frozen CLI menus differ from DSv4 K28..K33/K28..K48 contract"
+            "frozen CLI menus differ from the DSv4 on-law contract "
+            f"(experts {list(FP8_EXPERT_FORMATS)}, "
+            f"nonexperts {list(FP8_NONEXPERT_FORMATS)})"
         )
     format_plan_path = work_dir / "checkpoints" / "source_format_plan.json"
-    format_plan_path.parent.mkdir(parents=True, exist_ok=True)
-    write_format_plan(format_plan, format_plan_path)
+    if publish_format_plan:
+        format_plan_path.parent.mkdir(parents=True, exist_ok=True)
+        write_format_plan(format_plan, format_plan_path)
+    else:
+        # Replay treats the completed campaign as immutable input.  Validate
+        # its already-published plan against a fresh derivation, but do not
+        # even atomically replace it with equivalent bytes.
+        try:
+            published_plan = load_format_plan(format_plan_path)
+        except Exception as exc:
+            raise DSv4CampaignError(
+                f"completed source format plan is invalid: {format_plan_path}"
+            ) from exc
+        if published_plan.to_dict() != format_plan.to_dict():
+            raise DSv4CampaignError(
+                "completed source format plan differs from fresh derivation"
+            )
 
     declarations = _build_declarations(
         stats=stats,
@@ -676,6 +895,7 @@ def prepare_dsv4_campaign(args: argparse.Namespace) -> PreparedDSv4Campaign:
     plugin = CodebookAnchoredFormatPlugin(
         codebook_source_by_format=source_map,
         arm_identity=arm_identity,
+        anchor_formats=DSV4_ANCHOR_FORMATS,
     )
     units = build_cb_units(declarations, plugin)
     anchor_requests = plan_anchor_requests(units, plugin)
@@ -698,6 +918,10 @@ def prepare_dsv4_campaign(args: argparse.Namespace) -> PreparedDSv4Campaign:
         "format_plan_identity_sha256": format_plan.identity_sha256,
         "format_plan_path": str(format_plan_path),
         "cold_expert_render_units": len(missing_activations),
+        "streaming_source_cache": {
+            "max_cache_slots": DSV4_STREAMING_CACHE_MAX_SLOTS,
+            "effective_prefetch_lookahead": 0,
+        },
     }
     return PreparedDSv4Campaign(
         args=args,
@@ -785,8 +1009,18 @@ def _measure_streamed(prepared: PreparedDSv4Campaign) -> dict[str, object]:
         dtype=torch.bfloat16,
         offload_folder=str(checkpoint_root / "streamed-model-offload"),
         profile=prepared.profile,
+        max_cache_slots=DSV4_STREAMING_CACHE_MAX_SLOTS,
     )
     try:
+        if (
+            runner.context.max_cache_slots != DSV4_STREAMING_CACHE_MAX_SLOTS
+            or runner.prefetch_lookahead != 0
+        ):
+            raise DSv4CampaignError(
+                "DSv4 streamed source-cache policy is not fail-closed "
+                f"(max_cache_slots={runner.context.max_cache_slots}, "
+                f"prefetch_lookahead={runner.prefetch_lookahead})"
+            )
         model_identity = build_streamed_model_identity(
             runner,
             args.model,
@@ -829,11 +1063,684 @@ def _measure_streamed(prepared: PreparedDSv4Campaign) -> dict[str, object]:
                     "family", "role", "equivalence_class"
                 ],
                 "equivalence_vocabulary_name": "codebook_basis",
+                "streaming_source_cache": {
+                    "max_cache_slots": DSV4_STREAMING_CACHE_MAX_SLOTS,
+                    "effective_prefetch_lookahead": 0,
+                },
             },
         )
     finally:
         runner.shutdown()
     return payload
+
+
+def _normalized_purpose_plan(
+    raw: Mapping[str, object],
+) -> dict[str, dict[str, list[str]]]:
+    normalized: dict[str, dict[str, list[str]]] = {}
+    for raw_qname, raw_rows in raw.items():
+        qname = str(raw_qname)
+        if not isinstance(raw_rows, Mapping):
+            raise DSv4CampaignError(
+                f"render-purpose plan for {qname!r} is not a mapping"
+            )
+        rows: dict[str, list[str]] = {}
+        for raw_format, raw_purposes in raw_rows.items():
+            fmt = fr.canonical_format_name(str(raw_format))
+            values = (
+                [raw_purposes]
+                if isinstance(raw_purposes, str) else list(raw_purposes)
+            )
+            rows[fmt] = [str(value) for value in values]
+        normalized[qname] = rows
+    return normalized
+
+
+def _expected_checkpoint_cost_row(
+    qname: str,
+    fmt: str,
+    state_row: Mapping[str, object],
+    *,
+    n_probes: int,
+    diagnostic_expected: bool,
+) -> dict[str, object]:
+    try:
+        samples = [float(value) for value in state_row["x2_probe"]]
+        s2 = float(state_row["s2"])
+        s4 = float(state_row["s4"])
+        dw_source = str(state_row["dw_src"])
+    except Exception as exc:
+        raise DSv4CampaignError(
+            f"AURA journal state is malformed for {qname}@{fmt}"
+        ) from exc
+    if len(samples) != n_probes or any(
+        not math.isfinite(value) or value < 0.0 for value in samples
+    ):
+        raise DSv4CampaignError(
+            f"AURA journal samples are invalid for {qname}@{fmt}"
+        )
+    if (
+        not math.isfinite(s2)
+        or not math.isfinite(s4)
+        or s2 < 0.0
+        or s4 < 0.0
+        or not math.isclose(
+            sum(samples), s2, rel_tol=1e-15, abs_tol=0.0,
+        )
+        or not math.isclose(
+            sum(value * value for value in samples),
+            s4,
+            rel_tol=1e-15,
+            abs_tol=0.0,
+        )
+        or dw_source != "production_render"
+    ):
+        raise DSv4CampaignError(
+            f"AURA journal accumulators differ for {qname}@{fmt}"
+        )
+    inv = 1.0 / float(n_probes)
+    mean_x2 = inv * s2
+    variance = (
+        max((s4 - n_probes * mean_x2 * mean_x2) / (n_probes - 1), 0.0)
+        if n_probes >= 2 else 0.0
+    )
+    row: dict[str, object] = {
+        "predicted_dloss": 0.5 * mean_x2,
+        "predicted_dloss_stderr": 0.5 * math.sqrt(variance * inv),
+        "x2_per_probe": samples,
+        "dw_source": "production_render",
+        "output_mse_measured": False,
+        "cost_source": "aura",
+        "production_anchor_measured": True,
+        "production_anchor_zero": mean_x2 == 0.0,
+    }
+    observed_diagnostic = "weight_mse_diagnostic" in state_row
+    if observed_diagnostic != diagnostic_expected:
+        raise DSv4CampaignError(
+            f"AURA journal diagnostic scope differs for {qname}@{fmt}"
+        )
+    if diagnostic_expected:
+        diagnostic = float(state_row["weight_mse_diagnostic"])
+        if not math.isfinite(diagnostic) or diagnostic < 0.0:
+            raise DSv4CampaignError(
+                f"AURA journal diagnostic is invalid for {qname}@{fmt}"
+            )
+        row.update({
+            "weight_mse_diagnostic": diagnostic,
+            "weight_mse_diagnostic_normalization": "mean_per_weight",
+            "weight_mse_is_cost_input": False,
+        })
+    return row
+
+
+def _load_and_audit_completed_streamed_payload(
+    prepared: PreparedDSv4Campaign,
+    payload_path: str | Path,
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Replay a completed streamed result from its independent unit journal.
+
+    The monolithic pickle is convenient, not its own authority.  Every
+    measured scalar and source-weight binding is reconstructed from the
+    checksummed per-unit AURA envelopes before CPU-only fitting is admitted.
+    Historical synthetic terminal zeros are accepted only in their exact old
+    shape and are quarantined from the replay payload.
+    """
+    from prismaquant.aura_cost import (
+        AURA_CHECKPOINT_IDENTITY_SCHEMA,
+        AURA_CHECKPOINT_MANIFEST_SCHEMA,
+        AURA_CHECKPOINT_UNIT_SCHEMA,
+    )
+    from prismaquant.production_weight_cache import (
+        _combined_source_weights_sha256,
+    )
+
+    expected_payload_path = (
+        Path(prepared.args.work_dir) / "artifacts" /
+        "streamed_anchor_aura.pkl"
+    ).resolve(strict=False)
+    source_path = Path(payload_path).resolve(strict=False)
+    if source_path != expected_payload_path:
+        raise DSv4CampaignError(
+            "CPU replay accepts only this campaign's completed "
+            f"streamed_anchor_aura.pkl: {expected_payload_path}"
+        )
+    if not source_path.is_file() or source_path.stat().st_size <= 0:
+        raise DSv4CampaignError(
+            f"completed streamed AURA payload is absent: {source_path}"
+        )
+    source_bytes = source_path.read_bytes()
+    source_sha256 = hashlib.sha256(source_bytes).hexdigest()
+    try:
+        raw_payload = pickle.loads(source_bytes)
+    except Exception as exc:
+        raise DSv4CampaignError(
+            f"streamed AURA payload is unreadable: {source_path}"
+        ) from exc
+    if not isinstance(raw_payload, Mapping):
+        raise DSv4CampaignError("streamed AURA payload is not a mapping")
+
+    checkpoint_root = Path(prepared.args.checkpoint_dir) / "aura"
+    manifest_path = checkpoint_root / "manifest.json"
+    try:
+        manifest_bytes = manifest_path.read_bytes()
+        manifest = json.loads(manifest_bytes)
+    except Exception as exc:
+        raise DSv4CampaignError(
+            f"AURA checkpoint manifest is unreadable: {manifest_path}"
+        ) from exc
+    if not isinstance(manifest, Mapping) or manifest.get(
+        "schema"
+    ) != AURA_CHECKPOINT_MANIFEST_SCHEMA:
+        raise DSv4CampaignError("AURA checkpoint manifest schema differs")
+    identity = manifest.get("identity")
+    if not isinstance(identity, Mapping) or identity.get(
+        "schema"
+    ) != AURA_CHECKPOINT_IDENTITY_SCHEMA:
+        raise DSv4CampaignError("AURA checkpoint identity is absent or invalid")
+    identity_sha256 = canonical_json_sha256(
+        identity, where="DSv4 replay AURA checkpoint identity"
+    )
+    if manifest.get("identity_sha256") != identity_sha256:
+        raise DSv4CampaignError("AURA checkpoint manifest checksum differs")
+
+    units_by_name = {unit.qname: unit for unit in prepared.units}
+    expected_names = set(units_by_name)
+    if len(expected_names) != len(prepared.units):
+        raise DSv4CampaignError("prepared replay unit scope is duplicated")
+    identity_units = identity.get("units")
+    if not isinstance(identity_units, Sequence) or isinstance(
+        identity_units, (str, bytes)
+    ):
+        raise DSv4CampaignError("AURA checkpoint identity units are invalid")
+    identity_units_by_name: dict[str, Mapping[str, object]] = {}
+    for row in identity_units:
+        if not isinstance(row, Mapping):
+            raise DSv4CampaignError("AURA checkpoint identity unit is invalid")
+        qname = str(row.get("qname", ""))
+        if not qname or qname in identity_units_by_name:
+            raise DSv4CampaignError("AURA checkpoint identity units duplicate")
+        identity_units_by_name[qname] = row
+    if set(identity_units_by_name) != expected_names:
+        raise DSv4CampaignError(
+            "AURA checkpoint identity unit scope differs from preparation"
+        )
+    for qname, row in identity_units_by_name.items():
+        probe = prepared.probe_stats[qname]
+        expected_shape = [
+            int(probe["out_features"]), int(probe["in_features"])
+        ]
+        if (
+            list(row.get("shape", ())) != expected_shape
+            or int(row.get("n_params", -1)) != int(probe["n_params"])
+            or row.get("dtype") != "torch.bfloat16"
+        ):
+            raise DSv4CampaignError(
+                f"AURA checkpoint unit identity differs for {qname}"
+            )
+    if (
+        int(identity.get("n_probes", -1)) != int(prepared.args.n_probes)
+        or identity.get("collect_col_energy") is not False
+        or identity.get("require_production_cache") is not True
+        or identity.get("calibration", {}).get("calib_hash")
+        != prepared.probe_meta["calib_hash"]
+    ):
+        raise DSv4CampaignError(
+            "AURA checkpoint measurement/calibration identity differs"
+        )
+    raw_chunks = identity.get("chunks")
+    if not isinstance(raw_chunks, Sequence) or isinstance(
+        raw_chunks, (str, bytes)
+    ):
+        raise DSv4CampaignError("AURA checkpoint chunk identity is invalid")
+    chunk_names = [str(name) for chunk in raw_chunks for name in chunk]
+    if len(chunk_names) != len(set(chunk_names)) or set(
+        chunk_names
+    ) != expected_names:
+        raise DSv4CampaignError("AURA checkpoint chunks do not cover units once")
+
+    extra = identity.get("extra")
+    if not isinstance(extra, Mapping):
+        raise DSv4CampaignError("AURA checkpoint campaign identity is absent")
+    if (
+        extra.get("campaign_schema") != DSV4_CAMPAIGN_SCHEMA
+        or extra.get("source_format_plan_identity_sha256")
+        != prepared.format_plan.identity_sha256
+        or extra.get("routed_book_selection_sha256")
+        != prepared.routed_selection_sha256
+        or extra.get("include_routed_experts") is not True
+    ):
+        raise DSv4CampaignError("AURA checkpoint campaign identity differs")
+    expected_purposes = _normalized_purpose_plan(
+        prepared.purposes_by_qname
+    )
+    checkpoint_purposes = extra.get("production_anchor_render_purposes")
+    if not isinstance(checkpoint_purposes, Mapping) or (
+        _normalized_purpose_plan(checkpoint_purposes) != expected_purposes
+    ):
+        raise DSv4CampaignError("AURA checkpoint render-purpose plan differs")
+    expected_render_plan = {
+        qname: tuple(rows)
+        for qname, rows in expected_purposes.items()
+    }
+    legacy_zero_formats = {
+        "MXFP4_SOURCE", "FP8_BLOCK_UE8M0_SOURCE"
+    }
+    checkpoint_plan = extra.get("streamed_formats_by_qname")
+    if not isinstance(checkpoint_plan, Mapping) or set(
+        map(str, checkpoint_plan)
+    ) != expected_names:
+        raise DSv4CampaignError("AURA checkpoint streamed plan scope differs")
+    for qname in expected_names:
+        raw_formats = checkpoint_plan[qname]
+        if isinstance(raw_formats, (str, bytes)):
+            raise DSv4CampaignError(
+                f"AURA checkpoint streamed plan is invalid for {qname}"
+            )
+        canonical = [fr.canonical_format_name(fmt) for fmt in raw_formats]
+        expected = set(prepared.formats_by_qname[qname])
+        if len(canonical) != len(set(canonical)) or not (
+            expected <= set(canonical) <= expected | legacy_zero_formats
+        ):
+            raise DSv4CampaignError(
+                f"AURA checkpoint streamed plan differs for {qname}"
+            )
+    checkpoint_unmeasured = extra.get(
+        "unmeasured_streamed_formats_by_qname"
+    )
+    if checkpoint_unmeasured is not None:
+        expected_unmeasured = {
+            unit.qname: [next(
+                candidate.format_name for candidate in unit.candidates
+                if candidate.terminal
+            )]
+            for unit in prepared.units
+        }
+        if canonical_json(
+            checkpoint_unmeasured,
+            where="DSv4 replay checkpoint unmeasured formats",
+        ) != canonical_json(
+            expected_unmeasured,
+            where="DSv4 replay expected unmeasured formats",
+        ):
+            raise DSv4CampaignError(
+                "AURA checkpoint unmeasured-terminal plan differs"
+            )
+
+    manifest_units = manifest.get("units")
+    if not isinstance(manifest_units, Sequence) or isinstance(
+        manifest_units, (str, bytes)
+    ):
+        raise DSv4CampaignError("AURA checkpoint manifest unit list is invalid")
+    checkpoint_paths: dict[str, Path] = {}
+    for row in manifest_units:
+        if not isinstance(row, Mapping):
+            raise DSv4CampaignError("AURA checkpoint manifest unit is invalid")
+        qname = str(row.get("qname", ""))
+        expected_file = (
+            "units/" + hashlib.sha256(qname.encode()).hexdigest() + ".pkl"
+        )
+        if (
+            qname not in expected_names
+            or qname in checkpoint_paths
+            or row.get("file") != expected_file
+        ):
+            raise DSv4CampaignError(
+                f"AURA checkpoint manifest unit binding differs for {qname}"
+            )
+        checkpoint_paths[qname] = checkpoint_root / expected_file
+    if set(checkpoint_paths) != expected_names:
+        raise DSv4CampaignError("AURA checkpoint manifest unit scope differs")
+    actual_files = set((checkpoint_root / "units").glob("*.pkl"))
+    if actual_files != set(checkpoint_paths.values()):
+        raise DSv4CampaignError(
+            "AURA checkpoint unit directory is incomplete or contains extras"
+        )
+
+    raw_costs = raw_payload.get("costs")
+    raw_stats = raw_payload.get("stats")
+    raw_provenance = raw_payload.get("provenance")
+    if not all(isinstance(value, Mapping) for value in (
+        raw_costs, raw_stats, raw_provenance,
+    )):
+        raise DSv4CampaignError(
+            "streamed AURA payload lacks costs/stats/provenance mappings"
+        )
+    if (
+        raw_payload.get("schema") != "prismaquant.aura_cost.v1"
+        or int(raw_payload.get("n_probes", -1))
+        != int(prepared.args.n_probes)
+        or set(map(str, raw_costs)) != expected_names
+        or set(map(str, raw_stats)) != expected_names
+        or raw_provenance.get("calib_hash")
+        != prepared.probe_meta["calib_hash"]
+    ):
+        raise DSv4CampaignError("streamed AURA payload scope/identity differs")
+    raw_purposes = raw_provenance.get(
+        "production_anchor_render_purposes"
+    )
+    if not isinstance(raw_purposes, Mapping) or (
+        _normalized_purpose_plan(raw_purposes) != expected_purposes
+    ):
+        raise DSv4CampaignError("streamed AURA payload purpose plan differs")
+
+    base_renderer = extra.get("production_anchor_renderer")
+    raw_renderer = raw_provenance.get("production_anchor_renderer")
+    if not isinstance(base_renderer, Mapping) or not isinstance(
+        raw_renderer, Mapping
+    ):
+        raise DSv4CampaignError("production renderer identity is absent")
+    if base_renderer.get("arm_identity") != prepared.arm_identity:
+        raise DSv4CampaignError("checkpoint production arm identity differs")
+    for renderer, where in (
+        (base_renderer, "checkpoint"), (raw_renderer, "payload"),
+    ):
+        renderer_plan = renderer.get("formats_by_qname")
+        if not isinstance(renderer_plan, Mapping) or set(
+            map(str, renderer_plan)
+        ) != expected_names:
+            raise DSv4CampaignError(
+                f"{where} production renderer scope differs"
+            )
+        for qname, expected_formats in expected_render_plan.items():
+            raw_formats = renderer_plan[qname]
+            if isinstance(raw_formats, (str, bytes)):
+                raise DSv4CampaignError(
+                    f"{where} production renderer plan is invalid for {qname}"
+                )
+            canonical_formats = tuple(
+                fr.canonical_format_name(fmt) for fmt in raw_formats
+            )
+            # Renderer order is a performance plan; purpose-map keys are
+            # canonical JSON and therefore lexically ordered in the old live
+            # manifest.  The pair set, not these two independent orderings,
+            # is the load-bearing measurement scope.
+            if (
+                len(canonical_formats) != len(set(canonical_formats))
+                or set(canonical_formats) != set(expected_formats)
+            ):
+                raise DSv4CampaignError(
+                    f"{where} production renderer plan differs for {qname}"
+                )
+    base_static = dict(base_renderer)
+    raw_static = dict(raw_renderer)
+    base_cb = base_static.pop("cb_render_identity", None)
+    raw_cb = raw_static.pop("cb_render_identity", None)
+    raw_static.pop("source_weights", None)
+    if raw_static != base_static or not isinstance(base_cb, Mapping) or not (
+        isinstance(raw_cb, Mapping)
+    ):
+        raise DSv4CampaignError(
+            "completed production renderer differs from checkpoint identity"
+        )
+    dynamic_source_fields = {
+        "source_weights_complete", "source_weights_shapes",
+        "source_weights_content_sha256", "source_weights_sha256",
+        "render_scope",
+    }
+    if (
+        {key: value for key, value in base_cb.items()
+         if key not in dynamic_source_fields}
+        != {key: value for key, value in raw_cb.items()
+            if key not in dynamic_source_fields}
+    ):
+        raise DSv4CampaignError(
+            "completed sparse CB identity changed immutable renderer inputs"
+        )
+
+    n_probes = int(prepared.args.n_probes)
+    passthrough_zero = {
+        "predicted_dloss": 0.0,
+        "output_mse_measured": False,
+        "cost_source": "aura_passthrough_zero",
+    }
+    safe_costs: dict[str, dict[str, object]] = {}
+    source_records: dict[str, dict[str, object]] = {}
+    unit_payload_descriptors: list[dict[str, str]] = []
+    quarantined_fp8_zero = 0
+    quarantined_cross_terminal_zero = 0
+    measured_rows = 0
+    for qname in sorted(expected_names):
+        path = checkpoint_paths[qname]
+        try:
+            encoded = path.read_bytes()
+            envelope = pickle.loads(encoded)
+        except Exception as exc:
+            raise DSv4CampaignError(
+                f"AURA unit checkpoint is corrupt for {qname}: {path}"
+            ) from exc
+        if not isinstance(envelope, Mapping):
+            raise DSv4CampaignError(
+                f"AURA unit checkpoint is not an envelope for {qname}"
+            )
+        payload_bytes = envelope.get("payload")
+        if not isinstance(payload_bytes, bytes):
+            raise DSv4CampaignError(
+                f"AURA unit checkpoint has no payload for {qname}"
+            )
+        payload_digest = hashlib.sha256(payload_bytes).hexdigest()
+        if (
+            envelope.get("schema") != AURA_CHECKPOINT_UNIT_SCHEMA
+            or envelope.get("qname") != qname
+            or envelope.get("identity_sha256") != identity_sha256
+            or envelope.get("payload_sha256") != payload_digest
+        ):
+            raise DSv4CampaignError(
+                f"AURA unit checkpoint envelope differs for {qname}"
+            )
+        try:
+            state = pickle.loads(payload_bytes)
+        except Exception as exc:
+            raise DSv4CampaignError(
+                f"AURA unit checkpoint state is corrupt for {qname}"
+            ) from exc
+        if not isinstance(state, Mapping) or not isinstance(
+            state.get("rows"), Mapping
+        ):
+            raise DSv4CampaignError(
+                f"AURA unit checkpoint state is invalid for {qname}"
+            )
+        unit_payload_descriptors.append({
+            "qname": qname, "payload_sha256": payload_digest,
+        })
+        rows = state["rows"]
+        expected_formats = set(expected_render_plan[qname])
+        if set(map(str, rows)) != expected_formats:
+            raise DSv4CampaignError(
+                f"AURA unit checkpoint render rows differ for {qname}"
+            )
+        try:
+            g_trace = float(state["g_trace"])
+        except Exception as exc:
+            raise DSv4CampaignError(
+                f"AURA unit checkpoint g_trace is invalid for {qname}"
+            ) from exc
+        if not math.isfinite(g_trace) or g_trace < 0.0:
+            raise DSv4CampaignError(
+                f"AURA unit checkpoint g_trace is invalid for {qname}"
+            )
+        if state.get("col_energy") is not None:
+            raise DSv4CampaignError(
+                f"AURA unit checkpoint unexpectedly has col_energy for {qname}"
+            )
+        raw_source = state.get("source_weight_identity")
+        if not isinstance(raw_source, Mapping):
+            raise DSv4CampaignError(
+                f"AURA unit checkpoint lacks source identity for {qname}"
+            )
+        try:
+            source_record = {
+                "shape": [int(dim) for dim in raw_source["shape"]],
+                "sha256": str(raw_source["sha256"]).lower(),
+            }
+        except Exception as exc:
+            raise DSv4CampaignError(
+                f"AURA unit source identity is malformed for {qname}"
+            ) from exc
+        probe = prepared.probe_stats[qname]
+        if (
+            source_record["shape"] != [
+                int(probe["out_features"]), int(probe["in_features"])
+            ]
+            or len(source_record["sha256"]) != 64
+            or any(char not in "0123456789abcdef"
+                   for char in source_record["sha256"])
+        ):
+            raise DSv4CampaignError(
+                f"AURA unit source identity differs for {qname}"
+            )
+        source_records[qname] = source_record
+
+        payload_rows = raw_costs[qname]
+        if not isinstance(payload_rows, Mapping):
+            raise DSv4CampaignError(
+                f"streamed AURA costs are invalid for {qname}"
+            )
+        safe_row: dict[str, object] = {}
+        for fmt in expected_render_plan[qname]:
+            expected_row = _expected_checkpoint_cost_row(
+                qname,
+                fmt,
+                rows[fmt],
+                n_probes=n_probes,
+                diagnostic_expected=(
+                    "panel" in expected_purposes[qname][fmt]
+                ),
+            )
+            if payload_rows.get(fmt) != expected_row:
+                raise DSv4CampaignError(
+                    f"streamed AURA scalar differs from journal for "
+                    f"{qname}@{fmt}"
+                )
+            safe_row[fmt] = expected_row
+            measured_rows += 1
+        terminal = next(
+            candidate for candidate in units_by_name[qname].candidates
+            if candidate.terminal
+        )
+        unexpected_formats = set(map(str, payload_rows)) - expected_formats
+        for fmt in sorted(unexpected_formats):
+            canonical = fr.canonical_format_name(fmt)
+            if (
+                canonical not in legacy_zero_formats | {terminal.format_name}
+                or payload_rows[fmt] != passthrough_zero
+            ):
+                raise DSv4CampaignError(
+                    f"streamed AURA contains an unaudited row {qname}@{fmt}"
+                )
+            if canonical == terminal.format_name and (
+                terminal.allocator_selectable
+            ):
+                safe_row[canonical] = dict(passthrough_zero)
+            elif canonical == "FP8_BLOCK_UE8M0_SOURCE":
+                quarantined_fp8_zero += 1
+            else:
+                quarantined_cross_terminal_zero += 1
+        safe_costs[qname] = safe_row
+
+        expected_stats = {
+            "h_trace": g_trace / float(n_probes),
+            "n_params": int(probe["n_params"]),
+            "in_features": int(probe["in_features"]),
+            "out_features": int(probe["out_features"]),
+            "n_probes": n_probes,
+        }
+        if raw_stats[qname] != expected_stats:
+            raise DSv4CampaignError(
+                f"streamed AURA stats differ from journal for {qname}"
+            )
+
+    raw_source_binding = raw_renderer.get("source_weights")
+    if not isinstance(raw_source_binding, Mapping) or (
+        raw_source_binding.get("complete") is not True
+        or raw_source_binding.get("scope") != "sparse_anchor_plan"
+        or raw_source_binding.get("records") != source_records
+        or raw_source_binding.get("identity_sha256")
+        != canonical_json_sha256(
+            source_records, where="DSv4 replay source weights"
+        )
+    ):
+        raise DSv4CampaignError(
+            "completed renderer source-weight binding differs from journal"
+        )
+    cb_qnames = list(raw_cb.get("cb_formats_by_qname", ()))
+    cb_shapes = {name: source_records[name]["shape"] for name in cb_qnames}
+    cb_content = {name: source_records[name]["sha256"] for name in cb_qnames}
+    if (
+        raw_cb.get("source_weights_complete") is not True
+        or raw_cb.get("source_weights_shapes") != cb_shapes
+        or raw_cb.get("source_weights_content_sha256") != cb_content
+        or raw_cb.get("source_weights_sha256")
+        != _combined_source_weights_sha256(cb_shapes, cb_content)
+        or raw_cb.get("render_scope") != "sparse_production_anchors"
+        or raw_provenance.get("production_anchor_sparse_render_identity")
+        != raw_cb
+    ):
+        raise DSv4CampaignError(
+            "completed sparse CB source identity differs from journal"
+        )
+    expanded_cb = raw_provenance.get("cb_render_identity")
+    if not isinstance(expanded_cb, Mapping):
+        raise DSv4CampaignError(
+            "streamed AURA payload lacks expanded CB renderer inputs"
+        )
+    for field in (
+        "source_weights_complete", "source_weights_shapes",
+        "source_weights_content_sha256", "source_weights_sha256",
+    ):
+        if expanded_cb.get(field) != raw_cb.get(field):
+            raise DSv4CampaignError(
+                f"expanded CB source identity differs at {field}"
+            )
+
+    if int(raw_provenance.get("dw_production_anchor_rows", -1)) != measured_rows:
+        raise DSv4CampaignError(
+            "streamed AURA production-render row count differs from journal"
+        )
+    replay = {
+        "schema": DSV4_CPU_REPLAY_SCHEMA,
+        "measurement_invoked": False,
+        "source_payload": {
+            "path": str(source_path),
+            "size_bytes": len(source_bytes),
+            "sha256": source_sha256,
+        },
+        "checkpoint_manifest": {
+            "path": str(manifest_path.resolve()),
+            "size_bytes": len(manifest_bytes),
+            "sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+            "identity_sha256": identity_sha256,
+            "producer_git_commit": identity.get("git_commit"),
+            "producer_source_sha256": identity.get(
+                "producer_source_sha256"
+            ),
+        },
+        "source_format_plan_identity_sha256": (
+            prepared.format_plan.identity_sha256
+        ),
+        "production_arm_identity_sha256": canonical_json_sha256(
+            prepared.arm_identity,
+            where="DSv4 replay production arm identity",
+        ),
+        "unit_checkpoint_count": len(unit_payload_descriptors),
+        "unit_payload_set_sha256": canonical_json_sha256(
+            unit_payload_descriptors,
+            where="DSv4 replay AURA unit payload set",
+        ),
+        "measured_render_rows_validated": measured_rows,
+        "legacy_fp8_terminal_zero_rows_quarantined": quarantined_fp8_zero,
+        "legacy_cross_terminal_zero_rows_quarantined": (
+            quarantined_cross_terminal_zero
+        ),
+        "fp8_block_terminal_allocator_selectable": False,
+        "no_gpu_measurement_or_render": True,
+    }
+    replay = dict(canonical_json(replay, where="DSv4 CPU replay provenance"))
+    sanitized = dict(raw_payload)
+    sanitized["costs"] = safe_costs
+    sanitized_provenance = dict(raw_provenance)
+    sanitized_provenance["cpu_replay"] = replay
+    sanitized["provenance"] = sanitized_provenance
+    return sanitized, replay
 
 
 def _allocator_command(
@@ -849,14 +1756,18 @@ def _allocator_command(
     formats = (
         *NVFP4_FORMATS,
         *FP8_NONEXPERT_FORMATS,
-        "MXFP4_SOURCE", "FP8_BLOCK_UE8M0_SOURCE", "BF16",
+        # The block-FP8 source weight remains part of the dense unit/render
+        # identity, but Gridbook serves it through dynamic per-32 MXFP8 A-side
+        # quantization.  Weight-only AURA has no scalar for that perturbation,
+        # so this campaign must not place it on the allocator command menu.
+        "MXFP4_SOURCE", "BF16",
     )
     return [
         sys.executable, "-m", "prismaquant.allocator",
         "--probe", str(args.probe),
         "--costs", str(cost_path),
         "--model-override", str(args.model),
-        "--target-profile", "nvfp4_cb",
+        "--target-profile", DSV4_TARGET_PROFILE,
         "--target-disk-gb", f"{DSV4_BUDGET_BYTES / 1e9:.9f}",
         "--artifact-overhead-reserve-bytes",
         str(DSV4_ARTIFACT_RESERVE_BYTES),
@@ -922,10 +1833,14 @@ def _selected_assignment(
         )
     }
     for unit in units:
-        legal = {candidate.format_name for candidate in unit.candidates}
+        legal = {
+            candidate.format_name for candidate in unit.candidates
+            if candidate.allocator_selectable
+        }
         if assignment[unit.qname] not in legal:
             raise DSv4CampaignError(
-                f"allocator selected source-illegal {unit.qname}@"
+                f"allocator selected source-illegal or unmeasured "
+                f"{unit.qname}@"
                 f"{assignment[unit.qname]}"
             )
     return assignment
@@ -946,7 +1861,7 @@ def render_economics_report(
     # conservative E8 pre-optimization baseline.  The latter is also the only
     # supplied same-shape low-rung reference, so NV K12/K15/K16/K18 use it and
     # are labelled as unmatched rather than pretending it is an NV timing.
-    profile_seconds = {
+    measured_seconds = {
         "NVFP4_CB_K12": 0.069821,
         "NVFP4_CB_K15": 0.069821,
         "NVFP4_CB_K16": 0.069821,
@@ -961,6 +1876,20 @@ def render_economics_report(
         "FP8_CB_K47": 3.8868322437820098,
         "FP8_CB_K48": 4.442083168687532,
     }
+    # The on-law FP8 menu (k % 4 == 0) lands on rungs the timing sets never
+    # sampled.  Each borrows the next rung UP from the same measurement
+    # family: encode time grows with K, so a higher rung is a strict
+    # over-estimate.  These are labelled projections and are never presented
+    # as timings of the rung they price -- only wall-clock planning reads
+    # them, never any cost or quality number.
+    onlaw_timing_proxy = {
+        "FP8_CB_K32": "FP8_CB_K33",
+        "FP8_CB_K40": "FP8_CB_K41",
+        "FP8_CB_K44": "FP8_CB_K46",
+    }
+    profile_seconds = dict(measured_seconds)
+    for projected, source in onlaw_timing_proxy.items():
+        profile_seconds[projected] = measured_seconds[source]
     requests_by_cell: dict[tuple[str, str], list[RenderRequest]] = {}
     for request in (
         *prepared.anchor_requests,
@@ -1075,6 +2004,10 @@ def render_economics_report(
                 "raw_records.jsonl: medians of elapsed_encode_seconds for "
                 "K41/K46/K47/K48"
             ),
+            "onlaw_rung_next_rung_up_proxy": {
+                projected: source
+                for projected, source in sorted(onlaw_timing_proxy.items())
+            },
             "p0_proxy": (
                 "/home/rob/dq-runs/dsv4-flash-0731/prod-cal-0p7/"
                 "logs/probe.log: phase1=129.0s, phase2=1.8s, "
@@ -1114,9 +2047,12 @@ def render_economics_report(
         "projection_limitation": (
             "K12/K15/K16/K18 use the measured 69.821ms/E production-shape "
             "low-rung proxy; K41/K46/K47/K48 use older measured pilot "
-            "medians. P0 is a measured-phase scaling proxy, not a timing of "
-            "this new fused pass. Dot-product, checkpoint-fsync, allocator, "
-            "and export-copy wall time are not separately measured."
+            "medians. No on-law FP8 rung above K28 was itself timed: K32/K40/"
+            "K44 borrow the next measured rung up (K33/K41/K46), which "
+            "over-estimates because encode time grows with K. P0 is a "
+            "measured-phase scaling proxy, not a timing of this new fused "
+            "pass. Dot-product, checkpoint-fsync, allocator, and export-copy "
+            "wall time are not separately measured."
         ),
         "projected_peak_new_disk_bytes": projected_new_disk,
         "projected_peak_new_disk_assumptions": (
@@ -1140,6 +2076,157 @@ def render_economics_report(
         "panel_renders": len(prepared.panel_requests),
         "validation_renders": len(prepared.validation_requests),
     }
+
+
+def _finish_dsv4_campaign(
+    prepared: PreparedDSv4Campaign,
+    streamed_payload: Mapping[str, object],
+    *,
+    artifacts_dir: Path,
+    allocator_output: Path,
+    exportable_output: Path,
+    report_path: Path,
+    replay_provenance: Mapping[str, object] | None = None,
+) -> int:
+    """Shared CPU fit/price/allocate/publish tail for fresh and replay runs."""
+    args = prepared.args
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    anchors = anchors_from_streamed_payload(
+        prepared.anchor_requests, streamed_payload
+    )
+    panel_observations = observations_from_streamed_payload(
+        prepared.panel_requests, streamed_payload
+    )
+    fits = fit_all_cb_segments(
+        panel_observations, prepared.units, prepared.plugin, anchors=anchors
+    )
+    validation_observations = observations_from_streamed_payload(
+        prepared.validation_requests, streamed_payload
+    )
+    validation = heldout_validation_report(
+        validation_observations, anchors, fits
+    )
+    hulls = fitted_cb_hull_report(prepared.units, prepared.plugin, fits)
+    cells = price_anchored_candidates(
+        prepared.units, prepared.plugin, anchors, fits
+    )
+    cost_payload = build_cb_allocator_cost_payload(
+        cells,
+        streamed_payload=streamed_payload,
+        fits=fits,
+        hull_report=hulls,
+        validation_report=validation,
+    )
+    unsafe_rows = sorted(
+        qname for qname, row in cost_payload["costs"].items()
+        if "FP8_BLOCK_UE8M0_SOURCE" in row
+    )
+    if unsafe_rows:
+        raise DSv4CampaignError(
+            "activation-unmeasured FP8 block terminal survived pricing; "
+            f"sample={unsafe_rows[:8]}"
+        )
+    cost_path = write_cb_cost_payload(
+        artifacts_dir / "cost_aura_anchored.pkl", cost_payload
+    )
+    command = _allocator_command(
+        prepared, cost_path=cost_path, output_dir=allocator_output
+    )
+    command_formats = command[command.index("--formats") + 1].split(",")
+    if "FP8_BLOCK_UE8M0_SOURCE" in command_formats:
+        raise DSv4CampaignError(
+            "activation-unmeasured FP8 block terminal reached allocator menu"
+        )
+    invocation_replay = (
+        dict(replay_provenance) if replay_provenance is not None else None
+    )
+    run_allocator_once(
+        command=command,
+        output_dir=allocator_output,
+        resume=bool(args.resume),
+        environment_updates={"PRISMAQUANT_ACTIVATION_FAIR_PRICING": "0"},
+        invocation_provenance={
+            "cost_currency": AURA_CURRENCY,
+            "activation_fair_pricing": False,
+            "budget_bytes": DSV4_BUDGET_BYTES,
+            "cost_payload_sha256": _sha256(cost_path),
+            "format_plan_identity_sha256": (
+                prepared.format_plan.identity_sha256
+            ),
+            "production_arm_identity_sha256": canonical_json_sha256(
+                prepared.arm_identity,
+                where="DSv4 allocator production arm identity",
+            ),
+            "fp8_block_terminal_allocator_selectable": False,
+            **(
+                {"cpu_replay": invocation_replay}
+                if invocation_replay is not None else {}
+            ),
+        },
+    )
+    assignment = _selected_assignment(
+        allocator_output / "layer_config.json", prepared.units
+    )
+    exposure = extrapolation_distance_report(
+        prepared.units, prepared.plugin, anchors, assignment
+    )
+    economics = render_economics_report(prepared)
+    unselectable_terminals = Counter(
+        candidate.format_name
+        for unit in prepared.units
+        for candidate in unit.candidates
+        if candidate.terminal and not candidate.allocator_selectable
+    )
+    selected_formats = Counter(assignment.values())
+    if selected_formats.get("FP8_BLOCK_UE8M0_SOURCE", 0):
+        raise DSv4CampaignError(
+            "allocator selected activation-unmeasured FP8 block terminal"
+        )
+    report = {
+        "schema": DSV4_CAMPAIGN_SCHEMA,
+        "cost_currency": AURA_CURRENCY,
+        "budget_bytes": DSV4_BUDGET_BYTES,
+        "plan": dict(prepared.plan_report),
+        "panel": dict(prepared.panel_report),
+        "validation": validation,
+        "currency_invariance": {
+            segment.stamp: fit.aura_vs_weight_diagnostic
+            for segment, fit in sorted(fits.items())
+        },
+        "lower_convex_hull": hulls,
+        "extrapolation_distance": exposure,
+        "economics": economics,
+        "route_flip_limitation": ROUTE_FLIP_LIMITATION,
+        "served_metric_is_only_gate": True,
+        "terminal_admission": {
+            "identity_retained_but_allocator_unselectable": dict(
+                sorted(unselectable_terminals.items())
+            ),
+            "criterion": (
+                "exact source terminal is selectable only when its registered "
+                "activation path is identity"
+            ),
+            "fp8_block_terminal_selected_count": 0,
+            "allocator_command_formats": command_formats,
+        },
+        **(
+            {"cpu_replay": invocation_replay}
+            if invocation_replay is not None else {}
+        ),
+    }
+    json.dumps(report, allow_nan=False)
+    atomic_write_bytes(
+        report_path,
+        json.dumps(report, indent=2, sort_keys=True, allow_nan=False).encode(),
+    )
+    write_exportable_artifacts(
+        exportable_output,
+        allocator_output_dir=allocator_output,
+        cb_col_weights_path=args.col_weights,
+        provenance=report,
+        resume=bool(args.resume),
+    )
+    return 0
 
 
 def run_dsv4_anchor_campaign(
@@ -1167,95 +2254,71 @@ def run_dsv4_anchor_campaign(
         raw_path,
         pickle.dumps(streamed_payload, protocol=pickle.HIGHEST_PROTOCOL),
     )
-    anchors = anchors_from_streamed_payload(
-        prepared.anchor_requests, streamed_payload
+    return _finish_dsv4_campaign(
+        prepared,
+        streamed_payload,
+        artifacts_dir=artifacts_dir,
+        allocator_output=work_dir / "allocator-aura",
+        exportable_output=artifacts_dir / "exportable-aura",
+        report_path=artifacts_dir / "campaign_report.json",
     )
-    panel_observations = observations_from_streamed_payload(
-        prepared.panel_requests, streamed_payload
+
+
+def run_dsv4_anchor_replay(
+    args: argparse.Namespace, *, control_plane: str,
+) -> int:
+    """Validate a completed streamed journal and run only the CPU tail."""
+    if control_plane != __name__:
+        raise DSv4CampaignError(
+            f"unexpected DSv4 control plane {control_plane!r}"
+        )
+    work_dir = Path(args.work_dir)
+    receipt_path = completion_receipt_path(work_dir)
+    runtime_identity = _release_runtime_identity()
+    try:
+        completion_receipt = verify_receipt_for_replay(
+            receipt_path,
+            work_dir=work_dir,
+            historical_root=historical_checkpoint_root(work_dir),
+            expected_producer_commit=runtime_identity["commit"],
+        )
+    except CampaignCompletionError as exc:
+        raise DSv4CampaignError(
+            "activation-safe replay lacks a valid terminal campaign receipt: "
+            f"{exc}"
+        ) from exc
+    _bind_completion_receipt_to_runtime(
+        completion_receipt, runtime_identity
     )
-    fits = fit_all_cb_segments(
-        panel_observations, prepared.units, prepared.plugin
+    prepared = prepare_dsv4_campaign(args, publish_format_plan=False)
+    require_allocator_supersurrogate_support()
+    streamed_payload, replay = _load_and_audit_completed_streamed_payload(
+        prepared, args.replay_streamed_payload
     )
-    validation_observations = observations_from_streamed_payload(
-        prepared.validation_requests, streamed_payload
-    )
-    validation = heldout_validation_report(
-        validation_observations, anchors, fits
-    )
-    hulls = fitted_cb_hull_report(prepared.units, prepared.plugin, fits)
-    cells = price_anchored_candidates(
-        prepared.units, prepared.plugin, anchors, fits
-    )
-    cost_payload = build_cb_allocator_cost_payload(
-        cells,
-        streamed_payload=streamed_payload,
-        fits=fits,
-        hull_report=hulls,
-        validation_report=validation,
-    )
-    cost_path = write_cb_cost_payload(
-        artifacts_dir / "cost_aura_anchored.pkl", cost_payload
-    )
-    allocator_output = work_dir / "allocator-aura"
-    command = _allocator_command(
-        prepared, cost_path=cost_path, output_dir=allocator_output
-    )
-    run_allocator_once(
-        command=command,
-        output_dir=allocator_output,
-        resume=bool(args.resume),
-        environment_updates={"PRISMAQUANT_ACTIVATION_FAIR_PRICING": "0"},
-        invocation_provenance={
-            "cost_currency": AURA_CURRENCY,
-            "activation_fair_pricing": False,
-            "budget_bytes": DSV4_BUDGET_BYTES,
-            "cost_payload_sha256": _sha256(cost_path),
-            "format_plan_identity_sha256": (
-                prepared.format_plan.identity_sha256
-            ),
-            "production_arm_identity_sha256": canonical_json_sha256(
-                prepared.arm_identity,
-                where="DSv4 allocator production arm identity",
-            ),
-        },
-    )
-    assignment = _selected_assignment(
-        allocator_output / "layer_config.json", prepared.units
-    )
-    exposure = extrapolation_distance_report(
-        prepared.units, prepared.plugin, anchors, assignment
-    )
-    economics = render_economics_report(prepared)
-    report = {
-        "schema": DSV4_CAMPAIGN_SCHEMA,
-        "cost_currency": AURA_CURRENCY,
-        "budget_bytes": DSV4_BUDGET_BYTES,
-        "plan": dict(prepared.plan_report),
-        "panel": dict(prepared.panel_report),
-        "validation": validation,
-        "currency_invariance": {
-            segment.stamp: fit.aura_vs_weight_diagnostic
-            for segment, fit in sorted(fits.items())
-        },
-        "lower_convex_hull": hulls,
-        "extrapolation_distance": exposure,
-        "economics": economics,
-        "route_flip_limitation": ROUTE_FLIP_LIMITATION,
-        "served_metric_is_only_gate": True,
+    try:
+        assert_replay_matches_completion_receipt(replay, completion_receipt)
+    except CampaignCompletionError as exc:
+        raise DSv4CampaignError(
+            f"activation-safe replay differs from terminal receipt: {exc}"
+        ) from exc
+    replay = dict(replay)
+    replay["campaign_completion_receipt"] = {
+        "path": str(receipt_path.resolve(strict=True)),
+        "receipt_sha256": completion_receipt["receipt_sha256"],
+        "producer_commit": completion_receipt["producer"]["commit"],
     }
-    json.dumps(report, allow_nan=False)
-    atomic_write_bytes(
-        artifacts_dir / "campaign_report.json",
-        json.dumps(report, indent=2, sort_keys=True, allow_nan=False).encode(),
+    replay_artifacts = work_dir / "artifacts" / "replay-activation-safe"
+    return _finish_dsv4_campaign(
+        prepared,
+        streamed_payload,
+        artifacts_dir=replay_artifacts,
+        allocator_output=work_dir / "allocator-aura-activation-safe",
+        exportable_output=(
+            work_dir / "artifacts" / "exportable-aura-activation-safe"
+        ),
+        report_path=replay_artifacts / "campaign_report.json",
+        replay_provenance=replay,
     )
-    write_exportable_artifacts(
-        artifacts_dir / "exportable-aura",
-        allocator_output_dir=allocator_output,
-        cb_col_weights_path=args.col_weights,
-        provenance=report,
-        resume=bool(args.resume),
-    )
-    return 0
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -1280,6 +2343,15 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cost-mode", choices=("aura",), required=True)
     parser.add_argument("--require-production-cache", action="store_true")
     parser.add_argument("--format-plan")
+    parser.add_argument(
+        "--replay-streamed-payload",
+        help=(
+            "CPU-only replay of this work-dir's completed "
+            "artifacts/streamed_anchor_aura.pkl. Every row is revalidated "
+            "against the durable AURA unit journal after a bound terminal "
+            "campaign receipt authorizes replay; no model/GPU work runs."
+        ),
+    )
     return parser
 
 
@@ -1297,6 +2369,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "/tmp"
     ) in Path(args.work_dir).resolve(strict=False).parents:
         parser.error("campaign work-dir may not be under /tmp")
+    if args.replay_streamed_payload:
+        return run_dsv4_anchor_replay(args, control_plane=__name__)
     return run_dsv4_anchor_campaign(args, control_plane=__name__)
 
 
@@ -1322,4 +2396,5 @@ __all__ = [
     "prepare_dsv4_campaign",
     "render_economics_report",
     "run_dsv4_anchor_campaign",
+    "run_dsv4_anchor_replay",
 ]

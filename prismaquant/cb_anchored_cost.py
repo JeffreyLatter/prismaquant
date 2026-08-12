@@ -25,6 +25,7 @@ import pickle
 import re
 
 from prismaquant import format_registry as fr
+from prismaquant.allocator_candidates import SOURCE_PASSTHROUGH_CONTRACTS
 from prismaquant.anchored_cost import (
     AURA_CURRENCY,
     AnchorScalar,
@@ -58,7 +59,8 @@ CB_ARTIFACT_PUBLISH_SCHEMA = (
 )
 _CB_ARTIFACT_PUBLISH_MANIFEST = ".anchored_publish.json"
 _CB_ARTIFACT_OUTPUT_NAMES = (
-    "layer_config.json", "selection.json", "cb_col_weights.pkl",
+    "layer_config.json", "selection.json", "pareto.knees.json",
+    "cb_col_weights.pkl",
 )
 GENERIC_SEGMENT_FIELDS = ("family", "role", "equivalence_class")
 CB_SEGMENT_FIELDS = ("family", "role", "basis")
@@ -290,11 +292,90 @@ class CBUnitDeclaration:
     serving_group: str | None = None
 
 
+# The registered CB shape design, widest first.  Which of these columns is
+# actually *identifiable* is a property of the declared ladder, not of the
+# family -- see _identifiable_cb_shape_columns.
+_CB_SHAPE_COLUMNS: tuple[tuple[str, Callable[[int], float]], ...] = (
+    ("rung", lambda rung: float(rung)),
+    ("rung_parity", lambda rung: float(rung % 2)),
+)
+
+
+def _identifiable_cb_shape_columns(rungs: Sequence[int]) -> tuple[int, ...]:
+    """Keep the rung coordinate plus the derived columns this ladder resolves.
+
+    A derived feature that is constant across a segment's legal rungs carries
+    no information: per-unit centering turns it into a zero column, the design
+    drops to rank ``k-1`` of ``k``, and ``_fit_currency`` fails closed forever.
+    The ladder decides which survive, not the family.  Two live ladders make
+    that concrete -- the gridbook K1.2 fused mid-M kernel law admits only
+    ``k % 4 == 0`` FP8-CB rungs, so parity is constant on every legal FP8-CB
+    ladder, while NVFP4-CB (K12..K18) still spans both parities and keeps the
+    full rung-plus-parity design.  The rung coordinate itself is always
+    retained: ``CandidateSpec`` requires a nonempty basis, and the only ladder
+    on which the rung is constant is a one-rung ladder, which is priced by its
+    anchor and never fitted at all.
+    """
+    distinct = {int(rung) for rung in rungs}
+    if not distinct:
+        raise AnchoredCostError("cannot derive a shape basis from no rungs")
+    return (0, *(
+        index
+        for index, (_name, projection) in enumerate(_CB_SHAPE_COLUMNS)
+        if index > 0 and len({projection(rung) for rung in distinct}) > 1
+    ))
+
+
+def _cb_declaration_ladder(
+    declaration: CBUnitDeclaration,
+) -> tuple[str, dict[str, int], tuple[str, ...]]:
+    """Canonicalize one declaration into (terminal, payloads, CB ladder)."""
+    terminal = fr.canonical_format_name(declaration.terminal_format)
+    payloads = {
+        fr.canonical_format_name(str(name)): int(value)
+        for name, value in declaration.payload_bytes_by_format.items()
+    }
+    if terminal not in payloads:
+        raise AnchoredCostError(
+            f"{declaration.qname}: terminal payload is absent"
+        )
+    cb_formats = sorted(
+        (name for name in payloads if name != terminal),
+        key=lambda name: (
+            fr.get_format(name).family, cb_rung(name), name,
+        ),
+    )
+    if not cb_formats:
+        raise AnchoredCostError(
+            f"{declaration.qname}: source-gated CB ladder is empty"
+        )
+    return terminal, payloads, tuple(cb_formats)
+
+
 def build_cb_units(
     declarations: Sequence[CBUnitDeclaration],
     plugin: CodebookAnchoredFormatPlugin,
 ) -> tuple[UnitSpec, ...]:
     """Convert exact caller-owned ladders without redoing source legality."""
+    # Pass 1: the shape basis is a *segment* property, so it must be derived
+    # from the union of legal rungs across every unit in that segment.  Doing
+    # it per unit would hand two units in one segment different widths the
+    # moment source gating trims one ladder, and _fit_currency rejects a
+    # segment whose candidates use mixed shape bases.
+    ladder_rungs: dict[SegmentKey, set[int]] = defaultdict(set)
+    for declaration in declarations:
+        _terminal, _payloads, cb_formats = _cb_declaration_ladder(declaration)
+        for format_name in cb_formats:
+            ladder_rungs[SegmentKey(
+                fr.get_format(format_name).family,
+                declaration.role,
+                plugin.basis_for_format(format_name),
+            )].add(cb_rung(format_name))
+    columns_by_segment = {
+        segment: _identifiable_cb_shape_columns(sorted(rungs))
+        for segment, rungs in ladder_rungs.items()
+    }
+
     units: list[UnitSpec] = []
     seen: set[str] = set()
     for declaration in sorted(declarations, key=lambda item: item.qname):
@@ -303,25 +384,7 @@ def build_cb_units(
                 f"duplicate CB unit declaration {declaration.qname!r}"
             )
         seen.add(declaration.qname)
-        terminal = fr.canonical_format_name(declaration.terminal_format)
-        payloads = {
-            fr.canonical_format_name(str(name)): int(value)
-            for name, value in declaration.payload_bytes_by_format.items()
-        }
-        if terminal not in payloads:
-            raise AnchoredCostError(
-                f"{declaration.qname}: terminal payload is absent"
-            )
-        cb_formats = sorted(
-            (name for name in payloads if name != terminal),
-            key=lambda name: (
-                fr.get_format(name).family, cb_rung(name), name,
-            ),
-        )
-        if not cb_formats:
-            raise AnchoredCostError(
-                f"{declaration.qname}: source-gated CB ladder is empty"
-            )
+        terminal, payloads, cb_formats = _cb_declaration_ladder(declaration)
         plugin.validate_candidate_coverage(cb_formats)
         candidates: list[CandidateSpec] = []
         for format_name in cb_formats:
@@ -329,15 +392,11 @@ def build_cb_units(
             rung = cb_rung(format_name)
             family = fr.get_format(format_name).family
             basis = plugin.basis_for_format(format_name)
-            # FP8-lattice currently contains only K47/K48.  It therefore has
-            # one independently identifiable shape ratio, while the longer
-            # NV-lattice and FP8-learned ladders retain the registered
-            # rung-plus-parity design.  Declaring two columns for K47/K48
-            # would make every panel rank 1 of 2 and fail closed forever.
-            shape_features = (
-                (float(rung),)
-                if (family, basis) == ("fp8_cb", LATTICE_BASIS)
-                else (float(rung), float(rung % 2))
+            shape_features = tuple(
+                _CB_SHAPE_COLUMNS[index][1](rung)
+                for index in columns_by_segment[
+                    SegmentKey(family, declaration.role, basis)
+                ]
             )
             candidates.append(CandidateSpec(
                 format_name=format_name,
@@ -349,6 +408,23 @@ def build_cb_units(
                 coordinate=float(rung),
             ))
         terminal_payload = payloads[terminal]
+        try:
+            terminal_contract = SOURCE_PASSTHROUGH_CONTRACTS[terminal]
+        except KeyError as exc:
+            raise AnchoredCostError(
+                f"{declaration.qname}: terminal {terminal!r} has no exact "
+                "source-passthrough contract"
+            ) from exc
+        terminal_spec = fr.get_format(terminal)
+        # ``zero_cost_by_construction`` controls whether the generic cost
+        # loader synthesizes a missing column; it is not the terminal's
+        # end-to-end eligibility bit.  BF16 and FP8_SOURCE deliberately carry
+        # measured columns in ordinary campaigns, yet an exact-source terminal
+        # remains honest when its activation path is the identity.  The A-side
+        # contract is the decisive gate here: it preserves those terminals and
+        # excludes Gridbook's W8A8 block-FP8 terminal until activation-side
+        # AURA exists.
+        terminal_selectable = not terminal_spec.act_quant_changes_input
         candidates.append(CandidateSpec(
             format_name=terminal,
             bits=8.0 * terminal_payload / int(declaration.n_params),
@@ -358,6 +434,7 @@ def build_cb_units(
             shape_features=(),
             coordinate=0.0,
             terminal=True,
+            allocator_selectable=terminal_selectable,
         ))
         units.append(UnitSpec(
             qname=declaration.qname,
@@ -424,10 +501,14 @@ def plan_cb_panel_and_validation(
     """Choose deterministic role cohorts, globally disjoint from validation."""
     by_role_segments: dict[str, set[SegmentKey]] = defaultdict(set)
     by_segment: dict[SegmentKey, list[UnitSpec]] = defaultdict(list)
+    ladder_formats: dict[SegmentKey, set[str]] = defaultdict(set)
     for unit in units:
-        for segment in candidates_by_segment(unit, plugin):
+        for segment, candidates in candidates_by_segment(unit, plugin).items():
             by_role_segments[unit.role].add(segment)
             by_segment[segment].append(unit)
+            ladder_formats[segment].update(
+                candidate.format_name for candidate in candidates
+            )
 
     cohorts: dict[str, tuple[tuple[UnitSpec, ...], tuple[UnitSpec, ...]]] = {}
     for role, segments in sorted(by_role_segments.items()):
@@ -489,6 +570,32 @@ def plan_cb_panel_and_validation(
             fr.canonical_format_name(fmt)
             for fmt in policy.panel_rungs_by_segment.get(key, ())
         )
+        if len(ladder_formats[segment]) == 1:
+            # A one-rung segment has no shape law to fit and no room to fit
+            # one: the anchor is forced onto that rung, so pricing reduces to
+            # ratio 1.0 and the cell carries its own production render.  This
+            # is strictly more faithful than extrapolation, so renders spent
+            # on a panel here would buy nothing -- refuse a policy that asks
+            # for them rather than silently ignoring it.
+            if panel_formats or policy.validation_rungs_by_segment.get(key, ()):
+                raise AnchoredCostError(
+                    f"{segment.stamp} declares one legal rung and is priced "
+                    "by its anchor; it admits no panel or validation rungs"
+                )
+            accounting[segment.stamp] = {
+                "segment": basis_segment_dict(segment),
+                "panel_units": 0,
+                "panel_rungs": [],
+                "panel_render_cells": 0,
+                "validation_units": 0,
+                "validation_rungs": [],
+                "validation_render_cells": 0,
+                "design_rank": 0,
+                "design_rank_required": 0,
+                "single_rung_measured": True,
+                "sole_rung": sorted(ladder_formats[segment])[0],
+            }
+            continue
         if len(panel_formats) < 2:
             raise AnchoredCostError(
                 f"panel policy lacks >=2 rungs for {segment.stamp}"
@@ -801,10 +908,71 @@ def anchors_from_streamed_payload(
     return anchors
 
 
+def _single_rung_shape_fit(
+    segment: SegmentKey,
+    sole: CandidateSpec,
+    anchors: Mapping[tuple[str, SegmentKey], AnchorScalar],
+) -> ShapeFit:
+    """Price a one-rung segment from its own anchors instead of a shape law.
+
+    ``price_anchored_candidates`` evaluates ``anchor.predicted_dloss *
+    fit.ratio(candidate, anchor)``.  When a segment declares exactly one legal
+    rung the anchor is forced onto it, so the ratio is identically 1.0 and the
+    reported cost is that unit's own production render -- measured, not
+    extrapolated.  The identity fit below states that explicitly rather than
+    laundering it through a regression: a one-coordinate design centers to the
+    zero matrix, so fitting is impossible, not merely redundant.  Provenance
+    comes from the anchors themselves, which is exactly the identity pricing
+    re-checks per unit.
+    """
+    scoped = sorted(
+        (anchor for (_qname, key), anchor in anchors.items() if key == segment),
+        key=lambda anchor: anchor.qname,
+    )
+    if not scoped:
+        raise AnchoredCostError(
+            f"{segment.stamp} declares one legal rung but has no anchor"
+        )
+    off_ladder = sorted({
+        anchor.format_name for anchor in scoped
+        if anchor.format_name != sole.format_name
+    })
+    if off_ladder:
+        raise AnchoredCostError(
+            f"{segment.stamp} anchors at {off_ladder} outside its sole legal "
+            f"rung {sole.format_name}"
+        )
+    receipts = [anchor.receipt for anchor in scoped]
+    if len({receipt.arm_identity_sha256 for receipt in receipts}) != 1:
+        raise AnchoredCostError("single-rung segment spans production arms")
+    if len({receipt.payload_identity_sha256 for receipt in receipts}) != 1:
+        raise AnchoredCostError(
+            "single-rung segment spans render payload identities"
+        )
+    return ShapeFit(
+        segment=segment,
+        g_by_format={sole.format_name: 1.0},
+        reference_format=sole.format_name,
+        coefficients=(),
+        design_rank=0,
+        design_rank_required=0,
+        n_units=len({anchor.qname for anchor in scoped}),
+        n_observations=len(scoped),
+        arm_identity_sha256=receipts[0].arm_identity_sha256,
+        payload_identity_sha256=receipts[0].payload_identity_sha256,
+        panel_receipts_sha256=canonical_json_sha256(
+            sorted(receipt.receipt_sha256 for receipt in receipts),
+            where="single-rung measured segment anchor receipts",
+        ),
+    )
+
+
 def fit_all_cb_segments(
     observations: Sequence[ShapeObservation],
     units: Sequence[UnitSpec],
     plugin: CodebookAnchoredFormatPlugin,
+    *,
+    anchors: Mapping[tuple[str, SegmentKey], AnchorScalar],
 ) -> dict[SegmentKey, ShapeFit]:
     by_segment: dict[SegmentKey, list[ShapeObservation]] = defaultdict(list)
     ladders: dict[SegmentKey, dict[str, CandidateSpec]] = defaultdict(dict)
@@ -814,11 +982,16 @@ def fit_all_cb_segments(
         for segment, candidates in candidates_by_segment(unit, plugin).items():
             for candidate in candidates:
                 ladders[segment][candidate.format_name] = candidate
-    if set(by_segment) != set(ladders):
+    # A one-rung segment is priced by its anchor, so it is deliberately absent
+    # from the panel; every other legal segment must still be covered.
+    fitted = {
+        segment for segment, ladder in ladders.items() if len(ladder) > 1
+    }
+    if set(by_segment) != fitted:
         raise AnchoredCostError(
             "panel does not cover every legal family/role/basis segment"
         )
-    return {
+    fits = {
         segment: fit_segment_shape(
             by_segment[segment],
             segment=segment,
@@ -829,8 +1002,12 @@ def fit_all_cb_segments(
                 ),
             )),
         )
-        for segment in sorted(ladders)
+        for segment in sorted(fitted)
     }
+    for segment in sorted(set(ladders) - fitted):
+        (sole,) = ladders[segment].values()
+        fits[segment] = _single_rung_shape_fit(segment, sole, anchors)
+    return fits
 
 
 def heldout_validation_report(
@@ -1285,11 +1462,31 @@ def run_streamed_cb_anchor_aura(
     """Wire the exact bounded plan into the existing one-pass AURA runner."""
     from prismaquant.aura_cost import run_streamed_production_anchor_aura
 
+    unmeasured_terminals: dict[str, tuple[str, ...]] = {}
+    for raw_qname, raw_formats in formats_by_qname.items():
+        qname = str(raw_qname)
+        rendered = {
+            fr.canonical_format_name(fmt)
+            for fmt in purposes_by_qname.get(qname, {})
+        }
+        retained = tuple(
+            fr.canonical_format_name(fmt)
+            for fmt in raw_formats
+            if fr.canonical_format_name(fmt) not in rendered
+        )
+        if len(retained) != 1:
+            raise AnchoredCostError(
+                f"{qname}: streamed CB plan must retain exactly one "
+                f"unmeasured terminal, found {list(retained)}"
+            )
+        unmeasured_terminals[qname] = retained
+
     payload = run_streamed_production_anchor_aura(
         runner,
         calibration_ids,
         formats_by_qname=formats_by_qname,
         render_purposes_by_qname=purposes_by_qname,
+        unmeasured_formats_by_qname=unmeasured_terminals,
         activation_index=activation_index,
         render_levers=render_levers,
         col_weights=col_weights,
@@ -1536,8 +1733,12 @@ def write_exportable_artifacts(
         allocator_selection_bytes = (
             allocator_root / "selection.json"
         ).read_bytes()
+        allocator_pareto_bytes = (
+            allocator_root / "pareto.knees.json"
+        ).read_bytes()
         layer_config = json.loads(allocator_layer_bytes)
         selection = json.loads(allocator_selection_bytes)
+        pareto_knees = json.loads(allocator_pareto_bytes)
     except Exception as exc:
         raise AnchoredCostError("allocator outputs are unreadable") from exc
     required = {
@@ -1546,6 +1747,24 @@ def write_exportable_artifacts(
     if selection.get("feasible") is not True or not required.issubset(selection):
         raise AnchoredCostError(
             "allocator selection is infeasible or lacks export contract keys"
+        )
+    primary_knee = (
+        pareto_knees.get(pareto_knees.get("primary"))
+        if isinstance(pareto_knees, Mapping)
+        and isinstance(pareto_knees.get("primary"), str)
+        else None
+    )
+    primary_achieved_bits = (
+        primary_knee.get("achieved_bits")
+        if isinstance(primary_knee, Mapping) else None
+    )
+    if (
+        isinstance(primary_achieved_bits, bool)
+        or not isinstance(primary_achieved_bits, (int, float))
+        or not math.isfinite(float(primary_achieved_bits))
+    ):
+        raise AnchoredCostError(
+            "allocator Pareto knees lack a primary achieved-bpp record"
         )
     col_path = Path(cb_col_weights_path)
     if not col_path.is_file():
@@ -1577,6 +1796,10 @@ def write_exportable_artifacts(
         "selection.json": json.dumps(
             selection, indent=2, sort_keys=True, allow_nan=False
         ).encode(),
+        # Preserve the allocator's own bpp-accounting sidecar next to the
+        # AURA-stamped recipe.  The shipcard deliberately reads this number
+        # instead of recomputing it under a potentially different convention.
+        "pareto.knees.json": allocator_pareto_bytes,
         "cb_col_weights.pkl": col_payload,
     }
     expected_outputs = {
@@ -1600,6 +1823,9 @@ def write_exportable_artifacts(
         ).hexdigest(),
         "allocator_selection_sha256": hashlib.sha256(
             allocator_selection_bytes
+        ).hexdigest(),
+        "allocator_pareto_knees_sha256": hashlib.sha256(
+            allocator_pareto_bytes
         ).hexdigest(),
         "cb_col_weights_sha256": expected_outputs[
             "cb_col_weights.pkl"

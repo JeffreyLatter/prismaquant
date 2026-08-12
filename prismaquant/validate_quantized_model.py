@@ -363,6 +363,7 @@ def check_perplexity(base_url: str, model_name: str,
         "max_nll_per_tok": max_nll,
         "per_prompt_avg_nll": per_prompt_avg_nll,
         "n_tokens": total_tokens,
+        "spec_decode_detected": False,
     }
 
     reasons = []
@@ -537,6 +538,13 @@ def _fill_shipcard(args, rep: "ValidationReport") -> None:
     if ppl_check is not None:
         spec_detected = bool(ppl_check.metrics.get("spec_decode_detected", False))
     metrics = {c.name: {"passed": c.passed, **c.metrics} for c in rep.checks}
+    perplexity = metrics.get("perplexity")
+    if isinstance(perplexity, dict):
+        # Make the replayable evidence self-contained. ValidationReport already
+        # owns the threshold decision; the shipcard additionally needs the
+        # exact number of scored tokens to reject a fabricated empty pass.
+        if "n_tokens" not in perplexity:
+            perplexity["n_tokens"] = 0
     record = make_record(
         slot="ship_gate",
         tool="validate_quantized_model.py",

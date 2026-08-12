@@ -2,19 +2,18 @@
 
 ## Status
 
-The producer and consumer implementations exist, but the serving path is not
-released or qualified. Gridbook commit
-`032e8158acc01b13c125db4c5463267f21b1debf` prepares version 0.8.3 and declares
-`abi_features.routed_moe_per_role_codebook_lut = 1` in its packaged
-`runtime_contract.json`. It is not tagged or published, PrismaQuant's pin has
-`version_is_release: false`, and no device execution has been performed.
+The producer/consumer ABI is released in Gridbook **0.8.4**, commit
+`56259f6e5d8646da9f9179e1dde7a1708849722c`, and that exact release is the
+PrismaQuant pin. Gridbook 0.8.3 implemented the routed per-role path; 0.8.4 is
+the first release whose closed packaged `runtime_contract.json` explicitly
+attests `abi_features.routed_moe_per_role_codebook_lut = 1`. Required
+compatibility CI binds the final package version, immutable commit, and feature
+marker. PrismaQuant neither imports nor vendors Gridbook.
 
-Nothing becomes default-on. PrismaQuant still defaults
-`CB_CODEBOOK_SOURCE_SCOPE=none`; Gridbook still requires
-`PRISMAQUANT_CB_MOE_PER_ROLE_LUT=1`; and serving-lane metadata gives the
-unreleased 0.8.3 pin no fused-rung credit. Compatibility crosses the repository
-boundary only through the immutable pin and packaged contract. PrismaQuant does
-not import or vendor Gridbook.
+This is capability, not an artifact verdict. PrismaQuant still defaults
+`CB_CODEBOOK_SOURCE_SCOPE=none`, and a routed learned artifact must close its
+own eager/graph, quality, and paired served-performance shipcard gates on the
+target device. No result for the current DSv4 AURA artifact is claimed here.
 
 ## Consumer ABI
 
@@ -39,9 +38,9 @@ precede up rows. The config must not also declare a fused `gate_up_proj` ref,
 and a gate/up pair must be complete.
 
 Gridbook commit `49733a5` first made its legacy uniform MoE resolver compare
-`codebook_ref`; without the opt-in, mismatched refs raise at model load instead
-of decoding all roles against the first scheme. Commit `776c45d` adds the
-opt-in execution ABI. It ports the dense loader's exact-reference block
+`codebook_ref`; an unsupported mismatch raises at model load instead of
+decoding all roles against the first scheme. Commit `776c45d` added the
+execution ABI later released in 0.8.3. It ports the dense loader's exact-reference block
 interning and per-output-row LUT offsets to routed experts:
 
 - distinct reference tuples remain distinct even when their current values are
@@ -53,8 +52,7 @@ interning and per-output-row LUT offsets to routed experts:
 
 Offset-aware native decode operations consume those resident vectors. A
 multi-book prefill uses the exact BF16 bridge; one-LUT fused or persistent
-routes are ineligible. The flag is process-stable: changing it after first use
-raises. Missing refs, mixed formats/activation contracts, invalid role
+routes are ineligible. Missing refs, mixed formats/activation contracts, invalid role
 coverage, or a route that cannot consume offsets fail before generation.
 
 ## Producer ABI
@@ -122,29 +120,28 @@ per-subtable digests, role/rung, and source/imatrix digests. Bundle reload
 validates that bank-origin schema and ties it back to the cell's input and
 table identities; legacy and dense cells omit the field unchanged.
 
-The DSv4 run directory currently needs operator reconciliation before a real
-bundle can be built. A read-only strict audit resolves 287 valid K28–K33 book
-paths covering 284 distinct `(layer, projection, rung)` cells and 285 distinct
-FP16 payloads. The reported 236 is exactly the path count through layer 37;
-completed layers 38–42 add 51 more, so using 236 would silently discard the
-campaign tail. Final layer-shard semantics imply 264 needed logical cells, but
-no persisted file chooses pass precedence or the export assignment; three
-cells have multiple valid paths and one duplicate cell has different payloads.
-Of the strict 287 paths, 76 files are root-owned mode `0600` (141 of all 638
-files in the complete bank have that ownership). Producer code must not guess
-the intended selection or bypass those permissions.
+The DSv4 campaign now supplies an explicit immutable burn-book selection and
+an authoritative bundle. Its current bundle content identity is
+`4b0d551aa041876c1976736202960f137f492942311633a7f623a506a8abb17f`:
+129 routed rank-3 role tensors (33,024 flattened per-expert allocation units)
+each declare the two selected learned K28/K32 cells plus seven legal NVFP4
+lattice cells, while 301 dense tensors carry the complete 28-rung bundle menu.
+The preflight independently checks selection identity,
+declared census, and coverage of every legal cell; a bundle is never completed
+by scanning or guessing from the burn directory.
 
 ## Version gate
 
 `prismaquant.gridbook_runtime_pin` strictly parses the sole packaged pin. A
-final numeric version `>=0.8.3` carries this ABI; `version_is_release` is
-separate because an immutable preparation commit may implement the ABI before
-the tag exists. The current exact 0.8.3 pin therefore permits CPU production
-and export tests while still receiving no released-runtime performance credit.
+final numeric version `>=0.8.4` plus the exact packaged feature marker carries
+this producer-consumable ABI. `version_is_release` remains separate because an
+immutable preparation commit may implement behavior before a tag exists. The
+current 0.8.4 pin satisfies both gates; performance credit still comes only
+from the artifact's served evidence.
 
 The routed refusal remains active for:
 
-- every final numeric version below 0.8.3;
+- every final numeric version below 0.8.4;
 - prerelease, local, malformed, missing, or structurally invalid versions/pins;
 - any routed name, explicit routed flag, or rank-3 learned source under such a
   pin.
@@ -156,8 +153,8 @@ packaged `abi_features` marker.
 
 ## Ship gate
 
-Before tagging or enabling the runtime flag in a shipping image, all of the
-following must pass on unforked vLLM in the known-good container:
+Before publishing a routed learned artifact, all of the following must pass on
+unforked vLLM in the known-good container:
 
 1. Load a complete DSv4 artifact with deliberately different gate, up, and
    down books at K28 and K33 (include odd K29), with exact sidecar digest and
@@ -179,5 +176,5 @@ following must pass on unforked vLLM in the known-good container:
    shapes. Performance must be at least parity with the lattice container the
    learned artifact displaces.
 
-Only after those gates should the owner tag/publish Gridbook, flip the pin's
-release truth, and consider enabling the runtime opt-in in a served recipe.
+Gridbook's package/tag gate is already closed at 0.8.4. These are artifact
+gates and remain blocking regardless of released consumer capability.

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import subprocess
 
 from tools.aura_cb_reprice_preflight import (
     DSV4_EXPERT_UNITS,
@@ -17,6 +18,15 @@ from tools.aura_cb_reprice_preflight import (
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def _container_programs(driver: str) -> tuple[str, str]:
+    marker = 'docker "${docker_args[@]}" --entrypoint bash "$IMAGE_ID" -lc \''
+    pieces = driver.split(marker)
+    assert len(pieces) == 3
+    dense = pieces[1].split("\n'", 1)[0]
+    dsv4 = pieces[2].split("\n'", 1)[0]
+    return dense, dsv4
+
+
 def test_source_rate_domain_is_not_demand_truncated():
     plan = campaign_accounting()
 
@@ -26,11 +36,11 @@ def test_source_rate_domain_is_not_demand_truncated():
     assert plan["expert_2048x4096_units"] == 22_016
     assert plan["expert_4096x2048_units"] == 11_008
     nvfp4_formats = [f"NVFP4_CB_K{k}" for k in range(12, 19)]
-    expert_fp8_formats = [
-        f"FP8_CB_K{k}" for k in range(28, 34)
-    ]
+    # gridbook K1.2: FP8-CB is legal only at k % 4 == 0.  Routed experts are
+    # additionally capped at K33 by the byte-exact source-payload ceiling.
+    expert_fp8_formats = [f"FP8_CB_K{k}" for k in (28, 32)]
     nonexpert_fp8_formats = [
-        f"FP8_CB_K{k}" for k in range(28, 49)
+        f"FP8_CB_K{k}" for k in (28, 32, 36, 40, 44, 48)
     ]
     assert plan["expert_formats"] == [
         *nvfp4_formats,
@@ -43,15 +53,15 @@ def test_source_rate_domain_is_not_demand_truncated():
         "FP8_BLOCK_UE8M0_SOURCE",
     ]
     assert plan["nvfp4_cells"] == 233_275
-    assert plan["expert_fp8_cells"] == 198_144
-    assert plan["nonexpert_fp8_cells"] == 6_321
-    assert plan["fp8_learned_cells"] == 203_863
-    assert plan["fp8_lattice_cells"] == 602
-    assert plan["fp8_cells"] == 204_465
+    assert plan["expert_fp8_cells"] == 33_024 * 2 == 66_048
+    assert plan["nonexpert_fp8_cells"] == 301 * 6 == 1_806
+    assert plan["fp8_learned_cells"] == 66_048 + 301 * 5 == 67_553
+    assert plan["fp8_lattice_cells"] == 301 * 1 == 301
+    assert plan["fp8_cells"] == 67_854
     assert plan["source_terminal_cells"] == 33_325
-    assert plan["expert_cells"] == 462_336
-    assert plan["nonexpert_cells"] == 8_729
-    assert plan["candidate_cells"] == 471_065
+    assert plan["expert_cells"] == 33_024 * (7 + 2 + 1) == 330_240
+    assert plan["nonexpert_cells"] == 301 * (7 + 6 + 1) == 4_214
+    assert plan["candidate_cells"] == 334_454
     assert plan["segment_key_fields"] == [
         "family", "role", "equivalence_class",
     ]
@@ -336,14 +346,103 @@ def test_driver_takes_atomic_mutex_before_any_gpu_container():
     assert "PRISMAQUANT_CB_ENCODE_COMPILE" in driver
     assert "AURA_CB_LAUNCH_RECEIPT" in driver
     assert "--implementation-receipt" in driver
+    assert (
+        "gridbook@sha256:"
+        "f7dad9260fea6f4207bd894acc9ebc034d91c599a70489a89ab1938a75db9c47"
+        in driver
+    )
+    assert "IMAGE must be an immutable @sha256 digest" in driver
+    assert "docker image inspect --format '{{.Id}}'" in driver
+    assert driver.count("--entrypoint bash \"$IMAGE_ID\"") == 2
+    assert '--entrypoint bash "$IMAGE"' not in driver
+    assert "container_runtime_identity.py" in driver
+    assert "prismaquant_runtime_snapshot.py" in driver
+    assert "RUNTIME_SNAPSHOT_CACHE_ROOT" in driver
+    assert "status --porcelain --untracked-files=all" in driver
+    assert 'rev-parse --verify "${IDENTITY_GIT_COMMIT}^{tree}"' in driver
+    assert '"$RUNTIME_SNAPSHOT_TREE" != "$IDENTITY_GIT_TREE"' in driver
+    assert "--cache-root \"$RUNTIME_SNAPSHOT_CACHE_ROOT\"" in driver
+    assert "--source-root \"$RUNTIME_SNAPSHOT\"" in driver
+    assert (
+        '"$PYTHON_BIN" "$RUNTIME_SNAPSHOT_IDENTITY_TOOL" source-sha256'
+        in driver
+    )
+    assert (
+        '"$PYTHON_BIN" "$RUNTIME_SNAPSHOT_IDENTITY_TOOL" '
+        '"${runtime_identity_args[@]}"'
+        in driver
+    )
+    assert '"$PYTHON_BIN" "$RUNTIME_SNAPSHOT_VERIFY_TOOL" verify' in driver
+    assert '"$PYTHON_BIN" "$RUNTIME_SNAPSHOT_TOOL" verify' not in driver
+    assert (
+        '"$PYTHON_BIN" "$RUNTIME_IDENTITY_TOOL" source-sha256'
+        not in driver
+    )
+    assert '-v "$RUNTIME_SNAPSHOT:/pq:ro"' in driver
+    assert '-v "$REPO_ROOT:/pq:ro"' not in driver
+    assert driver.count("--expected-tree") == 3
+    assert driver.count("--expected-closure-sha256") == 3
+    assert driver.count("PQ_RUNTIME_PRISMAQUANT_SOURCE_SHA256") == 3
+    assert '-e "PYTHONNOUSERSITE=1"' in driver
+    assert '-e "PYTHONSAFEPATH=1"' in driver
+    assert "write-or-verify" in driver
+    assert driver.count("verify-mounted") == 2
+    assert "--require-receipt-image" in driver
+    assert "PRISMAQUANT_RUNTIME_IMAGE" not in driver
     assert 'CALIB_NSAMPLES="${CALIB_NSAMPLES:-16}"' in driver
     assert 'CALIB_SEQLEN="${CALIB_SEQLEN:-512}"' in driver
     assert 'CALIB_SEED="${CALIB_SEED:-42}"' in driver
+    assert 'CACHE_HEADROOM_GB="${CACHE_HEADROOM_GB:-100}"' in driver
+    assert '-e "CACHE_HEADROOM_GB=$CACHE_HEADROOM_GB"' in driver
+    assert '-e "PYTORCH_NO_CUDA_MEMORY_CACHING=0"' in driver
+    assert "DSv4 AURA image must declare" not in driver
+    assert "synchronizes and empty_cache()s" in driver
+    assert "DSv4 requires the layer-local caching allocator" in driver
+    assert "launch log reports cache_slots and must stay <= 1" in driver
     assert "--resume" in driver
     assert 'if [[ ! -s "$CACHE_MANIFEST" ]]' not in driver
     assert 'if [[ ! -s "$COST_OUTPUT" ]]' not in driver
     assert "run-pipeline.sh" not in driver  # cost-only, no accidental export
+    assert "> >(tee" not in driver
+    assert (
+        "' 2>&1 | tee -a \"$WORK_DIR/logs/aura_cost.log\"" in driver
+    )
+    assert (
+        "' 2>&1 | tee -a \"$WORK_DIR/logs/dsv4_aura_cb_reprice.log\""
+        in driver
+    )
+    dense_container, dsv4_container = _container_programs(driver)
+    assert dense_container.count("verify_pq_runtime") == 3  # definition + two calls
+    dense_second_verify_at = dense_container.rindex("verify_pq_runtime")
+    dense_second_producer_at = dense_container.index(
+        "exec python3 -m prismaquant.aura_cost"
+    )
+    assert dense_second_verify_at < dense_second_producer_at
+    assert not dense_container[
+        dense_second_verify_at + len("verify_pq_runtime"):dense_second_producer_at
+    ].strip()
+    mounted_verify_at = dsv4_container.rindex("verify-mounted")
+    producer_at = dsv4_container.index(
+        "exec python3 -m prismaquant.dsv4_aura_cb_reprice"
+    )
+    assert mounted_verify_at < producer_at
+    assert "python3 -m prismaquant" not in dsv4_container[:producer_at]
+    mounted_identity_end = dsv4_container.index(
+        '  --expected-git-commit "$PQ_RUNTIME_PRISMAQUANT_GIT_COMMIT"',
+        mounted_verify_at,
+    ) + len('  --expected-git-commit "$PQ_RUNTIME_PRISMAQUANT_GIT_COMMIT"')
+    assert not dsv4_container[mounted_identity_end:producer_at].strip()
     assert "\nimport torch" not in preflight
     assert "\nfrom torch" not in preflight
     assert "\nimport transformers" not in preflight
     assert "\nfrom transformers" not in preflight
+
+
+def test_driver_container_entrypoints_are_valid_bash():
+    driver = (ROOT / "tools/run_aura_cb_reprice.sh").read_text()
+    for name, program in zip(("dense", "dsv4"), _container_programs(driver)):
+        result = subprocess.run(
+            ["bash", "-n"], input=program, text=True, capture_output=True,
+            check=False,
+        )
+        assert result.returncode == 0, f"{name}: {result.stderr}"

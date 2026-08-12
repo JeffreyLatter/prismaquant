@@ -31,6 +31,7 @@ from .allocator_solver import (
 )
 from .nvfp4_cb_footprint import (
     CBSerializationContext,
+    cb_breakdown_identity_is_materialized,
     is_cb_format,
 )
 from .footprint import (
@@ -85,6 +86,11 @@ AURA_SUPERSURROGATE_ALLOCATOR_SEMANTICS = True
 # Serving-route token for a passthrough whose bytes the model's OWN loader
 # consumes, with no Gridbook codec in the path.
 ROUTE_DELEGATED_NATIVE = "delegated_native"
+# Gridbook-owned W8A8 dense route.  This is deliberately not described as
+# delegated/native: Gridbook 0.8.4 installs ``Mxfp8DenseLinearMethod``, embeds
+# block-128 source scales into per-32 MXFP8 weight scales, and quantizes the A
+# side dynamically to MXFP8 per 32.
+ROUTE_GRIDBOOK_MXFP8_DENSE = "gridbook_mxfp8_dense"
 
 # What a MEASUREMENT says about serving a passthrough's bytes. These are
 # verdicts from a real serve attempt on real hardware, not design intent —
@@ -99,9 +105,10 @@ ROUTE_STATUS_BLOCKED = "blocked"        # measured, every known route dead
 class SourcePassthroughContract:
     """One native source format the producer can ship back UNCHANGED.
 
-    "Any format the model natively uses belongs on a passthrough menu": the
-    allocator's cheapest honest option for a unit is always to keep the bytes
-    the checkpoint already has. This table is that menu, one entry per
+    Keeping a native source format always preserves its stored weight plane;
+    it is an allocator option only when the serving activation contract is
+    also priced honestly. This table records the source/storage contract, one
+    entry per
     (source format, unit contract) the census finds, so adding a newly
     encountered native format is a data change rather than a new code path.
 
@@ -120,10 +127,13 @@ class SourcePassthroughContract:
         Distinct from ``format_name``: the producer's registry name is ours to
         rename, the wire id is a cross-repo contract.
       ``route_status``  what a MEASUREMENT says about serving these bytes, per
-        ``ROUTE_STATUS_*``. Never remove a rung from the menu — an allocator
-        that wants an unservable passthrough is reporting a serving gap, and
-        hiding the rung would hide the signal — but anything other than
-        ``backed`` makes the export fail closed without an explicit override.
+        ``ROUTE_STATUS_*``. Route status alone never removes an honestly
+        priced rung from the menu — an allocator that wants an unservable
+        passthrough is reporting a serving gap — but anything other than
+        ``backed`` makes export fail closed without an explicit override.
+        This is orthogonal to cost admission: a terminal whose activation-side
+        loss has no currency must stay out of that allocator campaign even if
+        the serving route itself exists.
       ``route_requirement``  the serving-side condition that makes a BACKED
         route actually fire (e.g. a non-default vLLM MoE backend). Belongs in
         the artifact's serving notes; a backed route with an unmet
@@ -178,23 +188,29 @@ SOURCE_PASSTHROUGH_CONTRACTS: dict[str, SourcePassthroughContract] = {
             format_name="FP8_BLOCK_UE8M0_SOURCE",
             source_kind="fp8_ue8m0",
             wire_format_id="fp8_e4m3_ue8m0_block128",
-            zero_cost_by_construction=True,
-            serving_route=f"{ROUTE_DELEGATED_NATIVE}_fp8_block_ue8m0",
-            route_status=ROUTE_STATUS_BLOCKED,
+            # Weight bytes are copied exactly, but Gridbook's concrete route
+            # is W8A8.  A weight-only AURA pass therefore cannot synthesize a
+            # zero output cost for this terminal.
+            zero_cost_by_construction=False,
+            serving_route=ROUTE_GRIDBOOK_MXFP8_DENSE,
+            route_status=ROUTE_STATUS_PENDING,
+            route_requirement="GRIDBOOK_MXFP8_DENSE=1",
             detail=(
-                "native block-FP8 with UE8M0 block exponents. 'The checkpoint "
-                "already serves this way' turned out NOT to imply a serve "
-                "route on our target: measured on GB10/sm121, every route is "
-                "dead. Keeping the rung on the menu is deliberate — if the DP "
-                "still wants it, that is the serving gap becoming visible in "
-                "the allocation instead of at deploy time."
+                "block-FP8 with UE8M0 block exponents, served by Gridbook "
+                "0.8.4's opt-in Mxfp8DenseLinearMethod. The source weight "
+                "plane is embedded exactly into per-32 MXFP8, while inputs "
+                "are dynamically quantized to MXFP8 per 32 (W8A8). The route "
+                "exists and is correctness-audited, but remains pending until "
+                "the served native-parity performance gate is measured."
             ),
             route_evidence=(
-                "sm121 measured 2026-08-03: deep_gemm assert; cutlass "
-                "scaled_mm rejects the block layout; triton KeyError on "
-                "float8_e8m0fnu; flashinfer gated sm90-exact; marlin-linear "
-                "is <=sm89. CONSEQUENCE: CB re-encoding of the body is the "
-                "only way this checkpoint serves on this box at all."
+                "Gridbook 0.8.4 commit "
+                "56259f6e5d8646da9f9179e1dde7a1708849722c: "
+                "source_passthrough.py binds the wire id to "
+                "Mxfp8DenseLinearMethod on sm121 and requires "
+                "GRIDBOOK_MXFP8_DENSE=1; kernel-vs-oracle correctness is "
+                "audited on DSv4 shapes, while served native-parity evidence "
+                "is still pending."
             ),
         ),
         # DeepSeek-V4 routed experts: nibble-packed E2M1 + E8M0 group scales.
@@ -327,9 +343,11 @@ def source_format_for_kind(source_kind: str) -> fr.FormatSpec | None:
 # it. FP8_SOURCE and BF16 are deliberately NOT members: the cost pipeline
 # already emits real rows for them on the checkpoints where they are legal,
 # and synthesizing over a table that has an entry would hide a disagreement.
-# The newer source formats are members because no cost table will ever have a
-# column for them — they are byte-copy contracts, and asking the encoder to
-# "measure" a copy would burn GPU hours to reproduce a zero.
+# A byte-copy contract belongs here only when BOTH its W and A paths are the
+# identity.  ``FP8_BLOCK_UE8M0_SOURCE`` is intentionally absent: Gridbook
+# copies its weight bytes but serves them through a W8A8 per-32 MXFP8 method,
+# so activation-side AURA (or another measured output currency) is required
+# before the terminal can be allocator-selectable.
 #
 # Membership is not self-certifying: ``cost_entry_is_source_passthrough``
 # additionally requires the format to be a registered passthrough format whose
@@ -341,9 +359,11 @@ SOURCE_PASSTHROUGH_FORMATS: frozenset[str] = frozenset(
 )
 
 # Passthrough formats with no DEMONSTRATED serve route on the target — either
-# unaudited (pending) or measured dead (blocked). On the menu (an allocator
-# that wants one is reporting a serving gap), but the exporter refuses to ship
-# a selection containing one without an explicit override.
+# unaudited (pending) or measured dead (blocked). An otherwise honestly priced
+# candidate remains useful serving-gap evidence, but the exporter refuses to
+# ship a selection containing one without an explicit override.  This set does
+# not override independent cost-currency admission (notably activation-side
+# AURA for the W8A8 block-FP8 source route).
 ROUTE_PENDING_PASSTHROUGH_FORMATS: frozenset[str] = frozenset(
     name for name, contract in SOURCE_PASSTHROUGH_CONTRACTS.items()
     if not contract.route_backed
@@ -362,10 +382,12 @@ PASSTHROUGH_WIRE_FORMAT_IDS: dict[str, str] = {
 # The same cross-repo wire enum, for formats this producer RE-ENCODES rather
 # than copies. Kept as its own table beside the passthrough ids rather than
 # folded into SOURCE_PASSTHROUGH_CONTRACTS, because that table means something
-# specific and load-bearing: every member has an IDENTITY codec and a Δloss of
-# zero by construction. A re-quantization rung has a real encoder and a real
-# measured cost, so declaring it there would let it claim an exactness it has
-# not earned (tests/test_source_passthrough_family.py pins that invariant).
+# specific and load-bearing: every member copies the source WEIGHT payload
+# exactly and is source-kind gated. End-to-end Δloss is zero only for the
+# derived ``SOURCE_PASSTHROUGH_FORMATS`` subset whose activation path is also
+# identity. A re-quantization rung has a real weight encoder, so declaring it
+# here would still falsely claim byte-copy provenance
+# (tests/test_source_passthrough_family.py pins that invariant).
 #
 # What the two tables DO share is that the id is a contract with the consumer:
 # the registry name is ours to rename, the wire id is not.
@@ -509,11 +531,21 @@ def _source_bpp_applicability(
     if is_cb_format(spec.name) and cb_serialization_context is None:
         return FormatApplicability(True)
 
+    # Rate first, identity second.  A learned CB book is banked only for the
+    # rungs a unit may actually use, so demanding a materialized codebook here
+    # would make "is this rung legal?" depend on which books happen to exist:
+    # a routed expert that the source-payload ceiling already excludes at K36
+    # would raise instead of returning EXCEEDED, and the exact same menu would
+    # answer differently before and after a bundle rebuild.  Bytes are
+    # identical in both modes, so the verdict below is unchanged; identity is
+    # then re-asserted for the candidates that survive, which are exactly the
+    # ones a render can be asked for.
     candidate_item = format_tensor_payload_breakdown(
         spec,
         shape,
         qname=qname,
         cb_serialization_context=cb_serialization_context,
+        require_materialized_codebook_identity=False,
     )
     if source_owner.format_name is not None:
         source_item = format_tensor_payload_breakdown(
@@ -567,6 +599,20 @@ def _source_bpp_applicability(
             f"{source_bytes} bytes ({provenance['source_bpp']:.10g} bpp); "
             "comparison is exact integer bytes with no tolerance",
             provenance,
+        )
+    if is_cb_format(spec.name) and not cb_breakdown_identity_is_materialized(
+        candidate_item
+    ):
+        # Survived the rate gate, so this cell is one the pipeline may be
+        # asked to render, and its book is missing.  Re-price with identity
+        # required so the real diagnostic is raised here, at the gate, and not
+        # first at export.  A banked cell already carries its proof and pays
+        # nothing for this check.
+        format_tensor_payload_breakdown(
+            spec,
+            shape,
+            qname=qname,
+            cb_serialization_context=cb_serialization_context,
         )
     return FormatApplicability(True, provenance=provenance)
 

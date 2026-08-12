@@ -17,7 +17,7 @@ from typing import Any
 
 GRIDBOOK_RUNTIME_PIN_SCHEMA = "prismaquant.gridbook_runtime_pin.v2"
 GRIDBOOK_RUNTIME_REPOSITORY = "https://github.com/RobTand/gridbook.git"
-GRIDBOOK_ROUTED_MOE_PER_ROLE_CODEBOOK_LUT_MIN_VERSION = "0.8.3"
+GRIDBOOK_ROUTED_MOE_PER_ROLE_CODEBOOK_LUT_MIN_VERSION = "0.8.4"
 _REQUIRED_MEMBERS = {
     "schema",
     "repository",

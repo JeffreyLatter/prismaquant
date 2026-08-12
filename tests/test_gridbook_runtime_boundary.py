@@ -15,6 +15,7 @@ HELPER = ASSET_DIR / "gridbook_runtime.sh"
 PIN = ASSET_DIR / "gridbook_runtime_pin.json"
 LIVE_SCRIPTS = (
     "canary_ladder.sh",
+    "serve_dsv4_cb_validate.sh",
     "serve_hy3_smoke.sh",
     "serve_hy3_teb.sh",
     "serve_laguna_smoke.sh",
@@ -128,6 +129,19 @@ def test_producer_does_not_import_external_gridbook_runtime():
 
 
 def test_every_live_script_uses_the_one_external_runtime_helper():
+    discovered = {
+        path.name
+        for path in (REPO / "scripts").glob("*.sh")
+        if any(
+            marker in path.read_text(encoding="utf-8")
+            for marker in (
+                "gridbook_runtime_prepare",
+                "install-container",
+                "gridbook_runtime_install_container",
+            )
+        )
+    }
+    assert discovered == set(LIVE_SCRIPTS)
     for name in LIVE_SCRIPTS:
         text = (REPO / "scripts" / name).read_text(encoding="utf-8")
         assert "gridbook_runtime.sh" in text, name
@@ -143,6 +157,18 @@ def test_every_live_script_uses_the_one_external_runtime_helper():
         assert "plugins/gridbook" not in text, name
         assert "/repo/scripts/lib/gridbook_runtime.sh" not in text, name
         assert "--quantization prismaquant" not in text, name
+        # Import safety is intentionally owned once by the shared Docker
+        # argument vector.  A launcher-local override could appear after that
+        # vector and silently win Docker's last-value environment resolution.
+        if name == "serve_dsv4_cb_validate.sh":
+            # This launcher has a host-side, artifact-build-commit snapshot
+            # bootstrap before Gridbook preparation. Its strict source
+            # bootstrap requires PYTHONSAFEPATH in the host environment; the
+            # container value remains owned by GRIDBOOK_RUNTIME_DOCKER_ARGS.
+            assert "-e PYTHONSAFEPATH" not in text, name
+            assert "--env PYTHONSAFEPATH" not in text, name
+        else:
+            assert "PYTHONSAFEPATH" not in text, name
     delegation = (REPO / "scripts" /
                   "smoke_nvfp4_cb_delegation.sh").read_text(encoding="utf-8")
     assert "--quantization gridbook" in delegation
@@ -231,6 +257,29 @@ def test_checkout_override_requires_exact_clean_commit(tmp_path):
     assert "does not equal pinned" in wrong.stderr
 
 
+def test_standalone_checkout_rejects_linked_git_metadata(tmp_path):
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    commit = _make_gridbook_checkout(repository)
+    linked = tmp_path / "linked"
+    subprocess.run(
+        ["git", "worktree", "add", "--quiet", "--detach", str(linked), commit],
+        cwd=repository,
+        check=True,
+    )
+    command = (
+        f'. "{HELPER}"; '
+        'gridbook_runtime_verify_standalone_checkout "$1" "$2" 9.9.9'
+    )
+    refused = _bash(command, str(linked), commit)
+    assert refused.returncode == 2
+    assert "not self-contained" in refused.stderr
+
+    accepted = _bash(command, str(repository), commit)
+    assert accepted.returncode == 0, accepted.stderr
+    assert accepted.stdout.strip() == str(repository)
+
+
 def test_prepare_mounts_runtime_source_and_contract_read_only(tmp_path):
     checkout = tmp_path / "gridbook"
     checkout.mkdir()
@@ -250,14 +299,17 @@ def test_prepare_mounts_runtime_source_and_contract_read_only(tmp_path):
 
     prepared = _bash(
         'GRIDBOOK_RUNTIME_CHECKOUT="$1"; '
+        'GRIDBOOK_RUNTIME_CACHE_DIR="$3"; '
         '. "$2"; '
         'gridbook_runtime_prepare; '
         'printf "%s\\n" "${GRIDBOOK_RUNTIME_DOCKER_ARGS[@]}"',
-        str(checkout), str(copied_helper),
+        str(checkout), str(copied_helper), str(tmp_path / "cache"),
     )
     assert prepared.returncode == 0, prepared.stderr
     args = prepared.stdout.splitlines()
-    assert f"{checkout}:/opt/prismaquant-gridbook-source:ro" in args
+    materialized = tmp_path / "cache" / commit
+    assert f"{materialized}:/opt/prismaquant-gridbook-source:ro" in args
+    assert (materialized / ".git").is_dir()
     assert (
         f"{assets}:/opt/prismaquant-gridbook-runtime-contract:ro" in args
     )
@@ -265,7 +317,57 @@ def test_prepare_mounts_runtime_source_and_contract_read_only(tmp_path):
         "PQ_GRIDBOOK_RUNTIME_HELPER="
         "/opt/prismaquant-gridbook-runtime-contract/gridbook_runtime.sh"
     ) in args
+    assert "--workdir" in args
+    assert "/" in args
+    assert "--env" in args
+    assert "PYTHONSAFEPATH=1" in args
     assert all("/repo/" not in arg for arg in args)
+
+
+def test_prepare_materializes_linked_worktree_as_standalone_checkout(tmp_path):
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    commit = _make_gridbook_checkout(repository)
+    checkout = tmp_path / "linked-worktree"
+    subprocess.run(
+        ["git", "worktree", "add", "--quiet", "--detach", str(checkout), commit],
+        cwd=repository,
+        check=True,
+    )
+    assert (checkout / ".git").is_file()
+
+    assets = tmp_path / "contract"
+    assets.mkdir()
+    copied_helper = assets / HELPER.name
+    shutil.copy2(HELPER, copied_helper)
+    (assets / PIN.name).write_text(json.dumps({
+        "schema": "prismaquant.gridbook_runtime_pin.v2",
+        "repository": "https://github.com/example/gridbook.git",
+        "commit": commit,
+        "version": "9.9.9",
+        "version_is_release": False,
+    }), encoding="utf-8")
+    cache = tmp_path / "cache"
+    prepared = _bash(
+        'GRIDBOOK_RUNTIME_CHECKOUT="$1"; '
+        'GRIDBOOK_RUNTIME_CACHE_DIR="$3"; '
+        '. "$2"; '
+        'gridbook_runtime_prepare; '
+        'printf "%s\\n" "$GRIDBOOK_RUNTIME_SOURCE"',
+        str(checkout), str(copied_helper), str(cache),
+    )
+    assert prepared.returncode == 0, prepared.stderr
+    materialized = cache / commit
+    assert prepared.stdout.strip() == str(materialized)
+    assert (materialized / ".git").is_dir()
+    assert not (materialized / ".git" / "objects" / "info" / "alternates").exists()
+    verified = subprocess.run(
+        ["git", "-C", str(materialized), "fsck", "--no-dangling"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert verified.returncode == 0, verified.stderr
 
 
 def test_container_install_reloads_and_enforces_the_tracked_pin():
@@ -293,6 +395,30 @@ def test_runtime_helper_has_no_wheel_or_runtime_kind_branch():
     assert "GRIDBOOK_RUNTIME_WHEEL" not in text
     assert "PQ_GRIDBOOK_RUNTIME_KIND" not in text
     assert "gridbook_runtime_verify_wheel" not in text
+
+
+def test_container_install_preserves_exact_vcs_provenance():
+    text = HELPER.read_text(encoding="utf-8")
+    assert (
+        'git+file://${install_source}@${GRIDBOOK_RUNTIME_COMMIT}' in text
+    )
+    assert "--force-reinstall" in text
+    assert "cp -a --no-preserve=ownership" in text
+    assert "--no-build-isolation" in text
+    assert '"commit_id": expected_commit' in text
+    assert '"requested_revision": expected_commit' in text
+    assert '"vcs": "git"' in text
+    assert "importlib.import_module(\"gridbook\")" in text
+    assert "module_file != installed_init" in text
+    assert "entry.relative_to(package_root)" in text
+    assert "imported_version != expected" in text
+
+
+def test_runtime_helper_owns_safe_import_path_and_neutral_workdir():
+    text = HELPER.read_text(encoding="utf-8")
+    assert '--workdir /' in text
+    assert '--env "PYTHONSAFEPATH=1"' in text
+    assert "export PYTHONSAFEPATH=1" in text
 
 
 def test_container_install_path_is_owned_only_by_runtime_helper():

@@ -3,7 +3,7 @@
   "id": "nvfp4_cb",
   "export_container": "nvfp4_cb",
   "runtime": "vllm+gridbook_plugin",
-  "description": "NVFP4-CB / FP8-CB codebook container, served by the separately released Gridbook plugin pinned in prismaquant/gridbook_runtime/gridbook_runtime_pin.json. PrismaQuant does not vendor the runtime. Same OpenAI endpoint as the native lane — which is exactly why the CB half of R16 is wiring, not capability: validate_quantized_model is already endpoint-agnostic and knows nothing about the container.",
+  "description": "NVFP4-CB / FP8-CB codebook container, served by the separately released Gridbook plugin pinned in prismaquant/gridbook_runtime/gridbook_runtime_pin.json. PrismaQuant does not vendor the runtime. Load/generation validation is endpoint-driven and has separate eager and graph receipts because Gridbook is installed in an exact-pinned serving container rather than imported into the build environment.",
   "serving_profiles": ["nvfp4_cb"],
   "endpoint": {
     "kind": "openai",
@@ -13,6 +13,7 @@
   },
   "serve": {
     "scripts": [
+      "scripts/serve_dsv4_cb_validate.sh",
       "scripts/serve_qwen27b_smoke.sh",
       "scripts/serve_hy3_smoke.sh",
       "scripts/serve_hy3_teb.sh",
@@ -24,34 +25,40 @@
   },
   "gates": [
     {
-      "id": "load_generate",
-      "runner": "scripts/serve_*.sh (plugin serving env) + greedy generate",
+      "id": "load_generate.eager",
+      "runner": "MODEL=<artifact> scripts/serve_dsv4_cb_validate.sh eager",
       "shipcard_slot": "native_export.eager",
-      "description": "CB artifacts load ONLY through the gridbook plugin, so the load+generate smoke runs in the plugin's serving env, not in the build venv. The gridbook cb_fill_guard raises from process_weights_after_loading if any CB expert tensor went unconsumed (D3) — the failure mode this gate exists for is coherent-looking garbage, not a crash."
+      "description": "Fresh exact-pinned Gridbook container, TP=1, fp8 KV, speculative decode off, --enforce-eager, then two identical non-empty greedy completions over the OpenAI endpoint. Fills the eager load/generation slot, then reuses that exact live nonce-bound session for the independently recorded numeric ship gate and refuses unless the current ship_gate slot replays. It makes no gold-quality or performance claim."
+    },
+    {
+      "id": "load_generate.graph",
+      "runner": "MODEL=<artifact> scripts/serve_dsv4_cb_validate.sh graph",
+      "shipcard_slot": "native_export.graph",
+      "description": "A second fresh exact-pinned Gridbook container with --enforce-eager absent, followed by the same endpoint proof and a distinct server-side fingerprint. Eager success cannot stand in for CUDA-graph load/capture/generation success."
     },
     {
       "id": "ship_gate.ppl_p99nll",
       "runner": "prismaquant.validate_quantized_model --base-url ... --shipcard",
       "shipcard_slot": "ship_gate",
-      "description": "Unchanged from the native lane: same script, same endpoint, same thresholds."
+      "description": "Unchanged from the native lane: same validator, endpoint, and thresholds. For DSv4, serve_dsv4_cb_validate.sh eager invokes it before tearing down the exact nonce-bound server and explicitly verifies the resulting ship_gate slot."
     },
     {
       "id": "gold.kl",
-      "runner": "tools/measure_vllm_full_kl.py",
+      "runner": "tools/measure_vllm_full_kl.py --dsv4-gridbook-contract",
       "shipcard_slot": "gold.kl",
-      "description": "Served KL-vs-BF16 in the plugin serving env. Match extension residency across A/B arms: loading a CUDA extension shifts allocator addresses and moves confident-KL by up to 17%."
+      "description": "Served KL-vs-BF16 in the plugin serving env. Its BF16 teacher is produced first by tools/build_streamed_full_kl_teacher.py --wikitext-inputs <gold-inputs.json>. Match extension residency across A/B arms: loading a CUDA extension shifts allocator addresses and moves confident-KL by up to 17%."
     },
     {
       "id": "gold.ppl",
-      "runner": "tools/measure_wikitext_ppl.py",
+      "runner": "tools/measure_vllm_wikitext_ppl.py --dsv4-gridbook-contract --wikitext-inputs <gold-inputs.json>",
       "shipcard_slot": "gold.ppl",
-      "description": "Direct WikiText PPL on the served CB artifact."
+      "description": "Direct WikiText PPL on the served CB artifact using the exact CPU-materialized, value-closed offline token payload."
     },
     {
-      "id": "perf.prefill",
-      "runner": "scripts/serve_hy3_teb.sh + TTFT/decode read",
-      "shipcard_slot": null,
-      "description": "INV-2: no rung is production-eligible until it clears the prefill perf gate as well as the quality gate — a Triton-masquerade fallback that serves correct tokens slowly is a failed lane, not a passed one."
+      "id": "perf.matched_budget_parity",
+      "runner": "python -m prismaquant.validate_cb_performance --shipcard <artifact>/shipcard.json --manifest <paired-manifest.json>",
+      "shipcard_slot": "perf.matched_budget_parity",
+      "description": "Blocking paired single-Spark proof over the predeclared prefill, decode, and mixed matrix. The candidate must meet the strict phase-specific speed floor against the exact inventory-bound container this release displaces under the same whole-artifact byte budget and serving stack. The manifest states this release-comparison scope explicitly; it does not claim that the displaced container is globally fastest. A native-only infeasibility certificate remains independent and does not substitute for served parity."
     }
   ],
   "kl_evaluator": {
@@ -62,6 +69,7 @@
   "advisory_gates": true,
   "notes": [
     "Required CI compares the producer profiles declared CB-eligible with the pinned Gridbook consumer contract; the preflight refuses any mismatch (R6).",
-    "Single-GPU only: the pinned Gridbook contract has no qualified TP path."
+    "Single-GPU only: the pinned Gridbook contract has no qualified TP path.",
+    "The DSv4 driver pins the Spark image by digest and vLLM commit, installs the tracked released Gridbook commit independently in each arm, refuses speculative decode, enforces a post-load memory floor plus watchdog, and records the server-side serve fingerprint."
   ]
 }

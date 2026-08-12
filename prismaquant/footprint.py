@@ -90,8 +90,15 @@ def format_tensor_payload_breakdown(
     *,
     qname: str,
     cb_serialization_context: CBSerializationContext | None = None,
+    require_materialized_codebook_identity: bool = True,
 ) -> dict:
     """Return the exact additive payload for one candidate tensor.
+
+    ``require_materialized_codebook_identity=False`` prices a CB candidate
+    whose learned codebook has not been banked -- a rate-only question; see
+    :func:`prismaquant.nvfp4_cb_footprint.cb_tensor_payload_breakdown`.  The
+    byte counts are identical either way; only the identity is left unproven,
+    so this is for legality probes and never for a caller producing bytes.
 
     This is the per-unit primitive shared by allocator legality, candidate
     pricing, and whole-assignment footprint accounting.  It deliberately
@@ -124,6 +131,9 @@ def format_tensor_payload_breakdown(
             dims,
             qname=qname,
             context=cb_serialization_context,
+            require_materialized_codebook_identity=(
+                require_materialized_codebook_identity
+            ),
         )
 
     payload_bytes = int(spec.memory_bytes_for_shape(dims))

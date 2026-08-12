@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from prismaquant.export_output_safety import (
+    directory_publication_target,
     prepare_fresh_export_directory,
     prepare_fresh_export_file,
     transactional_export_directory,
@@ -203,6 +204,64 @@ def test_directory_transaction_publishes_complete_tree_only_after_success(
     mode_probe.mkdir()
     assert (output.stat().st_mode & 0o7777) == (mode_probe.stat().st_mode & 0o7777)
     assert not _transaction_temps(output)
+
+
+def test_directory_transaction_exposes_final_publication_target_and_resets(
+    tmp_path,
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    output = tmp_path / "artifact"
+
+    with transactional_export_directory(
+        source,
+        output,
+        where="unit-directory-transaction",
+    ) as staged:
+        assert directory_publication_target(staged) == output.resolve()
+        unrelated = tmp_path / "unrelated"
+        assert directory_publication_target(unrelated) == unrelated.resolve()
+        (staged / "config.json").write_text("{}")
+
+    # Context must not leak into subsequent work after publication.
+    assert directory_publication_target(output) == output.resolve()
+
+
+def test_shipcard_built_in_transaction_names_published_directory(tmp_path):
+    from prismaquant.shipcard import build_shipcard, load_shipcard, write_shipcard
+
+    source = tmp_path / "source"
+    source.mkdir()
+    output = tmp_path / "artifact"
+    with transactional_export_directory(
+        source,
+        output,
+        where="unit-directory-transaction",
+    ) as staged:
+        (staged / "config.json").write_text("{}")
+        (staged / "model.safetensors").write_bytes(b"weights")
+        write_shipcard(staged / "shipcard.json", build_shipcard(staged))
+
+    card = load_shipcard(output / "shipcard.json")
+    assert Path(card["model_dir"]) == output.resolve()
+    assert ".tmp-" not in card["model_dir"]
+
+
+def test_directory_publication_target_context_resets_after_failure(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    output = tmp_path / "artifact"
+
+    with pytest.raises(RuntimeError, match="late failure"):
+        with transactional_export_directory(
+            source,
+            output,
+            where="unit-directory-transaction",
+        ) as staged:
+            assert directory_publication_target(staged) == output.resolve()
+            raise RuntimeError("late failure")
+
+    assert directory_publication_target(output) == output.resolve()
 
 
 def test_directory_transaction_preserves_existing_empty_destination_mode(

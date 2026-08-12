@@ -414,6 +414,7 @@ class StreamingContext:
         self.visual_prefix = visual_prefix
         self.multimodal = multimodal
         self.estimated_layer_bytes = int(estimated_layer_bytes or 0)
+        self.max_cache_slots = layer_cache.max_entries
         self.prefetch_workers = int(prefetch_workers)
         self.prefetch_min_available_bytes = int(prefetch_min_available_bytes or 0)
         self.prefetch_memory_skips = 0
@@ -477,6 +478,12 @@ class StreamingContext:
         return tensors
 
     def schedule_prefetch(self, L: int):
+        # A one-slot policy is used by the DSv4 anchored-AURA campaign on a
+        # unified-memory Spark.  Speculative loading while the current layer
+        # is installed would create a second live source-weight plane even if
+        # the eventual cache insertion evicted back to one entry.
+        if self.max_cache_slots == 1:
+            return None
         if L < 0 or L >= self.num_layers:
             return None
         if self.layer_cache.peek(L):
@@ -628,17 +635,25 @@ class StreamingContext:
         }
 
     def suggest_prefetch_lookahead(self) -> int:
+        if self.max_cache_slots == 1:
+            return 0
         if self.estimated_layer_bytes <= 0:
-            return 3
+            if self.max_cache_slots is None:
+                return 3
+            return min(3, max(0, self.max_cache_slots - 1))
         cache_slots = max(
             1, int(self.layer_cache.max_bytes // self.estimated_layer_bytes))
+        if self.max_cache_slots is not None:
+            cache_slots = min(cache_slots, self.max_cache_slots)
         # Queue at most what the cache can plausibly retain. More than
         # this tends to turn prefetch into churn on memory-constrained
         # runs, especially when backward has become fast.
         # Leave one cache slot for the currently installed layer's live
         # tensors. `install()` drops cache ownership, but the model still
         # owns that layer until the caller unloads it after forward/bwd.
-        return max(1, min(12, cache_slots - 1))
+        if self.max_cache_slots is None:
+            return max(1, min(12, cache_slots - 1))
+        return max(0, min(12, cache_slots - 1))
 
     def prefetch_summary(self) -> str:
         with self._inflight_lock:
@@ -648,6 +663,7 @@ class StreamingContext:
         floor_gb = self.memory_pressure_floor_bytes() / (1024 ** 3)
         return (f"Prefetch: workers={self.prefetch_workers} "
                 f"inflight={inflight} est_layer={est_gb:.1f}GB "
+                f"max_cache_slots={self.max_cache_slots} "
                 f"min_avail={min_gb:.1f}GB "
                 f"pressure_floor={floor_gb:.1f}GB "
                 f"mem_skips={self.prefetch_memory_skips}")
@@ -887,6 +903,7 @@ def _build_streaming_context(model_path: str, *,
                              device: torch.device, dtype: torch.dtype,
                              offload_folder: str,
                              cache_headroom_gb: float | None = None,
+                             max_cache_slots: int | None = None,
                              prefetch_workers: int | str | None = None,
                              prefetch_min_available_gb: float | str | None = None,
                              log_prefix: str = "[streaming]",
@@ -917,6 +934,13 @@ def _build_streaming_context(model_path: str, *,
     vision-language *wrapper* config — falls back to
     `_resolve_text_only_skeleton` instead of raising. No visual tower is
     materialized on this path either way."""
+    if max_cache_slots is not None:
+        if (
+            isinstance(max_cache_slots, bool)
+            or not isinstance(max_cache_slots, int)
+            or max_cache_slots < 1
+        ):
+            raise ValueError("max_cache_slots must be an integer >= 1 or None")
     import psutil
     from transformers import AutoConfig, AutoModelForCausalLM
 
@@ -1124,7 +1148,10 @@ def _build_streaming_context(model_path: str, *,
                 resolved_headroom_gb = 75.0
     cache_bytes = max(int(free_bytes) - int(resolved_headroom_gb * 1024 ** 3),
                       8 * 1024 ** 3)
-    layer_cache = LayerCache(max_bytes=cache_bytes)
+    layer_cache = LayerCache(
+        max_bytes=cache_bytes,
+        max_entries=max_cache_slots,
+    )
     # v20 step 3+4: enable dynamic budget with the same headroom reserve
     # used to size the static max. The cache shrinks when host memory
     # tightens (other processes growing, gradient transients) and grows
@@ -1150,6 +1177,9 @@ def _build_streaming_context(model_path: str, *,
     )
     worker_count, worker_src = _auto_prefetch_workers(
         cache_bytes, estimated_layer_bytes, requested=prefetch_workers)
+    if max_cache_slots is not None:
+        worker_count = min(worker_count, max_cache_slots)
+        worker_src = f"{worker_src}, capped by max_cache_slots"
     min_available_bytes, min_available_src = _auto_prefetch_min_available_bytes(
         estimated_layer_bytes, requested=prefetch_min_available_gb)
     cache_slots = (
@@ -1162,6 +1192,7 @@ def _build_streaming_context(model_path: str, *,
             0, int((free_bytes - min_available_bytes) // estimated_layer_bytes))
     print(f"{log_prefix} prefetch auto: workers={worker_count} "
           f"({worker_src}), cache_slots={cache_slots}, "
+          f"max_cache_slots={max_cache_slots}, "
           f"memory_slots={memory_slots}, "
           f"est_layer={estimated_layer_bytes/(1024**3):.1f} GB, "
           f"min_avail={min_available_bytes/(1024**3):.1f} GB "

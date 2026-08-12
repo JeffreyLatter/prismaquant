@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import importlib.util
 import math
+import sys
 from pathlib import Path
 
 import pytest
@@ -117,3 +118,54 @@ def test_position_kl_pad_entries_do_not_consume_student_tail_mass():
 
     assert kl_padded == kl_bare
     assert top1_padded == top1_bare
+
+
+def test_position_kl_rejects_duplicate_student_token_ids():
+    t_ids = torch.tensor([3, 5], dtype=torch.int32)
+    t_lps = _log_softmax([1.0, 0.0]).float()
+    s_ids = torch.tensor([3, 3], dtype=torch.int32)
+    s_lps = _log_softmax([1.0, 0.0]).float()
+
+    with pytest.raises(RuntimeError, match="duplicate token id 3"):
+        tool._position_kl(t_ids, t_lps, s_ids, s_lps)
+
+
+@pytest.mark.parametrize("bad_logprob", [float("nan"), float("inf"), float("-inf")])
+def test_position_kl_rejects_nonfinite_student_logprobs(bad_logprob):
+    t_ids = torch.tensor([3, 5], dtype=torch.int32)
+    t_lps = _log_softmax([1.0, 0.0]).float()
+    s_ids = torch.tensor([3, 5], dtype=torch.int32)
+    s_lps = torch.tensor([-0.25, bad_logprob], dtype=torch.float64)
+
+    with pytest.raises(RuntimeError, match="student.*non-finite logprob"):
+        tool._position_kl(t_ids, t_lps, s_ids, s_lps)
+
+
+def test_position_kl_rejects_positive_student_logprob():
+    t_ids = torch.tensor([3, 5], dtype=torch.int32)
+    t_lps = _log_softmax([1.0, 0.0]).float()
+    s_ids = torch.tensor([3, 5], dtype=torch.int32)
+    s_lps = torch.tensor([-0.25, 1e-7], dtype=torch.float64)
+
+    with pytest.raises(RuntimeError, match="student.*positive logprob"):
+        tool._position_kl(t_ids, t_lps, s_ids, s_lps)
+
+
+def test_position_kl_rejects_nonfinite_computed_output():
+    # Two individually finite contributions overflow when summed. The row is
+    # malformed as a distribution, but the result boundary must still reject
+    # the non-finite value instead of allowing JSON's Infinity extension.
+    t_ids = torch.tensor([3, 5], dtype=torch.int32)
+    t_lps = torch.tensor([-0.1, -0.1], dtype=torch.float64)
+    s_ids = torch.tensor([3, 5], dtype=torch.int32)
+    s_lps = torch.tensor(
+        [-sys.float_info.max, -sys.float_info.max], dtype=torch.float64,
+    )
+
+    with pytest.raises(RuntimeError, match="non-finite KL output"):
+        tool._position_kl(t_ids, t_lps, s_ids, s_lps)
+
+
+def test_strict_json_text_rejects_nonfinite_output():
+    with pytest.raises(RuntimeError, match="non-finite full-KL evidence"):
+        tool._strict_json_text({"kl_mean": float("nan")})

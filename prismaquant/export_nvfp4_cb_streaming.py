@@ -387,6 +387,9 @@ def _nbytes(dtype: torch.dtype, shape) -> int:
 _EXPORT_PIPELINE_ENV = "PRISMAQUANT_EXPORT_PIPELINE"
 _EXPORT_PREFETCH_DEPTH_ENV = "PRISMAQUANT_EXPORT_PREFETCH_DEPTH"
 _EXPORT_WRITE_QUEUE_BYTES_ENV = "PRISMAQUANT_EXPORT_WRITE_QUEUE_BYTES"
+_SOURCE_MODEL_IDENTITY_CACHE_ENV = (
+    "PRISMAQUANT_STREAMED_MODEL_IDENTITY_CACHE"
+)
 _DEFAULT_EXPORT_PREFETCH_DEPTH = 1
 _DEFAULT_EXPORT_WRITE_QUEUE_BYTES = 2 * (1 << 30)
 _NO_SOURCE = object()
@@ -409,6 +412,94 @@ def _export_pipeline_enabled() -> bool:
     """Execution-strategy gate; deliberately absent from render identity."""
 
     return os.environ.get(_EXPORT_PIPELINE_ENV, "0") == "1"
+
+
+def _source_model_identity_from_env(
+    model_dir: str | Path,
+) -> dict[str, object] | None:
+    """Validate and compact the optional full-source export attestation."""
+    cache_path = os.environ.get(_SOURCE_MODEL_IDENTITY_CACHE_ENV)
+    if not cache_path:
+        return None
+    from prismaquant.cost_streaming import (
+        validate_cached_streamed_model_identity,
+    )
+
+    identity = validate_cached_streamed_model_identity(
+        model_dir, cache_path, require_complete_checkpoint=True
+    )
+    shards = identity.get("shards")
+    checkpoint_weight_map = identity.get("checkpoint_weight_map")
+    if not isinstance(shards, list) or not isinstance(
+        checkpoint_weight_map, dict
+    ):
+        raise RuntimeError(
+            f"{_SOURCE_MODEL_IDENTITY_CACHE_ENV} does not attest the complete "
+            "indexed source checkpoint"
+        )
+    # The full object is several MiB for DSv4.  Its canonical content digest
+    # already binds the normalized config, execution map, complete source
+    # index, and every shard SHA; keep the artifact provenance compact while
+    # retaining coverage counts that make accidental partial identities loud.
+    return {
+        "schema": identity.get("schema"),
+        "content_sha256": identity.get("content_sha256"),
+        "resolved_commit": identity.get("resolved_commit"),
+        "checkpoint_shards": len(shards),
+        "checkpoint_tensors": len(checkpoint_weight_map),
+    }
+
+
+def _require_production_source_model_identity(
+    model_dir: str | Path,
+    source_model_identity: dict[str, object] | None,
+    *,
+    allow_unstamped_research: bool,
+) -> None:
+    """Make the complete source attestation mandatory for DSv4 production.
+
+    DeepSeek-V4's body runner deliberately does not materialize its MTP
+    passthrough shards.  An optional identity cache therefore permits a
+    superficially valid export whose provenance covers only the streamed body,
+    not every byte copied into the artifact.  Synthetic/research renders retain
+    their explicit escape hatch; the production DSv4 path must bind the full
+    index-referenced checkpoint before it creates an output transaction.
+    """
+    if source_model_identity is not None or allow_unstamped_research:
+        return
+    config_path = Path(model_dir) / "config.json"
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"cannot determine whether production source identity is required: "
+            f"{config_path}: {exc}"
+        ) from exc
+    model_type = config.get("model_type") if isinstance(config, dict) else None
+    if str(model_type).lower().replace("-", "_") == "deepseek_v4":
+        raise RuntimeError(
+            "production DeepSeek-V4 streaming export requires "
+            f"{_SOURCE_MODEL_IDENTITY_CACHE_ENV} bound to the complete "
+            "index-referenced checkpoint (including passthrough/MTP shards)"
+        )
+
+
+def _bind_source_model_identity_provenance(
+    quant_config: dict,
+    source_model_identity: dict[str, object] | None,
+) -> None:
+    if source_model_identity is None:
+        return
+    provenance = quant_config.get("provenance")
+    if not isinstance(provenance, dict):
+        raise RuntimeError(
+            "streaming export cannot bind source identity without provenance"
+        )
+    if "source_model_identity" in provenance:
+        raise RuntimeError(
+            "streaming export quant config already carries a source identity"
+        )
+    provenance["source_model_identity"] = dict(source_model_identity)
 
 
 @dataclass(frozen=True)
@@ -683,6 +774,12 @@ class _StreamWriter:
 
     def __init__(self):
         self._entries: list[_StreamEntry] = []
+        # Set only after an atomic publication succeeds.  The production
+        # exporter feeds this digest into the shipcard's immutable weight
+        # manifest, avoiding a second sequential read of the finished
+        # 100GB-class DSv4 container.
+        self.last_content_sha256: str | None = None
+        self.last_content_bytes: int | None = None
 
     def add(self, name, dtype, shape, producer, copy_src=None, *, reader=None,
             encoder=None):
@@ -710,6 +807,8 @@ class _StreamWriter:
 
     def write(self, path: Path, *, before_publish=None,
               _pipeline_encode_workers: int = 1) -> dict[str, float] | None:
+        self.last_content_sha256 = None
+        self.last_content_bytes = None
         header: dict[str, dict] = {}
         off = 0
         for entry in self._entries:
@@ -753,8 +852,28 @@ class _StreamWriter:
         cuda = torch.cuda.is_available()
         owns_temp = False
         try:
-            with open(temp_path, "xb") as f:
+            digest = hashlib.sha256()
+            bytes_written = 0
+
+            class _HashingWriter:
+                """Binary writer that hashes exactly the bytes it publishes."""
+
+                def write(self, payload) -> int:
+                    nonlocal bytes_written
+                    view = memoryview(payload)
+                    written = raw_file.write(view)
+                    if written != len(view):
+                        raise OSError(
+                            "short write while streaming safetensors: "
+                            f"{written} of {len(view)} bytes"
+                        )
+                    digest.update(view)
+                    bytes_written += written
+                    return written
+
+            with open(temp_path, "xb") as raw_file:
                 owns_temp = True
+                f = _HashingWriter()
                 f.write(struct.pack("<Q", len(hjson)))
                 f.write(hjson)
                 if _export_pipeline_enabled():
@@ -766,10 +885,18 @@ class _StreamWriter:
                 else:
                     timings = None
                     self._write_serial(f, cuda=cuda)
+            expected_bytes = data0 + off
+            if bytes_written != expected_bytes:
+                raise AssertionError(
+                    "streamed safetensors byte count differs from its header: "
+                    f"{bytes_written} != {expected_bytes}"
+                )
             if before_publish is not None:
                 before_publish()
             os.replace(temp_path, path)
             owns_temp = False
+            self.last_content_sha256 = digest.hexdigest()
+            self.last_content_bytes = bytes_written
             return timings
         except BaseException:
             if owns_temp and os.path.lexists(temp_path):
@@ -2203,6 +2330,12 @@ def export_nvfp4_cb_streaming(
     """
     model_dir = Path(model_dir)
     out_dir = Path(out_dir)
+    source_model_identity = _source_model_identity_from_env(model_dir)
+    _require_production_source_model_identity(
+        model_dir,
+        source_model_identity,
+        allow_unstamped_research=allow_unstamped_research,
+    )
     if reuse_prior is not None:
         raise RuntimeError(
             "DELTA-EXPORT reuse is disabled: the prior artifact is not bound "
@@ -2251,6 +2384,11 @@ def export_nvfp4_cb_streaming(
         )
 
     assignment = load_assignment(layer_config_path)
+    # Preserve the allocator's expanded, per-Linear namespace for independent
+    # release-route replay.  The serializer below collapses routed experts to
+    # physical stacks, which is correct for bytes but cannot replace the
+    # certified serving-unit member ledger.
+    finalized_tensor_formats = dict(assignment)
     _recipe_payload = json.loads(Path(layer_config_path).read_text())
     _recipe_cb_context_stamp, _recipe_cb_tensor_stamps = (
         cb_serialization_metadata_from_assignment_payload(_recipe_payload)
@@ -2309,6 +2447,12 @@ def export_nvfp4_cb_streaming(
     # reduction here, once, before anything reads the assignment.
     per_expert_plans: dict[str, dict[str, list[dict[str, object]]]] = {}
     if per_expert_config_path is not None:
+        per_expert_assignment = _load_per_expert_config(per_expert_config_path)
+        finalized_tensor_formats.update({
+            qname: fmt
+            for qname, fmt in per_expert_assignment.items()
+            if ".experts." in qname
+        })
         (
             assignment,
             expert_stack_members,
@@ -2316,7 +2460,7 @@ def export_nvfp4_cb_streaming(
             expert_stack_report,
         ) = _split_per_expert_assignment(
             assignment,
-            _load_per_expert_config(per_expert_config_path),
+            per_expert_assignment,
             expert_groups,
             profile,
         )
@@ -4359,7 +4503,12 @@ def export_nvfp4_cb_streaming(
         excluded_namespaces=excluded_namespaces,
         weight_only_stock_targets=sidecar_stock,
         streaming_provenance=True,
-        include_tensor_formats=False,
+        # Release serving/performance evidence must be reconciled against the
+        # finalized assignment, not a benchmark-authored route claim.  Keep
+        # the compact per-Linear map in the inventory-bound quant_config so a
+        # later validator can derive every serving-unit route independently.
+        include_tensor_formats=True,
+        tensor_formats=finalized_tensor_formats,
     )
     # DSpark is a metadata-only source overlay.  The ordinary copy loop above
     # emitted its physical mtp.* weight/scale pairs byte-verbatim; now remove
@@ -4368,6 +4517,9 @@ def export_nvfp4_cb_streaming(
     # allocation target or tensor writer branch is changed by this step.
     quant_config = apply_dspark_overlay_to_quant_config(
         quant_config, dspark_source_overlay
+    )
+    _bind_source_model_identity_provenance(
+        quant_config, source_model_identity
     )
     if _per_expert_group_payload is not None:
         quant_config["provenance"]["per_expert_format_group_payload"] = (
@@ -4407,6 +4559,10 @@ def export_nvfp4_cb_streaming(
         out_dir / "model.safetensors",
         before_publish=_assert_source_coverage_before_publish,
     )
+    if writer.last_content_sha256 is None or writer.last_content_bytes is None:
+        raise AssertionError(
+            "streaming writer published without an exact content digest"
+        )
     if warm_session is not None:
         warm_provenance = warm_session.provenance()
         quant_config["provenance"]["encoder_warm_start"] = warm_provenance
@@ -4443,6 +4599,31 @@ def export_nvfp4_cb_streaming(
             (out_dir / aux).write_bytes(p.read_bytes())
     if ldlq_telemetry is not None:
         ldlq_telemetry.publish(out_dir, quant_config)
+    # Open the refusal record before inventory finalization: the preliminary
+    # quant_config binds the CB identity, while shipcard.json itself must be
+    # measured by the recursive inventory and the hard artifact budget.
+    from prismaquant.shipcard import (
+        WEIGHT_CONTENT_MANIFEST_SCHEMA,
+        open_cb_export_shipcard,
+    )
+
+    open_cb_export_shipcard(
+        out_dir,
+        quant_config,
+        source_model=model_dir,
+        layer_config_path=layer_config_path,
+        exporter="export_nvfp4_cb_streaming",
+        weight_content_manifest={
+            "schema": WEIGHT_CONTENT_MANIFEST_SCHEMA,
+            "algorithm": "sha256",
+            "files": {
+                "model.safetensors": {
+                    "bytes": writer.last_content_bytes,
+                    "sha256": writer.last_content_sha256,
+                },
+            },
+        },
+    )
     # Persist and assert a final filesystem inventory distinct from the CB
     # tensor-data payload contract.  This includes both safetensors headers,
     # JSON configs, tokenizer assets, and all other regular output files.

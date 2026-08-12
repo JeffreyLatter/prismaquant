@@ -15,8 +15,36 @@ import shutil
 import stat
 import tempfile
 from contextlib import contextmanager
+from contextvars import ContextVar
 from functools import wraps
 from pathlib import Path
+
+
+_DIRECTORY_PUBLICATION_CONTEXT: ContextVar[
+    tuple[Path, Path] | None
+] = ContextVar("prismaquant_directory_publication_context", default=None)
+
+
+def directory_publication_target(staged_output: str | Path) -> Path:
+    """Return the final publish path for an active staged directory.
+
+    Transactional exporters receive an owned sibling directory instead of
+    the operator-requested destination.  Value-bearing metadata written while
+    the transaction is active must still name the final artifact, not the
+    private ``.tmp-*`` staging root.  Outside the matching transaction this is
+    an identity operation over the resolved path.
+    """
+    staged_resolved = _resolved_output(
+        staged_output,
+        where="directory_publication_target",
+    )
+    context = _DIRECTORY_PUBLICATION_CONTEXT.get()
+    if context is None:
+        return staged_resolved
+    active_staged, final_target = context
+    if staged_resolved == active_staged:
+        return final_target
+    return staged_resolved
 
 
 def _resolved_source(source: str | Path, *, where: str) -> Path:
@@ -328,7 +356,14 @@ def transactional_export_directory(
     temp_root, temp_identity = _owned_sibling_temp_root(out, where=where)
     primary_error: BaseException | None = None
     try:
-        yield temp_root
+        publication_token = _DIRECTORY_PUBLICATION_CONTEXT.set((
+            _resolved_output(temp_root, where=where),
+            _resolved_output(out, where=where),
+        ))
+        try:
+            yield temp_root
+        finally:
+            _DIRECTORY_PUBLICATION_CONTEXT.reset(publication_token)
 
         reservation_identity = existing_identity
         owns_reservation = False

@@ -1734,6 +1734,18 @@ def export_nvfp4_cb(
             (out_dir / aux).write_bytes(p.read_bytes())
     if ldlq_telemetry is not None:
         ldlq_telemetry.publish(out_dir, quant_config)
+    # Open the refusal record before inventory finalization: the preliminary
+    # quant_config binds the CB identity, while shipcard.json itself must be
+    # measured by the recursive inventory and the hard artifact budget.
+    from prismaquant.shipcard import open_cb_export_shipcard
+
+    open_cb_export_shipcard(
+        out_dir,
+        quant_config,
+        source_model=model_dir,
+        layer_config_path=layer_config_path,
+        exporter="export_nvfp4_cb",
+    )
     # Final measured bytes are a separate scope from CB tensor-data pricing:
     # include safetensors headers, JSON, tokenizer files, and every other
     # regular file.  The helper embeds a self-consistent inventory in

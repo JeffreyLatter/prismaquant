@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from types import SimpleNamespace
+import weakref
 
 import pytest
 import torch
@@ -179,6 +180,15 @@ def test_streamed_aura_cost_rows_are_exactly_resident_rows():
     )
 
     streamed_model, context, runner = _dense_runner(state)
+    captured = {}
+    capture_boundaries = runner.capture_boundaries
+
+    def capture_and_retain_for_lifetime_audit(input_ids):
+        batch = capture_boundaries(input_ids)
+        captured["batch"] = batch
+        return batch
+
+    runner.capture_boundaries = capture_and_retain_for_lifetime_audit
     streamed_result = aura.compute_aura_cost_streamed(
         runner,
         calib,
@@ -194,6 +204,19 @@ def test_streamed_aura_cost_rows_are_exactly_resident_rows():
     assert streamed_result["stats"] == resident_result["stats"]
     assert streamed_result["costs"] == resident_result["costs"]
     assert context.max_active == 1
+    assert streamed_result["provenance"]["streamed_gradient_harvest"] == (
+        "post_accumulate_per_parameter"
+    )
+    assert streamed_result["provenance"]["streamed_cotangent_rollover"] == (
+        "in_place_per_probe"
+    )
+    assert all(
+        activation.numel() == 0
+        for activation in captured["batch"].activations_cpu
+    )
+    assert all(
+        parameter.grad is None for parameter in streamed_model.parameters()
+    )
 
 
 def _run_streamed_aura(
@@ -211,6 +234,7 @@ def _run_streamed_aura(
         calib,
         ["FP8_CB_K28"],
         n_probes=2,
+        min_free_gib=0.0,
         production_cache=_RenderedCache(model, "FP8_CB_K28"),
         require_production_cache=True,
         dw_dtype="float32",
@@ -271,6 +295,7 @@ def test_streamed_aura_interrupt_resume_and_identity_refusal(
         calib,
         ["FP8_CB_K28"],
         n_probes=2,
+        min_free_gib=0.0,
         production_cache=_RenderedCache(complete_model, "FP8_CB_K28"),
         require_production_cache=True,
         dw_dtype="float32",
@@ -289,6 +314,7 @@ def test_streamed_aura_interrupt_resume_and_identity_refusal(
             torch.tensor([[1, 2, 3, 9]]),
             ["FP8_CB_K28"],
             n_probes=2,
+            min_free_gib=0.0,
             production_cache=_RenderedCache(
                 mismatch_model, "FP8_CB_K28"
             ),
@@ -366,6 +392,7 @@ def test_streamed_aura_production_anchors_are_sparse_and_never_use_rtn(
         torch.tensor([[1, 2, 3, 4]]),
         ["NVFP4", "FP8_DYNAMIC", "BF16"],
         n_probes=2,
+        min_free_gib=0.0,
         dw_dtype="float32",
         formats_by_qname=unit_plan,
         anchor_renderer=renderer,
@@ -390,6 +417,278 @@ def test_streamed_aura_production_anchors_are_sparse_and_never_use_rtn(
     assert model is runner.model
 
 
+def test_streamed_aura_consumes_production_anchors_one_at_a_time():
+    torch.manual_seed(113)
+    seed_model = _DenseTinyLM().eval()
+    state = {
+        name: tensor.detach().clone()
+        for name, tensor in seed_model.state_dict().items()
+    }
+    q0 = "model.layers.0.proj"
+    q1 = "model.layers.1.proj"
+    plan = {
+        q0: ("NVFP4", "FP8_E4M3"),
+        q1: ("NVFP4",),
+    }
+
+    control_model, _control_context, control_runner = _dense_runner(state)
+    control = aura.compute_aura_cost_streamed(
+        control_runner,
+        torch.tensor([[1, 2, 3, 4]]),
+        ["NVFP4", "FP8_E4M3"],
+        n_probes=2,
+        min_free_gib=0.0,
+        dw_dtype="bfloat16",
+        formats_by_qname=plan,
+        anchor_renderer=_ExactAnchorRenderer(plan),
+        profile=DefaultProfile(),
+    )
+
+    class _TransientAnchorRenderer(_ExactAnchorRenderer):
+        def __init__(self, formats_by_qname):
+            super().__init__(formats_by_qname)
+            self.consumer_identities = []
+
+        def render_layer(self, **_kwargs):
+            raise AssertionError("materialized layer render must not run")
+
+        def render_layer_transient(
+            self,
+            *,
+            layer,
+            modules,
+            formats_by_qname,
+            consume_render,
+            consumer_identity,
+        ):
+            del layer
+            self.consumer_identities.append(dict(consumer_identity))
+            offsets = {
+                "NVFP4": 0.03125,
+                "FP8_E4M3": 0.015625,
+            }
+            observed = []
+            previous = None
+            for name, formats in formats_by_qname.items():
+                for fmt in formats:
+                    if previous is not None:
+                        assert previous() is None
+                    rendered = (
+                        modules[name].weight.detach().clone() + offsets[fmt]
+                    )
+                    result = consume_render(
+                        qname=name,
+                        fmt=fmt,
+                        reference_weight=modules[name].weight.data,
+                        rendered_weight=rendered,
+                        render_score={},
+                    )
+                    assert result["operation"] == (
+                        "fp32_subtract_then_store"
+                    )
+                    observed.append((name, fmt))
+                    self.render_count += 1
+                    self.max_live_rendered = max(
+                        self.max_live_rendered, 1
+                    )
+                    previous = weakref.ref(rendered)
+                    del rendered
+            assert previous is None or previous() is None
+            return tuple(observed)
+
+    renderer = _TransientAnchorRenderer(plan)
+    streamed_model, _streamed_context, streamed_runner = _dense_runner(state)
+    streamed = aura.compute_aura_cost_streamed(
+        streamed_runner,
+        torch.tensor([[1, 2, 3, 4]]),
+        ["NVFP4", "FP8_E4M3"],
+        n_probes=2,
+        min_free_gib=0.0,
+        dw_dtype="bfloat16",
+        formats_by_qname=plan,
+        anchor_renderer=renderer,
+        profile=DefaultProfile(),
+    )
+
+    assert streamed["costs"] == control["costs"]
+    assert renderer.render_count == 3
+    assert renderer.max_live_rendered == 1
+    assert all(
+        identity["schema"]
+        == "prismaquant.aura.production_anchor_delta_consumer.v1"
+        for identity in renderer.consumer_identities
+    )
+    assert streamed_model is streamed_runner.model
+    assert control_model is control_runner.model
+
+
+def test_streamed_aura_releases_bf16_anchors_while_building_bf16_dweights(
+    monkeypatch,
+):
+    torch.manual_seed(112)
+    seed_model = _DenseTinyLM().eval()
+    state = {
+        name: tensor.detach().clone()
+        for name, tensor in seed_model.state_dict().items()
+    }
+    qname = "model.layers.0.proj"
+    plan = {qname: ("NVFP4", "FP8_E4M3")}
+
+    class _LifetimePool(dict):
+        def __init__(self, values, tracker):
+            super().__init__(values)
+            self._tracker = tracker
+            self._previous = None
+            tracker["refs"].extend(weakref.ref(value) for value in values.values())
+
+        def pop(self, key):
+            if self._previous is not None:
+                self._tracker["prior_released_before_next_pop"].append(
+                    self._previous() is None
+                )
+            value = super().pop(key)
+            self._previous = weakref.ref(value)
+            self._tracker["remaining_after_pop"].append(len(self))
+            return value
+
+    class _Bf16AnchorRenderer(_ExactAnchorRenderer):
+        def __init__(self, formats_by_qname, tracker=None):
+            super().__init__(formats_by_qname)
+            self._tracker = tracker
+
+        def render_layer(self, *, layer, modules, formats_by_qname):
+            del layer
+            offsets = {"NVFP4": 0.03125, "FP8_E4M3": 0.015625}
+            rendered = {
+                (name, fmt): (
+                    modules[name].weight.detach().to(torch.bfloat16)
+                    + torch.tensor(offsets[fmt], dtype=torch.bfloat16)
+                )
+                for name, formats in formats_by_qname.items()
+                for fmt in formats
+            }
+            assert all(value.dtype == torch.bfloat16 for value in rendered.values())
+            self.render_count += len(rendered)
+            self.max_live_rendered = max(self.max_live_rendered, len(rendered))
+            if self._tracker is None:
+                return rendered
+            return _LifetimePool(rendered, self._tracker)
+
+    control_model, _control_context, control_runner = _dense_runner(state)
+    control = aura.compute_aura_cost_streamed(
+        control_runner,
+        torch.tensor([[1, 2, 3, 4]]),
+        ["NVFP4", "FP8_E4M3"],
+        n_probes=2,
+        min_free_gib=0.0,
+        dw_dtype="float32",
+        formats_by_qname=plan,
+        anchor_renderer=_Bf16AnchorRenderer(plan),
+        profile=DefaultProfile(),
+    )
+
+    tracker = {
+        "refs": [],
+        "prior_released_before_next_pop": [],
+        "remaining_after_pop": [],
+        "allocator_release_calls": [],
+    }
+
+    def release_allocator_cache(device):
+        # The allocator release must happen only after the last BF16 anchor
+        # reference is gone, and before the adjoint probe loop starts.
+        assert all(ref() is None for ref in tracker["refs"])
+        tracker["allocator_release_calls"].append(str(device))
+
+    monkeypatch.setattr(
+        aura,
+        "_release_streamed_anchor_allocator_cache",
+        release_allocator_cache,
+    )
+    tracked_model, _tracked_context, tracked_runner = _dense_runner(state)
+    tracked = aura.compute_aura_cost_streamed(
+        tracked_runner,
+        torch.tensor([[1, 2, 3, 4]]),
+        ["NVFP4", "FP8_E4M3"],
+        n_probes=2,
+        min_free_gib=0.0,
+        dw_dtype="bfloat16",
+        formats_by_qname=plan,
+        anchor_renderer=_Bf16AnchorRenderer(plan, tracker),
+        profile=DefaultProfile(),
+    )
+
+    assert tracker["remaining_after_pop"] == [1, 0]
+    assert tracker["prior_released_before_next_pop"] == [True]
+    assert all(ref() is None for ref in tracker["refs"])
+    assert tracker["allocator_release_calls"] == ["cpu"]
+    assert tracked["stats"] == control["stats"]
+    # BF16 is a deliberately different storage contract, not a byte-identical
+    # FP32 result. It must stay close on every scalar and preserve ordering.
+    for fmt in plan[qname]:
+        tracked_row = tracked["costs"][qname][fmt]
+        control_row = control["costs"][qname][fmt]
+        assert tracked_row["dw_source"] == control_row["dw_source"]
+        assert tracked_row["production_anchor_measured"] is True
+        assert tracked_row["predicted_dloss"] == pytest.approx(
+            control_row["predicted_dloss"], rel=0.01, abs=1e-12
+        )
+    assert sorted(
+        plan[qname],
+        key=lambda fmt: tracked["costs"][qname][fmt]["predicted_dloss"],
+    ) == sorted(
+        plan[qname],
+        key=lambda fmt: control["costs"][qname][fmt]["predicted_dloss"],
+    )
+    assert tracked_model is tracked_runner.model
+    assert control_model is control_runner.model
+
+
+def test_production_anchor_delta_subtracts_fp32_then_stores_bf16():
+    source = torch.tensor(
+        [[1.00390625, -2.0078125], [0.333251953125, 8.03125]],
+        dtype=torch.bfloat16,
+    )
+    rendered = torch.tensor(
+        [[1.01953125, -1.984375], [0.341796875, 8.09375]],
+        dtype=torch.bfloat16,
+    )
+    original = rendered.clone()
+
+    stored = aura._stored_production_anchor_delta(
+        rendered,
+        source,
+        storage_dtype=torch.bfloat16,
+    )
+
+    assert stored.dtype == torch.bfloat16
+    torch.testing.assert_close(
+        stored.float(),
+        (original.float() - source.float()).to(torch.bfloat16).float(),
+        rtol=0,
+        atol=0,
+    )
+    # The helper must not consume/mutate an injected renderer's tensor.
+    torch.testing.assert_close(rendered, original, rtol=0, atol=0)
+
+
+def test_streamed_anchor_allocator_release_is_cuda_only(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        torch.cuda, "synchronize", lambda device: calls.append(("sync", device))
+    )
+    monkeypatch.setattr(
+        torch.cuda, "empty_cache", lambda: calls.append(("empty", None))
+    )
+
+    aura._release_streamed_anchor_allocator_cache(torch.device("cpu"))
+    assert calls == []
+
+    cuda = torch.device("cuda")
+    aura._release_streamed_anchor_allocator_cache(cuda)
+    assert calls == [("sync", cuda), ("empty", None)]
+
+
 def _run_checkpointed_anchor_diagnostic(
     state, calib, checkpoint_dir, *, resume, monkeypatch,
 ):
@@ -411,6 +710,7 @@ def _run_checkpointed_anchor_diagnostic(
         calib,
         ["FP8_CB_K28"],
         n_probes=2,
+        min_free_gib=0.0,
         dw_dtype="float32",
         checkpoint_dir=checkpoint_dir,
         resume=resume,
@@ -593,6 +893,7 @@ def test_never_routed_expert_keeps_real_zero_production_anchor(monkeypatch):
         torch.tensor([[2, 4, 6, 8]]),
         ["NVFP4", "MXFP4_SOURCE"],
         n_probes=2,
+        min_free_gib=0.0,
         dw_dtype="float32",
         formats_by_qname={qname: ("NVFP4", "MXFP4_SOURCE")},
         anchor_renderer=renderer,
@@ -646,6 +947,9 @@ def test_production_anchor_cold_render_requires_exact_declared_profile_scope(
         max_act_rows=8,
         producer_git_commit="1" * 40,
         producer_source_sha256="2" * 64,
+        transient_consumer_identity=(
+            aura.AURA_PRODUCTION_ANCHOR_DELTA_CONSUMER_IDENTITY
+        ),
     )
     with pytest.raises(RuntimeError, match="undeclared_missing"):
         streaming.StreamedProductionAnchorRenderer(model, **kwargs)
@@ -671,8 +975,49 @@ def test_production_anchor_cold_render_requires_exact_declared_profile_scope(
         formats_by_qname={qname: ("NVFP4_CB_K12",)},
     )
     assert set(rendered) == {(qname, "NVFP4_CB_K12")}
-    assert calls == [("NVFP4_CB_K12", {}, True)]
-    assert renderer.render_count == 1
+    consumed = []
+
+    def consume_render(**kwargs):
+        consumed.append({
+            "qname": kwargs["qname"],
+            "fmt": kwargs["fmt"],
+            "rendered": kwargs["rendered_weight"].detach().clone(),
+        })
+        return {"consumed": True}
+
+    def refuse_throwaway_tensor_receipt(**_kwargs):
+        raise AssertionError(
+            "non-durable production anchor render hashed a tensor receipt"
+        )
+
+    monkeypatch.setattr(
+        streaming,
+        "_build_cb_transient_consumer_receipt",
+        refuse_throwaway_tensor_receipt,
+    )
+
+    observed = renderer.render_layer_transient(
+        layer=0,
+        modules={qname: model.get_submodule(qname)},
+        formats_by_qname={qname: ("NVFP4_CB_K12",)},
+        consume_render=consume_render,
+        consumer_identity=(
+            aura.AURA_PRODUCTION_ANCHOR_DELTA_CONSUMER_IDENTITY
+        ),
+    )
+    assert observed == ((qname, "NVFP4_CB_K12"),)
+    assert calls == [
+        ("NVFP4_CB_K12", {}, True),
+        ("NVFP4_CB_K12", {}, True),
+    ]
+    assert renderer.render_count == 2
+    assert renderer.max_live_rendered == 1
+    torch.testing.assert_close(
+        consumed[0]["rendered"],
+        rendered[(qname, "NVFP4_CB_K12")],
+        rtol=0,
+        atol=0,
+    )
     assert renderer.cache.weights == {}
     completed = renderer.bind_completed_source_weight_identities({
         qname: renderer.source_weight_identity_for(qname)
@@ -682,6 +1027,86 @@ def test_production_anchor_cold_render_requires_exact_declared_profile_scope(
     assert completed["cb_render_identity"]["render_scope"] == (
         "sparse_production_anchors"
     )
+
+
+def test_production_anchor_resolves_raw_named_expert_activation_cache(
+    monkeypatch,
+):
+    """DSv4-Flash keys its activation cache under RAW per-expert names.
+
+    ``canonical_linear_name`` remaps those onto the packed Qwen-style
+    spelling, which is cached for nobody here -- so resolving through it
+    alone reports every routed expert as an undeclared activation miss, and
+    (had the coverage gate not been fail-closed) would have rendered 66k
+    experts against the never-routed neutral prior instead of their real
+    activations.
+    """
+    import prismaquant.streaming_production_cache as streaming
+    from prismaquant.measure_quant_cost import canonical_linear_name
+    from prismaquant.nvfp4_cb_footprint import CBSerializationContext
+
+    torch.manual_seed(111)
+    model = _ExpertTinyLM().eval()
+    profile = DeepseekV4Profile()
+    qname = "model.layers.0.mlp.experts.1.gate_proj"
+    # The remap is real for this profile: without the raw-name fallback the
+    # renderer would look up a key the cache has never held.
+    assert canonical_linear_name(qname, profile) != qname
+
+    class _RawNamedActivations:
+        def __init__(self, names):
+            self._names = set(names)
+            self.loaded: list[str] = []
+
+        def __contains__(self, name):
+            return name in self._names
+
+        def load_with_row_indices(self, name):
+            if name not in self._names:
+                raise KeyError(name)
+            self.loaded.append(name)
+            cols = int(model.get_submodule(qname).weight.shape[1])
+            return torch.ones(4, cols), None
+
+    act_index = _RawNamedActivations([qname])
+    calls = []
+
+    def render(weight, fmt, *, activations, **_kw):
+        calls.append((fmt, sorted(activations)))
+        return weight.detach().clone() + 0.03125
+
+    monkeypatch.setattr(streaming, "render_production_weight", render)
+    # No cold declaration: the expert IS cached, just under the raw name.
+    renderer = streaming.StreamedProductionAnchorRenderer(
+        model,
+        act_index=act_index,
+        formats_by_qname={qname: ("NVFP4_CB_K12",)},
+        levers={"gptq": True, "weighted_vq": True},
+        profile=profile,
+        device="cpu",
+        col_weights={qname: torch.ones(16)},
+        cb_serialization_context=CBSerializationContext.production(
+            scale_sweep=True,
+            ldlq=True,
+            codebook_source="lattice",
+        ),
+        calibration_hash="b" * 64,
+        arm_identity={"arm": "fixture-raw-named-acts"},
+        model_identity=_model_identity("raw-named-act-source"),
+        max_act_rows=8,
+        producer_git_commit="3" * 40,
+        producer_source_sha256="4" * 64,
+    )
+    rendered = renderer.render_layer(
+        layer=0,
+        modules={qname: model.get_submodule(qname)},
+        formats_by_qname={qname: ("NVFP4_CB_K12",)},
+    )
+    assert set(rendered) == {(qname, "NVFP4_CB_K12")}
+    # Loaded under the raw name, and the render saw the REAL activations
+    # rather than the empty cold-prior mapping.
+    assert act_index.loaded == [qname]
+    assert calls == [("NVFP4_CB_K12", [qname])]
 
 
 def test_streamed_expert_cost_rows_are_exactly_resident_rows():

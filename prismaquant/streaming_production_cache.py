@@ -41,7 +41,7 @@ from prismaquant import format_registry as fr
 from prismaquant.build_rtn_cache import iter_quantizable_tensors
 from prismaquant.measure_quant_cost import (
     ActivationIndex,
-    canonical_linear_name,
+    resolve_cost_target_name,
 )
 from prismaquant.production_weight_cache import (
     CB_CACHE_PAIR_IDENTITY_SCHEMA,
@@ -340,7 +340,7 @@ def _render_dense_layer(
     if needs_nvfp4:
         per_qname_max_abs: dict[str, float] = {}
         for qname in qname_to_module:
-            canonical = canonical_linear_name(qname, profile)
+            canonical = resolve_cost_target_name(qname, act_index, profile)
             if canonical not in act_index:
                 continue
             X, _ = act_index.load_with_row_indices(canonical)
@@ -368,7 +368,7 @@ def _render_dense_layer(
         if not pending_formats:
             continue
         weight = mod.weight.data
-        canonical = canonical_linear_name(qname, profile)
+        canonical = resolve_cost_target_name(qname, act_index, profile)
         cold_declared = qname in declared_cold_qnames
         if canonical not in act_index and not cold_declared:
             raise RuntimeError(
@@ -496,18 +496,26 @@ def _render_dense_layer(
                         "streamed render consumer must return a Mapping for "
                         f"{qname}@{fmt}, got {type(result).__name__}"
                     )
-                if consumer_identity is None:
-                    raise ValueError(
-                        "transient streamed render requires consumer_identity"
+                # A receipt hashes the full canonical tensor and exists to
+                # authenticate a durable transient sidecar. Production-anchor
+                # AURA has no pair sidecar/cache directory; its exact consumer
+                # contract is already nested in the checkpoint identity, so a
+                # throwaway per-anchor tensor hash only burns CPU and UMA
+                # bandwidth on the hot path.
+                if cache_dir_path is not None:
+                    if consumer_identity is None:
+                        raise ValueError(
+                            "durable transient streamed render requires "
+                            "consumer_identity"
+                        )
+                    receipt = _build_cb_transient_consumer_receipt(
+                        qname=qname,
+                        fmt=fmt,
+                        tensor=canonical_render,
+                        render_score=render_score,
+                        consumer_identity=consumer_identity,
+                        result=result,
                     )
-                receipt = _build_cb_transient_consumer_receipt(
-                    qname=qname,
-                    fmt=fmt,
-                    tensor=canonical_render,
-                    render_score=render_score,
-                    consumer_identity=consumer_identity,
-                    result=result,
-                )
                 transient_results[score_key] = dict(result)
 
             if cache_dir_path is not None and _is_cb_format_name(fmt):
@@ -574,9 +582,11 @@ class StreamedProductionAnchorRenderer:
     The object deliberately owns no model residency mechanism.  Its caller
     installs a layer through the existing streaming context, then calls
     :meth:`render_layer` with that layer's live ``nn.Linear`` modules.  Each
-    production render is returned in memory and removed from the temporary
+    production render can either be returned in memory or passed directly to
+    a transient consumer and removed from the temporary
     ``ProductionWeightCache`` immediately; no rendered-weight shard or full
-    menu is published.
+    menu is published. The transient path bounds live rendered weights to one
+    pair while a caller retains its smaller derived state.
 
     ``formats_by_qname`` is the complete anchor plan, not a candidate menu.
     Multiple formats for one qname are supported because a unit can have one
@@ -604,6 +614,7 @@ class StreamedProductionAnchorRenderer:
         h_detail_dir: str | Path | None = None,
         producer_git_commit: str | None = None,
         producer_source_sha256: str | None = None,
+        transient_consumer_identity: Mapping[str, object] | None = None,
     ) -> None:
         from prismaquant.cost_stage_checkpoint import canonical_json
         from prismaquant.cost_streaming import validate_streamed_model_identity
@@ -696,10 +707,16 @@ class StreamedProductionAnchorRenderer:
                 f"declared routed experts; sample={not_routed[:8]}"
             )
 
+        # Probe-side key, not the live module name: DSv4-Flash keys its probe
+        # and activation cache under the RAW per-expert names, so resolving
+        # through canonical_linear_name alone reports every routed expert as
+        # missing.  resolve_cost_target_name is the one rule both conventions
+        # go through, and it stays fail-closed when neither spelling is cached.
         missing_activations = {
             qname
             for qname in canonical_plan
-            if canonical_linear_name(qname, profile) not in act_index
+            if resolve_cost_target_name(qname, act_index, profile)
+            not in act_index
         }
         if missing_activations != set(cold_qnames):
             undeclared = sorted(missing_activations - set(cold_qnames))
@@ -756,6 +773,14 @@ class StreamedProductionAnchorRenderer:
             if producer_source_sha256 is not None
             else _production_cache_source_sha256()
         )
+        self.transient_consumer_identity = (
+            canonical_json(
+                transient_consumer_identity,
+                where="production anchor transient consumer identity",
+            )
+            if transient_consumer_identity is not None
+            else None
+        )
         identity = {
             "schema": PRODUCTION_ANCHOR_RENDERER_IDENTITY_SCHEMA,
             "formats_by_qname": {
@@ -783,7 +808,12 @@ class StreamedProductionAnchorRenderer:
             ),
             "producer_git_commit": self.producer_git_commit,
             "producer_source_sha256": self.producer_source_sha256,
-            "retention": "one_layer_in_memory",
+            "retention": "one_render_or_explicit_layer_mapping",
+            "transient_consumer_identity": (
+                dict(self.transient_consumer_identity)
+                if self.transient_consumer_identity is not None
+                else None
+            ),
         }
         self.identity = canonical_json(
             identity, where="production anchor renderer identity"
@@ -882,6 +912,159 @@ class StreamedProductionAnchorRenderer:
         }
         self.render_count += len(rendered)
         return rendered
+
+    def render_layer_transient(
+        self,
+        *,
+        layer: int,
+        modules: Mapping[str, nn.Linear],
+        formats_by_qname: Mapping[str, Sequence[str]],
+        consume_render: Callable[..., Mapping[str, object]],
+        consumer_identity: Mapping[str, object],
+    ) -> tuple[tuple[str, str], ...]:
+        """Render and consume one pair at a time for an installed layer.
+
+        This is the memory-bounded counterpart to :meth:`render_layer`.
+        Rendering still goes through ``_render_dense_layer`` and the shared
+        ``ProductionWeightCache`` identity machinery; only retention changes.
+        The callback must finish deriving all value-bearing state before it
+        returns because the rendered tensor is released immediately.
+        """
+        del layer  # residency/layer ordering is owned by the caller
+        if not callable(consume_render):
+            raise TypeError(
+                "transient production anchor consumer is not callable"
+            )
+        if not isinstance(consumer_identity, Mapping) or not consumer_identity:
+            raise ValueError(
+                "transient production anchor consumer identity is empty"
+            )
+        if self.transient_consumer_identity is None:
+            raise RuntimeError(
+                "production anchor renderer has no identity-bound transient "
+                "consumer contract"
+            )
+        from prismaquant.cost_stage_checkpoint import canonical_json
+
+        supplied_consumer_identity = canonical_json(
+            consumer_identity,
+            where="production anchor transient consumer identity",
+        )
+        if supplied_consumer_identity != self.transient_consumer_identity:
+            raise RuntimeError(
+                "production anchor transient consumer identity differs from "
+                "the renderer's identity-bound contract"
+            )
+        requested: dict[str, tuple[str, ...]] = {}
+        for qname, raw_formats in formats_by_qname.items():
+            name = str(qname)
+            if name not in self.formats_by_qname:
+                raise RuntimeError(
+                    f"unplanned production anchor render requested for {name}"
+                )
+            formats = tuple(_canon_fmt(fmt) for fmt in raw_formats)
+            if not formats or not set(formats).issubset(
+                self.formats_by_qname[name]
+            ):
+                raise RuntimeError(
+                    f"production anchor render request for {name} differs "
+                    "from its identity-bound plan"
+                )
+            requested[name] = formats
+        if not requested:
+            return ()
+        missing_modules = sorted(set(requested) - set(modules))
+        if missing_modules:
+            raise RuntimeError(
+                "production anchor render was not given live modules for "
+                f"{missing_modules[:8]}"
+            )
+        if self.cache.weights:
+            raise RuntimeError(
+                "production anchor renderer retained weights across layers"
+            )
+
+        layer_scope = {
+            qname: module
+            for qname, module in modules.items()
+            if qname in self.formats_by_qname
+        }
+        expected = {
+            (qname, fmt)
+            for qname, formats in requested.items()
+            for fmt in formats
+        }
+        observed: list[tuple[str, str]] = []
+        observed_set: set[tuple[str, str]] = set()
+
+        def _consume_once(**kwargs) -> Mapping[str, object]:
+            key = (
+                str(kwargs.get("qname")),
+                _canon_fmt(str(kwargs.get("fmt"))),
+            )
+            if key not in expected:
+                raise RuntimeError(
+                    "production anchor renderer emitted an unexpected "
+                    f"transient pair {key}"
+                )
+            if key in observed_set:
+                raise RuntimeError(
+                    "production anchor renderer emitted a duplicate "
+                    f"transient pair {key}"
+                )
+            result = consume_render(**kwargs)
+            if not isinstance(result, Mapping):
+                raise TypeError(
+                    "transient production anchor consumer must return a "
+                    f"Mapping for {key}, got {type(result).__name__}"
+                )
+            observed.append(key)
+            observed_set.add(key)
+            return result
+
+        render_scores: dict[str, dict[str, object]] = {}
+        _render_dense_layer(
+            self.model,
+            layer_scope,
+            render_formats_by_qname=requested,
+            act_index=self.act_index,
+            cache=self.cache,
+            levers=self.levers,
+            cache_dir_path=None,
+            profile=self.profile,
+            device=self.device,
+            fisher_rows=self.fisher_rows,
+            render_score_records=render_scores,
+            col_weights=self.col_weights,
+            cb_serialization_context=self.cb_serialization_context,
+            retain_rendered=False,
+            consume_render=_consume_once,
+            consumer_identity=consumer_identity,
+            calibration_hash=self.calibration_hash,
+            resume=False,
+            max_act_rows=self.max_act_rows,
+            cb_pair_identities={},
+            cb_pair_artifacts={},
+            transient_results={},
+            cb_git_commit=self.producer_git_commit,
+            cb_producer_source_sha256=self.producer_source_sha256,
+            joint_scale_modules=layer_scope,
+            declared_cold_qnames=self.cold_qnames,
+            progress=False,
+        )
+        if observed_set != expected:
+            raise RuntimeError(
+                "production anchor renderer did not consume its exact layer "
+                f"plan: missing={sorted(expected - observed_set)[:8]} "
+                f"unexpected={sorted(observed_set - expected)[:8]}"
+            )
+        if self.cache.weights:
+            raise RuntimeError(
+                "transient production anchor renderer retained a weight"
+            )
+        self.max_live_rendered = max(self.max_live_rendered, 1)
+        self.render_count += len(observed)
+        return tuple(observed)
 
     def source_weight_identity_for(
         self, qname: str,

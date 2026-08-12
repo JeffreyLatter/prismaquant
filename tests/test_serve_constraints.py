@@ -338,14 +338,10 @@ def _lane_ctx(**slo_kw):
     )
 
 
-# The fused mid-M backed set is attested PER GRIDBOOK RELEASE, and the repo's
-# pin currently names 0.8.3 with ``version_is_release: false``. An unreleased
-# version deliberately backs nothing ("a pinned version with no entry backs
-# nothing, which is the fail-closed direction" -- nvfp4_cb.json), so resolving
-# against the ambient pin here would make these tests assert the PIN rather
-# than the RULE they exist to cover. Pin the newest ATTESTED release instead;
+# The fused mid-M backed set is attested PER GRIDBOOK RELEASE. Resolve these
+# rule-level tests against the current attested release; the separate
 # ``test_unattested_runtime_pin_backs_nothing`` covers the fail-closed side.
-_ATTESTED_RUNTIME = "0.8.2"
+_ATTESTED_RUNTIME = "0.8.4"
 
 
 def _profile_lane(_name, fmt):
