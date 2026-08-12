@@ -28,7 +28,7 @@
       "id": "load_generate.eager",
       "runner": "MODEL=<artifact> scripts/serve_dsv4_cb_validate.sh eager",
       "shipcard_slot": "native_export.eager",
-      "description": "Fresh exact-pinned Gridbook container, TP=1, fp8 KV, speculative decode off, --enforce-eager, then two identical non-empty greedy completions over the OpenAI endpoint. Fills only the eager load/generation slot; it makes no quality or performance claim."
+      "description": "Fresh exact-pinned Gridbook container, TP=1, fp8 KV, speculative decode off, --enforce-eager, then two identical non-empty greedy completions over the OpenAI endpoint. Fills the eager load/generation slot, then reuses that exact live nonce-bound session for the independently recorded numeric ship gate and refuses unless the current ship_gate slot replays. It makes no gold-quality or performance claim."
     },
     {
       "id": "load_generate.graph",
@@ -40,7 +40,7 @@
       "id": "ship_gate.ppl_p99nll",
       "runner": "prismaquant.validate_quantized_model --base-url ... --shipcard",
       "shipcard_slot": "ship_gate",
-      "description": "Unchanged from the native lane: same script, same endpoint, same thresholds."
+      "description": "Unchanged from the native lane: same validator, endpoint, and thresholds. For DSv4, serve_dsv4_cb_validate.sh eager invokes it before tearing down the exact nonce-bound server and explicitly verifies the resulting ship_gate slot."
     },
     {
       "id": "gold.kl",

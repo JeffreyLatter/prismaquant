@@ -7,8 +7,10 @@
 #   MODEL=/abs/path/to/artifact scripts/serve_dsv4_cb_validate.sh eager
 #   MODEL=/abs/path/to/artifact scripts/serve_dsv4_cb_validate.sh graph
 #
-# This closes only native_export.{eager,graph}.  It does not claim quality or
-# throughput and deliberately exposes no speculative-decode option.
+# Each arm closes its matching native_export slot.  The eager arm also runs the
+# numeric catastrophic-quality gate against that same live nonce-bound server
+# and closes ship_gate.  Neither arm claims gold quality or throughput, and the
+# launcher deliberately exposes no speculative-decode option.
 set -euo pipefail
 
 ARM=${1:-}
@@ -85,6 +87,7 @@ SERVE_LOG=$EVIDENCE/serve.log
 CAPTURE_LOG=$EVIDENCE/capture-evidence.log
 MANIFEST=$EVIDENCE/serve_manifest.json
 RESULT=$EVIDENCE/validation.json
+SHIP_GATE_REPORT=$EVIDENCE/ship-gate-report.md
 
 for value in "$START_FLOOR_GIB" "$READY_FLOOR_GIB" "$WATCHDOG_GIB"; do
   if [[ ! "$value" =~ ^[0-9]+$ ]]; then
@@ -365,6 +368,51 @@ fi
   --defer-shipcard-fill \
   "${graph_evidence_args[@]}")
 
+# The eager server is already identity-bound by validate_cb_endpoint above.
+# Reuse that exact live session for the numeric catastrophic-quality gate; a
+# second serve would lose the nonce/process/artifact binding we just proved.
+# validate_quantized_model deliberately treats shipcard write errors as
+# advisory, so this release driver must explicitly replay and verify only the
+# ship_gate slot before it is allowed to continue.
+if [[ "$ARM" == eager ]]; then
+  ship_gate_base_url="http://127.0.0.1:$PORT"
+  (cd -- "$REPO" && python3 -m prismaquant.validate_quantized_model \
+    --base-url "$ship_gate_base_url" \
+    --model-name "$SERVED_MODEL" \
+    --max-ppl 25.0 \
+    --max-mean-nll 3.0 \
+    --max-p99-nll 6.0 \
+    --min-gen-len 30 \
+    --min-mtp-accept-p0 0.60 \
+    --shipcard "$SHIPCARD" \
+    --artifact-dir "$MODEL" \
+    --report "$SHIP_GATE_REPORT")
+  (cd -- "$REPO" && python3 - \
+      "$SHIPCARD" "$MODEL" "$SERVED_MODEL" "$ship_gate_base_url" <<'PY'
+import sys
+
+from prismaquant.shipcard import load_shipcard, verify
+
+shipcard_path, model_dir, served_model, base_url = sys.argv[1:]
+card = load_shipcard(shipcard_path)
+problems = verify(card, model_dir=model_dir, required=("ship_gate",))
+record = (card.get("slots") or {}).get("ship_gate")
+if isinstance(record, dict):
+    if record.get("served_model_name") != served_model:
+        problems.append(
+            "ship_gate: served-model nonce differs from the current eager session"
+        )
+    if record.get("base_url") != base_url:
+        problems.append("ship_gate: base URL differs from the current eager session")
+    if record.get("model_sha_source") != model_dir:
+        problems.append("ship_gate: artifact path differs from the mounted model")
+if problems:
+    raise SystemExit("REFUSE: current eager ship_gate did not verify:\n- " + "\n- ".join(problems))
+print("[shipcard] verified ship_gate from current nonce-bound eager session")
+PY
+  )
+fi
+
 if [[ $(docker inspect -f '{{.State.Running}}' "$CID" 2>/dev/null) != true \
       || -e "$EVIDENCE/watchdog-tripped" ]]; then
   echo "REFUSE: container or memory watchdog failed during validation" >&2
@@ -415,4 +463,8 @@ from prismaquant.validate_cb_endpoint import commit_deferred_result
 commit_deferred_result(sys.argv[1], sys.argv[2], sys.argv[3])
 PY
 )
-echo "PASS: native_export.$ARM filled from exact-pinned CB serve"
+if [[ "$ARM" == eager ]]; then
+  echo "PASS: native_export.eager and ship_gate filled from exact-pinned CB serve"
+else
+  echo "PASS: native_export.graph filled from exact-pinned CB serve"
+fi

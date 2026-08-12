@@ -330,7 +330,7 @@ flowchart TD
   OUTCT --> VNE
   VNE --> VQM
   VQM --> GOLD
-  NOSMOKE --> GOLD
+  NOSMOKE --> VQM
   GGSMOKE --> GOLD
 
   classDef optin stroke:#c07800,stroke-width:2px,stroke-dasharray:4
@@ -888,6 +888,16 @@ site-package install, or a different checkout cannot silently enter either a fre
 resume. The already-running 2026-08-12 acceptance campaign predates this generic identity file
 and remains bound by its external commit/image receipt; it is deliberately not retroactively
 migrated.
+
+Long release jobs take the source boundary one step further. Before replay, export, or gold
+measurement, `tools/prismaquant_runtime_snapshot.py` uses `git archive` to materialize the exact
+reviewed commit under a commit/tree-addressed local cache. Its manifest inventories and hashes
+every tracked regular file and symlink, not only the importable package. The cache publisher is
+atomic and serialized; an existing entry is always re-hashed before reuse. Release containers
+mount that standalone snapshot read-only, verify the commit, tree, and complete closure before
+any PrismaQuant import, then separately require Python's origin and package hash to resolve from
+the mount. This removes the multi-hour mutation window inherent in executing directly from a
+live worktree while retaining the commit override needed by a Git-metadata-free archive.
 
 The first FP32-storage launch reached 474 MiB `MemAvailable` and the host 3-GiB safety guardian
 killed its container at 2026-08-12 11:44:30 EDT (`/var/log/gpu-guardian.log`); BF16 delta storage
@@ -1994,8 +2004,8 @@ re-render, it is the render the gate declined to keep.
 | Candidate real-KL (selection) | `validate_assignments_kl.py` | yes, only under `SELECTION_MODE=validated-surrogate` (`run-pipeline.sh:1223-1278`) | ranks, does not gate |
 | Artifact survey (PPL/MMLU/end-KL) | `validation_harness.py` | no | **no thresholds at all** |
 | vLLM load + greedy smoke | `validate_native_export.py` | **echoed only** (`run-pipeline.sh:1704-1705`) | binary |
-| DSv4 CB exact eager + CUDA-graph load/generation | `scripts/serve_dsv4_cb_validate.sh {eager,graph}` → `validate_cb_endpoint.py` | no — operator-run, one fresh container per arm | **binary; closes only its matching `native_export.*` slot** |
-| Numeric ship gate | `validate_quantized_model.py` | **never run, never echoed** | yes, exit 0/1 |
+| DSv4 CB exact eager + CUDA-graph load/generation | `scripts/serve_dsv4_cb_validate.sh {eager,graph}` → `validate_cb_endpoint.py` | no — operator-run, one fresh container per arm | **binary; each arm closes its matching `native_export.*` slot; eager also runs the independently recorded numeric gate before teardown** |
+| Numeric ship gate | `validate_quantized_model.py` | never by the build pipeline; the DSv4 CB eager serve driver invokes it against its already-bound live session | yes, exit 0/1; closes `ship_gate` |
 | Gold lane | `tools/measure_vllm_full_kl.py`, `tools/measure_vllm_wikitext_ppl.py` | never | manual, authoritative |
 | DSv4 CB matched-budget performance | `python -m prismaquant.validate_cb_performance` | no — operator-run after export | **blocking paired prefill/decode/mixed parity against the exact displaced container** |
 | Ship record | `exported/shipcard.json` (opened by the exporter) → `python -m prismaquant.shipcard_cli verify` | opened by every export | **refuses** until every serve-lane slot is closed |
@@ -2154,9 +2164,15 @@ the smoke client re-observes `/v1/models` at the same endpoint and requires the 
 before issuing deterministic completions, so a healthy unrelated listener cannot satisfy the
 gate (`validate_cb_endpoint._validate_live_server_session`,
 `validate_cb_endpoint.run_endpoint_smoke`,
-`serve_fingerprint.models_endpoint_binding_identity`). This gate proves exact
-load/capture/generation identity, not quality or speed;
-`ship_gate` and the two gold slots remain independent.
+`serve_fingerprint.models_endpoint_binding_identity`). The endpoint gate itself proves exact
+load/capture/generation identity, not quality or speed. After that endpoint proof, the eager
+driver runs `validate_quantized_model` against the same still-live nonce-bound process and
+explicitly calls `shipcard.verify(required=("ship_gate",))` against the mounted artifact. It
+also requires the written record's served-model nonce, base URL, and artifact path to match the
+current session, so a warned-away shipcard write or stale passing record fails closed. Only then
+may the driver tear down the server and commit the deferred `native_export.eager` result. The two
+records remain semantically independent; the graph arm does not rerun the numeric gate, and the
+two gold slots remain independent.
 
 **DSv4 CB matched-budget performance gate.**
 `prismaquant.validate_cb_performance` consumes a predeclared Cartesian matrix
@@ -2247,7 +2263,11 @@ exist only here.
 thresholds, `base_url`, served model name, detected spec-decode state) to the `ship_gate` slot;
 `--artifact-dir` (`:598`) names the local directory the `model_sha` is computed from, since the
 validator drives an HTTP endpoint and cannot otherwise know what the server loaded
-(`_fill_shipcard` `:516`, `_resolve_artifact_dir` `:502`).
+(`_fill_shipcard` `:516`, `_resolve_artifact_dir` `:502`). The DSv4 CB eager serve driver passes
+the fixed default thresholds explicitly, supplies its generated nonce as `--model-name`, and
+replays only `ship_gate` plus the current-session bindings before server teardown. This makes the
+numeric run part of the manual eager release operation without merging its evidence semantics
+into `native_export.eager`.
 
 ### 7.3 The gold lane (manual)
 

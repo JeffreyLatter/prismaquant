@@ -955,6 +955,20 @@ def test_driver_and_lane_declare_two_isolated_arms_and_guards():
     assert 'serve_fingerprint.py write' in text
     assert 'prismaquant.validate_cb_endpoint' in text
     assert '--defer-shipcard-fill' in text
+    assert 'if [[ "$ARM" == eager ]]; then' in text
+    assert 'python3 -m prismaquant.validate_quantized_model' in text
+    assert '--model-name "$SERVED_MODEL"' in text
+    assert '--artifact-dir "$MODEL"' in text
+    assert '--shipcard "$SHIPCARD"' in text
+    assert '--max-ppl 25.0' in text
+    assert '--max-mean-nll 3.0' in text
+    assert '--max-p99-nll 6.0' in text
+    assert '--min-gen-len 30' in text
+    assert '--min-mtp-accept-p0 0.60' in text
+    assert 'required=("ship_gate",)' in text
+    assert 'record.get("served_model_name") != served_model' in text
+    assert 'record.get("base_url") != base_url' in text
+    assert 'record.get("model_sha_source") != model_dir' in text
     assert 'openssl rand -hex 16' in text
     assert 'SERVED_MODEL=dsv4-flash-gridbook-${SERVE_NONCE}' in text
     assert '--base-url http://127.0.0.1:8000' in text
@@ -963,6 +977,10 @@ def test_driver_and_lane_declare_two_isolated_arms_and_guards():
     assert text.rindex('docker stop -t 30 "$CID"') < text.index(
         'commit_deferred_result'
     )
+    endpoint_idx = text.index('python3 -m prismaquant.validate_cb_endpoint')
+    ship_gate_idx = text.index('python3 -m prismaquant.validate_quantized_model')
+    stop_idx = text.rindex('docker stop -t 30 "$CID"')
+    assert endpoint_idx < ship_gate_idx < stop_idx
     assert 'contains_mxfp4_wire' in text
     assert '-e GRIDBOOK_MXFP8_DENSE=1' in text
     assert '-e VLLM_USE_DEEP_GEMM=0' in text
@@ -997,6 +1015,10 @@ def test_driver_and_lane_declare_two_isolated_arms_and_guards():
     assert graph is not None and graph.shipcard_slot == "native_export.graph"
     assert "serve_dsv4_cb_validate.sh eager" in eager.runner
     assert "serve_dsv4_cb_validate.sh graph" in graph.runner
+    ship_gate = lane.gate("ship_gate.ppl_p99nll")
+    assert ship_gate is not None and ship_gate.shipcard_slot == "ship_gate"
+    assert "serve_dsv4_cb_validate.sh eager" in ship_gate.description
+    assert "nonce-bound server" in ship_gate.description
 
 
 @pytest.mark.parametrize(
