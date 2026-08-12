@@ -98,7 +98,7 @@ WIKITEXT_GOLD_CALIBRATION_SCHEMA = "prismaquant.wikitext_gold_calibration/1"
 WIKITEXT_PPL_CALIBRATION_SCHEMA = "prismaquant.wikitext_ppl_calibration/1"
 GOLD_PRODUCER_IDENTITY_SCHEMA = "prismaquant.gold_producer_identity/1"
 GRIDBOOK_DISTRIBUTION_SCHEMA = (
-    "prismaquant.installed_gridbook_distribution/1"
+    "prismaquant.installed_gridbook_distribution/2"
 )
 TOPK_COVERAGE_POLICY_SCHEMA = "prismaquant.topk_tail_coverage_policy/1"
 WIKITEXT_REVISION = "b08601e04326c79dfdd32d625aee71d232d685c3"
@@ -954,7 +954,7 @@ def _verify_gridbook_distribution_identity(
         "schema", "name", "repository", "version", "direct_url",
         "direct_url_path", "direct_url_identity", "metadata_path",
         "metadata_identity", "record_path", "record_identity",
-        "source_files", "source_files_sha256",
+        "source_files", "source_files_sha256", "import_origin",
     }:
         return [f"{slot}: installed Gridbook distribution evidence is not closed"]
     direct_url = distribution.get("direct_url")
@@ -992,6 +992,19 @@ def _verify_gridbook_distribution_identity(
     ):
         return [
             f"{slot}: installed Gridbook PEP 610 identity differs from the pin"
+        ]
+    try:
+        from tools.serve_fingerprint import (
+            validate_gridbook_import_origin_identity,
+        )
+
+        validate_gridbook_import_origin_identity(
+            distribution.get("import_origin"),
+            expected_version=str(runtime_pin.get("version", "")),
+        )
+    except Exception:
+        return [
+            f"{slot}: imported Gridbook origin is outside the selected distribution"
         ]
 
     def descriptor(value: object) -> bool:
@@ -1676,6 +1689,10 @@ def _verify_dsv4_gridbook_gold_contract(
         problem("gold process/session identity is incomplete or inconsistent")
 
     manifest_environment = manifest.get("server_process_environment")
+    gold_process_environment = {
+        **dict(CANONICAL_GOLD_SET_ENVIRONMENT),
+        "PYTHONSAFEPATH": "1",
+    }
     environment_rows = manifest_environment.get("processes") if isinstance(
         manifest_environment, Mapping
     ) else None
@@ -1693,8 +1710,8 @@ def _verify_dsv4_gridbook_gold_contract(
         and manifest_environment.get("unreadable_pids") == []
         and manifest_environment.get("consistent") is True
         and manifest_environment.get("values")
-        == dict(CANONICAL_GOLD_SET_ENVIRONMENT)
-        and manifest.get("pq_env") == dict(CANONICAL_GOLD_SET_ENVIRONMENT)
+        == gold_process_environment
+        and manifest.get("pq_env") == gold_process_environment
         and isinstance(environment_rows, list)
         and len(environment_rows) == len(process_pids)
     )
@@ -1704,9 +1721,9 @@ def _verify_dsv4_gridbook_gold_contract(
                 not isinstance(row, Mapping)
                 or set(row) != {"pid", "values", "sha256"}
                 or row.get("pid") != process_pids[index]
-                or row.get("values") != dict(CANONICAL_GOLD_SET_ENVIRONMENT)
+                or row.get("values") != gold_process_environment
                 or row.get("sha256")
-                != canonical_sha(dict(CANONICAL_GOLD_SET_ENVIRONMENT))
+                != canonical_sha(gold_process_environment)
             ):
                 environment_valid = False
                 break

@@ -114,16 +114,54 @@ def test_extension_pattern_matches_the_tracked_sos():
     assert not EXTENSION_PATTERN.search("/usr/lib/libcudart.so.13")
 
 
-def test_external_gridbook_pin_is_recorded_in_the_stack(monkeypatch):
+def test_external_gridbook_pin_without_distribution_fails_closed(monkeypatch):
     monkeypatch.setenv("PQ_GRIDBOOK_RUNTIME_COMMIT", "a" * 40)
     monkeypatch.setenv("PQ_GRIDBOOK_RUNTIME_VERSION", "0.4.1")
+    monkeypatch.setattr(
+        serve_fingerprint.importlib_metadata,
+        "distribution",
+        lambda name: (_ for _ in ()).throw(
+            serve_fingerprint.importlib_metadata.PackageNotFoundError(name)
+        ),
+    )
     assert gridbook_runtime_pin() == {
         "commit": "a" * 40,
         "version": "0.4.1",
     }
+    with pytest.raises(ValueError, match="distribution is not installed"):
+        collect_manifest(
+            pids=[__import__("os").getpid()],
+            launch_argv=["vllm", "serve", "/m"],
+        )
+
+
+def test_external_gridbook_pin_and_distribution_are_recorded_in_stack(
+    monkeypatch,
+):
+    monkeypatch.setenv("PQ_GRIDBOOK_RUNTIME_COMMIT", "a" * 40)
+    monkeypatch.setenv("PQ_GRIDBOOK_RUNTIME_VERSION", "0.4.1")
+    distribution = {
+        "schema": "prismaquant.installed_gridbook_distribution/2",
+        "import_origin": {
+            "schema": "prismaquant.gridbook_import_origin/1",
+        },
+    }
+
+    def attest(pin):
+        assert pin == {
+            "repository": serve_fingerprint.GRIDBOOK_REPOSITORY,
+            "commit": "a" * 40,
+            "version": "0.4.1",
+        }
+        return distribution
+
+    monkeypatch.setattr(
+        serve_fingerprint, "gridbook_distribution_provenance", attest
+    )
     manifest = collect_manifest(
         pids=[__import__("os").getpid()], launch_argv=["vllm", "serve", "/m"])
     assert manifest["gridbook_runtime_pin"] == gridbook_runtime_pin()
+    assert manifest["gridbook_distribution"] == distribution
 
 
 def test_gridbook_mxfp8_lane_opt_in_is_fingerprinted(monkeypatch):

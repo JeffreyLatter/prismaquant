@@ -21,9 +21,6 @@ esac
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 REPO=$(cd -- "$SCRIPT_DIR/.." && pwd -P)
-. "$REPO/prismaquant/gridbook_runtime/gridbook_runtime.sh"
-gridbook_runtime_prepare
-
 MODEL=${MODEL:-}
 if [[ -z "$MODEL" || "$MODEL" != /* || ! -d "$MODEL" ]]; then
   echo "REFUSE: MODEL must be an existing absolute artifact directory" >&2
@@ -40,6 +37,140 @@ if ! compgen -G "$MODEL/*.safetensors" >/dev/null; then
   echo "REFUSE: MODEL has no safetensors checkpoint" >&2
   exit 2
 fi
+
+# The artifact's build receipt selects the PrismaQuant source commit used for
+# validation.  A live checkout is only a bootstrap: it must be clean at that
+# same commit, then this script re-executes from a complete content-addressed
+# snapshot before sourcing helpers or importing PrismaQuant.
+PQ_SERVE_SNAPSHOT_REEXEC=${PQ_SERVE_SNAPSHOT_REEXEC:-0}
+PQ_SNAPSHOT_CACHE=${PQ_SNAPSHOT_CACHE:-$(dirname -- "$MODEL")/runtime-source-cache}
+if [[ "$PQ_SERVE_SNAPSHOT_REEXEC" != 1 ]]; then
+  PQ_SNAPSHOT_CACHE=$(realpath -m -- "$PQ_SNAPSHOT_CACHE")
+  case "$PQ_SNAPSHOT_CACHE/" in
+    "$MODEL/"*)
+      echo "REFUSE: PQ_SNAPSHOT_CACHE must be outside the immutable artifact" >&2
+      exit 2
+      ;;
+  esac
+  readarray -t build_git < <(env -u PYTHONPATH PYTHONNOUSERSITE=1 \
+    PYTHONSAFEPATH=1 python3 -P - "$SHIPCARD" <<'PY'
+import json
+import re
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    card = json.load(handle)
+git = (card.get("build") or {}).get("git") or {}
+commit = git.get("commit")
+dirty = git.get("dirty")
+if not isinstance(commit, str) or re.fullmatch(r"[0-9a-f]{40}", commit) is None:
+    raise SystemExit("shipcard build.git.commit is not one full Git commit")
+if dirty is not False:
+    raise SystemExit("shipcard build.git.dirty is not false")
+print(commit)
+PY
+  )
+  ARTIFACT_BUILD_COMMIT=${build_git[0]:-}
+  if [[ ! "$ARTIFACT_BUILD_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "REFUSE: artifact lacks one clean full PrismaQuant build commit" >&2
+    exit 2
+  fi
+  REPO_HEAD=$(git -C "$REPO" rev-parse --verify 'HEAD^{commit}' 2>/dev/null || true)
+  REPO_DIRTY=$(git -C "$REPO" status --porcelain --untracked-files=all)
+  if [[ "$REPO_HEAD" != "$ARTIFACT_BUILD_COMMIT" || -n "$REPO_DIRTY" ]]; then
+    echo "REFUSE: serve checkout must be clean at artifact build commit $ARTIFACT_BUILD_COMMIT" >&2
+    exit 2
+  fi
+  PQ_SNAPSHOT_JSON=$(env -u PYTHONPATH PYTHONNOUSERSITE=1 PYTHONSAFEPATH=1 \
+    python3 -P "$REPO/tools/prismaquant_runtime_snapshot.py" \
+    materialize --source-root "$REPO" --cache-root "$PQ_SNAPSHOT_CACHE" \
+    --commit "$ARTIFACT_BUILD_COMMIT")
+  readarray -t snapshot_fields < <(env -u PYTHONPATH PYTHONNOUSERSITE=1 \
+    PYTHONSAFEPATH=1 python3 -P -c '
+import json, sys
+value = json.load(sys.stdin)
+for key in ("snapshot", "tree", "closure_sha256"):
+    item = value.get(key)
+    if not isinstance(item, str) or not item:
+        raise SystemExit(f"runtime snapshot lacks {key}")
+    print(item)
+' <<<"$PQ_SNAPSHOT_JSON")
+  PQ_RUNTIME_SNAPSHOT=${snapshot_fields[0]:-}
+  PQ_RUNTIME_TREE=${snapshot_fields[1]:-}
+  PQ_RUNTIME_CLOSURE_SHA256=${snapshot_fields[2]:-}
+  if [[ ! -d "$PQ_RUNTIME_SNAPSHOT" \
+        || ! "$PQ_RUNTIME_TREE" =~ ^[0-9a-f]{40}$ \
+        || ! "$PQ_RUNTIME_CLOSURE_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "REFUSE: reviewed PrismaQuant snapshot identity is malformed" >&2
+    exit 2
+  fi
+  env -u PYTHONPATH python3 -P \
+    "$PQ_RUNTIME_SNAPSHOT/tools/prismaquant_runtime_snapshot.py" verify \
+    --snapshot "$PQ_RUNTIME_SNAPSHOT" \
+    --expected-commit "$ARTIFACT_BUILD_COMMIT" \
+    --expected-tree "$PQ_RUNTIME_TREE" \
+    --expected-closure-sha256 "$PQ_RUNTIME_CLOSURE_SHA256" >/dev/null
+  if [[ $(git -C "$REPO" rev-parse --verify 'HEAD^{commit}') \
+        != "$ARTIFACT_BUILD_COMMIT" \
+        || -n $(git -C "$REPO" status --porcelain --untracked-files=all) ]]; then
+    echo "REFUSE: serve checkout changed while snapshotting" >&2
+    exit 2
+  fi
+  export PQ_SERVE_SNAPSHOT_REEXEC=1
+  export PQ_RUNTIME_SNAPSHOT ARTIFACT_BUILD_COMMIT PQ_RUNTIME_TREE
+  export PQ_RUNTIME_CLOSURE_SHA256
+  export PQ_RUNTIME_PRISMAQUANT_ROOT=$PQ_RUNTIME_SNAPSHOT
+  export PRISMAQUANT_IDENTITY_GIT_COMMIT=$ARTIFACT_BUILD_COMMIT
+  export PRISMAQUANT_IDENTITY_GIT_DIRTY=0
+  export PYTHONSAFEPATH=1
+  export PYTHONDONTWRITEBYTECODE=1
+  export PYTHONNOUSERSITE=1
+  unset PYTHONPATH
+  exec bash "$PQ_RUNTIME_SNAPSHOT/scripts/serve_dsv4_cb_validate.sh" "$ARM"
+fi
+
+if [[ ! "$ARTIFACT_BUILD_COMMIT" =~ ^[0-9a-f]{40}$ \
+      || ! "$PQ_RUNTIME_TREE" =~ ^[0-9a-f]{40}$ \
+      || ! "$PQ_RUNTIME_CLOSURE_SHA256" =~ ^[0-9a-f]{64}$ \
+      || "$REPO" != "$PQ_RUNTIME_SNAPSHOT" \
+      || "${PQ_RUNTIME_PRISMAQUANT_ROOT:-}" != "$REPO" \
+      || "${PYTHONSAFEPATH:-}" != 1 \
+      || "${PYTHONDONTWRITEBYTECODE:-}" != 1 \
+      || "${PYTHONNOUSERSITE:-}" != 1 \
+      || -n "${PYTHONPATH+x}" ]]; then
+  echo "REFUSE: serve launcher is not executing from its attested snapshot" >&2
+  exit 2
+fi
+verify_runtime_snapshot() {
+  env -u PYTHONPATH python3 -P \
+    "$REPO/tools/prismaquant_runtime_snapshot.py" verify \
+    --snapshot "$REPO" \
+    --expected-commit "$ARTIFACT_BUILD_COMMIT" \
+    --expected-tree "$PQ_RUNTIME_TREE" \
+    --expected-closure-sha256 "$PQ_RUNTIME_CLOSURE_SHA256" >/dev/null
+}
+pq_run_module() {
+  env -u PYTHONPATH PYTHONNOUSERSITE=1 python3 -P \
+    "$REPO/tools/prismaquant_source_bootstrap.py" run-module "$@"
+}
+verify_runtime_snapshot
+readarray -t inner_build_git < <(env -u PYTHONPATH PYTHONNOUSERSITE=1 \
+  python3 -P - "$SHIPCARD" <<'PY'
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    git = (json.load(handle).get("build") or {}).get("git") or {}
+print(git.get("commit", ""))
+print("false" if git.get("dirty") is False else "not-false")
+PY
+)
+if [[ "${inner_build_git[0]:-}" != "$ARTIFACT_BUILD_COMMIT" \
+      || "${inner_build_git[1]:-}" != false ]]; then
+  echo "REFUSE: artifact build identity changed across snapshot re-exec" >&2
+  exit 2
+fi
+. "$REPO/prismaquant/gridbook_runtime/gridbook_runtime.sh"
+gridbook_runtime_prepare
 
 # DSv4 evidence pin: eugr Spark vLLM 0.26.1rc1.dev515 at g653ebb52d.
 BASE_IMAGE=eugr/spark-vllm@sha256:7bf752a9fa225b528b27c6a1118cb1727cddd7c383096d83281010c4f8b407bc
@@ -107,9 +238,15 @@ fi
 
 # Header-only and sidecar-only preflight.  Refuse an incomplete decoder map or
 # a missing/mismatched released DSpark overlay before reserving the single GPU.
-(cd -- "$REPO" && python3 - "$MODEL" <<'PY'
+verify_runtime_snapshot
+env -u PYTHONPATH PYTHONNOUSERSITE=1 python3 -P - "$REPO" "$MODEL" <<'PY'
 import json
 import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(sys.argv.pop(1)) / "tools"))
+from prismaquant_source_bootstrap import activate_prismaquant_source
+activate_prismaquant_source()
 
 from prismaquant.validate_cb_endpoint import (
     validate_cb_artifact,
@@ -121,7 +258,7 @@ quant_config = validate_cb_artifact(artifact)
 evidence = validate_cb_artifact_decode_contract(artifact, quant_config)
 print(json.dumps(evidence, sort_keys=True))
 PY
-)
+verify_runtime_snapshot
 
 exec 9>"$LOCK"
 if ! flock -n -x 9; then
@@ -173,6 +310,14 @@ CID=$(docker create --pull=never --name "$NAME" --gpus all --ipc=host \
   -v "$EVIDENCE:/evidence:rw" \
   -v "$EXT_CACHE:/opt/gridbook/ext-cache:rw" \
   "${GRIDBOOK_RUNTIME_DOCKER_ARGS[@]}" \
+  -e "PQ_RUNTIME_PRISMAQUANT_ROOT=/repo" \
+  -e "PQ_RUNTIME_PRISMAQUANT_GIT_COMMIT=$ARTIFACT_BUILD_COMMIT" \
+  -e "PQ_RUNTIME_PRISMAQUANT_TREE=$PQ_RUNTIME_TREE" \
+  -e "PQ_RUNTIME_PRISMAQUANT_CLOSURE_SHA256=$PQ_RUNTIME_CLOSURE_SHA256" \
+  -e "PRISMAQUANT_IDENTITY_GIT_COMMIT=$ARTIFACT_BUILD_COMMIT" \
+  -e "PRISMAQUANT_IDENTITY_GIT_DIRTY=0" \
+  -e "PYTHONDONTWRITEBYTECODE=1" \
+  -e "PYTHONNOUSERSITE=1" \
   -e "PQ_ARM=$ARM" \
   -e "PQ_SERVED_MODEL=$SERVED_MODEL" \
   -e "PQ_VLLM_VERSION=$VLLM_VERSION" \
@@ -347,17 +492,26 @@ docker logs "$CID" > "$CAPTURE_LOG" 2>&1
 
 # Fingerprinting is fatal for this gate.  The older serve helper is advisory;
 # this ship receipt cannot be, because the stack identity is part of the proof.
-docker exec -e PYTHONPATH=/repo "$CID" \
-  python3 /repo/tools/serve_fingerprint.py write \
+verify_runtime_snapshot
+docker exec "$CID" env -u PYTHONPATH python3 -P \
+  /repo/tools/prismaquant_runtime_snapshot.py verify \
+  --snapshot /repo \
+  --expected-commit "$ARTIFACT_BUILD_COMMIT" \
+  --expected-tree "$PQ_RUNTIME_TREE" \
+  --expected-closure-sha256 "$PQ_RUNTIME_CLOSURE_SHA256" >/dev/null
+docker exec --workdir / "$CID" env -u PYTHONPATH python3 -P \
+  /repo/tools/prismaquant_source_bootstrap.py run-tool --source-root /repo \
+  serve-fingerprint write \
   --out /evidence/serve_manifest.json --image "$BASE_IMAGE" \
   --artifact-dir /model --base-url http://127.0.0.1:8000
 test -s "$MANIFEST"
+verify_runtime_snapshot
 
 graph_evidence_args=()
 if [[ "$ARM" == graph ]]; then
   graph_evidence_args+=(--serve-log "$CAPTURE_LOG")
 fi
-(cd -- "$REPO" && python3 -m prismaquant.validate_cb_endpoint \
+pq_run_module prismaquant.validate_cb_endpoint \
   --arm "$ARM" \
   --base-url "http://127.0.0.1:$PORT/v1" \
   --model-dir "$MODEL" \
@@ -366,7 +520,8 @@ fi
   --shipcard "$SHIPCARD" \
   --output-json "$RESULT" \
   --defer-shipcard-fill \
-  "${graph_evidence_args[@]}")
+  "${graph_evidence_args[@]}"
+verify_runtime_snapshot
 
 # The eager server is already identity-bound by validate_cb_endpoint above.
 # Reuse that exact live session for the numeric catastrophic-quality gate; a
@@ -376,7 +531,7 @@ fi
 # ship_gate slot before it is allowed to continue.
 if [[ "$ARM" == eager ]]; then
   ship_gate_base_url="http://127.0.0.1:$PORT"
-  (cd -- "$REPO" && python3 -m prismaquant.validate_quantized_model \
+  pq_run_module prismaquant.validate_quantized_model \
     --base-url "$ship_gate_base_url" \
     --model-name "$SERVED_MODEL" \
     --max-ppl 25.0 \
@@ -386,10 +541,16 @@ if [[ "$ARM" == eager ]]; then
     --min-mtp-accept-p0 0.60 \
     --shipcard "$SHIPCARD" \
     --artifact-dir "$MODEL" \
-    --report "$SHIP_GATE_REPORT")
-  (cd -- "$REPO" && python3 - \
-      "$SHIPCARD" "$MODEL" "$SERVED_MODEL" "$ship_gate_base_url" <<'PY'
+    --report "$SHIP_GATE_REPORT"
+  verify_runtime_snapshot
+  env -u PYTHONPATH PYTHONNOUSERSITE=1 python3 -P - \
+      "$REPO" "$SHIPCARD" "$MODEL" "$SERVED_MODEL" "$ship_gate_base_url" <<'PY'
 import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(sys.argv.pop(1)) / "tools"))
+from prismaquant_source_bootstrap import activate_prismaquant_source
+activate_prismaquant_source()
 
 from prismaquant.shipcard import load_shipcard, verify
 
@@ -410,7 +571,7 @@ if problems:
     raise SystemExit("REFUSE: current eager ship_gate did not verify:\n- " + "\n- ".join(problems))
 print("[shipcard] verified ship_gate from current nonce-bound eager session")
 PY
-  )
+  verify_runtime_snapshot
 fi
 
 if [[ $(docker inspect -f '{{.State.Running}}' "$CID" 2>/dev/null) != true \
@@ -456,13 +617,21 @@ fi
 
 # This is intentionally the terminal mutation. A PASS cannot reach the card
 # until endpoint, clean server shutdown, watchdog, and memory checks all pass.
-(cd -- "$REPO" && python3 - "$RESULT" "$SHIPCARD" "$MODEL" <<'PY'
+verify_runtime_snapshot
+env -u PYTHONPATH PYTHONNOUSERSITE=1 python3 -P - \
+    "$REPO" "$RESULT" "$SHIPCARD" "$MODEL" <<'PY'
 import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(sys.argv.pop(1)) / "tools"))
+from prismaquant_source_bootstrap import activate_prismaquant_source
+activate_prismaquant_source()
+
 from prismaquant.validate_cb_endpoint import commit_deferred_result
 
 commit_deferred_result(sys.argv[1], sys.argv[2], sys.argv[3])
 PY
-)
+verify_runtime_snapshot
 if [[ "$ARM" == eager ]]; then
   echo "PASS: native_export.eager and ship_gate filled from exact-pinned CB serve"
 else

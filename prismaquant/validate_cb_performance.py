@@ -37,6 +37,7 @@ from .native_baseline_feasibility import (
     validate_native_baseline_certificate,
 )
 from .shipcard import (
+    _verify_gridbook_distribution_identity,
     assert_weight_stat_attestation,
     compute_model_sha,
     fill_slot,
@@ -134,6 +135,7 @@ _REQUIRED_SERVER_ENVIRONMENT = {
     for name, value in _PERFORMANCE_SERVER_ENVIRONMENT.items()
     if value is not None
 }
+_REQUIRED_SERVER_ENVIRONMENT["PYTHONSAFEPATH"] = "1"
 
 
 class CBPerformanceValidationError(RuntimeError):
@@ -172,6 +174,17 @@ def _load_json(path: Path, *, label: str) -> tuple[dict[str, Any], bytes]:
 
 def _digest(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
+
+
+def _canonical_json_sha256(payload: object) -> str:
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return _digest(encoded)
 
 
 def _require_sha(value: object, where: str) -> str:
@@ -1219,6 +1232,7 @@ def _load_performance_serve_manifests(
     *,
     evidence_base: Path,
     attestation_references: Mapping[str, Any],
+    pin_repository: str,
     pin_commit: str,
     pin_version: str,
     label: str,
@@ -1423,6 +1437,21 @@ def _load_performance_serve_manifests(
         "version": pin_version,
     }:
         raise CBPerformanceValidationError(f"{label} live server uses the wrong Gridbook pin")
+    distribution_problems = _verify_gridbook_distribution_identity(
+        "perf.matched_budget_parity",
+        manifest,
+        {
+            "repository": pin_repository,
+            "commit": pin_commit,
+            "version": pin_version,
+        },
+        canonical_sha=_canonical_json_sha256,
+    )
+    if distribution_problems:
+        raise CBPerformanceValidationError(
+            f"{label} live server does not attest the exact imported Gridbook "
+            f"distribution: {distribution_problems[0]}"
+        )
     packages = manifest.get("package_versions")
     if (
         not isinstance(packages, Mapping)
@@ -2719,6 +2748,7 @@ def validate_cb_performance(
             attestation_references=raw_cell.get(
                 "candidate_serve_attestations", {}
             ),
+            pin_repository=pin.repository,
             pin_commit=pin.commit,
             pin_version=pin.version,
             label=f"cell {cell_id} candidate",
@@ -2739,6 +2769,7 @@ def validate_cb_performance(
             attestation_references=raw_cell.get(
                 "baseline_serve_attestations", {}
             ),
+            pin_repository=pin.repository,
             pin_commit=pin.commit,
             pin_version=pin.version,
             label=f"cell {cell_id} baseline",

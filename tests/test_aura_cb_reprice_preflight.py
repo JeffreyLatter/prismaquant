@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import subprocess
 
 from tools.aura_cb_reprice_preflight import (
     DSV4_EXPERT_UNITS,
@@ -15,6 +16,15 @@ from tools.aura_cb_reprice_preflight import (
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _container_programs(driver: str) -> tuple[str, str]:
+    marker = 'docker "${docker_args[@]}" --entrypoint bash "$IMAGE_ID" -lc \''
+    pieces = driver.split(marker)
+    assert len(pieces) == 3
+    dense = pieces[1].split("\n'", 1)[0]
+    dsv4 = pieces[2].split("\n'", 1)[0]
+    return dense, dsv4
 
 
 def test_source_rate_domain_is_not_demand_truncated():
@@ -346,6 +356,35 @@ def test_driver_takes_atomic_mutex_before_any_gpu_container():
     assert driver.count("--entrypoint bash \"$IMAGE_ID\"") == 2
     assert '--entrypoint bash "$IMAGE"' not in driver
     assert "container_runtime_identity.py" in driver
+    assert "prismaquant_runtime_snapshot.py" in driver
+    assert "RUNTIME_SNAPSHOT_CACHE_ROOT" in driver
+    assert "status --porcelain --untracked-files=all" in driver
+    assert 'rev-parse --verify "${IDENTITY_GIT_COMMIT}^{tree}"' in driver
+    assert '"$RUNTIME_SNAPSHOT_TREE" != "$IDENTITY_GIT_TREE"' in driver
+    assert "--cache-root \"$RUNTIME_SNAPSHOT_CACHE_ROOT\"" in driver
+    assert "--source-root \"$RUNTIME_SNAPSHOT\"" in driver
+    assert (
+        '"$PYTHON_BIN" "$RUNTIME_SNAPSHOT_IDENTITY_TOOL" source-sha256'
+        in driver
+    )
+    assert (
+        '"$PYTHON_BIN" "$RUNTIME_SNAPSHOT_IDENTITY_TOOL" '
+        '"${runtime_identity_args[@]}"'
+        in driver
+    )
+    assert '"$PYTHON_BIN" "$RUNTIME_SNAPSHOT_VERIFY_TOOL" verify' in driver
+    assert '"$PYTHON_BIN" "$RUNTIME_SNAPSHOT_TOOL" verify' not in driver
+    assert (
+        '"$PYTHON_BIN" "$RUNTIME_IDENTITY_TOOL" source-sha256'
+        not in driver
+    )
+    assert '-v "$RUNTIME_SNAPSHOT:/pq:ro"' in driver
+    assert '-v "$REPO_ROOT:/pq:ro"' not in driver
+    assert driver.count("--expected-tree") == 3
+    assert driver.count("--expected-closure-sha256") == 3
+    assert driver.count("PQ_RUNTIME_PRISMAQUANT_SOURCE_SHA256") == 3
+    assert '-e "PYTHONNOUSERSITE=1"' in driver
+    assert '-e "PYTHONSAFEPATH=1"' in driver
     assert "write-or-verify" in driver
     assert driver.count("verify-mounted") == 2
     assert "--require-receipt-image" in driver
@@ -364,7 +403,46 @@ def test_driver_takes_atomic_mutex_before_any_gpu_container():
     assert 'if [[ ! -s "$CACHE_MANIFEST" ]]' not in driver
     assert 'if [[ ! -s "$COST_OUTPUT" ]]' not in driver
     assert "run-pipeline.sh" not in driver  # cost-only, no accidental export
+    assert "> >(tee" not in driver
+    assert (
+        "' 2>&1 | tee -a \"$WORK_DIR/logs/aura_cost.log\"" in driver
+    )
+    assert (
+        "' 2>&1 | tee -a \"$WORK_DIR/logs/dsv4_aura_cb_reprice.log\""
+        in driver
+    )
+    dense_container, dsv4_container = _container_programs(driver)
+    assert dense_container.count("verify_pq_runtime") == 3  # definition + two calls
+    dense_second_verify_at = dense_container.rindex("verify_pq_runtime")
+    dense_second_producer_at = dense_container.index(
+        "exec python3 -m prismaquant.aura_cost"
+    )
+    assert dense_second_verify_at < dense_second_producer_at
+    assert not dense_container[
+        dense_second_verify_at + len("verify_pq_runtime"):dense_second_producer_at
+    ].strip()
+    mounted_verify_at = dsv4_container.rindex("verify-mounted")
+    producer_at = dsv4_container.index(
+        "exec python3 -m prismaquant.dsv4_aura_cb_reprice"
+    )
+    assert mounted_verify_at < producer_at
+    assert "python3 -m prismaquant" not in dsv4_container[:producer_at]
+    mounted_identity_end = dsv4_container.index(
+        '  --expected-git-commit "$PQ_RUNTIME_PRISMAQUANT_GIT_COMMIT"',
+        mounted_verify_at,
+    ) + len('  --expected-git-commit "$PQ_RUNTIME_PRISMAQUANT_GIT_COMMIT"')
+    assert not dsv4_container[mounted_identity_end:producer_at].strip()
     assert "\nimport torch" not in preflight
     assert "\nfrom torch" not in preflight
     assert "\nimport transformers" not in preflight
     assert "\nfrom transformers" not in preflight
+
+
+def test_driver_container_entrypoints_are_valid_bash():
+    driver = (ROOT / "tools/run_aura_cb_reprice.sh").read_text()
+    for name, program in zip(("dense", "dsv4"), _container_programs(driver)):
+        result = subprocess.run(
+            ["bash", "-n"], input=program, text=True, capture_output=True,
+            check=False,
+        )
+        assert result.returncode == 0, f"{name}: {result.stderr}"

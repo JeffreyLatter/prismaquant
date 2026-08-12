@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -17,6 +18,8 @@ def test_server_environment_allowlist_is_the_full_gridbook_registry():
     assert serve_fingerprint.SERVER_ENV_ALLOWLIST == (
         "PQ_GRIDBOOK_RUNTIME_COMMIT",
         "PQ_GRIDBOOK_RUNTIME_VERSION",
+        "PYTHONPATH",
+        "PYTHONSAFEPATH",
         *GRIDBOOK_ENVIRONMENT_ALLOWLIST,
     )
 
@@ -266,7 +269,14 @@ def _fake_gridbook_distribution(
         def locate_file(item):
             return tmp_path / str(item)
 
-    return FakeDistribution(), direct_name
+    init_path = tmp_path / "gridbook" / "__init__.py"
+    module = SimpleNamespace(
+        __version__="0.8.4",
+        __file__=str(init_path),
+        __path__=[str(init_path.parent)],
+        __spec__=SimpleNamespace(origin=str(init_path)),
+    )
+    return FakeDistribution(), direct_name, module
 
 
 def test_gridbook_distribution_attestation_binds_vcs_record_and_sources(
@@ -277,17 +287,27 @@ def test_gridbook_distribution_attestation_binds_vcs_record_and_sources(
         "commit": "5" * 40,
         "version": "0.8.4",
     }
-    distribution, _direct_name = _fake_gridbook_distribution(tmp_path, pin)
+    distribution, _direct_name, module = _fake_gridbook_distribution(tmp_path, pin)
     monkeypatch.setattr(
         serve_fingerprint.importlib_metadata,
         "distribution",
         lambda name: distribution,
+    )
+    monkeypatch.setattr(
+        serve_fingerprint.importlib,
+        "import_module",
+        lambda name: module,
     )
 
     evidence = serve_fingerprint.gridbook_distribution_provenance(pin)
     assert evidence["repository"] == pin["repository"]
     assert evidence["direct_url"]["vcs_info"]["commit_id"] == pin["commit"]
     assert evidence["record_identity"]["sha256"]
+    assert evidence["schema"] == "prismaquant.installed_gridbook_distribution/2"
+    assert evidence["import_origin"]["module_file"].endswith(
+        "/gridbook/__init__.py"
+    )
+    assert evidence["import_origin"]["identity_sha256"]
     assert evidence["source_files_sha256"] == serve_fingerprint._canonical_sha256(
         evidence["source_files"]
     )
@@ -301,7 +321,7 @@ def test_gridbook_distribution_accepts_exact_local_vcs_transport(
         "commit": "5" * 40,
         "version": "0.8.4",
     }
-    distribution, _direct_name = _fake_gridbook_distribution(
+    distribution, _direct_name, module = _fake_gridbook_distribution(
         tmp_path,
         pin,
         transport_url="file:///tmp/gridbook-runtime-555555555555",
@@ -310,6 +330,11 @@ def test_gridbook_distribution_accepts_exact_local_vcs_transport(
         serve_fingerprint.importlib_metadata,
         "distribution",
         lambda name: distribution,
+    )
+    monkeypatch.setattr(
+        serve_fingerprint.importlib,
+        "import_module",
+        lambda name: module,
     )
 
     evidence = serve_fingerprint.gridbook_distribution_provenance(pin)
@@ -330,7 +355,7 @@ def test_gridbook_distribution_attestation_rejects_non_vcs_direct_url(
         "commit": "5" * 40,
         "version": "0.8.4",
     }
-    distribution, direct_name = _fake_gridbook_distribution(tmp_path, pin)
+    distribution, direct_name, module = _fake_gridbook_distribution(tmp_path, pin)
     (tmp_path / direct_name).write_text(
         json.dumps({"url": "file:///tmp/gridbook", "dir_info": {}}),
         encoding="utf-8",
@@ -340,6 +365,104 @@ def test_gridbook_distribution_attestation_rejects_non_vcs_direct_url(
         "distribution",
         lambda name: distribution,
     )
+    monkeypatch.setattr(
+        serve_fingerprint.importlib,
+        "import_module",
+        lambda name: module,
+    )
 
     with pytest.raises(ValueError, match="PEP 610"):
+        serve_fingerprint.gridbook_distribution_provenance(pin)
+
+
+def test_gridbook_distribution_rejects_stale_pythonpath_shadow(
+    tmp_path, monkeypatch,
+):
+    pin = {
+        "repository": "https://github.com/RobTand/gridbook.git",
+        "commit": "5" * 40,
+        "version": "0.8.4",
+    }
+    installed = tmp_path / "installed"
+    distribution, _direct_name, _module = _fake_gridbook_distribution(
+        installed, pin
+    )
+    stale_init = tmp_path / "stale-pythonpath" / "gridbook" / "__init__.py"
+    stale_init.parent.mkdir(parents=True)
+    stale_init.write_text('__version__ = "0.8.4"\n', encoding="utf-8")
+    stale_module = SimpleNamespace(
+        __version__="0.8.4",
+        __file__=str(stale_init),
+        __path__=[str(stale_init.parent)],
+        __spec__=SimpleNamespace(origin=str(stale_init)),
+    )
+    monkeypatch.setattr(
+        serve_fingerprint.importlib_metadata,
+        "distribution",
+        lambda name: distribution,
+    )
+    monkeypatch.setattr(
+        serve_fingerprint.importlib,
+        "import_module",
+        lambda name: stale_module,
+    )
+
+    with pytest.raises(ValueError, match="CWD/PYTHONPATH shadow"):
+        serve_fingerprint.gridbook_distribution_provenance(pin)
+
+
+def test_gridbook_distribution_rejects_extra_import_path_outside_distribution(
+    tmp_path, monkeypatch,
+):
+    pin = {
+        "repository": "https://github.com/RobTand/gridbook.git",
+        "commit": "5" * 40,
+        "version": "0.8.4",
+    }
+    installed = tmp_path / "installed"
+    distribution, _direct_name, module = _fake_gridbook_distribution(
+        installed, pin
+    )
+    stale_path = tmp_path / "stale-pythonpath" / "gridbook"
+    stale_path.mkdir(parents=True)
+    module.__path__.append(str(stale_path))
+    monkeypatch.setattr(
+        serve_fingerprint.importlib_metadata,
+        "distribution",
+        lambda name: distribution,
+    )
+    monkeypatch.setattr(
+        serve_fingerprint.importlib,
+        "import_module",
+        lambda name: module,
+    )
+
+    with pytest.raises(ValueError, match="escapes the selected installed"):
+        serve_fingerprint.gridbook_distribution_provenance(pin)
+
+
+def test_gridbook_distribution_rejects_imported_version_mismatch(
+    tmp_path, monkeypatch,
+):
+    pin = {
+        "repository": "https://github.com/RobTand/gridbook.git",
+        "commit": "5" * 40,
+        "version": "0.8.4",
+    }
+    distribution, _direct_name, module = _fake_gridbook_distribution(
+        tmp_path, pin
+    )
+    module.__version__ = "0.1.0"
+    monkeypatch.setattr(
+        serve_fingerprint.importlib_metadata,
+        "distribution",
+        lambda name: distribution,
+    )
+    monkeypatch.setattr(
+        serve_fingerprint.importlib,
+        "import_module",
+        lambda name: module,
+    )
+
+    with pytest.raises(ValueError, match="imported Gridbook version"):
         serve_fingerprint.gridbook_distribution_provenance(pin)

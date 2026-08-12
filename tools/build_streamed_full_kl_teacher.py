@@ -18,7 +18,11 @@ import time
 
 import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+_TOOLS_ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(_TOOLS_ROOT))
+from prismaquant_source_bootstrap import activate_prismaquant_source
+
+activate_prismaquant_source()
 
 try:  # package mode
     from .full_kl_teacher_payload import (

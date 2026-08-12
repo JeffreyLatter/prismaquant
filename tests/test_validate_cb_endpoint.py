@@ -44,6 +44,54 @@ _RESOLVED_GRAPH_CONFIG = (
 _SERVED_MODEL = cbv.DSV4_SERVED_MODEL_PREFIX + "a" * 32
 
 
+def _gridbook_distribution(pin: dict) -> dict:
+    package_root = "/usr/local/lib/python3.12/site-packages/gridbook"
+    import_origin = {
+        "schema": "prismaquant.gridbook_import_origin/1",
+        "module_name": "gridbook",
+        "imported_version": pin["version"],
+        "distribution_package_root": package_root,
+        "module_file": f"{package_root}/__init__.py",
+        "module_search_locations": [package_root],
+    }
+    import_origin["identity_sha256"] = cbv._canonical_json_sha256(import_origin)
+    source_files = {
+        name: {"bytes": 123, "sha256": "c" * 64}
+        for name in (
+            "gridbook/__init__.py",
+            "gridbook/cuda_ext.py",
+            "gridbook/plugin.py",
+            "gridbook/runtime_contract.json",
+            "gridbook/source_passthrough.py",
+            "gridbook/csrc/cb_gemv.cu",
+            "gridbook/csrc/mxfp8_dense_gemm.cu",
+        )
+    }
+    return {
+        "schema": "prismaquant.installed_gridbook_distribution/2",
+        "name": "gridbook",
+        "repository": pin["repository"],
+        "version": pin["version"],
+        "direct_url": {
+            "url": f"file:///tmp/gridbook-runtime-{pin['commit'][:12]}",
+            "vcs_info": {
+                "vcs": "git",
+                "requested_revision": pin["commit"],
+                "commit_id": pin["commit"],
+            },
+        },
+        "direct_url_path": "gridbook-0.8.4.dist-info/direct_url.json",
+        "direct_url_identity": {"bytes": 123, "sha256": "d" * 64},
+        "metadata_path": "gridbook-0.8.4.dist-info/METADATA",
+        "metadata_identity": {"bytes": 123, "sha256": "e" * 64},
+        "record_path": "gridbook-0.8.4.dist-info/RECORD",
+        "record_identity": {"bytes": 123, "sha256": "f" * 64},
+        "source_files": source_files,
+        "source_files_sha256": cbv._canonical_json_sha256(source_files),
+        "import_origin": import_origin,
+    }
+
+
 def _models_payload(
     model_id: str = _SERVED_MODEL,
     *,
@@ -117,6 +165,7 @@ def _manifest(
         **dict(CANONICAL_GOLD_SET_ENVIRONMENT),
         "PQ_GRIDBOOK_RUNTIME_COMMIT": pin["commit"],
         "PQ_GRIDBOOK_RUNTIME_VERSION": pin["version"],
+        "PYTHONSAFEPATH": "1",
         "PRISMAQUANT_CB_EXT_DIR": "/opt/gridbook/ext-cache",
         "PRISMAQUANT_PRELOAD_FUSED": "1",
     }
@@ -180,6 +229,7 @@ def _manifest(
             "commit": pin["commit"],
             "version": pin["version"],
         },
+        "gridbook_distribution": _gridbook_distribution(pin),
         "resident_extensions": ["prismaquant_cb_ext.so"],
         "residency_readable": True,
         "processes": processes,
@@ -340,6 +390,48 @@ def test_manifest_fingerprint_cannot_be_stale():
             arm="graph",
             expected_served_model=_SERVED_MODEL,
             requires_moe_marlin=False,
+        )
+
+
+def test_manifest_rejects_resigned_gridbook_import_shadow():
+    manifest = _manifest("eager")
+    origin = manifest["gridbook_distribution"]["import_origin"]
+    origin["module_file"] = "/tmp/stale/gridbook/__init__.py"
+    origin["module_search_locations"] = ["/tmp/stale/gridbook"]
+    origin["identity_sha256"] = cbv._canonical_json_sha256({
+        key: value for key, value in origin.items()
+        if key != "identity_sha256"
+    })
+    manifest["serve_fingerprint"] = fingerprint(manifest)
+    with pytest.raises(cbv.CBEndpointValidationError, match="imported Gridbook"):
+        cbv.validate_serve_manifest(
+            manifest,
+            arm="eager",
+            expected_served_model=_SERVED_MODEL,
+            requires_moe_marlin=False,
+            expected_model_sha="c" * 64,
+        )
+
+
+def test_manifest_rejects_explicit_server_pythonpath_even_when_resigned():
+    manifest = _manifest("eager")
+    process_environment = manifest["server_process_environment"]
+    process_environment["values"]["PYTHONPATH"] = "/tmp/stale"
+    manifest["pq_env"]["PYTHONPATH"] = "/tmp/stale"
+    for row in process_environment["processes"]:
+        row["values"]["PYTHONPATH"] = "/tmp/stale"
+        row["sha256"] = cbv._canonical_json_sha256(row["values"])
+    manifest["serve_fingerprint"] = fingerprint(manifest)
+    with pytest.raises(
+        cbv.CBEndpointValidationError,
+        match="exact live-process Gridbook contract",
+    ):
+        cbv.validate_serve_manifest(
+            manifest,
+            arm="eager",
+            expected_served_model=_SERVED_MODEL,
+            requires_moe_marlin=False,
+            expected_model_sha="c" * 64,
         )
 
 
@@ -952,11 +1044,12 @@ def test_driver_and_lane_declare_two_isolated_arms_and_guards():
     assert cbv.DSV4_GRAPH_COMPILATION_CONFIG in text
     assert 'WATCHDOG_GIB' in text and 'READY_FLOOR_GIB' in text
     assert 'START_FLOOR_GIB < 110' in text
-    assert 'serve_fingerprint.py write' in text
+    assert 'serve-fingerprint write' in text
+    assert '/repo/tools/serve_fingerprint.py write' not in text
     assert 'prismaquant.validate_cb_endpoint' in text
     assert '--defer-shipcard-fill' in text
     assert 'if [[ "$ARM" == eager ]]; then' in text
-    assert 'python3 -m prismaquant.validate_quantized_model' in text
+    assert 'pq_run_module prismaquant.validate_quantized_model' in text
     assert '--model-name "$SERVED_MODEL"' in text
     assert '--artifact-dir "$MODEL"' in text
     assert '--shipcard "$SHIPCARD"' in text
@@ -977,8 +1070,10 @@ def test_driver_and_lane_declare_two_isolated_arms_and_guards():
     assert text.rindex('docker stop -t 30 "$CID"') < text.index(
         'commit_deferred_result'
     )
-    endpoint_idx = text.index('python3 -m prismaquant.validate_cb_endpoint')
-    ship_gate_idx = text.index('python3 -m prismaquant.validate_quantized_model')
+    endpoint_idx = text.index('pq_run_module prismaquant.validate_cb_endpoint')
+    ship_gate_idx = text.index(
+        'pq_run_module prismaquant.validate_quantized_model'
+    )
     stop_idx = text.rindex('docker stop -t 30 "$CID"')
     assert endpoint_idx < ship_gate_idx < stop_idx
     assert 'contains_mxfp4_wire' in text

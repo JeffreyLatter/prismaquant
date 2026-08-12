@@ -14,7 +14,11 @@ from pathlib import Path
 
 import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+_TOOLS_ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(_TOOLS_ROOT))
+from prismaquant_source_bootstrap import activate_prismaquant_source
+
+activate_prismaquant_source()
 
 try:  # package mode (`python -m tools.measure_vllm_full_kl`)
     from .dsv4_gridbook_contract import exact_llm_contract

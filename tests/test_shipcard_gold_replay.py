@@ -59,7 +59,10 @@ _SOURCE = {
     "checkpoint_shards": 48,
     "checkpoint_tensors": 72_317,
 }
-_GOLD_ENV = dict(CANONICAL_GOLD_SET_ENVIRONMENT)
+_GOLD_ENV = {
+    **dict(CANONICAL_GOLD_SET_ENVIRONMENT),
+    "PYTHONSAFEPATH": "1",
+}
 
 
 def _canonical_sha(value: object) -> str:
@@ -292,8 +295,18 @@ def _gridbook_distribution(pin) -> dict:
             "gridbook/csrc/mxfp8_dense_gemm.cu",
         )
     }
+    package_root = "/usr/local/lib/python3.12/site-packages/gridbook"
+    import_origin = {
+        "schema": "prismaquant.gridbook_import_origin/1",
+        "module_name": "gridbook",
+        "imported_version": pin.version,
+        "distribution_package_root": package_root,
+        "module_file": f"{package_root}/__init__.py",
+        "module_search_locations": [package_root],
+    }
+    import_origin["identity_sha256"] = _canonical_sha(import_origin)
     return {
-        "schema": "prismaquant.installed_gridbook_distribution/1",
+        "schema": "prismaquant.installed_gridbook_distribution/2",
         "name": "gridbook",
         "repository": pin.repository,
         "version": pin.version,
@@ -313,6 +326,7 @@ def _gridbook_distribution(pin) -> dict:
         "record_identity": {"bytes": 123, "sha256": "f" * 64},
         "source_files": source_files,
         "source_files_sha256": _canonical_sha(source_files),
+        "import_origin": import_origin,
     }
 
 
@@ -704,6 +718,14 @@ def test_gold_receipt_survives_move_and_weight_reattest(tmp_path, monkeypatch):
                 "gridbook_distribution"
             ]["direct_url"]["vcs_info"].update(commit_id="0" * 40),
             "PEP 610 identity",
+        ),
+        (
+            lambda record, _root: record["metrics"]["serve_manifest"][
+                "gridbook_distribution"
+            ]["import_origin"].update(
+                module_file="/tmp/stale/gridbook/__init__.py"
+            ),
+            "imported Gridbook origin",
         ),
         (
             lambda record, _root: record["metrics"]["serve_manifest"].update(

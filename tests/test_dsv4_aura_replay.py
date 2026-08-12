@@ -13,6 +13,109 @@ from prismaquant.cost_stage_checkpoint import canonical_json_sha256
 import prismaquant.dsv4_aura_cb_reprice as campaign
 
 
+def _runtime_snapshot_env(monkeypatch, root: Path) -> tuple[str, str, str]:
+    commit = "a" * 40
+    tree = "b" * 40
+    closure = "c" * 64
+    monkeypatch.setenv("PRISMAQUANT_IDENTITY_GIT_COMMIT", commit)
+    monkeypatch.setenv("PRISMAQUANT_IDENTITY_GIT_DIRTY", "0")
+    monkeypatch.setenv("PQ_RUNTIME_PRISMAQUANT_ROOT", str(root))
+    monkeypatch.setenv("PQ_RUNTIME_PRISMAQUANT_TREE", tree)
+    monkeypatch.setenv(
+        "PQ_RUNTIME_PRISMAQUANT_CLOSURE_SHA256", closure
+    )
+    monkeypatch.setenv("PYTHONSAFEPATH", "1")
+    monkeypatch.setenv("PYTHONDONTWRITEBYTECODE", "1")
+    monkeypatch.setenv("PYTHONNOUSERSITE", "1")
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    return commit, tree, closure
+
+
+def _mock_runtime_identity() -> dict[str, str]:
+    return {
+        "snapshot": "/runtime-snapshot",
+        "commit": "a" * 40,
+        "tree": "b" * 40,
+        "closure_sha256": "c" * 64,
+    }
+
+
+def _mock_receipt() -> dict[str, object]:
+    runtime = _mock_runtime_identity()
+    return {
+        "receipt_sha256": "d" * 64,
+        "producer": {
+            key: runtime[key]
+            for key in ("commit", "tree", "closure_sha256")
+        },
+    }
+
+
+def test_replay_runtime_commit_requires_and_verifies_own_snapshot(
+    monkeypatch, tmp_path,
+):
+    root = tmp_path / "snapshot"
+    module_path = root / "prismaquant" / "dsv4_aura_cb_reprice.py"
+    verifier_path = root / "tools" / "prismaquant_runtime_snapshot.py"
+    module_path.parent.mkdir(parents=True)
+    verifier_path.parent.mkdir(parents=True)
+    module_path.write_text("# exact replay module fixture\n", encoding="utf-8")
+    verifier_path.write_text(
+        "def verify_snapshot(snapshot, *, expected_commit, expected_tree, "
+        "expected_closure_sha256):\n"
+        "    return {\n"
+        "        'snapshot': str(snapshot),\n"
+        "        'commit': expected_commit,\n"
+        "        'tree': expected_tree,\n"
+        "        'closure_sha256': expected_closure_sha256,\n"
+        "    }\n",
+        encoding="utf-8",
+    )
+    commit, _tree, _closure = _runtime_snapshot_env(
+        monkeypatch, root
+    )
+    monkeypatch.setattr(campaign, "__file__", str(module_path))
+    monkeypatch.setattr(
+        campaign,
+        "sys",
+        SimpleNamespace(
+            flags=SimpleNamespace(safe_path=True, no_user_site=True),
+            dont_write_bytecode=True,
+        ),
+    )
+    assert campaign._release_runtime_commit() == commit
+
+
+def test_replay_runtime_commit_refuses_caller_assertion_without_snapshot(
+    monkeypatch, tmp_path,
+):
+    _runtime_snapshot_env(monkeypatch, tmp_path / "absent-snapshot")
+    monkeypatch.delenv("PQ_RUNTIME_PRISMAQUANT_ROOT")
+    monkeypatch.setattr(
+        campaign,
+        "sys",
+        SimpleNamespace(
+            flags=SimpleNamespace(safe_path=True, no_user_site=True),
+            dont_write_bytecode=True,
+        ),
+    )
+    with pytest.raises(
+        campaign.DSv4CampaignError, match="runtime snapshot identity",
+    ):
+        campaign._release_runtime_commit()
+
+
+def test_replay_refuses_completion_receipt_from_different_runtime_tree():
+    receipt = _mock_receipt()
+    receipt["producer"]["tree"] = "e" * 40
+    with pytest.raises(
+        campaign.DSv4CampaignError, match="producer.tree",
+    ):
+        campaign._bind_completion_receipt_to_runtime(
+            receipt, _mock_runtime_identity()
+        )
+
+
 def _write_minimal_completed_replay(tmp_path: Path):
     from prismaquant.aura_cost import (
         AURA_CHECKPOINT_IDENTITY_SCHEMA,
@@ -259,6 +362,11 @@ def test_replay_control_plane_never_invokes_measurement(monkeypatch, tmp_path):
         work_dir=str(tmp_path / "work"),
     )
     prepared = SimpleNamespace(args=args)
+    receipt_path = (
+        Path(args.work_dir) / "artifacts" / "campaign_completion_receipt.json"
+    )
+    receipt_path.parent.mkdir(parents=True)
+    receipt_path.write_text("{}")
     def prepare(_args, *, publish_format_plan=True):
         assert publish_format_plan is False
         return prepared
@@ -266,6 +374,19 @@ def test_replay_control_plane_never_invokes_measurement(monkeypatch, tmp_path):
     monkeypatch.setattr(campaign, "prepare_dsv4_campaign", prepare)
     monkeypatch.setattr(
         campaign, "require_allocator_supersurrogate_support", lambda: None,
+    )
+    monkeypatch.setattr(
+        campaign, "_release_runtime_identity", _mock_runtime_identity,
+    )
+    monkeypatch.setattr(
+        campaign,
+        "verify_receipt_for_replay",
+        lambda *_args, **_kwargs: _mock_receipt(),
+    )
+    monkeypatch.setattr(
+        campaign,
+        "assert_replay_matches_completion_receipt",
+        lambda *_args, **_kwargs: None,
     )
     monkeypatch.setattr(
         campaign,
@@ -291,3 +412,79 @@ def test_replay_control_plane_never_invokes_measurement(monkeypatch, tmp_path):
     assert observed["allocator_output"].name == (
         "allocator-aura-activation-safe"
     )
+    assert observed["replay_provenance"][
+        "campaign_completion_receipt"
+    ]["receipt_sha256"] == "d" * 64
+
+
+def test_replay_refuses_before_prepare_without_terminal_receipt(
+    monkeypatch, tmp_path,
+):
+    args = SimpleNamespace(
+        replay_streamed_payload=str(tmp_path / "streamed_anchor_aura.pkl"),
+        work_dir=str(tmp_path / "work"),
+    )
+    monkeypatch.setattr(
+        campaign, "_release_runtime_identity", _mock_runtime_identity,
+    )
+
+    def refuse(*_args, **_kwargs):
+        raise campaign.CampaignCompletionError("receipt absent")
+
+    monkeypatch.setattr(campaign, "verify_receipt_for_replay", refuse)
+    monkeypatch.setattr(
+        campaign,
+        "prepare_dsv4_campaign",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("prepare must not run before receipt admission")
+        ),
+    )
+    with pytest.raises(
+        campaign.DSv4CampaignError, match="valid terminal campaign receipt",
+    ):
+        campaign.run_dsv4_anchor_replay(
+            args, control_plane=campaign.__name__,
+        )
+
+
+def test_replay_refuses_receipt_mismatch_after_deep_audit(monkeypatch, tmp_path):
+    args = SimpleNamespace(
+        replay_streamed_payload=str(tmp_path / "streamed_anchor_aura.pkl"),
+        work_dir=str(tmp_path / "work"),
+    )
+    receipt_path = (
+        Path(args.work_dir) / "artifacts" / "campaign_completion_receipt.json"
+    )
+    receipt_path.parent.mkdir(parents=True)
+    receipt_path.write_text("{}")
+    monkeypatch.setattr(
+        campaign, "_release_runtime_identity", _mock_runtime_identity,
+    )
+    monkeypatch.setattr(
+        campaign,
+        "verify_receipt_for_replay",
+        lambda *_args, **_kwargs: _mock_receipt(),
+    )
+    monkeypatch.setattr(
+        campaign, "prepare_dsv4_campaign",
+        lambda *_args, **_kwargs: SimpleNamespace(args=args),
+    )
+    monkeypatch.setattr(
+        campaign, "require_allocator_supersurrogate_support", lambda: None,
+    )
+    monkeypatch.setattr(
+        campaign, "_load_and_audit_completed_streamed_payload",
+        lambda *_args, **_kwargs: ({"costs": {}}, {"measurement_invoked": False}),
+    )
+    monkeypatch.setattr(
+        campaign, "assert_replay_matches_completion_receipt",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            campaign.CampaignCompletionError("payload set differs")
+        ),
+    )
+    with pytest.raises(
+        campaign.DSv4CampaignError, match="differs from terminal receipt",
+    ):
+        campaign.run_dsv4_anchor_replay(
+            args, control_plane=campaign.__name__,
+        )

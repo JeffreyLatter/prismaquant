@@ -8,7 +8,7 @@ PREFLIGHT="${REPO_ROOT}/tools/aura_cb_reprice_preflight.py"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 GPU_LOCK="${GPU_LOCK:-/home/rob/dq-runs/gpu.lock}"
 DATASET="${DATASET:-/home/rob/dq-runs/calibration/diverse-v1.jsonl}"
-RUNTIME_IDENTITY_TOOL="${REPO_ROOT}/tools/container_runtime_identity.py"
+RUNTIME_SNAPSHOT_TOOL="${REPO_ROOT}/tools/prismaquant_runtime_snapshot.py"
 # The image name is only a human-facing repository label.  The digest is the
 # execution identity: local tags on the Spark have repeatedly been repointed
 # between materially different Gridbook/Transformers environments.
@@ -36,8 +36,8 @@ Actions:
 Preflight/launch also require AURA_CB_LAUNCH_RECEIPT to name an external,
 HEAD-bound implementation/test attestation. Inventory does not.
 
-The current branch is expected to FAIL launch preflight until the streamed,
-identity-resumable AURA/CB capabilities named by the report are implemented.
+Launch is admitted only when the streamed, identity-resumable AURA/CB
+capabilities and every receipt-bound preflight gate are present and verified.
 EOF
 }
 
@@ -70,6 +70,7 @@ fi
 CB_CODEBOOK_BUNDLE="${CB_CODEBOOK_BUNDLE:-}"
 CB_ROUTED_MOE_BOOK_SELECTION="${CB_ROUTED_MOE_BOOK_SELECTION:-}"
 AURA_CB_LAUNCH_RECEIPT="${AURA_CB_LAUNCH_RECEIPT:-}"
+RUNTIME_SNAPSHOT_CACHE_ROOT="${PRISMAQUANT_RUNTIME_SNAPSHOT_CACHE:-${RUN_ROOT}/runtime-source-cache}"
 
 fp8_menu() {
   local first="$1"
@@ -217,13 +218,13 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 # Producer identity for resumable pair shards.  The image ships no git binary
-# and /pq is an immutable read-only mount, so the in-container producer cannot
-# resolve its own commit -- which is the case PRISMAQUANT_IDENTITY_GIT_COMMIT
-# documents ("for immutable/container source mounts whose checkout metadata is
-# unavailable").  Resolve it on the host, where the preflight has just bound
-# this exact commit to the launch receipt and asserted a clean tree over
-# prismaquant/ tools/ tests/, and hand the value in.  Fail closed: an
-# unresolvable commit is not a useful identity.
+# and /pq is an immutable read-only snapshot, so the in-container producer
+# cannot resolve its own commit -- which is the case
+# PRISMAQUANT_IDENTITY_GIT_COMMIT documents ("for immutable/container source
+# mounts whose checkout metadata is unavailable").  Resolve it on the host,
+# where the preflight has just bound this exact commit to the launch receipt,
+# and hand the value in.  Fail closed: an unresolvable commit is not a useful
+# identity.
 IDENTITY_GIT_COMMIT="$(
   git -C "$REPO_ROOT" rev-parse --verify 'HEAD^{commit}' 2>/dev/null || true
 )"
@@ -231,12 +232,74 @@ if [[ ! "$IDENTITY_GIT_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
   echo "[aura-cb] BLOCK: cannot resolve $REPO_ROOT HEAD for producer identity" >&2
   exit 2
 fi
+IDENTITY_GIT_TREE="$(
+  git -C "$REPO_ROOT" rev-parse --verify "${IDENTITY_GIT_COMMIT}^{tree}" \
+    2>/dev/null || true
+)"
+if [[ ! "$IDENTITY_GIT_TREE" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "[aura-cb] BLOCK: cannot resolve the reviewed producer tree" >&2
+  exit 2
+fi
 IDENTITY_GIT_DIRTY="$(
-  git -C "$REPO_ROOT" status --porcelain --untracked-files=all -- \
-    prismaquant tools tests docs/ARCHITECTURE.md
+  git -C "$REPO_ROOT" status --porcelain --untracked-files=all
 )"
 if [[ -n "$IDENTITY_GIT_DIRTY" ]]; then
-  echo "[aura-cb] BLOCK: producer identity scope became dirty after preflight" >&2
+  echo "[aura-cb] BLOCK: producer worktree became dirty after preflight" >&2
+  exit 2
+fi
+
+# Execute from a standalone archive of the exact reviewed commit, never the
+# live worktree.  The helper publishes atomically under a commit/tree-addressed
+# cache and verifies every tracked regular file and symlink before returning.
+# Parse its machine output without importing PrismaQuant, derive the package
+# hash used by the existing resumable-runtime identity, then explicitly replay
+# the full host-side closure check with all caller-attested identities.
+RUNTIME_SNAPSHOT_JSON="$(
+  "$PYTHON_BIN" "$RUNTIME_SNAPSHOT_TOOL" materialize \
+    --source-root "$REPO_ROOT" \
+    --cache-root "$RUNTIME_SNAPSHOT_CACHE_ROOT" \
+    --commit "$IDENTITY_GIT_COMMIT"
+)"
+snapshot_field() {
+  local field="$1"
+  "$PYTHON_BIN" -c '
+import json
+import sys
+
+payload = json.load(sys.stdin)
+value = payload[sys.argv[1]]
+if not isinstance(value, str) or not value:
+    raise SystemExit(f"runtime snapshot field {sys.argv[1]!r} is absent")
+print(value)
+' "$field" <<<"$RUNTIME_SNAPSHOT_JSON"
+}
+RUNTIME_SNAPSHOT="$(snapshot_field snapshot)"
+RUNTIME_SNAPSHOT_TREE="$(snapshot_field tree)"
+RUNTIME_SNAPSHOT_CLOSURE_SHA256="$(snapshot_field closure_sha256)"
+if [[ "$RUNTIME_SNAPSHOT_TREE" != "$IDENTITY_GIT_TREE" \
+      || ! "$RUNTIME_SNAPSHOT_CLOSURE_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+  echo "[aura-cb] BLOCK: runtime snapshot differs from the reviewed Git tree" >&2
+  exit 2
+fi
+RUNTIME_SNAPSHOT_IDENTITY_TOOL="$RUNTIME_SNAPSHOT/tools/container_runtime_identity.py"
+RUNTIME_SNAPSHOT_VERIFY_TOOL="$RUNTIME_SNAPSHOT/tools/prismaquant_runtime_snapshot.py"
+RUNTIME_SNAPSHOT_SOURCE_SHA256="$(
+  "$PYTHON_BIN" "$RUNTIME_SNAPSHOT_IDENTITY_TOOL" source-sha256 \
+    --source-root "$RUNTIME_SNAPSHOT"
+)"
+if [[ ! "$RUNTIME_SNAPSHOT_SOURCE_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+  echo "[aura-cb] BLOCK: runtime snapshot returned malformed package hash" >&2
+  exit 2
+fi
+"$PYTHON_BIN" "$RUNTIME_SNAPSHOT_VERIFY_TOOL" verify \
+  --snapshot "$RUNTIME_SNAPSHOT" \
+  --expected-commit "$IDENTITY_GIT_COMMIT" \
+  --expected-tree "$RUNTIME_SNAPSHOT_TREE" \
+  --expected-closure-sha256 "$RUNTIME_SNAPSHOT_CLOSURE_SHA256"
+if [[ "$(git -C "$REPO_ROOT" rev-parse --verify 'HEAD^{commit}')" \
+      != "$IDENTITY_GIT_COMMIT" \
+      || -n "$(git -C "$REPO_ROOT" status --porcelain --untracked-files=all)" ]]; then
+  echo "[aura-cb] BLOCK: producer HEAD changed while materializing its snapshot" >&2
   exit 2
 fi
 
@@ -250,7 +313,7 @@ runtime_identity_args=(
   write-or-verify
   --identity "$RUNTIME_IDENTITY_PATH"
   --checkpoint-root "$WORK_DIR/checkpoints"
-  --source-root "$REPO_ROOT"
+  --source-root "$RUNTIME_SNAPSHOT"
   --target "$TARGET"
   --image-ref "$IMAGE"
   --image-id "$IMAGE_ID"
@@ -260,22 +323,27 @@ runtime_identity_args=(
 if [[ "$TARGET" == "dsv4" ]]; then
   runtime_identity_args+=(--require-receipt-image)
 fi
-"$PYTHON_BIN" "$RUNTIME_IDENTITY_TOOL" "${runtime_identity_args[@]}"
+"$PYTHON_BIN" "$RUNTIME_SNAPSHOT_IDENTITY_TOOL" "${runtime_identity_args[@]}"
 
 docker_args=(
   run --rm --name "$CONTAINER_NAME" --gpus all --ipc=host
-  -v "$REPO_ROOT:/pq:ro"
+  -v "$RUNTIME_SNAPSHOT:/pq:ro"
   -v "$MODEL_PATH:$MODEL_PATH:ro"
   -v "$WORK_DIR:$WORK_DIR"
   -v "$DATASET:$DATASET:ro"
   -e "PYTHONPATH=/pq"
   -e "PYTHONDONTWRITEBYTECODE=1"
+  -e "PYTHONNOUSERSITE=1"
+  -e "PYTHONSAFEPATH=1"
   -e "PRISMAQUANT_IDENTITY_GIT_COMMIT=$IDENTITY_GIT_COMMIT"
   -e "PQ_RUNTIME_IDENTITY_PATH=$RUNTIME_IDENTITY_PATH"
   -e "PQ_RUNTIME_IMAGE_REF=$IMAGE"
   -e "PQ_RUNTIME_IMAGE_ID=$IMAGE_ID"
   -e "PQ_RUNTIME_PRISMAQUANT_ROOT=/pq"
   -e "PQ_RUNTIME_PRISMAQUANT_GIT_COMMIT=$IDENTITY_GIT_COMMIT"
+  -e "PQ_RUNTIME_PRISMAQUANT_TREE=$RUNTIME_SNAPSHOT_TREE"
+  -e "PQ_RUNTIME_PRISMAQUANT_CLOSURE_SHA256=$RUNTIME_SNAPSHOT_CLOSURE_SHA256"
+  -e "PQ_RUNTIME_PRISMAQUANT_SOURCE_SHA256=$RUNTIME_SNAPSHOT_SOURCE_SHA256"
   -e "MODEL_PATH=$MODEL_PATH"
   -e "WORK_DIR=$WORK_DIR"
   -e "DATASET=$DATASET"
@@ -385,20 +453,41 @@ PY
 fi
 
 container_started=1
+# The terminal producer is exec'd inside the container, while this host-side
+# tee remains alive until Docker closes stdout.  With the launcher's pipefail
+# this both drains the final log bytes and preserves producer failure status.
+# The dense aura log is intentionally a superset containing its verified
+# cached-menu prelude; cached_menu.log remains the phase-specific copy.
 if [[ "$TARGET" == "dense" ]]; then
   docker "${docker_args[@]}" --entrypoint bash "$IMAGE_ID" -lc '
 set -euo pipefail
+verify_pq_runtime() {
+python3 /pq/tools/prismaquant_runtime_snapshot.py verify \
+  --snapshot "$PQ_RUNTIME_PRISMAQUANT_ROOT" \
+  --expected-commit "$PQ_RUNTIME_PRISMAQUANT_GIT_COMMIT" \
+  --expected-tree "$PQ_RUNTIME_PRISMAQUANT_TREE" \
+  --expected-closure-sha256 "$PQ_RUNTIME_PRISMAQUANT_CLOSURE_SHA256"
+OBSERVED_PQ_SOURCE_SHA256="$(
+  python3 /pq/tools/container_runtime_identity.py source-sha256 \
+    --source-root "$PQ_RUNTIME_PRISMAQUANT_ROOT"
+)"
+if [[ "$OBSERVED_PQ_SOURCE_SHA256" != "$PQ_RUNTIME_PRISMAQUANT_SOURCE_SHA256" ]]; then
+  echo "[aura-cb] BLOCK: mounted PrismaQuant package hash differs from host snapshot" >&2
+  exit 2
+fi
 python3 /pq/tools/container_runtime_identity.py verify-mounted \
   --identity "$PQ_RUNTIME_IDENTITY_PATH" \
   --expected-root "$PQ_RUNTIME_PRISMAQUANT_ROOT" \
   --expected-image-ref "$PQ_RUNTIME_IMAGE_REF" \
   --expected-image-id "$PQ_RUNTIME_IMAGE_ID" \
   --expected-git-commit "$PQ_RUNTIME_PRISMAQUANT_GIT_COMMIT"
+}
 CACHE_MANIFEST="$WORK_DIR/cache/production_weight_cache.pkl"
 COST_OUTPUT="$WORK_DIR/artifacts/cost_aura.pkl"
 # Never skip merely because a nonempty output exists.  The future resume
 # interfaces named here must validate model/menu/imatrix/bundle/calibration
 # identity per unit, then either resume or prove the result complete.
+verify_pq_runtime
 python3 -m prismaquant.build_production_cache \
   --model "$MODEL_PATH" \
   --output "$CACHE_MANIFEST" \
@@ -416,7 +505,8 @@ python3 -m prismaquant.build_production_cache \
   --resume \
   --col-weights "$CB_COL_WEIGHTS" \
   2>&1 | tee -a "$WORK_DIR/logs/cached_menu.log"
-python3 -m prismaquant.aura_cost \
+verify_pq_runtime
+exec python3 -m prismaquant.aura_cost \
   --model "$MODEL_PATH" \
   --cost-mode aura \
   --output "$COST_OUTPUT" \
@@ -436,27 +526,38 @@ python3 -m prismaquant.aura_cost \
   --min-free-gib "${AURA_MIN_FREE_GIB:-18}" \
   --accurate-chunk-bytes \
   --checkpoint-dir "$WORK_DIR/checkpoints/aura" \
-  --resume \
-  2>&1 | tee -a "$WORK_DIR/logs/aura_cost.log"
-echo "[aura-cb] dense cost ready: $COST_OUTPUT"
-'
+  --resume
+' 2>&1 | tee -a "$WORK_DIR/logs/aura_cost.log"
 else
   # The module named here is the bounded implementation seam: it must consume
   # the split source-rate plan, stream DSv4, checkpoint each unit, and write the
   # hybrid payload.  Preflight refuses before the lock while it is absent.
   docker "${docker_args[@]}" --entrypoint bash "$IMAGE_ID" -lc '
 set -euo pipefail
+if [[ "${PYTORCH_NO_CUDA_MEMORY_CACHING:-}" != "0" ]]; then
+  echo "[aura-cb] BLOCK: DSv4 requires the layer-local caching allocator" >&2
+  exit 2
+fi
+python3 /pq/tools/prismaquant_runtime_snapshot.py verify \
+  --snapshot "$PQ_RUNTIME_PRISMAQUANT_ROOT" \
+  --expected-commit "$PQ_RUNTIME_PRISMAQUANT_GIT_COMMIT" \
+  --expected-tree "$PQ_RUNTIME_PRISMAQUANT_TREE" \
+  --expected-closure-sha256 "$PQ_RUNTIME_PRISMAQUANT_CLOSURE_SHA256"
+OBSERVED_PQ_SOURCE_SHA256="$(
+  python3 /pq/tools/container_runtime_identity.py source-sha256 \
+    --source-root "$PQ_RUNTIME_PRISMAQUANT_ROOT"
+)"
+if [[ "$OBSERVED_PQ_SOURCE_SHA256" != "$PQ_RUNTIME_PRISMAQUANT_SOURCE_SHA256" ]]; then
+  echo "[aura-cb] BLOCK: mounted PrismaQuant package hash differs from host snapshot" >&2
+  exit 2
+fi
 python3 /pq/tools/container_runtime_identity.py verify-mounted \
   --identity "$PQ_RUNTIME_IDENTITY_PATH" \
   --expected-root "$PQ_RUNTIME_PRISMAQUANT_ROOT" \
   --expected-image-ref "$PQ_RUNTIME_IMAGE_REF" \
   --expected-image-id "$PQ_RUNTIME_IMAGE_ID" \
   --expected-git-commit "$PQ_RUNTIME_PRISMAQUANT_GIT_COMMIT"
-if [[ "${PYTORCH_NO_CUDA_MEMORY_CACHING:-}" != "0" ]]; then
-  echo "[aura-cb] BLOCK: DSv4 requires the layer-local caching allocator" >&2
-  exit 2
-fi
-python3 -m prismaquant.dsv4_aura_cb_reprice \
+exec python3 -m prismaquant.dsv4_aura_cb_reprice \
   --model "$MODEL_PATH" \
   --probe "$RUN_ROOT/prod-cal-0p7/artifacts/probe.pkl" \
   --activation-cache-dir "$RUN_ROOT/prod-cal-0p7/act" \
@@ -473,9 +574,8 @@ python3 -m prismaquant.dsv4_aura_cb_reprice \
   --n-probes "$AURA_NPROBES" \
   --resume \
   --cost-mode aura \
-  --require-production-cache \
-  2>&1 | tee -a "$WORK_DIR/logs/dsv4_aura_cb_reprice.log"
-'
+  --require-production-cache
+' 2>&1 | tee -a "$WORK_DIR/logs/dsv4_aura_cb_reprice.log"
 fi
 container_started=0
 trap - EXIT INT TERM

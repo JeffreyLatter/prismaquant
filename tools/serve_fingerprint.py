@@ -23,7 +23,8 @@ This module makes the stack an object:
 
 CLI (run inside the serving container, after READY):
 
-    python3 /repo/tools/serve_fingerprint.py write \
+    python3 -P /repo/tools/prismaquant_source_bootstrap.py \
+        run-tool serve-fingerprint write \
         --out /dqruns/<run>/exported/serve_manifest.json --image vllm-node:latest
 
 Stdlib only by construction: it must not import torch or vllm into the serving
@@ -38,6 +39,7 @@ import ast
 import base64
 import csv
 import hashlib
+import importlib
 import importlib.metadata as importlib_metadata
 import ipaddress
 import json
@@ -57,8 +59,10 @@ from urllib.parse import urlsplit, urlunsplit
 MANIFEST_SCHEMA = "prismaquant.serve_manifest/1"
 MANIFEST_FILENAME = "serve_manifest.json"
 GRIDBOOK_DISTRIBUTION_SCHEMA = (
-    "prismaquant.installed_gridbook_distribution/1"
+    "prismaquant.installed_gridbook_distribution/2"
 )
+GRIDBOOK_IMPORT_ORIGIN_SCHEMA = "prismaquant.gridbook_import_origin/1"
+GRIDBOOK_REPOSITORY = "https://github.com/RobTand/gridbook.git"
 GOLD_PRODUCER_IDENTITY_SCHEMA = "prismaquant.gold_producer_identity/1"
 MODELS_ENDPOINT_BINDING_SCHEMA = (
     "prismaquant.server_models_endpoint_binding/1"
@@ -71,6 +75,7 @@ _GOLD_PRODUCER_COMMON_FILES = (
     "tools/dsv4_gridbook_contract.py",
     "tools/dsv4_wikitext_inputs.py",
     "tools/prepare_dsv4_wikitext_inputs.py",
+    "tools/prismaquant_source_bootstrap.py",
     "tools/serve_fingerprint.py",
     "tools/spec_decode_guard.py",
 )
@@ -165,6 +170,18 @@ def _gridbook_environment_allowlist() -> tuple[str, ...]:
 SERVER_ENV_ALLOWLIST = (
     "PQ_GRIDBOOK_RUNTIME_COMMIT",
     "PQ_GRIDBOOK_RUNTIME_VERSION",
+    # The serving process must not carry an explicit Python module-search
+    # override.  ``server_environment_snapshot`` records only set values, so
+    # validators prove affirmative absence by requiring this allowlisted name
+    # to be missing from the exact process-environment projection.  The
+    # short-lived fingerprint writer is bootstrapped from the verified /repo
+    # snapshot with safe-path mode and no PYTHONPATH; it reads the independently
+    # running server PIDs from /proc and is not one of them.
+    "PYTHONPATH",
+    # Python's safe-path mode prevents the empty-string/script-directory entry
+    # from taking precedence over the exact VCS-installed Gridbook package.
+    # The imported module origin is attested separately below.
+    "PYTHONSAFEPATH",
     *_gridbook_environment_allowlist(),
 )
 
@@ -778,6 +795,187 @@ def _distribution_file(
     return relative, path
 
 
+def validate_gridbook_import_origin_identity(
+    payload: Mapping[str, Any],
+    *,
+    expected_version: str,
+) -> None:
+    """Replay the path-independent structural part of an import-origin proof.
+
+    The producer resolves symlinks and checks the live filesystem before it
+    writes this record.  Consumers may run outside the serving container, so
+    replay uses the recorded canonical absolute paths and their containment
+    relation rather than trying to dereference container-only paths.
+    """
+    required = {
+        "schema",
+        "module_name",
+        "imported_version",
+        "distribution_package_root",
+        "module_file",
+        "module_search_locations",
+        "identity_sha256",
+    }
+    if not isinstance(payload, Mapping) or set(payload) != required:
+        raise ValueError("Gridbook import-origin identity is not closed")
+    if (
+        payload.get("schema") != GRIDBOOK_IMPORT_ORIGIN_SCHEMA
+        or payload.get("module_name") != "gridbook"
+        or payload.get("imported_version") != expected_version
+    ):
+        raise ValueError(
+            "Gridbook imported module name/version differs from the distribution"
+        )
+
+    root_value = payload.get("distribution_package_root")
+    file_value = payload.get("module_file")
+    locations = payload.get("module_search_locations")
+    if (
+        not isinstance(root_value, str)
+        or not isinstance(file_value, str)
+        or not isinstance(locations, list)
+        or not locations
+        or any(not isinstance(value, str) for value in locations)
+    ):
+        raise ValueError("Gridbook import-origin paths are malformed")
+
+    def canonical_absolute(value: str) -> Path:
+        path = Path(value)
+        if (
+            not path.is_absolute()
+            or ".." in path.parts
+            or str(path) != value
+        ):
+            raise ValueError(
+                "Gridbook import-origin paths must be canonical and absolute"
+            )
+        return path
+
+    root = canonical_absolute(root_value)
+    module_file = canonical_absolute(file_value)
+    search_locations = [canonical_absolute(value) for value in locations]
+    try:
+        module_file.relative_to(root)
+        for location in search_locations:
+            location.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(
+            "imported Gridbook module escapes the selected distribution package root"
+        ) from exc
+    if module_file != root / "__init__.py":
+        raise ValueError(
+            "imported Gridbook __file__ is not the selected distribution __init__.py"
+        )
+    if locations != sorted(set(locations)):
+        raise ValueError(
+            "Gridbook import-origin search locations are not canonical and unique"
+        )
+    unsigned = {
+        key: value for key, value in payload.items() if key != "identity_sha256"
+    }
+    if payload.get("identity_sha256") != _canonical_sha256(unsigned):
+        raise ValueError("Gridbook import-origin identity digest is stale")
+
+
+def gridbook_import_origin_identity(
+    distribution: importlib_metadata.Distribution,
+    *,
+    expected_version: str,
+) -> dict[str, Any]:
+    """Prove that ``import gridbook`` resolves inside ``distribution``.
+
+    Metadata and imports have independent resolution rules.  In particular, a
+    stale ``gridbook`` directory in the current working directory or on
+    ``PYTHONPATH`` can be imported even while ``importlib.metadata`` selects the
+    exact newly installed distribution.  Resolve both sides and require the
+    imported ``__file__`` plus every package ``__path__`` entry to remain under
+    the selected distribution's real package root.
+    """
+    init_items = [
+        item for item in (distribution.files or ())
+        if str(item) == "gridbook/__init__.py"
+    ]
+    if len(init_items) != 1:
+        raise ValueError(
+            "installed Gridbook distribution must contain exactly one "
+            "gridbook/__init__.py"
+        )
+    installed_init = Path(distribution.locate_file(init_items[0]))
+    if not installed_init.is_file() or installed_init.is_symlink():
+        raise ValueError(
+            "installed Gridbook distribution __init__.py is missing or is a symlink"
+        )
+    try:
+        installed_init = installed_init.resolve(strict=True)
+        package_root = installed_init.parent.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError(
+            "installed Gridbook distribution package root is unreadable"
+        ) from exc
+
+    try:
+        module = importlib.import_module("gridbook")
+    except Exception as exc:
+        raise ValueError("installed Gridbook module cannot be imported") from exc
+    imported_version = getattr(module, "__version__", None)
+    if imported_version != expected_version:
+        raise ValueError(
+            f"imported Gridbook version {imported_version!r} differs from "
+            f"installed distribution {expected_version!r}"
+        )
+    module_file_value = getattr(module, "__file__", None)
+    module_path_value = getattr(module, "__path__", None)
+    if not isinstance(module_file_value, str) or module_path_value is None:
+        raise ValueError("imported Gridbook module has no concrete file/package path")
+    try:
+        module_file = Path(module_file_value).resolve(strict=True)
+        search_locations = sorted({
+            str(Path(value).resolve(strict=True)) for value in module_path_value
+        })
+    except (OSError, TypeError, ValueError) as exc:
+        raise ValueError("imported Gridbook module paths are unreadable") from exc
+    if not search_locations:
+        raise ValueError("imported Gridbook module has an empty __path__")
+    if module_file != installed_init:
+        raise ValueError(
+            "imported Gridbook __file__ does not equal the selected installed "
+            "distribution's __init__.py (CWD/PYTHONPATH shadow suspected)"
+        )
+    try:
+        module_file.relative_to(package_root)
+        for location in map(Path, search_locations):
+            location.relative_to(package_root)
+    except ValueError as exc:
+        raise ValueError(
+            "imported Gridbook module escapes the selected installed "
+            "distribution package root (CWD/PYTHONPATH shadow suspected)"
+        ) from exc
+    spec = getattr(module, "__spec__", None)
+    spec_origin = getattr(spec, "origin", None)
+    if not isinstance(spec_origin, str):
+        raise ValueError("imported Gridbook module has no concrete spec origin")
+    try:
+        resolved_spec_origin = Path(spec_origin).resolve(strict=True)
+    except OSError as exc:
+        raise ValueError("imported Gridbook spec origin is unreadable") from exc
+    if resolved_spec_origin != module_file:
+        raise ValueError("imported Gridbook __spec__.origin differs from __file__")
+
+    identity: dict[str, Any] = {
+        "schema": GRIDBOOK_IMPORT_ORIGIN_SCHEMA,
+        "module_name": "gridbook",
+        "imported_version": imported_version,
+        "distribution_package_root": str(package_root),
+        "module_file": str(module_file),
+        "module_search_locations": search_locations,
+    }
+    identity["identity_sha256"] = _canonical_sha256(identity)
+    validate_gridbook_import_origin_identity(
+        identity, expected_version=expected_version
+    )
+    return identity
+
+
 def gridbook_distribution_provenance(
     expected_pin: Mapping[str, str],
 ) -> dict[str, Any]:
@@ -792,8 +990,7 @@ def gridbook_distribution_provenance(
     if (
         not isinstance(expected_pin, Mapping)
         or set(expected_pin) != {"repository", "commit", "version"}
-        or expected_pin.get("repository")
-        != "https://github.com/RobTand/gridbook.git"
+        or expected_pin.get("repository") != GRIDBOOK_REPOSITORY
         or re.fullmatch(
             r"[0-9a-f]{40}", str(expected_pin.get("commit", ""))
         ) is None
@@ -812,6 +1009,9 @@ def gridbook_distribution_provenance(
         raise ValueError(
             "installed Gridbook name/version differs from the exact pin"
         )
+    import_origin = gridbook_import_origin_identity(
+        distribution, expected_version=version
+    )
 
     direct_relative, direct_path = _distribution_file(
         distribution, filename="direct_url.json"
@@ -944,6 +1144,7 @@ def gridbook_distribution_provenance(
         "record_identity": _file_identity(record_path),
         "source_files": source_files,
         "source_files_sha256": _canonical_sha256(source_files),
+        "import_origin": import_origin,
     }
 
 
@@ -1601,6 +1802,19 @@ def collect_manifest(
         else None
     )
     gpu = gpu_identity()
+    runtime_pin = gridbook_runtime_pin()
+    gridbook_distribution = None
+    if runtime_pin is not None:
+        if set(runtime_pin) != {"commit", "version"}:
+            raise ValueError(
+                "Gridbook runtime environment pin is partial; commit and version "
+                "must be present together"
+            )
+        gridbook_distribution = gridbook_distribution_provenance({
+            "repository": GRIDBOOK_REPOSITORY,
+            "commit": runtime_pin["commit"],
+            "version": runtime_pin["version"],
+        })
     manifest: dict[str, Any] = {
         "schema": MANIFEST_SCHEMA,
         "created": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
@@ -1619,7 +1833,7 @@ def collect_manifest(
         "kv_cache_dtype": _flag_value(launch_argv, "--kv-cache-dtype"),
         "speculative_config": _flag_value(launch_argv, "--speculative-config"),
         "package_versions": package_versions(),
-        "gridbook_runtime_pin": gridbook_runtime_pin(),
+        "gridbook_runtime_pin": runtime_pin,
         "resident_extensions": extensions,
         # False whenever any inspected process's address space could not be
         # read (the host-side-of-a-container case): an unverified scan must not
@@ -1634,6 +1848,8 @@ def collect_manifest(
         "listener_binding": bound_listener,
         "models_endpoint_binding": endpoint_models,
     }
+    if gridbook_distribution is not None:
+        manifest["gridbook_distribution"] = gridbook_distribution
     manifest.update(gpu)
     if artifact_dir is not None:
         manifest["artifact_binding"] = artifact_binding(
@@ -1751,13 +1967,23 @@ def self_manifest(
     manifest["measurement_parent_pid"] = parent_pid
     manifest["engine_descendant_pids"] = engine_descendants
     if gridbook_pin_attestation is not None:
-        manifest["gridbook_runtime_pin"] = {
+        expected_runtime_pin = {
             "commit": gridbook_pin_attestation["commit"],
             "version": gridbook_pin_attestation["version"],
         }
-        manifest["gridbook_distribution"] = (
-            gridbook_distribution_provenance(gridbook_pin_attestation)
-        )
+        observed_runtime_pin = manifest.get("gridbook_runtime_pin")
+        if (
+            observed_runtime_pin is not None
+            and observed_runtime_pin != expected_runtime_pin
+        ):
+            raise ValueError(
+                "gridbook_pin_attestation differs from the live runtime environment"
+            )
+        manifest["gridbook_runtime_pin"] = expected_runtime_pin
+        if "gridbook_distribution" not in manifest:
+            manifest["gridbook_distribution"] = (
+                gridbook_distribution_provenance(gridbook_pin_attestation)
+            )
         manifest["performance_stack_fingerprint"] = (
             performance_stack_fingerprint(manifest)
         )
@@ -1786,6 +2012,28 @@ def _cmd_write(args: argparse.Namespace) -> int:
         raise ValueError(
             "--pid is not permitted for server attestations; inspect the complete vLLM process set"
         )
+    # The DSv4 release container deliberately has no installed PrismaQuant.
+    # When an exact transported root is present, prove the lazy shipcard import
+    # used by artifact_binding resolves to that snapshot before inspecting or
+    # writing any serving evidence. The outer launcher separately re-hashes the
+    # complete snapshot closure immediately before this command.
+    transported_root = os.environ.get("PQ_RUNTIME_PRISMAQUANT_ROOT")
+    if transported_root is not None:
+        root = Path(transported_root)
+        if not root.is_absolute() or root.is_symlink():
+            raise ValueError(
+                "transported PrismaQuant root must be absolute and non-symlink"
+            )
+        root = root.resolve(strict=True)
+        module = importlib.import_module("prismaquant.shipcard")
+        module_file = getattr(module, "__file__", None)
+        expected = (root / "prismaquant" / "shipcard.py").resolve(strict=True)
+        if not isinstance(module_file, str) or Path(module_file).resolve(
+            strict=True
+        ) != expected:
+            raise ValueError(
+                "serve fingerprint shipcard import escapes the reviewed snapshot"
+            )
     manifest = collect_manifest(
         pids=None,
         image=args.image,

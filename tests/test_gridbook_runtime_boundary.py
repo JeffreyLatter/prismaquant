@@ -15,6 +15,7 @@ HELPER = ASSET_DIR / "gridbook_runtime.sh"
 PIN = ASSET_DIR / "gridbook_runtime_pin.json"
 LIVE_SCRIPTS = (
     "canary_ladder.sh",
+    "serve_dsv4_cb_validate.sh",
     "serve_hy3_smoke.sh",
     "serve_hy3_teb.sh",
     "serve_laguna_smoke.sh",
@@ -128,6 +129,19 @@ def test_producer_does_not_import_external_gridbook_runtime():
 
 
 def test_every_live_script_uses_the_one_external_runtime_helper():
+    discovered = {
+        path.name
+        for path in (REPO / "scripts").glob("*.sh")
+        if any(
+            marker in path.read_text(encoding="utf-8")
+            for marker in (
+                "gridbook_runtime_prepare",
+                "install-container",
+                "gridbook_runtime_install_container",
+            )
+        )
+    }
+    assert discovered == set(LIVE_SCRIPTS)
     for name in LIVE_SCRIPTS:
         text = (REPO / "scripts" / name).read_text(encoding="utf-8")
         assert "gridbook_runtime.sh" in text, name
@@ -143,6 +157,18 @@ def test_every_live_script_uses_the_one_external_runtime_helper():
         assert "plugins/gridbook" not in text, name
         assert "/repo/scripts/lib/gridbook_runtime.sh" not in text, name
         assert "--quantization prismaquant" not in text, name
+        # Import safety is intentionally owned once by the shared Docker
+        # argument vector.  A launcher-local override could appear after that
+        # vector and silently win Docker's last-value environment resolution.
+        if name == "serve_dsv4_cb_validate.sh":
+            # This launcher has a host-side, artifact-build-commit snapshot
+            # bootstrap before Gridbook preparation. Its strict source
+            # bootstrap requires PYTHONSAFEPATH in the host environment; the
+            # container value remains owned by GRIDBOOK_RUNTIME_DOCKER_ARGS.
+            assert "-e PYTHONSAFEPATH" not in text, name
+            assert "--env PYTHONSAFEPATH" not in text, name
+        else:
+            assert "PYTHONSAFEPATH" not in text, name
     delegation = (REPO / "scripts" /
                   "smoke_nvfp4_cb_delegation.sh").read_text(encoding="utf-8")
     assert "--quantization gridbook" in delegation
@@ -291,6 +317,10 @@ def test_prepare_mounts_runtime_source_and_contract_read_only(tmp_path):
         "PQ_GRIDBOOK_RUNTIME_HELPER="
         "/opt/prismaquant-gridbook-runtime-contract/gridbook_runtime.sh"
     ) in args
+    assert "--workdir" in args
+    assert "/" in args
+    assert "--env" in args
+    assert "PYTHONSAFEPATH=1" in args
     assert all("/repo/" not in arg for arg in args)
 
 
@@ -378,6 +408,17 @@ def test_container_install_preserves_exact_vcs_provenance():
     assert '"commit_id": expected_commit' in text
     assert '"requested_revision": expected_commit' in text
     assert '"vcs": "git"' in text
+    assert "importlib.import_module(\"gridbook\")" in text
+    assert "module_file != installed_init" in text
+    assert "entry.relative_to(package_root)" in text
+    assert "imported_version != expected" in text
+
+
+def test_runtime_helper_owns_safe_import_path_and_neutral_workdir():
+    text = HELPER.read_text(encoding="utf-8")
+    assert '--workdir /' in text
+    assert '--env "PYTHONSAFEPATH=1"' in text
+    assert "export PYTHONSAFEPATH=1" in text
 
 
 def test_container_install_path_is_owned_only_by_runtime_helper():

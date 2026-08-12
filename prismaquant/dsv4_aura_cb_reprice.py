@@ -17,11 +17,13 @@ from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 import hashlib
+import importlib.util
 import json
 import math
 import os
 from pathlib import Path
 import pickle
+import re
 import shutil
 import sys
 
@@ -63,6 +65,13 @@ from prismaquant.cost_stage_checkpoint import (
     canonical_json,
     canonical_json_sha256,
 )
+from prismaquant.dsv4_campaign_completion import (
+    CampaignCompletionError,
+    assert_replay_matches_completion_receipt,
+    completion_receipt_path,
+    historical_checkpoint_root,
+    verify_receipt_for_replay,
+)
 
 
 DSV4_BOUNDED_CAMPAIGN_WORKER = True
@@ -83,6 +92,8 @@ DSV4_STREAMING_CACHE_MAX_SLOTS = 1
 # it is the allocator's --target-profile.  Splitting these would let the
 # campaign price a menu the artifact is not allowed to ship.
 DSV4_TARGET_PROFILE = "nvfp4_cb"
+_FULL_GIT_COMMIT = re.compile(r"[0-9a-f]{40}")
+_FULL_SHA256 = re.compile(r"[0-9a-f]{64}")
 
 # The FP8-CB menus are the on-law rungs only.  gridbook K1.2's fused mid-M
 # kernel law admits FP8-CB at k % 4 == 0 and nothing else: type_size = 4k is
@@ -183,6 +194,128 @@ _TERMINAL_BY_SOURCE_KIND = {
 
 class DSv4CampaignError(RuntimeError):
     """A DSv4 inventory, identity, or orchestration refusal."""
+
+
+def _release_runtime_identity() -> dict[str, str]:
+    commit = os.environ.get("PRISMAQUANT_IDENTITY_GIT_COMMIT", "")
+    if _FULL_GIT_COMMIT.fullmatch(commit) is None:
+        raise DSv4CampaignError(
+            "activation-safe replay requires the full immutable PrismaQuant "
+            "runtime commit identity"
+        )
+    if os.environ.get("PRISMAQUANT_IDENTITY_GIT_DIRTY") != "0":
+        raise DSv4CampaignError(
+            "activation-safe replay requires a clean immutable runtime identity"
+        )
+    if "PYTHONPATH" in os.environ:
+        raise DSv4CampaignError(
+            "activation-safe replay requires PYTHONPATH to be absent"
+        )
+    if (
+        os.environ.get("PYTHONSAFEPATH") != "1"
+        or not sys.flags.safe_path
+    ):
+        raise DSv4CampaignError(
+            "activation-safe replay requires Python safe-path mode"
+        )
+    if (
+        os.environ.get("PYTHONDONTWRITEBYTECODE") != "1"
+        or not sys.dont_write_bytecode
+    ):
+        raise DSv4CampaignError(
+            "activation-safe replay requires bytecode writes to be disabled"
+        )
+    if (
+        os.environ.get("PYTHONNOUSERSITE") != "1"
+        or not sys.flags.no_user_site
+    ):
+        raise DSv4CampaignError(
+            "activation-safe replay requires disabled Python user-site imports"
+        )
+    root_raw = os.environ.get("PQ_RUNTIME_PRISMAQUANT_ROOT", "")
+    tree = os.environ.get("PQ_RUNTIME_PRISMAQUANT_TREE", "")
+    closure = os.environ.get(
+        "PQ_RUNTIME_PRISMAQUANT_CLOSURE_SHA256", ""
+    )
+    root = Path(root_raw)
+    if (
+        not root_raw
+        or not root.is_absolute()
+        or root.is_symlink()
+        or _FULL_GIT_COMMIT.fullmatch(tree) is None
+        or _FULL_SHA256.fullmatch(closure) is None
+    ):
+        raise DSv4CampaignError(
+            "activation-safe replay lacks a complete runtime snapshot identity"
+        )
+    try:
+        resolved_root = root.resolve(strict=True)
+        expected_module = (
+            resolved_root / "prismaquant" / "dsv4_aura_cb_reprice.py"
+        ).resolve(strict=True)
+        observed_module = Path(__file__).resolve(strict=True)
+        verifier_path = (
+            resolved_root / "tools" / "prismaquant_runtime_snapshot.py"
+        )
+        if verifier_path.is_symlink() or not verifier_path.is_file():
+            raise ValueError("runtime snapshot verifier is absent or unsafe")
+        if observed_module != expected_module:
+            raise ValueError(
+                "loaded DSv4 replay module is outside the selected snapshot"
+            )
+        spec = importlib.util.spec_from_file_location(
+            "_prismaquant_replay_runtime_snapshot", verifier_path
+        )
+        if spec is None or spec.loader is None:
+            raise ValueError("runtime snapshot verifier cannot be loaded")
+        verifier = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(verifier)
+        identity = verifier.verify_snapshot(
+            resolved_root,
+            expected_commit=commit,
+            expected_tree=tree,
+            expected_closure_sha256=closure,
+        )
+    except Exception as exc:
+        raise DSv4CampaignError(
+            f"activation-safe replay runtime snapshot failed verification: {exc}"
+        ) from exc
+    if (
+        identity.get("snapshot") != str(resolved_root)
+        or identity.get("commit") != commit
+        or identity.get("tree") != tree
+        or identity.get("closure_sha256") != closure
+    ):
+        raise DSv4CampaignError(
+            "activation-safe replay runtime snapshot identity differs"
+        )
+    return {
+        "snapshot": str(resolved_root),
+        "commit": commit,
+        "tree": tree,
+        "closure_sha256": closure,
+    }
+
+
+def _release_runtime_commit() -> str:
+    """Compatibility projection of the full replay runtime proof."""
+    return _release_runtime_identity()["commit"]
+
+
+def _bind_completion_receipt_to_runtime(
+    receipt: Mapping[str, object], runtime: Mapping[str, str]
+) -> None:
+    producer = receipt.get("producer")
+    if not isinstance(producer, Mapping):
+        raise DSv4CampaignError(
+            "campaign completion receipt lacks its runtime producer identity"
+        )
+    for key in ("commit", "tree", "closure_sha256"):
+        if producer.get(key) != runtime.get(key):
+            raise DSv4CampaignError(
+                "activation-safe replay runtime differs from the completion "
+                f"receipt at producer.{key}"
+            )
 
 
 @dataclass(frozen=True)
@@ -2139,12 +2272,41 @@ def run_dsv4_anchor_replay(
         raise DSv4CampaignError(
             f"unexpected DSv4 control plane {control_plane!r}"
         )
+    work_dir = Path(args.work_dir)
+    receipt_path = completion_receipt_path(work_dir)
+    runtime_identity = _release_runtime_identity()
+    try:
+        completion_receipt = verify_receipt_for_replay(
+            receipt_path,
+            work_dir=work_dir,
+            historical_root=historical_checkpoint_root(work_dir),
+            expected_producer_commit=runtime_identity["commit"],
+        )
+    except CampaignCompletionError as exc:
+        raise DSv4CampaignError(
+            "activation-safe replay lacks a valid terminal campaign receipt: "
+            f"{exc}"
+        ) from exc
+    _bind_completion_receipt_to_runtime(
+        completion_receipt, runtime_identity
+    )
     prepared = prepare_dsv4_campaign(args, publish_format_plan=False)
     require_allocator_supersurrogate_support()
     streamed_payload, replay = _load_and_audit_completed_streamed_payload(
         prepared, args.replay_streamed_payload
     )
-    work_dir = Path(args.work_dir)
+    try:
+        assert_replay_matches_completion_receipt(replay, completion_receipt)
+    except CampaignCompletionError as exc:
+        raise DSv4CampaignError(
+            f"activation-safe replay differs from terminal receipt: {exc}"
+        ) from exc
+    replay = dict(replay)
+    replay["campaign_completion_receipt"] = {
+        "path": str(receipt_path.resolve(strict=True)),
+        "receipt_sha256": completion_receipt["receipt_sha256"],
+        "producer_commit": completion_receipt["producer"]["commit"],
+    }
     replay_artifacts = work_dir / "artifacts" / "replay-activation-safe"
     return _finish_dsv4_campaign(
         prepared,
@@ -2186,7 +2348,8 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "CPU-only replay of this work-dir's completed "
             "artifacts/streamed_anchor_aura.pkl. Every row is revalidated "
-            "against the durable AURA unit journal; no model/GPU work runs."
+            "against the durable AURA unit journal after a bound terminal "
+            "campaign receipt authorizes replay; no model/GPU work runs."
         ),
     )
     return parser

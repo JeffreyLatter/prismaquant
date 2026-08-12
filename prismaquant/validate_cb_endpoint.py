@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from .shipcard import (
+    _verify_gridbook_distribution_identity,
     compute_model_sha,
     fill_slot,
     git_provenance,
@@ -164,6 +165,7 @@ def _expected_serve_environment(runtime_pin: Mapping[str, Any]) -> dict[str, str
         **_REQUIRED_SERVE_ENV,
         "PQ_GRIDBOOK_RUNTIME_COMMIT": commit,
         "PQ_GRIDBOOK_RUNTIME_VERSION": version,
+        "PYTHONSAFEPATH": "1",
     }
 
 
@@ -693,6 +695,17 @@ def validate_serve_manifest(
             "serve manifest has no resident reviewed Gridbook-native CUDA extension"
         )
     runtime_pin = _gridbook_runtime_pin()
+    distribution_problems = _verify_gridbook_distribution_identity(
+        "native_export",
+        payload,
+        runtime_pin,
+        canonical_sha=_canonical_json_sha256,
+    )
+    if distribution_problems:
+        raise CBEndpointValidationError(
+            "serve manifest does not attest the exact imported Gridbook "
+            f"distribution: {distribution_problems[0]}"
+        )
     _validate_closed_server_environment(payload, runtime_pin=runtime_pin)
     _validate_live_server_session(
         payload,

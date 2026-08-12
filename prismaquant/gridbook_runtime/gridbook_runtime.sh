@@ -368,8 +368,10 @@ gridbook_runtime_prepare() {
         GRIDBOOK_RUNTIME_CONTAINER_HELPER
 
     GRIDBOOK_RUNTIME_DOCKER_ARGS=(
+        --workdir /
         --volume "${source}:${container_source}:ro"
         --volume "${contract_source}:${container_contract}:ro"
+        --env "PYTHONSAFEPATH=1"
         --env "PQ_GRIDBOOK_RUNTIME_SOURCE=${container_source}"
         --env "PQ_GRIDBOOK_RUNTIME_COMMIT=${GRIDBOOK_RUNTIME_COMMIT}"
         --env "PQ_GRIDBOOK_RUNTIME_VERSION=${GRIDBOOK_RUNTIME_VERSION}"
@@ -394,6 +396,13 @@ gridbook_runtime_install_container() {
     local supplied_commit=${PQ_GRIDBOOK_RUNTIME_COMMIT:-}
     local supplied_version=${PQ_GRIDBOOK_RUNTIME_VERSION:-}
     local install_source install_spec
+
+    # Apply safe-path mode to pip and to the post-install import proof even
+    # when this function is called directly rather than through the prepared
+    # Docker argument vector.  The central Docker environment carries the same
+    # value into the later vLLM process; this local export alone would not cross
+    # the common `bash helper install-container; exec vllm ...` process boundary.
+    export PYTHONSAFEPATH=1
 
     if ! _gridbook_runtime_is_commit "$supplied_commit"; then
         _gridbook_runtime_error \
@@ -445,8 +454,9 @@ gridbook_runtime_install_container() {
     python3 -m pip install --no-deps --no-build-isolation --no-cache-dir --quiet \
         --force-reinstall "$install_spec"
     python3 - "$GRIDBOOK_RUNTIME_VERSION" "$GRIDBOOK_RUNTIME_COMMIT" <<'PY'
-from importlib.metadata import version
+import importlib
 from importlib.metadata import distribution
+from importlib.metadata import version
 import json
 from pathlib import Path
 import sys
@@ -457,6 +467,22 @@ actual = version("gridbook")
 if actual != expected:
     raise SystemExit(f"installed gridbook {actual!r}, expected {expected!r}")
 dist = distribution("gridbook")
+init_files = [
+    item for item in (dist.files or ())
+    if str(item) == "gridbook/__init__.py"
+]
+if len(init_files) != 1:
+    raise SystemExit(
+        "installed gridbook distribution must contain exactly one "
+        "gridbook/__init__.py"
+    )
+installed_init_path = Path(dist.locate_file(init_files[0]))
+if not installed_init_path.is_file() or installed_init_path.is_symlink():
+    raise SystemExit(
+        "installed gridbook distribution __init__.py is missing or is a symlink"
+    )
+installed_init = installed_init_path.resolve(strict=True)
+package_root = installed_init.parent.resolve(strict=True)
 direct_url_files = [
     file for file in (dist.files or ())
     if file.name == "direct_url.json" and ".dist-info" in str(file.parent)
@@ -478,9 +504,49 @@ if vcs != expected_vcs:
         f"installed gridbook PEP 610 vcs_info {vcs!r} does not equal "
         f"the pinned identity {expected_vcs!r}"
     )
+
+# Distribution metadata and Python imports resolve independently.  Prove that
+# the module this interpreter would actually hand to vLLM is the selected VCS
+# distribution, not a stale same-name directory in CWD or on PYTHONPATH.
+module = importlib.import_module("gridbook")
+imported_version = getattr(module, "__version__", None)
+if imported_version != expected:
+    raise SystemExit(
+        f"imported gridbook version {imported_version!r}, expected {expected!r}"
+    )
+module_file_value = getattr(module, "__file__", None)
+module_path_value = getattr(module, "__path__", None)
+if not isinstance(module_file_value, str) or module_path_value is None:
+    raise SystemExit("imported gridbook has no concrete __file__/__path__")
+module_file = Path(module_file_value).resolve(strict=True)
+module_paths = sorted({
+    Path(value).resolve(strict=True) for value in module_path_value
+}, key=str)
+if module_file != installed_init:
+    raise SystemExit(
+        "imported gridbook __file__ is not the selected installed "
+        "distribution (CWD/PYTHONPATH shadow suspected): "
+        f"imported={module_file}, selected={installed_init}"
+    )
+if not module_paths:
+    raise SystemExit("imported gridbook has an empty __path__")
+try:
+    module_file.relative_to(package_root)
+    for entry in module_paths:
+        entry.relative_to(package_root)
+except ValueError as exc:
+    raise SystemExit(
+        "imported gridbook path escapes the selected installed distribution "
+        f"root {package_root}: {module_paths}"
+    ) from exc
+spec_origin = getattr(getattr(module, "__spec__", None), "origin", None)
+if not isinstance(spec_origin, str) or Path(spec_origin).resolve(
+    strict=True
+) != module_file:
+    raise SystemExit("imported gridbook __spec__.origin differs from __file__")
 print(
     f"gridbook-runtime: installed gridbook {actual} "
-    f"from git commit {expected_commit}"
+    f"from git commit {expected_commit}; import root {package_root}"
 )
 PY
 }
