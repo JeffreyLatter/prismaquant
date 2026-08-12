@@ -343,6 +343,72 @@ def test_builder_copies_distinct_gate_up_down_books_and_never_trains(
     }
 
 
+def test_routed_roles_declare_supplied_lattice_cells(tmp_path, monkeypatch):
+    """A routed role must carry the lattice rungs, not only its burn shards.
+
+    The bundle is the authoritative per-(qname, format) cell map that
+    ``codebook_source_for_cell`` resolves every render through, and a lattice
+    table is weight-independent and shared -- it costs no book and no training.
+    Restricting routed roles to the selection's formats made every legal
+    lattice cell on a routed expert unrenderable: the DSv4 campaign prices the
+    NVFP4 lattice for all 33,325 units and died on its first routed anchor with
+    "immutable learned bundle has no NVFP4_CB_K15 cell; refusing lattice
+    fallback".  The learned set is unchanged -- retraining a rank-3 population
+    stays forbidden, which is why ``learn_pool`` is still fatal here.
+    """
+    model_dir, col, selection, _expected, _shards = _fixture(tmp_path)
+
+    def forbidden_train(*_args, **_kwargs):
+        raise AssertionError("routed bundle must not retrain pooled-Lloyd books")
+
+    monkeypatch.setattr(learned, "learn_pool", forbidden_train)
+    bundle = build_bundle_from_model(
+        model_dir=model_dir,
+        col_weights=col,
+        formats=["FP8_CB_K28", "NVFP4_CB_K15"],
+        output=tmp_path / "bundle.pqcb",
+        device="cpu",
+        routed_moe_book_selection=selection,
+    )
+
+    for projection in _PROJECTIONS:
+        role = f"model.layers.{_LAYER}.mlp.experts.{projection}"
+        assert bundle.cell(role, "FP8_CB_K28")["source"] == "learned"
+        lattice = bundle.cell(role, "NVFP4_CB_K15")
+        assert lattice["source"] == "lattice"
+        # A lattice cell carries no book, so it must not claim a rung policy
+        # or a banked origin the way a copied burn shard does.
+        assert "rung_policy" not in lattice
+        assert "pretrained_origin" not in lattice
+        # The exact lookup shape the campaign died on: a per-expert member
+        # name resolving through the alias map, not the role name.
+        member = f"model.layers.{_LAYER}.mlp.experts.0.{projection}"
+        assert bundle.cell(member, "NVFP4_CB_K15")["source"] == "lattice"
+
+    # Per-rung identity stays uniform and compact -- this property refuses a
+    # bundle whose source selection has become qname-local.
+    assert bundle.codebook_source_by_format == {
+        "FP8_CB_K28": "learned",
+        "NVFP4_CB_K15": "lattice",
+    }
+
+
+def test_routed_lattice_cell_absent_when_the_rung_is_not_supplied(tmp_path):
+    """The refusal is real: no cell exists for a rung outside the menu."""
+    model_dir, col, selection, _expected, _shards = _fixture(tmp_path)
+    bundle = build_bundle_from_model(
+        model_dir=model_dir,
+        col_weights=col,
+        formats=["FP8_CB_K28"],
+        output=tmp_path / "bundle.pqcb",
+        device="cpu",
+        routed_moe_book_selection=selection,
+    )
+    member = f"model.layers.{_LAYER}.mlp.experts.0.down_proj"
+    with pytest.raises(ValueError, match="no NVFP4_CB_K15 cell"):
+        bundle.cell(member, "NVFP4_CB_K15")
+
+
 def test_builder_refuses_stale_current_imatrix_identity(tmp_path):
     model_dir, col, selection, _expected, _shards = _fixture(tmp_path)
     stale = dict(col)

@@ -176,11 +176,14 @@ def build_bundle_from_model(
 ) -> object:
     """Stream source weights and publish one value-bearing bundle.
 
-    Dense learned cells retain the certified trainer.  Routed rank-3 cells
-    exist only when an explicit selection names an accepted burn shard, and
-    their books are loaded after the current role weight/imatrix identities
+    Dense learned cells retain the certified trainer.  Routed rank-3 *learned*
+    cells exist only when an explicit selection names an accepted burn shard,
+    and their books are loaded after the current role weight/imatrix identities
     are available.  No directory search, retraining, or lattice fallback is
-    reachable for those cells.
+    reachable for those cells.  Routed roles additionally carry a declaration
+    for every supplied *lattice* format, which needs no book and no training:
+    the bundle is the authoritative per-(qname, format) cell map, so a legal
+    lattice rung with no cell is simply unrenderable.
     """
 
     canonical_formats = _canonical_cb_formats(formats)
@@ -367,8 +370,23 @@ def build_bundle_from_model(
     formats_by_qname: dict[str, tuple[str, ...]] = {
         qname: canonical_formats for qname in dense_qnames
     }
+    # A routed role's LEARNED cells are exactly the accepted burn shards --
+    # retraining a rank-3 population is forbidden, so a rung with no shard can
+    # never be learned here.  Its LATTICE cells are a different question: a
+    # lattice table is weight-independent and shared, so it costs no book and
+    # no training, and the bundle is the authoritative per-(qname, format) cell
+    # map that codebook_source_for_cell resolves every render through.  Giving
+    # routed roles only the selection's formats therefore made every legal
+    # lattice cell on a routed expert unrenderable -- the campaign prices the
+    # NVFP4 lattice for all 33,325 units, so its first routed anchor died on
+    # "immutable learned bundle has no NVFP4_CB_K15 cell; refusing lattice
+    # fallback".  The per-rung basis map is unchanged either way; this makes
+    # cell-level resolution agree with it.
+    lattice_formats = tuple(
+        name for name in canonical_formats if name not in set(learned_formats)
+    )
     formats_by_qname.update({
-        qname: tuple(sorted(plan.selected_cells))
+        qname: tuple(sorted(set(plan.selected_cells) | set(lattice_formats)))
         for qname, plan in routed_plans.items()
     })
     target_qnames = tuple(sorted(formats_by_qname))
