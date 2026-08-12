@@ -31,6 +31,7 @@ from .allocator_solver import (
 )
 from .nvfp4_cb_footprint import (
     CBSerializationContext,
+    cb_breakdown_identity_is_materialized,
     is_cb_format,
 )
 from .footprint import (
@@ -509,11 +510,21 @@ def _source_bpp_applicability(
     if is_cb_format(spec.name) and cb_serialization_context is None:
         return FormatApplicability(True)
 
+    # Rate first, identity second.  A learned CB book is banked only for the
+    # rungs a unit may actually use, so demanding a materialized codebook here
+    # would make "is this rung legal?" depend on which books happen to exist:
+    # a routed expert that the source-payload ceiling already excludes at K36
+    # would raise instead of returning EXCEEDED, and the exact same menu would
+    # answer differently before and after a bundle rebuild.  Bytes are
+    # identical in both modes, so the verdict below is unchanged; identity is
+    # then re-asserted for the candidates that survive, which are exactly the
+    # ones a render can be asked for.
     candidate_item = format_tensor_payload_breakdown(
         spec,
         shape,
         qname=qname,
         cb_serialization_context=cb_serialization_context,
+        require_materialized_codebook_identity=False,
     )
     if source_owner.format_name is not None:
         source_item = format_tensor_payload_breakdown(
@@ -567,6 +578,20 @@ def _source_bpp_applicability(
             f"{source_bytes} bytes ({provenance['source_bpp']:.10g} bpp); "
             "comparison is exact integer bytes with no tolerance",
             provenance,
+        )
+    if is_cb_format(spec.name) and not cb_breakdown_identity_is_materialized(
+        candidate_item
+    ):
+        # Survived the rate gate, so this cell is one the pipeline may be
+        # asked to render, and its book is missing.  Re-price with identity
+        # required so the real diagnostic is raised here, at the gate, and not
+        # first at export.  A banked cell already carries its proof and pays
+        # nothing for this check.
+        format_tensor_payload_breakdown(
+            spec,
+            shape,
+            qname=qname,
+            cb_serialization_context=cb_serialization_context,
         )
     return FormatApplicability(True, provenance=provenance)
 

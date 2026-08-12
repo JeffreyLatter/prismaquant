@@ -73,6 +73,11 @@ DSV4_NONEXPERT_UNITS = 301
 DSV4_EXPECTED_ANCHORS = 66_951
 DSV4_BUDGET_BYTES = 112_690_000_000
 DSV4_ARTIFACT_RESERVE_BYTES = 268_435_456
+# One profile id for the whole campaign: it bounds the source-class plan's
+# family to the rungs the pinned runtime's fused mid-M lane instantiates, and
+# it is the allocator's --target-profile.  Splitting these would let the
+# campaign price a menu the artifact is not allowed to ship.
+DSV4_TARGET_PROFILE = "nvfp4_cb"
 
 # The FP8-CB menus are the on-law rungs only.  gridbook K1.2's fused mid-M
 # kernel law admits FP8-CB at k % 4 == 0 and nothing else: type_size = 4k is
@@ -673,7 +678,25 @@ def prepare_dsv4_campaign(args: argparse.Namespace) -> PreparedDSv4Campaign:
         expert_formats=args.expert_formats,
         nonexpert_formats=args.nonexpert_formats,
         cb_serialization_context=cb_context,
+        # The on-law menu is not a CLI opinion: it is the fused mid-M rung set
+        # nvfp4_cb declares for the pinned Gridbook release, resolved through
+        # the serving lane.  Passing it here is what lets the planner's
+        # complete-family contract and the frozen menus above be the same
+        # statement -- without it the planner demands all 21 registered
+        # FP8-CB rungs, including the fifteen k % 4 != 0 ones this campaign
+        # exists to exclude.  DSV4_TARGET_PROFILE also drives --target-profile
+        # on the allocator run below, so producer and consumer read one table.
+        serving_backed_profile=DSV4_TARGET_PROFILE,
     )
+    restriction = format_plan.serving_backed_restriction or {}
+    if tuple(restriction.get("fused_mid_m_rungs", ())) != FP8_NONEXPERT_RUNGS:
+        raise DSv4CampaignError(
+            "the pinned serving runtime does not back the DSv4 on-law rung "
+            f"set: profile={restriction.get('profile_id')!r} "
+            f"runtime={restriction.get('runtime_version')!r} "
+            f"backs {list(restriction.get('fused_mid_m_rungs', ()))}, "
+            f"campaign requires {list(FP8_NONEXPERT_RUNGS)}"
+        )
     if tuple(format_plan.menus["expert"]) != FP8_EXPERT_FORMATS or tuple(
         format_plan.menus["nonexpert"]
     ) != FP8_NONEXPERT_FORMATS:
@@ -896,7 +919,7 @@ def _allocator_command(
         "--probe", str(args.probe),
         "--costs", str(cost_path),
         "--model-override", str(args.model),
-        "--target-profile", "nvfp4_cb",
+        "--target-profile", DSV4_TARGET_PROFILE,
         "--target-disk-gb", f"{DSV4_BUDGET_BYTES / 1e9:.9f}",
         "--artifact-overhead-reserve-bytes",
         str(DSV4_ARTIFACT_RESERVE_BYTES),

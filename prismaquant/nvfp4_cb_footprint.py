@@ -2300,22 +2300,32 @@ def _sidecar_identity(
     qname: str,
     format_name: str,
     context: CBSerializationContext,
+    *,
+    require_materialized: bool = True,
 ) -> dict:
     canonical = str(format_name).strip().upper()
     refs = _physical_codebook_refs(qname, canonical, context)
     shapes = codebook_subtable_shapes(canonical)
     source = codebook_source_for_format(canonical, context)
     content_sha256 = None
+    deferred = False
     if source == "learned":
         digests = context.codebook_content_digests or {}
         missing = [ref for ref in refs if ref not in digests]
-        if missing:
+        if missing and require_materialized:
             raise ValueError(
                 f"{qname}: learned {canonical} sidecar identity is missing "
                 f"materialized SHA-256 digest(s) for {missing}; logical refs "
                 "alone cannot prove render/export byte identity"
             )
-        content_sha256 = [digests[ref] for ref in refs]
+        if missing:
+            # Sizing-only caller (see require_materialized_codebook_identity
+            # on cb_tensor_payload_breakdown).  Byte counts below are exact
+            # regardless; only the identity is unproven, and it is marked as
+            # such so it can never masquerade as a materialized one.
+            deferred = True
+        else:
+            content_sha256 = [digests[ref] for ref in refs]
     else:
         content_sha256 = list(lattice_codebook_content_sha256(canonical))
         supplied_digests = context.codebook_content_digests or {}
@@ -2338,6 +2348,7 @@ def _sidecar_identity(
         "subtable_shapes": [list(shape) for shape in shapes],
         "payload_bytes": codebook_sidecar_payload_bytes(canonical),
         "content_sha256": content_sha256,
+        **({"materialized_identity": False} if deferred else {}),
     }
 
 
@@ -2370,6 +2381,8 @@ def _tensor_sidecar_identities(
     qname: str,
     format_name: str,
     context: CBSerializationContext,
+    *,
+    require_materialized: bool = True,
 ) -> tuple[dict, ...]:
     """Resolve the physical codebook sets consumed by one packed tensor.
 
@@ -2401,13 +2414,19 @@ def _tensor_sidecar_identities(
                 bundle_role_qname(str(qname), "down_proj"),
                 canonical,
                 context,
+                require_materialized=require_materialized,
             ),
         )
     if (
         codebook_source_for_format(canonical, context) != "learned"
         or not physical_parent.endswith(routed_marker)
     ):
-        return (_sidecar_identity(qname, canonical, context),)
+        return (
+            _sidecar_identity(
+                qname, canonical, context,
+                require_materialized=require_materialized,
+            ),
+        )
 
     gate_qname = bundle_role_qname(str(qname), "gate_proj")
     up_qname = bundle_role_qname(str(qname), "up_proj")
@@ -2422,7 +2441,12 @@ def _tensor_sidecar_identities(
     )
 
     if not gate_supplied and not up_supplied:
-        return (_sidecar_identity(qname, canonical, context),)
+        return (
+            _sidecar_identity(
+                qname, canonical, context,
+                require_materialized=require_materialized,
+            ),
+        )
     if physical_supplied:
         raise ValueError(
             f"{qname}: learned routed-MoE {canonical} supplies both the "
@@ -2436,8 +2460,14 @@ def _tensor_sidecar_identities(
             f"incomplete; missing explicit refs for {missing!r}"
         )
     return (
-        _sidecar_identity(gate_qname, canonical, context),
-        _sidecar_identity(up_qname, canonical, context),
+        _sidecar_identity(
+            gate_qname, canonical, context,
+            require_materialized=require_materialized,
+        ),
+        _sidecar_identity(
+            up_qname, canonical, context,
+            require_materialized=require_materialized,
+        ),
     )
 
 
@@ -2451,11 +2481,25 @@ def cb_tensor_payload_breakdown(
     *,
     qname: str,
     context: CBSerializationContext,
+    require_materialized_codebook_identity: bool = True,
 ) -> dict:
     """Versioned byte breakdown for one serialized CB Linear.
 
     ``tensor_payload_bytes`` excludes the shared codebook sidecar; the returned
     ``sidecar_identity`` is what assignment-level accounting deduplicates.
+
+    ``require_materialized_codebook_identity=False`` answers the *rate*
+    question alone: every byte count here is derived from the format and the
+    shape (``codebook_sidecar_payload_bytes`` is a function of the rung), so a
+    learned cell whose book has not been banked can still be priced.  It is
+    for legality probes that must evaluate formats the unit will never be
+    allowed to use -- a routed expert against a K48 rung, say, whose book was
+    deliberately never learned because the source-payload ceiling already
+    excludes it.  Making that verdict depend on which books happen to exist
+    would make legality a function of build order.  Any identity produced this
+    way carries ``materialized_identity: False`` and a null ``content_sha256``
+    so it cannot be mistaken for a proof of render/export byte identity;
+    callers that produce bytes must use the default.
     """
     if context is None:
         raise ValueError(
@@ -2499,7 +2543,12 @@ def cb_tensor_payload_breakdown(
         + fp8_row_scale_bytes
         + input_global_scale_bytes
     )
-    sidecars = _tensor_sidecar_identities(qname, canonical, context)
+    sidecars = _tensor_sidecar_identities(
+        qname,
+        canonical,
+        context,
+        require_materialized=require_materialized_codebook_identity,
+    )
     if len(sidecars) == 1:
         sidecar = sidecars[0]
     else:
@@ -2582,6 +2631,23 @@ def cb_tensor_payload_breakdown(
             _identity_key(identity) for identity in sidecars
         ]
     return result
+
+
+def cb_breakdown_identity_is_materialized(breakdown: Mapping) -> bool:
+    """False when a breakdown's codebook identity was left unproven.
+
+    Only ``require_materialized_codebook_identity=False`` can produce that,
+    and only for a learned cell whose book is not banked; a sizing-mode call
+    on a banked cell is byte-identical to a strict one, so this is also how a
+    caller cheaply asks "did the deferral actually apply here?".
+    """
+    identities = breakdown.get("sidecar_identities")
+    if not identities:
+        identities = [breakdown.get("sidecar_identity") or {}]
+    return all(
+        bool(dict(identity).get("materialized_identity", True))
+        for identity in identities
+    )
 
 
 def cb_assignment_payload_breakdown(
