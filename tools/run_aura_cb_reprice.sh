@@ -248,6 +248,24 @@ docker_args=(
   -e "COST_OBJECTIVE=aura-adjoint"
 )
 
+# Memory levers, forwarded only when the operator sets them.  Unset means the
+# container sees nothing and the autoscaler decides exactly as before, so this
+# block is a no-op on every existing invocation.
+#
+# CACHE_HEADROOM_GB overrides the autoscaler's derived headroom AND sets the
+# dynamic reserve (streaming_model.py `configure_dynamic_budget`).  It is the
+# operator-side handle on the anchor-render peak: `render_layer` materialises a
+# whole layer's anchor set before the per-format `d_weights` are built, so both
+# are resident at once, and the layer cache only shrinks inside `put()` -- which
+# does not happen during that window.  The access pattern here is strictly
+# sequential (one install/unload per layer), so a multi-slot cache buys nothing
+# and capping it is close to free.
+# CACHE_HEADROOM_GB is the ONLY real knob here -- `streaming_model.py:1108` is
+# its single reader, and there is no env override for the cache's layer count.
+if [[ -n "${CACHE_HEADROOM_GB:-}" ]]; then
+  docker_args+=(-e "CACHE_HEADROOM_GB=$CACHE_HEADROOM_GB")
+fi
+
 # Mount immutable value inputs read-only when they are not already under the
 # writable work tree.  Docker accepts a file bind at the same absolute path.
 case "$CB_CODEBOOK_BUNDLE" in
