@@ -339,6 +339,9 @@ def test_driver_takes_atomic_mutex_before_any_gpu_container():
     assert 'CALIB_NSAMPLES="${CALIB_NSAMPLES:-16}"' in driver
     assert 'CALIB_SEQLEN="${CALIB_SEQLEN:-512}"' in driver
     assert 'CALIB_SEED="${CALIB_SEED:-42}"' in driver
+    assert 'CACHE_HEADROOM_GB="${CACHE_HEADROOM_GB:-100}"' in driver
+    assert '-e "CACHE_HEADROOM_GB=$CACHE_HEADROOM_GB"' in driver
+    assert "launch log reports cache_slots and must stay <= 1" in driver
     assert "--resume" in driver
     assert 'if [[ ! -s "$CACHE_MANIFEST" ]]' not in driver
     assert 'if [[ ! -s "$COST_OUTPUT" ]]' not in driver

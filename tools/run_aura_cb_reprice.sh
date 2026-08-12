@@ -49,6 +49,14 @@ if [[ "$TARGET" == "dsv4" ]]; then
   MODEL_PATH="${MODEL_PATH:-${RUN_ROOT}/source}"
   WORK_DIR="${WORK_DIR:-${RUN_ROOT}/aura-cb-reprice}"
   CB_COL_WEIGHTS="${CB_COL_WEIGHTS:-${RUN_ROOT}/prod-cal-0p7/artifacts/cb_col_weights.pkl}"
+  # The worst routed layer builds 51.3 GiB of exact FP32 anchor deltas and
+  # carries ~24.4 GiB of source/gradient state.  Anchors are consumed while
+  # those deltas are built, but a multi-layer source cache would still overlap
+  # the ~75.7 GiB working set and OOM a 128 GiB Spark.  A 100 GiB reserve leaves
+  # at most the forced current-layer slot at the observed 110 GiB free.  Keep
+  # this explicit and overridable for a future box with a different memory
+  # envelope; the launch log reports cache_slots and must stay <= 1 here.
+  CACHE_HEADROOM_GB="${CACHE_HEADROOM_GB:-100}"
 else
   MODEL_PATH="${MODEL_PATH:-}"
   WORK_DIR="${WORK_DIR:-}"
@@ -248,9 +256,9 @@ docker_args=(
   -e "COST_OBJECTIVE=aura-adjoint"
 )
 
-# Memory levers, forwarded only when the operator sets them.  Unset means the
-# container sees nothing and the autoscaler decides exactly as before, so this
-# block is a no-op on every existing invocation.
+# Memory lever.  Dense campaigns retain the old opt-in behavior.  DSv4 sets a
+# measured single-Spark default above so the container never falls back to the
+# unsafe six-slot autoscale observed in launch #3.
 #
 # CACHE_HEADROOM_GB overrides the autoscaler's derived headroom AND sets the
 # dynamic reserve (streaming_model.py `configure_dynamic_budget`).  It is the
