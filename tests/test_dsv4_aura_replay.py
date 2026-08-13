@@ -143,7 +143,7 @@ def _write_minimal_completed_replay(tmp_path: Path):
                 terminal_format, 8.0, 16, "source_terminal",
                 "passthrough", (), 0.0,
                 terminal=True,
-                allocator_selectable=False,
+                allocator_selectable=True,
             ),
         ),
     )
@@ -169,6 +169,7 @@ def _write_minimal_completed_replay(tmp_path: Path):
         purposes_by_qname=purposes,
         formats_by_qname={qname: (terminal_format, measured_format)},
         format_plan=SimpleNamespace(identity_sha256="f" * 64),
+        measurement_format_plan_identity_sha256="f" * 64,
         routed_selection_sha256="e" * 64,
         arm_identity=arm_identity,
     )
@@ -324,7 +325,7 @@ def _write_minimal_completed_replay(tmp_path: Path):
     return prepared, artifact_path, raw_payload, qname, measured_format
 
 
-def test_cpu_replay_quarantines_legacy_terminal_zeros(tmp_path):
+def test_cpu_replay_readmits_w8a16_terminal_and_quarantines_cross_terminal(tmp_path):
     prepared, artifact, _raw, qname, measured = (
         _write_minimal_completed_replay(tmp_path)
     )
@@ -334,11 +335,15 @@ def test_cpu_replay_quarantines_legacy_terminal_zeros(tmp_path):
         )
     )
 
-    assert set(sanitized["costs"][qname]) == {measured}
+    assert set(sanitized["costs"][qname]) == {
+        measured, "FP8_BLOCK_UE8M0_SOURCE"
+    }
     assert provenance["measurement_invoked"] is False
-    assert provenance["legacy_fp8_terminal_zero_rows_quarantined"] == 1
+    assert provenance["legacy_fp8_terminal_zero_rows_quarantined"] == 0
+    assert provenance["legacy_fp8_terminal_zero_rows_readmitted"] == 1
     assert provenance["legacy_cross_terminal_zero_rows_quarantined"] == 1
     assert provenance["unit_checkpoint_count"] == 1
+    assert provenance["fp8_block_terminal_allocator_selectable"] is True
 
 
 def test_cpu_replay_refuses_monolithic_scalar_tamper(tmp_path):
@@ -488,3 +493,70 @@ def test_replay_refuses_receipt_mismatch_after_deep_audit(monkeypatch, tmp_path)
         campaign.run_dsv4_anchor_replay(
             args, control_plane=campaign.__name__,
         )
+
+
+def _format_plan_fixture(*, runtime_version: str, rungs_source: str):
+    return {
+        "schema": "prismaquant.source_class_format_plan.v1",
+        "menus": {"expert": ["FP8_CB_K28"], "nonexpert": ["FP8_CB_K28"]},
+        "units": {"fixture": {"source_kind": "fp8_ue8m0"}},
+        "serving_groups": [],
+        "serving_backed_restriction": {
+            "profile_id": "nvfp4_cb",
+            "family": "fp8_cb",
+            "runtime_version": runtime_version,
+            "rungs_source": rungs_source,
+            "fused_mid_m_rungs": [28, 32, 36, 40, 44, 48],
+        },
+    }
+
+
+def test_w8a16_format_plan_migration_allows_only_runtime_provenance():
+    historical = _format_plan_fixture(
+        runtime_version="0.8.4", rungs_source="serving_profile_spec:0.8.4"
+    )
+    historical["identity_sha256"] = (
+        campaign.DSV4_W8A16_LEGACY_FORMAT_PLAN_SHA256
+    )
+    current = _format_plan_fixture(
+        runtime_version="0.8.5", rungs_source="serving_profile_spec:0.8.5"
+    )
+    current["identity_sha256"] = "a" * 64
+    old = SimpleNamespace(to_dict=lambda: historical)
+    new = SimpleNamespace(to_dict=lambda: current)
+
+    proof = campaign._w8a16_format_plan_delta(old, new)
+    assert proof["semantic_payload_equal_after_allowed_delta"] is True
+    assert proof["historical_identity_sha256"] == (
+        campaign.DSV4_W8A16_LEGACY_FORMAT_PLAN_SHA256
+    )
+
+    changed = json.loads(json.dumps(current))
+    changed["menus"]["nonexpert"].append("FP8_CB_K32")
+    with pytest.raises(campaign.DSv4CampaignError, match="changed beyond"):
+        campaign._w8a16_format_plan_delta(
+            old, SimpleNamespace(to_dict=lambda: changed)
+        )
+
+
+def test_w8a16_readmission_release_pin_is_deliberately_fail_closed():
+    with pytest.raises(
+        campaign.DSv4CampaignError,
+        match="exact release commit is still unresolved",
+    ):
+        campaign._w8a16_runtime_contract_proof()
+
+
+def test_w8a16_legacy_receipt_allowlist_is_exact():
+    receipt = {
+        "receipt_sha256": campaign.DSV4_W8A16_LEGACY_RECEIPT_SHA256,
+        "producer": dict(campaign.DSV4_W8A16_LEGACY_PRODUCER),
+        "service": {
+            "result": "success",
+            "invocation_id": campaign.DSV4_W8A16_LEGACY_INVOCATION_ID,
+        },
+    }
+    campaign._assert_w8a16_legacy_receipt(receipt)
+    receipt["service"]["invocation_id"] = "wrong"
+    with pytest.raises(campaign.DSv4CampaignError, match="not allowlisted"):
+        campaign._assert_w8a16_legacy_receipt(receipt)

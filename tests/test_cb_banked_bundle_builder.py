@@ -36,6 +36,10 @@ def _pretend_gridbook_supports_routed_lut(monkeypatch):
         "version": (
             runtime_pin.GRIDBOOK_ROUTED_MOE_PER_ROLE_CODEBOOK_LUT_MIN_VERSION),
         "version_is_release": False,
+        "runtime_contract_schema": runtime_pin.GRIDBOOK_RUNTIME_CONTRACT_SCHEMA,
+        "required_abi_features": dict(
+            runtime_pin.GRIDBOOK_REQUIRED_ABI_FEATURES
+        ),
     })
     monkeypatch.setattr(
         learned, "load_gridbook_runtime_pin", lambda: supported)

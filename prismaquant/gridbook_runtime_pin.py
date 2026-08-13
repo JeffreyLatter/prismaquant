@@ -12,26 +12,37 @@ from functools import lru_cache
 from importlib import resources
 import json
 import re
+from types import MappingProxyType
 from typing import Any
 
 
-GRIDBOOK_RUNTIME_PIN_SCHEMA = "prismaquant.gridbook_runtime_pin.v2"
+GRIDBOOK_RUNTIME_PIN_SCHEMA = "prismaquant.gridbook_runtime_pin.v3"
 GRIDBOOK_RUNTIME_REPOSITORY = "https://github.com/RobTand/gridbook.git"
+# This is the sole unresolved release input.  It is deliberately not a
+# plausible Git object id, so every installer/serve boundary fails closed until
+# the Gridbook v0.8.5 release commit replaces it.
+GRIDBOOK_RUNTIME_COMMIT_PENDING = "PENDING_GRIDBOOK_V0_8_5_RELEASE_COMMIT"
+GRIDBOOK_RUNTIME_CONTRACT_SCHEMA = "gridbook.runtime-contract.v3"
+# Historical diagnostic floor retained for error prose and third-party callers.
+# Capability decisions no longer use it; they read the closed feature map.
 GRIDBOOK_ROUTED_MOE_PER_ROLE_CODEBOOK_LUT_MIN_VERSION = "0.8.4"
+GRIDBOOK_REQUIRED_ABI_FEATURES = {
+    "routed_moe_per_role_codebook_lut": 1,
+    "source_fp8_block128_w8a16": 1,
+}
 _REQUIRED_MEMBERS = {
     "schema",
     "repository",
     "commit",
     "version",
     "version_is_release",
+    "runtime_contract_schema",
+    "required_abi_features",
 }
 _FULL_COMMIT_RE = re.compile(r"[0-9a-f]{40}")
 _PIN_VERSION_RE = re.compile(
     r"[0-9]+(?:[.][0-9]+)*(?:[A-Za-z0-9.+-]*)?"
 )
-_FINAL_NUMERIC_VERSION_RE = re.compile(r"[0-9]+(?:[.][0-9]+)+")
-
-
 class GridbookRuntimePinError(ValueError):
     """The tracked Gridbook pin is missing or structurally invalid."""
 
@@ -43,6 +54,12 @@ class GridbookRuntimePin:
     commit: str
     version: str
     version_is_release: bool
+    runtime_contract_schema: str
+    required_abi_features: Mapping[str, int]
+
+    @property
+    def commit_is_resolved(self) -> bool:
+        return _FULL_COMMIT_RE.fullmatch(self.commit) is not None
 
 
 def parse_gridbook_runtime_pin(
@@ -50,7 +67,7 @@ def parse_gridbook_runtime_pin(
     *,
     where: str = "gridbook_runtime_pin.json",
 ) -> GridbookRuntimePin:
-    """Validate the complete v2 pin payload without permissive defaults."""
+    """Validate the complete v3 pin payload without permissive defaults."""
 
     if not isinstance(payload, Mapping):
         raise GridbookRuntimePinError(f"{where}: pin must be a JSON object")
@@ -72,9 +89,13 @@ def parse_gridbook_runtime_pin(
             f"{where}: repository must be {GRIDBOOK_RUNTIME_REPOSITORY!r}"
         )
     commit = payload["commit"]
-    if not isinstance(commit, str) or _FULL_COMMIT_RE.fullmatch(commit) is None:
+    if not isinstance(commit, str) or (
+        _FULL_COMMIT_RE.fullmatch(commit) is None
+        and commit != GRIDBOOK_RUNTIME_COMMIT_PENDING
+    ):
         raise GridbookRuntimePinError(
-            f"{where}: commit must be a lowercase full 40-hex SHA"
+            f"{where}: commit must be a lowercase full 40-hex SHA or the "
+            "one fail-closed release placeholder"
         )
     version = payload["version"]
     if not isinstance(version, str) or _PIN_VERSION_RE.fullmatch(version) is None:
@@ -86,12 +107,41 @@ def parse_gridbook_runtime_pin(
         raise GridbookRuntimePinError(
             f"{where}: version_is_release must be a JSON boolean"
         )
+    runtime_contract_schema = payload["runtime_contract_schema"]
+    if runtime_contract_schema != GRIDBOOK_RUNTIME_CONTRACT_SCHEMA:
+        raise GridbookRuntimePinError(
+            f"{where}: runtime_contract_schema must be "
+            f"{GRIDBOOK_RUNTIME_CONTRACT_SCHEMA!r}"
+        )
+    features = payload["required_abi_features"]
+    if not isinstance(features, Mapping) or set(features) != set(
+        GRIDBOOK_REQUIRED_ABI_FEATURES
+    ):
+        raise GridbookRuntimePinError(
+            f"{where}: required_abi_features must contain exactly "
+            f"{sorted(GRIDBOOK_REQUIRED_ABI_FEATURES)}"
+        )
+    normalized_features: dict[str, int] = {}
+    for name, expected in GRIDBOOK_REQUIRED_ABI_FEATURES.items():
+        value = features[name]
+        if type(value) is not int or value != expected:
+            raise GridbookRuntimePinError(
+                f"{where}: required_abi_features.{name} must equal "
+                f"integer {expected}"
+            )
+        normalized_features[name] = value
+    if commit == GRIDBOOK_RUNTIME_COMMIT_PENDING and version_is_release:
+        raise GridbookRuntimePinError(
+            f"{where}: unresolved release commit cannot be marked released"
+        )
     return GridbookRuntimePin(
         schema=schema,
         repository=repository,
         commit=commit,
         version=version,
         version_is_release=version_is_release,
+        runtime_contract_schema=runtime_contract_schema,
+        required_abi_features=MappingProxyType(normalized_features),
     )
 
 
@@ -130,40 +180,43 @@ def load_gridbook_runtime_pin() -> GridbookRuntimePin:
     return parse_gridbook_runtime_pin(payload, where=str(location))
 
 
-def _final_numeric_version(version: str) -> tuple[int, ...] | None:
-    text = str(version)
-    if _FINAL_NUMERIC_VERSION_RE.fullmatch(text) is None:
-        return None
-    return tuple(int(part) for part in text.split("."))
-
-
 def supports_routed_moe_per_role_codebook_lut(
     pin: GridbookRuntimePin,
 ) -> bool:
-    """Whether this pin's version carries the routed per-role LUT ABI.
+    """Whether the consumer contract explicitly requires the routed LUT ABI."""
 
-    ``version_is_release`` is intentionally not part of this capability gate.
-    An immutable pre-tag release-preparation commit can carry the ABI while
-    correctly reporting that no release tag exists yet.  Release status gates
-    served-rung credit elsewhere; the exact commit plus compatibility CI binds
-    this version claim to Gridbook's packaged runtime contract.
-    """
+    return pin.required_abi_features.get(
+        "routed_moe_per_role_codebook_lut"
+    ) == 1
 
-    actual = _final_numeric_version(pin.version)
-    minimum = _final_numeric_version(
-        GRIDBOOK_ROUTED_MOE_PER_ROLE_CODEBOOK_LUT_MIN_VERSION
-    )
-    assert minimum is not None
-    return actual is not None and actual >= minimum
+
+def supports_source_fp8_block128_w8a16(pin: GridbookRuntimePin) -> bool:
+    """Whether the consumer contract explicitly requires raw-source W8A16."""
+
+    return pin.required_abi_features.get("source_fp8_block128_w8a16") == 1
+
+
+def require_resolved_gridbook_runtime_pin(pin: GridbookRuntimePin) -> None:
+    """Refuse release work while the conspicuous commit placeholder remains."""
+
+    if not pin.commit_is_resolved:
+        raise GridbookRuntimePinError(
+            "Gridbook v0.8.5 exact release commit is still unresolved"
+        )
 
 
 __all__ = [
+    "GRIDBOOK_REQUIRED_ABI_FEATURES",
     "GRIDBOOK_ROUTED_MOE_PER_ROLE_CODEBOOK_LUT_MIN_VERSION",
+    "GRIDBOOK_RUNTIME_COMMIT_PENDING",
+    "GRIDBOOK_RUNTIME_CONTRACT_SCHEMA",
     "GRIDBOOK_RUNTIME_REPOSITORY",
     "GRIDBOOK_RUNTIME_PIN_SCHEMA",
     "GridbookRuntimePin",
     "GridbookRuntimePinError",
     "load_gridbook_runtime_pin",
     "parse_gridbook_runtime_pin",
+    "require_resolved_gridbook_runtime_pin",
     "supports_routed_moe_per_role_codebook_lut",
+    "supports_source_fp8_block128_w8a16",
 ]

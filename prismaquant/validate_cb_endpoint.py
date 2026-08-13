@@ -73,13 +73,14 @@ _FULL_DECODE_CONFIG_RE = re.compile(
     r"'cudagraph_capture_sizes': \[1\]",
 )
 _GRIDBOOK_NATIVE_EXTENSION_RE = re.compile(
-    r"^(?:prismaquant_cb(?:_v2)?_ext|pq_cb_|pq_mxfp8_dense_)"
+    r"^(?:prismaquant_cb(?:_v2)?_ext|pq_cb_|pq_mxfp8_dense_|"
+    r"pq_fp8_source_w8a16_)"
 )
 _ENDPOINT_SERVE_ENVIRONMENT = {
     **dict(CANONICAL_GOLD_ENVIRONMENT),
     # Native eager/graph gates intentionally preload all extension families so
     # both arms start from matching residency.  This is the sole override of
-    # the canonical Gridbook-0.8.4 gold profile.
+    # the canonical Gridbook gold profile.
     "PRISMAQUANT_PRELOAD_FUSED": "1",
     # The endpoint runner mounts one persistent, non-/tmp build cache.  This
     # residency/build input is path identity rather than a numerical lever,

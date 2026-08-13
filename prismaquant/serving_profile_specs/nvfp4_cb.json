@@ -95,9 +95,9 @@
       "formats": [
         "FP8_BLOCK_UE8M0_SOURCE"
       ],
-      "activation_contract": "w8a8-dynamic-e4m3-block128-ue8m0",
-      "fallback_route": "route_unbacked at Gridbook 0.8.0: every STOCK vLLM route is dead on sm121 (deep_gemm assert / cutlass scaled_mm reject / triton float8_e8m0fnu KeyError / flashinfer sm90-exact gate / marlin-linear <=sm89), and Gridbook 0.8.0's own Mxfp8DenseLinearMethod serves the format but is OPT-IN behind GRIDBOOK_MXFP8_DENSE=1 and refuses at load with the flag unset. AVAILABLE, NOT BACKED: the NATIVE-PARITY served timing bench is still pending, so this lane backs no rung.",
-      "detail": "SOURCE-PASSTHROUGH lane for the checkpoint's own block-FP8 body: E4M3 elements with ONE-BYTE UE8M0 block exponents at 128x128, copied verbatim. ROUTE STATUS: OPT-IN, NOT BACKED (was BLOCKED before Gridbook 0.8.0). The intuition that 'the released checkpoint already serves this way, so the route must exist' is measurably FALSE on our target -- on GB10/sm121, 2026-08-03, every STOCK route was tried and every one is dead: deep_gemm asserts, cutlass scaled_mm rejects the block layout, triton raises KeyError on float8_e8m0fnu, flashinfer's gate is sm90-exact, and marlin-linear tops out at sm89. WHAT CHANGED AT 0.8.0: Gridbook now serves this format itself, through its own sm120 block-scaled MXFP8 collective, by the exact embedding 128 = 4*32 (the DeepSeek block-128 UE8M0 plane broadcasts to per-32 MX scales with no element byte changed). That route is correctness-audited -- worst rel-Frobenius 5.9e-5 against an fp32 oracle over the seven real-checkpoint DSV4-Flash body shapes -- but it ships OPT-IN behind GRIDBOOK_MXFP8_DENSE=1 and refuses at load with the flag unset, because its NATIVE-PARITY served timing bench has not been run. So it is AVAILABLE, not BACKED, and it backs no rung here: pricing a rung on a lane the default serve never takes is the P5b defect this data exists to prevent. THE ARCHITECTURAL CONSEQUENCE THEREFORE STANDS: CB re-encoding of the body is still the only way DSV4-Flash serves on this box by default, so the body's CB rungs remain load-bearing rather than merely economical. The rung stays on the menu deliberately -- if the DP still wants it, that is the serving gap surfacing in the allocation instead of at deploy time -- but the exporter refuses to ship a selection containing it without an explicit override. Byte contract: 8.00049 bpw, pinned against the checkpoint's own header spans."
+      "activation_contract": "w8a16-bf16-input-fp8-e4m3-block128-ue8m0",
+      "fallback_route": "route_unbacked until the exact Gridbook v0.8.5 release pin, runtime-contract v3 feature source_fp8_block128_w8a16=1, and native-parity served evidence are all present; stock vLLM routes remain dead on sm121",
+      "detail": "SOURCE-PASSTHROUGH lane for the checkpoint's own block-FP8 body: E4M3 elements with ONE-BYTE UE8M0 block exponents at 128x128, copied verbatim. The dedicated Gridbook Fp8SourceW8A16LinearMethod keeps both source planes resident and consumes BF16 activations unchanged; it is not the direct group-32 MXFP8 re-encode lane and does not require GRIDBOOK_MXFP8_DENSE. Numerical pricing is therefore exact zero-cost source passthrough. Route publication remains fail-closed while the Gridbook v0.8.5 commit placeholder is unresolved or native-parity evidence is absent. Byte contract remains 8.00049 bpw and the wire id remains fp8_e4m3_ue8m0_block128."
     },
     {
       "id": "delegated_native_mxfp4",
@@ -209,10 +209,18 @@
             40,
             44,
             48
+          ],
+          "0.8.5": [
+            28,
+            32,
+            36,
+            40,
+            44,
+            48
           ]
         }
       },
-      "detail": "fp8-CB's fused prologue kernel consumes the SAME per-token dynamic E4M3 QDQ as its non-fused route, so the fused mid-M lane (9 <= M <= 128, measured 1.04x/1.26x/1.45x at M = 32/64/128) is a pure kernel substitution and ships as DEFAULT, but only for the rungs the consumer actually instantiates. The backed set is K in {28,32,36,40,44,48}: k % 4 == 0 is a format-plus-TMA law, because type_size = 4k must be a 16-byte multiple and the fused mainloop's uniform CbSubW = k/4 is wrong for ragged off-law sub-tables. Historical version keys are immutable. Gridbook 0.8.3 added routed per-role LUT support inside the fused mainloop without changing the codec or rung law. Gridbook 0.8.4 is a version-and-contract-only release relative to that tested code: gridbook/codec.py and the fused kernel are byte-unchanged, and its packaged runtime contract explicitly attests abi_features.routed_moe_per_role_codebook_lut=1. PrismaQuant therefore refuses routed learned books below 0.8.4, while the served per-role routed-artifact smoke remains the binding runtime evidence. When the runtime pin advances, ADD its released-version key rather than editing an existing list; an undeclared pinned version backs nothing, fail-closed."
+      "detail": "fp8-CB's fused prologue kernel consumes the SAME per-token dynamic E4M3 QDQ as its non-fused route, so the fused mid-M lane (9 <= M <= 128, measured 1.04x/1.26x/1.45x at M = 32/64/128) is a pure kernel substitution and ships as DEFAULT, but only for the rungs the consumer actually instantiates. The backed set is K in {28,32,36,40,44,48}: k % 4 == 0 is a format-plus-TMA law, because type_size = 4k must be a 16-byte multiple and the fused mainloop's uniform CbSubW = k/4 is wrong for ragged off-law sub-tables. Historical version keys are immutable. Gridbook 0.8.3 added routed per-role LUT support inside the fused mainloop without changing the codec or rung law. Gridbook 0.8.4 explicitly attests abi_features.routed_moe_per_role_codebook_lut=1. The 0.8.5 rung entry preserves the same codec law; the exact runtime commit and v3 contract still gate release work. When the runtime pin advances, ADD its released-version key rather than editing an existing list; an undeclared pinned version backs nothing, fail-closed."
     }
   ]
 }

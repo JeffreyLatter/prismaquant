@@ -945,6 +945,8 @@ def _validate_contract_binding(raw: object) -> str:
             "commit",
             "version",
             "version_is_release",
+            "runtime_contract_schema",
+            "required_abi_features",
             "file_sha256",
         },
         where="contract.gridbook_runtime_pin",
@@ -957,6 +959,17 @@ def _validate_contract_binding(raw: object) -> str:
     _require_string(runtime["version"], where="gridbook_runtime_pin.version")
     if not isinstance(runtime["version_is_release"], bool):
         raise ValueError("gridbook_runtime_pin.version_is_release must be boolean")
+    _require_string(
+        runtime["runtime_contract_schema"],
+        where="gridbook_runtime_pin.runtime_contract_schema",
+    )
+    features = runtime["required_abi_features"]
+    if not isinstance(features, Mapping) or any(
+        type(value) is not int for value in features.values()
+    ):
+        raise ValueError(
+            "gridbook_runtime_pin.required_abi_features must be an integer map"
+        )
     _require_sha256(
         runtime["file_sha256"], where="gridbook_runtime_pin.file_sha256"
     )
@@ -1497,6 +1510,8 @@ def _contract_binding(profile: object, target_profile: str, lane_id: str) -> dic
             "commit": pin.commit,
             "version": pin.version,
             "version_is_release": pin.version_is_release,
+            "runtime_contract_schema": pin.runtime_contract_schema,
+            "required_abi_features": dict(pin.required_abi_features),
             "file_sha256": _file_sha256(runtime_path),
         },
     }

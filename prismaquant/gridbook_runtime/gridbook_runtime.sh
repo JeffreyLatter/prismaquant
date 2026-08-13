@@ -43,25 +43,39 @@ import re
 import sys
 
 path = sys.argv[1]
+def strict_object(pairs):
+    value = {}
+    for name, item in pairs:
+        if name in value:
+            raise ValueError(f"duplicate JSON member {name!r}")
+        value[name] = item
+    return value
+
 with open(path, encoding="utf-8") as f:
-    pin = json.load(f)
-required = {"schema", "repository", "commit", "version", "version_is_release"}
+    pin = json.load(f, object_pairs_hook=strict_object)
+required = {
+    "schema", "repository", "commit", "version", "version_is_release",
+    "runtime_contract_schema", "required_abi_features",
+}
 if set(pin) != required:
     raise SystemExit(
         f"{path}: expected exactly {sorted(required)}, got {sorted(pin)}")
-if pin["schema"] != "prismaquant.gridbook_runtime_pin.v2":
+if pin["schema"] != "prismaquant.gridbook_runtime_pin.v3":
     raise SystemExit(f"{path}: unsupported schema {pin['schema']!r}")
 repo = pin["repository"]
-if not isinstance(repo, str) or not repo.startswith("https://") \
-        or not repo.endswith(".git"):
-    raise SystemExit(f"{path}: repository must be an https .git URL")
+if repo != "https://github.com/RobTand/gridbook.git":
+    raise SystemExit(f"{path}: repository is not the reviewed Gridbook origin")
 commit = pin["commit"]
-if not isinstance(commit, str) or re.fullmatch(r"[0-9a-f]{40}", commit) is None:
-    raise SystemExit(f"{path}: commit must be a lowercase full 40-hex SHA")
+pending = "PENDING_GRIDBOOK_V0_8_5_RELEASE_COMMIT"
+if not isinstance(commit, str) or (
+        re.fullmatch(r"[0-9a-f]{40}", commit) is None and commit != pending):
+    raise SystemExit(f"{path}: invalid exact release commit field")
 version = pin["version"]
 if not isinstance(version, str) or re.fullmatch(
         r"[0-9]+(?:[.][0-9]+)*(?:[A-Za-z0-9.+-]*)?", version) is None:
     raise SystemExit(f"{path}: invalid package version {version!r}")
+if version != "0.8.5":
+    raise SystemExit(f"{path}: runtime-contract v3 release must be version 0.8.5")
 # True only when `commit` IS the release tag commit for `version`. A pin that
 # advances to a post-release master commit keeps the same `version` string (the
 # runtime self-reports it until the next bump), so the version alone cannot say
@@ -69,7 +83,25 @@ if not isinstance(version, str) or re.fullmatch(
 # what stops a rung table from crediting an unreleased runtime.
 if not isinstance(pin["version_is_release"], bool):
     raise SystemExit(f"{path}: version_is_release must be a JSON boolean")
-print(pin["schema"], repo, commit, version, sep="\t")
+if commit == pending and pin["version_is_release"]:
+    raise SystemExit(f"{path}: unresolved commit cannot be marked released")
+contract_schema = pin["runtime_contract_schema"]
+if contract_schema != "gridbook.runtime-contract.v3":
+    raise SystemExit(f"{path}: unsupported runtime contract schema")
+features = pin["required_abi_features"]
+required_features = {
+    "routed_moe_per_role_codebook_lut": 1,
+    "source_fp8_block128_w8a16": 1,
+}
+if features != required_features or any(
+        type(value) is not int for value in features.values()):
+    raise SystemExit(f"{path}: required ABI feature set differs")
+print(
+    pin["schema"], repo, commit, version, int(pin["version_is_release"]),
+    contract_schema,
+    features["routed_moe_per_role_codebook_lut"],
+    features["source_fp8_block128_w8a16"], sep="\t",
+)
 PY
 )"; then
         _gridbook_runtime_error "invalid pin file $_GRIDBOOK_RUNTIME_PIN_FILE"
@@ -78,13 +110,26 @@ PY
 
     IFS=$'\t' read -r GRIDBOOK_RUNTIME_PIN_SCHEMA \
         GRIDBOOK_RUNTIME_REPOSITORY GRIDBOOK_RUNTIME_COMMIT \
-        GRIDBOOK_RUNTIME_VERSION <<<"$values"
+        GRIDBOOK_RUNTIME_VERSION GRIDBOOK_RUNTIME_VERSION_IS_RELEASE \
+        GRIDBOOK_RUNTIME_CONTRACT_SCHEMA \
+        GRIDBOOK_RUNTIME_FEATURE_ROUTED_MOE_PER_ROLE_CODEBOOK_LUT \
+        GRIDBOOK_RUNTIME_FEATURE_SOURCE_FP8_BLOCK128_W8A16 <<<"$values"
     if ! _gridbook_runtime_is_commit "$GRIDBOOK_RUNTIME_COMMIT"; then
-        _gridbook_runtime_error "pin parser did not return a full commit"
+        _gridbook_runtime_error \
+            "Gridbook v0.8.5 exact release commit is unresolved; replace the tracked placeholder"
+        return
+    fi
+    if [[ "$GRIDBOOK_RUNTIME_VERSION_IS_RELEASE" != 1 ]]; then
+        _gridbook_runtime_error \
+            "Gridbook v0.8.5 pin is not an exact released commit"
         return
     fi
     export GRIDBOOK_RUNTIME_PIN_SCHEMA GRIDBOOK_RUNTIME_REPOSITORY \
-        GRIDBOOK_RUNTIME_COMMIT GRIDBOOK_RUNTIME_VERSION
+        GRIDBOOK_RUNTIME_COMMIT GRIDBOOK_RUNTIME_VERSION \
+        GRIDBOOK_RUNTIME_VERSION_IS_RELEASE \
+        GRIDBOOK_RUNTIME_CONTRACT_SCHEMA \
+        GRIDBOOK_RUNTIME_FEATURE_ROUTED_MOE_PER_ROLE_CODEBOOK_LUT \
+        GRIDBOOK_RUNTIME_FEATURE_SOURCE_FP8_BLOCK128_W8A16
 }
 
 _gridbook_runtime_source_version() {
@@ -375,6 +420,9 @@ gridbook_runtime_prepare() {
         --env "PQ_GRIDBOOK_RUNTIME_SOURCE=${container_source}"
         --env "PQ_GRIDBOOK_RUNTIME_COMMIT=${GRIDBOOK_RUNTIME_COMMIT}"
         --env "PQ_GRIDBOOK_RUNTIME_VERSION=${GRIDBOOK_RUNTIME_VERSION}"
+        --env "PQ_GRIDBOOK_RUNTIME_CONTRACT_SCHEMA=${GRIDBOOK_RUNTIME_CONTRACT_SCHEMA}"
+        --env "PQ_GRIDBOOK_RUNTIME_FEATURE_ROUTED_MOE_PER_ROLE_CODEBOOK_LUT=${GRIDBOOK_RUNTIME_FEATURE_ROUTED_MOE_PER_ROLE_CODEBOOK_LUT}"
+        --env "PQ_GRIDBOOK_RUNTIME_FEATURE_SOURCE_FP8_BLOCK128_W8A16=${GRIDBOOK_RUNTIME_FEATURE_SOURCE_FP8_BLOCK128_W8A16}"
         --env "PQ_GRIDBOOK_RUNTIME_HELPER=${GRIDBOOK_RUNTIME_CONTAINER_HELPER}"
     )
     printf 'gridbook-runtime: checkout %s (%s); contract %s\n' \
@@ -395,6 +443,7 @@ gridbook_runtime_install_container() {
     local source=${PQ_GRIDBOOK_RUNTIME_SOURCE:-}
     local supplied_commit=${PQ_GRIDBOOK_RUNTIME_COMMIT:-}
     local supplied_version=${PQ_GRIDBOOK_RUNTIME_VERSION:-}
+    local supplied_contract_schema=${PQ_GRIDBOOK_RUNTIME_CONTRACT_SCHEMA:-}
     local install_source install_spec
 
     # Apply safe-path mode to pip and to the post-install import proof even
@@ -428,6 +477,11 @@ gridbook_runtime_install_container() {
             "container version $supplied_version does not equal tracked pin $GRIDBOOK_RUNTIME_VERSION"
         return
     fi
+    if [[ "$supplied_contract_schema" != "$GRIDBOOK_RUNTIME_CONTRACT_SCHEMA" ]]; then
+        _gridbook_runtime_error \
+            "container runtime-contract schema differs from tracked pin"
+        return
+    fi
 
     gridbook_runtime_verify_standalone_checkout "$source" \
         "$GRIDBOOK_RUNTIME_COMMIT" \
@@ -453,7 +507,10 @@ gridbook_runtime_install_container() {
     install_spec="git+file://${install_source}@${GRIDBOOK_RUNTIME_COMMIT}"
     python3 -m pip install --no-deps --no-build-isolation --no-cache-dir --quiet \
         --force-reinstall "$install_spec"
-    python3 - "$GRIDBOOK_RUNTIME_VERSION" "$GRIDBOOK_RUNTIME_COMMIT" <<'PY'
+    python3 - "$GRIDBOOK_RUNTIME_VERSION" "$GRIDBOOK_RUNTIME_COMMIT" \
+        "$GRIDBOOK_RUNTIME_CONTRACT_SCHEMA" \
+        "$GRIDBOOK_RUNTIME_FEATURE_ROUTED_MOE_PER_ROLE_CODEBOOK_LUT" \
+        "$GRIDBOOK_RUNTIME_FEATURE_SOURCE_FP8_BLOCK128_W8A16" <<'PY'
 import importlib
 from importlib.metadata import distribution
 from importlib.metadata import version
@@ -463,6 +520,11 @@ import sys
 
 expected = sys.argv[1]
 expected_commit = sys.argv[2]
+expected_contract_schema = sys.argv[3]
+expected_features = {
+    "routed_moe_per_role_codebook_lut": int(sys.argv[4]),
+    "source_fp8_block128_w8a16": int(sys.argv[5]),
+}
 actual = version("gridbook")
 if actual != expected:
     raise SystemExit(f"installed gridbook {actual!r}, expected {expected!r}")
@@ -544,6 +606,31 @@ if not isinstance(spec_origin, str) or Path(spec_origin).resolve(
     strict=True
 ) != module_file:
     raise SystemExit("imported gridbook __spec__.origin differs from __file__")
+
+# Version/commit identity is insufficient for a cross-repository wire route.
+# Read Gridbook's packaged, standard-library-only consumer contract and require
+# the exact feature values the producer pin names.
+runtime_contract_module = importlib.import_module("gridbook.runtime_contract")
+load_contract = getattr(runtime_contract_module, "load_runtime_contract", None)
+if not callable(load_contract):
+    raise SystemExit("installed gridbook has no runtime-contract loader")
+runtime_contract = load_contract()
+if not isinstance(runtime_contract, dict):
+    raise SystemExit("installed gridbook runtime contract is not a mapping")
+if runtime_contract.get("schema") != expected_contract_schema:
+    raise SystemExit(
+        "installed gridbook runtime-contract schema differs: "
+        f"{runtime_contract.get('schema')!r}"
+    )
+abi_features = runtime_contract.get("abi_features")
+if not isinstance(abi_features, dict):
+    raise SystemExit("installed gridbook runtime contract lacks abi_features")
+for name, expected_value in expected_features.items():
+    if abi_features.get(name) != expected_value:
+        raise SystemExit(
+            f"installed gridbook ABI feature {name!r} is "
+            f"{abi_features.get(name)!r}, expected {expected_value}"
+        )
 print(
     f"gridbook-runtime: installed gridbook {actual} "
     f"from git commit {expected_commit}; import root {package_root}"

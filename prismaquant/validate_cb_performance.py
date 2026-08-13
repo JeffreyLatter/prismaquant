@@ -67,7 +67,8 @@ MAX_PARITY_TOLERANCE = 0.05
 
 _SHA256 = frozenset("0123456789abcdef")
 _GRIDBOOK_NATIVE_EXTENSION_RE = re.compile(
-    r"^(?:prismaquant_cb(?:_v2)?_ext|pq_cb_|pq_mxfp8_dense_)"
+    r"^(?:prismaquant_cb(?:_v2)?_ext|pq_cb_|pq_mxfp8_dense_|"
+    r"pq_fp8_source_w8a16_)"
 )
 _CB_FORMAT_RE = re.compile(r"^(?:NVFP4_CB|FP8_CB)_K[0-9]+$")
 _GRIDBOOK_BACKEND_RE = re.compile(r"^gridbook-[a-z0-9][a-z0-9._-]*$")
@@ -122,7 +123,7 @@ _PHASE_METRICS = {
 }
 # Performance intentionally preloads every Gridbook extension family so the
 # candidate and displaced-container arms have identical residency.  Every
-# other Gridbook 0.8.4 input is the canonical gold value.  The full map keeps
+# other Gridbook input is the canonical gold value. The full map keeps
 # the absent variables reviewable; the live process/report representation
 # contains only the set-valued projection, with absence proven by the complete
 # serve-fingerprint allowlist.

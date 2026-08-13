@@ -182,7 +182,7 @@ def test_cb_mapping_uses_authoritative_basis_and_source_gated_ladders():
     assert expert_terminal.format_name == "MXFP4_SOURCE"
     assert expert_terminal.allocator_selectable
     assert dense_terminal.format_name == "FP8_BLOCK_UE8M0_SOURCE"
-    assert not dense_terminal.allocator_selectable
+    assert dense_terminal.allocator_selectable
 
     expert_segments = candidates_by_segment(expert, plugin)
     dense_segments = candidates_by_segment(dense, plugin)
@@ -239,7 +239,7 @@ def test_cb_mapping_uses_authoritative_basis_and_source_gated_ladders():
     ("BF16", True),
     ("FP8_SOURCE", True),
     ("MXFP4_SOURCE", True),
-    ("FP8_BLOCK_UE8M0_SOURCE", False),
+    ("FP8_BLOCK_UE8M0_SOURCE", True),
 ))
 def test_terminal_selectability_is_activation_identity(
     terminal, selectable,
@@ -914,7 +914,7 @@ def test_dsv4_driver_wires_resume_to_allocator_and_artifact_publish():
         ).body)
 
 
-def test_dsv4_allocator_command_excludes_unmeasured_fp8_terminal(tmp_path):
+def test_dsv4_allocator_command_includes_w8a16_fp8_terminal(tmp_path):
     prepared = SimpleNamespace(
         args=SimpleNamespace(
             probe=tmp_path / "probe.pkl",
@@ -933,10 +933,10 @@ def test_dsv4_allocator_command_excludes_unmeasured_fp8_terminal(tmp_path):
     formats = command[command.index("--formats") + 1].split(",")
     assert "MXFP4_SOURCE" in formats
     assert "BF16" in formats
-    assert "FP8_BLOCK_UE8M0_SOURCE" not in formats
+    assert "FP8_BLOCK_UE8M0_SOURCE" in formats
 
 
-def test_selected_assignment_refuses_identity_only_fp8_terminal(tmp_path):
+def test_selected_assignment_accepts_w8a16_fp8_terminal(tmp_path):
     plugin = _plugin()
     (unit,) = build_cb_units((
         _declaration("dense", role="wq_a", nonexpert=True),
@@ -945,10 +945,9 @@ def test_selected_assignment_refuses_identity_only_fp8_terminal(tmp_path):
     layer_config.write_text(json.dumps({
         unit.qname: "FP8_BLOCK_UE8M0_SOURCE",
     }))
-    with pytest.raises(
-        DSv4CampaignError, match="source-illegal or unmeasured",
-    ):
-        _selected_assignment(layer_config, (unit,))
+    assert _selected_assignment(layer_config, (unit,)) == {
+        unit.qname: "FP8_BLOCK_UE8M0_SOURCE"
+    }
 
 
 def test_allocator_supersurrogate_gate_is_satisfied_and_stays_fail_closed(

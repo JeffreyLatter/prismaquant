@@ -129,6 +129,21 @@ def test_routed_moe_per_role_lut_capability_matches_the_pinned_contract():
     )
 
 
+def test_source_fp8_block128_w8a16_capability_matches_the_pinned_contract():
+    from prismaquant.gridbook_runtime_pin import (
+        load_gridbook_runtime_pin,
+        supports_source_fp8_block128_w8a16,
+    )
+
+    pin = load_gridbook_runtime_pin()
+    contract = _runtime_contract()
+    assert contract.get("schema") == pin.runtime_contract_schema
+    assert supports_source_fp8_block128_w8a16(pin)
+    assert contract.get("abi_features", {}).get(
+        "source_fp8_block128_w8a16"
+    ) == 1
+
+
 def test_a_declared_lane_the_runtime_cannot_serve_still_fails(monkeypatch):
     """Negative control for the relaxation above.
 

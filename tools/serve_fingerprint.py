@@ -99,7 +99,9 @@ _REQUIRED_GRIDBOOK_SOURCE_FILES = frozenset({
     "gridbook/plugin.py",
     "gridbook/runtime_contract.json",
     "gridbook/source_passthrough.py",
+    "gridbook/fp8_source_w8a16.py",
     "gridbook/csrc/cb_gemv.cu",
+    "gridbook/csrc/fp8_source_w8a16.cu",
     "gridbook/csrc/mxfp8_dense_gemm.cu",
 })
 
@@ -187,7 +189,8 @@ SERVER_ENV_ALLOWLIST = (
 
 #: The extensions whose residency moves the numbers (§7.4).
 EXTENSION_PATTERN = re.compile(
-    r"gridbook|prismaquant|flashinfer|causal_conv1d|fla")
+    r"gridbook|prismaquant|pq_(?:cb|mxfp8|fp8_source)|flashinfer|"
+    r"causal_conv1d|fla")
 
 #: Packages whose version pins the numeric stack.
 TRACKED_PACKAGES = (

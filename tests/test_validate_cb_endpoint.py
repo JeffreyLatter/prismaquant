@@ -44,6 +44,34 @@ _RESOLVED_GRAPH_CONFIG = (
 _SERVED_MODEL = cbv.DSV4_SERVED_MODEL_PREFIX + "a" * 32
 
 
+@pytest.fixture(autouse=True)
+def _released_gridbook_pin(monkeypatch):
+    """Exercise endpoint evidence behind a synthetic resolved release pin."""
+
+    import prismaquant.shipcard as shipcard_module
+    from dataclasses import replace
+    from prismaquant.gridbook_runtime_pin import load_gridbook_runtime_pin
+
+    pin_path = (
+        ROOT
+        / "prismaquant"
+        / "gridbook_runtime"
+        / "gridbook_runtime_pin.json"
+    )
+    released = json.loads(pin_path.read_text(encoding="utf-8"))
+    released["commit"] = "a" * 40
+    released["version_is_release"] = True
+    monkeypatch.setattr(cbv, "_gridbook_runtime_pin", lambda: dict(released))
+    released_pin = replace(
+        load_gridbook_runtime_pin(),
+        commit=released["commit"],
+        version_is_release=True,
+    )
+    monkeypatch.setattr(
+        shipcard_module, "load_gridbook_runtime_pin", lambda: released_pin
+    )
+
+
 def _gridbook_distribution(pin: dict) -> dict:
     package_root = "/usr/local/lib/python3.12/site-packages/gridbook"
     import_origin = {
@@ -63,7 +91,9 @@ def _gridbook_distribution(pin: dict) -> dict:
             "gridbook/plugin.py",
             "gridbook/runtime_contract.json",
             "gridbook/source_passthrough.py",
+            "gridbook/fp8_source_w8a16.py",
             "gridbook/csrc/cb_gemv.cu",
+            "gridbook/csrc/fp8_source_w8a16.cu",
             "gridbook/csrc/mxfp8_dense_gemm.cu",
         )
     }
@@ -80,11 +110,11 @@ def _gridbook_distribution(pin: dict) -> dict:
                 "commit_id": pin["commit"],
             },
         },
-        "direct_url_path": "gridbook-0.8.4.dist-info/direct_url.json",
+        "direct_url_path": f"gridbook-{pin['version']}.dist-info/direct_url.json",
         "direct_url_identity": {"bytes": 123, "sha256": "d" * 64},
-        "metadata_path": "gridbook-0.8.4.dist-info/METADATA",
+        "metadata_path": f"gridbook-{pin['version']}.dist-info/METADATA",
         "metadata_identity": {"bytes": 123, "sha256": "e" * 64},
-        "record_path": "gridbook-0.8.4.dist-info/RECORD",
+        "record_path": f"gridbook-{pin['version']}.dist-info/RECORD",
         "record_identity": {"bytes": 123, "sha256": "f" * 64},
         "source_files": source_files,
         "source_files_sha256": cbv._canonical_json_sha256(source_files),
@@ -362,8 +392,8 @@ def test_manifest_validation_binds_each_arm_to_exact_stack(arm):
         (lambda m: m.update(model="/different"), "exact /model"),
         (lambda m: m.update(resident_extensions=[]), "Gridbook-native CUDA extension"),
         (
-            lambda m: m["pq_env"].pop("GRIDBOOK_MXFP8_DENSE"),
-            "GRIDBOOK_MXFP8_DENSE",
+            lambda m: m["pq_env"].__setitem__("GRIDBOOK_MXFP8_DENSE", "1"),
+            "exact live-process Gridbook contract",
         ),
     ],
 )
@@ -1077,7 +1107,7 @@ def test_driver_and_lane_declare_two_isolated_arms_and_guards():
     stop_idx = text.rindex('docker stop -t 30 "$CID"')
     assert endpoint_idx < ship_gate_idx < stop_idx
     assert 'contains_mxfp4_wire' in text
-    assert '-e GRIDBOOK_MXFP8_DENSE=1' in text
+    assert '-e GRIDBOOK_MXFP8_DENSE=1' not in text
     assert '-e VLLM_USE_DEEP_GEMM=0' in text
     assert '-e PRISMAQUANT_PRELOAD_FUSED=1' in text
     assert '-e PRISMAQUANT_CB_DECODE=' not in text
@@ -1123,6 +1153,8 @@ def test_driver_and_lane_declare_two_isolated_arms_and_guards():
         "prismaquant_cb_v2_ext.so",
         "pq_cb_fused_fp4_deadbeef.so",
         "pq_mxfp8_dense_deadbeef.so",
+        "pq_fp8_source_w8a16_deadbeef.so",
+        "pq_cb_bf16_grouped_deadbeef.so",
     ],
 )
 def test_manifest_accepts_reviewed_gridbook_native_extension_families(extension):

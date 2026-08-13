@@ -91,6 +91,9 @@ ROUTE_DELEGATED_NATIVE = "delegated_native"
 # block-128 source scales into per-32 MXFP8 weight scales, and quantizes the A
 # side dynamically to MXFP8 per 32.
 ROUTE_GRIDBOOK_MXFP8_DENSE = "gridbook_mxfp8_dense"
+# Gridbook-owned raw-resident block-128 source route. Unlike the direct G32
+# MXFP8 lane above, this route consumes BF16 activations unchanged.
+ROUTE_GRIDBOOK_FP8_SOURCE_W8A16 = "gridbook_fp8_source_w8a16"
 
 # What a MEASUREMENT says about serving a passthrough's bytes. These are
 # verdicts from a real serve attempt on real hardware, not design intent —
@@ -188,29 +191,26 @@ SOURCE_PASSTHROUGH_CONTRACTS: dict[str, SourcePassthroughContract] = {
             format_name="FP8_BLOCK_UE8M0_SOURCE",
             source_kind="fp8_ue8m0",
             wire_format_id="fp8_e4m3_ue8m0_block128",
-            # Weight bytes are copied exactly, but Gridbook's concrete route
-            # is W8A8.  A weight-only AURA pass therefore cannot synthesize a
-            # zero output cost for this terminal.
-            zero_cost_by_construction=False,
-            serving_route=ROUTE_GRIDBOOK_MXFP8_DENSE,
+            zero_cost_by_construction=True,
+            serving_route=ROUTE_GRIDBOOK_FP8_SOURCE_W8A16,
             route_status=ROUTE_STATUS_PENDING,
-            route_requirement="GRIDBOOK_MXFP8_DENSE=1",
+            route_requirement=(
+                "pinned Gridbook runtime-contract v3 feature "
+                "abi_features.source_fp8_block128_w8a16=1"
+            ),
             detail=(
-                "block-FP8 with UE8M0 block exponents, served by Gridbook "
-                "0.8.4's opt-in Mxfp8DenseLinearMethod. The source weight "
-                "plane is embedded exactly into per-32 MXFP8, while inputs "
-                "are dynamically quantized to MXFP8 per 32 (W8A8). The route "
-                "exists and is correctness-audited, but remains pending until "
-                "the served native-parity performance gate is measured."
+                "block-FP8 with UE8M0 block exponents, consumed by "
+                "Gridbook's dedicated Fp8SourceW8A16LinearMethod. Both "
+                "source planes stay resident and byte-verbatim and BF16 "
+                "activations are unchanged. The numerical terminal is exact "
+                "by construction; release/served-parity evidence remains a "
+                "separate fail-closed route gate."
             ),
             route_evidence=(
-                "Gridbook 0.8.4 commit "
-                "56259f6e5d8646da9f9179e1dde7a1708849722c: "
-                "source_passthrough.py binds the wire id to "
-                "Mxfp8DenseLinearMethod on sm121 and requires "
-                "GRIDBOOK_MXFP8_DENSE=1; kernel-vs-oracle correctness is "
-                "audited on DSv4 shapes, while served native-parity evidence "
-                "is still pending."
+                "Anticipated Gridbook 0.8.5 runtime-contract v3 feature "
+                "source_fp8_block128_w8a16=1 and method "
+                "Fp8SourceW8A16LinearMethod. Exact release commit and "
+                "native-parity served evidence are intentionally pending."
             ),
         ),
         # DeepSeek-V4 routed experts: nibble-packed E2M1 + E8M0 group scales.
@@ -344,10 +344,8 @@ def source_format_for_kind(source_kind: str) -> fr.FormatSpec | None:
 # already emits real rows for them on the checkpoints where they are legal,
 # and synthesizing over a table that has an entry would hide a disagreement.
 # A byte-copy contract belongs here only when BOTH its W and A paths are the
-# identity.  ``FP8_BLOCK_UE8M0_SOURCE`` is intentionally absent: Gridbook
-# copies its weight bytes but serves them through a W8A8 per-32 MXFP8 method,
-# so activation-side AURA (or another measured output currency) is required
-# before the terminal can be allocator-selectable.
+# identity. ``FP8_BLOCK_UE8M0_SOURCE`` qualifies through Gridbook's dedicated
+# W8A16 route; runtime release status remains independently fail-closed below.
 #
 # Membership is not self-certifying: ``cost_entry_is_source_passthrough``
 # additionally requires the format to be a registered passthrough format whose

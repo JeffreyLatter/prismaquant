@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import copy
+from dataclasses import replace
 import hashlib
 import json
 import math
 import shutil
+import sys
 from pathlib import Path
 
 import pytest
@@ -63,6 +65,31 @@ _GOLD_ENV = {
     **dict(CANONICAL_GOLD_SET_ENVIRONMENT),
     "PYTHONSAFEPATH": "1",
 }
+
+
+@pytest.fixture(autouse=True)
+def _resolved_release_pin_for_gold_replay(monkeypatch):
+    """Unit-test gold replay mechanics independently of the staged pin gate."""
+
+    import prismaquant.validate_cb_endpoint as endpoint
+
+    released = replace(
+        load_gridbook_runtime_pin(),
+        commit="a" * 40,
+        version_is_release=True,
+    )
+    monkeypatch.setattr(
+        sys.modules[__name__], "load_gridbook_runtime_pin", lambda: released
+    )
+    monkeypatch.setattr(endpoint, "_gridbook_runtime_pin", lambda: {
+        "schema": released.schema,
+        "repository": released.repository,
+        "commit": released.commit,
+        "version": released.version,
+        "version_is_release": released.version_is_release,
+        "runtime_contract_schema": released.runtime_contract_schema,
+        "required_abi_features": dict(released.required_abi_features),
+    })
 
 
 def _canonical_sha(value: object) -> str:
@@ -291,7 +318,9 @@ def _gridbook_distribution(pin) -> dict:
             "gridbook/plugin.py",
             "gridbook/runtime_contract.json",
             "gridbook/source_passthrough.py",
+            "gridbook/fp8_source_w8a16.py",
             "gridbook/csrc/cb_gemv.cu",
+            "gridbook/csrc/fp8_source_w8a16.cu",
             "gridbook/csrc/mxfp8_dense_gemm.cu",
         )
     }
@@ -318,11 +347,11 @@ def _gridbook_distribution(pin) -> dict:
                 "commit_id": pin.commit,
             },
         },
-        "direct_url_path": "gridbook-0.8.4.dist-info/direct_url.json",
+        "direct_url_path": f"gridbook-{pin.version}.dist-info/direct_url.json",
         "direct_url_identity": {"bytes": 123, "sha256": "d" * 64},
-        "metadata_path": "gridbook-0.8.4.dist-info/METADATA",
+        "metadata_path": f"gridbook-{pin.version}.dist-info/METADATA",
         "metadata_identity": {"bytes": 123, "sha256": "e" * 64},
-        "record_path": "gridbook-0.8.4.dist-info/RECORD",
+        "record_path": f"gridbook-{pin.version}.dist-info/RECORD",
         "record_identity": {"bytes": 123, "sha256": "f" * 64},
         "source_files": source_files,
         "source_files_sha256": _canonical_sha(source_files),
@@ -385,11 +414,12 @@ def _gold_record(root: Path, *, slot: str = "gold.kl") -> tuple[dict, dict]:
             "version": pin.version,
         },
         "gridbook_distribution": _gridbook_distribution(pin),
-        "resident_extensions": [
-            "pq_mxfp8_dense_deadbeef.so",
+        "resident_extensions": sorted([
+            "pq_fp8_source_w8a16_deadbeef.so",
+            "pq_cb_bf16_grouped_deadbeef.so",
             "prismaquant_cb_ext.so",
             "prismaquant_cb_v2_ext.so",
-        ],
+        ]),
         "residency_readable": True,
         "processes": processes,
         "server_process_environment": {
@@ -516,6 +546,22 @@ def test_gold_replay_accepts_null_source_commit_and_exact_engine_evidence(
     assert _verify_dsv4_gridbook_gold_contract(
         "gold.kl", record, metrics, model_dir=root
     ) == []
+
+
+def test_gold_replay_reports_an_unavailable_release_pin(tmp_path, monkeypatch):
+    import prismaquant.validate_cb_endpoint as endpoint
+
+    root, _card = _artifact(tmp_path)
+    record, metrics = _gold_record(root)
+
+    def unavailable():
+        raise endpoint.CBEndpointValidationError("staged release pin")
+
+    monkeypatch.setattr(endpoint, "_gridbook_runtime_pin", unavailable)
+    problems = _verify_dsv4_gridbook_gold_contract(
+        "gold.kl", record, metrics, model_dir=root
+    )
+    assert any("release pin unavailable" in problem for problem in problems)
 
 
 def test_ppl_calibration_is_pinned_and_artifact_tokenizer_bound(tmp_path):

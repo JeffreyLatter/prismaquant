@@ -89,11 +89,16 @@ def _inputs():
                 "spec_sha256": "f" * 64,
             },
             "gridbook_runtime_pin": {
-                "schema": "prismaquant.gridbook_runtime_pin.v2",
+                "schema": "prismaquant.gridbook_runtime_pin.v3",
                 "repository": "https://example.invalid/gridbook",
                 "commit": "1" * 40,
                 "version": "1.2.3",
                 "version_is_release": True,
+                "runtime_contract_schema": "gridbook.runtime-contract.v3",
+                "required_abi_features": {
+                    "routed_moe_per_role_codebook_lut": 1,
+                    "source_fp8_block128_w8a16": 1,
+                },
                 "file_sha256": "9" * 64,
             },
         },

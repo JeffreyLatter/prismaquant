@@ -1,9 +1,11 @@
 """Fail-closed tests for the paired Gridbook serving-performance gate."""
 from __future__ import annotations
 
+from dataclasses import replace
 import hashlib
 import json
 from pathlib import Path
+import sys
 
 import pytest
 
@@ -77,6 +79,48 @@ _ALLOWED_DIFFERENCES = [
 ]
 
 
+@pytest.fixture(autouse=True)
+def _released_gridbook_pin(monkeypatch):
+    """Exercise parity mechanics independently of the staged release gate."""
+
+    import prismaquant.native_baseline_feasibility as native_feasibility
+    import prismaquant.shipcard as shipcard_module
+    import prismaquant.validate_cb_endpoint as endpoint_validator
+
+    released = replace(
+        load_gridbook_runtime_pin(),
+        commit="a" * 40,
+        version_is_release=True,
+    )
+    monkeypatch.setattr(
+        sys.modules[__name__], "load_gridbook_runtime_pin", lambda: released
+    )
+    monkeypatch.setattr(
+        performance_validator, "load_gridbook_runtime_pin", lambda: released
+    )
+    monkeypatch.setattr(
+        native_feasibility, "load_gridbook_runtime_pin", lambda: released
+    )
+    monkeypatch.setattr(
+        shipcard_module, "load_gridbook_runtime_pin", lambda: released
+    )
+    monkeypatch.setattr(endpoint_validator, "_gridbook_runtime_pin", lambda: {
+        "schema": released.schema,
+        "repository": released.repository,
+        "commit": released.commit,
+        "version": released.version,
+        "version_is_release": released.version_is_release,
+        "runtime_contract_schema": released.runtime_contract_schema,
+        "required_abi_features": dict(released.required_abi_features),
+    })
+    monkeypatch.setitem(
+        _SERVER_ENVIRONMENT, "PQ_GRIDBOOK_RUNTIME_COMMIT", released.commit
+    )
+    monkeypatch.setitem(
+        _SERVER_ENVIRONMENT, "PQ_GRIDBOOK_RUNTIME_VERSION", released.version
+    )
+
+
 def _write_json(path: Path, payload: object) -> str:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
@@ -114,7 +158,9 @@ def _gridbook_distribution() -> dict:
             "gridbook/plugin.py",
             "gridbook/runtime_contract.json",
             "gridbook/source_passthrough.py",
+            "gridbook/fp8_source_w8a16.py",
             "gridbook/csrc/cb_gemv.cu",
+            "gridbook/csrc/fp8_source_w8a16.cu",
             "gridbook/csrc/mxfp8_dense_gemm.cu",
         )
     }
@@ -131,11 +177,11 @@ def _gridbook_distribution() -> dict:
                 "commit_id": pin.commit,
             },
         },
-        "direct_url_path": "gridbook-0.8.4.dist-info/direct_url.json",
+        "direct_url_path": f"gridbook-{pin.version}.dist-info/direct_url.json",
         "direct_url_identity": {"bytes": 123, "sha256": "d" * 64},
-        "metadata_path": "gridbook-0.8.4.dist-info/METADATA",
+        "metadata_path": f"gridbook-{pin.version}.dist-info/METADATA",
         "metadata_identity": {"bytes": 123, "sha256": "e" * 64},
-        "record_path": "gridbook-0.8.4.dist-info/RECORD",
+        "record_path": f"gridbook-{pin.version}.dist-info/RECORD",
         "record_identity": {"bytes": 123, "sha256": "f" * 64},
         "source_files": source_files,
         "source_files_sha256": _inventory_sha(source_files),

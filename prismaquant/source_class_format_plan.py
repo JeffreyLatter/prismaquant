@@ -600,7 +600,11 @@ def write_format_plan(plan: SourceClassFormatPlan, path: str | Path) -> None:
     atomic_write_bytes(Path(path), encoded)
 
 
-def load_format_plan(path: str | Path) -> SourceClassFormatPlan:
+def load_format_plan(
+    path: str | Path,
+    *,
+    verify_current_serving_restriction: bool = True,
+) -> SourceClassFormatPlan:
     plan_path = Path(path)
     try:
         raw = json.loads(plan_path.read_text())
@@ -639,23 +643,36 @@ def load_format_plan(path: str | Path) -> SourceClassFormatPlan:
             f"format plan {plan_path} has a non-object "
             "serving_backed_restriction"
         )
-    family_formats, restriction = _complete_family(
-        menus[EXPERT_MENU],
-        menus[NONEXPERT_MENU],
-        serving_backed_profile=(
-            None if stored_restriction is None
-            else str(stored_restriction.get("profile_id", ""))
-        ),
-    )
-    if restriction is not None and canonical_json(
-        dict(restriction), where="serving-backed restriction"
-    ) != canonical_json(
-        dict(stored_restriction), where="stored serving-backed restriction"
-    ):
-        raise ValueError(
-            f"format plan {plan_path} was written under a different "
-            "serving-backed restriction than the current pin resolves: "
-            f"stored={dict(stored_restriction)} current={dict(restriction)}"
+    if verify_current_serving_restriction:
+        family_formats, restriction = _complete_family(
+            menus[EXPERT_MENU],
+            menus[NONEXPERT_MENU],
+            serving_backed_profile=(
+                None if stored_restriction is None
+                else str(stored_restriction.get("profile_id", ""))
+            ),
+        )
+        if restriction is not None and canonical_json(
+            dict(restriction), where="serving-backed restriction"
+        ) != canonical_json(
+            dict(stored_restriction), where="stored serving-backed restriction"
+        ):
+            raise ValueError(
+                f"format plan {plan_path} was written under a different "
+                "serving-backed restriction than the current pin resolves: "
+                f"stored={dict(stored_restriction)} current={dict(restriction)}"
+            )
+    else:
+        # Explicit migration callers may need to verify an immutable historical
+        # plan after the consumer pin advances. This bypasses only the CURRENT
+        # pin comparison: the stored digest, closed menus, units, source bytes,
+        # and serving groups are still parsed and checked below. The caller
+        # must separately prove the allowed semantic delta to a fresh plan.
+        family_formats = tuple(menus[NONEXPERT_MENU])
+        restriction = (
+            None
+            if stored_restriction is None
+            else dict(stored_restriction)
         )
     _validate_declared_menus(
         menus[EXPERT_MENU], menus[NONEXPERT_MENU], family_formats
