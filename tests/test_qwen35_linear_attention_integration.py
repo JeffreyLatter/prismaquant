@@ -44,14 +44,34 @@ def _force_pure_torch_kernels(monkeypatch):
 
     transformers selects `causal_conv1d`/`fla` extensions by package
     availability, not tensor device — in a cu130 stack the installed CUDA
-    extension gets picked for CPU tensors and fails with
-    `Expected x.is_cuda()`. The kernel-dispatch wrappers keep the pure
-    PyTorch implementation reachable via `__wrapped__`; unwrap them so the
-    test always runs the torch path, everywhere. No-op in clean CPU envs
-    and on transformers versions without those wrappers."""
+    extension gets picked for CPU tensors. Transformers <=5.14 binds raw
+    optional-extension globals/classes onto each DeltaNet instance at
+    construction; 5.15 wraps module-level torch fallbacks and dispatches
+    through them.
+
+    Select the package-provided PyTorch implementation for both layouts
+    before `_tiny_hybrid()` constructs its layers."""
     import transformers.models.qwen3_5.modeling_qwen3_5 as m
+
+    # <=5.14: replace the raw optional-extension globals that __init__ copies
+    # onto Qwen3_5GatedDeltaNet. A None full-convolution function selects the
+    # module's nn.Conv1d branch; the other globals have explicit torch twins.
+    if hasattr(m, "torch_causal_conv1d_update"):
+        monkeypatch.setattr(m, "causal_conv1d_fn", None)
+        monkeypatch.setattr(m, "causal_conv1d_update",
+                            m.torch_causal_conv1d_update)
+        monkeypatch.setattr(m, "chunk_gated_delta_rule",
+                            m.torch_chunk_gated_delta_rule)
+        monkeypatch.setattr(m, "fused_recurrent_gated_delta_rule",
+                            m.torch_recurrent_gated_delta_rule)
+        monkeypatch.setattr(m, "FusedRMSNormGated", None)
+        return
+
+    # >=5.15: the module-level fallbacks are kernel-dispatch wrappers whose
+    # undecorated PyTorch implementation remains reachable via __wrapped__.
     for name in ("causal_conv1d_fn", "causal_conv1d_update",
-                 "chunk_gated_delta_rule", "recurrent_gated_delta_rule"):
+                 "torch_chunk_gated_delta_rule",
+                 "torch_recurrent_gated_delta_rule"):
         fn = getattr(m, name, None)
         if fn is None:
             continue
