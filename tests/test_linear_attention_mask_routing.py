@@ -295,3 +295,30 @@ def test_mixed_schedule_non_attention_blocks_get_none():
     with pytest.raises(RuntimeError, match="known layer_type"):
         _call_layer(unknown, hidden, position_embeddings=None,
                     attention_mask=masks2, position_ids=position_ids)
+
+
+def test_nonattention_schedule_without_recurrent_layers_takes_dict_path():
+    # Self-found adjacent gap: a schedule declaring moe/mlp WITHOUT any
+    # linear/sliding/conv layer must still take the per-type dict path —
+    # the single-dense-mask early return would otherwise feed the dense
+    # mask to the non-attention blocks too.
+    cfg = PreTrainedConfig()
+    cfg.is_causal = True
+    cfg.layer_types = ["full_attention", "moe", "mlp"]
+    cfg._attn_implementation = "eager"
+    hidden = torch.zeros(1, 4, 8)
+    position_ids = torch.arange(4).unsqueeze(0)
+
+    masks = _compute_attention_mask(_Base(cfg), hidden, position_ids)
+
+    assert isinstance(masks, dict)
+    assert masks["moe"] is None and masks["mlp"] is None
+    assert masks["full_attention"].shape == (1, 1, 4, 4)
+
+    # non-regression: a plain all-full schedule keeps the bare dense mask
+    cfg2 = PreTrainedConfig()
+    cfg2.is_causal = True
+    cfg2.layer_types = ["full_attention", "full_attention"]
+    cfg2._attn_implementation = "eager"
+    bare = _compute_attention_mask(_Base(cfg2), hidden, position_ids)
+    assert not isinstance(bare, dict) and bare.shape == (1, 1, 4, 4)

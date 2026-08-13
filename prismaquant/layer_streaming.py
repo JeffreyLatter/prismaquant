@@ -2032,7 +2032,14 @@ def _compute_attention_mask(
     # helper), so both route through _recurrent_padding_mask here.
     has_linear = "linear_attention" in layer_types
     has_conv = "conv" in layer_types
-    if cfg is None or not (has_sliding or has_linear or has_conv):
+    # A schedule declaring non-attention blocks needs the per-type dict
+    # path even without linear/sliding/conv layers — otherwise the single
+    # dense mask from the early return below would be fed to moe/mlp
+    # blocks too.
+    has_nonattn = any(lt in _NON_ATTENTION_BLOCK_TYPES
+                      for lt in layer_types)
+    if cfg is None or not (has_sliding or has_linear or has_conv
+                           or has_nonattn):
         return _make_causal_mask(hidden.size(1), hidden.device, hidden.dtype)
 
     try:
