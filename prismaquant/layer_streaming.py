@@ -1746,10 +1746,17 @@ def _embed_prefix(base_model: nn.Module, full_path: str) -> str:
 
 
 def _layer_attention_type(layer: nn.Module):
+    # `.block_type` is the transformers>=5.13 name for what `.layer_type`
+    # was on hybrid decoder layers up to 5.12; `.linear_attn` is the
+    # recurrent child module on Qwen3.5/3.6 DeltaNet hybrid layers, which
+    # carries its own `layer_type`/`layer_idx` (the outer layer has no
+    # `self_attn`/`attention` on those layers).
     lt = (
         getattr(layer, "layer_type", None)
+        or getattr(layer, "block_type", None)
         or getattr(getattr(layer, "self_attn", None), "layer_type", None)
         or getattr(getattr(layer, "attention", None), "layer_type", None)
+        or getattr(getattr(layer, "linear_attn", None), "layer_type", None)
     )
     if lt is not None:
         return lt
@@ -1763,7 +1770,7 @@ def _layer_attention_type(layer: nn.Module):
     # Generic fallback: config.layer_types[layer_idx] when both exist.
     idx = getattr(layer, "layer_idx", None)
     if idx is None:
-        for attn_name in ("self_attn", "attention"):
+        for attn_name in ("self_attn", "attention", "linear_attn"):
             idx = getattr(getattr(layer, attn_name, None), "layer_idx", None)
             if idx is not None:
                 break
@@ -1772,6 +1779,8 @@ def _layer_attention_type(layer: nn.Module):
     lts = getattr(cfg, "layer_types", None) if cfg is not None else None
     if idx is not None and lts is not None and 0 <= int(idx) < len(lts):
         return lts[int(idx)]
+    # No guessing beyond this point: an unresolved layer type stays None so
+    # `_call_layer` fails closed instead of silently assuming semantics.
     return None
 
 
@@ -1923,6 +1932,58 @@ def _make_causal_mask(seqlen: int, device: torch.device, dtype: torch.dtype):
     return mask.unsqueeze(0).unsqueeze(0)
 
 
+def _recurrent_padding_mask(inputs_embeds: torch.Tensor,
+                            attention_mask: torch.Tensor | None):
+    """Recurrent-mask contract for linear-attention/conv hybrid layers.
+
+    Used on EVERY transformers version (deliberately not delegating to
+    ``masking_utils.create_recurrent_attention_mask``): the upstream helper
+    first appears in transformers 5.13, but 5.13.0-5.14.1 ship it with the
+    pre-fix contract — it returns ``None`` whenever
+    ``past_key_values.has_previous_state()``, including a padded multi-token
+    cached continuation (silently corrupting the recurrent state), and has
+    no single-token special case. Only 5.15/current trims-and-keeps the 2D
+    mask for a padded continuation. Helper *presence* is therefore not a
+    usable compatibility gate; implementing the current contract locally is.
+
+    Mirrors the current upstream contract exactly (source: transformers
+    v5.15.0 ``masking_utils.create_recurrent_attention_mask``):
+
+    - ``None`` when the incoming mask is missing or not a 2D padding mask
+      (a custom 4D mask carries no padding signal for the recurrence);
+    - ``None`` for a single-token decode step (a generated token is never
+      padding);
+    - ``None`` for an all-ones mask (un-padded batch — the masking multiply
+      would be a no-op), skipped only outside trace/compile;
+    - otherwise the mask trimmed to the trailing ``inputs_embeds.shape[1]``
+      positions — so a growing cache-continuation mask aligns with the
+      current forward's local sequence — made contiguous.
+    """
+    if attention_mask is None or attention_mask.ndim != 2:
+        return None
+    if inputs_embeds.shape[1] == 1:
+        return None
+    try:
+        from transformers.masking_utils import is_tracing
+        tracing = is_tracing(attention_mask)
+    except Exception:
+        tracing = torch.jit.is_tracing() or isinstance(
+            attention_mask, torch.fx.Proxy)
+    if not tracing and torch.all(attention_mask == 1):
+        return None
+    return attention_mask[:, -inputs_embeds.shape[1]:].contiguous()
+
+
+# Block types a hybrid schedule may declare that consume NO attention mask
+# at all (pure feed-forward blocks). Upstream dispatches masks via
+# ``causal_mask_mapping.get(block_type)``, so these receive ``None`` — e.g.
+# Nemotron-H declares ["linear_attention", "moe", "full_attention", "mlp"].
+# Deliberately an explicit allowlist rather than a "not *_attention"
+# heuristic: anything NOT listed here and not buildable stays absent from
+# the mask dict and fails closed in ``_call_layer``. Extend per family.
+_NON_ATTENTION_BLOCK_TYPES = frozenset({"moe", "mlp"})
+
+
 def _compute_attention_mask(
     base_model: nn.Module,
     hidden: torch.Tensor,
@@ -1932,14 +1993,53 @@ def _compute_attention_mask(
 ):
     """Return the streaming attention mask for a full forward pass.
 
-    Most models use one full causal mask. Gemma3/Gemma4-style hybrid models
-    declare ``config.layer_types`` with both ``full_attention`` and
-    ``sliding_attention``; those must receive the same per-type mask mapping
-    that HuggingFace's model.forward builds.
+    Most models use one full causal mask. Hybrid models declare
+    ``config.layer_types`` mixing ``full_attention`` with one of:
+
+    - ``sliding_attention`` (Gemma3/Gemma4-style windowed attention) — needs
+      the dense additive mask from HuggingFace's own ``masking_utils``
+      (``create_sliding_window_causal_mask``), same family as
+      ``full_attention``'s ``create_causal_mask``, just windowed.
+    - ``linear_attention`` (Qwen3.5/Qwen3.6 DeltaNet-style recurrent
+      hybrids) — NOT a variant of causal attention at all. The recurrence
+      is already causal by construction; what the layer needs is the
+      recurrent-mask contract of current HuggingFace
+      ``masking_utils.create_recurrent_attention_mask`` (>= 5.15): a 2D
+      ``[batch, local_seq]`` padding mask trimmed to the current forward's
+      sequence, or ``None`` whenever masking would be a no-op (non-2D
+      input, single-token decode, all-ones batch). We always apply the
+      local ``_recurrent_padding_mask`` shim implementing that contract —
+      see its docstring for why the upstream helper is not called even
+      when present (5.13/5.14 ship it with the broken pre-fix contract).
+      Feeding these layers the dense ``[1, 1, T, T]`` causal mask instead
+      — the bug this branch fixes — broadcasts wrongly against
+      ``hidden_states`` inside ``apply_mask_to_padding_states`` and, on
+      transformers >= 5.15 (which removed the padding-mask shape guard),
+      raises a tensor-size mismatch on the last dim (hidden_size vs.
+      seqlen); an un-trimmed growing cache-continuation mask can mismatch
+      the same way, which is why the raw incoming mask is not passed
+      through either.
+
+    Both hybrid kinds return the same ``{layer_type: mask}`` mapping shape;
+    ``_call_layer`` selects the right entry per layer via its
+    ``layer.layer_type``.
     """
     cfg = getattr(base_model, "config", None)
     layer_types = tuple(getattr(cfg, "layer_types", ()) or ())
-    if cfg is None or "sliding_attention" not in layer_types:
+    has_sliding = "sliding_attention" in layer_types
+    # "conv" shares the recurrent-mask contract upstream
+    # (LAYER_PATTERN_TO_MASK_FUNCTION_MAPPING maps both to the recurrent
+    # helper), so both route through _recurrent_padding_mask here.
+    has_linear = "linear_attention" in layer_types
+    has_conv = "conv" in layer_types
+    # A schedule declaring non-attention blocks needs the per-type dict
+    # path even without linear/sliding/conv layers — otherwise the single
+    # dense mask from the early return below would be fed to moe/mlp
+    # blocks too.
+    has_nonattn = any(lt in _NON_ATTENTION_BLOCK_TYPES
+                      for lt in layer_types)
+    if cfg is None or not (has_sliding or has_linear or has_conv
+                           or has_nonattn):
         return _make_causal_mask(hidden.size(1), hidden.device, hidden.dtype)
 
     try:
@@ -1949,7 +2049,8 @@ def _compute_attention_mask(
         )
     except Exception as exc:
         raise RuntimeError(
-            "sliding-window layer_types require transformers masking_utils"
+            "sliding-window/linear-attention layer_types require "
+            "transformers masking_utils"
         ) from exc
 
     mask_kwargs = {
@@ -1960,7 +2061,7 @@ def _compute_attention_mask(
         "position_ids": position_ids,
     }
     sliding_mask_kwargs = dict(mask_kwargs)
-    if getattr(cfg, "use_bidirectional_attention", False):
+    if has_sliding and getattr(cfg, "use_bidirectional_attention", False):
         try:
             from transformers.models.gemma3.modeling_gemma3 import (
                 _bidirectional_window_overlay,
@@ -1977,23 +2078,43 @@ def _compute_attention_mask(
             cfg.sliding_window
         )
 
-    masks = {
-        "full_attention": create_causal_mask(**mask_kwargs),
-        "sliding_attention": create_sliding_window_causal_mask(
+    masks = {"full_attention": create_causal_mask(**mask_kwargs)}
+
+    if has_sliding:
+        masks["sliding_attention"] = create_sliding_window_causal_mask(
             **sliding_mask_kwargs
-        ),
-    }
-    # DSv4-Flash: the compress-ratio ladder yields layer types beyond the
-    # Gemma pair — compressed_sparse_attention (ratio 4) and
-    # heavily_compressed_attention (ratio 128). In probe mode every
-    # compressed variant degrades to sliding-window-only attention (the
-    # vendored layer stubs out the compressor and skips the long-range
-    # branch), and the vendored root feeds one sliding-window mask to all
-    # layers. Alias exactly those two types to the sliding mask; any
-    # other unknown layer type still fails loudly downstream.
-    for lt in ("compressed_sparse_attention", "heavily_compressed_attention"):
-        if lt in layer_types and lt not in masks:
-            masks[lt] = masks["sliding_attention"]
+        )
+        # DSv4-Flash: the compress-ratio ladder yields layer types beyond
+        # the Gemma pair — compressed_sparse_attention (ratio 4) and
+        # heavily_compressed_attention (ratio 128). In probe mode every
+        # compressed variant degrades to sliding-window-only attention
+        # (the vendored layer stubs out the compressor and skips the
+        # long-range branch), and the vendored root feeds one
+        # sliding-window mask to all layers. Alias exactly those two types
+        # to the sliding mask; any other unknown layer type still fails
+        # loudly downstream.
+        for lt in ("compressed_sparse_attention", "heavily_compressed_attention"):
+            if lt in layer_types and lt not in masks:
+                masks[lt] = masks["sliding_attention"]
+
+    if has_linear or has_conv:
+        # DeltaNet/Mamba-style recurrent layers must never receive a dense
+        # additive mask — route them through the recurrent-mask contract
+        # (see _recurrent_padding_mask on why this is always the local
+        # shim, never the upstream helper).
+        recurrent = _recurrent_padding_mask(hidden, attention_mask)
+        if has_linear:
+            masks["linear_attention"] = recurrent
+        if has_conv:
+            masks["conv"] = recurrent
+
+    # Declared non-attention blocks (moe/mlp) receive None, mirroring
+    # upstream's `.get(block_type)` dispatch. Any OTHER declared type we
+    # cannot build stays absent and fails closed in _call_layer.
+    for lt in layer_types:
+        if lt in _NON_ATTENTION_BLOCK_TYPES and lt not in masks:
+            masks[lt] = None
+
     return masks
 
 
