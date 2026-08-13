@@ -1,6 +1,39 @@
 # Changelog
 
-## Unreleased
+## 0.12.0 — 2026-08-12
+
+The DSv4Flash export-readiness release. It lands the activation-safe,
+identity-bound AURA campaign and replay path merged in PR #81, then closes the
+source block-FP8 serving mismatch discovered during final allocation review.
+The approved 112.690 GB assignment is unchanged; this release changes the
+legality and provenance gates used to reproduce and export it.
+
+- Bind campaign completion, streamed checkpoints, allocator replay, exporter
+  handoff, and child-process imports to one clean immutable PrismaQuant source
+  snapshot. The CPU-only W8A16 readmission reconstructs the historical AURA
+  rows and permits only the audited source-terminal correction; it refuses any
+  assignment or byte-accounting drift before export.
+- Preserve the production cache/prefetch contract and bounded one-Spark
+  residency throughout the DSv4 path. No parallel activation or rendered-weight
+  cache was introduced.
+
+- Resolve the external Gridbook 0.8.5 runtime pin to immutable commit
+  `e992e5980c96333a48149f96392d6cff56ae9e3f` and promote the raw block-128
+  E4M3/UE8M0 source lane to its dedicated W8A16 route. The installed-wheel
+  GB10/sm121 gate passed 91 tests with no skips; decode uses native source
+  GEMV and prefill uses transient BF16 expansion plus Gridbook's owned grouped
+  CUTLASS bridge. Newly exported artifacts no longer carry the obsolete
+  route-pending acknowledgement. Full-artifact serving, performance, and
+  quality remain independent shipcard gates. The exact command, image, wheel
+  identity, logs, and JUnit record are in
+  `docs/results/gridbook_0p8p5_w8a16_gate_2026-08-12.md`.
+- Make every shipping boundary require that exact Gridbook version and commit,
+  not merely a syntactically resolved release pin. Source block-FP8 remains
+  W8A16; the distinct direct group-32 MXFP8 re-encode lane remains W8A8 and
+  unbacked by default.
+
+Activation-quantization-aware AURA and MTP/DSpark re-optimization are explicitly
+post-ship work and are not part of 0.12.0.
 
 ## 0.11.0 — 2026-08-11
 

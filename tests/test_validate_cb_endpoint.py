@@ -42,6 +42,28 @@ _RESOLVED_GRAPH_CONFIG = (
     "'cudagraph_capture_sizes': [1], 'max_cudagraph_capture_size': 1}\n"
 )
 _SERVED_MODEL = cbv.DSV4_SERVED_MODEL_PREFIX + "a" * 32
+_REAL_GRIDBOOK_RUNTIME_PIN = cbv._gridbook_runtime_pin
+
+
+@pytest.fixture(autouse=True)
+def _released_gridbook_pin(monkeypatch):
+    """Exercise endpoint evidence behind the exact tracked release pin."""
+
+    import prismaquant.shipcard as shipcard_module
+    from prismaquant.gridbook_runtime_pin import load_gridbook_runtime_pin
+
+    pin_path = (
+        ROOT
+        / "prismaquant"
+        / "gridbook_runtime"
+        / "gridbook_runtime_pin.json"
+    )
+    released = json.loads(pin_path.read_text(encoding="utf-8"))
+    monkeypatch.setattr(cbv, "_gridbook_runtime_pin", lambda: dict(released))
+    released_pin = load_gridbook_runtime_pin()
+    monkeypatch.setattr(
+        shipcard_module, "load_gridbook_runtime_pin", lambda: released_pin
+    )
 
 
 def _gridbook_distribution(pin: dict) -> dict:
@@ -63,7 +85,9 @@ def _gridbook_distribution(pin: dict) -> dict:
             "gridbook/plugin.py",
             "gridbook/runtime_contract.json",
             "gridbook/source_passthrough.py",
+            "gridbook/fp8_source_w8a16.py",
             "gridbook/csrc/cb_gemv.cu",
+            "gridbook/csrc/fp8_source_w8a16.cu",
             "gridbook/csrc/mxfp8_dense_gemm.cu",
         )
     }
@@ -80,16 +104,23 @@ def _gridbook_distribution(pin: dict) -> dict:
                 "commit_id": pin["commit"],
             },
         },
-        "direct_url_path": "gridbook-0.8.4.dist-info/direct_url.json",
+        "direct_url_path": f"gridbook-{pin['version']}.dist-info/direct_url.json",
         "direct_url_identity": {"bytes": 123, "sha256": "d" * 64},
-        "metadata_path": "gridbook-0.8.4.dist-info/METADATA",
+        "metadata_path": f"gridbook-{pin['version']}.dist-info/METADATA",
         "metadata_identity": {"bytes": 123, "sha256": "e" * 64},
-        "record_path": "gridbook-0.8.4.dist-info/RECORD",
+        "record_path": f"gridbook-{pin['version']}.dist-info/RECORD",
         "record_identity": {"bytes": 123, "sha256": "f" * 64},
         "source_files": source_files,
         "source_files_sha256": cbv._canonical_json_sha256(source_files),
         "import_origin": import_origin,
     }
+
+
+def test_live_gridbook_runtime_pin_projects_immutable_features_to_plain_dict():
+    pin = _REAL_GRIDBOOK_RUNTIME_PIN()
+
+    assert pin["commit"] == cbv.load_gridbook_runtime_pin().commit
+    assert type(pin["required_abi_features"]) is dict
 
 
 def _models_payload(
@@ -303,7 +334,7 @@ def _artifact_decode_record(*, requires_marlin: bool = False) -> dict:
         "passthrough_unit_count": 1,
         "verbatim_namespace_unit_count": 1,
         "classified_unit_count": 3,
-        "route_pending_acknowledged": ["FP8_BLOCK_UE8M0_SOURCE"],
+        "route_pending_acknowledged": [],
         "excluded_namespaces": [],
         "dspark_overlay": overlay,
         "dspark_overlay_sha256": "b" * 64,
@@ -362,8 +393,8 @@ def test_manifest_validation_binds_each_arm_to_exact_stack(arm):
         (lambda m: m.update(model="/different"), "exact /model"),
         (lambda m: m.update(resident_extensions=[]), "Gridbook-native CUDA extension"),
         (
-            lambda m: m["pq_env"].pop("GRIDBOOK_MXFP8_DENSE"),
-            "GRIDBOOK_MXFP8_DENSE",
+            lambda m: m["pq_env"].__setitem__("GRIDBOOK_MXFP8_DENSE", "1"),
+            "exact live-process Gridbook contract",
         ),
     ],
 )
@@ -734,11 +765,7 @@ def _artifact_and_card(tmp_path: Path) -> tuple[Path, Path]:
             },
         },
         "codebook_file": "codebooks.pqcb",
-        "provenance": {
-            "route_pending_passthrough_acknowledged": [
-                "FP8_BLOCK_UE8M0_SOURCE"
-            ],
-        },
+        "provenance": {},
     }
     quant_config["provenance"]["weight_content_manifest"] = (
         build_weight_content_manifest(artifact)
@@ -753,14 +780,22 @@ def _artifact_and_card(tmp_path: Path) -> tuple[Path, Path]:
     return artifact, shipcard
 
 
-def test_artifact_gate_requires_explicit_block_fp8_acknowledgement(tmp_path):
+def test_artifact_gate_accepts_backed_block_fp8_without_acknowledgement(tmp_path):
     artifact, _shipcard = _artifact_and_card(tmp_path)
-    quant_path = artifact / "quant_config.json"
-    payload = json.loads(quant_path.read_text(encoding="utf-8"))
-    payload["provenance"].pop("route_pending_passthrough_acknowledged")
-    quant_path.write_text(json.dumps(payload), encoding="utf-8")
+    quant = cbv.validate_cb_artifact(artifact)
+    assert "route_pending_passthrough_acknowledged" not in quant["provenance"]
 
-    with pytest.raises(cbv.CBEndpointValidationError, match="acknowledgement"):
+
+def test_artifact_gate_still_requires_ack_for_a_pending_route(
+    tmp_path, monkeypatch,
+):
+    artifact, _shipcard = _artifact_and_card(tmp_path)
+    monkeypatch.setattr(
+        cbv,
+        "ROUTE_PENDING_PASSTHROUGH_FORMATS",
+        frozenset({"FP8_BLOCK_UE8M0_SOURCE"}),
+    )
+    with pytest.raises(cbv.CBEndpointValidationError, match="route-pending"):
         cbv.validate_cb_artifact(artifact)
 
 
@@ -777,7 +812,7 @@ def test_artifact_decode_contract_binds_completeness_and_dspark_overlay(
         cb_units=["model.layers.0.mlp"],
         passthrough_units=["model.main_proj"],
         verbatim_namespace_units=["mtp.0.attn.wq_a"],
-        route_pending_acknowledged=["FP8_BLOCK_UE8M0_SOURCE"],
+        route_pending_acknowledged=[],
     )
     overlay_provenance = _artifact_decode_record()["dspark_overlay"]
     overlay = SimpleNamespace(
@@ -1077,7 +1112,7 @@ def test_driver_and_lane_declare_two_isolated_arms_and_guards():
     stop_idx = text.rindex('docker stop -t 30 "$CID"')
     assert endpoint_idx < ship_gate_idx < stop_idx
     assert 'contains_mxfp4_wire' in text
-    assert '-e GRIDBOOK_MXFP8_DENSE=1' in text
+    assert '-e GRIDBOOK_MXFP8_DENSE=1' not in text
     assert '-e VLLM_USE_DEEP_GEMM=0' in text
     assert '-e PRISMAQUANT_PRELOAD_FUSED=1' in text
     assert '-e PRISMAQUANT_CB_DECODE=' not in text
@@ -1123,6 +1158,8 @@ def test_driver_and_lane_declare_two_isolated_arms_and_guards():
         "prismaquant_cb_v2_ext.so",
         "pq_cb_fused_fp4_deadbeef.so",
         "pq_mxfp8_dense_deadbeef.so",
+        "pq_fp8_source_w8a16_deadbeef.so",
+        "pq_cb_bf16_grouped_deadbeef.so",
     ],
 )
 def test_manifest_accepts_reviewed_gridbook_native_extension_families(extension):

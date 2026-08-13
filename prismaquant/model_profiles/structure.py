@@ -12,7 +12,7 @@ import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from fnmatch import fnmatchcase
-from importlib import resources
+from pathlib import Path
 from typing import Any
 
 import torch.nn as nn
@@ -547,8 +547,10 @@ class ModelGraph:
 def load_structure_spec(profile_name: str) -> ModelStructureSpec | None:
     """Load ``model_profiles/specs/<profile_name>.json`` if it exists."""
 
-    resource = resources.files("prismaquant.model_profiles").joinpath(
-        "specs", f"{profile_name}.json"
+    resource = (
+        Path(__file__).resolve().parent
+        / "specs"
+        / f"{profile_name}.json"
     )
     try:
         text = resource.read_text(encoding="utf-8")
@@ -560,7 +562,7 @@ def load_structure_spec(profile_name: str) -> ModelStructureSpec | None:
 def structure_spec_ids() -> tuple[str, ...]:
     """Every ``specs/<id>.json`` shipped with the package, sorted by id."""
 
-    specs_dir = resources.files("prismaquant.model_profiles").joinpath("specs")
+    specs_dir = Path(__file__).resolve().parent / "specs"
     out: list[str] = []
     for entry in specs_dir.iterdir():
         name = entry.name

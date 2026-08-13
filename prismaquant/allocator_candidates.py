@@ -91,6 +91,9 @@ ROUTE_DELEGATED_NATIVE = "delegated_native"
 # block-128 source scales into per-32 MXFP8 weight scales, and quantizes the A
 # side dynamically to MXFP8 per 32.
 ROUTE_GRIDBOOK_MXFP8_DENSE = "gridbook_mxfp8_dense"
+# Gridbook-owned raw-resident block-128 source route. Unlike the direct G32
+# MXFP8 lane above, this route consumes BF16 activations unchanged.
+ROUTE_GRIDBOOK_FP8_SOURCE_W8A16 = "gridbook_fp8_source_w8a16"
 
 # What a MEASUREMENT says about serving a passthrough's bytes. These are
 # verdicts from a real serve attempt on real hardware, not design intent —
@@ -188,29 +191,30 @@ SOURCE_PASSTHROUGH_CONTRACTS: dict[str, SourcePassthroughContract] = {
             format_name="FP8_BLOCK_UE8M0_SOURCE",
             source_kind="fp8_ue8m0",
             wire_format_id="fp8_e4m3_ue8m0_block128",
-            # Weight bytes are copied exactly, but Gridbook's concrete route
-            # is W8A8.  A weight-only AURA pass therefore cannot synthesize a
-            # zero output cost for this terminal.
-            zero_cost_by_construction=False,
-            serving_route=ROUTE_GRIDBOOK_MXFP8_DENSE,
-            route_status=ROUTE_STATUS_PENDING,
-            route_requirement="GRIDBOOK_MXFP8_DENSE=1",
+            zero_cost_by_construction=True,
+            serving_route=ROUTE_GRIDBOOK_FP8_SOURCE_W8A16,
+            route_status=ROUTE_STATUS_BACKED,
+            route_requirement=(
+                "Gridbook 0.8.5 commit "
+                "e992e5980c96333a48149f96392d6cff56ae9e3f with "
+                "runtime-contract v3 feature "
+                "abi_features.source_fp8_block128_w8a16=1"
+            ),
             detail=(
-                "block-FP8 with UE8M0 block exponents, served by Gridbook "
-                "0.8.4's opt-in Mxfp8DenseLinearMethod. The source weight "
-                "plane is embedded exactly into per-32 MXFP8, while inputs "
-                "are dynamically quantized to MXFP8 per 32 (W8A8). The route "
-                "exists and is correctness-audited, but remains pending until "
-                "the served native-parity performance gate is measured."
+                "block-FP8 with UE8M0 block exponents, consumed by "
+                "Gridbook's dedicated Fp8SourceW8A16LinearMethod. Both "
+                "source planes stay resident and byte-verbatim and BF16 "
+                "activations are unchanged. The numerical terminal is exact "
+                "by construction. Full-artifact served parity remains a "
+                "separate ship gate, not an exporter route override."
             ),
             route_evidence=(
-                "Gridbook 0.8.4 commit "
-                "56259f6e5d8646da9f9179e1dde7a1708849722c: "
-                "source_passthrough.py binds the wire id to "
-                "Mxfp8DenseLinearMethod on sm121 and requires "
-                "GRIDBOOK_MXFP8_DENSE=1; kernel-vs-oracle correctness is "
-                "audited on DSv4 shapes, while served native-parity evidence "
-                "is still pending."
+                "Gridbook 0.8.5 commit e992e5980c96333a48149f96392d6cff56ae9e3f; "
+                "installed-wheel GPU gate on GB10/sm121: 91 passed, 0 skipped. "
+                "Fp8SourceW8A16LinearMethod keeps raw E4M3/UE8M0 planes "
+                "resident, dispatches decode to native GEMV and prefill to "
+                "the owned grouped BF16 CUTLASS bridge, and attests the exact "
+                "JIT extension identity/capability."
             ),
         ),
         # DeepSeek-V4 routed experts: nibble-packed E2M1 + E8M0 group scales.
@@ -344,10 +348,8 @@ def source_format_for_kind(source_kind: str) -> fr.FormatSpec | None:
 # already emits real rows for them on the checkpoints where they are legal,
 # and synthesizing over a table that has an entry would hide a disagreement.
 # A byte-copy contract belongs here only when BOTH its W and A paths are the
-# identity.  ``FP8_BLOCK_UE8M0_SOURCE`` is intentionally absent: Gridbook
-# copies its weight bytes but serves them through a W8A8 per-32 MXFP8 method,
-# so activation-side AURA (or another measured output currency) is required
-# before the terminal can be allocator-selectable.
+# identity. ``FP8_BLOCK_UE8M0_SOURCE`` qualifies through Gridbook's dedicated
+# W8A16 route; runtime release status remains independently fail-closed below.
 #
 # Membership is not self-certifying: ``cost_entry_is_source_passthrough``
 # additionally requires the format to be a registered passthrough format whose
@@ -362,8 +364,9 @@ SOURCE_PASSTHROUGH_FORMATS: frozenset[str] = frozenset(
 # unaudited (pending) or measured dead (blocked). An otherwise honestly priced
 # candidate remains useful serving-gap evidence, but the exporter refuses to
 # ship a selection containing one without an explicit override.  This set does
-# not override independent cost-currency admission (notably activation-side
-# AURA for the W8A8 block-FP8 source route).
+# not override independent cost-currency admission for activation-changing
+# re-quantization routes such as direct G32 MXFP8 W8A8; the raw block-128
+# source route is W8A16 and preserves A.
 ROUTE_PENDING_PASSTHROUGH_FORMATS: frozenset[str] = frozenset(
     name for name, contract in SOURCE_PASSTHROUGH_CONTRACTS.items()
     if not contract.route_backed

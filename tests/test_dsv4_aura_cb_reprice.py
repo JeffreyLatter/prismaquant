@@ -4,6 +4,7 @@ import ast
 import inspect
 import json
 from pathlib import Path
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -182,7 +183,7 @@ def test_cb_mapping_uses_authoritative_basis_and_source_gated_ladders():
     assert expert_terminal.format_name == "MXFP4_SOURCE"
     assert expert_terminal.allocator_selectable
     assert dense_terminal.format_name == "FP8_BLOCK_UE8M0_SOURCE"
-    assert not dense_terminal.allocator_selectable
+    assert dense_terminal.allocator_selectable
 
     expert_segments = candidates_by_segment(expert, plugin)
     dense_segments = candidates_by_segment(dense, plugin)
@@ -239,7 +240,7 @@ def test_cb_mapping_uses_authoritative_basis_and_source_gated_ladders():
     ("BF16", True),
     ("FP8_SOURCE", True),
     ("MXFP4_SOURCE", True),
-    ("FP8_BLOCK_UE8M0_SOURCE", False),
+    ("FP8_BLOCK_UE8M0_SOURCE", True),
 ))
 def test_terminal_selectability_is_activation_identity(
     terminal, selectable,
@@ -914,7 +915,7 @@ def test_dsv4_driver_wires_resume_to_allocator_and_artifact_publish():
         ).body)
 
 
-def test_dsv4_allocator_command_excludes_unmeasured_fp8_terminal(tmp_path):
+def test_dsv4_allocator_command_includes_w8a16_fp8_terminal(tmp_path):
     prepared = SimpleNamespace(
         args=SimpleNamespace(
             probe=tmp_path / "probe.pkl",
@@ -930,13 +931,95 @@ def test_dsv4_allocator_command_excludes_unmeasured_fp8_terminal(tmp_path):
         cost_path=tmp_path / "cost.pkl",
         output_dir=tmp_path / "allocator",
     )
+    expected_bootstrap = (
+        Path(inspect.getfile(_allocator_command)).resolve().parents[1]
+        / "tools"
+        / "prismaquant_source_bootstrap.py"
+    )
+    assert Path(command[0]).name == "env"
+    assert command[1:10] == [
+        "-u",
+        "PYTHONPATH",
+        sys.executable,
+        "-P",
+        str(expected_bootstrap),
+        "run-module",
+        "--source-root",
+        str(expected_bootstrap.parents[1]),
+        "prismaquant.allocator",
+    ]
+    assert "-m" not in command[:10]
     formats = command[command.index("--formats") + 1].split(",")
     assert "MXFP4_SOURCE" in formats
     assert "BF16" in formats
-    assert "FP8_BLOCK_UE8M0_SOURCE" not in formats
+    assert "FP8_BLOCK_UE8M0_SOURCE" in formats
 
 
-def test_selected_assignment_refuses_identity_only_fp8_terminal(tmp_path):
+def test_dsv4_allocator_command_preserves_installed_wheel_invocation(
+    monkeypatch, tmp_path,
+):
+    import prismaquant.dsv4_aura_cb_reprice as module
+
+    installed_module = (
+        tmp_path / "site-packages" / "prismaquant" / "dsv4_aura_cb_reprice.py"
+    )
+    installed_module.parent.mkdir(parents=True)
+    installed_module.write_text("# installed-wheel fixture\n", encoding="utf-8")
+    monkeypatch.setattr(module, "__file__", str(installed_module))
+    prepared = SimpleNamespace(
+        args=SimpleNamespace(
+            probe=tmp_path / "probe.pkl",
+            model=tmp_path / "model",
+            col_weights=tmp_path / "col.pkl",
+        ),
+        cb_context=SimpleNamespace(
+            codebook_bundle_path=tmp_path / "bundle.pqcb"
+        ),
+    )
+    command = module._allocator_command(
+        prepared,
+        cost_path=tmp_path / "cost.pkl",
+        output_dir=tmp_path / "allocator",
+    )
+    assert command[:3] == [sys.executable, "-m", "prismaquant.allocator"]
+
+
+def test_dsv4_allocator_command_refuses_strict_snapshot_without_bootstrap(
+    monkeypatch, tmp_path,
+):
+    import prismaquant.dsv4_aura_cb_reprice as module
+
+    strict_root = tmp_path / "snapshot"
+    installed_module = (
+        strict_root / "prismaquant" / "dsv4_aura_cb_reprice.py"
+    )
+    installed_module.parent.mkdir(parents=True)
+    installed_module.write_text("# strict snapshot fixture\n", encoding="utf-8")
+    monkeypatch.setattr(module, "__file__", str(installed_module))
+    monkeypatch.setenv("PQ_RUNTIME_PRISMAQUANT_ROOT", str(strict_root))
+    prepared = SimpleNamespace(
+        args=SimpleNamespace(
+            probe=tmp_path / "probe.pkl",
+            model=tmp_path / "model",
+            col_weights=tmp_path / "col.pkl",
+        ),
+        cb_context=SimpleNamespace(
+            codebook_bundle_path=tmp_path / "bundle.pqcb"
+        ),
+    )
+
+    with pytest.raises(
+        DSv4CampaignError,
+        match="requires the exact source bootstrap",
+    ):
+        module._allocator_command(
+            prepared,
+            cost_path=tmp_path / "cost.pkl",
+            output_dir=tmp_path / "allocator",
+        )
+
+
+def test_selected_assignment_accepts_w8a16_fp8_terminal(tmp_path):
     plugin = _plugin()
     (unit,) = build_cb_units((
         _declaration("dense", role="wq_a", nonexpert=True),
@@ -945,10 +1028,9 @@ def test_selected_assignment_refuses_identity_only_fp8_terminal(tmp_path):
     layer_config.write_text(json.dumps({
         unit.qname: "FP8_BLOCK_UE8M0_SOURCE",
     }))
-    with pytest.raises(
-        DSv4CampaignError, match="source-illegal or unmeasured",
-    ):
-        _selected_assignment(layer_config, (unit,))
+    assert _selected_assignment(layer_config, (unit,)) == {
+        unit.qname: "FP8_BLOCK_UE8M0_SOURCE"
+    }
 
 
 def test_allocator_supersurrogate_gate_is_satisfied_and_stays_fail_closed(

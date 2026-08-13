@@ -961,31 +961,27 @@ register_format(FormatSpec(
 #     tensor the checkpoint's own loader does not expect — the opposite of a
 #     passthrough.
 #
-# Serving: Gridbook 0.8.4 owns this route through
-# ``Mxfp8DenseLinearMethod``.  It embeds the block-128 scale plane exactly into
-# per-32 MXFP8 weight scales, then dynamically quantizes the activation to the
-# same per-32 MXFP8 grid.  Consequently the SOURCE bytes remain weight-exact,
-# but the layer is W8A8 and its output is not an identity transform.  This is
-# the same activation contract as ``MXFP8_UE8M0_G32`` above; declaring A16 here
-# would let a weight-only cost path turn an unmeasured A-side perturbation into
-# an unbeatable zero-cost allocator candidate.
+# Serving: this block-128 wire contract is consumed by Gridbook's dedicated
+# ``Fp8SourceW8A16LinearMethod``.  The stored E4M3 weight plane and UE8M0 scale
+# plane remain resident and byte-verbatim; BF16 activations cross the route
+# unchanged.  It is deliberately distinct from ``MXFP8_UE8M0_G32`` above,
+# which is a producer re-encode with dynamic per-32 MXFP8 activations (W8A8).
+# Runtime admission is feature-gated by the pinned Gridbook runtime contract;
+# this registry declaration states the numerical contract, not release status.
 register_format(FormatSpec(
     name="FP8_BLOCK_UE8M0_SOURCE",
     weight_bits=8, group_size=128, scale_bits=8,
     scale_dtype_name="uint8_e8m0",
     weight_element_dtype="fp8_e4m3",
     scale_block_shape=(128, 128),
-    act_bits=8, act_dtype_name="fp8_e4m3", act_group_size=32,
+    act_bits=None,
     family="fp", min_capability_sm=89,
     autoround_config=lambda: dict(bits=8, group_size=128,
                                    data_type="fp8_e4m3", sym=True,
                                    scale_fmt="ue8m0",
-                                   act_bits=8, act_group_size=32,
-                                   act_sym=True, act_data_type="mx_fp",
-                                   act_element_dtype="fp8_e4m3",
-                                   act_scale_fmt="ue8m0", act_dynamic=True),
+                                   act_bits=16, act_data_type="float"),
     quantize_dequantize=lambda w: w.clone(),
-    activation_quantize_dequantize=_mxfp8_ue8m0_activation_rtn,
+    activation_quantize_dequantize=lambda x: x.clone(),
 ))
 
 # Source-MXFP4 passthrough — the OCP-MX sibling of FP8_SOURCE, for models whose

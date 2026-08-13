@@ -85,16 +85,11 @@ def test_reference_selections_reconcile_within_one_part_per_thousand(
 
 
 @pytest.mark.integration
-def test_activation_blind_block_fp8_reference_is_retired():
-    """Do not silently replay the old block-FP8 source terminal as zero.
-
-    This historical selection predates Gridbook's concrete W8A8 route and
-    therefore has no measured activation-side cost for its 27 selected
-    ``FP8_BLOCK_UE8M0_SOURCE`` rows.  Current repricing must refuse it instead
-    of synthesizing the former activation-identity zero.
-    """
+def test_block_fp8_reference_reconciles_under_w8a16_source_identity():
+    """The raw-source W8A16 route restores exact zero-cost reconciliation."""
     selection_dir = _RETIRED_ACTIVATION_BLIND_SELECTION
     if not selection_dir.exists():
         pytest.skip(f"read-only reference artifact is not mounted: {selection_dir}")
-    with pytest.raises(KeyError, match="missing cost for FP8_BLOCK_UE8M0_SOURCE"):
-        reconcile_selection(selection_dir)
+    reconstructed, recorded, ratio = reconcile_selection(selection_dir)
+    assert reconstructed == pytest.approx(recorded, rel=1.0e-3)
+    assert ratio == pytest.approx(1.0, abs=1.0e-3)

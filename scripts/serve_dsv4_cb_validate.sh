@@ -335,14 +335,13 @@ CID=$(docker create --pull=never --name "$NAME" --gpus all --ipc=host \
   -e PRISMAQUANT_CB_DECODE_CONTRACT=v1 \
   -e PRISMAQUANT_SKIP_CB_CAST_CHECK=0 \
   -e PRISMAQUANT_PRELOAD_FUSED=1 \
-  -e GRIDBOOK_MXFP8_DENSE=1 \
   -e VLLM_USE_DEEP_GEMM=0 \
   -e PYTORCH_ALLOC_CONF=expandable_segments:True \
   --entrypoint bash "$BASE_IMAGE" -lc '
     set -euo pipefail
     # Absence is part of the released environment contract.  In particular,
     # literal 0 is invalid for both fused-FP4 selectors and expert chunking.
-    unset CUDACXX CXX \
+    unset CUDACXX CXX GRIDBOOK_MXFP8_DENSE \
       PRISMAQUANT_CB_DECODE PRISMAQUANT_CB_EXPAND PRISMAQUANT_CB_PREFILL \
       PRISMAQUANT_CB_FUSED_FP4 PRISMAQUANT_CB_FUSED_FP4_MOE \
       PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK \

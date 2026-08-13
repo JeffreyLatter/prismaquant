@@ -49,7 +49,7 @@ DIAGNOSTIC = ("PRISMAQUANT_DEBUG_PREFIXES",)
 CANONICAL = {
     "CUDACXX": None,
     "CXX": None,
-    "GRIDBOOK_MXFP8_DENSE": "1",
+    "GRIDBOOK_MXFP8_DENSE": None,
     "PRISMAQUANT_CB_BF16_SM120": "0",
     "PRISMAQUANT_CB_DECODE": None,
     "PRISMAQUANT_CB_DECODE_CONTRACT": "v1",
@@ -145,7 +145,7 @@ def test_attestation_receipt_is_full_and_fails_closed_on_set_and_unset_drift():
     )
     assert receipt == {
         "schema": envmod.GRIDBOOK_ENVIRONMENT_SCHEMA,
-        "gridbook_version": "0.8.4",
+        "gridbook_version": "0.8.5",
         "gridbook_commit": envmod.PINNED_GRIDBOOK_COMMIT,
         "environment": CANONICAL,
     }
@@ -166,8 +166,28 @@ def test_attestation_receipt_is_full_and_fails_closed_on_set_and_unset_drift():
         envmod.attest_canonical_gold_environment(environ, require_pin=False)
 
 
-def test_registry_matches_the_packaged_released_runtime_pin():
-    envmod.require_pinned_gridbook_084()
+def test_registry_matches_the_packaged_runtime_contract():
+    envmod.require_pinned_gridbook_runtime()
+    assert envmod.PINNED_GRIDBOOK_COMMIT == (
+        "e992e5980c96333a48149f96392d6cff56ae9e3f"
+    )
+
+
+def test_registry_rejects_an_alternate_resolved_release(monkeypatch):
+    from dataclasses import replace
+
+    alternate = replace(
+        envmod.load_gridbook_runtime_pin(),
+        commit="a" * 40,
+    )
+    monkeypatch.setattr(
+        envmod,
+        "load_gridbook_runtime_pin",
+        lambda: alternate,
+    )
+
+    with pytest.raises(envmod.GridbookEnvironmentError, match="exact release"):
+        envmod.require_pinned_gridbook_runtime()
 
 
 def test_source_scanner_surfaces_a_new_environment_identifier(tmp_path: Path):
@@ -183,7 +203,7 @@ def test_source_scanner_surfaces_a_new_environment_identifier(tmp_path: Path):
         envmod.GridbookEnvironmentError,
         match="GRIDBOOK_NEW_EXECUTION_FLAG",
     ):
-        envmod.require_gridbook_084_source_compatible(tmp_path)
+        envmod.require_gridbook_source_compatible(tmp_path)
 
 
 def test_released_source_environment_scan_is_closed_when_checkout_is_present():
@@ -197,7 +217,7 @@ def test_released_source_environment_scan_is_closed_when_checkout_is_present():
     ).stdout.strip()
     assert commit == envmod.PINNED_GRIDBOOK_COMMIT
 
-    report = envmod.require_gridbook_084_source_compatible(root)
+    report = envmod.require_gridbook_source_compatible(root)
     assert report.unknown_identifiers == ()
     assert report.missing_expected_identifiers == ()
     assert report.classified_non_environment == tuple(sorted(

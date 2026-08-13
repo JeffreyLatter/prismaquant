@@ -128,6 +128,56 @@ def test_run_module_executes_only_after_the_source_proof():
     assert result.returncode == 0, result.stderr
 
 
+def test_strict_bootstrap_namespace_loads_packaged_profile_data():
+    program = f"""
+import importlib.util
+from pathlib import Path
+import sys
+import types
+
+tool = Path({str(TOOL)!r})
+spec = importlib.util.spec_from_file_location("pq_source_bootstrap", tool)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+root = module.activate_prismaquant_source({str(REPO)!r})
+module._install_exact_package_namespace(root)
+
+# This test exercises package-data lookup under the bootstrap's synthetic
+# namespace, not PyTorch.  Keep it independent of optional user-site packages
+# by supplying the two tiny interfaces needed while these modules are loaded.
+format_registry = types.ModuleType("prismaquant.format_registry")
+format_registry.canonical_format_name = lambda name: str(name)
+format_registry.aliases_for = lambda name: (str(name),)
+sys.modules[format_registry.__name__] = format_registry
+torch = types.ModuleType("torch")
+torch_nn = types.ModuleType("torch.nn")
+torch_nn.Module = type("Module", (), {{}})
+torch_nn.Linear = type("Linear", (torch_nn.Module,), {{}})
+torch_nn.Embedding = type("Embedding", (torch_nn.Module,), {{}})
+torch.nn = torch_nn
+sys.modules[torch.__name__] = torch
+sys.modules[torch_nn.__name__] = torch_nn
+
+from prismaquant.serving_profiles import (
+    gridbook_runtime_version,
+    load_serving_profile,
+)
+from prismaquant.model_profiles.structure import load_structure_spec
+assert load_serving_profile("nvfp4_cb").id == "nvfp4_cb"
+assert gridbook_runtime_version() == "0.8.5"
+assert load_structure_spec("deepseek_v4").id == "deepseek_v4"
+"""
+    result = subprocess.run(
+        [sys.executable, "-P", "-c", program],
+        cwd="/",
+        env=_environment(),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
 def test_run_tool_executes_real_write_from_snapshot_and_preserves_closure(
     tmp_path,
 ):

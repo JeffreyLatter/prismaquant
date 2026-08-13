@@ -233,11 +233,30 @@ def test_advancing_the_pin_adds_a_version_key_and_never_edits_an_old_one():
                 if l.id == "fp8_cb_fused_mid_m")
     declared = dict(lane.fused_mid_m_rungs_by_runtime_version)
     assert {"0.5.0", "0.6.0", "0.7.0", "0.8.0", "0.8.1",
-            "0.8.2", "0.8.3", "0.8.4"} <= set(declared)
+            "0.8.2", "0.8.3", "0.8.4", "0.8.5"} <= set(declared)
     assert (declared["0.5.0"] == declared["0.6.0"] == declared["0.7.0"]
             == declared["0.8.0"] == declared["0.8.1"] == declared["0.8.2"]
             == declared["0.8.3"] == declared["0.8.4"]
+            == declared["0.8.5"]
             == tuple(range(28, 49, 4)))
+
+
+def test_block128_source_lane_is_w8a16_and_direct_g32_remains_w8a8():
+    source = sp.serving_lane_route(
+        _PROFILE, "FP8_BLOCK_UE8M0_SOURCE"
+    )
+    direct = sp.serving_lane_route(_PROFILE, "MXFP8_UE8M0_G32")
+    assert source.activation_contract == (
+        "w8a16-bf16-input-fp8-e4m3-block128-ue8m0"
+    )
+    assert "Fp8SourceW8A16LinearMethod" in source.detail
+    assert "does not require GRIDBOOK_MXFP8_DENSE" in source.detail
+    assert "ROUTE STATUS: BACKED" in source.detail
+    assert "e992e5980c96333a48149f96392d6cff56ae9e3f" in source.detail
+    assert "route_unbacked" not in source.fallback_route
+    assert direct.activation_contract == (
+        "w8a8-dynamic-mxfp8-e4m3-group32-ue8m0"
+    )
 
     for old_version in ("0.5.0", "0.6.0"):
         old = sp.serving_lane_route(

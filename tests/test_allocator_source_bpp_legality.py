@@ -11,6 +11,7 @@ import math
 import pytest
 
 from prismaquant import format_registry as fr
+from prismaquant.activation_fair_pricing import BRANCH_SOURCE_PASSTHROUGH
 from prismaquant.allocator_candidates import (
     SOURCE_BPP_EXCEEDED_REASON,
     SOURCE_BPP_UNKNOWN_REASON,
@@ -158,8 +159,8 @@ def test_dense_fp8_source_allows_k48_and_its_measured_equal_source_format():
     )
 
 
-def test_dense_ue8m0_source_excludes_unmeasured_activation_changing_terminal():
-    """Weight-exact W8A8 source bytes are not a free dW-only candidate."""
+def test_dense_ue8m0_w8a16_source_is_an_exact_identity_terminal():
+    """The raw-resident W8A16 route preserves both source W and BF16 A."""
     qname = "model.layers.0.self_attn.o_proj.fp8_ue8m0"
     shape = (8192, 4096)
     source_format = "FP8_BLOCK_UE8M0_SOURCE"
@@ -177,12 +178,14 @@ def test_dense_ue8m0_source_excludes_unmeasured_activation_changing_terminal():
     resolved_source = source_format_for_kind("fp8_ue8m0")
     assert resolved_source is not None
     assert resolved_source.name == source_format
-    assert resolved_source.act_quant_changes_input
-    assert [candidate.fmt for candidate in candidates[qname]] == [
-        "FP8_CB_K48"
-    ]
-    # It is absent because no activation-inclusive cost row exists, not
-    # because its exact source payload exceeds itself.
+    assert not resolved_source.act_quant_changes_input
+    by_format = {candidate.fmt: candidate for candidate in candidates[qname]}
+    assert set(by_format) == {"FP8_CB_K48", source_format}
+    terminal = by_format[source_format]
+    assert terminal.memory_bytes == resolved_source.memory_bytes_for_shape(shape)
+    assert terminal.predicted_dloss == 0.0
+    assert terminal.activation_pricing == BRANCH_SOURCE_PASSTHROUGH
+    assert by_format["FP8_CB_K48"].memory_bytes < terminal.memory_bytes
     assert records == []
 
 

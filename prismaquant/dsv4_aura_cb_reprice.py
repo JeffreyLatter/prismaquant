@@ -77,6 +77,9 @@ from prismaquant.dsv4_campaign_completion import (
 DSV4_BOUNDED_CAMPAIGN_WORKER = True
 DSV4_CAMPAIGN_SCHEMA = "prismaquant.dsv4_cb_anchored_aura.v1"
 DSV4_CPU_REPLAY_SCHEMA = "prismaquant.dsv4_cb_anchored_aura.cpu_replay.v1"
+DSV4_W8A16_READMISSION_SCHEMA = (
+    "prismaquant.dsv4_cb_anchored_aura.w8a16_readmission.v1"
+)
 DSV4_TOTAL_UNITS = 33_325
 DSV4_EXPERT_UNITS = 43 * 256 * 3
 DSV4_NONEXPERT_UNITS = 301
@@ -95,13 +98,49 @@ DSV4_TARGET_PROFILE = "nvfp4_cb"
 _FULL_GIT_COMMIT = re.compile(r"[0-9a-f]{40}")
 _FULL_SHA256 = re.compile(r"[0-9a-f]{64}")
 
+# The only historical measurement producer this one-purpose semantic migration
+# may consume. Generic replay remains same-snapshot-only.
+DSV4_W8A16_LEGACY_PRODUCER = {
+    "commit": "58fb335fdb8e4fde35312d40564062c5a44f3457",
+    "tree": "55b67ebe49b6df0d8a2d8a57b52dcda7b27fd79e",
+    "closure_sha256": (
+        "a4f10f5c6a8411f4194eec03ee747f81782762644735c507e0c6a615fda11816"
+    ),
+}
+DSV4_W8A16_LEGACY_RECEIPT_SHA256 = (
+    "835a814ccae84bb8082f29e19f484f6c26494bee97c4cfc6c9880ea24f0dfe75"
+)
+DSV4_W8A16_LEGACY_INVOCATION_ID = "e3f41a3b3ff44dc4b3a8960b8f0cc796"
+DSV4_W8A16_LEGACY_FORMAT_PLAN_SHA256 = (
+    "f0f4cfa233a6190aea49a706a567d22909719c54366b4437330e13d41286a644"
+)
+DSV4_W8A16_APPROVED_ASSIGNMENT_SHA256 = (
+    "db6d9bc78807efa973ca0a49666c0aa8c4ef198a3e891a4b77f16840af1f5fef"
+)
+DSV4_W8A16_APPROVED_LAYER_CONFIG_SHA256 = (
+    "1b3a3c2ea0e44e42e4e7642730672c0604b300d45c88e8b511d5edf3eb57ef32"
+)
+DSV4_W8A16_APPROVED_SELECTION_SHA256 = (
+    "d38e41133e567bb38e99983bae9ecb2696c53ed56bccc1887b9c24ca83b8fdb8"
+)
+DSV4_W8A16_APPROVED_CB_COL_WEIGHTS_SHA256 = (
+    "df045bde786f7d092e501bfa856984243106a13f05594f4a11fe30270fb09379"
+)
+DSV4_W8A16_APPROVED_SELECTION = {
+    "budget_bytes": DSV4_BUDGET_BYTES,
+    "chosen_achieved_bits": 2.7555507482797204,
+    "predicted_dloss": 0.35597906499701,
+    "selection_tensor_payload_bytes": 112_349_756_664,
+    "selection_whole_artifact_upper_bound_bytes": 112_618_192_120,
+}
+
 # The FP8-CB menus are the on-law rungs only.  gridbook K1.2's fused mid-M
 # kernel law admits FP8-CB at k % 4 == 0 and nothing else: type_size = 4k is
 # the packed-B TMA box's contiguous extent and must stay a 16-byte multiple,
 # and the fused mainloop's single CbSubW = k/4 sub-table width is the format's
 # real layout only on those rungs -- a uniform decode at, say, k37 would be
 # *wrong*, not merely unaligned.  serving_profile_specs/nvfp4_cb.json backs
-# [28, 32, 36, 40, 44, 48] for every runtime 0.5.0..0.8.4 (the pin is 0.8.4,
+# [28, 32, 36, 40, 44, 48] for every runtime 0.5.0..0.8.5 (the pin is 0.8.5,
 # version_is_release, and its packaged contract explicitly attests the routed
 # per-role LUT ABI), so this is the served set, not an aspiration. NVFP4-CB
 # is outside that law -- its lane backs no fused mid-M rungs at any version --
@@ -327,6 +366,8 @@ class PreparedDSv4Campaign:
     cb_context: object
     plugin: CodebookAnchoredFormatPlugin
     format_plan: object
+    measurement_format_plan_identity_sha256: str
+    format_plan_migration: Mapping[str, object] | None
     units: tuple[UnitSpec, ...]
     anchor_requests: tuple[RenderRequest, ...]
     panel_requests: tuple[RenderRequest, ...]
@@ -752,10 +793,77 @@ def assert_dsv4_anchor_accounting(
     return dict(counts)
 
 
+def _w8a16_format_plan_delta(
+    historical_plan: object,
+    current_plan: object,
+) -> dict[str, object]:
+    """Prove the 0.8.4 -> 0.8.5 plan change is version metadata only."""
+
+    historical = historical_plan.to_dict()
+    current = current_plan.to_dict()
+    if historical.get("identity_sha256") != DSV4_W8A16_LEGACY_FORMAT_PLAN_SHA256:
+        raise DSv4CampaignError(
+            "W8A16 readmission historical format-plan identity is not allowlisted"
+        )
+    historical_restriction = historical.get("serving_backed_restriction")
+    current_restriction = current.get("serving_backed_restriction")
+    if not isinstance(historical_restriction, Mapping) or not isinstance(
+        current_restriction, Mapping
+    ):
+        raise DSv4CampaignError(
+            "W8A16 readmission requires old and current serving restrictions"
+        )
+    allowed = {"runtime_version", "rungs_source"}
+    old_delta = {name: historical_restriction.get(name) for name in allowed}
+    new_delta = {name: current_restriction.get(name) for name in allowed}
+    if old_delta != {
+        "runtime_version": "0.8.4",
+        "rungs_source": "serving_profile_spec:0.8.4",
+    } or new_delta != {
+        "runtime_version": "0.8.5",
+        "rungs_source": "serving_profile_spec:0.8.5",
+    }:
+        raise DSv4CampaignError(
+            "W8A16 readmission format-plan version delta is not the approved "
+            f"0.8.4 -> 0.8.5 transition: old={old_delta}, new={new_delta}"
+        )
+    old_normalized = dict(historical)
+    new_normalized = dict(current)
+    old_normalized.pop("identity_sha256", None)
+    new_normalized.pop("identity_sha256", None)
+    old_restriction = dict(historical_restriction)
+    new_restriction = dict(current_restriction)
+    for name in allowed:
+        old_restriction.pop(name, None)
+        new_restriction.pop(name, None)
+    old_normalized["serving_backed_restriction"] = old_restriction
+    new_normalized["serving_backed_restriction"] = new_restriction
+    if canonical_json(
+        old_normalized, where="historical W8A16 format plan"
+    ) != canonical_json(new_normalized, where="current W8A16 format plan"):
+        raise DSv4CampaignError(
+            "W8A16 readmission format plan changed beyond runtime-version "
+            "provenance"
+        )
+    return {
+        "historical_identity_sha256": historical["identity_sha256"],
+        "current_identity_sha256": current["identity_sha256"],
+        "allowed_changed_fields": [
+            "serving_backed_restriction.runtime_version",
+            "serving_backed_restriction.rungs_source",
+            "identity_sha256",
+        ],
+        "historical_runtime": old_delta,
+        "current_runtime": new_delta,
+        "semantic_payload_equal_after_allowed_delta": True,
+    }
+
+
 def prepare_dsv4_campaign(
     args: argparse.Namespace,
     *,
     publish_format_plan: bool = True,
+    allow_historical_plan_delta: bool = False,
 ) -> PreparedDSv4Campaign:
     """Complete every CPU identity/legality check before the P0 GPU pass."""
     work_dir = _safe_work_dir(args.work_dir)
@@ -848,6 +956,8 @@ def prepare_dsv4_campaign(
             f"nonexperts {list(FP8_NONEXPERT_FORMATS)})"
         )
     format_plan_path = work_dir / "checkpoints" / "source_format_plan.json"
+    measurement_format_plan_identity = format_plan.identity_sha256
+    format_plan_migration = None
     if publish_format_plan:
         format_plan_path.parent.mkdir(parents=True, exist_ok=True)
         write_format_plan(format_plan, format_plan_path)
@@ -856,12 +966,22 @@ def prepare_dsv4_campaign(
         # its already-published plan against a fresh derivation, but do not
         # even atomically replace it with equivalent bytes.
         try:
-            published_plan = load_format_plan(format_plan_path)
+            published_plan = load_format_plan(
+                format_plan_path,
+                verify_current_serving_restriction=(
+                    not allow_historical_plan_delta
+                ),
+            )
         except Exception as exc:
             raise DSv4CampaignError(
                 f"completed source format plan is invalid: {format_plan_path}"
             ) from exc
-        if published_plan.to_dict() != format_plan.to_dict():
+        if allow_historical_plan_delta:
+            format_plan_migration = _w8a16_format_plan_delta(
+                published_plan, format_plan
+            )
+            measurement_format_plan_identity = published_plan.identity_sha256
+        elif published_plan.to_dict() != format_plan.to_dict():
             raise DSv4CampaignError(
                 "completed source format plan differs from fresh derivation"
             )
@@ -916,6 +1036,13 @@ def prepare_dsv4_campaign(
         "panel_renders": len(panel),
         "validation_renders": len(validation),
         "format_plan_identity_sha256": format_plan.identity_sha256,
+        "measurement_format_plan_identity_sha256": (
+            measurement_format_plan_identity
+        ),
+        **(
+            {"format_plan_migration": format_plan_migration}
+            if format_plan_migration is not None else {}
+        ),
         "format_plan_path": str(format_plan_path),
         "cold_expert_render_units": len(missing_activations),
         "streaming_source_cache": {
@@ -931,6 +1058,10 @@ def prepare_dsv4_campaign(
         cb_context=cb_context,
         plugin=plugin,
         format_plan=format_plan,
+        measurement_format_plan_identity_sha256=(
+            measurement_format_plan_identity
+        ),
+        format_plan_migration=format_plan_migration,
         units=units,
         anchor_requests=anchor_requests,
         panel_requests=panel,
@@ -1304,7 +1435,7 @@ def _load_and_audit_completed_streamed_payload(
     if (
         extra.get("campaign_schema") != DSV4_CAMPAIGN_SCHEMA
         or extra.get("source_format_plan_identity_sha256")
-        != prepared.format_plan.identity_sha256
+        != prepared.measurement_format_plan_identity_sha256
         or extra.get("routed_book_selection_sha256")
         != prepared.routed_selection_sha256
         or extra.get("include_routed_experts") is not True
@@ -1496,6 +1627,7 @@ def _load_and_audit_completed_streamed_payload(
     safe_costs: dict[str, dict[str, object]] = {}
     source_records: dict[str, dict[str, object]] = {}
     unit_payload_descriptors: list[dict[str, str]] = []
+    readmitted_fp8_zero = 0
     quarantined_fp8_zero = 0
     quarantined_cross_terminal_zero = 0
     measured_rows = 0
@@ -1631,6 +1763,8 @@ def _load_and_audit_completed_streamed_payload(
                 terminal.allocator_selectable
             ):
                 safe_row[canonical] = dict(passthrough_zero)
+                if canonical == "FP8_BLOCK_UE8M0_SOURCE":
+                    readmitted_fp8_zero += 1
             elif canonical == "FP8_BLOCK_UE8M0_SOURCE":
                 quarantined_fp8_zero += 1
             else:
@@ -1715,6 +1849,9 @@ def _load_and_audit_completed_streamed_payload(
             ),
         },
         "source_format_plan_identity_sha256": (
+            prepared.measurement_format_plan_identity_sha256
+        ),
+        "current_source_format_plan_identity_sha256": (
             prepared.format_plan.identity_sha256
         ),
         "production_arm_identity_sha256": canonical_json_sha256(
@@ -1728,10 +1865,16 @@ def _load_and_audit_completed_streamed_payload(
         ),
         "measured_render_rows_validated": measured_rows,
         "legacy_fp8_terminal_zero_rows_quarantined": quarantined_fp8_zero,
+        "legacy_fp8_terminal_zero_rows_readmitted": readmitted_fp8_zero,
         "legacy_cross_terminal_zero_rows_quarantined": (
             quarantined_cross_terminal_zero
         ),
-        "fp8_block_terminal_allocator_selectable": False,
+        "fp8_block_terminal_allocator_selectable": all(
+            candidate.allocator_selectable
+            for unit in prepared.units
+            for candidate in unit.candidates
+            if candidate.format_name == "FP8_BLOCK_UE8M0_SOURCE"
+        ),
         "no_gpu_measurement_or_render": True,
     }
     replay = dict(canonical_json(replay, where="DSv4 CPU replay provenance"))
@@ -1756,14 +1899,61 @@ def _allocator_command(
     formats = (
         *NVFP4_FORMATS,
         *FP8_NONEXPERT_FORMATS,
-        # The block-FP8 source weight remains part of the dense unit/render
-        # identity, but Gridbook serves it through dynamic per-32 MXFP8 A-side
-        # quantization.  Weight-only AURA has no scalar for that perturbation,
-        # so this campaign must not place it on the allocator command menu.
-        "MXFP4_SOURCE", "BF16",
+        # Both source carriers are byte-verbatim W/A identity terminals.
+        # Gridbook release/route admission remains an independent export gate.
+        "MXFP4_SOURCE", "FP8_BLOCK_UE8M0_SOURCE", "BF16",
     )
+    # A release replay runs from a loader-less, source-bootstrap package
+    # namespace. A bare ``python -m`` child could resolve the image's stale
+    # site-package instead of the immutable /pq snapshot. When repository
+    # tools are present, re-enter through that exact snapshot's bootstrap and
+    # remove PYTHONPATH before its fail-closed source proof. Installed wheels do
+    # not package repository-level tools/, so they retain the normal module
+    # invocation through their already-selected interpreter distribution.
+    source_root = Path(__file__).resolve().parents[1]
+    source_bootstrap = source_root / "tools" / "prismaquant_source_bootstrap.py"
+    strict_root_raw = os.environ.get("PQ_RUNTIME_PRISMAQUANT_ROOT", "")
+    if strict_root_raw:
+        strict_root = Path(strict_root_raw)
+        try:
+            resolved_strict_root = strict_root.resolve(strict=True)
+        except OSError as exc:
+            raise DSv4CampaignError(
+                "strict-snapshot allocator launch has an unreadable runtime "
+                "source root"
+            ) from exc
+        if (
+            not strict_root.is_absolute()
+            or strict_root.is_symlink()
+            or resolved_strict_root != source_root
+        ):
+            raise DSv4CampaignError(
+                "strict-snapshot allocator launch source root differs from "
+                "the active PrismaQuant module"
+            )
+        if source_bootstrap.is_symlink() or not source_bootstrap.is_file():
+            raise DSv4CampaignError(
+                "strict-snapshot allocator launch requires the exact source "
+                "bootstrap"
+            )
+    bootstrap_available = (
+        source_bootstrap.is_file() and not source_bootstrap.is_symlink()
+    )
+    if bootstrap_available:
+        env_program = shutil.which("env")
+        if not env_program:
+            raise DSv4CampaignError(
+                "source-snapshot allocator launch requires the env utility"
+            )
+        allocator_prefix = [
+            env_program, "-u", "PYTHONPATH",
+            sys.executable, "-P", str(source_bootstrap), "run-module",
+            "--source-root", str(source_root), "prismaquant.allocator",
+        ]
+    else:
+        allocator_prefix = [sys.executable, "-m", "prismaquant.allocator"]
     return [
-        sys.executable, "-m", "prismaquant.allocator",
+        *allocator_prefix,
         "--probe", str(args.probe),
         "--costs", str(cost_path),
         "--model-override", str(args.model),
@@ -2087,6 +2277,7 @@ def _finish_dsv4_campaign(
     exportable_output: Path,
     report_path: Path,
     replay_provenance: Mapping[str, object] | None = None,
+    approved_assignment: Mapping[str, str] | None = None,
 ) -> int:
     """Shared CPU fit/price/allocate/publish tail for fresh and replay runs."""
     args = prepared.args
@@ -2117,13 +2308,20 @@ def _finish_dsv4_campaign(
         hull_report=hulls,
         validation_report=validation,
     )
+    from prismaquant.allocator_candidates import cost_entry_is_source_passthrough
+
     unsafe_rows = sorted(
-        qname for qname, row in cost_payload["costs"].items()
+        qname
+        for qname, row in cost_payload["costs"].items()
         if "FP8_BLOCK_UE8M0_SOURCE" in row
+        and not cost_entry_is_source_passthrough(
+            row["FP8_BLOCK_UE8M0_SOURCE"],
+            "FP8_BLOCK_UE8M0_SOURCE",
+        )
     )
     if unsafe_rows:
         raise DSv4CampaignError(
-            "activation-unmeasured FP8 block terminal survived pricing; "
+            "FP8 block terminal lacks exact source-passthrough provenance; "
             f"sample={unsafe_rows[:8]}"
         )
     cost_path = write_cb_cost_payload(
@@ -2133,9 +2331,26 @@ def _finish_dsv4_campaign(
         prepared, cost_path=cost_path, output_dir=allocator_output
     )
     command_formats = command[command.index("--formats") + 1].split(",")
-    if "FP8_BLOCK_UE8M0_SOURCE" in command_formats:
+    block_terminal_count = sum(
+        1
+        for unit in prepared.units
+        for candidate in unit.candidates
+        if candidate.format_name == "FP8_BLOCK_UE8M0_SOURCE"
+    )
+    block_selectable_count = sum(
+        1
+        for unit in prepared.units
+        for candidate in unit.candidates
+        if candidate.format_name == "FP8_BLOCK_UE8M0_SOURCE"
+        and candidate.allocator_selectable
+    )
+    if block_terminal_count and (
+        block_selectable_count != block_terminal_count
+        or "FP8_BLOCK_UE8M0_SOURCE" not in command_formats
+    ):
         raise DSv4CampaignError(
-            "activation-unmeasured FP8 block terminal reached allocator menu"
+            "W8A16 FP8 block terminal admission differs between prepared "
+            "units and allocator command"
         )
     invocation_replay = (
         dict(replay_provenance) if replay_provenance is not None else None
@@ -2157,7 +2372,10 @@ def _finish_dsv4_campaign(
                 prepared.arm_identity,
                 where="DSv4 allocator production arm identity",
             ),
-            "fp8_block_terminal_allocator_selectable": False,
+            "fp8_block_terminal_allocator_selectable": (
+                block_selectable_count == block_terminal_count
+                and block_terminal_count > 0
+            ),
             **(
                 {"cpu_replay": invocation_replay}
                 if invocation_replay is not None else {}
@@ -2178,10 +2396,63 @@ def _finish_dsv4_campaign(
         if candidate.terminal and not candidate.allocator_selectable
     )
     selected_formats = Counter(assignment.values())
-    if selected_formats.get("FP8_BLOCK_UE8M0_SOURCE", 0):
-        raise DSv4CampaignError(
-            "allocator selected activation-unmeasured FP8 block terminal"
+    assignment_attestation = None
+    if approved_assignment is not None:
+        from prismaquant.nvfp4_cb_footprint import (
+            assignment_serialization_sha256,
         )
+
+        approved = {str(name): str(fmt) for name, fmt in approved_assignment.items()}
+        differing = sorted(
+            name for name in set(assignment) | set(approved)
+            if assignment.get(name) != approved.get(name)
+        )
+        assignment_sha256 = assignment_serialization_sha256(assignment)
+        approved_sha256 = assignment_serialization_sha256(approved)
+        if (
+            differing
+            or approved_sha256 != DSV4_W8A16_APPROVED_ASSIGNMENT_SHA256
+            or assignment_sha256 != approved_sha256
+        ):
+            raise DSv4CampaignError(
+                "W8A16 readmission assignment differs from approved raw "
+                f"allocation: sample={differing[:8]}, current={assignment_sha256}, "
+                f"approved={approved_sha256}"
+            )
+        try:
+            selection = json.loads(
+                (allocator_output / "selection.json").read_text()
+            )
+            whole = selection["whole_artifact_budget"]
+        except Exception as exc:
+            raise DSv4CampaignError(
+                "W8A16 readmission allocator selection is unreadable"
+            ) from exc
+        observed_selection = {
+            "budget_bytes": selection.get("budget_bytes"),
+            "chosen_achieved_bits": selection.get("chosen_achieved_bits"),
+            "predicted_dloss": selection.get("predicted_dloss"),
+            "selection_tensor_payload_bytes": whole.get(
+                "selection_tensor_payload_bytes"
+            ),
+            "selection_whole_artifact_upper_bound_bytes": whole.get(
+                "selection_whole_artifact_upper_bound_bytes"
+            ),
+        }
+        if observed_selection != DSV4_W8A16_APPROVED_SELECTION or whole.get(
+            "selection_assignment_sha256"
+        ) != assignment_sha256:
+            raise DSv4CampaignError(
+                "W8A16 readmission selection metrics differ from approved raw "
+                f"allocation: {observed_selection}"
+            )
+        assignment_attestation = {
+            "approved_assignment_sha256": approved_sha256,
+            "readmitted_assignment_sha256": assignment_sha256,
+            "unit_count": len(assignment),
+            "full_qname_format_map_equal": True,
+            "selection": observed_selection,
+        }
     report = {
         "schema": DSV4_CAMPAIGN_SCHEMA,
         "cost_currency": AURA_CURRENCY,
@@ -2206,12 +2477,18 @@ def _finish_dsv4_campaign(
                 "exact source terminal is selectable only when its registered "
                 "activation path is identity"
             ),
-            "fp8_block_terminal_selected_count": 0,
+            "fp8_block_terminal_selected_count": selected_formats.get(
+                "FP8_BLOCK_UE8M0_SOURCE", 0
+            ),
             "allocator_command_formats": command_formats,
         },
         **(
             {"cpu_replay": invocation_replay}
             if invocation_replay is not None else {}
+        ),
+        **(
+            {"approved_raw_assignment_attestation": assignment_attestation}
+            if assignment_attestation is not None else {}
         ),
     }
     json.dumps(report, allow_nan=False)
@@ -2321,6 +2598,233 @@ def run_dsv4_anchor_replay(
     )
 
 
+def _assert_w8a16_legacy_receipt(
+    receipt: Mapping[str, object],
+) -> None:
+    producer = receipt.get("producer")
+    service = receipt.get("service")
+    if not isinstance(producer, Mapping) or any(
+        producer.get(key) != value
+        for key, value in DSV4_W8A16_LEGACY_PRODUCER.items()
+    ):
+        raise DSv4CampaignError(
+            "W8A16 readmission receipt producer is not the exact allowlisted "
+            "measurement snapshot"
+        )
+    if (
+        receipt.get("receipt_sha256") != DSV4_W8A16_LEGACY_RECEIPT_SHA256
+        or not isinstance(service, Mapping)
+        or service.get("result") != "success"
+        or service.get("invocation_id") != DSV4_W8A16_LEGACY_INVOCATION_ID
+    ):
+        raise DSv4CampaignError(
+            "W8A16 readmission receipt/service identity is not allowlisted"
+        )
+
+
+def _w8a16_runtime_contract_proof() -> dict[str, object]:
+    from prismaquant.gridbook_runtime_pin import (
+        GRIDBOOK_RUNTIME_CONTRACT_SCHEMA,
+        load_gridbook_runtime_pin,
+        require_exact_gridbook_runtime_release,
+        supports_source_fp8_block128_w8a16,
+    )
+
+    pin = load_gridbook_runtime_pin()
+    try:
+        require_exact_gridbook_runtime_release(pin)
+    except Exception as exc:
+        raise DSv4CampaignError(
+            f"W8A16 readmission requires a resolved Gridbook release pin: {exc}"
+        ) from exc
+    if (
+        pin.version != "0.8.5"
+        or pin.version_is_release is not True
+        or pin.runtime_contract_schema != GRIDBOOK_RUNTIME_CONTRACT_SCHEMA
+        or not supports_source_fp8_block128_w8a16(pin)
+    ):
+        raise DSv4CampaignError(
+            "W8A16 readmission requires released Gridbook 0.8.5 with "
+            "runtime-contract v3 source_fp8_block128_w8a16=1"
+        )
+    return {
+        "schema": pin.schema,
+        "repository": pin.repository,
+        "commit": pin.commit,
+        "version": pin.version,
+        "version_is_release": pin.version_is_release,
+        "runtime_contract_schema": pin.runtime_contract_schema,
+        "required_abi_features": dict(pin.required_abi_features),
+    }
+
+
+def _load_w8a16_approved_raw_assignment(
+    work_dir: Path,
+) -> tuple[dict[str, str], dict[str, object]]:
+    from prismaquant.layer_config import load_assignment
+    from prismaquant.nvfp4_cb_footprint import assignment_serialization_sha256
+
+    publication = work_dir / "artifacts" / "exportable-aura"
+    layer_config = publication / "layer_config.json"
+    selection_path = publication / "selection.json"
+    col_weights = publication / "cb_col_weights.pkl"
+    expected_files = {
+        layer_config: DSV4_W8A16_APPROVED_LAYER_CONFIG_SHA256,
+        selection_path: DSV4_W8A16_APPROVED_SELECTION_SHA256,
+        col_weights: DSV4_W8A16_APPROVED_CB_COL_WEIGHTS_SHA256,
+    }
+    for path, expected_sha256 in expected_files.items():
+        try:
+            observed = _sha256(path)
+        except Exception as exc:
+            raise DSv4CampaignError(
+                f"approved raw publication input is unreadable: {path}"
+            ) from exc
+        if observed != expected_sha256:
+            raise DSv4CampaignError(
+                f"approved raw publication input changed: {path} "
+                f"observed={observed} expected={expected_sha256}"
+            )
+    assignment = load_assignment(layer_config)
+    assignment_sha256 = assignment_serialization_sha256(assignment)
+    if (
+        len(assignment) != DSV4_TOTAL_UNITS
+        or assignment_sha256 != DSV4_W8A16_APPROVED_ASSIGNMENT_SHA256
+        or Counter(assignment.values()).get("FP8_BLOCK_UE8M0_SOURCE", 0) != 120
+    ):
+        raise DSv4CampaignError(
+            "approved raw publication assignment no longer matches its "
+            "allowlisted identity"
+        )
+    selection = json.loads(selection_path.read_text())
+    whole = selection.get("whole_artifact_budget")
+    observed_selection = {
+        "budget_bytes": selection.get("budget_bytes"),
+        "chosen_achieved_bits": selection.get("chosen_achieved_bits"),
+        "predicted_dloss": selection.get("predicted_dloss"),
+        "selection_tensor_payload_bytes": (
+            whole.get("selection_tensor_payload_bytes")
+            if isinstance(whole, Mapping) else None
+        ),
+        "selection_whole_artifact_upper_bound_bytes": (
+            whole.get("selection_whole_artifact_upper_bound_bytes")
+            if isinstance(whole, Mapping) else None
+        ),
+    }
+    if (
+        observed_selection != DSV4_W8A16_APPROVED_SELECTION
+        or not isinstance(whole, Mapping)
+        or whole.get("selection_assignment_sha256") != assignment_sha256
+    ):
+        raise DSv4CampaignError(
+            "approved raw publication selection stamp changed"
+        )
+    return assignment, {
+        "publication": str(publication.resolve(strict=True)),
+        "layer_config_sha256": expected_files[layer_config],
+        "selection_sha256": expected_files[selection_path],
+        "cb_col_weights_sha256": expected_files[col_weights],
+        "assignment_sha256": assignment_sha256,
+        "unit_count": len(assignment),
+        "fp8_block_terminal_count": 120,
+        "selection": observed_selection,
+    }
+
+
+def run_dsv4_w8a16_readmission(
+    args: argparse.Namespace, *, control_plane: str,
+) -> int:
+    """CPU-only, no-clobber reinterpretation of the exact completed journal."""
+
+    if control_plane != __name__:
+        raise DSv4CampaignError(
+            f"unexpected DSv4 control plane {control_plane!r}"
+        )
+    if bool(args.resume):
+        raise DSv4CampaignError("W8A16 readmission is fresh-only; --resume is invalid")
+    work_dir = Path(args.work_dir)
+    runtime_identity = _release_runtime_identity()
+    runtime_contract = _w8a16_runtime_contract_proof()
+    receipt_path = completion_receipt_path(work_dir)
+    try:
+        completion_receipt = verify_receipt_for_replay(
+            receipt_path,
+            work_dir=work_dir,
+            historical_root=historical_checkpoint_root(work_dir),
+            expected_producer_commit=DSV4_W8A16_LEGACY_PRODUCER["commit"],
+        )
+    except CampaignCompletionError as exc:
+        raise DSv4CampaignError(
+            f"W8A16 readmission lacks its exact terminal receipt: {exc}"
+        ) from exc
+    _assert_w8a16_legacy_receipt(completion_receipt)
+    approved_assignment, approved_raw = _load_w8a16_approved_raw_assignment(
+        work_dir
+    )
+
+    replay_artifacts = work_dir / "artifacts" / "replay-w8a16-readmission"
+    allocator_output = work_dir / "allocator-aura-w8a16-readmission"
+    exportable_output = (
+        work_dir / "artifacts" / "exportable-aura-w8a16-readmission"
+    )
+    occupied = [
+        path for path in (replay_artifacts, allocator_output, exportable_output)
+        if path.exists()
+    ]
+    if occupied:
+        raise DSv4CampaignError(
+            "W8A16 readmission refuses to overwrite prior outputs: "
+            + ", ".join(map(str, occupied))
+        )
+
+    prepared = prepare_dsv4_campaign(
+        args,
+        publish_format_plan=False,
+        allow_historical_plan_delta=True,
+    )
+    require_allocator_supersurrogate_support()
+    streamed_payload, cpu_replay = _load_and_audit_completed_streamed_payload(
+        prepared, args.replay_streamed_payload
+    )
+    try:
+        assert_replay_matches_completion_receipt(
+            cpu_replay, completion_receipt
+        )
+    except CampaignCompletionError as exc:
+        raise DSv4CampaignError(
+            f"W8A16 readmission differs from terminal receipt: {exc}"
+        ) from exc
+    readmission = {
+        "schema": DSV4_W8A16_READMISSION_SCHEMA,
+        "measurement_invoked": False,
+        "no_gpu_measurement_or_render": True,
+        "legacy_measurement_producer": dict(DSV4_W8A16_LEGACY_PRODUCER),
+        "current_interpretation_producer": dict(runtime_identity),
+        "campaign_completion_receipt": {
+            "path": str(receipt_path.resolve(strict=True)),
+            "receipt_sha256": completion_receipt["receipt_sha256"],
+            "service_invocation_id": DSV4_W8A16_LEGACY_INVOCATION_ID,
+        },
+        "format_plan_migration": prepared.format_plan_migration,
+        "gridbook_runtime_pin": runtime_contract,
+        "approved_raw_publication": approved_raw,
+        "cpu_replay": cpu_replay,
+    }
+    readmission = dict(canonical_json(
+        readmission, where="DSv4 W8A16 readmission provenance"
+    ))
+    return _finish_dsv4_campaign(
+        prepared,
+        streamed_payload,
+        artifacts_dir=replay_artifacts,
+        allocator_output=allocator_output,
+        exportable_output=exportable_output,
+        report_path=replay_artifacts / "campaign_report.json",
+        replay_provenance=readmission,
+        approved_assignment=approved_assignment,
+    )
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Bounded, anchored DSv4 AURA/CB one-shot campaign"
@@ -2352,6 +2856,15 @@ def _build_parser() -> argparse.ArgumentParser:
             "campaign receipt authorizes replay; no model/GPU work runs."
         ),
     )
+    parser.add_argument(
+        "--w8a16-readmission",
+        action="store_true",
+        help=(
+            "reinterpret only the exact allowlisted completed DSv4 journal "
+            "under the raw-resident Gridbook W8A16 contract; CPU-only and "
+            "fresh/no-clobber"
+        ),
+    )
     return parser
 
 
@@ -2370,7 +2883,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     ) in Path(args.work_dir).resolve(strict=False).parents:
         parser.error("campaign work-dir may not be under /tmp")
     if args.replay_streamed_payload:
+        if args.w8a16_readmission:
+            return run_dsv4_w8a16_readmission(
+                args, control_plane=__name__
+            )
         return run_dsv4_anchor_replay(args, control_plane=__name__)
+    if args.w8a16_readmission:
+        parser.error("--w8a16-readmission requires --replay-streamed-payload")
     return run_dsv4_anchor_campaign(args, control_plane=__name__)
 
 
@@ -2397,4 +2916,5 @@ __all__ = [
     "render_economics_report",
     "run_dsv4_anchor_campaign",
     "run_dsv4_anchor_replay",
+    "run_dsv4_w8a16_readmission",
 ]

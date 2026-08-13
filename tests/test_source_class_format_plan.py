@@ -274,3 +274,12 @@ def test_serving_backed_plan_round_trip_rejects_pin_drift(tmp_path):
     path.write_text(json.dumps(payload))
     with pytest.raises(ValueError, match="different serving-backed restriction"):
         load_format_plan(path)
+
+    historical = load_format_plan(
+        path, verify_current_serving_restriction=False
+    )
+    assert historical.identity_sha256 == payload["identity_sha256"]
+    assert historical.serving_backed_restriction == (
+        payload["serving_backed_restriction"]
+    )
+    assert historical.formats_for(expert) == ON_LAW_EXPERT_FORMATS

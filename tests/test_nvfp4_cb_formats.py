@@ -1314,6 +1314,12 @@ def test_exporter_packed_experts_roundtrip(export_dir, source, monkeypatch):
             "version": (runtime_pin
                         .GRIDBOOK_ROUTED_MOE_PER_ROLE_CODEBOOK_LUT_MIN_VERSION),
             "version_is_release": False,
+            "runtime_contract_schema": (
+                runtime_pin.GRIDBOOK_RUNTIME_CONTRACT_SCHEMA
+            ),
+            "required_abi_features": dict(
+                runtime_pin.GRIDBOOK_REQUIRED_ABI_FEATURES
+            ),
         }))
 
     mdl, out = export_dir / "model", export_dir / "out"

@@ -1224,10 +1224,10 @@ class TestRoundTrip(unittest.TestCase):
                         # is no render to compare against a serve: the
                         # exporter copies the checkpoint's own weight bytes.
                         # Only contracts whose activation path is also the
-                        # identity may claim zero end-to-end loss.  Gridbook's
-                        # block-FP8 route deliberately exercises the other
-                        # branch: weight-exact W8A8 with measured MXFP8 A-side
-                        # quantization.
+                        # identity may claim zero end-to-end loss. Gridbook's
+                        # raw block-FP8 W8A16 source route satisfies that
+                        # identity contract; the separate direct G32 MXFP8
+                        # re-quantization route remains W8A8.
                         spec = fr.get_format(fmt)
                         torch.testing.assert_close(
                             spec.quantize_dequantize(W), W)

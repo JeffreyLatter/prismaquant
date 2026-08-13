@@ -22,7 +22,6 @@ from prismaquant.allocator_candidates import (
     PASSTHROUGH_SOURCE_REQUIREMENTS,
     PASSTHROUGH_WIRE_FORMAT_IDS,
     ROUTE_STATUS_BACKED,
-    ROUTE_STATUS_PENDING,
     passthrough_serving_notes,
     ROUTE_PENDING_PASSTHROUGH_FORMATS,
     SOURCE_PASSTHROUGH_CONTRACTS,
@@ -63,10 +62,8 @@ N_EXPERTS = 256
 def test_every_contract_names_a_registered_weight_identity_format():
     """Every contract copies W exactly; only zero-cost contracts copy A too.
 
-    The zero cost is justified ONLY by the exporter copying bytes. A format
-    Gridbook's block-FP8 route is the deliberate exception on A: it embeds W
-    exactly but dynamically quantizes activations to per-32 MXFP8, so its
-    terminal cannot claim a weight-only zero.
+    The zero cost is justified only when both the exported source bytes and
+    the serving activation path are identities.
     """
     probe = torch.randn(8, 128)
     for name, contract in SOURCE_PASSTHROUGH_CONTRACTS.items():
@@ -81,11 +78,13 @@ def test_every_contract_names_a_registered_weight_identity_format():
             assert not spec.act_quant_changes_input, name
 
     block = fr.get_format("FP8_BLOCK_UE8M0_SOURCE")
-    assert block.act_bits == 8
-    assert block.act_group_size == 32
-    assert block.act_dtype_name == "fp8_e4m3"
-    assert block.act_quant_changes_input
-    assert not torch.equal(block.activation_quantize_dequantize(probe), probe)
+    assert block.act_bits is None
+    assert block.act_group_size is None
+    assert block.act_dtype_name is None
+    assert not block.act_quant_changes_input
+    torch.testing.assert_close(block.activation_quantize_dequantize(probe), probe)
+    assert block.autoround_config()["act_bits"] == 16
+    assert block.autoround_config()["act_data_type"] == "float"
 
 
 def test_derived_views_agree_with_the_contract_table():
@@ -237,7 +236,7 @@ def test_lane_metadata_declares_a_distinct_delegated_native_route():
 
 
 def test_route_status_follows_the_pinned_gridbook_contract():
-    """Gridbook owns block-FP8 correctness; served parity is still pending."""
+    """The exact Gridbook W8A16 route is backed; parity is a later ship gate."""
     mxfp4 = SOURCE_PASSTHROUGH_CONTRACTS["MXFP4_SOURCE"]
     body = SOURCE_PASSTHROUGH_CONTRACTS["FP8_BLOCK_UE8M0_SOURCE"]
     assert mxfp4.route_status == ROUTE_STATUS_BACKED
@@ -245,10 +244,12 @@ def test_route_status_follows_the_pinned_gridbook_contract():
     # BACKED only WITH a requirement; a backed route whose requirement is
     # unmet serves no better than a blocked one, so it must be declared.
     assert mxfp4.route_requirement == "vllm --moe-backend marlin"
-    assert body.route_status == ROUTE_STATUS_PENDING
-    assert not body.route_backed
-    assert body.serving_route == "gridbook_mxfp8_dense"
-    assert body.route_requirement == "GRIDBOOK_MXFP8_DENSE=1"
+    assert body.route_status == ROUTE_STATUS_BACKED
+    assert body.route_backed
+    assert body.serving_route == "gridbook_fp8_source_w8a16"
+    assert "source_fp8_block128_w8a16=1" in body.route_requirement
+    assert "GRIDBOOK_MXFP8_DENSE" not in body.route_requirement
+    assert "e992e5980c96333a48149f96392d6cff56ae9e3f" in body.route_requirement
     # Both carry the evidence for their verdict.
     assert mxfp4.route_evidence and body.route_evidence
 
@@ -293,9 +294,9 @@ def test_serving_notes_carry_requirement_and_evidence():
     assert notes["MXFP4_SOURCE"]["requirement"] == "vllm --moe-backend marlin"
     assert notes["MXFP4_SOURCE"]["route_status"] == ROUTE_STATUS_BACKED
     assert notes["FP8_BLOCK_UE8M0_SOURCE"]["route_status"] == (
-        ROUTE_STATUS_PENDING)
-    assert notes["FP8_BLOCK_UE8M0_SOURCE"]["requirement"] == (
-        "GRIDBOOK_MXFP8_DENSE=1"
+        ROUTE_STATUS_BACKED)
+    assert "source_fp8_block128_w8a16=1" in (
+        notes["FP8_BLOCK_UE8M0_SOURCE"]["requirement"]
     )
     for entry in notes.values():
         assert entry["evidence"]

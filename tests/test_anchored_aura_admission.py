@@ -197,9 +197,9 @@ def test_terminals_keep_the_passthrough_contract_not_the_aura_branch():
         {"h_trace": 1.0}, terminal, fmt) == candidates.BRANCH_SOURCE_PASSTHROUGH
 
     block = "FP8_BLOCK_UE8M0_SOURCE"
-    assert fr.get_format(block).act_quant_changes_input
-    assert block not in candidates.SOURCE_PASSTHROUGH_FORMATS
-    assert not candidates.cost_entry_is_source_passthrough(terminal, block)
+    assert not fr.get_format(block).act_quant_changes_input
+    assert block in candidates.SOURCE_PASSTHROUGH_FORMATS
+    assert candidates.cost_entry_is_source_passthrough(terminal, block)
 
 
 if __name__ == "__main__":  # pragma: no cover

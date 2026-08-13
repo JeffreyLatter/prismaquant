@@ -49,6 +49,11 @@ from .gridbook_environment import (
     CANONICAL_GOLD_ENVIRONMENT,
     CANONICAL_GOLD_SET_ENVIRONMENT,
 )
+from .gridbook_runtime_pin import (
+    GridbookRuntimePin,
+    load_gridbook_runtime_pin,
+    require_exact_gridbook_runtime_release,
+)
 
 SCHEMA = "prismaquant.shipcard/1"
 
@@ -76,6 +81,15 @@ ALL_SLOTS: tuple[str, ...] = REQUIRED_SLOTS + CB_REQUIRED_SLOTS
 GOLD_SLOTS: frozenset[str] = frozenset({"gold.kl", "gold.ppl"})
 
 SHIPCARD_FILENAME = "shipcard.json"
+
+
+def _released_gridbook_runtime_pin() -> GridbookRuntimePin:
+    """Return the sole tracked pin only when it is an immutable release."""
+
+    pin = load_gridbook_runtime_pin()
+    require_exact_gridbook_runtime_release(pin)
+    return pin
+
 
 # The refusal record is intentionally mutated after export as independent
 # serve/gold gates close its slots.  A fixed-size JSON file keeps the exporter
@@ -125,16 +139,22 @@ _TOKENIZER_IDENTITY_FILENAMES = (
     "vocab.json",
 )
 _CB_FORMAT_RE = re.compile(r"^(?:NVFP4_CB|FP8_CB)_[KS][0-9]+$")
-_MXFP8_DENSE_WIRE_IDS = frozenset({
+_FP8_SOURCE_W8A16_WIRE_IDS = frozenset({
     "fp8_e4m3_ue8m0_block128",
-    "mxfp8_e4m3_e8m0_g32",
 })
+_MXFP8_DENSE_WIRE_IDS = frozenset({"mxfp8_e4m3_e8m0_g32"})
 _CB_MAIN_EXTENSION_RE = re.compile(r"^prismaquant_cb_ext(?:[.][^/]*)?[.]so$")
 _CB_V2_EXTENSION_RE = re.compile(
     r"^prismaquant_cb_v2_ext(?:[.][^/]*)?[.]so$"
 )
 _MXFP8_DENSE_EXTENSION_RE = re.compile(
     r"^pq_mxfp8_dense_[A-Za-z0-9_-]+(?:[.][^/]*)?[.]so$"
+)
+_FP8_SOURCE_W8A16_EXTENSION_RE = re.compile(
+    r"^pq_fp8_source_w8a16_[A-Za-z0-9_-]+(?:[.][^/]*)?[.]so$"
+)
+_CB_BF16_GROUPED_EXTENSION_RE = re.compile(
+    r"^pq_cb_bf16_grouped_[A-Za-z0-9_-]+(?:[.][^/]*)?[.]so$"
 )
 CB_PERFORMANCE_TELEMETRY_KINDS = frozenset({
     "routing_per_layer_per_step",
@@ -783,6 +803,7 @@ def _gold_extension_requirements(
     """Extension families implied by the finalized live assignment."""
     cb_formats: set[str] = set()
     dense_mxfp8 = False
+    source_fp8_w8a16 = False
 
     config_groups = quant_config.get("config_groups")
     if config_groups is not None:
@@ -807,11 +828,12 @@ def _gold_extension_requirements(
                 raise ValueError("quant_config tensor_formats is malformed")
             if _CB_FORMAT_RE.fullmatch(fmt):
                 cb_formats.add(fmt)
-            if fmt in {
-                "FP8_BLOCK_UE8M0_SOURCE", "MXFP8_UE8M0_G32",
-                *_MXFP8_DENSE_WIRE_IDS,
-            }:
+            if fmt in {"MXFP8_UE8M0_G32", *_MXFP8_DENSE_WIRE_IDS}:
                 dense_mxfp8 = True
+            if fmt in {
+                "FP8_BLOCK_UE8M0_SOURCE", *_FP8_SOURCE_W8A16_WIRE_IDS,
+            }:
+                source_fp8_w8a16 = True
 
     delegated = quant_config.get("source_passthrough")
     if delegated is not None:
@@ -827,6 +849,8 @@ def _gold_extension_requirements(
                 raise ValueError("source_passthrough route is malformed")
             if wire in _MXFP8_DENSE_WIRE_IDS:
                 dense_mxfp8 = True
+            if wire in _FP8_SOURCE_W8A16_WIRE_IDS:
+                source_fp8_w8a16 = True
 
     per_expert = quant_config.get("per_expert_format_groups")
     if per_expert is not None:
@@ -852,6 +876,8 @@ def _gold_extension_requirements(
                         cb_formats.add(wire)
                     if wire in _MXFP8_DENSE_WIRE_IDS:
                         dense_mxfp8 = True
+                    if wire in _FP8_SOURCE_W8A16_WIRE_IDS:
+                        source_fp8_w8a16 = True
 
     required: set[str] = set()
     if cb_formats:
@@ -865,6 +891,8 @@ def _gold_extension_requirements(
             required.add("cb_v2")
     if dense_mxfp8:
         required.add("mxfp8_dense")
+    if source_fp8_w8a16:
+        required.update({"fp8_source_w8a16", "cb_bf16_grouped"})
     return frozenset(required)
 
 
@@ -1043,7 +1071,9 @@ def _verify_gridbook_distribution_identity(
         "gridbook/plugin.py",
         "gridbook/runtime_contract.json",
         "gridbook/source_passthrough.py",
+        "gridbook/fp8_source_w8a16.py",
         "gridbook/csrc/cb_gemv.cu",
+        "gridbook/csrc/fp8_source_w8a16.cu",
         "gridbook/csrc/mxfp8_dense_gemm.cu",
     }
     if (
@@ -1586,7 +1616,11 @@ def _verify_dsv4_gridbook_gold_contract(
         _gridbook_runtime_pin,
     )
 
-    runtime_pin = _gridbook_runtime_pin()
+    try:
+        runtime_pin = _gridbook_runtime_pin()
+    except Exception as exc:
+        problem(f"tracked Gridbook release pin unavailable: {exc}")
+        return problems
     expected_runtime_pin = {
         "commit": runtime_pin["commit"],
         "version": runtime_pin["version"],
@@ -1847,6 +1881,8 @@ def _verify_dsv4_gridbook_gold_contract(
                 "cb_main": _CB_MAIN_EXTENSION_RE,
                 "cb_v2": _CB_V2_EXTENSION_RE,
                 "mxfp8_dense": _MXFP8_DENSE_EXTENSION_RE,
+                "fp8_source_w8a16": _FP8_SOURCE_W8A16_EXTENSION_RE,
+                "cb_bf16_grouped": _CB_BF16_GROUPED_EXTENSION_RE,
             }
             missing_extension_families = sorted(
                 family
@@ -2045,17 +2081,13 @@ def _verify_gridbook_native_record(
                 f"{slot}: endpoint metric {key}={metrics.get(key)!r}, expected {value!r}"
             )
     try:
-        pin = json.loads((
-            Path(__file__).resolve().parent
-            / "gridbook_runtime"
-            / "gridbook_runtime_pin.json"
-        ).read_text(encoding="utf-8"))
+        pin = _released_gridbook_runtime_pin()
     except Exception as exc:
-        problems.append(f"{slot}: tracked Gridbook pin unreadable: {exc}")
+        problems.append(f"{slot}: tracked Gridbook release pin unavailable: {exc}")
     else:
-        if metrics.get("gridbook_runtime_commit") != pin.get("commit"):
+        if metrics.get("gridbook_runtime_commit") != pin.commit:
             problems.append(f"{slot}: Gridbook runtime commit is not the tracked pin")
-        if metrics.get("gridbook_runtime_version") != pin.get("version"):
+        if metrics.get("gridbook_runtime_version") != pin.version:
             problems.append(f"{slot}: Gridbook runtime version is not the tracked pin")
 
     contract = metrics.get("endpoint_contract")
@@ -2194,18 +2226,14 @@ def _verify_gridbook_performance_record(
         problem("PrismaQuant validator commit differs from record provenance")
 
     try:
-        pin = json.loads((
-            Path(__file__).resolve().parent
-            / "gridbook_runtime"
-            / "gridbook_runtime_pin.json"
-        ).read_text(encoding="utf-8"))
+        pin = _released_gridbook_runtime_pin()
     except Exception as exc:
-        problem(f"tracked Gridbook pin unreadable: {exc}")
+        problem(f"tracked Gridbook release pin unavailable: {exc}")
         pin = None
-    if isinstance(pin, Mapping):
-        if metrics.get("gridbook_runtime_commit") != pin.get("commit"):
+    if isinstance(pin, GridbookRuntimePin):
+        if metrics.get("gridbook_runtime_commit") != pin.commit:
             problem("Gridbook runtime commit is not the tracked pin")
-        if metrics.get("gridbook_runtime_version") != pin.get("version"):
+        if metrics.get("gridbook_runtime_version") != pin.version:
             problem("Gridbook runtime version is not the tracked pin")
 
     environment_contract = metrics.get("server_environment_contract")

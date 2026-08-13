@@ -1,9 +1,15 @@
 # Source passthrough in the nvfp4-cb container
 
-Status: producer and delegated-native MXFP4 route implemented. The released
-Gridbook 0.8.4 MXFP8 dense route is available but remains opt-in and unbacked;
-the exact DSV4 endpoint explicitly enables it (see
-[Route status](#route-status)).
+Status: producer and delegated-native routes implemented. PrismaQuant pins
+Gridbook 0.8.5 at exact commit
+`e992e5980c96333a48149f96392d6cff56ae9e3f`; its dedicated raw-resident
+block-FP8 W8A16 route passed the installed-wheel GB10/sm121 GPU gate (91
+passed, 0 skipped) and is backed for export without a route-pending override.
+Full-artifact eager/graph generation, native-parity performance, and served
+quality remain independent post-export shipcard gates (see
+[Route status](#route-status)). The exact installed-wheel command and raw
+evidence are recorded in
+`docs/results/gridbook_0p8p5_w8a16_gate_2026-08-12.md`.
 
 ## The rule
 
@@ -13,12 +19,13 @@ For every serving unit, the allocator's cheapest honest option is to keep the
 bytes the checkpoint already has. A source-passthrough rung is that option
 made explicit:
 
-* **Δloss is exactly 0, by construction.** Every cost in this pipeline is
-  measured against the *dequantized source*. Shipping the source bytes
-  unchanged is the identity transform on that reference. There is nothing to
-  measure and no measurement branch to take — the candidate is priced `0.0`
-  with provenance `cost_source="source_passthrough"`, and no cost run can ever
-  produce a more accurate number for it.
+* **Δloss is exactly 0 only when W and A are both identity.** Every cost in
+  this pipeline is measured against the *dequantized source*. Shipping source
+  weights unchanged is a zero weight perturbation; it becomes a complete
+  zero-cost terminal only when the serving method also leaves BF16 activation
+  inputs unchanged. Gridbook's dedicated block-FP8 W8A16 method satisfies
+  that contract. The direct group-32 MXFP8 method does not: it remains W8A8
+  and must carry an activation-aware measured price.
 * **Bytes are the exact source slice** — the weight tensor plus every
   scale/aux tensor of the unit — pinned against the checkpoint's own
   safetensors header spans before an allocation ships.
@@ -71,12 +78,16 @@ probe inventory: 33,325 Linears
   (none without a source kind)
 ```
 
+The approved 112.690 GB allocation selects the W8A16 source terminal for 120
+of those 301 eligible body Linears; eligibility and selection counts are not
+interchangeable.
+
 ## The formats
 
 | Format | Wire id | Source kind | bpw | Synth. | Route status on sm121 |
 |---|---|---|---|---|---|
 | `MXFP4_SOURCE` | `mxfp4_e2m1_ue8m0_g32` | `mxfp4` | 4.25 | yes | **backed — requires `--moe-backend marlin`** |
-| `FP8_BLOCK_UE8M0_SOURCE` | `fp8_e4m3_ue8m0_block128` | `fp8_ue8m0` | 8.00049 | yes | **available, opt-in/unbacked — Gridbook MXFP8 dense; exact DSV4 endpoint sets `GRIDBOOK_MXFP8_DENSE=1`** |
+| `FP8_BLOCK_UE8M0_SOURCE` | `fp8_e4m3_ue8m0_block128` | `fp8_ue8m0` | 8.00049 | yes | **backed — Gridbook 0.8.5 `Fp8SourceW8A16LinearMethod`; raw weight/scale planes resident, BF16 activations unchanged; installed-wheel GB10/sm121 GPU gate 91 passed / 0 skipped** |
 | `FP8_SOURCE` | — | `fp8` | 8.00195 | no | backed (other checkpoints) |
 | `BF16` | — | `bf16` | 16 | no | backed |
 
@@ -85,7 +96,7 @@ which is not a passthrough and has no source kind (it is legal on any):
 
 | Format | Wire id | bpw | Route status on sm121 |
 |---|---|---|---|
-| `MXFP8_UE8M0_G32` | `mxfp8_e4m3_e8m0_g32` | 8.25 | **unbacked — consumer lane exists but is opt-in (`GRIDBOOK_MXFP8_DENSE=1`), serve-parity bench pending** |
+| `MXFP8_UE8M0_G32` | `mxfp8_e4m3_e8m0_g32` | 8.25 | **unbacked W8A8 — distinct re-encode lane; consumer path remains opt-in (`GRIDBOOK_MXFP8_DENSE=1`) and activation-aware pricing is required** |
 
 ### The stock-route verdicts came out the opposite way round
 
@@ -101,31 +112,35 @@ checkpoint already serves this way, so a route must exist" is **false**:
 * **Every stock route for `FP8_BLOCK_UE8M0_SOURCE` was measured dead**:
   `deep_gemm` assert, cutlass `scaled_mm` rejects the block layout, triton
   `KeyError: float8_e8m0fnu`, flashinfer's gate is sm90-exact, marlin-linear
-  tops out at sm89. Gridbook subsequently supplied its own sm120 MXFP8 dense
-  route. In released 0.8.4 that route is correctness-audited and available,
-  but remains opt-in behind `GRIDBOOK_MXFP8_DENSE=1` and unbacked until its
-  served NATIVE-PARITY bench passes.
+  tops out at sm89. The old Gridbook MXFP8 dense workaround dynamically
+  quantizes activations and is therefore the separate W8A8 group-32 rung.
+  Gridbook 0.8.5 instead adds a source-specific method that accepts the
+  checkpoint's block-128 weight/scale planes verbatim and BF16 activations.
+  Its exact 0.8.5 installed-wheel CUDA oracle, dispatch, residency, JIT
+  identity, and capability tests close the route-existence gate. They do not
+  substitute for the full-artifact served NATIVE-PARITY gate.
 
-**The architectural consequence:** CB re-encoding remains the only
-default-on body route, but it is no longer the only route that can serve on
-this box. The exact DSV4 endpoint hard-enables `GRIDBOOK_MXFP8_DENSE=1`, so a
-body unit may use the opt-in Gridbook MXFP8 dense route. That makes the route
-available, not backed: route-pending acknowledgement and the served parity
-gate remain mandatory, and the body's CB rungs remain load-bearing rather than
-merely economical.
+**The architectural consequence:** `FP8_BLOCK_UE8M0_SOURCE` is an honest
+zero-cost W8A16 terminal and may participate in the CPU re-admission DP. With
+the exact 0.8.5 pin and backed route, the tracked pre-export handoff permits it
+without a blanket route-pending acknowledgement; it still refuses changed
+runtime/publication/model/bundle bytes or an existing output. Full-artifact
+served parity is evaluated after materialization. `GRIDBOOK_MXFP8_DENSE` stays
+unset, because enabling it would select the different direct W8A8 route and
+would invalidate the zero-cost interpretation.
 
-A blocked or pending rung still stays **on the menu** — if the DP wants it,
-that is the serving gap surfacing in the allocation rather than at deploy
-time — but the exporter refuses to ship a selection containing one without
-`--allow-route-pending-passthrough`.
+A blocked or pending rung can stay **on the research menu** so the DP surfaces
+the serving gap. The fixed DSv4 release handoff is stricter than the generic
+research override: it refuses any pending route, even if the generic exporter
+offers `--allow-route-pending-passthrough` for non-release experiments.
 
 ### Serving notes for the shipped artifact
 
     --moe-backend marlin        (MXFP4 experts; the default backend asserts)
     --kv-cache-dtype fp8        (the SM120 MLA backend asserts otherwise)
     VLLM_USE_DEEP_GEMM=0        (the hyper-connections path breaks otherwise)
-    GRIDBOOK_MXFP8_DENSE=1      (exact DSV4 endpoint; available opt-in route,
-                                 not a backed/default promotion)
+    GRIDBOOK_MXFP8_DENSE unset  (W8A16 source method; the override belongs only
+                                 to the distinct direct group-32 W8A8 lane)
 
 "Synthesized candidate" means the allocator *manufactures* the cost row rather
 than requiring a column in the cost table. No cost run will ever have a column
@@ -183,10 +198,10 @@ the K0.2 attestation scopes itself to CB layers and the artifact declares the
 source-passthrough groups explicitly, rather than leaving them looking like a
 missing attestation.
 
-Neither lane declares a `fused_mid_m` block. A passthrough rung has no Gridbook
-decode prologue to fuse, so an empty backed set is the honest state rather than
-a data gap; it resolves with
-`rungs_source = lane_declares_no_fused_mid_m_lane`.
+Neither source lane declares a CB `fused_mid_m` block. A passthrough rung has
+no CB decode prologue to fuse, so an empty CB-rung set is the honest state
+rather than a data gap. The block-FP8 W8A16 lane is nevertheless implemented
+by its own native source kernel family, `fp8_source_w8a16`, not by a CB rung.
 
 ### Route status policy
 
@@ -196,6 +211,7 @@ serving, possibly with a requirement), `pending` (unaudited), `blocked`
 rung on the menu but makes the export fail closed without
 `--allow-route-pending-passthrough`; the acknowledgement is recorded in
 `quant_config["provenance"]["route_pending_passthrough_acknowledged"]`.
+The generic acknowledgement is not accepted by the fixed DSv4 W8A16 handoff.
 
 ## The declaration: `source_passthrough`
 
@@ -267,5 +283,6 @@ these are not).
 | Contract table, source-kind census, candidate synthesis | `prismaquant/allocator_candidates.py` |
 | Byte pinning against the checkpoint | `prismaquant/footprint.py` |
 | Legality, lanes, route-pending | `prismaquant/serving_profile_specs/nvfp4_cb.json` |
-| Emit + declaration | `prismaquant/export_nvfp4_cb_streaming.py`, `prismaquant/cb_export_config.py` |
+| Emit + declaration | `prismaquant/export_nvfp4_cb_streaming.py`, `prismaquant/cb_export_config.py` (frozen byte-identical for this readmission) |
+| Fixed DSv4 re-admission and pre-export proof | `prismaquant/dsv4_aura_cb_reprice.py`, `prismaquant/dsv4_w8a16_export_handoff.py`, `tools/verify_dsv4_w8a16_export_handoff.py` |
 | K0.2 scoping | `prismaquant/nvfp4_activation_contract.py` |

@@ -5,6 +5,8 @@ import dataclasses
 import pytest
 
 import prismaquant.format_registry as fr
+import prismaquant.serving_profiles as serving_profiles_module
+from prismaquant.gridbook_runtime_pin import load_gridbook_runtime_pin
 from prismaquant.serving_profiles import (
     ExportLaneSpec,
     ServingProfile,
@@ -36,6 +38,21 @@ ALL_FORMAT_NAMES = tuple(sorted(set(fr.REGISTRY) | set(fr.FORMAT_ALIASES)))
 def test_serving_profile_names_are_config_discovered():
     assert "research" in serving_profile_names()
     assert VLLM_PROFILE in serving_profile_names()
+
+
+def test_gridbook_runtime_version_fails_closed_for_unreleased_pin(monkeypatch):
+    pin = dataclasses.replace(
+        load_gridbook_runtime_pin(),
+        version_is_release=False,
+    )
+    monkeypatch.setattr(serving_profiles_module, "_RUNTIME_VERSION", None)
+    monkeypatch.setattr(
+        serving_profiles_module,
+        "load_gridbook_runtime_pin",
+        lambda: pin,
+    )
+
+    assert serving_profiles_module.gridbook_runtime_version() == ""
 
 
 def test_vllm_profile_extends_runtime_shape_rules():

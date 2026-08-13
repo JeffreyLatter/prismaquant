@@ -34,7 +34,7 @@ def _bash(script: str, *args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def test_gridbook_pin_is_one_full_immutable_commit():
+def test_gridbook_pin_has_one_exact_released_runtime_identity():
     pins = [
         path
         for root in (REPO / "prismaquant", REPO / "scripts")
@@ -42,14 +42,22 @@ def test_gridbook_pin_is_one_full_immutable_commit():
     ]
     assert pins == [PIN]
     payload = json.loads(PIN.read_text(encoding="utf-8"))
-    assert set(payload) == {"schema", "repository", "commit", "version",
-                            "version_is_release"}
-    assert payload["schema"] == "prismaquant.gridbook_runtime_pin.v2"
+    assert set(payload) == {
+        "schema", "repository", "commit", "version", "version_is_release",
+        "runtime_contract_schema", "required_abi_features",
+    }
+    assert payload["schema"] == "prismaquant.gridbook_runtime_pin.v3"
     assert payload["repository"] == "https://github.com/RobTand/gridbook.git"
-    assert re.fullmatch(r"[0-9a-f]{40}", payload["commit"])
+    assert payload["commit"] == "e992e5980c96333a48149f96392d6cff56ae9e3f"
     assert re.fullmatch(r"[0-9]+(?:[.][0-9]+)+(?:[A-Za-z0-9.+-]*)?",
                         payload["version"])
     assert isinstance(payload["version_is_release"], bool)
+    assert payload["version_is_release"] is True
+    assert payload["runtime_contract_schema"] == "gridbook.runtime-contract.v3"
+    assert payload["required_abi_features"] == {
+        "routed_moe_per_role_codebook_lut": 1,
+        "source_fp8_block128_w8a16": 1,
+    }
 
 
 def _version_tuple(text: str) -> tuple[int, ...]:
@@ -96,11 +104,10 @@ def test_rung_tables_may_only_credit_a_runtime_that_was_actually_released():
             f"version the producer has never resolved")
 
     if not payload["version_is_release"]:
-        assert pin_version not in keyed, (
-            f"the pin names version {pin_version} but its commit "
-            f"{payload['commit']} is not that version's release "
-            f"(version_is_release is false), so no rung table may credit it -- "
-            f"either pin the release tag commit or drop the {pin_version} key")
+        # The prospective table may be reviewed before the tag exists, but
+        # every release/readmission/install boundary must reject the unresolved
+        # commit. This lets the exact commit be the only late-bound code field.
+        assert payload["commit"].startswith("PENDING_GRIDBOOK_")
 
 
 def test_no_gridbook_runtime_or_tests_are_vendored():
@@ -190,9 +197,9 @@ def test_helper_and_live_scripts_are_valid_bash():
 def _make_gridbook_checkout(root: Path) -> str:
     (root / "gridbook").mkdir(parents=True)
     (root / "gridbook" / "__init__.py").write_text(
-        '__version__ = "9.9.9"\n', encoding="utf-8")
+        '__version__ = "0.8.5"\n', encoding="utf-8")
     (root / "pyproject.toml").write_text(
-        '[project]\nname = "gridbook"\nversion = "9.9.9"\n',
+        '[project]\nname = "gridbook"\nversion = "0.8.5"\n',
         encoding="utf-8")
     subprocess.run(["git", "init", "-q"], cwd=root, check=True)
     subprocess.run(["git", "config", "user.email", "test@example.invalid"],
@@ -212,7 +219,7 @@ def test_checkout_override_requires_exact_clean_commit(tmp_path):
     commit = _make_gridbook_checkout(checkout)
     command = (
         f'. "{HELPER}"; '
-        'gridbook_runtime_verify_checkout "$1" "$2" 9.9.9')
+        'gridbook_runtime_verify_checkout "$1" "$2" 0.8.5')
     clean = _bash(command, str(checkout), commit)
     assert clean.returncode == 0, clean.stderr
     assert clean.stdout.strip() == str(checkout)
@@ -242,7 +249,7 @@ def test_checkout_override_requires_exact_clean_commit(tmp_path):
     safe_command = (
         f'. "{HELPER}"; '
         'PATH="$1:$PATH" GRIDBOOK_TEST_SAFE_DIRECTORY="$2" '
-        'gridbook_runtime_verify_checkout "$2" "$3" 9.9.9')
+        'gridbook_runtime_verify_checkout "$2" "$3" 0.8.5')
     safe = _bash(safe_command, str(wrapper_dir), str(checkout), commit)
     assert safe.returncode == 0, safe.stderr
     assert safe.stdout.strip() == str(checkout)
@@ -269,7 +276,7 @@ def test_standalone_checkout_rejects_linked_git_metadata(tmp_path):
     )
     command = (
         f'. "{HELPER}"; '
-        'gridbook_runtime_verify_standalone_checkout "$1" "$2" 9.9.9'
+        'gridbook_runtime_verify_standalone_checkout "$1" "$2" 0.8.5'
     )
     refused = _bash(command, str(linked), commit)
     assert refused.returncode == 2
@@ -290,11 +297,16 @@ def test_prepare_mounts_runtime_source_and_contract_read_only(tmp_path):
     copied_helper = assets / HELPER.name
     shutil.copy2(HELPER, copied_helper)
     (assets / PIN.name).write_text(json.dumps({
-        "schema": "prismaquant.gridbook_runtime_pin.v2",
-        "repository": "https://github.com/example/gridbook.git",
+        "schema": "prismaquant.gridbook_runtime_pin.v3",
+        "repository": "https://github.com/RobTand/gridbook.git",
         "commit": commit,
-        "version": "9.9.9",
-        "version_is_release": False,
+        "version": "0.8.5",
+        "version_is_release": True,
+        "runtime_contract_schema": "gridbook.runtime-contract.v3",
+        "required_abi_features": {
+            "routed_moe_per_role_codebook_lut": 1,
+            "source_fp8_block128_w8a16": 1,
+        },
     }), encoding="utf-8")
 
     prepared = _bash(
@@ -341,11 +353,16 @@ def test_prepare_materializes_linked_worktree_as_standalone_checkout(tmp_path):
     copied_helper = assets / HELPER.name
     shutil.copy2(HELPER, copied_helper)
     (assets / PIN.name).write_text(json.dumps({
-        "schema": "prismaquant.gridbook_runtime_pin.v2",
-        "repository": "https://github.com/example/gridbook.git",
+        "schema": "prismaquant.gridbook_runtime_pin.v3",
+        "repository": "https://github.com/RobTand/gridbook.git",
         "commit": commit,
-        "version": "9.9.9",
-        "version_is_release": False,
+        "version": "0.8.5",
+        "version_is_release": True,
+        "runtime_contract_schema": "gridbook.runtime-contract.v3",
+        "required_abi_features": {
+            "routed_moe_per_role_codebook_lut": 1,
+            "source_fp8_block128_w8a16": 1,
+        },
     }), encoding="utf-8")
     cache = tmp_path / "cache"
     prepared = _bash(
@@ -372,7 +389,12 @@ def test_prepare_materializes_linked_worktree_as_standalone_checkout(tmp_path):
 
 def test_container_install_reloads_and_enforces_the_tracked_pin():
     pin = json.loads(PIN.read_text(encoding="utf-8"))
-    wrong_commit = "f" * 40 if pin["commit"] != "f" * 40 else "e" * 40
+    resolved = _bash(f'bash "{HELPER}" print-pin')
+    assert resolved.returncode == 0, resolved.stderr
+    assert resolved.stdout.strip().split() == [
+        pin["repository"], pin["commit"], pin["version"]
+    ]
+    wrong_commit = "f" * 40
     commit = _bash(
         f'PQ_GRIDBOOK_RUNTIME_SOURCE=/not-used '
         f'PQ_GRIDBOOK_RUNTIME_COMMIT={wrong_commit} '
@@ -388,6 +410,28 @@ def test_container_install_reloads_and_enforces_the_tracked_pin():
         f'bash "{HELPER}" install-container')
     assert version.returncode == 2
     assert "does not equal tracked pin" in version.stderr
+
+
+def test_runtime_helper_rejects_resolved_but_unreleased_pin(tmp_path):
+    assets = tmp_path / "contract"
+    assets.mkdir()
+    copied_helper = assets / HELPER.name
+    shutil.copy2(HELPER, copied_helper)
+    (assets / PIN.name).write_text(json.dumps({
+        "schema": "prismaquant.gridbook_runtime_pin.v3",
+        "repository": "https://github.com/RobTand/gridbook.git",
+        "commit": "a" * 40,
+        "version": "0.8.5",
+        "version_is_release": False,
+        "runtime_contract_schema": "gridbook.runtime-contract.v3",
+        "required_abi_features": {
+            "routed_moe_per_role_codebook_lut": 1,
+            "source_fp8_block128_w8a16": 1,
+        },
+    }), encoding="utf-8")
+    refused = _bash(f'bash "{copied_helper}" print-pin')
+    assert refused.returncode == 2
+    assert "not an exact released commit" in refused.stderr
 
 
 def test_runtime_helper_has_no_wheel_or_runtime_kind_branch():
@@ -412,6 +456,8 @@ def test_container_install_preserves_exact_vcs_provenance():
     assert "module_file != installed_init" in text
     assert "entry.relative_to(package_root)" in text
     assert "imported_version != expected" in text
+    assert 'importlib.import_module("gridbook.runtime_contract")' in text
+    assert 'source_fp8_block128_w8a16' in text
 
 
 def test_runtime_helper_owns_safe_import_path_and_neutral_workdir():

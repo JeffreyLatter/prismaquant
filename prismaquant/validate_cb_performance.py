@@ -30,7 +30,12 @@ from .gridbook_environment import (
     CANONICAL_GOLD_ENVIRONMENT,
     GRIDBOOK_ENVIRONMENT_SCHEMA,
 )
-from .gridbook_runtime_pin import load_gridbook_runtime_pin
+from .gridbook_runtime_pin import (
+    GridbookRuntimePin,
+    GridbookRuntimePinError,
+    load_gridbook_runtime_pin,
+    require_exact_gridbook_runtime_release,
+)
 from .native_baseline_feasibility import (
     SCHEMA as NATIVE_BASELINE_FEASIBILITY_SCHEMA,
     certificate_sha256 as native_feasibility_certificate_sha256,
@@ -67,7 +72,8 @@ MAX_PARITY_TOLERANCE = 0.05
 
 _SHA256 = frozenset("0123456789abcdef")
 _GRIDBOOK_NATIVE_EXTENSION_RE = re.compile(
-    r"^(?:prismaquant_cb(?:_v2)?_ext|pq_cb_|pq_mxfp8_dense_)"
+    r"^(?:prismaquant_cb(?:_v2)?_ext|pq_cb_|pq_mxfp8_dense_|"
+    r"pq_fp8_source_w8a16_)"
 )
 _CB_FORMAT_RE = re.compile(r"^(?:NVFP4_CB|FP8_CB)_K[0-9]+$")
 _GRIDBOOK_BACKEND_RE = re.compile(r"^gridbook-[a-z0-9][a-z0-9._-]*$")
@@ -122,7 +128,7 @@ _PHASE_METRICS = {
 }
 # Performance intentionally preloads every Gridbook extension family so the
 # candidate and displaced-container arms have identical residency.  Every
-# other Gridbook 0.8.4 input is the canonical gold value.  The full map keeps
+# other Gridbook input is the canonical gold value. The full map keeps
 # the absent variables reviewable; the live process/report representation
 # contains only the set-valued projection, with absence proven by the complete
 # serve-fingerprint allowlist.
@@ -140,6 +146,19 @@ _REQUIRED_SERVER_ENVIRONMENT["PYTHONSAFEPATH"] = "1"
 
 class CBPerformanceValidationError(RuntimeError):
     """The paired performance evidence is incomplete or failed parity."""
+
+
+def _exact_gridbook_runtime_pin() -> GridbookRuntimePin:
+    """Load the one reviewed Gridbook release accepted by this validator."""
+
+    pin = load_gridbook_runtime_pin()
+    try:
+        require_exact_gridbook_runtime_release(pin)
+    except GridbookRuntimePinError as exc:
+        raise CBPerformanceValidationError(
+            f"performance gate requires the exact Gridbook release: {exc}"
+        ) from exc
+    return pin
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -395,7 +414,7 @@ def _route_contract(
         "FP8_BLOCK_UE8M0_SOURCE": {
             "serialized_layout": "source-passthrough",
             "scale_coding": "ue8m0-block128",
-            "quant_contract": "W8A8",
+            "quant_contract": "W8A16",
             "backend_policy": "gridbook",
         },
         "MXFP8_UE8M0_G32": {
@@ -2533,7 +2552,7 @@ def validate_cb_performance(
     if manifest.get("schema") != MANIFEST_SCHEMA:
         raise CBPerformanceValidationError(f"unsupported comparison manifest schema {manifest.get('schema')!r}")
     base = manifest_file.resolve().parent
-    pin = load_gridbook_runtime_pin()
+    pin = _exact_gridbook_runtime_pin()
     producer_git = git_provenance()
     manifest_runtime = manifest.get("prismaquant_runtime")
     if (

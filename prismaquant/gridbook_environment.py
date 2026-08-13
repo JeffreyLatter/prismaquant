@@ -1,4 +1,4 @@
-"""Pinned Gridbook-0.8.4 serving-environment contract.
+"""Pinned Gridbook-0.8.5 serving-environment contract.
 
 Gridbook resolves some dispatch choices at import/model-load time and reads a
 few CUDA schedule selectors at launch time.  A gold measurement therefore
@@ -21,12 +21,20 @@ from pathlib import Path
 import re
 from types import MappingProxyType
 
-from .gridbook_runtime_pin import load_gridbook_runtime_pin
+from .gridbook_runtime_pin import (
+    GridbookRuntimePinError,
+    load_gridbook_runtime_pin,
+    require_exact_gridbook_runtime_release,
+    supports_source_fp8_block128_w8a16,
+)
 
 
 GRIDBOOK_ENVIRONMENT_SCHEMA = "prismaquant.gridbook_environment/1"
-PINNED_GRIDBOOK_VERSION = "0.8.4"
-PINNED_GRIDBOOK_COMMIT = "56259f6e5d8646da9f9179e1dde7a1708849722c"
+PINNED_GRIDBOOK_VERSION = "0.8.5"
+# A projection of the single packaged pin, not a second independently edited
+# commit constant. Future unresolved pins still surface their fail-closed
+# placeholder here; the current released pin is a full immutable commit.
+PINNED_GRIDBOOK_COMMIT = load_gridbook_runtime_pin().commit
 
 CATEGORY_EXECUTION = "execution"
 CATEGORY_CORRECTNESS_BYPASS = "correctness_bypass"
@@ -41,7 +49,7 @@ class GridbookEnvironmentError(ValueError):
 
 @dataclass(frozen=True)
 class GridbookEnvironmentVariable:
-    """One Gridbook-0.8.4 environment input and its gold-lane disposition."""
+    """One Gridbook-0.8.5 environment input and its gold-lane disposition."""
 
     name: str
     category: str
@@ -66,14 +74,15 @@ def _var(
     )
 
 
-# The values and domains below are transcribed from released Gridbook 0.8.4 at
-# PINNED_GRIDBOOK_COMMIT.  ``None`` is a contract value: the variable must be
+# The values and domains below carry forward the audited Gridbook 0.8.4 set
+# into the released 0.8.5 contract. ``None`` is a contract value: the
+# variable must be
 # absent.  This matters for FUSED_FP4/FUSED_FP4_MOE ("0" is invalid), for the
 # expert-chunk override ("0" is invalid), and for CUDA switches whose source
 # recognizes only a non-default sentinel rather than a canonical default word.
 GRIDBOOK_ENVIRONMENT_REGISTRY = (
     _var(
-        "GRIDBOOK_MXFP8_DENSE", CATEGORY_EXECUTION, "1", "disabled",
+        "GRIDBOOK_MXFP8_DENSE", CATEGORY_EXECUTION, None, "disabled",
         "strict boolean: unset, 0, or 1",
     ),
     _var(
@@ -231,18 +240,23 @@ CANONICAL_GOLD_CLEARED_ENVIRONMENT = tuple(
 )
 
 
-def require_pinned_gridbook_084() -> None:
+def require_pinned_gridbook_runtime() -> None:
     """Fail if PrismaQuant no longer pins the contract this registry describes."""
 
     pin = load_gridbook_runtime_pin()
+    try:
+        require_exact_gridbook_runtime_release(pin)
+    except GridbookRuntimePinError as exc:
+        raise GridbookEnvironmentError(
+            f"Gridbook environment registry requires the exact release: {exc}"
+        ) from exc
     if (
         pin.version != PINNED_GRIDBOOK_VERSION
-        or pin.commit != PINNED_GRIDBOOK_COMMIT
-        or pin.version_is_release is not True
+        or not supports_source_fp8_block128_w8a16(pin)
     ):
         raise GridbookEnvironmentError(
-            "Gridbook environment registry describes released "
-            f"{PINNED_GRIDBOOK_VERSION}@{PINNED_GRIDBOOK_COMMIT}, but the "
+            "Gridbook environment registry describes "
+            f"{PINNED_GRIDBOOK_VERSION} with source-FP8 W8A16, but the "
             f"packaged pin is version={pin.version!r}, commit={pin.commit!r}, "
             f"version_is_release={pin.version_is_release!r}"
         )
@@ -265,7 +279,7 @@ def apply_canonical_gold_environment(
     """Clear then install the exact gold state; call before importing Gridbook."""
 
     if require_pin:
-        require_pinned_gridbook_084()
+        require_pinned_gridbook_runtime()
     target = os.environ if environ is None else environ
     for name in GRIDBOOK_ENVIRONMENT_ALLOWLIST:
         target.pop(name, None)
@@ -282,7 +296,7 @@ def attest_canonical_gold_environment(
     """Return a receipt for the exact gold state or fail on every difference."""
 
     if require_pin:
-        require_pinned_gridbook_084()
+        require_pinned_gridbook_runtime()
     observed = snapshot_gridbook_environment(environ)
     mismatches = []
     for name in GRIDBOOK_ENVIRONMENT_ALLOWLIST:
@@ -310,7 +324,8 @@ def attest_canonical_gold_environment(
 # commonly passes a module constant to ``latched_bool`` and C++ uses getenv;
 # scanning every Gridbook/PrismaQuant/vLLM-looking identifier catches a newly
 # introduced flag even when the read is indirect.  The following identifiers
-# are present in 0.8.4 source but are explicitly not runtime environment inputs.
+# are present in the audited source but are explicitly not runtime environment
+# inputs.
 GRIDBOOK_SOURCE_NON_ENVIRONMENT_IDENTIFIERS = MappingProxyType({
     "PRISMAQUANT_ARTIFACT_INVENTORY_SCHEMA": "Python schema constant",
     "PRISMAQUANT_OPS_CUDAGRAPH_UNSAFE": "retired no-op mentioned in a comment",
@@ -319,7 +334,7 @@ GRIDBOOK_SOURCE_NON_ENVIRONMENT_IDENTIFIERS = MappingProxyType({
     "VLLM_TEST_FORCE_FP8_MARLIN": "external vLLM test flag mentioned in prose",
 })
 
-_GRIDBOOK_084_EXPECTED_SOURCE_IDENTIFIERS = frozenset({
+_GRIDBOOK_EXPECTED_SOURCE_IDENTIFIERS = frozenset({
     "CUDACXX",
     "CXX",
     "GRIDBOOK_MXFP8_DENSE",
@@ -424,7 +439,7 @@ def scan_gridbook_source_environment(
     )
     known = set(registered) | set(classified)
     unknown = tuple(name for name in identifiers if name not in known)
-    missing = tuple(sorted(_GRIDBOOK_084_EXPECTED_SOURCE_IDENTIFIERS - set(identifiers)))
+    missing = tuple(sorted(_GRIDBOOK_EXPECTED_SOURCE_IDENTIFIERS - set(identifiers)))
     location_rows = tuple(
         (name, tuple(sorted(paths))) for name, paths in sorted(locations.items())
     )
@@ -439,7 +454,7 @@ def scan_gridbook_source_environment(
     )
 
 
-def require_gridbook_084_source_compatible(
+def require_gridbook_source_compatible(
     source_root: str | os.PathLike[str],
 ) -> GridbookSourceEnvironmentScan:
     """Fail closed when released source adds, removes, or renames an identifier."""
@@ -447,7 +462,7 @@ def require_gridbook_084_source_compatible(
     report = scan_gridbook_source_environment(source_root)
     if report.unknown_identifiers or report.missing_expected_identifiers:
         raise GridbookEnvironmentError(
-            "Gridbook-0.8.4 environment source drift: unknown="
+            "Gridbook environment source drift: unknown="
             f"{list(report.unknown_identifiers)}, missing="
             f"{list(report.missing_expected_identifiers)}"
         )
@@ -474,8 +489,8 @@ __all__ = [
     "PINNED_GRIDBOOK_VERSION",
     "apply_canonical_gold_environment",
     "attest_canonical_gold_environment",
-    "require_gridbook_084_source_compatible",
-    "require_pinned_gridbook_084",
+    "require_gridbook_source_compatible",
+    "require_pinned_gridbook_runtime",
     "scan_gridbook_source_environment",
     "snapshot_gridbook_environment",
 ]

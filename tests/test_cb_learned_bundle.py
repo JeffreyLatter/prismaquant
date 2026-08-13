@@ -274,12 +274,26 @@ def test_cached_loader_invalidates_on_same_path_file_identity_change(mixed_bundl
 
 
 def _gridbook_pin(version, *, commit="a" * 40, version_is_release=False):
+    features = dict(runtime_pin.GRIDBOOK_REQUIRED_ABI_FEATURES)
+    if tuple(map(int, version.split("."))) < (0, 8, 4):
+        features["routed_moe_per_role_codebook_lut"] = 0
+        return runtime_pin.GridbookRuntimePin(
+            schema="historical-test-pin",
+            repository=runtime_pin.GRIDBOOK_RUNTIME_REPOSITORY,
+            commit=commit,
+            version=version,
+            version_is_release=version_is_release,
+            runtime_contract_schema="historical-test-contract",
+            required_abi_features=features,
+        )
     return runtime_pin.parse_gridbook_runtime_pin({
         "schema": runtime_pin.GRIDBOOK_RUNTIME_PIN_SCHEMA,
         "repository": "https://github.com/RobTand/gridbook.git",
         "commit": commit,
         "version": version,
         "version_is_release": version_is_release,
+        "runtime_contract_schema": runtime_pin.GRIDBOOK_RUNTIME_CONTRACT_SCHEMA,
+        "required_abi_features": features,
     })
 
 
