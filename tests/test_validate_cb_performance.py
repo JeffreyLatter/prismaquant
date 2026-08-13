@@ -81,17 +81,13 @@ _ALLOWED_DIFFERENCES = [
 
 @pytest.fixture(autouse=True)
 def _released_gridbook_pin(monkeypatch):
-    """Exercise parity mechanics independently of the staged release gate."""
+    """Exercise parity mechanics against the exact tracked release pin."""
 
     import prismaquant.native_baseline_feasibility as native_feasibility
     import prismaquant.shipcard as shipcard_module
     import prismaquant.validate_cb_endpoint as endpoint_validator
 
-    released = replace(
-        load_gridbook_runtime_pin(),
-        commit="a" * 40,
-        version_is_release=True,
-    )
+    released = load_gridbook_runtime_pin()
     monkeypatch.setattr(
         sys.modules[__name__], "load_gridbook_runtime_pin", lambda: released
     )
@@ -125,6 +121,26 @@ def _write_json(path: Path, payload: object) -> str:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_performance_gate_rejects_alternate_resolved_gridbook_commit(
+    monkeypatch,
+):
+    alternate = replace(
+        load_gridbook_runtime_pin(),
+        commit="a" * 40,
+    )
+    monkeypatch.setattr(
+        performance_validator,
+        "load_gridbook_runtime_pin",
+        lambda: alternate,
+    )
+
+    with pytest.raises(
+        CBPerformanceValidationError,
+        match="exact Gridbook release",
+    ):
+        performance_validator._exact_gridbook_runtime_pin()
 
 
 def _inventory_sha(inventory: dict) -> str:
@@ -1652,23 +1668,30 @@ def _one_certified_route() -> tuple[dict, ...]:
 
 
 @pytest.mark.parametrize(
-    "fmt,wire,backend",
+    "fmt,wire,backend,quant_contract",
     (
-        ("MXFP4_SOURCE", "mxfp4_e2m1_ue8m0_g32", "vllm-marlin"),
+        (
+            "MXFP4_SOURCE",
+            "mxfp4_e2m1_ue8m0_g32",
+            "vllm-marlin",
+            "W4A16",
+        ),
         (
             "FP8_BLOCK_UE8M0_SOURCE",
             "fp8_e4m3_ue8m0_block128",
             "gridbook",
+            "W8A16",
         ),
         (
             "MXFP8_UE8M0_G32",
             "mxfp8_e4m3_e8m0_g32",
             "gridbook",
+            "W8A8",
         ),
     ),
 )
 def test_artifact_derived_native_routes_require_the_sanctioned_backend(
-    fmt, wire, backend,
+    fmt, wire, backend, quant_contract,
 ):
     expected = performance_validator._derive_expected_execution_assignments(
         _artifact_route_config(fmt, wire=wire),
@@ -1676,6 +1699,7 @@ def test_artifact_derived_native_routes_require_the_sanctioned_backend(
         label="test artifact",
     )
     assert expected[0]["backend_policy"] == backend
+    assert expected[0]["quant_contract"] == quant_contract
     assignment = {
         key: value
         for key, value in expected[0].items()

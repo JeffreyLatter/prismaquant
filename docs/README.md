@@ -82,6 +82,7 @@ before citing anything.
 
 | Path | What it is | Status / superseded by |
 |---|---|---|
+| `results/gridbook_0p8p5_w8a16_gate_2026-08-12.md` | Exact Gridbook 0.8.5 installed-wheel GB10/sm121 gate: immutable commit, wheel, image, command, 91-pass/0-skip JUnit, and raw evidence paths for block-FP8 W8A16. | CURRENT route-existence, residency, and operator evidence; not full-artifact serving, performance, KL, or PPL evidence |
 | `results/qwen3_30b_a3b_profile_census_2026-08-03.md` | Contract/vLLM-qualified Qwen3-30B-A3B selection, complete safetensors census, unified `qwen3` producer bridge, and verified probe capture points. | CURRENT profile-onboarding evidence; not a quantization or serving result |
 | `results/aura_4b_dense_frontier_2026-06-05.md` | Dense 4.5→8.0 bpp AURA RD sweep on Qwen3-4B, fp32 vs bf16; frontier clean and log-linear, kneedle unstable (fp32 5.00 in 454/1000 bootstraps). | HISTORICAL — its conclusion won: selection moved off kneedle to a byte-budget + saturation-B* rule |
 | `results/fp8_gptq_mx_scale_27b_results_2026-05-21.md` | 27B tail A/B, FP8_E4M3 GPTQ vs MXFP8 with E8M0 joint-scale search: FP8 won all 149 tail Linears and all 90 fused units; the allocator then selected zero MXFP8. Explicit "do not ship". | HISTORICAL — the primary 27B evidence for de-menuing MXFP8; the joint-scale search it used has since been removed (self-bannered) |

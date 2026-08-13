@@ -51,9 +51,8 @@ from .gridbook_environment import (
 )
 from .gridbook_runtime_pin import (
     GridbookRuntimePin,
-    GridbookRuntimePinError,
     load_gridbook_runtime_pin,
-    require_resolved_gridbook_runtime_pin,
+    require_exact_gridbook_runtime_release,
 )
 
 SCHEMA = "prismaquant.shipcard/1"
@@ -88,11 +87,7 @@ def _released_gridbook_runtime_pin() -> GridbookRuntimePin:
     """Return the sole tracked pin only when it is an immutable release."""
 
     pin = load_gridbook_runtime_pin()
-    require_resolved_gridbook_runtime_pin(pin)
-    if not pin.version_is_release:
-        raise GridbookRuntimePinError(
-            "tracked Gridbook runtime pin is not marked as a release"
-        )
+    require_exact_gridbook_runtime_release(pin)
     return pin
 
 

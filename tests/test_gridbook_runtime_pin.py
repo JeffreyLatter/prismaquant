@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -98,16 +99,39 @@ def test_strict_parser_rejects_runtime_contract_drift(field, value, match):
         pinmod.parse_gridbook_runtime_pin(payload)
 
 
-def test_unresolved_release_commit_is_conspicuous_and_fail_closed():
+def test_tracked_release_commit_is_resolved_and_exact():
     pinmod.load_gridbook_runtime_pin.cache_clear()
     pin = pinmod.load_gridbook_runtime_pin()
-    assert pin.commit == pinmod.GRIDBOOK_RUNTIME_COMMIT_PENDING
-    assert pin.version_is_release is False
-    with pytest.raises(pinmod.GridbookRuntimePinError, match="unresolved"):
-        pinmod.require_resolved_gridbook_runtime_pin(pin)
+    assert pin.commit == pinmod.GRIDBOOK_RUNTIME_RELEASE_COMMIT
+    assert pin.version_is_release is True
+    pinmod.require_resolved_gridbook_runtime_pin(pin)
+    pinmod.require_exact_gridbook_runtime_release(pin)
 
 
-def test_shipcard_gates_refuse_the_staged_release_pin():
+def test_exact_release_gate_rejects_an_alternate_resolved_commit():
+    pin = pinmod.parse_gridbook_runtime_pin(_payload())
+    assert pin.commit_is_resolved
+    with pytest.raises(pinmod.GridbookRuntimePinError, match="exact released"):
+        pinmod.require_exact_gridbook_runtime_release(pin)
+
+
+def test_shipcard_gate_accepts_the_exact_release_pin():
     pinmod.load_gridbook_runtime_pin.cache_clear()
-    with pytest.raises(pinmod.GridbookRuntimePinError, match="unresolved"):
-        _released_gridbook_runtime_pin()
+    assert _released_gridbook_runtime_pin() == pinmod.load_gridbook_runtime_pin()
+
+
+def test_shipcard_gate_rejects_an_alternate_resolved_commit(monkeypatch):
+    import prismaquant.shipcard as shipcard_module
+
+    alternate = replace(
+        pinmod.load_gridbook_runtime_pin(),
+        commit="a" * 40,
+    )
+    monkeypatch.setattr(
+        shipcard_module,
+        "load_gridbook_runtime_pin",
+        lambda: alternate,
+    )
+
+    with pytest.raises(pinmod.GridbookRuntimePinError, match="exact released"):
+        shipcard_module._released_gridbook_runtime_pin()

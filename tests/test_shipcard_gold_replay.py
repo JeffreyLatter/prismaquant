@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import copy
-from dataclasses import replace
 import hashlib
 import json
 import math
@@ -69,15 +68,11 @@ _GOLD_ENV = {
 
 @pytest.fixture(autouse=True)
 def _resolved_release_pin_for_gold_replay(monkeypatch):
-    """Unit-test gold replay mechanics independently of the staged pin gate."""
+    """Unit-test gold replay mechanics against the exact released pin."""
 
     import prismaquant.validate_cb_endpoint as endpoint
 
-    released = replace(
-        load_gridbook_runtime_pin(),
-        commit="a" * 40,
-        version_is_release=True,
-    )
+    released = load_gridbook_runtime_pin()
     monkeypatch.setattr(
         sys.modules[__name__], "load_gridbook_runtime_pin", lambda: released
     )

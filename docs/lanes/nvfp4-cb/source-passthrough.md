@@ -1,11 +1,15 @@
 # Source passthrough in the nvfp4-cb container
 
-Status: producer and delegated-native MXFP4 route implemented. Gridbook 0.8.5
-adds a dedicated raw-resident block-FP8 W8A16 method, but the PrismaQuant pin
-still contains the conspicuous unresolved release-commit placeholder and this
-route remains `pending` until exact-release and served native-parity evidence
-close. Readmission may prove the allocation on CPU; export and serving remain
-fail-closed meanwhile (see [Route status](#route-status)).
+Status: producer and delegated-native routes implemented. PrismaQuant pins
+Gridbook 0.8.5 at exact commit
+`e992e5980c96333a48149f96392d6cff56ae9e3f`; its dedicated raw-resident
+block-FP8 W8A16 route passed the installed-wheel GB10/sm121 GPU gate (91
+passed, 0 skipped) and is backed for export without a route-pending override.
+Full-artifact eager/graph generation, native-parity performance, and served
+quality remain independent post-export shipcard gates (see
+[Route status](#route-status)). The exact installed-wheel command and raw
+evidence are recorded in
+`docs/results/gridbook_0p8p5_w8a16_gate_2026-08-12.md`.
 
 ## The rule
 
@@ -83,7 +87,7 @@ interchangeable.
 | Format | Wire id | Source kind | bpw | Synth. | Route status on sm121 |
 |---|---|---|---|---|---|
 | `MXFP4_SOURCE` | `mxfp4_e2m1_ue8m0_g32` | `mxfp4` | 4.25 | yes | **backed — requires `--moe-backend marlin`** |
-| `FP8_BLOCK_UE8M0_SOURCE` | `fp8_e4m3_ue8m0_block128` | `fp8_ue8m0` | 8.00049 | yes | **pending — dedicated Gridbook `Fp8SourceW8A16LinearMethod`; raw weight/scale planes resident, BF16 activations unchanged; exact 0.8.5 commit + served parity still required** |
+| `FP8_BLOCK_UE8M0_SOURCE` | `fp8_e4m3_ue8m0_block128` | `fp8_ue8m0` | 8.00049 | yes | **backed — Gridbook 0.8.5 `Fp8SourceW8A16LinearMethod`; raw weight/scale planes resident, BF16 activations unchanged; installed-wheel GB10/sm121 GPU gate 91 passed / 0 skipped** |
 | `FP8_SOURCE` | — | `fp8` | 8.00195 | no | backed (other checkpoints) |
 | `BF16` | — | `bf16` | 16 | no | backed |
 
@@ -112,15 +116,16 @@ checkpoint already serves this way, so a route must exist" is **false**:
   quantizes activations and is therefore the separate W8A8 group-32 rung.
   Gridbook 0.8.5 instead adds a source-specific method that accepts the
   checkpoint's block-128 weight/scale planes verbatim and BF16 activations.
-  Its CUDA oracle/dispatch/residency tests are necessary producer evidence;
-  they do not substitute for the unresolved immutable release pin or served
-  NATIVE-PARITY gate.
+  Its exact 0.8.5 installed-wheel CUDA oracle, dispatch, residency, JIT
+  identity, and capability tests close the route-existence gate. They do not
+  substitute for the full-artifact served NATIVE-PARITY gate.
 
 **The architectural consequence:** `FP8_BLOCK_UE8M0_SOURCE` is an honest
-zero-cost W8A16 terminal and may participate in the CPU re-admission DP. It is
-not thereby shippable. The tracked pre-export handoff refuses while the pin is
-unresolved or the route remains `pending`; no blanket route-pending
-acknowledgement is part of the release driver. `GRIDBOOK_MXFP8_DENSE` stays
+zero-cost W8A16 terminal and may participate in the CPU re-admission DP. With
+the exact 0.8.5 pin and backed route, the tracked pre-export handoff permits it
+without a blanket route-pending acknowledgement; it still refuses changed
+runtime/publication/model/bundle bytes or an existing output. Full-artifact
+served parity is evaluated after materialization. `GRIDBOOK_MXFP8_DENSE` stays
 unset, because enabling it would select the different direct W8A8 route and
 would invalidate the zero-cost interpretation.
 

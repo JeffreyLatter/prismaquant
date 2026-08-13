@@ -1,7 +1,7 @@
 # PrismaQuant Architecture
 
 As of: 2026-08-12 · branch `ship/dsv4flash-fp8-w8a16` · verified against
-implementation baseline commit `58fb335` plus the W8A16 release integration
+implementation baseline commit `d4a9738` plus the Gridbook pin promotion
 described by the named schemas and symbols below. The final integration commit is
 deliberately not predicted in this provenance stamp. This revision includes the Spark
 BF16 AURA-anchor residency and streamed-reverse lifetime corrections, the activation-safe
@@ -18,21 +18,25 @@ WikiText gold-input contract, plus the platform-agnostic anchored-cost
 mechanism, CB mapping plugin, DSv4 one-shot acceptance-driver contract, the
 anchored-AURA allocator admission branch (P0, closed 2026-08-11), and the
 one-purpose CPU-only W8A16 readmission plus tracked pre-export handoff gate.
-The external runtime record is staged for Gridbook **0.8.5** with
+The external runtime record pins Gridbook **0.8.5** at exact commit
+`e992e5980c96333a48149f96392d6cff56ae9e3f`, with
 `gridbook.runtime-contract.v3` and the exact required feature map
 `routed_moe_per_role_codebook_lut=1` plus
-`source_fp8_block128_w8a16=1`. Its `commit` is deliberately the non-hex
-`PENDING_GRIDBOOK_V0_8_5_RELEASE_COMMIT` placeholder and
-`version_is_release=false`; install, readmission, export, serving, endpoint,
-performance, and shipcard release boundaries all fail closed until the exact
-release commit replaces that sole field. Gridbook 0.8.4 remains the released
-minimum that introduced the explicit routed per-role LUT feature; capability
+`source_fp8_block128_w8a16=1`, and `version_is_release=true`. The exact
+installed wheel passed its GB10/sm121 GPU gate (91 passed, 0 skipped), including
+raw-source W8A16 residency, native decode/prefill dispatch, and JIT extension
+identity/capability. That closes the route-existence and export gates; exact
+full-artifact eager/graph generation, performance parity, and served quality
+remain post-export shipcard gates. The measured command, immutable inputs, and
+raw evidence paths are recorded in
+`docs/results/gridbook_0p8p5_w8a16_gate_2026-08-12.md`. Gridbook 0.8.4 introduced the explicit
+routed per-role LUT feature; capability
 decisions now read the closed feature map rather than infer from a numeric
 version. The on-law K28/K32/K36/K40/K44/K48 FP8-CB set is unchanged. This
 branch also preserves the dated 2026-08-01 DeepSeek-V4-Flash-0731
 92 GB study record (§9.2) as historical candidate-era evidence. It is not promotion
 evidence for the current runtime: the release path is the separately gated
-112.690 GB AURA artifact, and no export is authorized by this unresolved pin.
+112.690 GB AURA artifact authorized only by the exact W8A16 handoff.
 
 This revision retains the four 2026-07-30 architecture re-vet waves documented in
 `docs/audits/architecture_re-vet_2026-07-30.md` and closes the runtime-ownership debt: the
@@ -41,8 +45,8 @@ and required CI checks the independent producer and consumer at one immutable co
 0.8.5 boundary carries forward the closed 29-variable measurement environment with
 `GRIDBOOK_MXFP8_DENSE` now affirmatively absent, exact installed-distribution provenance,
 artifact-derived native-extension requirements, and a dedicated raw-source W8A16 kernel
-family. These harden evidence and admission; they do not by themselves promote an unmeasured
-serving route. The four behavioural facts a
+family. These harden evidence and admission and back the source W8A16 route for export; they do
+not by themselves promote an unmeasured full artifact. The four behavioural facts a
 returning reader must know are that **`COST_MODE` defaults to `aura`** (§3.3), Gridbook serving
 is native CUDA/CUTLASS-only and fails closed (§9.2), and fused native-NVFP4 remains default-off
 after its teacher-backed quality gate (§9.2); direct group-32 MXFP8 remains W8A8 while the
@@ -1107,11 +1111,15 @@ completed producer/receipt/journal, permits only the audited 0.8.4→0.8.5 forma
 delta, reconstructs all measured rows from unit receipts, and re-admits only the historical
 block-source terminal zeros. It reruns the DP and requires full qname→format equality plus the
 canonical assignment digest and exact selection metrics before atomically publishing a new
-AURA-stamped directory. Generic replay remains same-snapshot and activation-safe. Separately,
-the source route remains `pending` until the exact released Gridbook pin and served
-native-parity evidence close; the tracked pre-export handoff refuses the unresolved pin,
-pending routes, changed source/bundle/publication bytes, changed frozen exporter code, or an
-existing output. No GPU measurement, replay, or export is implied by readmission
+AURA-stamped directory. The allocator subprocess re-enters through the same verified source
+bootstrap with `PYTHONPATH` removed, so it cannot fall through to the image's older installed
+PrismaQuant; ordinary installed-wheel runs retain their normal module entrypoint. Generic replay
+remains same-snapshot and activation-safe. The exact
+Gridbook 0.8.5 pin plus its 91-test installed-wheel GPU gate back the source W8A16 route for
+export without a route-pending acknowledgement. The tracked pre-export handoff still refuses
+an unresolved/unreleased pin, any pending route, changed source/bundle/publication bytes,
+changed frozen exporter code, or an existing output. Readmission does not itself imply GPU
+measurement or export; full-artifact native parity remains a post-export shipcard gate
 (`dsv4_aura_cb_reprice`, `dsv4_w8a16_export_handoff`).
 
 **Residual CB-family activation blindness (reported; terminal shortcut gated).** Every rung of `nvfp4_cb` and
@@ -2782,7 +2790,7 @@ artifacts exported before the rename.
 | gemma4 | `gemma4.py` | 140 | ✅ | `vllm_packed_moe` | CT | ⚠ none | none |
 | lfm2_moe (LFM2.5) | `lfm2_moe.py` | 150 | ✅ | `vllm_packed_moe` | CT | ⚠ none | `has_mtp → False` |
 | minimax_m2 | `minimax_m2.py` | 160 | ✅ **added R22** — all 8 overrides declared | `vllm_packed_moe` **(added R22)** | CT | ⚠ none | `has_mtp → False` |
-| deepseek_v4 | `deepseek_v4.py` | 170 | ✅ | `vllm_packed_moe` **(added R22)** | CT, **nvfp4_cb** (CT) | declared by the staged Gridbook 0.8.5 v3 contract; streaming CB export, W8A16 source passthrough, top-level loader, and routed per-role LUT ABI are wired, but release remains fail-closed on the unresolved exact commit and served parity | `has_mtp → False`; three source-quantized DSpark stages are declared by the header-validated physical→construction overlay (§6.3), with no tensor rewrite |
+| deepseek_v4 | `deepseek_v4.py` | 170 | ✅ | `vllm_packed_moe` **(added R22)** | CT, **nvfp4_cb** (CT) | declared by exact Gridbook 0.8.5 v3 commit `e992e59`; streaming CB export, W8A16 source passthrough, top-level loader, and routed per-role LUT ABI are wired and the installed-wheel GPU route gate passed; full-artifact served parity remains a post-export gate | `has_mtp → False`; three source-quantized DSpark stages are declared by the header-validated physical→construction overlay (§6.3), with no tensor rewrite |
 | hy_v3 | `hy_v3.py` | 180 | ✅ | `gguf` (overridden, L1) | CT, nvfp4_cb, **gguf** (gguf) | declared by pinned Gridbook contract | `has_mtp → False`; MTP passthrough + out-of-band CB scripts |
 | laguna (poolside S/XS 2.x) | `laguna.py` | 190 | ✅ | `nvfp4_cb` (overridden, L1) | CT, **nvfp4_cb** (nvfp4_cb) | declared by pinned Gridbook contract; drafter still separate | `has_mtp → False` |
 | default | `default.py` | — (terminal) | n/a by design | — | CT (default) | n/a | none |
@@ -3027,8 +3035,9 @@ the artifact ABI; CI
 compares every packing/layout field and every rung so incompatibility fails at the boundary.
 
 At runtime `register()` registers `"gridbook"` plus the legacy artifact alias `"prismaquant"`
-and installs the per-architecture loader hooks. It does not patch vLLM core. The released 0.8.4
-base resolves and attests every serving-reachable extension, optional-kernel mode, ABI, device, and
+and installs the per-architecture loader hooks. It does not patch vLLM core. Released 0.8.5 at
+`e992e5980c96333a48149f96392d6cff56ae9e3f` resolves and attests every serving-reachable
+extension, optional-kernel mode, ABI, device, and
 shape contract during model load. Decode, expansion, activation QDQ, and routing support are
 native CUDA; GEMM and grouped GEMM are native CUTLASS. A missing or ineligible required native
 operation raises instead of selecting Triton, a fallback-capable vLLM helper, or another serving
@@ -3036,10 +3045,11 @@ implementation. The container may mix CB groups, ignored BF16 prefixes, and stoc
 groups delegated to vLLM. Gridbook's own FP8 transient paths call vLLM's registered native
 CUDA quantizer and CUTLASS scaled-matmul operators directly after attestation. Fused dense and
 grouped native-NVFP4 paths remain explicit opt-ins: the 2026-08-01 teacher-backed LFM gate
-rejected default enablement even though operator arithmetic passed. The staged 0.8.5 v3 contract
+rejected default enablement even though operator arithmetic passed. The released 0.8.5 v3 contract
 attests both `abi_features.routed_moe_per_role_codebook_lut=1` and
-`abi_features.source_fp8_block128_w8a16=1`; compatibility is feature-gated and the unresolved
-release pin prevents either marker from being used as release evidence. The canceled gfx1151/ROCm
+`abi_features.source_fp8_block128_w8a16=1`; compatibility is feature-gated and bound to that
+exact commit. The installed-wheel GB10/sm121 gate backs the source route, while the materialized
+artifact must still close eager/graph, performance, and quality gates. The canceled gfx1151/ROCm
 prototype was removed rather than maintained as an unqualified second backend.
 
 **Storage format.** Product vector quantization onto a codebook whose every entry lies exactly
@@ -3156,9 +3166,9 @@ selection fails with no directory search, retraining, or lattice fallback.
 lattice routed-CB and the default `CB_CODEBOOK_SOURCE_SCOPE=none` are unchanged.
 
 **Runtime defaults and kernel provenance live only in Gridbook.** The old table
-here was removed after it drifted from the runtime it described. The staged pin names Gridbook
-0.8.5 but is intentionally unresolved and unreleased; resolve its eventual exact commit from
-`prismaquant/gridbook_runtime/gridbook_runtime_pin.json`, then consult that source's
+here was removed after it drifted from the runtime it described. The runtime pin names Gridbook
+0.8.5 at released commit `e992e5980c96333a48149f96392d6cff56ae9e3f`; resolve it from
+`prismaquant/gridbook_runtime/gridbook_runtime_pin.json`, then consult that exact source's
 `docs/PLUGIN.md`, `docs/KERNELS.md`, and dated audits. The cross-project policy
 is only this: a numerics-changing path cannot be promoted by kernel arithmetic
 or speed alone. The latest teacher-backed LFM gate rejected both fused-NVFP4
@@ -3168,8 +3178,9 @@ defaults, so dense and grouped paths remain explicit opt-ins.
 paragraph is ported verbatim from the 0.5.1-era study working tree and is kept under its
 measurement date. It was taken against the then-uncommitted native-only Gridbook candidate
 (base `4e7c1bc6` plus a dirty tree), which was later released as Gridbook 0.6.0 at
-`ca0f0f562d3f398e094bfa5356a9ce3fa47472f1`. PrismaQuant's staged consumer is now the unresolved
-0.8.5 v3 contract; these numbers remain candidate-era historical evidence and are not a
+`ca0f0f562d3f398e094bfa5356a9ce3fa47472f1`. PrismaQuant's current consumer is the released
+0.8.5 v3 contract at `e992e5980c96333a48149f96392d6cff56ae9e3f`; these numbers remain
+candidate-era historical evidence and are not a
 re-measurement or promotion of either runtime.
 
 The exact-shape native A/B used the seven ordinary Linear calls repeated across all 43 DSV4

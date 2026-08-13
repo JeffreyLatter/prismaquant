@@ -193,9 +193,11 @@ SOURCE_PASSTHROUGH_CONTRACTS: dict[str, SourcePassthroughContract] = {
             wire_format_id="fp8_e4m3_ue8m0_block128",
             zero_cost_by_construction=True,
             serving_route=ROUTE_GRIDBOOK_FP8_SOURCE_W8A16,
-            route_status=ROUTE_STATUS_PENDING,
+            route_status=ROUTE_STATUS_BACKED,
             route_requirement=(
-                "pinned Gridbook runtime-contract v3 feature "
+                "Gridbook 0.8.5 commit "
+                "e992e5980c96333a48149f96392d6cff56ae9e3f with "
+                "runtime-contract v3 feature "
                 "abi_features.source_fp8_block128_w8a16=1"
             ),
             detail=(
@@ -203,14 +205,16 @@ SOURCE_PASSTHROUGH_CONTRACTS: dict[str, SourcePassthroughContract] = {
                 "Gridbook's dedicated Fp8SourceW8A16LinearMethod. Both "
                 "source planes stay resident and byte-verbatim and BF16 "
                 "activations are unchanged. The numerical terminal is exact "
-                "by construction; release/served-parity evidence remains a "
-                "separate fail-closed route gate."
+                "by construction. Full-artifact served parity remains a "
+                "separate ship gate, not an exporter route override."
             ),
             route_evidence=(
-                "Anticipated Gridbook 0.8.5 runtime-contract v3 feature "
-                "source_fp8_block128_w8a16=1 and method "
-                "Fp8SourceW8A16LinearMethod. Exact release commit and "
-                "native-parity served evidence are intentionally pending."
+                "Gridbook 0.8.5 commit e992e5980c96333a48149f96392d6cff56ae9e3f; "
+                "installed-wheel GPU gate on GB10/sm121: 91 passed, 0 skipped. "
+                "Fp8SourceW8A16LinearMethod keeps raw E4M3/UE8M0 planes "
+                "resident, dispatches decode to native GEMV and prefill to "
+                "the owned grouped BF16 CUTLASS bridge, and attests the exact "
+                "JIT extension identity/capability."
             ),
         ),
         # DeepSeek-V4 routed experts: nibble-packed E2M1 + E8M0 group scales.
@@ -360,8 +364,9 @@ SOURCE_PASSTHROUGH_FORMATS: frozenset[str] = frozenset(
 # unaudited (pending) or measured dead (blocked). An otherwise honestly priced
 # candidate remains useful serving-gap evidence, but the exporter refuses to
 # ship a selection containing one without an explicit override.  This set does
-# not override independent cost-currency admission (notably activation-side
-# AURA for the W8A8 block-FP8 source route).
+# not override independent cost-currency admission for activation-changing
+# re-quantization routes such as direct G32 MXFP8 W8A8; the raw block-128
+# source route is W8A16 and preserves A.
 ROUTE_PENDING_PASSTHROUGH_FORMATS: frozenset[str] = frozenset(
     name for name, contract in SOURCE_PASSTHROUGH_CONTRACTS.items()
     if not contract.route_backed

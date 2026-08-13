@@ -2,9 +2,9 @@
 
 ## Status
 
-The producer/consumer ABI is released in Gridbook **0.8.4**, commit
-`56259f6e5d8646da9f9179e1dde7a1708849722c`, and that exact release is the
-PrismaQuant pin. Gridbook 0.8.3 implemented the routed per-role path; 0.8.4 is
+The producer/consumer ABI remains released in Gridbook **0.8.5**, commit
+`e992e5980c96333a48149f96392d6cff56ae9e3f`, and that exact release is the
+PrismaQuant pin. Gridbook 0.8.3 implemented the routed per-role path; 0.8.4 was
 the first release whose closed packaged `runtime_contract.json` explicitly
 attests `abi_features.routed_moe_per_role_codebook_lut = 1`. Required
 compatibility CI binds the final package version, immutable commit, and feature
@@ -136,8 +136,9 @@ by scanning or guessing from the burn directory.
 final numeric version `>=0.8.4` plus the exact packaged feature marker carries
 this producer-consumable ABI. `version_is_release` remains separate because an
 immutable preparation commit may implement behavior before a tag exists. The
-current 0.8.4 pin satisfies both gates; performance credit still comes only
-from the artifact's served evidence.
+current exact 0.8.5 pin satisfies both gates and additionally carries the
+source-FP8 W8A16 feature; performance credit still comes only from the
+artifact's served evidence.
 
 The routed refusal remains active for:
 
@@ -176,5 +177,5 @@ unforked vLLM in the known-good container:
    shapes. Performance must be at least parity with the lattice container the
    learned artifact displaces.
 
-Gridbook's package/tag gate is already closed at 0.8.4. These are artifact
+Gridbook's package/tag gate is closed at the current 0.8.5 pin. These are artifact
 gates and remain blocking regardless of released consumer capability.

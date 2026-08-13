@@ -251,6 +251,9 @@ def test_block128_source_lane_is_w8a16_and_direct_g32_remains_w8a8():
     )
     assert "Fp8SourceW8A16LinearMethod" in source.detail
     assert "does not require GRIDBOOK_MXFP8_DENSE" in source.detail
+    assert "ROUTE STATUS: BACKED" in source.detail
+    assert "e992e5980c96333a48149f96392d6cff56ae9e3f" in source.detail
+    assert "route_unbacked" not in source.fallback_route
     assert direct.activation_contract == (
         "w8a8-dynamic-mxfp8-e4m3-group32-ue8m0"
     )

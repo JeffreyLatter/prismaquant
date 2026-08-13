@@ -2257,9 +2257,9 @@ def test_floor_block_fp8_declaration_survives_the_completeness_gate(workdir):
     _, out, _, _ = _export_dsv4(workdir, floor_fp8=True)
     report = assert_artifact_complete(out)
     assert "layers.0.attn.wo_a" in report.passthrough_units
-    # Route-pending is an honest recorded state, not a reason to fail: the
-    # producer said out loud which lane it shipped into.
-    assert report.route_pending_acknowledged
+    # The exact Gridbook W8A16 route is backed, so no override record belongs
+    # in a newly exported artifact.
+    assert report.route_pending_acknowledged == []
 
 
 def test_completeness_gate_catches_the_original_silent_corruption(workdir):
@@ -2366,23 +2366,20 @@ def test_route_pending_ack_env_defaults_off_and_needs_exactly_one(monkeypatch):
     assert _route_pending_ack_from_env() is True
 
 
-def test_floor_block_fp8_refuses_to_ship_unacknowledged(workdir):
-    """Without the acknowledgement the export STOPS — it does not ship plainly.
-
-    The asymmetry worth pinning: for an allocated rung, refusing means the DP
-    picks something else. For a floor unit there is no something else, so the
-    refusal has to be loud rather than a quiet downgrade to `ignore`.
-    """
+def test_backed_floor_block_fp8_ships_without_route_override(workdir):
+    """The released W8A16 route needs no stale route-pending acknowledgement."""
     mdl = workdir / "src"
     _dsv4_source_model(mdl, floor_fp8=True)
     assignment, col_weights = _dsv4_recipe(floor_fp8=True)
     path = workdir / "recipe.json"
     _assign(path, assignment)
 
-    with pytest.raises(ValueError, match="route-pending source passthrough"):
-        export_nvfp4_cb_streaming(
-            mdl, path, workdir / "refused", col_weights, device="cpu",
-            allow_route_pending_passthrough=False)
+    out = workdir / "backed"
+    export_nvfp4_cb_streaming(
+        mdl, path, out, col_weights, device="cpu",
+        allow_route_pending_passthrough=False)
+    quant = json.loads((out / "quant_config.json").read_text())
+    assert "route_pending_passthrough_acknowledged" not in quant["provenance"]
 
 
 # --- namespace exclusion: omitting a floor namespace entirely ---------------

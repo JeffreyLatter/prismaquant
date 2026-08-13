@@ -140,7 +140,7 @@ DSV4_W8A16_APPROVED_SELECTION = {
 # and the fused mainloop's single CbSubW = k/4 sub-table width is the format's
 # real layout only on those rungs -- a uniform decode at, say, k37 would be
 # *wrong*, not merely unaligned.  serving_profile_specs/nvfp4_cb.json backs
-# [28, 32, 36, 40, 44, 48] for every runtime 0.5.0..0.8.4 (the pin is 0.8.4,
+# [28, 32, 36, 40, 44, 48] for every runtime 0.5.0..0.8.5 (the pin is 0.8.5,
 # version_is_release, and its packaged contract explicitly attests the routed
 # per-role LUT ABI), so this is the served set, not an aspiration. NVFP4-CB
 # is outside that law -- its lane backs no fused mid-M rungs at any version --
@@ -1903,8 +1903,57 @@ def _allocator_command(
         # Gridbook release/route admission remains an independent export gate.
         "MXFP4_SOURCE", "FP8_BLOCK_UE8M0_SOURCE", "BF16",
     )
+    # A release replay runs from a loader-less, source-bootstrap package
+    # namespace. A bare ``python -m`` child could resolve the image's stale
+    # site-package instead of the immutable /pq snapshot. When repository
+    # tools are present, re-enter through that exact snapshot's bootstrap and
+    # remove PYTHONPATH before its fail-closed source proof. Installed wheels do
+    # not package repository-level tools/, so they retain the normal module
+    # invocation through their already-selected interpreter distribution.
+    source_root = Path(__file__).resolve().parents[1]
+    source_bootstrap = source_root / "tools" / "prismaquant_source_bootstrap.py"
+    strict_root_raw = os.environ.get("PQ_RUNTIME_PRISMAQUANT_ROOT", "")
+    if strict_root_raw:
+        strict_root = Path(strict_root_raw)
+        try:
+            resolved_strict_root = strict_root.resolve(strict=True)
+        except OSError as exc:
+            raise DSv4CampaignError(
+                "strict-snapshot allocator launch has an unreadable runtime "
+                "source root"
+            ) from exc
+        if (
+            not strict_root.is_absolute()
+            or strict_root.is_symlink()
+            or resolved_strict_root != source_root
+        ):
+            raise DSv4CampaignError(
+                "strict-snapshot allocator launch source root differs from "
+                "the active PrismaQuant module"
+            )
+        if source_bootstrap.is_symlink() or not source_bootstrap.is_file():
+            raise DSv4CampaignError(
+                "strict-snapshot allocator launch requires the exact source "
+                "bootstrap"
+            )
+    bootstrap_available = (
+        source_bootstrap.is_file() and not source_bootstrap.is_symlink()
+    )
+    if bootstrap_available:
+        env_program = shutil.which("env")
+        if not env_program:
+            raise DSv4CampaignError(
+                "source-snapshot allocator launch requires the env utility"
+            )
+        allocator_prefix = [
+            env_program, "-u", "PYTHONPATH",
+            sys.executable, "-P", str(source_bootstrap), "run-module",
+            "--source-root", str(source_root), "prismaquant.allocator",
+        ]
+    else:
+        allocator_prefix = [sys.executable, "-m", "prismaquant.allocator"]
     return [
-        sys.executable, "-m", "prismaquant.allocator",
+        *allocator_prefix,
         "--probe", str(args.probe),
         "--costs", str(cost_path),
         "--model-override", str(args.model),
@@ -2577,13 +2626,13 @@ def _w8a16_runtime_contract_proof() -> dict[str, object]:
     from prismaquant.gridbook_runtime_pin import (
         GRIDBOOK_RUNTIME_CONTRACT_SCHEMA,
         load_gridbook_runtime_pin,
-        require_resolved_gridbook_runtime_pin,
+        require_exact_gridbook_runtime_release,
         supports_source_fp8_block128_w8a16,
     )
 
     pin = load_gridbook_runtime_pin()
     try:
-        require_resolved_gridbook_runtime_pin(pin)
+        require_exact_gridbook_runtime_release(pin)
     except Exception as exc:
         raise DSv4CampaignError(
             f"W8A16 readmission requires a resolved Gridbook release pin: {exc}"

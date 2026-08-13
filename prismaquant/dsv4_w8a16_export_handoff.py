@@ -39,7 +39,7 @@ from prismaquant.format_registry import get_format
 from prismaquant.gridbook_runtime_pin import (
     GRIDBOOK_RUNTIME_CONTRACT_SCHEMA,
     load_gridbook_runtime_pin,
-    require_resolved_gridbook_runtime_pin,
+    require_exact_gridbook_runtime_release,
     supports_source_fp8_block128_w8a16,
 )
 from prismaquant.layer_config import load_assignment
@@ -208,7 +208,7 @@ def _verify_frozen_export_code(repo_root: Path) -> dict[str, str]:
 def _verify_runtime_contract() -> dict[str, object]:
     try:
         pin = load_gridbook_runtime_pin()
-        require_resolved_gridbook_runtime_pin(pin)
+        require_exact_gridbook_runtime_release(pin)
     except Exception as exc:
         raise W8A16ExportHandoffError(
             f"Gridbook release pin is unresolved: {exc}"
@@ -231,7 +231,6 @@ def _verify_runtime_contract() -> dict[str, object]:
     direct = get_format("MXFP8_UE8M0_G32")
     if (
         block.act_quant_changes_input
-        or block.act_bits is not None
         or not direct.act_quant_changes_input
         or direct.act_bits != 8
     ):

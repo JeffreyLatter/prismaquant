@@ -539,12 +539,14 @@ def test_w8a16_format_plan_migration_allows_only_runtime_provenance():
         )
 
 
-def test_w8a16_readmission_release_pin_is_deliberately_fail_closed():
-    with pytest.raises(
-        campaign.DSv4CampaignError,
-        match="exact release commit is still unresolved",
-    ):
-        campaign._w8a16_runtime_contract_proof()
+def test_w8a16_readmission_release_pin_is_exact_and_released():
+    proof = campaign._w8a16_runtime_contract_proof()
+    assert proof["commit"] == "e992e5980c96333a48149f96392d6cff56ae9e3f"
+    assert proof["version"] == "0.8.5"
+    assert proof["version_is_release"] is True
+    assert proof["required_abi_features"][
+        "source_fp8_block128_w8a16"
+    ] == 1
 
 
 def test_w8a16_legacy_receipt_allowlist_is_exact():

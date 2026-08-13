@@ -37,6 +37,12 @@ from .shipcard import (
 )
 from .gridbook_assignment import artifact_requires_moe_backend_marlin
 from .gridbook_environment import CANONICAL_GOLD_ENVIRONMENT
+from .gridbook_runtime_pin import (
+    GridbookRuntimePinError,
+    load_gridbook_runtime_pin,
+    require_exact_gridbook_runtime_release,
+)
+from .allocator_candidates import ROUTE_PENDING_PASSTHROUGH_FORMATS
 
 
 DSV4_SPARK_VLLM_IMAGE = (
@@ -121,23 +127,22 @@ class CBEndpointValidationError(RuntimeError):
 
 
 def _gridbook_runtime_pin() -> dict[str, Any]:
-    path = (
-        Path(__file__).resolve().parent
-        / "gridbook_runtime"
-        / "gridbook_runtime_pin.json"
-    )
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    if not payload.get("version_is_release"):
+    try:
+        pin = load_gridbook_runtime_pin()
+        require_exact_gridbook_runtime_release(pin)
+    except (GridbookRuntimePinError, OSError, UnicodeError) as exc:
         raise CBEndpointValidationError(
-            f"Gridbook runtime pin is not a released commit: {path}"
-        )
-    commit = payload.get("commit")
-    version = payload.get("version")
-    if not isinstance(commit, str) or re.fullmatch(r"[0-9a-f]{40}", commit) is None:
-        raise CBEndpointValidationError(f"invalid Gridbook runtime commit in {path}")
-    if not isinstance(version, str) or not version:
-        raise CBEndpointValidationError(f"invalid Gridbook runtime version in {path}")
-    return payload
+            f"Gridbook runtime pin is not one strict released commit: {exc}"
+        ) from exc
+    return {
+        "schema": pin.schema,
+        "repository": pin.repository,
+        "commit": pin.commit,
+        "version": pin.version,
+        "version_is_release": pin.version_is_release,
+        "runtime_contract_schema": pin.runtime_contract_schema,
+        "required_abi_features": dict(pin.required_abi_features),
+    }
 
 
 def _canonical_json_sha256(payload: object) -> str:
@@ -769,13 +774,13 @@ def validate_cb_artifact(model_dir: str | Path) -> dict[str, Any]:
             "CB artifact has no exact weight_content_manifest"
         )
     acknowledgements = provenance.get(
-        "route_pending_passthrough_acknowledged"
+        "route_pending_passthrough_acknowledged", []
     )
-    if not isinstance(acknowledgements, list) or (
-        "FP8_BLOCK_UE8M0_SOURCE" not in acknowledgements
+    if not isinstance(acknowledgements, list) or acknowledgements != sorted(
+        set(str(value) for value in acknowledgements)
     ):
         raise CBEndpointValidationError(
-            "DSv4 artifact did not record the block-FP8 route acknowledgement"
+            "DSv4 artifact route-pending acknowledgements are not canonical"
         )
     groups = quant_config.get("config_groups")
     if not isinstance(groups, dict) or not groups:
@@ -788,6 +793,24 @@ def validate_cb_artifact(model_dir: str | Path) -> dict[str, Any]:
     ):
         raise CBEndpointValidationError(
             "DSv4 artifact has no declared FP8_BLOCK_UE8M0_SOURCE overlay"
+        )
+    source_formats = {
+        str(group.get("source_format"))
+        for group in groups.values()
+        if isinstance(group, Mapping)
+        and group.get("format") == "source-passthrough"
+        and isinstance(group.get("source_format"), str)
+    }
+    required_acknowledgements = sorted(
+        source_formats & ROUTE_PENDING_PASSTHROUGH_FORMATS
+    )
+    missing_acknowledgements = sorted(
+        set(required_acknowledgements) - set(acknowledgements)
+    )
+    if missing_acknowledgements:
+        raise CBEndpointValidationError(
+            "DSv4 artifact did not record required route-pending "
+            f"acknowledgements: {missing_acknowledgements}"
         )
     codebook_file = quant_config.get("codebook_file")
     if not isinstance(codebook_file, str) or not codebook_file.endswith(".pqcb"):
@@ -951,9 +974,10 @@ def _validate_artifact_decode_record(payload: Mapping[str, Any]) -> None:
     acknowledged = payload.get("route_pending_acknowledged")
     if not isinstance(acknowledged, list) or acknowledged != sorted(
         set(str(value) for value in acknowledged)
-    ) or "FP8_BLOCK_UE8M0_SOURCE" not in acknowledged:
+    ):
         raise CBEndpointValidationError(
-            "artifact decode contract lacks the unique block-FP8 acknowledgement"
+            "artifact decode contract route-pending acknowledgements are not "
+            "canonical"
         )
     excluded = payload.get("excluded_namespaces")
     if not isinstance(excluded, list) or excluded != sorted(

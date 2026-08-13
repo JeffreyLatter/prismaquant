@@ -34,7 +34,7 @@ def _bash(script: str, *args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def test_gridbook_pin_has_one_conspicuous_fail_closed_release_placeholder():
+def test_gridbook_pin_has_one_exact_released_runtime_identity():
     pins = [
         path
         for root in (REPO / "prismaquant", REPO / "scripts")
@@ -48,11 +48,11 @@ def test_gridbook_pin_has_one_conspicuous_fail_closed_release_placeholder():
     }
     assert payload["schema"] == "prismaquant.gridbook_runtime_pin.v3"
     assert payload["repository"] == "https://github.com/RobTand/gridbook.git"
-    assert payload["commit"] == "PENDING_GRIDBOOK_V0_8_5_RELEASE_COMMIT"
+    assert payload["commit"] == "e992e5980c96333a48149f96392d6cff56ae9e3f"
     assert re.fullmatch(r"[0-9]+(?:[.][0-9]+)+(?:[A-Za-z0-9.+-]*)?",
                         payload["version"])
     assert isinstance(payload["version_is_release"], bool)
-    assert payload["version_is_release"] is False
+    assert payload["version_is_release"] is True
     assert payload["runtime_contract_schema"] == "gridbook.runtime-contract.v3"
     assert payload["required_abi_features"] == {
         "routed_moe_per_role_codebook_lut": 1,
@@ -389,10 +389,11 @@ def test_prepare_materializes_linked_worktree_as_standalone_checkout(tmp_path):
 
 def test_container_install_reloads_and_enforces_the_tracked_pin():
     pin = json.loads(PIN.read_text(encoding="utf-8"))
-    # The tracked placeholder fails before any checkout/install work.
-    unresolved = _bash(f'bash "{HELPER}" print-pin')
-    assert unresolved.returncode == 2
-    assert "exact release commit is unresolved" in unresolved.stderr
+    resolved = _bash(f'bash "{HELPER}" print-pin')
+    assert resolved.returncode == 0, resolved.stderr
+    assert resolved.stdout.strip().split() == [
+        pin["repository"], pin["commit"], pin["version"]
+    ]
     wrong_commit = "f" * 40
     commit = _bash(
         f'PQ_GRIDBOOK_RUNTIME_SOURCE=/not-used '
@@ -400,7 +401,7 @@ def test_container_install_reloads_and_enforces_the_tracked_pin():
         f'PQ_GRIDBOOK_RUNTIME_VERSION={pin["version"]} '
         f'bash "{HELPER}" install-container')
     assert commit.returncode == 2
-    assert "exact release commit is unresolved" in commit.stderr
+    assert "does not equal tracked pin" in commit.stderr
 
     version = _bash(
         f'PQ_GRIDBOOK_RUNTIME_SOURCE=/not-used '
@@ -408,7 +409,7 @@ def test_container_install_reloads_and_enforces_the_tracked_pin():
         f'PQ_GRIDBOOK_RUNTIME_VERSION=999.0.0 '
         f'bash "{HELPER}" install-container')
     assert version.returncode == 2
-    assert "not a full 40-hex SHA" in version.stderr
+    assert "does not equal tracked pin" in version.stderr
 
 
 def test_runtime_helper_rejects_resolved_but_unreleased_pin(tmp_path):

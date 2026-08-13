@@ -11,10 +11,15 @@ import json
 import re
 from dataclasses import dataclass, field
 from importlib import import_module
-from importlib import resources
+from pathlib import Path
 from typing import Any, Collection, Mapping
 
 from . import format_registry as fr
+from .gridbook_runtime_pin import (
+    GridbookRuntimePinError,
+    load_gridbook_runtime_pin,
+    require_exact_gridbook_runtime_release,
+)
 
 
 SCHEMA = "prismaquant.serving_profile.v1"
@@ -765,7 +770,7 @@ def _declared_exporter_formats(path: str, lane_id: str) -> set[str]:
 
 
 def serving_profile_names() -> tuple[str, ...]:
-    root = resources.files("prismaquant").joinpath("serving_profile_specs")
+    root = Path(__file__).resolve().parent / "serving_profile_specs"
     names: list[str] = []
     try:
         for resource in root.iterdir():
@@ -996,11 +1001,10 @@ def gridbook_runtime_version() -> str:
     global _RUNTIME_VERSION
     if _RUNTIME_VERSION is None:
         try:
-            text = resources.files("prismaquant").joinpath(
-                "gridbook_runtime", "gridbook_runtime_pin.json"
-            ).read_text(encoding="utf-8")
-            _RUNTIME_VERSION = str(json.loads(text).get("version", "") or "")
-        except Exception:
+            pin = load_gridbook_runtime_pin()
+            require_exact_gridbook_runtime_release(pin)
+            _RUNTIME_VERSION = pin.version
+        except GridbookRuntimePinError:
             _RUNTIME_VERSION = ""
     return _RUNTIME_VERSION
 
@@ -1079,8 +1083,10 @@ def check_serving_shape(
 
 
 def _load_serving_profile_uncached(profile_id: str) -> ServingProfile:
-    resource = resources.files("prismaquant").joinpath(
-        "serving_profile_specs", f"{profile_id}.json"
+    resource = (
+        Path(__file__).resolve().parent
+        / "serving_profile_specs"
+        / f"{profile_id}.json"
     )
     text = resource.read_text(encoding="utf-8")
     return ServingProfile.from_dict(json.loads(text))

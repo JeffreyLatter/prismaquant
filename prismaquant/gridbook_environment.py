@@ -22,7 +22,9 @@ import re
 from types import MappingProxyType
 
 from .gridbook_runtime_pin import (
+    GridbookRuntimePinError,
     load_gridbook_runtime_pin,
+    require_exact_gridbook_runtime_release,
     supports_source_fp8_block128_w8a16,
 )
 
@@ -30,8 +32,8 @@ from .gridbook_runtime_pin import (
 GRIDBOOK_ENVIRONMENT_SCHEMA = "prismaquant.gridbook_environment/1"
 PINNED_GRIDBOOK_VERSION = "0.8.5"
 # A projection of the single packaged pin, not a second independently edited
-# commit constant. It intentionally exposes the fail-closed placeholder until
-# the release commit is known.
+# commit constant. Future unresolved pins still surface their fail-closed
+# placeholder here; the current released pin is a full immutable commit.
 PINNED_GRIDBOOK_COMMIT = load_gridbook_runtime_pin().commit
 
 CATEGORY_EXECUTION = "execution"
@@ -73,7 +75,7 @@ def _var(
 
 
 # The values and domains below carry forward the audited Gridbook 0.8.4 set
-# into the staged 0.8.5 contract. ``None`` is a contract value: the
+# into the released 0.8.5 contract. ``None`` is a contract value: the
 # variable must be
 # absent.  This matters for FUSED_FP4/FUSED_FP4_MOE ("0" is invalid), for the
 # expert-chunk override ("0" is invalid), and for CUDA switches whose source
@@ -242,6 +244,12 @@ def require_pinned_gridbook_runtime() -> None:
     """Fail if PrismaQuant no longer pins the contract this registry describes."""
 
     pin = load_gridbook_runtime_pin()
+    try:
+        require_exact_gridbook_runtime_release(pin)
+    except GridbookRuntimePinError as exc:
+        raise GridbookEnvironmentError(
+            f"Gridbook environment registry requires the exact release: {exc}"
+        ) from exc
     if (
         pin.version != PINNED_GRIDBOOK_VERSION
         or not supports_source_fp8_block128_w8a16(pin)

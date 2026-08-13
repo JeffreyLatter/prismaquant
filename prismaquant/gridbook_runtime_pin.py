@@ -9,8 +9,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import lru_cache
-from importlib import resources
 import json
+from pathlib import Path
 import re
 from types import MappingProxyType
 from typing import Any
@@ -18,9 +18,13 @@ from typing import Any
 
 GRIDBOOK_RUNTIME_PIN_SCHEMA = "prismaquant.gridbook_runtime_pin.v3"
 GRIDBOOK_RUNTIME_REPOSITORY = "https://github.com/RobTand/gridbook.git"
-# This is the sole unresolved release input.  It is deliberately not a
-# plausible Git object id, so every installer/serve boundary fails closed until
-# the Gridbook v0.8.5 release commit replaces it.
+GRIDBOOK_RUNTIME_RELEASE_VERSION = "0.8.5"
+GRIDBOOK_RUNTIME_RELEASE_COMMIT = (
+    "e992e5980c96333a48149f96392d6cff56ae9e3f"
+)
+# Historical staging sentinel retained so parsers and third-party tooling can
+# reject an unresolved future pin explicitly. The packaged v0.8.5 pin is now a
+# full immutable commit and does not use this value.
 GRIDBOOK_RUNTIME_COMMIT_PENDING = "PENDING_GRIDBOOK_V0_8_5_RELEASE_COMMIT"
 GRIDBOOK_RUNTIME_CONTRACT_SCHEMA = "gridbook.runtime-contract.v3"
 # Historical diagnostic floor retained for error prose and third-party callers.
@@ -160,8 +164,10 @@ def _reject_duplicate_members(pairs):
 def load_gridbook_runtime_pin() -> GridbookRuntimePin:
     """Read and validate the one packaged Gridbook runtime pin."""
 
-    location = resources.files("prismaquant").joinpath(
-        "gridbook_runtime", "gridbook_runtime_pin.json"
+    location = (
+        Path(__file__).resolve().parent
+        / "gridbook_runtime"
+        / "gridbook_runtime_pin.json"
     )
     try:
         raw = location.read_text(encoding="utf-8")
@@ -205,17 +211,37 @@ def require_resolved_gridbook_runtime_pin(pin: GridbookRuntimePin) -> None:
         )
 
 
+def require_exact_gridbook_runtime_release(pin: GridbookRuntimePin) -> None:
+    """Require the one reviewed release behind PrismaQuant's current ABI."""
+
+    require_resolved_gridbook_runtime_pin(pin)
+    if (
+        pin.version != GRIDBOOK_RUNTIME_RELEASE_VERSION
+        or pin.commit != GRIDBOOK_RUNTIME_RELEASE_COMMIT
+        or pin.version_is_release is not True
+    ):
+        raise GridbookRuntimePinError(
+            "Gridbook runtime must be exact released v0.8.5 commit "
+            f"{GRIDBOOK_RUNTIME_RELEASE_COMMIT}; observed "
+            f"version={pin.version!r} commit={pin.commit!r} "
+            f"version_is_release={pin.version_is_release!r}"
+        )
+
+
 __all__ = [
     "GRIDBOOK_REQUIRED_ABI_FEATURES",
     "GRIDBOOK_ROUTED_MOE_PER_ROLE_CODEBOOK_LUT_MIN_VERSION",
     "GRIDBOOK_RUNTIME_COMMIT_PENDING",
     "GRIDBOOK_RUNTIME_CONTRACT_SCHEMA",
+    "GRIDBOOK_RUNTIME_RELEASE_COMMIT",
+    "GRIDBOOK_RUNTIME_RELEASE_VERSION",
     "GRIDBOOK_RUNTIME_REPOSITORY",
     "GRIDBOOK_RUNTIME_PIN_SCHEMA",
     "GridbookRuntimePin",
     "GridbookRuntimePinError",
     "load_gridbook_runtime_pin",
     "parse_gridbook_runtime_pin",
+    "require_exact_gridbook_runtime_release",
     "require_resolved_gridbook_runtime_pin",
     "supports_routed_moe_per_role_codebook_lut",
     "supports_source_fp8_block128_w8a16",

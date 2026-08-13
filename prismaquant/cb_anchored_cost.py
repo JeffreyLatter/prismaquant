@@ -421,9 +421,9 @@ def build_cb_units(
         # end-to-end eligibility bit.  BF16 and FP8_SOURCE deliberately carry
         # measured columns in ordinary campaigns, yet an exact-source terminal
         # remains honest when its activation path is the identity.  The A-side
-        # contract is the decisive gate here: it preserves those terminals and
-        # excludes Gridbook's W8A8 block-FP8 terminal until activation-side
-        # AURA exists.
+        # contract is the decisive gate here: it preserves the block-FP8 W8A16
+        # source terminal, while activation-changing terminals remain excluded
+        # until activation-side AURA exists.
         terminal_selectable = not terminal_spec.act_quant_changes_input
         candidates.append(CandidateSpec(
             format_name=terminal,

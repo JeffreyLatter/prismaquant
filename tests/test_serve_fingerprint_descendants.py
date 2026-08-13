@@ -224,7 +224,9 @@ def _fake_gridbook_distribution(
         "gridbook/plugin.py",
         "gridbook/runtime_contract.json",
         "gridbook/source_passthrough.py",
+        "gridbook/fp8_source_w8a16.py",
         "gridbook/csrc/cb_gemv.cu",
+        "gridbook/csrc/fp8_source_w8a16.cu",
         "gridbook/csrc/mxfp8_dense_gemm.cu",
     )
     dist_info = "gridbook-0.8.4.dist-info"

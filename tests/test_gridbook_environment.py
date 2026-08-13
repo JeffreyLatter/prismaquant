@@ -168,7 +168,26 @@ def test_attestation_receipt_is_full_and_fails_closed_on_set_and_unset_drift():
 
 def test_registry_matches_the_packaged_runtime_contract():
     envmod.require_pinned_gridbook_runtime()
-    assert envmod.PINNED_GRIDBOOK_COMMIT.startswith("PENDING_GRIDBOOK_")
+    assert envmod.PINNED_GRIDBOOK_COMMIT == (
+        "e992e5980c96333a48149f96392d6cff56ae9e3f"
+    )
+
+
+def test_registry_rejects_an_alternate_resolved_release(monkeypatch):
+    from dataclasses import replace
+
+    alternate = replace(
+        envmod.load_gridbook_runtime_pin(),
+        commit="a" * 40,
+    )
+    monkeypatch.setattr(
+        envmod,
+        "load_gridbook_runtime_pin",
+        lambda: alternate,
+    )
+
+    with pytest.raises(envmod.GridbookEnvironmentError, match="exact release"):
+        envmod.require_pinned_gridbook_runtime()
 
 
 def test_source_scanner_surfaces_a_new_environment_identifier(tmp_path: Path):
