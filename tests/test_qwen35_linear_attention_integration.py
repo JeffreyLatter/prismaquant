@@ -2,9 +2,9 @@
 
 The fakes in test_linear_attention_mask_routing.py pin the contract; this
 file pins it against transformers' actual Qwen3_5 modules (tiny random-weight
-hybrid, CPU) — the family whose transformers>=5.15 refactor (`.block_type`
-rename, `apply_mask_to_padding_states` without a shape guard) motivated the
-fix. The forward-path tests run on every transformers version that ships
+hybrid, CPU) — the family whose transformers hybrid refactors (`.block_type` rename in
+5.13, removal of the `apply_mask_to_padding_states` shape guard in 5.15)
+motivated the fix. The forward-path tests run on every transformers version that ships
 qwen3_5 (the locked 5.8 environment included — same contract, pre-refactor
 attribute names); the two assertions specific to the 5.15 refactor
 (`.block_type`/child `layer_type`, guardless ``apply_mask_to_padding_states``)
@@ -21,8 +21,9 @@ pytest.importorskip(
 import transformers
 from packaging.version import parse as _parse_version
 
-_POST_REFACTOR = _parse_version(
-    transformers.__version__) >= _parse_version("5.15.0")
+_TV = _parse_version(transformers.__version__)
+_HAS_BLOCK_TYPE = _TV >= _parse_version("5.13.0")   # .block_type + child attrs
+_GUARDLESS_MASK = _TV >= _parse_version("5.15.0")   # padding-mask shape guard removed
 
 from transformers.models.qwen3_5 import Qwen3_5TextConfig
 from transformers.models.qwen3_5.modeling_qwen3_5 import (
@@ -35,6 +36,30 @@ from prismaquant.layer_streaming import (
     _compute_attention_mask,
     _layer_attention_type,
 )
+
+
+@pytest.fixture(autouse=True)
+def _force_pure_torch_kernels(monkeypatch):
+    """Keep the CPU integration CPU-safe in CUDA-toolkit environments.
+
+    transformers selects `causal_conv1d`/`fla` extensions by package
+    availability, not tensor device — in a cu130 stack the installed CUDA
+    extension gets picked for CPU tensors and fails with
+    `Expected x.is_cuda()`. The kernel-dispatch wrappers keep the pure
+    PyTorch implementation reachable via `__wrapped__`; unwrap them so the
+    test always runs the torch path, everywhere. No-op in clean CPU envs
+    and on transformers versions without those wrappers."""
+    import transformers.models.qwen3_5.modeling_qwen3_5 as m
+    for name in ("causal_conv1d_fn", "causal_conv1d_update",
+                 "chunk_gated_delta_rule", "recurrent_gated_delta_rule"):
+        fn = getattr(m, name, None)
+        if fn is None:
+            continue
+        inner = fn
+        while hasattr(inner, "__wrapped__"):
+            inner = inner.__wrapped__
+        if inner is not fn:
+            monkeypatch.setattr(m, name, inner)
 
 
 def _tiny_hybrid():
@@ -74,15 +99,15 @@ def _stream(base, layers, rotary, hidden, attention_mask):
 
 
 def test_real_layers_resolve():
-    # Passes pre- and post-refactor: `.layer_type` on 5.8, `.block_type`
-    # (plus the recurrent child's own attributes) from 5.15 on.
+    # Passes pre- and post-refactor: `.layer_type` up to 5.12, `.block_type`
+    # (plus the recurrent child's own attributes) from 5.13 on.
     _, _, layers, _ = _tiny_hybrid()
     assert _layer_attention_type(layers[0]) == "linear_attention"
     assert _layer_attention_type(layers[1]) == "full_attention"
 
 
-@pytest.mark.skipif(not _POST_REFACTOR,
-                    reason="`.block_type` rename landed in transformers 5.15")
+@pytest.mark.skipif(not _HAS_BLOCK_TYPE,
+                    reason="`.block_type` rename landed in transformers 5.13")
 def test_post_refactor_child_carries_fallback_attributes():
     _, _, layers, _ = _tiny_hybrid()
     assert layers[0].block_type == "linear_attention"
@@ -117,7 +142,7 @@ def test_streaming_forward_unpadded_batch():
 
 
 @pytest.mark.skipif(
-    not _POST_REFACTOR,
+    not _GUARDLESS_MASK,
     reason="pre-5.15 apply_mask_to_padding_states still shape-guards "
            "non-2D masks, so the dense mask is silently ignored there")
 def test_dense_mask_crashes_real_linear_layer():

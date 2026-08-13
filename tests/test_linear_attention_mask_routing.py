@@ -2,14 +2,15 @@
 
 Pins the PR #80 review contract. Two halves:
 
-- `linear_attention` layers are routed through transformers'
-  recurrent-mask contract (`masking_utils.create_recurrent_attention_mask`
-  when the installed transformers ships it, the contract-identical
-  `_recurrent_padding_mask` fallback on the locked transformers 5.8):
+- `linear_attention` layers are routed through the CURRENT (transformers
+  >= 5.15) recurrent-mask contract, always via the local
+  `_recurrent_padding_mask` shim — never the upstream helper, whose
+  5.13/5.14 incarnation still has the pre-fix cache-state contract:
   2D padding mask trimmed to the local sequence, `None` whenever masking
   would be a no-op — never the dense additive causal mask, never the raw
-  un-trimmed growing mask.
-- layer-type resolution covers the transformers>=5.15 `.block_type` rename
+  un-trimmed growing mask, and identical semantics with or without a
+  populated cache.
+- layer-type resolution covers the transformers>=5.13 `.block_type` rename
   and the Qwen3.5/3.6 `linear_attn` child module through the existing
   attribute/index/config lookups, and an otherwise unknown layer still
   fails closed instead of being guessed structurally.
@@ -26,7 +27,7 @@ from prismaquant.layer_streaming import (
     _call_layer,
     _compute_attention_mask,
     _layer_attention_type,
-    _linear_attention_mask,
+    _recurrent_padding_mask,
 )
 
 
@@ -60,20 +61,10 @@ def _hybrid_cfg():
     return cfg
 
 
-def _mask_kwargs(cfg, hidden, pad, position_ids=None):
-    return {
-        "config": cfg,
-        "inputs_embeds": hidden,
-        "attention_mask": pad,
-        "past_key_values": None,
-        "position_ids": position_ids,
-    }
-
-
 # --- layer-type resolution -------------------------------------------------
 @pytest.mark.parametrize("lt", ["linear_attention", "full_attention"])
 def test_block_type_resolves(lt):
-    # transformers>=5.15: Qwen3_5DecoderLayer stores `.block_type`
+    # transformers>=5.13: hybrid decoder layers store `.block_type`
     layer = nn.Module()
     layer.block_type = lt
     assert _layer_attention_type(layer) == lt
@@ -81,7 +72,7 @@ def test_block_type_resolves(lt):
 
 @pytest.mark.parametrize("lt", ["linear_attention", "sliding_attention"])
 def test_legacy_layer_type_still_resolves(lt):
-    # transformers<5.15 name — must keep working unchanged
+    # transformers<=5.12 name — must keep working unchanged
     layer = nn.Module()
     layer.layer_type = lt
     assert _layer_attention_type(layer) == lt
@@ -120,40 +111,33 @@ def test_unknown_self_attn_layer_fails_closed():
 
 # --- recurrent-mask contract (direct) --------------------------------------
 def test_continuation_mask_trims_to_local_sequence():
-    cfg = _hybrid_cfg()
     hidden = torch.zeros(2, 4, 8)
     # growing cache-continuation mask: 6 total positions, local seq is 4
     pad = torch.tensor([[1, 1, 0, 1, 1, 1],
                         [0, 0, 1, 1, 1, 1]])
-    out = _linear_attention_mask(_mask_kwargs(cfg, hidden, pad), hidden, pad)
+    out = _recurrent_padding_mask(hidden, pad)
     assert out.shape == (2, 4)
     assert torch.equal(out, pad[:, -4:])
     assert out.is_contiguous()
 
 
 def test_single_token_decode_returns_none():
-    cfg = _hybrid_cfg()
     hidden = torch.zeros(1, 1, 8)
     # decode step continuing a cached, left-padded prompt: not all-ones,
     # longer than the local sequence — None purely because local seq == 1
     pad = torch.tensor([[0, 1, 1, 1, 1, 1]])
-    assert _linear_attention_mask(
-        _mask_kwargs(cfg, hidden, pad), hidden, pad) is None
+    assert _recurrent_padding_mask(hidden, pad) is None
 
 
 def test_non_2d_mask_returns_none():
-    cfg = _hybrid_cfg()
     hidden = torch.zeros(1, 4, 8)
     pad4d = torch.zeros(1, 1, 4, 4)
-    assert _linear_attention_mask(
-        _mask_kwargs(cfg, hidden, pad4d), hidden, pad4d) is None
+    assert _recurrent_padding_mask(hidden, pad4d) is None
 
 
 def test_missing_mask_returns_none():
-    cfg = _hybrid_cfg()
     hidden = torch.zeros(1, 4, 8)
-    assert _linear_attention_mask(
-        _mask_kwargs(cfg, hidden, None), hidden, None) is None
+    assert _recurrent_padding_mask(hidden, None) is None
 
 
 # --- routing through _compute_attention_mask -------------------------------
@@ -222,3 +206,92 @@ def test_call_layer_delivers_recurrent_mask_to_linear_layer():
     _call_layer(full, torch.zeros(1, 4, 8), position_embeddings=None,
                 attention_mask=masks, position_ids=None)
     assert full.received_mask is dense
+
+
+# --- shim-only guarantee (5.13/5.14 old-helper regression) ------------------
+def test_routing_never_consults_upstream_helper(monkeypatch):
+    # transformers 5.13/5.14 ship create_recurrent_attention_mask with the
+    # pre-fix contract (None whenever the cache has previous state, no
+    # single-token case). The routing must therefore NEVER consult the
+    # upstream helper, on any version — booby-trap it and exercise both
+    # semantics Rob's review names: padded multi-token and single-token.
+    try:
+        import transformers.masking_utils as mu
+    except ImportError:  # pragma: no cover
+        mu = None
+    if mu is not None and hasattr(mu, "create_recurrent_attention_mask"):
+        def _trap(**kwargs):
+            pytest.fail("upstream create_recurrent_attention_mask must not "
+                        "be consulted (5.13/5.14 ship the pre-fix contract)")
+        monkeypatch.setattr(mu, "create_recurrent_attention_mask", _trap)
+
+    cfg = _hybrid_cfg()
+    base = _Base(cfg)
+
+    # padded multi-token: 2D mask kept and (trivially) trimmed, NOT None
+    hidden = torch.zeros(1, 4, 8)
+    pad = torch.tensor([[0, 1, 1, 1]])
+    masks = _compute_attention_mask(base, hidden, torch.arange(4).unsqueeze(0),
+                                    attention_mask=pad)
+    assert torch.equal(masks["linear_attention"], pad)
+
+    # single-token step: None
+    hidden1 = torch.zeros(1, 1, 8)
+    masks1 = _compute_attention_mask(base, hidden1, torch.zeros(1, 1,
+                                                                dtype=torch.long),
+                                     attention_mask=torch.ones(1, 1))
+    assert masks1["linear_attention"] is None
+
+
+def test_cached_continuation_contract_is_cache_state_independent():
+    # The old 5.13/5.14 helper returned None whenever
+    # past_key_values.has_previous_state() — silently dropping padding from
+    # a multi-token cached continuation. The current contract (and our
+    # shim, which takes no cache argument at all — by design) must keep and
+    # trim the mask regardless of cache state.
+    hidden = torch.zeros(2, 4, 8)
+    continuation = torch.tensor([[1, 1, 0, 1, 1, 1],
+                                 [0, 0, 1, 1, 1, 1]])  # 6 cached+new, 4 local
+    out = _recurrent_padding_mask(hidden, continuation)
+    assert out is not None and torch.equal(out, continuation[:, -4:])
+
+
+# --- non-attention blocks in a mixed hybrid schedule ------------------------
+def test_mixed_schedule_non_attention_blocks_get_none():
+    # Nemotron-H-style schedule: moe/mlp blocks consume no attention mask —
+    # upstream dispatches them None via `.get(block_type)`. An unknown
+    # *attention* type still fails closed.
+    cfg = PreTrainedConfig()
+    cfg.is_causal = True
+    cfg.layer_types = ["linear_attention", "moe", "full_attention", "mlp"]
+    cfg._attn_implementation = "eager"
+    base = _Base(cfg)
+    hidden = torch.zeros(1, 4, 8)
+    position_ids = torch.arange(4).unsqueeze(0)
+    pad = torch.tensor([[0, 1, 1, 1]])
+
+    masks = _compute_attention_mask(base, hidden, position_ids,
+                                    attention_mask=pad)
+
+    assert masks["moe"] is None and masks["mlp"] is None
+    assert torch.equal(masks["linear_attention"], pad)
+    assert masks["full_attention"].shape == (1, 1, 4, 4)
+
+    moe = _RecorderLayer(block_type="moe")
+    _call_layer(moe, hidden, position_embeddings=None,
+                attention_mask=masks, position_ids=position_ids)
+    assert moe.received_mask is None
+
+    # a declared but unbuildable attention type stays fail-closed
+    cfg2 = PreTrainedConfig()
+    cfg2.is_causal = True
+    cfg2.layer_types = ["linear_attention", "quantum_attention",
+                        "full_attention"]
+    cfg2._attn_implementation = "eager"
+    masks2 = _compute_attention_mask(_Base(cfg2), hidden, position_ids,
+                                     attention_mask=pad)
+    assert "quantum_attention" not in masks2
+    unknown = _RecorderLayer(block_type="quantum_attention")
+    with pytest.raises(RuntimeError, match="known layer_type"):
+        _call_layer(unknown, hidden, position_embeddings=None,
+                    attention_mask=masks2, position_ids=position_ids)
