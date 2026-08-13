@@ -1746,11 +1746,17 @@ def _embed_prefix(base_model: nn.Module, full_path: str) -> str:
 
 
 def _layer_attention_type(layer: nn.Module):
+    # `.block_type` is the transformers>=5.15 name for what `.layer_type`
+    # was before the linear-attn refactor (huggingface/transformers#47630);
+    # `.linear_attn` is the recurrent child module on Qwen3.5/3.6 DeltaNet
+    # hybrid layers, which carries its own `layer_type`/`layer_idx` (the
+    # outer layer has no `self_attn`/`attention` on those layers).
     lt = (
         getattr(layer, "layer_type", None)
         or getattr(layer, "block_type", None)
         or getattr(getattr(layer, "self_attn", None), "layer_type", None)
         or getattr(getattr(layer, "attention", None), "layer_type", None)
+        or getattr(getattr(layer, "linear_attn", None), "layer_type", None)
     )
     if lt is not None:
         return lt
@@ -1764,7 +1770,7 @@ def _layer_attention_type(layer: nn.Module):
     # Generic fallback: config.layer_types[layer_idx] when both exist.
     idx = getattr(layer, "layer_idx", None)
     if idx is None:
-        for attn_name in ("self_attn", "attention"):
+        for attn_name in ("self_attn", "attention", "linear_attn"):
             idx = getattr(getattr(layer, attn_name, None), "layer_idx", None)
             if idx is not None:
                 break
@@ -1773,18 +1779,8 @@ def _layer_attention_type(layer: nn.Module):
     lts = getattr(cfg, "layer_types", None) if cfg is not None else None
     if idx is not None and lts is not None and 0 <= int(idx) < len(lts):
         return lts[int(idx)]
-    # Qwen3.5/Qwen3.6 DeltaNet convention (transformers>=5.15.0): the
-    # decoder layer exposes no `layer_type`/`block_type`-driven idx match
-    # reachable above for its recurrent layers (no `self_attn`/`attention`
-    # at all on those layers, so the idx-fallback above can't fire either).
-    # Detect structurally instead: `.linear_attn` present -> recurrent
-    # (Qwen3_5GatedDeltaNet); `.self_attn`/`.attention` present -> dense.
-    # Unambiguous for this family; does not change resolution for any
-    # model that doesn't expose `.linear_attn`.
-    if hasattr(layer, "linear_attn"):
-        return "linear_attention"
-    if hasattr(layer, "self_attn") or hasattr(layer, "attention"):
-        return "full_attention"
+    # No guessing beyond this point: an unresolved layer type stays None so
+    # `_call_layer` fails closed instead of silently assuming semantics.
     return None
 
 
@@ -1936,6 +1932,53 @@ def _make_causal_mask(seqlen: int, device: torch.device, dtype: torch.dtype):
     return mask.unsqueeze(0).unsqueeze(0)
 
 
+def _recurrent_padding_mask(inputs_embeds: torch.Tensor,
+                            attention_mask: torch.Tensor | None):
+    """Fallback for ``masking_utils.create_recurrent_attention_mask`` on
+    transformers versions that predate it (< 5.14).
+
+    Mirrors the upstream helper's observable contract exactly (source:
+    transformers v5.15.0 ``masking_utils.create_recurrent_attention_mask``):
+
+    - ``None`` when the incoming mask is missing or not a 2D padding mask
+      (a custom 4D mask carries no padding signal for the recurrence);
+    - ``None`` for a single-token decode step (a generated token is never
+      padding);
+    - ``None`` for an all-ones mask (un-padded batch — the masking multiply
+      would be a no-op), skipped only outside trace/compile;
+    - otherwise the mask trimmed to the trailing ``inputs_embeds.shape[1]``
+      positions — so a growing cache-continuation mask aligns with the
+      current forward's local sequence — made contiguous.
+    """
+    if attention_mask is None or attention_mask.ndim != 2:
+        return None
+    if inputs_embeds.shape[1] == 1:
+        return None
+    try:
+        from transformers.masking_utils import is_tracing
+        tracing = is_tracing(attention_mask)
+    except Exception:
+        tracing = torch.jit.is_tracing() or isinstance(
+            attention_mask, torch.fx.Proxy)
+    if not tracing and torch.all(attention_mask == 1):
+        return None
+    return attention_mask[:, -inputs_embeds.shape[1]:].contiguous()
+
+
+def _linear_attention_mask(mask_kwargs: dict, hidden: torch.Tensor,
+                           attention_mask: torch.Tensor | None):
+    """Recurrent-mask contract for ``linear_attention`` layers: the upstream
+    ``create_recurrent_attention_mask`` when the installed transformers ships
+    it (>= 5.14), else the contract-identical ``_recurrent_padding_mask``."""
+    try:
+        from transformers.masking_utils import (
+            create_recurrent_attention_mask,
+        )
+    except ImportError:
+        return _recurrent_padding_mask(hidden, attention_mask)
+    return create_recurrent_attention_mask(**mask_kwargs)
+
+
 def _compute_attention_mask(
     base_model: nn.Module,
     hidden: torch.Tensor,
@@ -1954,18 +1997,22 @@ def _compute_attention_mask(
       ``full_attention``'s ``create_causal_mask``, just windowed.
     - ``linear_attention`` (Qwen3.5/Qwen3.6 DeltaNet-style recurrent
       hybrids) — NOT a variant of causal attention at all. The recurrence
-      is already causal by construction, so the "mask" HuggingFace's
-      ``apply_mask_to_padding_states()`` wants is the RAW 2D
-      ``[batch, seq_len]`` padding mask (or ``None`` for an unpadded
-      batch), used only to zero padding positions before the scan. This
-      mirrors ``Qwen3_5TextModel._update_linear_attn_mask()`` (minus its
-      cache-position/all-ones fast path — a pure no-op already subsumed by
-      ``apply_mask_to_padding_states``'s own ``shape[0] > 1 and
-      shape[1] > 1`` guard). Feeding it the dense ``[1, 1, T, T]`` causal
-      mask instead — the bug this branch fixes — broadcasts wrongly
-      against ``hidden_states`` inside ``apply_mask_to_padding_states``
-      (``hidden_states * attention_mask[:, :, None]``) and raises a
-      tensor-size mismatch on the last dim (hidden_size vs. seqlen).
+      is already causal by construction; what the layer needs is the
+      recurrent-mask contract of HuggingFace's
+      ``masking_utils.create_recurrent_attention_mask``: a 2D
+      ``[batch, local_seq]`` padding mask trimmed to the current forward's
+      sequence, or ``None`` whenever masking would be a no-op (non-2D
+      input, single-token decode, all-ones batch). We call the upstream
+      helper when the installed transformers ships it (>= 5.14) and
+      otherwise apply ``_recurrent_padding_mask``, a fallback with the
+      same observable contract, so PrismaQuant's locked transformers 5.8
+      environment behaves identically. Feeding these layers the dense
+      ``[1, 1, T, T]`` causal mask instead — the bug this branch fixes —
+      broadcasts wrongly against ``hidden_states`` inside
+      ``apply_mask_to_padding_states`` and raises a tensor-size mismatch
+      on the last dim (hidden_size vs. seqlen); an un-trimmed growing
+      cache-continuation mask can mismatch the same way, which is why the
+      raw incoming mask is not passed through either.
 
     Both hybrid kinds return the same ``{layer_type: mask}`` mapping shape;
     ``_call_layer`` selects the right entry per layer via its
@@ -2034,13 +2081,12 @@ def _compute_attention_mask(
                 masks[lt] = masks["sliding_attention"]
 
     if has_linear:
-        # DeltaNet/Mamba-style linear-attention layers: pass the raw
-        # incoming padding mask through untouched (see docstring). This is
-        # deliberately *not* `_make_causal_mask(...)` — linear-attention
-        # layers must never receive a dense additive mask, only the 2D
-        # padding mask (or None) that `apply_mask_to_padding_states`
-        # expects.
-        masks["linear_attention"] = attention_mask
+        # DeltaNet/Mamba-style linear-attention layers must never receive
+        # a dense additive mask — route them through the recurrent-mask
+        # contract instead (see docstring).
+        masks["linear_attention"] = _linear_attention_mask(
+            mask_kwargs, hidden, attention_mask
+        )
 
     return masks
 
