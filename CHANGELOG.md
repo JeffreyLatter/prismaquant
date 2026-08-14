@@ -1,5 +1,50 @@
 # Changelog
 
+## 0.12.3 — 2026-08-14
+
+### Fixed
+
+- A wheel that fails the pinned-digest check is no longer published into the
+  serving-wheel cache. The cache is keyed by the *expected* digest, and the
+  materializer's first branch trusts that directory name — it takes the single
+  wheel inside and verifies it, never consulting a supplied wheel or a download.
+  Caching a rejected wheel was therefore permanent: one
+  `pip download gridbook==0.8.6` bricked the DSpark serving lane on that
+  machine, and supplying a correct wheel afterwards could not help because the
+  supplied path was never reached. The pre-`mv` verification did not abort
+  because the materializer's only caller reaches it as
+  `wheel="$(_gridbook_serving_materialize_wheel)" || return`, and Bash disables
+  `errexit` for a command substitution whose enclosing command is part of a
+  `||` list — re-arming `set -e` inside that subshell does not restore it, so
+  the function's own `set -euo pipefail` is inert on the one path that runs it.
+  All three verification sites now test their status explicitly, and the
+  fast-path refusal names the directory to remove instead of reporting only a
+  digest mismatch. Regression-tested through the download path (the only path
+  where the defect fires) and mutation-proven against the pre-fix file.
+  This defect was *armed* by publishing 0.8.6: before it existed on PyPI the
+  download failed outright and cached nothing.
+  See `docs/audits/serving_wheel_cache_poisoning_2026-08-14.md`.
+
+### Changed
+
+- `docs/ARCHITECTURE.md` no longer describes the DSpark serving pin as pending
+  sentinels — it is resolved — and it no longer asserts a rule the code
+  contradicts. The doc required the digest "reported by the published PyPI
+  file"; `prismaquant/gridbook_serving_runtime_pin.py` requires the digest read
+  out of the served image and forbids substituting a PyPI or locally rebuilt
+  wheel. Both cannot govern. Measured: the two 0.8.6 wheels are
+  content-identical (all 58 archive members byte-for-byte equal, differing only
+  in zip container metadata) and the PyPI wheel was built by the release run
+  from exactly the pinned commit, so the rules select the same code and differ
+  only in which archive's digest is asserted. Which rule governs is Robert's
+  call; the doc now records the tension and the operational consequence rather
+  than hiding it.
+- The serve-environment census fix shipped in 0.12.2 is now **verified
+  end-to-end on a live server** rather than by screen: the release-pinned image
+  with the ship gate's exact environment block reports `consistent: true` with
+  the EngineCore process renamed (`VLLM::EngineCore`) and both PIDs at an
+  identical allowlist digest, before and after a completion request.
+
 ## 0.12.2 — 2026-08-14
 
 ### Fixed

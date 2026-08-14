@@ -168,7 +168,18 @@ _gridbook_serving_materialize_wheel() (
             _gridbook_serving_error "cached digest directory does not contain one wheel"
             exit 2
         fi
-        gridbook_serving_runtime_verify_wheel "${existing[0]}"
+        if ! gridbook_serving_runtime_verify_wheel "${existing[0]}"; then
+            # Name the cache explicitly.  A digest-named directory holding the
+            # wrong wheel is unrecoverable through this path -- the branch
+            # above short-circuits before any download or supplied wheel is
+            # considered -- so an operator who is only told "SHA-256 X differs
+            # from pin Y" has no way to know the CACHE is what must be
+            # removed, and will keep re-supplying a correct wheel that is
+            # never read.
+            _gridbook_serving_error \
+                "cached wheel does not match the pin; remove $destination and retry"
+            exit 2
+        fi
         exit
     fi
     tmp="$(mktemp -d "${cache_root}/.wheel-${GRIDBOOK_RUNTIME_WHEEL_SHA256:0:12}.XXXXXX")"
@@ -180,7 +191,15 @@ _gridbook_serving_materialize_wheel() (
     trap cleanup EXIT
     supplied=${GRIDBOOK_SERVING_RUNTIME_WHEEL:-}
     if [[ -n "$supplied" ]]; then
-        wheel="$(gridbook_serving_runtime_verify_wheel "$supplied")"
+        # Test the status explicitly rather than leaning on errexit; see the
+        # pre-publish guard below for why `set -e` is inert on this call path.
+        # Without this, a rejected wheel leaves "$wheel" empty and the failure
+        # surfaces as a confusing `cp` error against an empty operand.
+        if ! wheel="$(gridbook_serving_runtime_verify_wheel "$supplied")"; then
+            _gridbook_serving_error \
+                "supplied wheel does not match the pin: $supplied"
+            exit 2
+        fi
         cp -- "$wheel" "$tmp/$(basename -- "$wheel")"
     else
         python3 -m pip download --quiet --disable-pip-version-check --no-deps \
@@ -192,7 +211,26 @@ _gridbook_serving_materialize_wheel() (
         _gridbook_serving_error "download did not yield exactly one wheel"
         exit 2
     fi
-    gridbook_serving_runtime_verify_wheel "${published[0]}" >/dev/null
+    # Never publish an unverified wheel into the digest-named cache.
+    #
+    # This MUST test the status explicitly.  The only caller reaches this
+    # function as `wheel="$(_gridbook_serving_materialize_wheel)" || return`,
+    # and Bash disables errexit for a command substitution whose enclosing
+    # command is part of a `||` list -- re-arming `set -e` inside the subshell
+    # does not restore it.  The `set -euo pipefail` above is therefore inert
+    # here, so a bare call would print its rejection and then fall through to
+    # the `mv`, permanently caching a wheel the pin rejects: every later
+    # invocation takes the fast path above, finds the bad wheel and refuses,
+    # and no supplied wheel or download is ever consulted again.  One attempt
+    # without a matching wheel would brick the serving lane on that machine.
+    # Observed 2026-08-14: the PyPI 0.8.6 wheel (content-identical to the
+    # pinned artifact but a different archive) was cached under the pinned
+    # digest and refused the lane until the directory was removed by hand.
+    if ! gridbook_serving_runtime_verify_wheel "${published[0]}" >/dev/null; then
+        _gridbook_serving_error \
+            "materialized wheel does not match the pin; refusing to cache it"
+        exit 2
+    fi
     if mv -T -- "$tmp" "$destination" 2>/dev/null; then
         tmp=""
     elif [[ ! -d "$destination" ]]; then

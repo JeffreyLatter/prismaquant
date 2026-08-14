@@ -1,8 +1,11 @@
 # PrismaQuant Architecture
 
-As of: 2026-08-13 · branch `release/dsv4flash-dspark-v0121` · verified against
-implementation baseline commit `f0747a4` plus the cherry-picked Gridbook wheel-attestation repair
-described by the named schemas and symbols below. The final integration commit is
+As of: 2026-08-14 · branch `release/dsv4flash-dspark-v0121` · verified against
+implementation baseline commit `babf6fa` (v0.12.2) plus the cherry-picked Gridbook
+wheel-attestation repair described by the named schemas and symbols below, the
+serve-environment census readability fix (`SPT_NOENV`, §"Parent + EngineCore live
+attestation", verified end-to-end on a live server 2026-08-14), and the
+serving-wheel cache integrity guard (§9.2). The final integration commit is
 deliberately not predicted in this provenance stamp. This revision includes the Spark
 BF16 AURA-anchor residency and streamed-reverse lifetime corrections, the activation-safe
 AURA terminal/replay policy, the endpoint live-session and matched-budget
@@ -62,15 +65,38 @@ it is not silently repointed when the serving plugin changes. DSpark serving
 has a second, current-consumer pin in
 `gridbook_runtime/gridbook_serving_runtime_pin.json`. It names Gridbook 0.8.6,
 runtime-contract v4, the routed-MoE/source-FP8 features above, and
-`dspark_construction_physical_bridge=1`. Its release commit and published-wheel
-SHA-256 are currently explicit `PENDING_...` sentinels and
-`version_is_release=false`, so every live endpoint, quality, performance, and
-paired-DSpark gate fails closed. The final pin patch must use the wheel digest
-reported by the published PyPI file and independently match it to the GitHub
-Release asset; a local pre-tag wheel is not byte-reproducible evidence and must
-not supply that digest. `gridbook_serving_runtime.sh` then downloads or accepts
-only that exact wheel, validates its archive paths and METADATA, installs it
-from the read-only local file, and checks PEP 610 plus the v4 feature closure.
+`dspark_construction_physical_bridge=1`. **That pin is now RESOLVED** (release
+commit `dde15e04`, `version_is_release=true`), superseding this section's former
+description of it as `PENDING_...` sentinels;
+`test_packaged_serving_pin_is_resolved_and_loads_in_shell` asserts the resolved
+state from both the Python and shell readers.
+`gridbook_serving_runtime.sh` downloads or accepts only the exact pinned wheel,
+validates its archive paths and METADATA, installs it from the read-only local
+file, and checks PEP 610 plus the v4 feature closure. A wheel that fails that
+digest check is **never published into the digest-named cache** — the cache's
+first branch trusts the directory name, so caching a rejected wheel is permanent
+and bricks the lane (2026-08-14 incident; guarded and regression-tested in
+`tests/test_gridbook_serving_runtime_pin.py`).
+
+**Open policy question — which wheel the digest names.** This section formerly
+required the digest "reported by the published PyPI file", on the ground that a
+local pre-tag wheel is not byte-reproducible evidence. The shipped pin does the
+opposite, and `prismaquant/gridbook_serving_runtime_pin.py` states that rule
+normatively: the digest is read out of the **served image**
+(`gridbook:0.8.6-clean-dde15e0`) — the runtime the accepted prefill/decode
+numbers were taken on — and "a locally rebuilt or a PyPI-published wheel is a
+DIFFERENT artifact and must not be substituted here". Both cannot be the rule.
+Measured 2026-08-14: the two 0.8.6 wheels are **content-identical** (all 58
+archive members byte-for-byte equal; they differ only in zip container
+metadata), and the PyPI wheel was built by the release run from exactly the
+pinned commit `dde15e04` — so the two rules select the same *code* and differ
+only in which archive's digest is asserted. The consequence is operational, not
+semantic: because the pin names the image wheel, a plain
+`pip download gridbook==0.8.6` does **not** satisfy it, and the serving lane
+must be given `GRIDBOOK_SERVING_RUNTIME_WHEEL=<wheel extracted from the served
+image>` (or a correctly populated cache). Resolving which rule governs is
+Robert's call; until then the code is authoritative and this paragraph records
+the tension rather than hiding it.
 
 This revision retains the four 2026-07-30 architecture re-vet waves documented in
 `docs/audits/architecture_re-vet_2026-07-30.md` and closes the runtime-ownership debt: the

@@ -92,6 +92,12 @@ slots requires rebuilding at a commit that carries this fix, which produces a ne
 `model_sha` and detaches the accepted perf evidence from the shipped bytes. That
 is a deliberate decision and is Rob's, not the gate's.
 
+The rebuild commit is **v0.12.3 or later**, not v0.12.2: the serving lane also
+needs the wheel-cache integrity guard
+(`docs/audits/serving_wheel_cache_poisoning_2026-08-14.md`). A rebuild must
+additionally supply `GRIDBOOK_SERVING_RUNTIME_WHEEL=<wheel extracted from the
+served image>`, because the pinned digest is not the PyPI wheel's.
+
 ## 6. Fix
 
 Both runtime Docker vectors now set `SPT_NOENV=1`
@@ -110,10 +116,53 @@ Guarded by `tests/test_gridbook_runtime_boundary.py`
 (`test_both_runtime_vectors_keep_proc_environ_readable`, plus the prepared-vector
 assertion), mutation-checked: deleting the `SPT_NOENV` line fails the guard.
 
-## 7. Lesson
+## 7. Verified end-to-end — the census is GREEN
+
+The evidence above (in-image single-process measurement + a vector-membership
+unit test) was a **screen**, and this document's own §8 lesson forbids treating
+a screen as a result. It has now been run against a live server.
+
+`eugr/spark-vllm@sha256:58862b38…` (the release-pinned serving image), the ship
+gate's exact environment block plus `SPT_NOENV=1`, serving Qwen3-0.6B. Model
+choice is irrelevant to the question — process-environment inheritance — and
+keeps the run cheap. Census run by the real helper
+(`tools/serve_fingerprint.py::server_environment_snapshot`) against the live
+PIDs, before and after a completion request:
+
+| pid | name / argv | allowlisted names | sha256 |
+|---|---|---|---|
+| 1 | `vllm serve /model …` | 17 / 34 | `18d8eb7ea09b…` |
+| 149 | **`VLLM::EngineCore`** (renamed) | 17 / 34 | `18d8eb7ea09b…` |
+
+`consistent: true`, `unreadable_pids: []`, and pre-census `== ` post-census.
+Generation was coherent (`" Paris. The capital of France is also"`).
+
+Two things make this non-vacuous. **setproctitle demonstrably fired** — pid 149's
+argv *is* the renamed `VLLM::EngineCore`, so the defect's trigger occurred and
+the environment was still readable. And **discovery returned two PIDs**, so the
+comparison actually spanned the API server and the engine; a one-PID census
+would have proven nothing.
+
+This also closes a second, independent failure mode that the earlier screen
+could not see: `/proc/<pid>/environ` is an **exec-time** snapshot, so if the API
+server mutated an allowlisted variable *after* its own exec but *before*
+spawning EngineCore, the child's snapshot would differ and `consistent` would be
+false for an unrelated reason. `VLLM_USE_DEEP_GEMM` is allowlisted and vLLM
+calls `setdefault` on it — but the gate sets it explicitly (`-e
+VLLM_USE_DEEP_GEMM=0`), making the `setdefault` a no-op, and Gridbook never
+writes any environment variable (no `environ[…] =`, `setdefault`, or `putenv`
+anywhere in the 0.8.6 wheel). Measured: identical shas, so no such mutation
+occurs on this path.
+
+Evidence: `/home/rob/dq-runs/spt-noenv-smoke/` (`census-pre.json`,
+`census-post.json`, `run_smoke.sh`).
+
+## 8. Lesson
 
 The house question — *measurement gap or optimizer gap?* — applied to a gate.
 A refusal is evidence about the measurement as much as about the artifact, and
 the first move on a red gate is to check that the check can be satisfied at all.
 This one never could. Related: **verify a gate has been green at least once
-before treating its refusal as a finding about the thing under test.**
+before treating its refusal as a finding about the thing under test.** That rule
+binds the *fix* too, which is why §7 exists: a fix supported only by a screen is
+a claim, not a result.
