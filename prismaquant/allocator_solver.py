@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import time
 from dataclasses import dataclass
+from math import inf
 from typing import TYPE_CHECKING
 
 from . import format_registry as fr
@@ -80,6 +81,28 @@ class Candidate:
     # stops the allocator from pricing a fast path nobody backs without at
     # least recording that it did.
     serving_lane: ResolvedServingLane | None = None
+
+
+@dataclass(frozen=True)
+class DualInterval:
+    """Non-negative point-cost shadow prices weakly supporting one selected rung.
+
+    ``lambda_lo`` and ``lambda_hi`` are in predicted-dloss per DP-charged
+    byte.  An interval is empty when ``lambda_lo > lambda_hi``.  Empty
+    intervals are expected for integer-knapsack choices in non-convex pockets:
+    the exact budget DP may select a rung that no scalar Lagrangian supports.
+
+    This is not the uncertainty-aware global lambda-star bracket from an
+    interval cost table: the current :class:`Candidate` carries one loss and
+    the current DP carries no lower/upper loss bounds.
+    """
+
+    lambda_lo: float
+    lambda_hi: float
+
+    @property
+    def is_empty(self) -> bool:
+        return self.lambda_lo > self.lambda_hi
 
 
 def _shape_from_stats(entry: dict) -> tuple[int, ...]:
@@ -459,6 +482,89 @@ def _charged_bins(d_avg_bits: float, bit_precision: float) -> int:
     if dbins == 0 and d_avg_bits > 0.0:
         return 1
     return dbins
+
+
+def selected_rung_dual_intervals(
+    stats: dict,
+    candidates: dict[str, list[Candidate]],
+    assignment: dict[str, str],
+    bit_precision: float = 0.001,
+) -> dict[str, DualInterval]:
+    """Return each selected rung's local weak-Lagrangian support interval.
+
+    This reads the two quantities already formed by ``solve_allocation``'s
+    forward options: ``predicted_dloss`` and the conservatively rounded
+    average-bit charge from :func:`_charged_bins`.  The latter is converted to
+    bytes with ``total_params / 8`` so lambda has the design's bytes-to-loss
+    units while still mirroring the DP's discretization exactly.
+
+    For selected rung ``s`` and every alternative ``c``, the supporting-price
+    condition is::
+
+        loss(s) + lambda * bytes(s) <= loss(c) + lambda * bytes(c)
+
+    Alternatives cheaper than ``s`` supply upper bounds; alternatives more
+    expensive than ``s`` supply lower bounds.  Equal-charge alternatives can
+    make the interval empty.  This is a per-unit pairwise intersection under
+    the DP's rounded charge function, including equality at breakpoints; it is
+    not a certificate of the exact-budget DP's global tie choice or the
+    design's uncertainty-aware hull widening.  The helper is deliberately
+    observational: it neither runs nor changes the budget DP, and an exact
+    integer-DP choice may legitimately have an empty interval when it lies off
+    the Lagrangian hull.
+    """
+    if bit_precision <= 0.0:
+        raise ValueError("bit_precision must be positive")
+
+    names = list(candidates.keys())
+    total_params = sum(int(stats[n]["n_params"]) for n in names)
+    if total_params <= 0:
+        return {}
+
+    bytes_per_bin = float(bit_precision) * float(total_params) / 8.0
+    out: dict[str, DualInterval] = {}
+    for name in names:
+        if name not in assignment:
+            raise KeyError(f"assignment is missing candidate unit {name!r}")
+        cs = candidates[name]
+        selected_fmt = assignment[name]
+        matches = [c for c in cs if c.fmt == selected_fmt]
+        if len(matches) != 1:
+            raise ValueError(
+                f"assignment {name!r}={selected_fmt!r} resolves to "
+                f"{len(matches)} candidates; expected exactly one"
+            )
+        selected = matches[0]
+        baseline = min(cs, key=lambda c: c.bits_per_param)
+        fraction = int(stats[name]["n_params"]) / total_params
+
+        def charged_bytes(candidate: Candidate) -> float:
+            d_avg_bits = (
+                candidate.bits_per_param - baseline.bits_per_param
+            ) * fraction
+            return (
+                _charged_bins(d_avg_bits, bit_precision) * bytes_per_bin
+            )
+
+        selected_bytes = charged_bytes(selected)
+        lambda_lo = 0.0
+        lambda_hi = inf
+        for competitor in cs:
+            if competitor is selected:
+                continue
+            byte_delta = selected_bytes - charged_bytes(competitor)
+            loss_delta = (
+                competitor.predicted_dloss - selected.predicted_dloss
+            )
+            if byte_delta > 0.0:
+                lambda_hi = min(lambda_hi, loss_delta / byte_delta)
+            elif byte_delta < 0.0:
+                lambda_lo = max(lambda_lo, loss_delta / byte_delta)
+            elif selected.predicted_dloss > competitor.predicted_dloss:
+                lambda_lo, lambda_hi = inf, -inf
+                break
+        out[name] = DualInterval(lambda_lo=lambda_lo, lambda_hi=lambda_hi)
+    return out
 
 
 def solve_allocation(stats: dict, candidates: dict[str, list[Candidate]],
