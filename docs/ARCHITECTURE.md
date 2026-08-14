@@ -1,6 +1,9 @@
 # PrismaQuant Architecture
 
-As of: 2026-08-14 · branch `merge/aura-sensitivity-contract` · verified against
+As of: 2026-08-14 · branch `merge/proven-rescues` · re-stamped at `1dbf146`
+(AQUA-AURA's activation term now reaches a production allocation, and its
+`act_var` can be measured on real cached activations rather than modelled — see
+the AQUA-AURA note below and §"Three cost tiers"). Previously verified against
 implementation baseline commit `ed4f2e0` (v0.12.3) merged with the Sensitivity
 Card contract branch at `c8f3cfd`. That baseline carries the cherry-picked Gridbook
 wheel-attestation repair described by the named schemas and symbols below, the
@@ -49,9 +52,23 @@ authority.
 
 The Sensitivity Card item changes exactly one shipping default, and it is
 probe-side: `incremental_probe.py` now emits five per-channel marginal vectors
-into `probe.pkl` unless told not to (§3.3, §4.1). The card, its three cost tiers
-and AQUA-AURA are additive modules with no `run-pipeline.sh` call site, no
-`COST_MODE` value, and no served validation; they allocate nothing today.
+into `probe.pkl` unless told not to (§3.3, §4.1). The card and its three cost
+tiers remain additive modules with no `run-pipeline.sh` call site and no
+`COST_MODE` value.
+
+**AQUA-AURA is no longer one of them.** As of 2026-08-14 its activation term
+reaches a production allocation: `aqua_activation_cost.py` prices the A-side off
+a card and merges it into an existing weight-only cost pkl as `act_dloss`, and
+`allocator_candidates.cost_entry_predicted_dloss` adds it on the weight-only
+branches only (`78ec816`, `3c14209`). The term rides **inside** P5a's per-family
+multiply — `(base + act) · penalty`, never `base · penalty + act`, since the
+fitted constants run to ×8103 and adding outside dilutes an A-side worth 6× the
+W-side to 0.07%, which produced a Pareto byte-identical to the weight-only one.
+`act_var` is measured on the probe's real cached activations when
+`--act-dir` is given and modelled from a per-channel Gaussian fit otherwise
+(`1dbf146`; the two differ by 3.23% of Linears at 5.0–5.5 bpp). It is **still
+research** — there is no served KL/PPL A/B against the weight-only arm at
+matched bpp, and that A/B is the promotion gate.
 The external runtime record pins Gridbook **0.8.5** at exact commit
 `e992e5980c96333a48149f96392d6cff56ae9e3f`, with
 `gridbook.runtime-contract.v3` and the exact required feature map
