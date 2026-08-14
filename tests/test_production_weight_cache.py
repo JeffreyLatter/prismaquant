@@ -94,6 +94,67 @@ def test_prefetch_loads_disk_entries_and_respects_lru(tmp_path):
     assert cache._lru_bytes == 0
 
 
+def test_release_resident_tensors_frees_memory_without_losing_data(tmp_path):
+    """Releasing after a one-way install must be lossless, not destructive.
+
+    `validate_assignments_kl` drops the cache's resident copies once
+    `_materialize_assignment_inplace` has copied the render set into the live
+    model, because the hooks then run under
+    PRISMAQUANT_EXTERNAL_WEIGHT_MANAGEMENT=1 and never read the cache again.
+    On a 27B assignment that is tens of GiB of dead bytes inside a shared
+    121.6 GB pool. The guarantee that makes it safe is the one asserted here:
+    every key stays resolvable and reloads bit-identically.
+    """
+    weights = {}
+    expected = {}
+    for idx, name in enumerate(("a", "b", "c")):
+        tensor = torch.full((4, 4), float(idx), dtype=torch.float32)
+        torch.save(tensor, tmp_path / f"{name}.pt")
+        weights[(name, "NVFP4")] = f"{name}.pt"
+        expected[name] = tensor
+
+    cache = ProductionWeightCache(
+        weights=weights, levers={"gptq": True}, cache_dir=str(tmp_path))
+    cache.enable_lru(64 * 1024 * 1024)
+    assert cache.prefetch(max_workers=2) == 3
+    assert any(isinstance(v, torch.Tensor) for v in cache.weights.values())
+
+    released = cache.release_resident_tensors()
+
+    assert released >= 1
+    assert all(not isinstance(v, torch.Tensor) for v in cache.weights.values())
+    assert cache._lru_bytes == 0
+    # Every key still resolves, and to the SAME bytes -- a release is a
+    # residency decision, never a data one.
+    for name, want in expected.items():
+        assert torch.equal(cache.get(name, "NVFP4"), want)
+
+
+def test_inplace_measure_can_skip_a_redundant_materialization():
+    """Repeats vary the calibration draw, never the weights.
+
+    The in-place install is one-way and nothing reverts it, so re-installing on
+    every repeat re-copies identical bytes into the parameters that already
+    hold them -- a numeric no-op that re-reads the whole render set and refills
+    the LRU. At 27B/repeats=4 that is what drove the pool to its ceiling.
+    """
+    import inspect
+
+    from prismaquant.validate_assignments_kl import (
+        _measure_inplace_assignment_kl,
+    )
+
+    sig = inspect.signature(_measure_inplace_assignment_kl)
+    assert sig.parameters["materialize"].default is True, (
+        "materializing must stay the default; only a caller that KNOWS the "
+        "model already holds this assignment may skip it")
+
+    src = inspect.getsource(_measure_inplace_assignment_kl)
+    assert "release_resident_tensors" in src, (
+        "the one-way install must release the cache's now-unreadable resident "
+        "tensors")
+
+
 def test_production_cache_resolves_format_aliases_and_sizes(tmp_path):
     tensor = torch.ones((2, 2), dtype=torch.float32)
     path = tmp_path / "layer.pt"

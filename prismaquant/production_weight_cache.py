@@ -325,6 +325,22 @@ class ProductionWeightCache:
         self._cb_verified_keys = None
         return compacted
 
+    def release_resident_tensors(self) -> int:
+        """Drop disk-backed resident tensors, keeping every key resolvable.
+
+        Same operation as :meth:`compact_for_pickle` — that one is named for
+        why it was first needed — but callers reach for this one when the goal
+        is *memory*, not serialization: after a one-way install has copied the
+        render set into a live model, nothing reads the cache's resident copies
+        again, and on a 27B assignment they are up to the full LRU cap of dead
+        bytes inside a shared 121.6 GB pool.
+
+        Entries that were never disk-backed are left resident, because dropping
+        those would lose data rather than free a re-readable copy. A later
+        ``get()`` on a released key simply reloads it from disk.
+        """
+        return self.compact_for_pickle()
+
     def _path_for_value(self, value: object) -> str:
         path = str(value)
         if self.cache_dir and not Path(path).is_absolute():

@@ -77,7 +77,10 @@ from prismaquant.select_validated_frontier import (
 )
 from prismaquant.schemas import validate_cost_payload
 from prismaquant.sensitivity_probe import load_calibration
-from prismaquant.source_prefetch import prefetch_safetensors_checkpoint
+from prismaquant.source_prefetch import (
+    _available_memory_bytes,
+    prefetch_safetensors_checkpoint,
+)
 
 
 def _load_json(path: str | Path):
@@ -905,6 +908,7 @@ def _measure_inplace_assignment_kl(
     production_cache,
     kl_scope: str,
     use_cuda_graphs: bool | None,
+    materialize: bool = True,
 ) -> tuple[float, list[float], dict[str, object]]:
     """Measure assignment KL in place; return ``(mean, per_sequence, stats)``.
 
@@ -912,17 +916,59 @@ def _measure_inplace_assignment_kl(
     at the return. They are now returned, and ``stats['nll_per_sample']`` carries
     the free rung-2 token NLL computed from the same student logits (``None``
     under the last-token scope, which has no next-token label in the window).
+
+    ``materialize=False`` skips the weight install because the live model is
+    already holding this exact assignment. Only pass it when that is true: the
+    install is one-way (see ``_materialize_assignment_inplace``) and nothing
+    reverts it, so across repeats of the SAME assignment every pass after the
+    first re-copies identical bytes into the parameters that already hold them.
+    That is a numeric no-op that costs a full re-read of the render set and
+    re-fills the cache LRU each time -- at 27B, 45.35 GiB and ~34s per repeat,
+    and it is what pushed a repeats=4 arm into the 121.6 GB pool's ceiling
+    (the second pass logged "cache files require 45.35 GiB, budget is 11.02
+    GiB"). Repeats vary the calibration DRAW, never the weights.
     """
     device = next(model.parameters()).device
     cal_hash = calibration_data_hash(calib_ids)
     calib_ids = calib_ids.to(device)
     full_sequence = kl_scope == "full_sequence"
-    materialize_stats = _materialize_assignment_inplace(
-        model,
-        assignment,
-        production_cache,
-        progress=True,
-    )
+    if materialize:
+        materialize_stats = _materialize_assignment_inplace(
+            model,
+            assignment,
+            production_cache,
+            progress=True,
+        )
+        # The install is one-way and the hooks below run under
+        # PRISMAQUANT_EXTERNAL_WEIGHT_MANAGEMENT=1, where _apply_weight_quant
+        # returns immediately without touching the cache
+        # (perturbed_x_cache.py:808). So every resident tensor in the cache is
+        # now unreadable for the rest of this measurement -- up to the whole
+        # LRU cap of dead bytes in a pool the model already half fills. Keys
+        # stay resolvable; a later get() reloads from disk.
+        released = production_cache.release_resident_tensors()
+        avail = _available_memory_bytes()
+        materialize_stats = {
+            **materialize_stats,
+            "cache_tensors_released": int(released),
+            # MemAvailable, not RSS: on this unified-memory box CUDA device
+            # memory is invisible to RSS, so RSS reads "fine" right up to the
+            # OOM kill.
+            "mem_available_gib": (
+                round(avail / 2**30, 2) if avail is not None else None),
+        }
+        print(
+            f"[validate-kl/inplace] released {released} resident cache tensors "
+            f"after install; MemAvailable "
+            f"{'?' if avail is None else f'{avail / 2**30:.1f}'} GiB",
+            flush=True,
+        )
+    else:
+        materialize_stats = {
+            "skipped": True,
+            "reason": "already resident; inplace install is one-way and the "
+                      "assignment is constant across repeats",
+        }
     hook_assignment = _activation_quant_assignment(assignment)
     hooks = PerturbedActivationCache(
         model,
@@ -1758,6 +1804,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                             None if args.kl_cuda_graphs == "auto"
                             else args.kl_cuda_graphs == "on"
                         ),
+                        # Install the weights once. The install is one-way and
+                        # the model is not reloaded between repeats, so it is
+                        # still holding this assignment; repeats change only
+                        # the calibration draw.
+                        materialize=(repeat_idx == 0),
                     )
                 else:
                     kl_value, kl_seq, replay_stats = measure_assignment_kl(
