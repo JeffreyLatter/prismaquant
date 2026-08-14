@@ -146,8 +146,13 @@ def pareto_frontier(points: Iterable[AllocationPoint],
     they cannot be placed on the frontier, and defaulting them to fast or slow
     would be a fabricated number either way.
 
-    Ties on both axes keep the first point seen, so the result is stable under
-    a stable input order.
+    Candidates equal on BOTH axes are all kept, not deduplicated: neither
+    dominates the other (``strictly_better`` is false), so both survive. That is
+    intentional -- two assignments can price identically and still differ in
+    ways this module cannot see -- but it means the frontier may contain
+    duplicates on the two axes, and a consumer that needs a unique answer must
+    say which one it wants. The selection functions here do not: ``min``/``max``
+    break such a tie arbitrarily.
     """
     known = [p for p in points if p.speed_index is not None]
     frontier: list[AllocationPoint] = []
