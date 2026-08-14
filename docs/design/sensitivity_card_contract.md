@@ -200,6 +200,88 @@ the post-allocator-rewrite antipattern.
 **No pickle.** A shareable artifact must load without executing arbitrary
 objects. The card is a single compressed `.npz` with a JSON header.
 
+## 7b. FIRST REAL-MODEL RUN (2026-08-14): two bugs, and an lm_head blocker
+
+The marginal emission was default-ON and had only ever been exercised by
+synthetic unit tests. Its first run against a real model — Qwen3-0.6B, n=8,
+T=512, `--emit-marginals`,
+`/home/rob/dq-runs/aura-card-marginals-0p6b/` — found the following.
+
+**Bug 1 (fixed): the probe crashed instantly.** `_compute_precompute_key()`
+was called with `emit_marginals=...` but its signature never took the argument
+(`TypeError`). The call site's reasoning was right — the resident marginals are
+written *into* the cached stats, so a precompute cache built with the flag off
+must not be reused with it on — so the fix adds the parameter and puts it in
+the key rather than dropping it at the call site.
+
+**Bug 2 (fixed): `worst_unit` could name the wrong Linear.** In
+`tools/validate_probe_marginals.py`, the name list was filtered by key presence
+and the value array by finiteness, so a single non-finite entry misaligned the
+`argmax` index.
+
+**The identity holds, and holds tightly.** 197/197 units carry marginals; zero
+negative and zero non-finite entries across all vectors.
+
+| check | median | p99 | max | over 1e-4 |
+|---|---|---|---|---|
+| `sum(row)` vs `sum(col)` | 2.3e-09 | 4.3e-08 | **6.1e-08** | **0 / 197** |
+| `sum(row)` vs `h_trace_raw` | 2.3e-08 | 1.0e-07 | 1.0e-03 | 1 / 197 |
+| `sum(col)` vs `h_trace_raw` | 2.3e-08 | 9.8e-08 | 1.0e-03 | 1 / 197 |
+
+**So `rtol=1e-4` is empirically defensible** — it clears the real distribution
+by roughly three orders of magnitude on 196 of 197 units.
+
+**The blocker: `lm_head` fails `validate()`.**
+
+```
+ValueError: lm_head: sum(fisher_row)=1.80171e+08 does not match
+h_trace_raw=1.80355e+08. The marginals and the trace must come from the
+same accumulator.
+```
+
+The diagnosis is unambiguous and the assertion is doing its job:
+
+| lm_head | value |
+|---|---|
+| `sum(fisher_row)` | 1.801713770e+08 |
+| `sum(fisher_col)` | 1.801713709e+08 |
+| row vs col | **3.4e-08** — the marginals agree with *each other* |
+| `h_trace_raw` | 1.803550720e+08 |
+| row vs trace | **1.0e-03** — both disagree with the trace |
+
+The marginals are self-consistent; it is `h_trace_raw` that comes from a
+different accumulator. That matches the probe log: lm_head is the only unit in
+a resident-only shard (`"shard has only resident Linears (n=1); skipping
+Phase-3 reverse sweep"`), so it never goes through the sweep that produces
+every other unit's trace. A 1e-3 relative gap is bf16-accumulation territory
+(bf16 eps 3.9e-3), consistent with the two paths differing in accumulation
+precision or order.
+
+**This is not fixed, and I did not weaken the assertion to make it pass.** A
+correct assertion firing on a real inconsistency is a finding, not an obstacle
+(principles 1 and 2). But as it stands **no card can be built from any probe
+that includes lm_head**, which blocks the lane. The two candidate resolutions,
+for Robert to pick:
+
+1. **Make lm_head's trace use the marginal accumulator** — fixes the root
+   cause, but touches the shipping probe's resident path.
+2. **Exclude lm_head from the card as a non-allocatable unit** — principled
+   rather than a fudge, because principle 12 already excludes `lm_head` from
+   bpp accounting and it is never assigned a format. The card is a sensitivity
+   card *for allocation*; carrying a unit that is never allocated is what
+   created the exposure.
+
+Option 2 is the smaller change and matches an existing project invariant;
+option 1 is the one that makes the number right. **Neither is implemented.**
+
+**Incidental measurement worth keeping:** the row-Fisher is *flat*, not
+concentrated — the median unit needs **92.9%** of its output rows to hold 99%
+of the Fisher mass (max 98.4%). Tempering expectations accordingly: the
+MARGINAL tier's advantage over SCALAR will come from non-uniform *error*
+placement, not from a few dominant output rows.
+
+---
+
 ## 8. What is proven, and what is not
 
 **Proven on REAL production artifacts** (`tools/validate_card_zero_churn.py`,

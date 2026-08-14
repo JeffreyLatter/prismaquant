@@ -1319,9 +1319,16 @@ def _resident_linear_fqns(model: nn.Module, layers_prefix: str,
 def _compute_precompute_key(model_path: str, dataset_name: str,
                             nsamples: int, seqlen: int, dtype_name: str,
                             device: str, importance_weighting: bool,
-                            resident_include_union: str) -> dict[str, Any]:
+                            resident_include_union: str,
+                            emit_marginals: bool = False) -> dict[str, Any]:
     """Fingerprint for the global precompute cache. If any of these
-    inputs change, recompute; otherwise reuse the cached tensors."""
+    inputs change, recompute; otherwise reuse the cached tensors.
+
+    `emit_marginals` belongs in the key because the resident marginal
+    vectors are written *into* the cached stats: a cache built with the
+    flag off carries no marginals, and silently reusing it with the flag
+    on would yield a probe that claims marginals and has none.
+    """
     return {
         "model": model_path,
         "dataset": dataset_name,
@@ -1332,6 +1339,7 @@ def _compute_precompute_key(model_path: str, dataset_name: str,
         "importance_weighting": importance_weighting,
         "resident_include_union": resident_include_union,
         "router_coverage_version": _ROUTER_COVERAGE_VERSION,
+        "emit_marginals": bool(emit_marginals),
     }
 
 
