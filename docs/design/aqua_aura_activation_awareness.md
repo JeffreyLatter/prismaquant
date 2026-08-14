@@ -125,10 +125,44 @@ The inputs required are:
 
 | symbol | meaning | source |
 |---|---|---|
-| `F_o` | per-output-channel Fisher | card `fisher_row` ✓ |
+| `F_o` | per-output-channel Fisher | card **`g_sq_sum`** ✓ (**not** `fisher_row` — see below) |
 | `a_i` | per-input-channel activation 2nd moment | card `act_sq_sum` ✓ |
 | `W`   | clean weight | the checkpoint ✓ |
 | `e_i(f)` | activation quant MSE for format `f` | §4 — needs `act_absmax` ✓ |
+
+> **Correction, 2026-08-14 — this table originally named `fisher_row` as `F_o`,
+> and that was a currency error of exactly the kind
+> [[factorization-currency-dependent]] records.** Read the marginals off
+> `incremental_probe.py::_marginal_chunk` and `sensitivity_card.py`:
+>
+> ```
+> fisher_row[o] = Σ_i H[o,i] = Σ_t g[t,o]² · (Σ_i x[t,i]²)     # input energy FOLDED IN
+> g_sq_sum[o]   =              Σ_t g[t,o]²                      # the OUTPUT-space Fisher
+> ```
+>
+> `fisher_row` is output-*indexed* but not output-*space*: it already carries a
+> `‖x_t‖²` factor. Both `cost_w` and `cost_a` above multiply `F_o` by a second,
+> explicitly activation-derived factor (`a_i` and `e_i(f)` respectively), so
+> substituting `fisher_row` would **double-count activation energy** — inflating
+> exactly those units whose inputs are largest, which is the same failure
+> signature as the ÷token-fraction bug removed in PR #14. Use `g_sq_sum`; it is
+> already on the card, so the "no new probe pass" conclusion is unaffected.
+> The card's own docstring states this distinction outright (`sensitivity_card.py`
+> lines 31 and 43) — I had the field list right and the semantics wrong.
+>
+> **The error was confined to this table; the code is correct.** Do not "fix"
+> `format_cost_protocol.py` to match the old prose. Checked line by line:
+> `activation_dloss` (l.227) already uses `g_sq_sum` and carries an explicit
+> NOTE — *"the sensitivity used here is `g_sq_sum` (output space), NOT `h_trace`
+> (weight space). That distinction is the whole point."* And `weight_dloss`
+> (l.196) uses `fisher_row` **legitimately**, because the W-side is not literally
+> `Σ_o F_o Σ_i a_i δW²` in the implementation: it reconstructs the full Hessian
+> rank-1 as `H ≈ outer(row, col) / h_trace_raw` and evaluates
+> `(row @ δW² @ col) / h_trace_raw`, which needs *both* marginals and never forms
+> `H`. So the two terms legitimately consume different fields — the W-side a
+> rank-1 (row, col) pair, the A-side the output-space `g_sq_sum` — and §3's
+> two-line `cost_w`/`cost_a` display is a simplification of the first, not a
+> specification of it.
 
 **This is the headline finding of the design pass: the contract built this
 session already carries the exact state AQUA needs.** `act_sq_sum` and

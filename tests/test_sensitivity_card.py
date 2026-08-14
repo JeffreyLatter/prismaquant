@@ -172,7 +172,7 @@ def test_marginal_model_differs_from_scalar_when_sensitivity_is_uneven():
 # ------------------------------------------------------------------ AQUA-AURA
 
 
-def test_activation_dloss_uses_output_space_fisher_not_h_trace():
+def test_activation_dloss_returns_none_without_g_sq_sum():
     """A card lacking g_sq_sum returns None -- never 0.0.
 
     An unmeasured activation cost must not read as a free one.
@@ -183,6 +183,65 @@ def test_activation_dloss_uses_output_space_fisher_not_h_trace():
     var = np.full(IN, 1e-4)
     assert activation_dloss(stripped, w, var) is None
     assert activation_dloss(u, w, var) is not None
+
+
+def test_activation_dloss_uses_g_sq_sum_not_fisher_row():
+    """The A-side sensitivity must be g_sq_sum (output space), NOT fisher_row.
+
+    This pins a CURRENCY distinction, and the test above does not pin it: that
+    one only checks the None contract, so swapping the body to `fisher_row`
+    while keeping the `g_sq_sum is None` guard would leave it green.
+
+    The two vectors are easy to confuse because both are indexed by output
+    channel, but they are not the same quantity::
+
+        fisher_row[o] = sum_i H[o,i] = sum_t g[t,o]^2 * (sum_i x[t,i]^2)
+        g_sq_sum[o]   =                sum_t g[t,o]^2
+
+    fisher_row already carries a per-token input-energy factor. Since
+    activation_dloss multiplies the sensitivity by W^2 @ act_var -- itself an
+    activation-derived quantity -- using fisher_row would double-count input
+    energy and inflate exactly those units whose inputs are largest. That is the
+    same failure signature as the divide-by-token-fraction bug removed in PR #14.
+
+    Constructed so the two CANNOT coincide: per-token input energy is swept over
+    three orders of magnitude, which makes fisher_row a strongly reweighted
+    version of g_sq_sum rather than a near-multiple of it.
+    """
+    rng = np.random.default_rng(20260814)
+    g_sq = rng.random((TOKENS, OUT)) + 0.1
+    x_sq = rng.random((TOKENS, IN)) + 0.1
+    # Sweep per-token input energy hard, so sum_i x[t,i]^2 is NOT ~constant in t.
+    x_sq *= np.logspace(-1.5, 1.5, TOKENS)[:, None]
+    H = g_sq.T @ x_sq
+    w = rng.standard_normal((OUT, IN))
+
+    u = SensitivityUnit(
+        topology=UnitTopology(name="model.layers.0.mlp.down_proj", layer_index=0,
+                              role="down", fused_group=None,
+                              source_dtype="bfloat16"),
+        out_features=OUT, in_features=IN, n_params=OUT * IN, n_tokens=TOKENS,
+        h_trace_raw=float(H.sum()), h_w2_sum_raw=float((H * w ** 2).sum()),
+        w_norm_sq=float((w ** 2).sum()), w_max_abs=float(np.abs(w).max()),
+        fisher_row=H.sum(axis=1), fisher_col=H.sum(axis=0),
+        act_sq_sum=x_sq.sum(axis=0), g_sq_sum=g_sq.sum(axis=0),
+        act_absmax=np.sqrt(x_sq).max(axis=0),
+    )
+
+    var = rng.random(IN) * 1e-3
+    per_out = (w ** 2) @ var
+
+    got = activation_dloss(u, w, var)
+    want_g = 0.5 * float(u.g_sq_sum @ per_out) / TOKENS
+    want_row = 0.5 * float(u.fisher_row @ per_out) / TOKENS
+
+    # The fixture must actually separate the two, else the assertion is vacuous.
+    assert want_row > 10.0 * want_g, (
+        "fixture failed to separate the two sensitivities; the discrimination "
+        f"below would be vacuous (row={want_row:.3e} vs g={want_g:.3e})")
+
+    assert got == pytest.approx(want_g, rel=1e-9)
+    assert got != pytest.approx(want_row, rel=1e-3)
 
 
 def test_w4a4_and_w4a8_are_distinct_candidates():
