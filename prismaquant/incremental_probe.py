@@ -1670,10 +1670,30 @@ def _compute_global_precompute(
                     dtype=torch.float32, device="cpu")
                 resident_h_full[name] = acc
             acc.add_(chunk_h.float().to("cpu"))
-            # Trace via the outer-product-norm identity (avoids a second
-            # full matmul, just two reductions of size T).
-            resident_stats[name]["h_trace_raw"] += float(
-                (gy2_sq.sum(dim=1) * x2_sq.sum(dim=1)).sum().item())
+            # Trace from the SAME fp32 object the marginals reduce, which is
+            # how both body-layer sites do it (`h_trace_dev = chunk_h.sum()`).
+            # This makes `sum(fisher_row) == sum(fisher_col) == h_trace_raw`
+            # hold BY CONSTRUCTION rather than as a numerical coincidence.
+            #
+            # It used to use the outer-product-norm identity
+            # `Σ_t (Σ_o gy²)(Σ_i x²)`, justified as "avoids a second full
+            # matmul". That justification was stale on THIS path: `chunk_h` is
+            # materialized unconditionally three lines up (it has to be — it
+            # feeds `resident_h_full`), so summing it is free and no second
+            # matmul was ever avoided.
+            #
+            # The identity route was also numerically wrong here, and lm_head
+            # is where it showed. Both reductions ran in bf16 (no
+            # `dtype=torch.float32`, unlike `_marginal_chunk`, which forces
+            # fp32 precisely because "a T-long running sum in bf16 loses real
+            # precision for free"). `gy2_sq.sum(dim=1)` reduces over the OUTPUT
+            # dim, which for lm_head is the vocabulary — ~152k bf16 addends on
+            # Qwen3 against ~1-5k for a body Linear. With 8 mantissa bits that
+            # cost ~1e-3 relative on lm_head and ~1e-8 elsewhere, which is
+            # exactly the split the first real-model run measured: lm_head was
+            # the ONLY unit of 197 whose h_trace disagreed with its own
+            # marginals, and it failed `SensitivityCard.validate()` alone.
+            resident_stats[name]["h_trace_raw"] += float(chunk_h.sum().item())
             if _emit_marginals:
                 _marginal_accumulate(
                     resident_marginals, name,
