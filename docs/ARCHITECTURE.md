@@ -2539,8 +2539,13 @@ shipcard, so the artifact itself carries the record that it shipped ungated. Tes
 **The ship record (`exported/shipcard.json`).** Native export and both CB exporters open a card
 carrying the build-lane
 facts it already holds — git commit, `assignment_hash`, `layer_config_sha`, achieved bpp *with
-its provenance named* (read from the allocator's `pareto.knees.json`, never recomputed under a
-different accounting convention), exact `artifact_bytes`, format histogram, the render-lever
+its provenance named* (read from the **recipe's own metadata**, never recomputed under a
+different accounting convention: `selected_achieved_bits` when a validated frontier selected the
+point, else the allocator's `achieved_bits`, and only then falling back to `pareto.knees.json`.
+The knee file is a *separate* artifact describing the **surrogate** frontier, so under
+`SELECTION_MODE=validated-surrogate` it does not describe the recipe beside it — reading it
+first put a 1.25 bpp false claim on the Qwen3.8-27B arm-B card, 5.9994 for bytes that were the
+validated 4.7496), exact `artifact_bytes`, format histogram, the render-lever
 echo (`_render_lever_provenance()`, shared with the export cache's fingerprint so the two
 cannot drift), and the `PRISMAQUANT_ALLOW_KV_SHARED_FISHER` / `PRISMAQUANT_KV_COTANGENT` state
 so an allocation that rode an unvalidated Fisher correction is visible on the artifact rather

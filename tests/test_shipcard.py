@@ -584,6 +584,7 @@ def test_export_writes_a_card_with_build_facts_and_empty_slots(tmp_path):
     assert build["achieved_bpp"]["value"] == pytest.approx(4.7513)
     assert build["achieved_bpp"]["source"] == "pareto.knees.json:log_error"
     assert build["layer_config_sha"] and build["assignment_hash"]
+
     assert build["format_histogram"] == {"NVFP4/packed": 1}
     assert "PRISMAQUANT_GPTQ_DAMP" in build["render_levers"]
     assert "unvalidated_kv_fisher_correction" in build["kv_shared_fisher"]
@@ -592,6 +593,96 @@ def test_export_writes_a_card_with_build_facts_and_empty_slots(tmp_path):
 
 # ---------------------------------------------------------------------------
 # CLI
+def test_validated_selection_beats_the_surrogate_knee_file(tmp_path):
+    """A validated recipe must not be labelled with the surrogate knee's bpp.
+
+    Regression: on Qwen3.8-27B arm B the card claimed 5.9994 bpp
+    (pareto.knees.json:log_error) for bytes that were the validated frontier's
+    4.7496 pick -- a 1.25 bpp false claim on the publication gate.  Both the
+    knee file and the recipe's own stale `achieved_bits` are present here, as
+    they are on a real validated run, so this pins the precedence rather than
+    just the happy path.
+    """
+    from prismaquant.shipcard import allocator_achieved_bpp
+
+    recipe = tmp_path / "layer_config.json"
+    recipe.write_text(json.dumps({
+        "model.layers.0.mlp.up_proj": {"bits": 4},
+        "__prismaquant__": {
+            "schema": "prismaquant.layer_config_meta.v1",
+            "achieved_bits": 5.50016116330051,      # stale: pre-selection
+            "target_bits": 5.5,
+            "selected_by": "validated_frontier:kneedle",
+            "selected_achieved_bits": 4.749587350041043,
+            "selected_label": "allocator_target_4p7500_achieved_4p7496",
+        },
+    }))
+    (tmp_path / "pareto.knees.json").write_text(json.dumps({
+        "primary": "log_error",
+        "log_error": {"achieved_bits": 5.999404111844319, "target_bits": 6.0},
+    }))
+
+    got = allocator_achieved_bpp(recipe)
+    assert got["value"] == pytest.approx(4.749587350041043)
+    assert got["source"] == "layer_config.json:validated_frontier:kneedle"
+    assert got["selected_label"] == "allocator_target_4p7500_achieved_4p7496"
+
+
+def test_allocator_written_recipe_prefers_its_own_metadata(tmp_path):
+    """No validated selection: the recipe's own achieved_bits still wins.
+
+    It is coupled to this file; the knee file is a separate artifact that can
+    describe a different point.
+    """
+    from prismaquant.shipcard import allocator_achieved_bpp
+
+    recipe = tmp_path / "layer_config.json"
+    recipe.write_text(json.dumps({
+        "model.layers.0.mlp.up_proj": {"bits": 4},
+        "__prismaquant__": {
+            "schema": "prismaquant.layer_config_meta.v1",
+            "achieved_bits": 4.7513,
+            "target_bits": 4.75,
+            "achieved_bits_scope": "body_assignment_tensor_payload",
+        },
+    }))
+    (tmp_path / "pareto.knees.json").write_text(json.dumps({
+        "primary": "log_error",
+        "log_error": {"achieved_bits": 5.999404111844319, "target_bits": 6.0},
+    }))
+
+    got = allocator_achieved_bpp(recipe)
+    assert got["value"] == pytest.approx(4.7513)
+    assert got["source"] == "layer_config.json:achieved_bits"
+    assert got["scope"] == "body_assignment_tensor_payload"
+
+
+def test_validated_selection_without_a_bpp_reports_nothing(tmp_path):
+    """Announcing a validated selection but stamping no bpp must not fall back.
+
+    The knee file describes the surrogate frontier, i.e. some OTHER point, so
+    silence is correct and a number would be a fabrication.
+    """
+    from prismaquant.shipcard import allocator_achieved_bpp
+
+    recipe = tmp_path / "layer_config.json"
+    recipe.write_text(json.dumps({
+        "model.layers.0.mlp.up_proj": {"bits": 4},
+        "__prismaquant__": {
+            "schema": "prismaquant.layer_config_meta.v1",
+            "selected_by": "validated_frontier:kneedle",
+        },
+    }))
+    (tmp_path / "pareto.knees.json").write_text(json.dumps({
+        "primary": "log_error",
+        "log_error": {"achieved_bits": 5.999404111844319},
+    }))
+
+    got = allocator_achieved_bpp(recipe)
+    assert got["value"] is None
+    assert "no bpp stamped" in got["source"]
+
+
 # ---------------------------------------------------------------------------
 def test_cli_verify_exit_codes(tmp_path, capsys):
     model_dir = _artifact(tmp_path)

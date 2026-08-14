@@ -3020,13 +3020,65 @@ def allocator_achieved_bpp(
 ) -> dict[str, Any]:
     """Best-effort achieved bpp, with its provenance named.
 
-    The exporter is handed a recipe, not a bpp. The allocator's own number lives
-    in `pareto.knees.json` next to `layer_config.json`; read it and *say where it
-    came from* rather than recomputing an accounting-convention-sensitive number
-    (CLAUDE.md principle 12: bpp labels are not comparable across eras).
+    The exporter is handed a recipe, not a bpp, so this reports someone else's
+    number and *says whose* rather than recomputing an
+    accounting-convention-sensitive one (CLAUDE.md principle 12: bpp labels are
+    not comparable across eras).
+
+    Prefer the recipe's OWN metadata over `pareto.knees.json`. The knee file is
+    a different file describing the *surrogate* frontier, and under
+    `SELECTION_MODE=validated-surrogate` it does not describe the recipe beside
+    it: `select_validated_frontier` overwrites `layer_config.json` with the
+    measured pick and stamps `selected_achieved_bits` into it. On Qwen3.8-27B
+    arm B those disagreed by 1.25 bpp — the card claimed the surrogate knee's
+    5.9994 for bytes that were the validated 4.7496 — which is a false public
+    claim and would silently break any matched-bpp comparison built on it.
+
+    Note that the same metadata's plain `achieved_bits` is *stale* on a
+    validated recipe: the frontier carries the allocator's block forward
+    verbatim (it owns the serving profile the exporter needs), so that field
+    still describes the allocator's pre-selection run. Hence `selected_by`
+    wins, and a recipe that announces a validated selection without a number
+    reports nothing rather than falling through to a knee file that is
+    describing some other point.
     """
     if not layer_config_path:
         return {"value": None, "source": None}
+    try:
+        from prismaquant.layer_config import read_layer_config_metadata
+        meta = dict(read_layer_config_metadata(layer_config_path) or {})
+    except Exception:
+        meta = {}
+    selected_by = meta.get("selected_by")
+    if selected_by:
+        value = meta.get("selected_achieved_bits")
+        if value is None:
+            return {
+                "value": None,
+                "source": f"layer_config.json:{selected_by} (no bpp stamped)",
+            }
+        return {
+            "value": float(value),
+            "source": f"layer_config.json:{selected_by}",
+            "selected_label": meta.get("selected_label"),
+            "scope": meta.get("achieved_bits_scope"),
+            "note": (
+                "the bpp of the assignment this recipe actually holds, stamped "
+                "by the stage that selected it; it describes the recipe, not "
+                "the exported bytes"
+            ),
+        }
+    if meta.get("achieved_bits") is not None:
+        return {
+            "value": float(meta["achieved_bits"]),
+            "source": "layer_config.json:achieved_bits",
+            "target_bits": meta.get("target_bits"),
+            "scope": meta.get("achieved_bits_scope"),
+            "note": (
+                "the allocator's achieved bpp for this recipe; it describes "
+                "the recipe, not the exported bytes"
+            ),
+        }
     knees = Path(layer_config_path).parent / "pareto.knees.json"
     if not knees.is_file():
         return {"value": None, "source": None}
