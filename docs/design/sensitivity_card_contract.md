@@ -88,10 +88,12 @@ flagged rather than hidden.
 
 ## 4. Why the storage projection collapses
 
-The 18 TB figure is a property of **rendered menu caches**: every (Linear,
-format) pair rendered and stored so its error can be measured. The card removes
-the need for that entirely, because weight error is computed **locally** from
-`W` plus the format's own quantizer:
+The 18 TB figure is *consistent with* the cost of a **rendered menu cache**:
+every (Linear, format) pair rendered and stored so its error can be measured.
+(I did not locate the original derivation, so treat the attribution as inferred
+— the measured card sizes in §3 answer the question either way.) The card
+removes the need for such a cache entirely, because weight error is computed
+**locally** from `W` plus the format's own quantizer:
 
 ```python
 class FormatCostPlugin(Protocol):
@@ -200,6 +202,20 @@ objects. The card is a single compressed `.npz` with a JSON header.
 
 ## 8. What is proven, and what is not
 
+**Proven on REAL production artifacts** (`tools/validate_card_zero_churn.py`,
+2026-08-14) — the scalar tier prices bit-for-bit like the shipping allocator on
+two completed Qwen3.6-27B runs:
+
+| run | units | formats | pairs | bit-identical | worst rel. dev. |
+|---|---:|---:|---:|---:|---:|
+| `prod-27b-nvfp4cb-5p5` | 505 | 7 | 3,528 | **3,528** | 0.0 |
+| `prod-27b-cb-20gb` | 505 | 37 | 18,648 | **18,648** | 0.0 |
+
+**22,176 real (unit, format) pairs, zero deviation.** So switching a pipeline to
+the card's SCALAR tier is a no-op for allocation — no shipped artifact needs
+re-validating. (This says nothing about MARGINAL or AQUA, which are *supposed*
+to differ; see below.)
+
 **Proven (unit tests, 17/17):**
 - the scalar tier reproduces `allocator_solver.predicted_dloss` *exactly*;
 - the marginal tier is exact on a rank-1 Fisher (`rtol=1e-10`);
@@ -220,10 +236,18 @@ objects. The card is a single compressed `.npz` with a JSON header.
 - The `8 * sigma` Gaussian range fallback (used only when `act_absmax` is
   absent) is a surrogate, which is why `act_absmax` is preferred and captured.
 
+- **The probe's marginal emission has never run on a real model.** It is
+  default-ON but has only been exercised by synthetic fixtures — no real hooks,
+  no real bf16 accumulation. `tools/validate_probe_marginals.py` exists to
+  measure the identity `sum(fisher_row) == sum(fisher_col) == h_trace_raw` on a
+  real probe and *report* the empirical tolerance rather than assume one. **Run
+  it before any probe that matters.**
+
 **Required before promotion:** (a) rank-agreement of marginal pricing against
-measured `output_mse` on a small model, (b) allocation churn vs a shipped
-`cost.pkl` within the known ~3% noise, (c) a served W4A4-vs-W4A8 A/B before
-AQUA-AURA is default-on.
+measured `output_mse` on a small model, (b) ~~allocation churn vs a shipped
+`cost.pkl`~~ — **done for SCALAR, exactly zero on 22,176 real pairs**; still
+open for MARGINAL, (c) a served W4A4-vs-W4A8 A/B before AQUA-AURA is default-on,
+(d) `validate_probe_marginals.py` green on a real probe.
 
 ## 9. Publishing (prismaquant.org)
 
