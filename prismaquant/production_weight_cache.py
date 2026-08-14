@@ -117,6 +117,32 @@ CB_TRANSIENT_CONSUMER_RECEIPT_SCHEMA = (
 )
 
 
+# Formats whose WEIGHT PLANE is the same artifact and must therefore get the
+# same production render.
+#
+# NVFP4 and NVFP4A16 are one serialization: identical packed 4-bit weights,
+# identical group scales, identical per-tensor global scale. They differ only in
+# whether the config group declares `input_activations`, which vLLM reads to
+# pick W4A4 (CUTLASS) or W4A16 (Marlin) at RUNTIME. The bytes on disk are the
+# same bytes.
+#
+# The render gate used to be `fmt == "NVFP4"` literally, so NVFP4A16 fell
+# through to the registry RTN path and shipped weights that had never seen
+# GPTQ, static_act_order or JSO -- measured max|diff| 0.0217 against NVFP4 on a
+# 512x1024 Linear. That made A16 strictly WORSE on the weight plane, so any
+# A16-vs-A4 comparison measured the rendering difference rather than the
+# activation contract: a rendering confound, principle 8's exact prohibition,
+# and it silently biased the allocator against ever choosing A16.
+#
+# GPTQ's objective is ||WX - W_hat X|| under the CALIBRATION activations, which
+# are the true unquantized ones in both contracts. Nothing in the weight solve
+# depends on whether activations are quantized at serve time, so the same
+# render is not merely acceptable for both -- it is the correct one, and
+# sharing it makes the activation axis genuinely byte-free AND render-free.
+# That is what lets one production cache entry serve both contracts.
+NVFP4_RENDER_EQUIVALENT = frozenset({"NVFP4", "NVFP4A16"})
+
+
 def _render_base_format(fmt: str) -> str:
     return str(fmt).strip().upper()
 
@@ -4272,7 +4298,7 @@ def render_production_weight(
     }:
         raise ValueError("activation clip rescaling is not supported")
     progressive_gates = _env_flag("PRISMAQUANT_RENDER_PROGRESSIVE_GATES", True)
-    if fmt == "NVFP4" and progressive_gates:
+    if fmt in NVFP4_RENDER_EQUIVALENT and progressive_gates:
         return _render_nvfp4_progressively(
             weight,
             qname=qname,
@@ -4285,7 +4311,7 @@ def render_production_weight(
             gate_trace=gate_trace,
         )
 
-    if fmt != "NVFP4":
+    if fmt not in NVFP4_RENDER_EQUIVALENT:
         spec = fr.get_format(fmt)
         acts = activations.get(qname)
         acts_for_render = (
