@@ -122,6 +122,152 @@ class RegistryFormatPlugin:
             err = (w.float() - q.float()) ** 2
         return err.cpu().numpy()
 
+    # ------------------------------------------------- reduced (chunked) cost
+
+    def weight_cost_reduced(self, unit: SensitivityUnit,
+                            weight: np.ndarray,
+                            *, chunk_bytes: int = 256 << 20,
+                            ) -> tuple[float, float] | None:
+        """``(mean(dw^2), row @ dw^2 @ col)`` without ever materializing dw^2.
+
+        WHY THIS EXISTS. Both quantities the coster needs are REDUCTIONS of the
+        elementwise squared error, and :meth:`weight_error` returns that error as
+        a dense ``[out, in]`` fp32 array on the HOST. For a body Linear that is a
+        356 MB round trip; for a large-vocab ``lm_head`` (248320 x 5120) it is
+        5.08 GB, and ``price`` then builds several more arrays of that shape in
+        float64 to reduce it. On GB10, where the GPU and host share one physical
+        pool, those transients are what actually exhaust the box -- and they do
+        it INVISIBLY to host RSS, because CUDA device memory is not charged to
+        the process. Measured: an 89M-param unit settles at 9.8 GiB reserved, so
+        `lm_head` at 14x that scale has no chance.
+
+        The fix is to keep the reduction on the device and stream it in row
+        chunks. Peak device memory becomes ``w + q`` (bf16, so 2 bytes each) plus
+        one chunk, instead of five dense fp32 copies. It is also markedly faster:
+        the dense path was bus- and host-bound, which is why the GPU sat at low
+        utilization during costing -- exactly the "launch-overhead-bound, 96% at
+        11 W" signature this codebase warns about.
+
+        CRITICALLY, ``quantize_dequantize`` still runs on the WHOLE tensor. Only
+        the reduction is chunked. Formats whose scales are computed per tensor
+        (rather than per group along the input axis) would otherwise see a
+        different scale per chunk and silently render something the exporter
+        never ships -- a rendering confound, which is the one thing the "one
+        cache mechanism" rule exists to prevent.
+
+        Accumulation is float64 for both outputs, so the only difference from the
+        dense path is summation ORDER, at fp64 precision. Returns ``None`` for a
+        passthrough format (exactly zero error by construction) and when the card
+        carries no marginals, letting the caller keep its existing fallbacks.
+        """
+        if self.descriptor.passthrough:
+            return (0.0, 0.0)
+        if not unit.has_vectors or unit.h_trace_raw <= 0.0:
+            return None
+
+        w = torch.as_tensor(np.asarray(weight), dtype=torch.bfloat16,
+                            device=self.device)
+        out_features, in_features = int(w.shape[0]), int(w.shape[1])
+        qdq = self._row_chunked_qdq(w)
+        if qdq is None:
+            return None
+        row = torch.as_tensor(np.asarray(unit.fisher_row), dtype=torch.float64,
+                              device=self.device)
+        col = torch.as_tensor(np.asarray(unit.fisher_col), dtype=torch.float64,
+                              device=self.device)
+
+        # One chunk holds `rows x in_features` in fp32 several times over; size
+        # it from a byte budget so the peak is bounded by configuration rather
+        # than by whatever shape the model happens to have.
+        rows_per_chunk = max(1, int(chunk_bytes // max(1, in_features * 4)))
+
+        total_sq = torch.zeros((), dtype=torch.float64, device=self.device)
+        quad = torch.zeros((), dtype=torch.float64, device=self.device)
+        with torch.no_grad():
+            for lo in range(0, out_features, rows_per_chunk):
+                hi = min(lo + rows_per_chunk, out_features)
+                blk = w[lo:hi]
+                dd = ((blk.float() - qdq(blk).float()) ** 2).double()
+                total_sq += dd.sum()
+                # row-block @ (dw^2 block @ col) -- the same bilinear form the
+                # dense path computes, accumulated block by block.
+                quad += row[lo:hi] @ (dd @ col)
+                del blk, dd
+            del w
+        n = float(out_features) * float(in_features)
+        return (float(total_sq.item()) / n, float(quad.item()))
+
+    # ------------------------------------------------------ chunking the QDQ
+
+    #: Formats whose render is row-separable: every scale they derive is local
+    #: to a group along the INPUT axis, so quantizing a row block gives bitwise
+    #: the same result as quantizing the whole tensor. Verified by test, not
+    #: assumed -- ``tests/test_row_chunked_qdq.py`` asserts bitwise equality.
+    ROW_SEPARABLE_FAMILIES = ("mx",)
+
+    def _row_chunked_qdq(self, w: "torch.Tensor"):
+        """A callable rendering ONE row block exactly as the full tensor would.
+
+        This is the piece that actually bounds memory. Chunking the reduction
+        alone was not enough: ``quantize_dequantize`` still ran on the whole
+        tensor, and for a 248320 x 5120 ``lm_head`` its fp32 internals reserved
+        **102 GiB** on a box with 121 -- measured, and the direct cause of an
+        OOM that RSS never showed, since CUDA device memory is not charged to
+        the process on GB10's unified pool.
+
+        Row-chunking is NOT universally safe, which is why this is a method and
+        not a one-liner. NVFP4 derives a per-TENSOR global scale, so naively
+        rendering a block picks a different scale and produces different bytes
+        (measured max|diff| 2.4e-2 -- not rounding noise, a different render,
+        i.e. exactly the rendering confound the one-cache rule forbids). The
+        export codec anticipates this and takes ``global_real_override``, so the
+        scale is computed ONCE over the whole tensor and pinned for every block,
+        which is bitwise identical to the unchunked render by construction.
+
+        Returns ``None`` when this format has no proven-safe chunked render, so
+        the caller falls back to the dense path rather than silently shipping a
+        different rendering.
+        """
+        import torch
+
+        spec = self.spec
+        name = spec.name
+        if self.descriptor.passthrough or name == "BF16":
+            return lambda blk: blk
+
+        # Per-row / per-group only: separable by construction.
+        if name.startswith("FP8_E4M3") or spec.family in self.ROW_SEPARABLE_FAMILIES:
+            return lambda blk: spec.quantize_dequantize(blk.contiguous())
+
+        if name in ("NVFP4", "NVFP4A16"):
+            from . import export_native_compressed as enc
+
+            group = 16
+            in_f = int(w.shape[1])
+            if in_f % group != 0:
+                return None
+            # Pass 1: the tensor-global scale, accumulated block by block so the
+            # full [rows, groups, 16] view never exists at once.
+            rows_scan = max(1, int((256 << 20) // max(1, in_f * 4)))
+            gmax = torch.zeros((), dtype=torch.float32, device=w.device)
+            for lo in range(0, int(w.shape[0]), rows_scan):
+                blk = w[lo:lo + rows_scan].float()
+                grouped = blk.reshape(blk.shape[0], in_f // group, group)
+                s = enc._select_nvfp4_group_scales(grouped)
+                gmax = torch.maximum(gmax, s.amax())
+                del blk, grouped, s
+            global_real = (gmax / enc.FP8_E4M3_MAX).clamp_min(1e-12)
+
+            def _qdq(blk):
+                out = enc._rtn_dequant_nvfp4(
+                    blk.float(), group_size=group,
+                    global_real_override=global_real)
+                return out.to(blk.dtype)
+
+            return _qdq
+
+        return None
+
     # -------------------------------------------------------- activation side
 
     def activation_error_variance(self, unit: SensitivityUnit,

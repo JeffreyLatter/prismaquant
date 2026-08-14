@@ -265,14 +265,26 @@ def activation_dloss(unit: SensitivityUnit, weight: np.ndarray,
     if unit.g_sq_sum is None:
         return None
     g_sq = np.asarray(unit.g_sq_sum, dtype=np.float64)
-    w_sq = np.asarray(weight, dtype=np.float64) ** 2
+    w = np.asarray(weight)
     var = np.asarray(act_var, dtype=np.float64)
-    if w_sq.shape != (unit.out_features, unit.in_features):
+    if w.shape != (unit.out_features, unit.in_features):
         raise ValueError(f"{unit.topology.name}: weight shape mismatch")
     if var.shape != (unit.in_features,):
         raise ValueError(f"{unit.topology.name}: act_var shape mismatch")
-    per_out = w_sq @ var                      # [out]
-    total = float(g_sq @ per_out)
+
+    # Chunked over output rows. Promoting the whole weight to float64 and
+    # squaring it costs 8 bytes per parameter -- 10.2 GiB for a 248320 x 5120
+    # lm_head, before the matvec's own temporary -- which is enough on its own
+    # to exhaust a shared 121 GiB pool once a few formats are priced back to
+    # back. The result is a sum over rows, so a row-blocked accumulation is
+    # arithmetically the same quantity at a bounded peak. float64 accumulation
+    # is kept exactly as before.
+    rows_per_chunk = max(1, int((64 << 20) // max(1, unit.in_features * 8)))
+    total = 0.0
+    for lo in range(0, unit.out_features, rows_per_chunk):
+        hi = min(lo + rows_per_chunk, unit.out_features)
+        w_sq = np.asarray(w[lo:hi], dtype=np.float64) ** 2
+        total += float(g_sq[lo:hi] @ (w_sq @ var))
     return 0.5 * (total / max(1, unit.n_tokens)) * float(gain)
 
 
@@ -497,13 +509,33 @@ def price(unit: SensitivityUnit, weight: np.ndarray,
     if not desc.is_legal_for(unit):
         return None
 
-    dw_sq = plugin.weight_error(unit, weight)
-    weight_mse = float(np.mean(dw_sq))
+    # Prefer a plugin that can REDUCE the weight error without handing back a
+    # dense [out, in] array. Both quantities below are reductions, so the dense
+    # array is pure overhead -- and on a large-vocab lm_head it is gigabytes of
+    # it, in device memory that host RSS does not even show. A plugin without
+    # this method, or one returning None (no marginals to contract against),
+    # falls through to the dense path unchanged.
+    reduced = None
+    if model is not CostModel.SCALAR:
+        reduce_fn = getattr(plugin, "weight_cost_reduced", None)
+        if callable(reduce_fn):
+            reduced = reduce_fn(unit, weight)
 
-    if model is CostModel.SCALAR:
-        w_dloss = weight_dloss_scalar(unit, weight_mse, gain)
+    if reduced is not None:
+        weight_mse, quad = reduced
+        if unit.has_vectors and unit.h_trace_raw > 0.0:
+            w_dloss = 0.5 * (quad / unit.h_trace_raw
+                             / max(1, unit.n_tokens)) * float(gain)
+        else:
+            w_dloss = weight_dloss_scalar(unit, weight_mse, gain)
+        dw_sq = None
     else:
-        w_dloss = weight_dloss_marginal(unit, dw_sq, gain)
+        dw_sq = plugin.weight_error(unit, weight)
+        weight_mse = float(np.mean(dw_sq))
+        if model is CostModel.SCALAR:
+            w_dloss = weight_dloss_scalar(unit, weight_mse, gain)
+        else:
+            w_dloss = weight_dloss_marginal(unit, dw_sq, gain)
 
     a_dloss: float | None = None
     if model is CostModel.AQUA and desc.quantizes_activations:
