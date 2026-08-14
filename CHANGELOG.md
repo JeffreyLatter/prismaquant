@@ -1,5 +1,52 @@
 # Changelog
 
+## 0.13.0 — 2026-08-14
+
+### Added
+
+- **The Sensitivity Card** — a shareable, probe-once artifact that carries
+  everything an optimizer needs to price an *arbitrary* format menu, so a new
+  format costs a registry entry rather than a new probe. `sensitivity_card.py`
+  builds and validates it, `format_cost_protocol.py` + `format_cost_registry.py`
+  are the plugin seam, and `sensitivity_card_allocate.py` feeds the real
+  allocator DP. The card compresses the probe's per-Linear Fisher structure to
+  per-channel marginals — 104.2 GB down to 75.2 MB on 27B — because the
+  marginals are out+in vectors, not the full outer product.
+  See `docs/design/sensitivity_card_contract.md`.
+- **AQUA-AURA** — activation-quantization awareness. AURA is provably blind to
+  the W4A4/W4A8 choice today: NVFP4 and NVFP4A16 render weights *bit-identically*
+  (max `dW` difference 0.0) while differing 9.42% RMS on activations, so the DP
+  cannot see the difference no matter how it is weighted. `speed_quality_frontier.py`
+  adds the speed/quality lever as a **constraint on a Pareto frontier, never a
+  weight** — activation format changes speed and quality but not bytes, so it
+  does not belong in the byte-budget objective.
+  See `docs/design/aqua_aura_activation_awareness.md`.
+
+### Fixed
+
+- `incremental_probe.py` computed `lm_head`'s `h_trace` through the
+  outer-product-norm identity with both reductions in **bf16**. That reduction
+  runs over the output dim — the vocabulary, ~152k addends on Qwen3 against
+  ~1–5k for a body Linear — so with 8 mantissa bits it cost ~1e-3 relative on
+  `lm_head` and ~1e-8 everywhere else. `lm_head` was consequently the only unit
+  of 197 failing `SensitivityCard.validate()`. The trace is now taken from the
+  same fp32 object the marginals reduce, which both body-layer sites already
+  did, so `sum(fisher_row) == sum(fisher_col) == h_trace_raw` holds by
+  construction rather than by numerical coincidence. Measured on Qwen3-0.6B
+  n=8 T=512: row-vs-trace agreement 1.019e-03 → 2.781e-08, card validation
+  failures 1 → 0. `lm_head` sits in the allocator's non-quantizable floor by
+  default, so no default allocation changes; a run that opts it back in with
+  `--allow-pinned lm_head` now prices it correctly rather than through a bf16
+  vocabulary-length reduction.
+
+### Changed
+
+- The probe now emits five per-channel Fisher marginal vectors into `probe.pkl`
+  unless told not to. **This is the only shipping default this release changes,
+  and it is probe-side.** The card, its three cost tiers and AQUA-AURA are
+  additive modules with no `run-pipeline.sh` call site, no `COST_MODE` value,
+  and no served validation — they allocate nothing today, by design.
+
 ## 0.12.3 — 2026-08-14
 
 ### Fixed
