@@ -7,6 +7,9 @@ live tables (§9.1) and re-resolved every `file.py:NNN` in this document that
 pointed past its file's EOF — the split moved the L3 half of
 `kl_measurement.py` into `archive/l3_propagated_2026-07-30/` and the citations
 were never re-anchored.
+*2026-08-14: one row added, `PRISMAQUANT_PROBE_MARGINALS` (§1) — a new
+probe-module default, not a `run-pipeline.sh` variable. No other row re-verified
+on that pass.*
 Method: AST + literal sweep of `os.environ` / `os.getenv` / `_env_flag` /
 `_env_int` / `_env_flag_enabled` / registry `*_env=` parameters / `pq_env_*`
 across `prismaquant/`, `tools/`, `scripts/`, `pipeline.py`, and the separately
@@ -41,6 +44,7 @@ and never sees a build flag.
 | `PRISMAQUANT_ACT_CACHE_FP32` | `1` | `incremental_probe.py:1770` / `:2561` | Store cached activations in fp32 rather than the model dtype. |
 | `PRISMAQUANT_DIRECT_CUDA_LOAD` | **on** | `layer_streaming.py:103` | Pass `device=cuda:N` to `safetensors.safe_open` so layer tensors land on the GPU directly instead of going through a host stage. ~10-30 ms saved per layer load. Falls back transparently if safetensors complains. |
 | `PRISMAQUANT_COST_PREFETCH_ACT` | **on** | `measure_quant_cost.py:1518` | `measure_batched_gpu` prefetches chunk N+1's activation files on a thread pool while chunk N runs on the GPU. Hides ~30-40% of the cost step's wall on big models. |
+| `PRISMAQUANT_PROBE_MARGINALS` | **on** | `incremental_probe.py:94` (`_marginals_enabled`); CLI twin `--emit-marginals` / `--no-emit-marginals` publishes into this env var at `:3486` | Emit five per-channel vectors per Linear into `probe.pkl` alongside the scalars: `fisher_row [out]`, `fisher_col [in]` (the two marginals of the per-element weight Fisher `H`, which is itself unstorable at ~800 GB), plus `g_sq_sum [out]`, `act_sq_sum [in]`, `act_absmax [in]`. Cost is `(2·out + 3·in)·4` bytes per Linear and **no extra matmul** — every reduction is taken off the `chunk_h` each accumulation site already forms. They are what the Sensitivity Card prices an arbitrary format menu from (ARCHITECTURE.md §4.8); nothing in the production allocator reads them yet. `0` / `--no-emit-marginals` restores byte-identical legacy output. `run-pipeline.sh` sets nothing, so this is a **module** default, not a shell one. Sums add elementwise across chunks and shards; `act_absmax` is a bound and merges by elementwise **maximum** (one `merge_marginals` shared by the per-layer flush and the cross-shard merge). Because the flag decides WHICH KEYS a stats entry carries rather than how work is grouped, it is part of the precompute-cache fingerprint, `_expected_probe_shard_meta`, and `_CONTENT_META_KEYS` (`5639a8b`): a flag-off shard is rebuilt rather than pooled into a flag-on run, including shards written before the key existed. Tests: `tests/test_probe_marginals.py`. |
 | `PRISMAQUANT_PROBE_DOMAIN` | unset | `incremental_probe.py:970` | Calibration-domain tag stamped into probe provenance. |
 | `PRISMAQUANT_PROBE_CTX_CACHE` | unset | `incremental_probe.py:3126` | Reuse the cross-chunk probe context cache. |
 | `PRISMAQUANT_PROBE_RETAIN_CROSS_CHUNK` | unset | `incremental_probe.py:3143` | Retain cross-chunk probe state instead of dropping it between chunks. |
