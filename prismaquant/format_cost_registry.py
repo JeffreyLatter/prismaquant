@@ -69,6 +69,11 @@ def descriptor_for(spec: FormatSpec, *, shape: tuple[int, int],
         act_bits=spec.act_bits if quantizes else None,
         quantizes_activations=quantizes,
         group_size=spec.group_size or None,
+        # Carried across for the same reason as act_bits: the A-side error model
+        # needs the A-side grouping. Every activation-quantizing format in the
+        # shipped menu is block scaled (NVFP4 16, MX 32), so dropping this made
+        # the analytic fallback wrong for 100% of the formats it could fire on.
+        act_group_size=(spec.act_group_size or None) if quantizes else None,
         passthrough=spec.name in PASSTHROUGH_SOURCE_DTYPE,
         requires_source_dtype=PASSTHROUGH_SOURCE_DTYPE.get(spec.name),
         speed_index=speed_index,

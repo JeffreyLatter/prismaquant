@@ -15,6 +15,8 @@ from prismaquant.format_cost_protocol import (
     CostModel,
     FormatDescriptor,
     activation_dloss,
+    analytic_act_quant_variance,
+    block_scaled_act_quant_variance,
     price,
     uniform_act_quant_variance,
     weight_dloss_marginal,
@@ -386,3 +388,177 @@ def test_structure_is_carried_but_not_policy():
         "model.layers.0.self_attn.q_proj", "model.layers.0.self_attn.k_proj"}
     # The card exposes no serving policy at all -- that is the consumer's job.
     assert not hasattr(card, "must_share_format")
+
+
+# ------------------------------------------- AQUA-1: block-scaled A-side model
+#
+# The uniform model sets the activation step from act_absmax -- the largest
+# value a channel reached over the WHOLE calibration. Every activation-
+# quantizing format in the shipped registry is block scaled (NVFP4 G=16, MX
+# G=32) and rescales per token per block, so that step is wrong for 100% of the
+# formats the fallback can fire on, and wrong in the direction that penalises
+# W4A4. These tests hold the replacement to a simulated quantizer.
+
+A_BITS, A_GROUP = 4, 16
+A_IN, A_OUT, A_TOK = 128, 8, 512
+
+
+def _unit_from_activations(x: np.ndarray, seed: int = 0) -> SensitivityUnit:
+    """A unit whose A-side vectors are the TRUE marginals of activations ``x``."""
+    rng = np.random.default_rng(seed)
+    n_tok, n_in = x.shape
+    g_sq = rng.random((n_tok, A_OUT)) + 0.1
+    x_sq = x ** 2
+    H = g_sq.T @ x_sq
+    w = rng.standard_normal((A_OUT, n_in))
+    return SensitivityUnit(
+        topology=UnitTopology(name="model.layers.0.mlp.down_proj", layer_index=0,
+                              role="down", fused_group=None,
+                              source_dtype="bfloat16"),
+        out_features=A_OUT, in_features=n_in, n_params=A_OUT * n_in,
+        n_tokens=n_tok,
+        h_trace_raw=float(H.sum()), h_w2_sum_raw=float((H * w ** 2).sum()),
+        w_norm_sq=float((w ** 2).sum()), w_max_abs=float(np.abs(w).max()),
+        fisher_row=H.sum(axis=1), fisher_col=H.sum(axis=0),
+        act_sq_sum=x_sq.sum(axis=0), g_sq_sum=g_sq.sum(axis=0),
+        act_absmax=np.abs(x).max(axis=0),
+    )
+
+
+def _simulate_block_act_error_var(x: np.ndarray, bits: int = A_BITS,
+                                  group: int = A_GROUP) -> np.ndarray:
+    """Ground truth: per-channel error variance of a dynamic per-token,
+    per-block absmax grid -- what an NVFP4/MX kernel actually does."""
+    n_in = x.shape[1]
+    err = np.empty_like(x, dtype=np.float64)
+    for start in range(0, n_in, group):
+        blk = x[:, start:start + group].astype(np.float64)
+        absmax = np.abs(blk).max(axis=1, keepdims=True)
+        step = 2.0 * absmax / float(2 ** bits)
+        step = np.where(step > 0.0, step, 1.0)
+        err[:, start:start + group] = np.round(blk / step) * step - blk
+    return (err ** 2).mean(axis=0)
+
+
+def _hetero_activations(seed: int = 7, *, massive: bool = False) -> np.ndarray:
+    """Activations with heterogeneous per-channel scales.
+
+    ``massive=True`` additionally gives 2% of tokens a 30x magnitude spike --
+    the "massive activation" phenomenon real LLMs exhibit at delimiter/BOS
+    positions. That is the regime where a global-absmax step and a per-token
+    block step diverge, so it is what the non-vacuity test uses. It was chosen
+    for being representative and STABLE (uniform lands at 19.7-22.6x across
+    seeds 7/8/9); an earlier fixture that spiked 6 individual (token, channel)
+    cells varied between 3x and 30x depending on where the spikes fell, which
+    would have made the threshold a coin flip rather than a property.
+    """
+    rng = np.random.default_rng(seed)
+    scales = np.exp(rng.normal(0.0, 0.8, size=A_IN))
+    x = rng.standard_normal((A_TOK, A_IN)) * scales
+    if massive:
+        n_spiked = max(1, int(0.02 * A_TOK))
+        x[rng.choice(A_TOK, n_spiked, replace=False), :] *= 30.0
+    return x
+
+
+@pytest.mark.parametrize("massive", [False, True])
+def test_block_model_tracks_a_simulated_block_quantizer(massive):
+    """The analytic block model must track the real quantizer's error."""
+    x = _hetero_activations(massive=massive)
+    u = _unit_from_activations(x)
+
+    analytic = block_scaled_act_quant_variance(u, A_BITS, A_GROUP)
+    sim = _simulate_block_act_error_var(x)
+
+    ratio = float(np.median(analytic / sim))
+    # Measured at authoring time: 1.04 clean, 1.17 with massive tokens. The
+    # residual is the step^2/12 quantizer model, not the order statistic --
+    # E[blockmax^2] itself matches simulation to within 0.1%.
+    assert 0.7 < ratio < 1.5, (
+        f"block model median ratio {ratio:.3f} vs simulated quantizer")
+
+
+def test_block_model_beats_the_global_absmax_model_it_replaces():
+    """NON-VACUITY: the fix must actually move the number.
+
+    Without this, a block model that silently equalled the uniform one would
+    still pass the tracking test above on a benign fixture. Activation outliers
+    are the regime that separates them, and the regime real LLMs live in.
+    """
+    x = _hetero_activations(massive=True)
+    u = _unit_from_activations(x)
+    sim = _simulate_block_act_error_var(x)
+
+    block = block_scaled_act_quant_variance(u, A_BITS, A_GROUP)
+    uniform = uniform_act_quant_variance(u, A_BITS)
+
+    uniform_err = float(uniform.mean() / sim.mean())
+    block_err = float(block.mean() / sim.mean())
+
+    # Measured at authoring time: uniform overstates by 22.6x, block by 1.08x
+    # (19.7-22.6x / 1.08-1.23x across seeds 7/8/9).
+    assert uniform_err > 10.0, (
+        f"fixture is not discriminating: uniform only off by {uniform_err:.1f}x")
+    assert block_err < 3.0, f"block model off by {block_err:.1f}x"
+    assert block_err < uniform_err / 5.0
+
+
+def test_block_model_needs_act_sq_sum_and_says_so():
+    """A per-channel SCALE is required; act_absmax alone would smuggle the
+    global maximum back in, which is the error being removed."""
+    u = _unit_from_activations(_hetero_activations())
+    stripped = SensitivityUnit(**{**u.__dict__, "act_sq_sum": None})
+    assert block_scaled_act_quant_variance(stripped, A_BITS, A_GROUP) is None
+
+
+def test_block_model_handles_a_ragged_final_block():
+    """in_features need not be a multiple of the group size."""
+    x = _hetero_activations()[:, :A_IN - 5]            # 123 channels, G=16
+    u = _unit_from_activations(x)
+    var = block_scaled_act_quant_variance(u, A_BITS, A_GROUP)
+    assert var.shape == (A_IN - 5,)
+    assert np.all(np.isfinite(var)) and np.all(var > 0.0)
+
+
+def test_analytic_dispatch_follows_the_declared_activation_grid():
+    """A block-scaled descriptor must get the block model, not the uniform one.
+
+    Dispatch is on declared metadata, so an arbitrary downstream format is
+    priced correctly without editing the protocol module.
+    """
+    u = _unit_from_activations(_hetero_activations(massive=True))
+    blocked = FormatDescriptor(name="W4A4_BLOCK", weight_bits=4.0, act_bits=A_BITS,
+                               quantizes_activations=True, act_group_size=A_GROUP)
+    per_channel = FormatDescriptor(name="W4A4_FLAT", weight_bits=4.0,
+                                   act_bits=A_BITS, quantizes_activations=True)
+
+    got_block = analytic_act_quant_variance(u, blocked)
+    got_flat = analytic_act_quant_variance(u, per_channel)
+
+    assert np.allclose(
+        got_block, block_scaled_act_quant_variance(u, A_BITS, A_GROUP))
+    assert np.allclose(got_flat, uniform_act_quant_variance(u, A_BITS))
+    # And they must genuinely differ, or the dispatch proves nothing.
+    assert got_flat.mean() > 5.0 * got_block.mean()
+
+
+def test_registry_descriptor_carries_the_activation_group_size():
+    """The A-side grouping must survive the FormatSpec -> descriptor hop.
+
+    It was being dropped, which is what made the analytic fallback wrong for
+    every format it could fire on.
+    """
+    from prismaquant.format_cost_registry import descriptor_for
+    from prismaquant.format_registry import REGISTRY
+
+    nvfp4 = descriptor_for(REGISTRY["NVFP4"], shape=(A_OUT, A_IN))
+    assert nvfp4.act_group_size == 16
+    assert nvfp4.group_size == 16
+
+    mx = descriptor_for(REGISTRY["MXFP4"], shape=(A_OUT, A_IN))
+    assert mx.act_group_size == 32
+
+    # A format that does not touch activations carries no activation grid.
+    a16 = descriptor_for(REGISTRY["NVFP4A16"], shape=(A_OUT, A_IN))
+    assert a16.quantizes_activations is False
+    assert a16.act_group_size is None
