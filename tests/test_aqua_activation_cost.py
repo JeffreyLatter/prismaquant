@@ -209,6 +209,44 @@ def test_the_a_side_does_not_depend_on_the_weights_being_rendered():
         "the A-side must be a pure function of (unit, dense weight, format)")
 
 
+def test_an_explicit_act_var_wins_over_the_modelled_one():
+    """Real measured activations must not be silently overridden by the model.
+
+    ``act_var`` is the one factor in the A-side that is not measured by default:
+    the plugin runs the real quantizer but over independent per-channel
+    Gaussians, which reproduce every channel's marginal and destroy the joint --
+    and an NVFP4 block scale is a function of the joint, since 16 consecutive
+    channels share one scale set by the largest magnitude among them.
+
+    So when a caller has the layer's REAL input rows, that variance must be the
+    one used, and the plugin's model must not even be consulted. Pinned with a
+    plugin whose model would raise if reached.
+    """
+    card = pytest.importorskip("prismaquant.sensitivity_card")
+    from prismaquant.format_cost_protocol import price_activation_only
+    unit = _synthetic_unit(card)
+    w = np.full((unit.out_features, unit.in_features), 0.01, dtype=np.float32)
+
+    class _Desc:
+        quantizes_activations = True
+
+    class _WouldModel:
+        descriptor = _Desc()
+
+        def activation_error_variance(self, unit):
+            raise AssertionError("the modelled variance must not be consulted "
+                                 "when a measured one was supplied")
+
+    var = np.full(unit.in_features, 1e-4, dtype=np.float64)
+    got = price_activation_only(unit, w, _WouldModel(), act_var=var)
+    assert got is not None and got > 0.0
+    # Doubling the measured variance must double the price: the A-side is
+    # linear in act_var, which is what makes a real-activation measurement a
+    # drop-in replacement for the modelled one rather than a recalibration.
+    assert price_activation_only(
+        unit, w, _WouldModel(), act_var=var * 2.0) == pytest.approx(2.0 * got)
+
+
 def _synthetic_unit(card_mod):
     """Smallest card unit that can carry an A-side price.
 

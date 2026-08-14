@@ -290,7 +290,8 @@ def activation_dloss(unit: SensitivityUnit, weight: np.ndarray,
 
 def price_activation_only(unit: SensitivityUnit, weight: np.ndarray,
                           plugin: FormatCostPlugin, *,
-                          gain: float = 1.0) -> float | None:
+                          gain: float = 1.0,
+                          act_var: np.ndarray | None = None) -> float | None:
     """The A-side price of one (unit, format), with NO weight rendering.
 
     Split out of :func:`price` so there is exactly one implementation of "how
@@ -315,13 +316,28 @@ def price_activation_only(unit: SensitivityUnit, weight: np.ndarray,
     desc = plugin.descriptor
     if not desc.quantizes_activations:
         return None
-    # Prefer a variance MEASURED through the format's own activation quantizer;
-    # fall back to the analytic uniform-grid model only when the plugin cannot
-    # supply one. Measuring beats assuming a grid shape.
-    var = None
-    measure = getattr(plugin, "activation_error_variance", None)
-    if callable(measure):
-        var = measure(unit)
+    # Variance sources, most faithful first:
+    #
+    #   1. ``act_var`` supplied by the caller -- measured through this format's
+    #      own quantizer on the layer's REAL cached input rows. Nothing is
+    #      assumed about the activation distribution at all.
+    #   2. the plugin's ``activation_error_variance`` -- the real quantizer, but
+    #      over independent per-channel Gaussians fitted to the card's
+    #      ``act_sq_sum``/``act_absmax``. Faithful marginals, no joint: it cannot
+    #      see how outliers co-occur ACROSS the 16 consecutive channels that
+    #      share one NVFP4 block scale.
+    #   3. the analytic uniform-grid model -- assumes the grid shape too.
+    #
+    # Measured on Qwen3.8-27B across 32 stratified units, (2) is close to
+    # unbiased against (1) -- median real/synthetic 1.011 for NVFP4 and 1.003
+    # for FP8_E4M3 -- but the per-unit spread is real (p10 0.83 / p90 1.15 on
+    # NVFP4, and 0.45 on L0 down_proj), which is why (1) exists as an option
+    # rather than a claim that (2) is good enough everywhere.
+    var = act_var
+    if var is None:
+        measure = getattr(plugin, "activation_error_variance", None)
+        if callable(measure):
+            var = measure(unit)
     if var is None:
         var = analytic_act_quant_variance(unit, desc)
     if var is None:
