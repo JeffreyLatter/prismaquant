@@ -9,8 +9,10 @@ has a served A/B.
 
 **One experiment has been run.** T1 (§6) confirms the premise on the live
 registry: NVFP4 and NVFP4A16 render weights **bit-identically** (max deviation
-`0.0`) while differing by **9.42 % RMS activation error** — so the allocator is
-provably indifferent between them today. Everything else remains a prediction.
+`0.0`) while differing by **9.42 % RMS activation error** (Gaussian input) — so
+the allocator is provably indifferent between them today. The bit-identity is
+distribution-independent and is the finding; the 9.42 % is illustrative and
+distribution-dependent (§6). Everything else remains a prediction.
 
 Author's note on provenance: written 2026-08-14 as the "spare time" item of the
 overnight mandate. It answers Rob's framing directly — *"AURA is blind to
@@ -230,7 +232,8 @@ would repeat the mistake the platform already rejects (principle 1).
 ## 6. Falsification plan — ordered, cheap first, each one fatal
 
 **T1 — Indifference check. ✅ EXECUTED 2026-08-14, premise CONFIRMED.**
-Rendered both formats through the live registry on CUDA (256×512 bf16, seed 0):
+Rendered both formats through the live registry on CUDA (256×512 bf16, seed 0,
+**Gaussian synthetic input** — see the confidence split below):
 
 ```
 weight renderings bit-identical : True
@@ -246,6 +249,19 @@ same cost for both. Meanwhile the two formats differ by **9.42 % RMS relative
 error injected into the activations**. So the allocator is exactly indifferent
 between a format that perturbs activations by ~9 % and one that does not
 perturb them at all. That is the blindness, measured rather than argued.
+
+**The two halves of this result carry different confidence, and they must be
+quoted differently.** The **bit-identity is distribution-independent** — it
+follows from the two `FormatSpec`s declaring the same
+`weight_element_dtype="fp4_e2m1"` and the same group size, so no choice of
+input can make the weight renderings differ. The blindness is therefore a
+structural fact about the cost function, and that is the finding. The
+**9.42 % is distribution-dependent** — it is one draw of Gaussian input, and
+real activations are outlier-heavy in exactly the way that inflates block-scaled
+quantization error, so the true figure on a calibrated model is plausibly
+*worse*. Use 9.42 % to say "the gap is not negligible"; do not use it as the
+magnitude of the A-side term, and re-measure on calibration activations before
+it goes anywhere near a paper.
 
 *(Still open in T1: confirming the same indifference end-to-end on a production
 `cost.pkl`. The default menu does not contain `NVFP4A16`, so that requires a
