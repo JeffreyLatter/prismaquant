@@ -202,8 +202,10 @@ def test_w4a4_and_w4a8_are_distinct_candidates():
         def weight_error(self, unit, weight):
             return np.full((unit.out_features, unit.in_features), 4e-4)
 
-    a4 = _Plug(FormatDescriptor(name="W4A4", weight_bits=4.0, act_bits=4))
-    a8 = _Plug(FormatDescriptor(name="W4A8", weight_bits=4.0, act_bits=8))
+    a4 = _Plug(FormatDescriptor(name="W4A4", weight_bits=4.0, act_bits=4,
+                                     quantizes_activations=True))
+    a8 = _Plug(FormatDescriptor(name="W4A8", weight_bits=4.0, act_bits=8,
+                                     quantizes_activations=True))
 
     c4 = price(u, w, a4, render_basis=RenderBasis.RTN, model=CostModel.AQUA)
     c8 = price(u, w, a8, render_basis=RenderBasis.RTN, model=CostModel.AQUA)

@@ -41,6 +41,7 @@ class StubPlugin:
                  requires_source_dtype=None, err_scale=None):
         self.descriptor = FormatDescriptor(
             name=name, weight_bits=weight_bits, act_bits=act_bits,
+            quantizes_activations=act_bits is not None,
             passthrough=passthrough, requires_source_dtype=requires_source_dtype)
         # Error falls ~4x per extra bit, the standard quantizer scaling.
         self._err = err_scale if err_scale is not None else 4.0 ** (-weight_bits)

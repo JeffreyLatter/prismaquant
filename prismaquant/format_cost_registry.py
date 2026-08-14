@@ -60,11 +60,14 @@ def descriptor_for(spec: FormatSpec, *, shape: tuple[int, int],
     byte budget spends *stored* bits including scale/codebook overhead, and
     because codebook formats report ``weight_bits == 0``.
     """
-    act_bits = spec.act_bits if spec.act_quant_changes_input else None
+    # act_quant_changes_input is THE predicate (format_registry defines it);
+    # it is carried across as explicit data rather than re-derived downstream.
+    quantizes = bool(spec.act_quant_changes_input)
     return FormatDescriptor(
         name=spec.name,
         weight_bits=float(spec.effective_bits_for_shape(shape)),
-        act_bits=act_bits,
+        act_bits=spec.act_bits if quantizes else None,
+        quantizes_activations=quantizes,
         group_size=spec.group_size or None,
         passthrough=spec.name in PASSTHROUGH_SOURCE_DTYPE,
         requires_source_dtype=PASSTHROUGH_SOURCE_DTYPE.get(spec.name),
@@ -130,7 +133,7 @@ class RegistryFormatPlugin:
         card carries no activation statistics. None is not zero: an unmeasured
         activation cost must never read as a free one.
         """
-        if self.descriptor.act_bits is None:
+        if not self.descriptor.quantizes_activations:
             return None
         if unit.act_sq_sum is None:
             return None

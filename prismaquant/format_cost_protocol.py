@@ -104,10 +104,17 @@ class FormatDescriptor:
     #: Effective stored bits per weight parameter, INCLUDING scale/codebook
     #: overhead amortized over the group. This is what the byte budget spends.
     weight_bits: float
-    #: Activation bits at serve time. ``None`` means activations stay in the
-    #: compute dtype (a "W-only" format such as NVFP4A16). This field is the
-    #: entire difference between W4A4 and W4A8.
+    #: WIDTH of the serve-time activation grid, when there is one. This is the
+    #: quantity the error model needs; it is NOT the predicate for "does this
+    #: format quantize activations" -- see :attr:`quantizes_activations`.
+    #: Re-deriving that predicate from a width is the bug
+    #: `test_activation_quant_predicate_has_one_definition` exists to prevent,
+    #: because consumers that did so disagreed with the allocator's gate.
     act_bits: int | None = None
+    #: THE predicate. Explicit data rather than an inference, sourced from
+    #: ``FormatSpec.act_quant_changes_input`` by `format_cost_registry`. This
+    #: field is the entire difference between W4A4 and W4A16.
+    quantizes_activations: bool = False
     #: Quantization group size along the input dimension, if any.
     group_size: int | None = None
     #: True when the format is a verbatim copy of an already-matching source
@@ -317,7 +324,7 @@ def price(unit: SensitivityUnit, weight: np.ndarray,
         w_dloss = weight_dloss_marginal(unit, dw_sq, gain)
 
     a_dloss: float | None = None
-    if model is CostModel.AQUA and desc.act_bits is not None:
+    if model is CostModel.AQUA and desc.quantizes_activations:
         # Prefer a variance MEASURED through the format's own activation
         # quantizer; fall back to the analytic uniform-grid model only when the
         # plugin cannot supply one. Measuring beats assuming a grid shape.
