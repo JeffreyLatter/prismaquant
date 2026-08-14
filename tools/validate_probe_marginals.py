@@ -126,8 +126,13 @@ def main() -> int:
               "(--emit-marginals / PRISMAQUANT_PROBE_MARGINALS, default on)")
         return 2
 
-    def _col(key: str) -> list[float]:
-        return [r[key] for r in rows if key in r and math.isfinite(r[key])]
+    def _col(key: str) -> list[tuple[str, float]]:
+        """(name, value) pairs, kept together so an index can never misalign."""
+        return [
+            (r["name"], r[key])
+            for r in rows
+            if key in r and math.isfinite(r[key])
+        ]
 
     rc = _col("row_vs_col_rel")
     rh = _col("row_vs_htrace_rel")
@@ -141,30 +146,25 @@ def main() -> int:
         "reported_rtol": args.rtol,
     }
 
-    def _stat(label: str, vals: list[float]) -> dict[str, Any]:
-        if not vals:
+    def _stat(pairs: list[tuple[str, float]]) -> dict[str, Any]:
+        if not pairs:
             return {"n": 0}
-        arr = np.asarray(vals)
-        worst = int(np.argmax(arr))
-        names = [r["name"] for r in rows if label_key[label] in r]
+        names = [p[0] for p in pairs]
+        arr = np.asarray([p[1] for p in pairs])
+        worst = int(np.argmax(arr))  # index into `pairs`, so the name matches
         return {
             "n": int(arr.size),
             "max": float(arr.max()),
             "p99": float(np.percentile(arr, 99)),
             "median": float(np.median(arr)),
             "n_over_rtol": int((arr > args.rtol).sum()),
-            "worst_unit": names[worst] if worst < len(names) else None,
+            "worst_unit": names[worst],
         }
 
-    label_key = {
-        "row_vs_col": "row_vs_col_rel",
-        "row_vs_htrace": "row_vs_htrace_rel",
-        "col_vs_htrace": "col_vs_htrace_rel",
-    }
     summary["identity"] = {
-        "row_vs_col": _stat("row_vs_col", rc),
-        "row_vs_htrace": _stat("row_vs_htrace", rh),
-        "col_vs_htrace": _stat("col_vs_htrace", ch),
+        "row_vs_col": _stat(rc),
+        "row_vs_htrace": _stat(rh),
+        "col_vs_htrace": _stat(ch),
     }
     summary["negatives"] = {
         "row": sum(1 for r in rows if r.get("row_min", 0.0) < 0.0),
@@ -178,7 +178,7 @@ def main() -> int:
         "g_sq_sum": sum(r.get("g_sq_sum_nonfinite", 0) for r in rows),
         "act_sq_sum": sum(r.get("act_sq_sum_nonfinite", 0) for r in rows),
     }
-    tail = _col("row_frac_for_99pct")
+    tail = [v for _, v in _col("row_frac_for_99pct")]
     if tail:
         summary["row_frac_of_outputs_holding_99pct_of_fisher"] = {
             "median": float(np.median(tail)),

@@ -211,10 +211,19 @@ two completed Qwen3.6-27B runs:
 | `prod-27b-nvfp4cb-5p5` | 505 | 7 | 3,528 | **3,528** | 0.0 |
 | `prod-27b-cb-20gb` | 505 | 37 | 18,648 | **18,648** | 0.0 |
 
-**22,176 real (unit, format) pairs, zero deviation.** So switching a pipeline to
-the card's SCALAR tier is a no-op for allocation — no shipped artifact needs
-re-validating. (This says nothing about MARGINAL or AQUA, which are *supposed*
-to differ; see below.)
+**22,176 real (unit, format) pairs, zero deviation.**
+
+Be precise about what that is and is not. What was measured is a **pricing
+identity**: given the same `h_trace` and `weight_mse`, the card's SCALAR tier
+and `allocator_solver.predicted_dloss` return bit-identical values. What a
+"switching the pipeline changes nothing" claim *additionally* requires is
+**candidate-construction identity** — that `candidates_from_card`'s
+bits_per_param / memory_bytes / legality / fused-sibling promotion match
+`allocator_candidates.py` closely enough that the DP reproduces a shipped
+`layer_config.json`. **That end-to-end comparison has not been run.** It is the
+next check, and it is cheap: re-solve a completed run from the card and diff the
+assignment. (This says nothing about MARGINAL or AQUA, which are *supposed* to
+differ; see below.)
 
 **Proven (unit tests, 17/17):**
 - the scalar tier reproduces `allocator_solver.predicted_dloss` *exactly*;
