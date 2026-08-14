@@ -47,16 +47,40 @@ def _artifact(tmp_path, name="exported"):
     return model_dir
 
 
+_FAKE_FINGERPRINT = "f" * 64
+_FAKE_COMMIT = "a" * 40
+
+#: A gold record's generic evidence (finite metric, serve fingerprint, producer
+#: commit, position count, score_positions=all) is now required on EVERY lane,
+#: not just Gridbook CB, so the publish fixtures must close the gold slots with
+#: records that look like real measurements.
+_GOLD_METRICS = {
+    "gold.kl": {
+        "kl_mean": 0.0151,
+        "kl_confident_mean": 0.0143,
+        "n_positions": 4088,
+        "n_samples": 8,
+        "seqlen": 512,
+        "score_positions": "all",
+    },
+    "gold.ppl": {"ppl": 8.33, "mean_nll": 2.12, "n_tokens_scored": 8192},
+}
+
+
 def _close_all_slots(model_dir, *, passed=True, spec=False):
     path = model_dir / "shipcard.json"
     sha = compute_model_sha(model_dir)
     for slot in REQUIRED_SLOTS:
+        is_gold = slot in GOLD_SLOTS
         fill_slot(path, slot, make_record(
             slot=slot,
             tool="test",
             passed=passed,
             model_sha=sha,
-            spec_decode_detected=(spec if slot in GOLD_SLOTS else None),
+            spec_decode_detected=(spec if is_gold else None),
+            metrics=(_GOLD_METRICS.get(slot) if is_gold else None),
+            serve_fingerprint=(_FAKE_FINGERPRINT if is_gold else None),
+            git_commit=(_FAKE_COMMIT if is_gold else None),
         ))
     return path
 
@@ -257,12 +281,16 @@ def test_gridbook_card_cannot_publish_without_matched_budget_parity(
     write_shipcard(model_dir / "shipcard.json", card)
     sha = compute_model_sha(model_dir)
     for slot in REQUIRED_SLOTS:
+        is_gold = slot in GOLD_SLOTS
         fill_slot(model_dir / "shipcard.json", slot, make_record(
             slot=slot,
             tool="test",
             passed=True,
             model_sha=sha,
-            spec_decode_detected=False if slot in GOLD_SLOTS else None,
+            spec_decode_detected=False if is_gold else None,
+            metrics=(_GOLD_METRICS.get(slot) if is_gold else None),
+            serve_fingerprint=(_FAKE_FINGERPRINT if is_gold else None),
+            git_commit=(_FAKE_COMMIT if is_gold else None),
         ))
 
     assert publish_cli(_argv(model_dir)) == 1

@@ -53,11 +53,42 @@ def _open_card(tmp_path, model_dir):
     return path
 
 
+_FAKE_FINGERPRINT = "f" * 64
+_FAKE_COMMIT = "a" * 40
+
+#: What a real gold record carries. These helpers used to fill the gold slots
+#: with an EMPTY metrics dict and the card verified anyway, because
+#: `_verify_gold_record` only ran on the Gridbook CB lane — so the tests were
+#: encoding the hole rather than catching it. Every generic gold requirement
+#: (finite metric, serve fingerprint, producer commit, position count,
+#: score_positions=all) now applies on every lane, and the fixtures have to
+#: look like real measurements.
+_GOLD_METRICS = {
+    "gold.kl": {
+        "kl_mean": 0.0151,
+        "kl_confident_mean": 0.0143,
+        "n_positions": 4088,
+        "n_samples": 8,
+        "seqlen": 512,
+        "score_positions": "all",
+    },
+    "gold.ppl": {
+        "ppl": 8.33,
+        "mean_nll": 2.12,
+        "n_tokens_scored": 8192,
+    },
+}
+
+
 def _fill_all(path, model_sha, *, spec=False, passed=True):
     for slot in REQUIRED_SLOTS:
+        is_gold = slot in GOLD_SLOTS
         fill_slot(path, slot, make_record(
             slot=slot, tool="test", passed=passed, model_sha=model_sha,
-            spec_decode_detected=(spec if slot in GOLD_SLOTS else None),
+            spec_decode_detected=(spec if is_gold else None),
+            metrics=(_GOLD_METRICS.get(slot) if is_gold else None),
+            serve_fingerprint=(_FAKE_FINGERPRINT if is_gold else None),
+            git_commit=(_FAKE_COMMIT if is_gold else None),
         ))
 
 
@@ -457,13 +488,16 @@ def test_shipcard_fixed_reservation_survives_every_slot_fill(tmp_path):
 
     model_sha = compute_model_sha(model_dir)
     for slot in REQUIRED_SLOTS:
+        is_gold = slot in GOLD_SLOTS
         fill_slot(path, slot, make_record(
             slot=slot,
             tool="fixed-size-test",
             passed=True,
             model_sha=model_sha,
-            metrics={"detail": "x" * 4096},
-            spec_decode_detected=False if slot in GOLD_SLOTS else None,
+            metrics={"detail": "x" * 4096, **_GOLD_METRICS.get(slot, {})},
+            spec_decode_detected=False if is_gold else None,
+            serve_fingerprint=(_FAKE_FINGERPRINT if is_gold else None),
+            git_commit=(_FAKE_COMMIT if is_gold else None),
         ))
         assert path.stat().st_size == SHIPCARD_RESERVED_BYTES
 
@@ -522,9 +556,14 @@ def test_gold_slots_refuse_spec_decode_states(tmp_path, spec, expected):
     model_dir = _artifact(tmp_path)
     path = _open_card(tmp_path, model_dir)
     _fill_all(path, compute_model_sha(model_dir))
+    # Re-fill gold.kl as a fully valid record apart from the spec-decode
+    # state, so the assertion below isolates the spec-decode refusal instead of
+    # counting the generic gold-evidence problems alongside it.
     fill_slot(path, "gold.kl", make_record(
         slot="gold.kl", tool="test", passed=True,
-        model_sha=compute_model_sha(model_dir), spec_decode_detected=spec))
+        model_sha=compute_model_sha(model_dir), spec_decode_detected=spec,
+        metrics=_GOLD_METRICS["gold.kl"],
+        serve_fingerprint=_FAKE_FINGERPRINT, git_commit=_FAKE_COMMIT))
 
     problems = verify(load_shipcard(path), model_dir=model_dir)
     assert len(problems) == 1
@@ -757,3 +796,78 @@ def test_cli_show_lists_unfilled_slots(tmp_path, capsys):
     assert shipcard_cli(["show", str(path)]) == 0
     out = capsys.readouterr().out
     assert out.count("UNFILLED") == len(REQUIRED_SLOTS)
+
+
+@pytest.mark.parametrize("score_positions, expect_refusal", [
+    ("all", False),
+    ("final", True),
+    (None, True),
+])
+def test_gold_kl_refuses_the_last_token_hook_screen(
+    tmp_path, score_positions, expect_refusal
+):
+    """A positive sample count was never enough to make a number the gold KL.
+
+    `measure_vllm_full_kl.py --score-positions final` — its DEFAULT — scores one
+    position per sequence, the window-final context. That is the cheap
+    last-token "hook KL" screen: triage only, never a promotion metric. It
+    reports n_samples=8 and sailed through the count check, so the card could
+    not tell an 8-position screen from a 4088-position gold measurement.
+
+    Found 2026-08-14 on the Qwen3.8-27B lane, where the driver simply omitted
+    the flag: the teacher wrote shape [8, 248077] — 8 positions, not 8x511.
+    """
+    model_dir = _artifact(tmp_path)
+    path = _open_card(tmp_path, model_dir)
+    _fill_all(path, compute_model_sha(model_dir))
+
+    metrics = dict(_GOLD_METRICS["gold.kl"])
+    if score_positions is None:
+        metrics.pop("score_positions")
+        # `final` mode does not stamp the key at all, which is why absence has
+        # to be refused just as loudly as the explicit value.
+        metrics["n_positions"] = 8
+    else:
+        metrics["score_positions"] = score_positions
+    fill_slot(path, "gold.kl", make_record(
+        slot="gold.kl", tool="test", passed=True,
+        model_sha=compute_model_sha(model_dir), spec_decode_detected=False,
+        metrics=metrics,
+        serve_fingerprint=_FAKE_FINGERPRINT, git_commit=_FAKE_COMMIT))
+
+    problems = verify(load_shipcard(path), model_dir=model_dir)
+    hits = [p for p in problems if "score_positions" in p]
+    assert bool(hits) is expect_refusal, problems
+    if expect_refusal:
+        assert "triage only" in hits[0]
+
+
+def test_native_lane_gold_slots_are_verified_at_all(tmp_path):
+    """The generic gold checks used to run only when the card was Gridbook CB.
+
+    A NATIVE card — the default lane, and the one shipping artifacts — had its
+    gold slots checked for nothing but spec-decode, so an empty metrics dict
+    with no fingerprint and no producer commit verified clean.
+    """
+    model_dir = _artifact(tmp_path)
+    path = _open_card(tmp_path, model_dir)
+    _fill_all(path, compute_model_sha(model_dir))
+    assert verify(load_shipcard(path), model_dir=model_dir) == []
+
+    for slot in GOLD_SLOTS:
+        fill_slot(path, slot, make_record(
+            slot=slot, tool="test", passed=True,
+            model_sha=compute_model_sha(model_dir),
+            spec_decode_detected=False))
+
+    problems = verify(load_shipcard(path), model_dir=model_dir)
+    for slot in GOLD_SLOTS:
+        assert any(
+            p.startswith(f"{slot}: carries no finite") for p in problems
+        ), problems
+        assert any(
+            p == f"{slot}: missing exact serve fingerprint" for p in problems
+        ), problems
+        assert any(
+            p == f"{slot}: missing full producer git commit" for p in problems
+        ), problems

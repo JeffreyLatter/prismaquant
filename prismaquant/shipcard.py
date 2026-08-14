@@ -814,12 +814,19 @@ def verify(
             ))
         if is_gridbook_cb and slot == "ship_gate":
             problems.extend(_verify_ship_gate_record(slot, record))
-        if is_gridbook_cb and slot in GOLD_SLOTS:
+        if slot in GOLD_SLOTS:
+            # Every lane, not just Gridbook CB. This ran under `is_gridbook_cb`
+            # only, which meant a NATIVE card -- the default lane, and the one
+            # shipping artifacts today -- had its gold slots checked for nothing
+            # but spec-decode: no finite metric, no serve fingerprint, no
+            # producer commit, no position count. The DSv4/Gridbook contract
+            # stays CB-gated via the flag; the generic evidence requirements
+            # were never CB-specific and should never have been behind it.
             problems.extend(_verify_gold_record(
                 slot,
                 record,
                 model_dir=model_dir,
-                require_dsv4_gridbook_contract=True,
+                require_dsv4_gridbook_contract=is_gridbook_cb,
                 require_current_artifact_path=False,
             ))
         if slot == "mtp.dspark":
@@ -2027,6 +2034,22 @@ def _verify_gold_record(
             for key in ("n_positions", "n_samples")
         ):
             problems.append(f"{slot}: missing positive KL sample/position count")
+        # A positive count was never enough. `--score-positions final` scores
+        # ONE position per sequence -- the window-final context -- which is the
+        # cheap last-token "hook KL" screen that is triage-only and must never
+        # be a promotion number (§5). It reports n_samples=8 and sails through
+        # the count check above, so the card could not tell an 8-position screen
+        # from a 4088-position gold measurement. Caught 2026-08-14 on the
+        # Qwen3.8-27B lane, where the driver simply omitted the flag and the
+        # tool's default is `final`.
+        if metrics.get("score_positions") != "all":
+            problems.append(
+                f"{slot}: score_positions={metrics.get('score_positions')!r} — "
+                "the gold KL contract is every prompt position "
+                "(--score-positions all, n_positions = n_samples*(seqlen-1)). "
+                "'final' is the last-token hook screen: triage only, never a "
+                "promotion metric."
+            )
     elif not isinstance(metrics.get("n_tokens_scored"), int) or isinstance(
         metrics.get("n_tokens_scored"), bool
     ) or metrics.get("n_tokens_scored", 0) <= 0:
