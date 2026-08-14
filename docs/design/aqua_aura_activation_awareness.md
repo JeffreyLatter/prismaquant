@@ -188,10 +188,51 @@ The bracket is **one scalar per Linear**, precomputed once. *Any*
 relative-error activation format is then priced by a single multiply. This is
 essentially free and it is what makes a large menu tractable.
 
-**AQUA-1 (block-scaled formats — NVFP4 group 16, MX group 32).** Error is set
-by the **group's absmax**, not the element's magnitude:
-`e_i ≈ (s_g / (2^{b−1}−1))² / 12`, with `s_g` from `act_absmax` over the group.
-Needs the group partition, which the `FormatSpec` already declares.
+**AQUA-1 (block-scaled formats — NVFP4 group 16, MX group 32).** ✅ **IMPLEMENTED
+2026-08-14** — `format_cost_protocol.block_scaled_act_quant_variance`, dispatched
+by `analytic_act_quant_variance` on the descriptor's `act_group_size`.
+
+Error is set by the **group's maximum**, not the element's magnitude:
+`e_i ≈ (2·s_g / 2^b)² / 12`. The subtlety is *which* maximum, and this
+document originally got it wrong: it specified `s_g` from **`act_absmax` over
+the group**, which is a max over the whole calibration's **tokens**. That is the
+right model for a *statically calibrated* activation grid and the wrong one for
+what NVFP4/MX kernels actually do — they rescale **per token, per block**, so
+the step follows the *local, per-token* block maximum, which is far below any
+over-tokens maximum. Pricing a dynamic quantizer with a static step overstates
+its error by **22.6×** on activations carrying massive-activation tokens
+(measured against a simulated block quantizer), and the bias is directional: it
+penalises exactly the W4A4 formats, which is the axis §5 exists to reason about.
+
+So the shipped model computes `E_t[blockmax_t²]` from the **per-channel scales**
+`σ_j² = act_sq_sum[j] / n_tokens`, exactly, via the tail-integral identity with
+the folded-normal CDF:
+
+```
+E[M²] = ∫₀^∞ 2u (1 − Π_j erf(u / (σ_j √2))) du
+```
+
+This is exact for independent Gaussian channels **of differing scale** — the
+per-channel heterogeneity is carried, not assumed away. Two cheaper routes were
+tried and rejected *on measurement*:
+
+| route | error vs 400k-sample simulation |
+|---|---|
+| `√(2 ln 2G)` asymptotic | **+52%** at G=16, +46% at G=32 |
+| …with its Fisher–Tippett correction | **−14%** at G=16 |
+| collapse each block to its RMS σ | **−47% to −71%** (1.9×–3.5× under-priced) |
+| **exact tail integral (shipped)** | **≤0.1%** across all four regimes tested |
+
+Against the *simulated quantizer* end-to-end (which adds the `step²/12` model's
+own error on top of the order statistic) the shipped model lands at median
+**1.04×** on clean Gaussian activations and **1.17×** with massive-activation
+tokens, versus the old global-absmax model's **22.6×**.
+
+Assumptions that remain, all stated in the docstring: Gaussian and independent
+*within* a block; dynamic per-token scales (a statically-calibrated format
+should decline to declare `act_group_size` and get the uniform model instead);
+and the block scale treated as exact, ignoring NVFP4's FP8 snap and MX's pow2
+snap as second order.
 
 **AQUA-2 (measured).** Render `Q_a` on the calibration activations and measure
 `e_i` directly. This is the fallback for formats the analytic model does not
@@ -260,6 +301,50 @@ The lever does not need to be accurate; it needs to be *diverse*.
 microbenchmark table. The entire premise is that A4 unlocks a different
 tensor-core path whose speedup is shape- and kernel-dependent; modelling it
 would repeat the mistake the platform already rejects (principle 1).
+
+### 5a. Implementation status — the SELECTOR half landed 2026-08-14
+
+`prismaquant/speed_quality_frontier.py` implements the *selection* half of the
+above. The λ-sweep **candidate generator** is deliberately **not** implemented;
+it is a modified unary cost fed to the existing DP, and it should be written
+when there is a measured `time(ℓ,f)` table to sweep against.
+
+What landed:
+
+- `pareto_frontier` — non-dominated under (min Δloss, max speed).
+- `select_by_speed_floor` / `select_by_quality_ceiling` — **the lever, as a
+  constraint in the two directions an operator thinks in.** Never
+  `α·quality + (1−α)·speed`. `test_frontier_keeps_a_point_no_weight_can_select`
+  builds a non-convex pocket, sweeps 2001 weights, and shows **none** of them
+  selects the middle point a speed floor reaches immediately — the same geometry
+  that put λ-bisection in the graveyard as a selector. An unsatisfiable
+  constraint returns `None`, never a quietly relaxed answer.
+- `aggregate_speed_index` — a **params-weighted harmonic** mean (total work over
+  total time), because throughput does not average arithmetically; an arithmetic
+  mean lets a few fast units hide the slow one that sets the pace.
+
+**Why AQUA-1 had to come first, with numbers.** Priced on the same unit with
+identical weights, NVFP4 and NVFP4A16 come out at **identical `weight_dloss`
+(0.182269) and identical bpp (4.500)** — the weights are 4-bit either way.
+Without an A-side term they are *literally the same candidate* and the frontier
+is one degenerate point. With AQUA-1, NVFP4 prices at **0.419871** vs
+NVFP4A16's **0.182269**. That 2.3× is the quality the extra throughput costs,
+and it is the entire frontier. Demonstrated end-to-end over
+`{NVFP4, NVFP4A16, MXFP4, MXFP8_E4M3}`: 2 of 4 survive domination, and raising
+the speed floor from 1.0 to 1.5 flips the selection from MXFP8_E4M3
+(8.25 bpp, best quality) to NVFP4 (4.5 bpp, 2× declared speed).
+
+**What this is NOT.** `speed_index` is a **declared per-format hint**, so the
+aggregate is a *proxy*, not a serve measurement — blind to kernel dispatch,
+bandwidth limits, batch shape, and to a mixed assignment falling off a fused
+kernel entirely. This is the machinery; §5's "`time(ℓ,f)` must be measured"
+requirement is **unchanged and unmet**. A measured W4A4-vs-W4A8 frontier needs
+a served A/B and is not claimed. Two honesty properties are enforced in code
+rather than documented: an assignment with any unit lacking a hint has
+`speed_index=None` and is *excluded* from the frontier rather than defaulted,
+and units that quantize activations but came back unpriced are counted and
+printed by `frontier_table`, so a candidate flattered by a missing measurement
+cannot pass as a win.
 
 ---
 
@@ -335,22 +420,35 @@ blindness already documented in [[aura_expert_routeflip_floor_confirmed]].
   structure**, not a measurement. T2 is what would turn it into a result. It
   must not be quoted as a finding before then.
 - Nothing here changes a default, a menu, or a shipped artifact.
-- **The analytic fallback degrades silently for block-scaled formats, and that
-  is an asymmetry in the None-discipline.** `price_format` prefers a
-  plugin-supplied `activation_error_variance` (AQUA-2, measured) and falls back
-  to `uniform_act_quant_variance` — which models a **uniform grid over
-  per-channel absmax**. For NVFP4/MX the A-side is a *block-scaled* E2M1 grid
-  whose error is set by the **per-group** absmax over 16/32 input channels, and
-  whose levels are exponentially, not uniformly, spaced. §4's AQUA-1 is the
-  right model there and is **not implemented** — it needs the group partition
-  the `FormatSpec` already declares. So a block-scaled plugin that omits
-  `activation_error_variance` gets a *plausible but wrong* number rather than a
-  refusal. Contrast the discipline applied one function over: a card lacking
-  `g_sq_sum` returns `None`, never `0.0`, precisely so an unmeasured A-side is
-  distinguishable from a free one. The grid-shape mismatch deserves the same
-  treatment — either implement AQUA-1 or have the fallback refuse when
-  `descriptor` declares a block-scaled activation grid. Left as-is deliberately
-  (nothing consumes it yet), but it must not reach a default in this state.
+- **The analytic fallback no longer degrades silently for block-scaled formats
+  — ✅ CLOSED 2026-08-14 by AQUA-1 (§4).** Recorded here because the shape of
+  the defect is worth keeping: `price` preferred a plugin-supplied
+  `activation_error_variance` (AQUA-2, measured) and fell back to
+  `uniform_act_quant_variance`, which models a uniform grid over **per-channel
+  absmax**. Every activation-quantizing format in the shipped registry is block
+  scaled (NVFP4 `act_gs=16`, MXFP4/MXFP8 `act_gs=32`), so the fallback was wrong
+  for **100% of the formats it could ever fire on**, and it produced a
+  *plausible but wrong* number rather than a refusal — an asymmetry against the
+  discipline one function over, where a card lacking `g_sq_sum` returns `None`,
+  never `0.0`. It is now dispatched on the declared `act_group_size` and priced
+  exactly. **Two things still deserve the None-discipline and have it:**
+  `block_scaled_act_quant_variance` returns `None` when the card carries no
+  `act_sq_sum` (it needs per-channel *scales*; `act_absmax` alone would smuggle
+  the global maximum back in), and `CostComponents.quantizes_activations` is
+  carried as data so a consumer can tell "this format leaves activations alone,
+  `None` is correct" from "this format quantizes them and we failed to price it,
+  `None` is a hole" — `speed_quality_frontier` counts and prints the latter.
+  **Still research-tier**: the measured plugin variance remains preferred and
+  takes precedence, and none of this changes a default or a shipped artifact.
+- **The remaining modelling gap is the grid *shape*, not the grid *scale*.**
+  AQUA-1 prices the step from the correct (per-token, per-block) maximum, but
+  still applies the uniform-quantizer `step²/12` variance. NVFP4's E2M1 levels
+  are exponentially, not uniformly, spaced within a block. Empirically this is
+  the residual: `E[blockmax²]` matches simulation to ≤0.1% while the end-to-end
+  variance sits at 1.04–1.17×, so the `step²/12` model is the whole discrepancy.
+  It is small, and it is *conservative* (over-prices), which is the safe
+  direction — but it is the next thing to fix if AQUA-1 is ever promoted past
+  research.
 
 ## 7b. Relationship to `activation_fair_pricing.py` (the existing partial answer)
 
