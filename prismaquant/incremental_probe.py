@@ -51,6 +51,7 @@ from prismaquant.incremental_shards import (
 # while torch's bookkeeping still thinks it has headroom.
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
+import numpy as np
 import torch
 
 
@@ -64,6 +65,140 @@ def _env_flag(name: str, *, default: bool) -> bool:
     if raw is None:
         return default
     return raw not in ("0", "", "false", "False", "FALSE", "no", "NO")
+
+
+# ---- Per-channel Fisher marginals -------------------------------------
+# The per-element diagonal H[o,i] = Σ_t g[t,o]²·x[t,i]² is unstorable at
+# scale (47k Linears × 17 MB ≈ 800 GB — the reason only two scalars
+# survive today). Its two MARGINALS are storable, and they are what a
+# per-channel sensitivity contract actually needs:
+#
+#   fisher_row[o] = Σ_i H[o,i]      fisher_col[i] = Σ_o H[o,i]
+#
+# plus the two pure factors (g_sq_sum, act_sq_sum) that let a consumer
+# separate "this output channel has hot gradients" from "this input
+# channel has hot activations", and act_absmax for clipping decisions.
+#
+# The row/col marginals are read off the `chunk_h` every accumulation
+# site already materializes, so they cost no extra matmul AND satisfy
+# sum(fisher_row) == sum(fisher_col) == chunk_h.sum() by construction —
+# that identity is the wiring check (tests/test_probe_marginals.py).
+_MARGINAL_KEYS = (
+    "fisher_row", "fisher_col", "g_sq_sum", "act_sq_sum", "act_absmax")
+# act_absmax is a BOUND, not a total: it merges by elementwise maximum
+# across chunks/shards. Summing it would inflate it without bound.
+_MARGINAL_MAX_KEYS = frozenset({"act_absmax"})
+
+
+def _marginals_enabled() -> bool:
+    return _env_flag("PRISMAQUANT_PROBE_MARGINALS", default=True)
+
+
+def _marginal_chunk(gy2_sq: torch.Tensor, x2_sq: torch.Tensor,
+                    x2: torch.Tensor,
+                    chunk_h: torch.Tensor) -> list[torch.Tensor]:
+    """Five per-channel reductions of one (gy², x², H) chunk, in
+    `_MARGINAL_KEYS` order, device-resident fp32.
+
+    Reductions force fp32 accumulation: the inputs are bf16 and a
+    T-long running sum in bf16 loses real precision for free.
+    act_absmax comes off `x2` directly via amax/amin rather than
+    sqrt(x2_sq.amax) — same value, but exact in the input dtype and
+    without materializing a [T, in] abs() copy on the hot path.
+    """
+    if x2.size(0) == 0:
+        # A routed expert can be handed zero tokens; the sums are all
+        # zero anyway but amax/amin raise on an empty reduction dim.
+        absmax = torch.zeros(x2.size(1), dtype=torch.float32,
+                             device=x2.device)
+    else:
+        absmax = torch.maximum(x2.amax(dim=0).abs(),
+                               x2.amin(dim=0).abs()).to(torch.float32)
+    return [
+        chunk_h.sum(dim=1, dtype=torch.float32),
+        chunk_h.sum(dim=0, dtype=torch.float32),
+        gy2_sq.sum(dim=0, dtype=torch.float32),
+        x2_sq.sum(dim=0, dtype=torch.float32),
+        absmax,
+    ]
+
+
+def _marginal_accumulate(slot: dict, name: str,
+                         vecs: list[torch.Tensor]) -> None:
+    """Fold one chunk's marginals into `slot[name]`, staying
+    DEVICE-RESIDENT. The v21 #1 optimization batches every device→host
+    scalar transfer to one sync per layer; a `.cpu()` here would put
+    ~94k syncs back on the backward hot path."""
+    cur = slot.get(name)
+    if cur is None:
+        slot[name] = [v.detach().clone() for v in vecs]
+        return
+    for key, c, v in zip(_MARGINAL_KEYS, cur, vecs):
+        if key in _MARGINAL_MAX_KEYS:
+            torch.maximum(c, v, out=c)
+        else:
+            c.add_(v)
+
+
+def merge_marginals(dst: dict, src) -> None:
+    """Fold per-channel marginals from `src` into `dst` in place.
+
+    Sums add elementwise; act_absmax merges by MAXIMUM. Used both for
+    the per-layer host flush and for the cross-shard partial-stats
+    merge, so the two cannot drift apart on the max-vs-sum rule.
+    """
+    for key in _MARGINAL_KEYS:
+        new = src.get(key)
+        if new is None:
+            continue
+        new = np.asarray(new, dtype=np.float32)
+        old = dst.get(key)
+        if old is None:
+            dst[key] = new.copy()
+        elif key in _MARGINAL_MAX_KEYS:
+            dst[key] = np.maximum(old, new)
+        else:
+            dst[key] = old + new
+
+
+def _marginal_flush(device_slot: dict, stats: dict) -> None:
+    """Drain device-resident marginal accumulators into `stats` as
+    numpy fp32, using ONE device→host transfer for the whole layer:
+    every vector is concatenated flat, copied once, then sliced. Same
+    discipline as the h_trace/h_w2_sum stack above it."""
+    if not device_slot:
+        return
+    names = list(device_slot.keys())
+    host = torch.cat(
+        [v.reshape(-1) for n in names for v in device_slot[n]]).cpu()
+    off = 0
+    for n in names:
+        payload = {}
+        for key, v in zip(_MARGINAL_KEYS, device_slot[n]):
+            ln = v.numel()
+            # .copy() so the per-Linear arrays do not each pin the one
+            # big host buffer alive.
+            payload[key] = host[off:off + ln].numpy().copy()
+            off += ln
+        entry = stats.get(n)
+        if entry is not None:
+            merge_marginals(entry, payload)
+    device_slot.clear()
+
+
+def _marginal_zeros(out_features: int, in_features: int) -> dict:
+    """Zero-initialized marginal keys for a stats entry. Zeros are the
+    identity for both merge rules (sum and max over |x| ≥ 0), so a
+    Linear whose hook never fires ships zeros rather than missing keys."""
+    return {
+        "fisher_row": np.zeros(int(out_features), dtype=np.float32),
+        "fisher_col": np.zeros(int(in_features), dtype=np.float32),
+        "g_sq_sum": np.zeros(int(out_features), dtype=np.float32),
+        "act_sq_sum": np.zeros(int(in_features), dtype=np.float32),
+        "act_absmax": np.zeros(int(in_features), dtype=np.float32),
+    }
+
+
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -1454,6 +1589,10 @@ def _compute_global_precompute(
     resident_stats: dict[str, dict] = {}
     resident_h_full: dict[str, torch.Tensor] = {}
     resident_g2_per_token: dict[str, list[torch.Tensor]] = defaultdict(list)
+    # Device-resident per-channel marginals, drained once after phase-2's
+    # backward completes (below) rather than per hook call.
+    resident_marginals: dict[str, list[torch.Tensor]] = {}
+    _emit_marginals = _marginals_enabled()
     resident_saved_inputs: dict[str, torch.Tensor] = {}
     resident_handles: list = []
     resident_act_snaps: dict[str, list[torch.Tensor]] = defaultdict(list)
@@ -1518,6 +1657,10 @@ def _compute_global_precompute(
             # full matmul, just two reductions of size T).
             resident_stats[name]["h_trace_raw"] += float(
                 (gy2_sq.sum(dim=1) * x2_sq.sum(dim=1)).sum().item())
+            if _emit_marginals:
+                _marginal_accumulate(
+                    resident_marginals, name,
+                    _marginal_chunk(gy2_sq, x2_sq, x2, chunk_h))
             w = mod_ref.weight
             if w is not None and not w.is_meta:
                 resident_stats[name]["h_w2_sum_raw"] += float(
@@ -1546,6 +1689,9 @@ def _compute_global_precompute(
             "router_path": None,
             "expert_id": None,
         }
+        if _emit_marginals:
+            resident_stats[fqn].update(
+                _marginal_zeros(mod.out_features, mod.in_features))
         for p in mod.parameters():
             p.requires_grad_(True)
         resident_handles.append(mod.register_forward_hook(_make_resident_fwd(fqn)))
@@ -1607,6 +1753,9 @@ def _compute_global_precompute(
         h.remove()
     resident_handles.clear()
     resident_saved_inputs.clear()
+    # One device→host transfer for every resident Linear's marginals,
+    # after the backward is done — the hooks themselves never synced.
+    _marginal_flush(resident_marginals, resident_stats)
     del grad_buf, norm_out, norm_out_d, final_hidden
     gc.collect()
     if device.type == "cuda":
@@ -2115,6 +2264,8 @@ def _run_body_streaming_shard(
                         pending = moe_block_pending.pop(_block_name, None)
                         if not pending:
                             return
+                        _emit_marginals_blk = _marginals_enabled()
+                        blk_marginals: dict[str, list[torch.Tensor]] = {}
                         from collections import defaultdict as _dd
                         by_w: dict[str, list] = _dd(list)
                         for (eid, w_name), (X, gy, lname, T, w_ref) in pending.items():
@@ -2153,6 +2304,15 @@ def _run_body_streaming_shard(
                                 chunk_h_batch = gy_sq.transpose(1, 2).bmm(X_sq)  # (n_e, out, in)
                                 gy_norm = gy_sq.sum(dim=2)
                                 x_norm = X_sq.sum(dim=2)
+                                # Per-channel factors must be reduced out
+                                # of the batched tensors BEFORE the del.
+                                # Padded rows are zero, so they are inert
+                                # for both the sums and the max (x² ≥ 0)
+                                # — no T_valid mask needed here.
+                                if _emit_marginals_blk:
+                                    g_sq_e = gy_sq.sum(dim=1, dtype=torch.float32)
+                                    act_sq_e = X_sq.sum(dim=1, dtype=torch.float32)
+                                    act_absmax_e = X_sq.amax(dim=1).sqrt()
                                 del X_sq, gy_sq
                                 per_token = gy_norm * x_norm
                                 mask = (torch.arange(max_T, device=device).unsqueeze(0)
@@ -2177,7 +2337,20 @@ def _run_body_streaming_shard(
                                         acc_stats[lname]["h_w2_sum_raw"] += float(
                                             (chunk_h_batch[i] * w_ref.detach().float().pow(2)
                                              .to(chunk_h_batch.device)).sum().item())
+                                    if _emit_marginals_blk:
+                                        _marginal_accumulate(
+                                            blk_marginals, lname, [
+                                                chunk_h_batch[i].sum(
+                                                    dim=1, dtype=torch.float32),
+                                                chunk_h_batch[i].sum(
+                                                    dim=0, dtype=torch.float32),
+                                                g_sq_e[i], act_sq_e[i],
+                                                act_absmax_e[i],
+                                            ])
                                 del chunk_h_batch, per_token, trace_per_e
+                        # One transfer for the whole block, not one per
+                        # expert — same discipline as the v21 #1 stack.
+                        _marginal_flush(blk_marginals, acc_stats)
                     return flush
 
                 moe_block_handles.append(
@@ -2229,6 +2402,7 @@ def _run_body_streaming_shard(
             # path; only the device→host scalar transfers are batched).
             deferred_sync = _env_flag(
                 "PRISMAQUANT_DEFERRED_FISHER_SYNC", default=True)
+            emit_marginals = _marginals_enabled()
             # v22 Fix B: deferred Fisher COMPUTE. Beyond just deferring the
             # device→host syncs (above), this defers the per-Linear matmul
             # itself out of the autograd engine's per-Linear callback path.
@@ -2261,6 +2435,11 @@ def _run_body_streaming_shard(
             # Per-Linear device-resident accumulators built lazily inside
             # the hook so we know the stream / device the kernel ran on.
             device_accums: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+            # Per-channel marginals, same device-resident discipline.
+            # Kept in its own dict (not the scalar tuple) because the
+            # five vectors have per-Linear shapes and cannot be stacked;
+            # they are flushed with one flat cat + one .cpu() per layer.
+            device_marginals: dict[str, list[torch.Tensor]] = {}
             # Per-layer deferred-compute queue: (name, x, gy, mod_ref).
             # Drained immediately after `out.backward(grad_out)` returns.
             deferred_queue: list[tuple[str, torch.Tensor, torch.Tensor, "nn.Linear"]] = []
@@ -2309,6 +2488,10 @@ def _run_body_streaming_shard(
                     gy2_sq = gy2.pow(2)                        # bf16
                     x2_sq = x2.pow(2)                          # bf16
                     chunk_h = (gy2_sq.t() @ x2_sq).float()    # bf16 matmul + fp32 cast
+                    if emit_marginals:
+                        _marginal_accumulate(
+                            device_marginals, name,
+                            _marginal_chunk(gy2_sq, x2_sq, x2, chunk_h))
                     if collect_h_full:
                         acc_g2_per_token[name].append(
                             gy2_sq.sum(dim=1).detach().to(
@@ -2390,6 +2573,9 @@ def _run_body_streaming_shard(
                     "router_path": None,
                     "expert_id": None,
                 }
+                if emit_marginals:
+                    acc_stats[fqn].update(
+                        _marginal_zeros(mod.out_features, mod.in_features))
                 for p in mod.parameters():
                     p.requires_grad_(True)
                 handles.append(mod.register_forward_hook(make_fwd(fqn)))
@@ -2536,6 +2722,10 @@ def _run_body_streaming_shard(
                     gy2_sq = gy2.pow(2)
                     x2_sq = x2.pow(2)
                     chunk_h = (gy2_sq.t() @ x2_sq).float()
+                    if emit_marginals:
+                        _marginal_accumulate(
+                            device_marginals, name,
+                            _marginal_chunk(gy2_sq, x2_sq, x2, chunk_h))
                     if collect_h_full:
                         acc_g2_per_token[name].append(
                             gy2_sq.sum(dim=1).detach().to(
@@ -2600,6 +2790,12 @@ def _run_body_streaming_shard(
                     acc_stats[n]["h_trace_raw"] += float(tr_v)
                     acc_stats[n]["h_w2_sum_raw"] += float(w2_v)
                 device_accums.clear()
+            # Marginals get their own flush (one flat cat, one .cpu()):
+            # the five vectors are per-Linear-shaped so they cannot join
+            # the (2, N) scalar stack, and they must drain even when
+            # deferred_sync is off — otherwise the legacy per-Linear
+            # `.item()` path would have no flush site at all.
+            _marginal_flush(device_marginals, acc_stats)
 
             for local_key, raw in packed_grad_acc.items():
                 full_key = f"{layer_prefix}{local_key}"
@@ -2644,6 +2840,8 @@ def _run_body_streaming_shard(
                     prev["h_trace_raw"] += s.get("h_trace_raw", 0.0)
                     prev["h_w2_sum_raw"] += s.get("h_w2_sum_raw", 0.0)
                     prev["n_tokens_seen"] += s.get("n_tokens_seen", 0)
+                    # Per-channel marginals: sums add, act_absmax maxes.
+                    merge_marginals(prev, s)
                     # Per-expert Fisher is a list of floats on the packed
                     # stat entry; sum element-wise across shard splits.
                     per_prev = prev.get("h_trace_per_expert_raw")
@@ -3189,6 +3387,17 @@ def main():
                          "per-weight delta loss = 0.5 * <H, MSE_W> instead "
                          "of the scalar proxy. Omit to keep the legacy "
                          "scalar path.")
+    ap.add_argument("--emit-marginals",
+                    action=argparse.BooleanOptionalAction, default=None,
+                    help="Emit per-channel Fisher marginals alongside the "
+                         "scalars: fisher_row [out], fisher_col [in], "
+                         "g_sq_sum [out], act_sq_sum [in], act_absmax [in]. "
+                         "Unlike the full [out, in] Fisher these are cheap "
+                         "reductions of tensors the probe already forms; "
+                         "memory is sum over Linears of "
+                         "(2*out + 3*in) * 4 bytes. Default ON; overrides "
+                         "PRISMAQUANT_PROBE_MARGINALS. --no-emit-marginals "
+                         "restores byte-identical legacy output.")
     ap.add_argument("--unified-sweep", action="store_true", default=False,
                     help="Phase-3 in ONE reverse sweep through all 62 "
                          "layers, tracking ALL in-scope Linears at once "
@@ -3261,6 +3470,12 @@ def main():
     ap.add_argument("--mm-max-text-len", type=int, default=128,
                     help="Max text tokens per multimodal calibration sample.")
     args = ap.parse_args()
+    # The marginal switch is read deep inside the hooks (and by shard
+    # subprocesses), so the CLI flag lands on the env var the same way
+    # allocator.py publishes --threads. Unset leaves the env default.
+    if args.emit_marginals is not None:
+        os.environ["PRISMAQUANT_PROBE_MARGINALS"] = (
+            "1" if args.emit_marginals else "0")
     from prismaquant.gpu_guard import require_cuda_hot_path
     require_cuda_hot_path("incremental_probe", args.device)
 
@@ -3488,6 +3703,9 @@ def main():
         device=str(device),
         importance_weighting=args.importance_weighting,
         resident_include_union=resident_include_union,
+        # Resident marginals are written into the cached stats, so a
+        # cache built with the flag off must not be reused with it on.
+        emit_marginals=_marginals_enabled(),
     )
 
     def _ensure_precompute() -> GlobalPrecompute:
