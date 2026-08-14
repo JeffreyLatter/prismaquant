@@ -1,11 +1,13 @@
 # PrismaQuant Architecture
 
-As of: 2026-08-14 · branch `release/dsv4flash-dspark-v0121` · verified against
-implementation baseline commit `babf6fa` (v0.12.2) plus the cherry-picked Gridbook
+As of: 2026-08-14 · branch `merge/aura-sensitivity-contract` · verified against
+implementation baseline commit `ed4f2e0` (v0.12.3) merged with the Sensitivity
+Card contract branch at `c8f3cfd`. That baseline carries the cherry-picked Gridbook
 wheel-attestation repair described by the named schemas and symbols below, the
-serve-environment census readability fix (`SPT_NOENV`, §"Parent + EngineCore live
-attestation", verified end-to-end on a live server 2026-08-14), and the
-serving-wheel cache integrity guard (§9.2). The final integration commit is
+Gridbook pin promotion, the serve-environment census readability fix (`SPT_NOENV`,
+§"Parent + EngineCore live attestation", verified end-to-end on a live server
+2026-08-14), and the serving-wheel cache integrity guard (§9.2). The final
+integration commit is
 deliberately not predicted in this provenance stamp. This revision includes the Spark
 BF16 AURA-anchor residency and streamed-reverse lifetime corrections, the activation-safe
 AURA terminal/replay policy, the endpoint live-session and matched-budget
@@ -29,9 +31,13 @@ cached-menu render/consume contract, and the profile-declared routed-expert
 AURA/empirical hybrid key-space contract, the offline value-closed DSv4
 WikiText gold-input contract, plus the platform-agnostic anchored-cost
 mechanism, CB mapping plugin, DSv4 one-shot acceptance-driver contract, the
-anchored-AURA allocator admission branch (P0, closed 2026-08-11), and the
+anchored-AURA allocator admission branch (P0, closed 2026-08-11), the
 one-purpose CPU-only W8A16 readmission plus the deliberately restamped v2
-pre-export handoff gate. The current handoff approval binds the 15-file
+pre-export handoff gate, and the shareable Sensitivity Card contract with its
+format-cost plugin seam and the default-ON probe per-channel Fisher marginal
+emission that backs it (§4.8, §8.7, §12 D30).
+
+The current handoff approval binds the 15-file
 `prismaquant.dsv4_w8a16.export_source_closure.v1` semantic closure at identity
 `7517d87cfc231e5cfa60faa74728505a272540d33d8bc15c2196c54e62fa7fca`;
 the v2 handoff implementation source is
@@ -40,6 +46,12 @@ and its reviewed streaming-exporter member is
 `f740ebd9b90e586fc10ffa975f2f624ee8f7f85b02bb927701e946989bc3319f`.
 older v1 handoff receipts remain dated history and are not current export
 authority.
+
+The Sensitivity Card item changes exactly one shipping default, and it is
+probe-side: `incremental_probe.py` now emits five per-channel marginal vectors
+into `probe.pkl` unless told not to (§3.3, §4.1). The card, its three cost tiers
+and AQUA-AURA are additive modules with no `run-pipeline.sh` call site, no
+`COST_MODE` value, and no served validation; they allocate nothing today.
 The external runtime record pins Gridbook **0.8.5** at exact commit
 `e992e5980c96333a48149f96392d6cff56ae9e3f`, with
 `gridbook.runtime-contract.v3` and the exact required feature map
@@ -521,6 +533,19 @@ AURA_ADDITIVITY_GATE=measure
 PRISMAQUANT_GGUF_IMATRIX=1  DEVICE=cuda  EXPORT_DEVICE=cuda
 ```
 
+**One default in this section is not a shell default.** `--emit-marginals` /
+`PRISMAQUANT_PROBE_MARGINALS` is **ON by default in the probe module itself**
+(`incremental_probe._marginals_enabled`, `_env_flag(..., default=True)`), and
+`run-pipeline.sh` sets nothing — `grep -c MARGINAL prismaquant/run-pipeline.sh`
+→ 0. It is listed here anyway because it changes what every pipeline run writes
+into `probe.pkl` (§4.1, §4.8): five per-channel vectors per Linear, costing
+`(2·out + 3·in)·4` bytes. `--no-emit-marginals` restores byte-identical legacy
+output. The flag is *not* a grouping axis but a key-set axis, so it joins the
+precompute fingerprint, the per-shard reuse meta (`_expected_probe_shard_meta`)
+and the LPS-invariant linear cache's `_CONTENT_META_KEYS` (`5639a8b`): a
+flag-off shard is refused rather than pooled into a flag-on run, where it would
+otherwise contribute marginal-less entries that nothing downstream checks for.
+
 **`PRISMAQUANT_CB_LDLQ_SCOPE` is the authoritative LDLQ selector**; the older boolean
 `PRISMAQUANT_CB_LDLQ` survives only as its degenerate spelling. `cb_serialization_context_from_env`
 (`nvfp4_cb_footprint.py:660`, scope read `:683`) validates the scope against
@@ -772,7 +797,7 @@ allocator-consumable cost table falls out of it for free — §6.5.2.
 
 | Stage | Module | Produces |
 |---|---|---|
-| L1 Fisher probe | `incremental_probe.py` (`run-pipeline.sh:539-560`) | `artifacts/probe.pkl` (per-Linear `h_trace`, `n_params`, shapes) **and** `WORK_DIR/act`, the activation cache every later stage reads |
+| L1 Fisher probe | `incremental_probe.py` (`run-pipeline.sh:539-560`) | `artifacts/probe.pkl` (per-Linear `h_trace`, `n_params`, shapes; since 2026-08-14 also the five per-channel marginal vectors, default-ON — §3.3, §4.8) **and** `WORK_DIR/act`, the activation cache every later stage reads |
 | Base RTN cost | `incremental_measure_quant_cost.py` (`:606-661`) | per-`(Linear, format)` measured RTN error; under `aura` demoted to sidecar-backfill source (`:928-952`) |
 
 The probe is streamed shard-by-shard through `layer_streaming` — head resident, body paged,
@@ -1551,6 +1576,145 @@ defaults to **`measure`** (ruled 2026-07-30), so every `COST_MODE=aura` run perf
 bounded end-KL eval and stamps a real `residual` into `cost.pkl`'s `provenance["additivity"]`
 — stage `[3c]`, §4.3. `auto` (report only from a measurement the run already made) and `0`
 remain selectable.
+
+### 4.8 The Sensitivity Card — probe once, price an arbitrary menu (2026-08-14)
+
+Landed on `feat/aura-sensitivity-contract`. Read the status line first, because
+everything below is additive and unpromoted: **none of these modules is a
+pipeline stage**, `run-pipeline.sh` calls none of them, `COST_MODE` gains no
+value, and no shipped allocation goes through them. The one shipping default the
+work changes is probe-side (§3.3), which is why the section exists at all under
+§0's rule. Full design, including what is proven and what is not:
+`docs/design/sensitivity_card_contract.md`.
+
+**Why.** Probing a model is the expensive, model-specific half; choosing formats
+is the cheap, platform-specific half. Today they are fused — `probe.pkl` carries
+scalars that only become a cost next to a **rendered menu cache** built for one
+particular format list (§4.2), so a new menu means a new render, a probe cannot
+be shared because it is not sufficient on its own to price anything, and W4A4
+and W4A8 are literally the same candidate because the cost is weight-space only.
+
+**What the probe can now store.** The per-element diagonal weight Fisher
+`H[o,i] = Σ_t g[t,o]²·x[t,i]²` is already materialized per chunk as `chunk_h` at
+every accumulation site, and has never been storable: the unified-sweep path
+documents it as *"47k × 17 MB = 800 GB CPU, doesn't fit"*, which is why only
+`h_trace` and `h_w2_sum` survived. Its two **marginals** are storable, and are
+what a format-independent cost actually needs:
+
+```
+fisher_row[o] = Σ_i H[o,i]        fisher_col[i] = Σ_o H[o,i]
+```
+
+`out + in` floats instead of `out · in`, read off the `chunk_h` each site
+already forms, so no extra matmul (`incremental_probe._marginal_chunk:97-123`).
+Three further vectors ride along because they are **not** recoverable from the
+weight-Fisher marginals: `act_sq_sum` (the imatrix, `diag(XᵀX)`), `g_sq_sum`
+(the **output**-space Fisher diagonal), and `act_absmax`. The merge rules differ
+per key and getting that wrong is the likely bug — sums add elementwise,
+`act_absmax` is a bound and merges by elementwise **maximum**
+(`_MARGINAL_MAX_KEYS:90`) — so one `merge_marginals` (`:143-161`) serves both the
+per-layer host flush and the cross-shard partial-stats merge and the two cannot
+drift apart on that rule. Sync discipline is preserved rather than re-litigated:
+the five vectors accumulate device-resident in fp32 and drain through one flat
+concatenation and one `.cpu()` per layer (`_marginal_accumulate:126-140`,
+`_marginal_flush:164-186`). A `.cpu()` inside the hook would put back the ~94k
+per-Linear syncs that `PRISMAQUANT_DEFERRED_FISHER_SYNC` removed.
+
+`sum(fisher_row) == sum(fisher_col) == h_trace_raw` is the wiring check, and it
+is free: a transposed axis, a dropped chunk or a wrong-shaped accumulator all
+break it. `SensitivityUnit.validate` (`sensitivity_card.py:245-288`) enforces it
+at `rtol=1e-3`, which catches the whole class of bug where one accumulator is
+normalized and another is not. Its *exactness* is site-dependent — §12 D30.
+
+**The card.** `sensitivity_card.py` — one compressed `.npz` with a JSON header,
+loaded `allow_pickle=False` (`:463-470`), because a shareable artifact must load
+without executing arbitrary objects. Per unit it carries shape, `n_params`, the
+**global** calibration token count (the one denominator of §4.1 — a per-expert
+routed count inverts importance weighting), the raw un-normalized scalars, and
+whichever of the five vectors exist. Three refusals are structural, not
+advisory:
+
+- **Calibration is identity.** `assert_compatible` (`:385-406`) refuses a
+  cross-calibration merge or comparison outright — the same rule a CB book gets
+  by hashing its imatrix into its book key (§9.2). Rebase the card, do not
+  compare across calibrations.
+- **Render basis is stamped, not assumed.** A shareable card is necessarily RTN:
+  compensated renders need per-Linear Hessians (~100 MB/Linear at 27B scale),
+  which are not shippable. That is load-bearing, not a footnote — RTN-vs-rendered
+  `dW` is immaterial at fp4 and decisive at fp8 (+36% served KL, §4.3), so a card
+  priced on one basis mis-ranks the other's 8-bit rungs, and mismatched bases
+  refuse to compare.
+- **Structure travels; policy does not.** The card records that q/k/v *are*
+  siblings, which experts are packed together, and each unit's source dtype
+  (`UnitTopology`, `:141-166`). It deliberately does **not** record that a
+  runtime *requires* siblings to share a format, or that packed experts need
+  vLLM canonical scheme names: those are §6.4 serving invariants, derived
+  downstream from whichever profile the author names (§8.1). Baking vLLM's
+  packing into a shareable file makes it wrong for llama.cpp, and wrong the day
+  vLLM changes.
+
+Card footprint against the full-`H` footprint of the same probe rows: 27B dense
+104.2 GB → 75.2 MB, 35B-A3B 8.2 GB → 17.4 MB, MiniMax-M2.7 at per-expert
+granularity 0.9 TB → 2.3 GB (`docs/design/sensitivity_card_contract.md` §3,
+which flags the per-expert case as the one where the card is not yet small —
+size tracks probe *rows*, not parameters).
+
+**Three cost tiers, one seam** (`format_cost_protocol.py`):
+
+| tier | weight term | status |
+|---|---|---|
+| `SCALAR` | `0.5 · h_trace · weight_mse · gain` | **exactly today's model** — same formula, same inputs |
+| `MARGINAL` | `0.5 · (row @ dW² @ col) / h_trace_raw / n_tokens` | rank-1 reconstruction of `H`; `SCALAR` is its rank-0 collapse |
+| `AQUA` | `MARGINAL` + an activation term | W4A4 and W4A8 stop being one candidate |
+
+`SCALAR` is not *equivalent to* `allocator_solver.predicted_dloss` (§4.1) — it is
+the identical expression, kept as a named one-liner (`weight_dloss_scalar:184-192`)
+so any divergence is a one-line diff rather than a hunt, and pinned by
+`tests/test_sensitivity_card.py::test_scalar_model_reproduces_allocator_solver`.
+A card carrying no vectors falls back to it (`weight_dloss_marginal:209-210`),
+which is what lets an existing `probe.pkl` convert to a card with no re-probe:
+degraded, not broken. `MARGINAL` is **exact** when `H` is genuinely rank-1
+(`test_marginal_model_matches_exact_fisher_on_rank1`, `rtol=1e-10`), which is the
+sharpest available check on the quadratic form and its normalization.
+
+**The solver seam is unchanged.** `sensitivity_card_allocate.candidates_from_card`
+(`:47-84`) emits exactly the `dict[name, list[Candidate]]` that
+`allocator_solver.solve_allocation` already consumes —
+`Candidate(fmt, bits_per_param, memory_bytes, predicted_dloss)`, §4.5 — so an
+arbitrary format menu enters as an arbitrary list of plugins rather than as a
+change to the DP. Only `DELTA_LOSS` may leave the module toward the solver
+(`CostComponents.assert_currency:172-178`), because only loss is additive across
+units. A unit with no legal format is dropped from **both** `stats` and
+`candidates` rather than handed over as an empty option list, which the DP would
+otherwise read as a free choice — the same failure shape as the unpriced packed
+member of §4.5.
+
+**AQUA-AURA, and why it needs its own sensitivity.** `h_trace` is a *weight-space*
+curvature. An activation-quantization error is an *input-side* perturbation
+`x → x + dx` that reaches the loss as `dy = W dx`. Multiplying an input-side
+error by a weight-space sensitivity is the currency error
+`activation_fair_pricing.py` exists to correct (§3.3 `ACTIVATION_FAIR_PRICING`),
+so `activation_dloss` (`:227-254`) routes through `g_sq_sum` — the output-space
+Fisher, the one term a weight-space `h_trace` structurally cannot supply — and
+never through `h_trace`. Three rules hold the line, each of them principle 2 in
+practice: an unmeasured A-side returns **`None`, never `0.0`**, so a missing
+measurement can never read as a free one; the `1/12` step variance is a property
+of a uniform grid, not a tuned constant (`uniform_act_quant_variance:257-281`);
+and there is **no speed/quality scalarization constant** — `speed_index` and
+`predicted_dloss` come back as separate axes, because choosing between them is a
+frontier selection (§4.6), and inventing a weighting would be exactly the
+heuristic-where-an-explicit-exists that is banned. `activation_fair_pricing.py`
+is left running and untouched: superseding it is a promotion decision on served
+evidence, not a drive-by refactor.
+
+**Status.** The tier that reproduces today's behaviour is exact and unit-tested;
+the two that do not are **screening surrogates with no served A/B**, and §2.5
+says a screen is never sold as a result. Do not describe `MARGINAL` or
+AQUA-AURA as validated, promoted, or default. What promotion would require is
+the ordinary §2.4 ladder: rank agreement against measured `output_mse` on a
+small model, allocation churn against a shipped `cost.pkl` inside the known ~3%
+noise, and — for AQUA — a served W4A4-vs-W4A8 A/B. §12 D30 carries the honest
+gaps.
 
 ## 5. Formats & render
 
@@ -3181,6 +3345,45 @@ allocation.
 And there is CI to run it — `.github/workflows/ci.yml` (#18, `1cc7b90`) executes the suite on
 every push and PR, on py3.11 and 3.12 with CPU torch. §12 D11.
 
+### 8.7 A fourth plug-in point: `FormatCostPlugin` (formats, not models)
+
+The three registries above are the **model-support** contract and stay three.
+`format_cost_protocol.FormatCostPlugin` (`:284-300`) is a different axis: it is
+what a **format** must implement to be priced, and it exists only on the
+Sensitivity Card path (§4.8) — no production stage consumes it today.
+
+The whole protocol is one attribute and one method: a `FormatDescriptor`
+(storage bits, group size, passthrough requirement, the explicit
+`quantizes_activations` predicate, an optional `speed_index`) and
+`weight_error(unit, weight) -> [out, in]` squared error computed **from the
+weight alone** under the card's declared render basis. That is the point of the
+seam: adding a format is adding a plugin, not re-probing the model and not
+re-rendering a menu cache. The consumer already has the weights; what they
+cannot compute is the sensitivity, and that is `O(out + in)` in the card.
+
+Two properties keep it honest rather than merely convenient:
+
+- **Reference plugins call the real quantizers.** `format_cost_registry.RegistryFormatPlugin`
+  (`:78-160`) invokes `FormatSpec.quantize_dequantize` and
+  `activation_quantize_dequantize` directly, so the error a plugin reports is
+  produced by the same code that renders (§5.1). A plugin that re-implemented a
+  format's rounding would reintroduce precisely the rendering confound the
+  one-cache rule exists to prevent (§5.4). Passthrough formats return exactly
+  zero error rather than a measured epsilon, so float noise cannot decide a
+  passthrough-vs-quantized comparison; and `FormatDescriptor.is_legal_for`
+  (`:129-135`) refuses a passthrough on a mismatched source dtype, which is the
+  §6.4 passthrough-integrity invariant restated on this path.
+- **`act_quant_changes_input` has one definition.** The descriptor carries the
+  registry's predicate as explicit data (`descriptor_for:65`,
+  `format_registry.py:75-106`) rather than re-deriving it from an `act_bits`
+  width; consumers that re-derived it disagreed with the allocator's own gate
+  (§4.5, bit-exact re-encode), and
+  `tests/test_bit_exact_cost_pricing.py::test_activation_quant_predicate_has_one_definition`
+  pins the single definition. This is the
+  entire difference between `NVFP4` (W4A4) and `NVFP4A16` — two registry entries
+  with identical weight bits — which is what makes them a clean A-side isolation
+  menu.
+
 ## 9. Serving lanes
 
 Three artifact containers, one allocator. `EXPORT_CONTAINER` picks the lane (§3.3) and
@@ -3996,6 +4199,7 @@ New with the 2026-07-30 merge:
 | D27 | **CLOSED 2026-08-01; import resolution hardened 2026-08-12; immutable-wheel parity added 2026-08-13.** The version skew was not benign enough to preserve: the vendored package, mirror, and sync test were deleted. PrismaQuant consumes one full-commit pin, verifies package version plus PEP 610 exact-VCS identity or an independently pinned release-wheel digest, launches from a neutral directory in Python safe-path mode, rejects an import outside the selected distribution root (including CWD/`PYTHONPATH` shadows), and fingerprints that import origin plus the complete RECORD-bound source closure for every pinned serve. | `prismaquant/gridbook_runtime/gridbook_runtime_pin.json`; `prismaquant/gridbook_runtime/gridbook_runtime.sh`; `tools/serve_fingerprint.py`; `tests/test_serve_fingerprint_descendants.py` | ~~LOW~~ closed | — |
 | D28 | **Serve-time fast-kernel enforcement has no caller.** `require_fast_kernels(model)` — which reads the model profile's kernel requirements and hard-fails at startup when a required fast kernel (`causal-conv1d`, `flash-linear-attention`, …) is not importable — lost its only caller when `polish_from_assignment` was archived on **2026-05-15**, and was itself walled 2026-07-30 (R19) as an orphan. It is the only mechanized piece of **core principle 9's** "routed to a *performant* kernel (not a slow fallback)" gate, so that gate is **manual today**: nothing in the build or serve path refuses a checkpoint whose arch would silently fall back to the slow PyTorch implementation. The mechanism is written and tested — only the call site is missing. | `archive/orphans_2026-07-30/prismaquant/_fast_kernel_guard.py` + `tests/test_fast_kernel_guard.py`; sole historical caller `archive/polish_2026-05-15/prismaquant/polish_from_assignment.py:202` | LOW | Move the guard back and call it from `validate_native_export` / the serve launcher, keyed on the resolved profile — or, if serve-time enforcement belongs to the lane scripts, say so in §7 and delete the row. |
 | D29 | **The FP8-CB row scale is not bit-reproducible across CPU architectures.** It is the scalar argmin of a scale sweep whose objective reduces over every column of the row, and that reduction reorders differently on x86 than on aarch64: on the fixed `test_cbl_scope_identity` fixture the packed index bytes -- the payload that actually ships -- are **identical** on both, while the single float32 scale differs in the low bits. Found 2026-08-11 when a byte-identity test recorded on the aarch64 build box failed on x86 CI. Consequence for the provenance gate (§5): artifact byte-reproducibility is a **within-platform** guarantee, not a cross-platform one; a rebuild on a different architecture may differ in scale bytes without differing in indices. Artifacts are built on the Spark, so nothing shipped is affected. The test now pins the packed plane by exact digest everywhere and the scale by value within float32's own worst-case reordering bound (n·2^-23), keeping the exact digest assertion on the recording platform. | `tests/test_cbl_scope_identity.py::test_unset_scopes_pin_76666bd_stamp_and_rendered_bytes`; `nvfp4_cb_formats._sweep_encode_moment` | LOW | Decide whether cross-architecture byte reproducibility is a goal at all. If it is, the sweep objective needs a fixed reduction order; if it is not (the likely answer -- artifacts are Spark-built), say so in §5 so a future reader does not read a cross-platform promise into the provenance gate. |
+| D30 | **The Sensitivity Card's non-scalar tiers are screening surrogates, and its probe wiring has two soft spots** (added 2026-08-14, §4.8). Four honest gaps, none of them closed: (1) **No served A/B.** The `MARGINAL` tier and AQUA-AURA have never been measured on exact full-vocab vLLM KL-vs-BF16 or direct WikiText PPL. `SCALAR` is a byte-identical reproduction of today's model and carries no such debt; the other two must not be cited as results (§2.5). (2) **The rank-1 reconstruction's error is unquantified on real layers.** `H = Σ_t outer(g_t², x_t²)` is exactly rank-1 only when one token dominates; `outer(row, col)/h_trace_raw` is provably exact in that case (`rtol=1e-10`) and an approximation of unknown magnitude everywhere else. Nothing has compared it against a materialized `H` on a real Linear. (3) **The marginal identity is exact only at the two streaming sites.** `sum(fisher_row) == sum(fisher_col) == h_trace_raw` holds by construction where `h_trace_raw` is literally `chunk_h.sum()` in fp32 (`incremental_probe.py:2520`, `:2751`). On the **resident** path `h_trace_raw` comes from the bf16 outer-product-norm identity `(gy2_sq.sum(1) · x2_sq.sum(1)).sum()` (`:1667-1668`) while the marginals reduce the fp32 `chunk_h`, so the two agree mathematically but not bitwise; `SensitivityUnit.validate`'s `rtol=1e-3` is what absorbs that, and nothing measures the actual spread. (4) **One accumulation site is dead on the shipping path and therefore untested.** The batched MoE block-flush hook (`:2276-2362`) fires only for blocks whose immediate children are per-expert containers exposing the profile's projection names as `nn.Linear` — the *unpacked*-expert layout. The shipping recipe's MoE models do not take it, and `tests/test_probe_marginals.py` covers the helpers and the two streaming sites but not that branch, so its marginal emission has never executed. A transposed axis or a wrong merge rule there would surface first on a new unpacked-expert architecture, which is exactly the class of silent-garbage failure §8.5 L3 is about. | §4.8; `prismaquant/sensitivity_card.py`, `format_cost_protocol.py`, `sensitivity_card_allocate.py`; `incremental_probe.py:97-199,1667-1672,2276-2360,2501-2520,2735-2751`; `tests/test_sensitivity_card.py`, `tests/test_probe_marginals.py`; `docs/design/sensitivity_card_contract.md` §8 | MED | (1)-(2) run the rank-agreement check against measured `output_mse` on Qwen3-0.6B and an allocation-churn check against a shipped `cost.pkl` before any tier but `SCALAR` is proposed for a default; (3) record the resident-vs-streaming identity spread on one real probe, or tighten the resident path to reduce `chunk_h` for both; (4) cover the MoE block flush with a synthetic unpacked-expert fixture, or state that the branch is retired. |
 
 **Open items carried from session handovers.** Of the 41 items the handover census could not
 map to a verified closure, the prior FP4-CB fast-expander/Triton item is now closed by the
