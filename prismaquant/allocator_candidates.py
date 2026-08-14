@@ -1423,8 +1423,17 @@ def cost_entry_predicted_dloss(
         # measured one, where falling through would silently apply another
         # family's transfer constant to a projection that is not in its units.
         return base + cost_entry_act_dloss(cost_entry)
-    return (base * _activation_penalty(format_name, activation_pricing)
-            + cost_entry_act_dloss(cost_entry))
+    # The A-side rides the SAME per-family transfer as the W-side. Adding it
+    # OUTSIDE the multiply puts the two halves of one unit's price on two
+    # scales, and P5a's fitted constants are large: measured on Qwen3.8-27B the
+    # NVFP4 family fit was x8103, which diluted an A-side worth 6x the W-side
+    # down to 0.07% of the total and produced an allocation byte-identical to
+    # the weight-only one. Multiplying the sum preserves the A:W ratio, which is
+    # the quantity the DP actually ranks on, and is exactly ``base + act`` when
+    # P5a is inert (penalty 1.0) -- so it cannot change a run that has no
+    # measured rows to calibrate from.
+    return ((base + cost_entry_act_dloss(cost_entry))
+            * _activation_penalty(format_name, activation_pricing))
 
 
 #: AQUA-AURA: the A-side Δloss of a (unit, format), written into the cost row by

@@ -67,6 +67,43 @@ def test_the_term_is_added_on_the_weight_only_branch():
         "same currency as the weight term, not a multiplicative penalty")
 
 
+def test_the_a_side_rides_the_same_p5a_transfer_as_the_w_side():
+    """The two halves of one unit's price must be on ONE scale.
+
+    P5a is a per-family multiplicative re-leveling of weight-only rows. Adding
+    the A-side outside that multiply leaves it in un-transferred units, and the
+    fitted constants are large -- x8103 for the NVFP4 family on Qwen3.8-27B --
+    so an A-side worth 6x the W-side arrives as 0.07% of the total. That is not
+    a rounding difference: it produced a shipped Pareto byte-identical to the
+    weight-only one, which is how the bug was caught.
+
+    Multiplying the SUM keeps the A:W ratio, which is what the DP ranks on.
+    """
+    entry = _weight_only_entry(**{ACT_DLOSS_KEY: ACT})
+    plain = cost_entry_predicted_dloss(STATS, entry, format_name="NVFP4")
+    assert plain == pytest.approx(1.0 + ACT)
+
+    class _FixedPenalty:
+        enabled = True
+
+        def penalty_for(self, format_name, act_changes):
+            # ``_activation_penalty`` reads element [0]; the second slot is the
+            # branch label used only for reporting.
+            return (1000.0, "test")
+
+    scaled = cost_entry_predicted_dloss(
+        STATS, entry, format_name="NVFP4", activation_pricing=_FixedPenalty())
+    assert scaled == pytest.approx((1.0 + ACT) * 1000.0), (
+        "a large per-family penalty must scale the A-side with the W-side, not "
+        "drown it")
+    # The ratio is what the DP ranks on and must be penalty-invariant.
+    without = dict(entry)
+    without.pop(ACT_DLOSS_KEY)
+    ref = cost_entry_predicted_dloss(
+        STATS, without, format_name="NVFP4", activation_pricing=_FixedPenalty())
+    assert scaled / ref == pytest.approx(plain / 1.0)
+
+
 def test_it_is_not_added_to_an_activation_inclusive_measurement():
     """The double-count guard for ``_prices_from_output_mse``.
 
