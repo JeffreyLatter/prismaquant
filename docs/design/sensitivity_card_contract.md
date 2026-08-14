@@ -328,7 +328,7 @@ known to be unlicensed across a codebook-basis change.
 
 ---
 
-## 7d. MARGINAL vs SCALAR: fusion absorbs most of the RANKING, none of the ALLOCATION
+## 7d. MARGINAL vs SCALAR: fusion absorbs most of the RANKING, none of the ALLOCATION at the default budget
 
 > **Read §7d-bis before quoting anything from §7d.** The rank statistics below
 > say the two tiers nearly agree once fused groups are the unit (Spearman
@@ -409,16 +409,42 @@ same budget, the **only** difference being `CostModel.SCALAR` vs `MARGINAL`:
 | 6.0 | 26 / 196 = 13.3% | 17 / 196 = 8.7% |
 
 **12.2% of units get a different format at the production budget, and fused
-promotion absorbs none of it there.** The 4.5 row is not agreement: 4.5 *is* the
-NVFP4 floor, both arms assign 196/196 NVFP4, and a point with no freedom cannot
-disagree.
+promotion absorbs none of it there** (it absorbs a third to a half at 5.0–6.0).
+The 4.5 row is not agreement: 4.5 *is* the NVFP4 floor, both arms assign 196/196
+NVFP4, and a point with no freedom cannot disagree.
 
-**The direction is systematic: MARGINAL is more conservative.** At 4.75 SCALAR
-lifts 26 units to FP8 (54 after promotion); MARGINAL lifts 18 (36 after). This
-follows from the median ratio 0.73 — MARGINAL scores the cheap format's Δloss
-*lower*, so NVFP4 looks relatively better and fewer units need the upgrade.
-The churn is attention-dominated at 4.75 (`v_proj`/`k_proj`/`q_proj`/`o_proj`)
-and shifts to MLP (`down_proj`/`up_proj`/`gate_proj`) by 5.5–6.0.
+**Read the raw-DP column as the result; the promoted column is indicative
+only.** The promoted numbers come from a one-shot `promote_fused` over a bare
+`solve_allocation` — a *projection*, which overshoots the byte budget (SCALAR at
+4.75 ends with 54 units on ~8 bits). The production path is
+`solve_with_promotion`, which re-tightens and re-solves until the *promoted*
+assignment is feasible, and churn under that iterated path could differ. The
+raw-DP figure is the clean cost-model isolation statistic, since both arms are
+projected identically.
+
+**They disagree about WHICH units to lift, not just how many — and that is the
+stronger result.** Set overlap of the FP8-lifted units:
+
+| target | SCALAR lifts | MARGINAL lifts | **both** | SCALAR-only | MARGINAL-only | subset? |
+|---|---|---|---|---|---|---|
+| 4.75 | 26 | 18 | **10** | 16 | 8 | no |
+| 5.0 | 45 | 44 | 32 | 13 | 12 | no |
+| **5.5** | **76** | **75** | 62 | 14 | 13 | no |
+| 6.0 | 102 | 98 | 87 | 15 | 11 | no |
+
+At 4.75 only **10 units are FP8 under both tiers** — 38% of SCALAR's picks. If
+MARGINAL were merely *conservative* (a subset of SCALAR's lifts) churn would be
+26−18 = 8; it is 24. **MARGINAL is a subset of SCALAR at no budget.**
+
+**The 5.5 row is the one to internalise:** SCALAR lifts 76, MARGINAL lifts 75 —
+a difference of **one** — and they still disagree on **27 units**. The count
+asymmetry is essentially zero while the disagreement is at its maximum. So
+"MARGINAL is more conservative" is a real but *minor* effect (visible mainly at
+4.75, and consistent with its median ratio of 0.73); the dominant effect is a
+**re-selection of which Linears deserve the bits**, which no aggregate count
+reveals. The churn is attention-dominated at 4.75
+(`v_proj`/`k_proj`/`q_proj`/`o_proj`) and shifts to MLP
+(`down_proj`/`up_proj`/`gate_proj`) by 5.5–6.0.
 
 **Calibrating 12.2%:** the decision-level uncertainty study found a cost CV of
 23% produced only **3%** churn at 4.75 and a **0σ** served effect. This is **4x
