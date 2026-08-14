@@ -328,6 +328,69 @@ known to be unlicensed across a codebook-basis change.
 
 ---
 
+## 7d. MARGINAL vs SCALAR: big per-Linear repricing, mostly absorbed by fusion
+
+Measured 2026-08-14 on the Qwen3-0.6B marginals probe (n=8, T=512), 196 units
+(lm_head excluded), RTN render, through the shipping `price()` and
+`RegistryFormatPlugin`. Scripts and JSON in
+`/home/rob/dq-runs/aura-card-marginals-0p6b/` (`marginal_vs_scalar_rank.py`,
+`marginal_group_level.py`).
+
+**Per Linear, MARGINAL is emphatically not a no-op:**
+
+| | NVFP4 | FP8_DYNAMIC |
+|---|---|---|
+| Spearman(SCALAR, MARGINAL) | **0.718** | **0.569** |
+| median rank shift (of 196) | 21 | 28 |
+| units moving > 20 ranks | 98 / 196 | 108 / 196 |
+| top-16 overlap | 10 / 16 | 10 / 16 |
+| ratio MARGINAL/SCALAR | 0.17x – 7.75x (med 0.73) | 0.05x – 5.20x (med 0.68) |
+
+**At the DP's actual decision unit, most of it cancels:**
+
+| | NVFP4 | FP8_DYNAMIC |
+|---|---|---|
+| Spearman, **fused-group** level | **0.965** | **0.954** |
+| median rank shift (of 112) | **4** | **3.5** |
+| groups moving > 5 ranks | 37 / 112 | 41 / 112 |
+| top-14 overlap | 12 / 14 | 12 / 14 |
+
+The cancellation is **within-group**: across the 56 multi-member groups, the
+members' own MARGINAL/SCALAR ratios differ by a median factor of **1.71x**
+(NVFP4), i.e. siblings move in *opposite* directions and the sum absorbs it.
+The per-Linear riser/faller pair is `k_proj` up / `v_proj` down on both formats
+— and those are siblings in the same `attn_qkv` group, forced to one format by
+union-find promotion. **Scoring Linears the DP never decides independently
+overstates the effect.**
+
+**The mechanism is entirely on the column side.** The row marginal is flat
+(median unit needs 92.9% of its output rows for 99% of the mass), so the row
+weighting contributes ~nothing. The column marginal is where the structure is:
+median 90.6%, but the **minimum is 0.00195** — one unit carries 99% of its
+column-Fisher mass in 0.2% of its input channels. That is the activation-outlier
+structure, and it is why MARGINAL and AQUA-AURA share a mechanism.
+
+**One expectation this refutes.** The natural guess is that the surviving
+group-level movement is concentrated in *unfused* units, since those have
+nothing to cancel against. It is not: single-member groups are 50% of all
+groups but only 30% (NVFP4) / 37% (FP8) of the movers, and the biggest mover
+class is `attn_qkv` (15 of 37) — three-member groups aggregating three
+different column structures. Fusion damps the magnitude; it does not decide
+which units survive it.
+
+**What this does NOT say.** It compares two surrogates **to each other**;
+neither is ground truth, so it says nothing about which is *better*. It is a
+screen on one 0.6B dense model under an RTN render — and per §7c, the measured
+compensated cost that would arbitrate is exactly what no plugin serves yet.
+The honest read: **MARGINAL's headline per-Linear effect is largely an artifact
+of the wrong unit of analysis, and its real allocation-level effect on a dense
+Qwen is a ~4-rank perturbation.** That is worth knowing before anyone budgets
+MARGINAL as the reason to re-probe a 27B. Expect a larger effect where fusion
+does not apply and column structure is sharper — MoE experts, and any model
+with heavier activation outliers.
+
+---
+
 ## 8. What is proven, and what is not
 
 **Proven on REAL production artifacts** (`tools/validate_card_zero_churn.py`,
