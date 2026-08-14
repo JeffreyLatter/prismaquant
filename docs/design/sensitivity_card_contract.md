@@ -307,8 +307,12 @@ n=8 T=512 (`/home/rob/dq-runs/aura-lmhead-ab/`), identical `calib_hash`
 | lm_head row-sum vs `h_trace_raw` | 3.612e-04 | **7.357e-08** |
 | `validate()` failures across the card | 1 | **0** |
 
-Every body unit is **bit-identical** across the arms, confirming the change is
-surgical. On a separately-drawn calibration the same fix moved lm_head from
+Every body unit's `h_trace_raw` is **bit-identical** across the arms, confirming
+the change is surgical. (Scope that precisely: `h_trace_raw` is the field the
+one-statement diff touches and the field compared here — it is the measurement.
+That the marginal *vectors* are also unchanged follows from the diff, which does
+not reach them, but was not separately compared.) On a separately-drawn
+calibration the same fix moved lm_head from
 1.019e-03 to 2.781e-08; the absolute size of the bf16 error varies with the
 draw, but it is ~4 orders worse than the fp32 path either way. Worst-case
 row-vs-trace across all 197 units after the fix is **1.334e-07**, clearing
