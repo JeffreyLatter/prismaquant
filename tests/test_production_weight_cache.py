@@ -130,6 +130,48 @@ def test_release_resident_tensors_frees_memory_without_losing_data(tmp_path):
         assert torch.equal(cache.get(name, "NVFP4"), want)
 
 
+def test_spilled_ref_log_probs_round_trip_and_hold_nothing_resident(tmp_path):
+    """Reference log-probs go to disk, and come back bit-identical.
+
+    They must all exist before the first measurement (the in-place install
+    destroys the model that produces them), and at 27B full-vocab fp32 that is
+    ~8 GiB per repeat. Relocating them to host memory would be pointless on a
+    unified-memory box -- one pool -- so they go to NVMe. This asserts the
+    property that makes that safe: what comes back equals what went in.
+    """
+    from prismaquant.validate_assignments_kl import _SpilledRefLogProbs
+
+    vocab, seqlen, n_seq = 7, 3, 4
+
+    class _StubModel:
+        def __call__(self, batch):
+            # Deterministic, distinguishable per sequence.
+            base = float(batch[0, 0].item())
+            logits = torch.arange(
+                seqlen * vocab, dtype=torch.float32
+            ).reshape(1, seqlen, vocab) + base
+            return SimpleNamespace(logits=logits)
+
+    calib_ids = torch.arange(n_seq * seqlen).reshape(n_seq, seqlen)
+    spilled = _SpilledRefLogProbs(
+        _StubModel(), calib_ids, torch.device("cpu"),
+        kl_scope="full_sequence", out_dir=tmp_path / "refs")
+
+    assert len(spilled) == n_seq
+    assert spilled.nbytes == n_seq * seqlen * vocab * 4
+
+    import torch.nn.functional as F
+    for i in range(n_seq):
+        want = F.log_softmax(
+            _StubModel()(calib_ids[i:i + 1]).logits.float(), dim=-1)
+        assert torch.equal(spilled[i], want)
+
+    # Nothing cached in the object: each read comes off disk, so N repeats cost
+    # one sequence of memory, not N x the whole set.
+    assert not any(
+        isinstance(v, torch.Tensor) for v in vars(spilled).values())
+
+
 def test_inplace_measure_can_skip_a_redundant_materialization():
     """Repeats vary the calibration draw, never the weights.
 

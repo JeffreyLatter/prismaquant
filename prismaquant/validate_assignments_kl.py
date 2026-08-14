@@ -896,6 +896,60 @@ def _kl_repeat_summary(
     return summary
 
 
+class _SpilledRefLogProbs:
+    """One repeat's reference log-probs, held on NVMe instead of in the pool.
+
+    Reference log-probs must be computed for EVERY repeat before the first
+    measurement, because the in-place install destroys the BF16 model that
+    produces them. They are fp32 over the full vocabulary, so on Qwen3.8-27B
+    (16 x 512 tokens, vocab 248320) one repeat is 8.14 GiB and ``--calib-repeats
+    4`` pins 32.6 GiB for the entire measurement -- on top of the model and the
+    render set, inside one shared 121.6 GB pool. That is what made repeats>=4
+    unrunnable at 27B, and repeats>=4 is exactly what CLAUDE.md requires before
+    a KL difference may be quoted.
+
+    Moving them "to CPU" is not a fix here: GPU and host share one physical
+    pool on this box, so host-resident and device-resident cost the same bytes.
+    Disk is the only place that is genuinely elsewhere.
+
+    Written one sequence at a time as they are produced, so even building the
+    references never holds more than a single sequence (~508 MiB). Reads are
+    one sequence at a time too; the consumer already does ``.to(device)`` on
+    what it gets back, so a CPU tensor from disk drops straight in.
+    """
+
+    @torch.no_grad()
+    def __init__(self, model, calib_ids, device, *, kl_scope: str, out_dir: Path):
+        import torch.nn.functional as F
+
+        out_dir.mkdir(parents=True, exist_ok=True)
+        self._paths: list[Path] = []
+        self._bytes = 0
+        for i in range(calib_ids.size(0)):
+            batch = calib_ids[i:i + 1].to(device)
+            logits = model(batch).logits
+            if kl_scope == "last_token":
+                logits = logits[:, -1:, :]
+            # fp32 deliberately: kl_divergence upcasts to fp32 anyway, and the
+            # teacher is the reference the whole metric is defined against.
+            lp = F.log_softmax(logits.float(), dim=-1).to("cpu")
+            path = out_dir / f"ref_{i:04d}.pt"
+            torch.save(lp, path)
+            self._paths.append(path)
+            self._bytes += lp.numel() * lp.element_size()
+            del logits, lp
+
+    def __len__(self) -> int:
+        return len(self._paths)
+
+    def __getitem__(self, i: int) -> torch.Tensor:
+        return torch.load(self._paths[i], map_location="cpu", weights_only=True)
+
+    @property
+    def nbytes(self) -> int:
+        return self._bytes
+
+
 @torch.no_grad()
 def _measure_inplace_assignment_kl(
     model,
@@ -1549,15 +1603,44 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.model,
             entrypoint="validate-kl",
         )
-        ref_log_prob_repeats = [
-            cache_reference_log_probs(
-                model,
-                calib_ids,
-                model_device,
-                kl_scope=args.kl_scope,
+        # Every repeat's references must exist before the first measurement --
+        # the in-place install is one-way and destroys the model that produces
+        # them. Holding them all in the pool is what broke repeats>=4 at 27B
+        # (see _SpilledRefLogProbs), so spill to disk as soon as there is more
+        # than one. repeats==1 keeps the historical in-memory path byte for
+        # byte, so no existing single-repeat artifact changes.
+        if len(calib_repeats) > 1:
+            _ref_dir = Path(tempfile.mkdtemp(
+                prefix="prismaquant_refs_", dir=str(work_root)))
+            ref_log_prob_repeats = [
+                _SpilledRefLogProbs(
+                    model,
+                    calib_ids,
+                    model_device,
+                    kl_scope=args.kl_scope,
+                    out_dir=_ref_dir / f"repeat_{idx:02d}",
+                )
+                for idx, calib_ids in enumerate(calib_repeats)
+            ]
+            _spilled_gib = sum(r.nbytes for r in ref_log_prob_repeats) / 2**30
+            _avail = _available_memory_bytes()
+            print(
+                f"[validate-kl] spilled {len(ref_log_prob_repeats)} repeats of "
+                f"reference log-probs ({_spilled_gib:.1f} GiB) to disk; "
+                f"MemAvailable "
+                f"{'?' if _avail is None else f'{_avail / 2**30:.1f}'} GiB",
+                flush=True,
             )
-            for calib_ids in calib_repeats
-        ]
+        else:
+            ref_log_prob_repeats = [
+                cache_reference_log_probs(
+                    model,
+                    calib_ids,
+                    model_device,
+                    kl_scope=args.kl_scope,
+                )
+                for calib_ids in calib_repeats
+            ]
 
         # M4: lazily render each frontier point's packed experts into the
         # shared cache BEFORE the strict gate. The format-menu build renders
