@@ -166,7 +166,19 @@ class CostComponents:
 
     bits_per_param: float = 0.0
     memory_bytes: int = 0
+    #: Parameter count of the unit. Carried so a consumer can aggregate bpp and
+    #: params-weighted speed without back-deriving it from memory_bytes, which
+    #: is undefined for codebook formats reporting ``bits_per_param == 0``.
+    n_params: int = 0
     speed_index: float | None = None
+    #: Whether the priced format touches activations, copied from
+    #: ``FormatDescriptor.quantizes_activations``. Carried rather than inferred
+    #: for the same reason it is explicit on the descriptor: it is the ONLY way
+    #: to tell "this format leaves activations alone, so act_dloss=None is
+    #: correct" from "this format quantizes activations but we failed to price
+    #: them, so act_dloss=None is a hole". Consumers that re-derived it from the
+    #: cost model got W4A16 wrong.
+    quantizes_activations: bool = False
 
     def to_predicted_dloss(self) -> float:
         """Collapse to the single float the knapsack DP sums.
@@ -517,5 +529,7 @@ def price(unit: SensitivityUnit, weight: np.ndarray,
         act_dloss=a_dloss,
         bits_per_param=desc.weight_bits,
         memory_bytes=int(round(unit.n_params * desc.weight_bits / 8.0)),
+        n_params=int(unit.n_params),
         speed_index=desc.speed_index,
+        quantizes_activations=bool(desc.quantizes_activations),
     )
