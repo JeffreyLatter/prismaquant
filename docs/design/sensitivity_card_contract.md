@@ -200,7 +200,7 @@ the post-allocator-rewrite antipattern.
 **No pickle.** A shareable artifact must load without executing arbitrary
 objects. The card is a single compressed `.npz` with a JSON header.
 
-## 7b. FIRST REAL-MODEL RUN (2026-08-14): two bugs, and an lm_head blocker
+## 7b. FIRST REAL-MODEL RUN (2026-08-14): two bugs, and an lm_head blocker (since FIXED — see the RESOLVED block below)
 
 The marginal emission was default-ON and had only ever been exercised by
 synthetic unit tests. Its first run against a real model — Qwen3-0.6B, n=8,
@@ -257,22 +257,67 @@ every other unit's trace. A 1e-3 relative gap is bf16-accumulation territory
 (bf16 eps 3.9e-3), consistent with the two paths differing in accumulation
 precision or order.
 
-**This is not fixed, and I did not weaken the assertion to make it pass.** A
-correct assertion firing on a real inconsistency is a finding, not an obstacle
-(principles 1 and 2). But as it stands **no card can be built from any probe
-that includes lm_head**, which blocks the lane. The two candidate resolutions,
-for Robert to pick:
+I did not weaken the assertion to make it pass. A correct assertion firing on a
+real inconsistency is a finding, not an obstacle (principles 1 and 2). Two
+resolutions were put to Robert:
 
 1. **Make lm_head's trace use the marginal accumulator** — fixes the root
    cause, but touches the shipping probe's resident path.
-2. **Exclude lm_head from the card as a non-allocatable unit** — principled
-   rather than a fudge, because principle 12 already excludes `lm_head` from
-   bpp accounting and it is never assigned a format. The card is a sensitivity
-   card *for allocation*; carrying a unit that is never allocated is what
-   created the exposure.
+2. **Exclude lm_head from the card as a non-allocatable unit** — principle 12
+   already excludes `lm_head` from bpp accounting, and a 20-`layer_config.json`
+   check (Qwen3-0.6B through DSv4-284B, 33,326 units) confirmed the allocator
+   has assigned it a format **zero** times.
 
-Option 2 is the smaller change and matches an existing project invariant;
-option 1 is the one that makes the number right. **Neither is implemented.**
+### RESOLVED 2026-08-14: Robert chose option 1. Fixed in `3006483`.
+
+*"Fix lm_head."* The root cause turned out to be narrower and more mundane than
+"a different accumulator", and the earlier phrasing above (the Phase-3 skip) is
+the *route*, not the *defect*. The defect is a missing dtype:
+
+```python
+# the RESIDENT backward hook — lm_head's path
+resident_stats[name]["h_trace_raw"] += float(
+    (gy2_sq.sum(dim=1) * x2_sq.sum(dim=1)).sum().item())   # bf16 reductions!
+```
+
+`gy2_sq` and `x2_sq` are **bf16**, and neither reduction passes
+`dtype=torch.float32` — while `_marginal_chunk`, ten lines away, forces fp32 on
+every reduction and documents exactly why: *"a T-long running sum in bf16 loses
+real precision for free."* Crucially `gy2_sq.sum(dim=1)` reduces over the
+**output** dimension, which for `lm_head` is the **vocabulary**: ~152k bf16
+addends on Qwen3 against ~1–5k for a body Linear. With 8 mantissa bits that is
+~1e-3 relative on lm_head and ~1e-8 everywhere else — precisely the observed
+split, and the reason exactly one unit of 197 failed.
+
+The fix takes the trace from `chunk_h.sum()`, which is **what both body-layer
+sites already do** (`h_trace_dev = chunk_h.sum()`, `:2528` and `:2759`). The
+identity `sum(fisher_row) == sum(fisher_col) == h_trace_raw` now holds **by
+construction on every path** instead of as a numerical coincidence. The old
+comment's justification — *"avoids a second full matmul"* — was stale on this
+path: `chunk_h` is materialized unconditionally three lines above because it
+feeds `resident_h_full`, so summing it is free and no matmul was ever avoided.
+
+**Verified by a controlled A/B**, both arms `--calib-seed 123` on Qwen3-0.6B
+n=8 T=512 (`/home/rob/dq-runs/aura-lmhead-ab/`), identical `calib_hash`
+`feb6ba6e…`:
+
+| | old code | new code |
+|---|---|---|
+| units whose `h_trace_raw` changed | — | **1 of 197 (`lm_head` only)** |
+| lm_head row-sum vs `h_trace_raw` | 3.612e-04 | **7.357e-08** |
+| `validate()` failures across the card | 1 | **0** |
+
+Every body unit is **bit-identical** across the arms, confirming the change is
+surgical. On a separately-drawn calibration the same fix moved lm_head from
+1.019e-03 to 2.781e-08; the absolute size of the bf16 error varies with the
+draw, but it is ~4 orders worse than the fp32 path either way. Worst-case
+row-vs-trace across all 197 units after the fix is **1.334e-07**, clearing
+`validate()`'s default `rtol=1e-3` by ~7500x.
+
+**The card can now be built from a probe including `lm_head`. The lane is
+unblocked.** Option 2 is moot, and deliberately so: a 16 GB-card Qwen3.8-27B
+build may well *want* to allocate the head, since it is a large fraction of a
+small dense model — which is exactly why fixing the number beat excluding it.
 
 **Incidental measurement worth keeping:** the row-Fisher is *flat*, not
 concentrated — the median unit needs **92.9%** of its output rows to hold 99%
