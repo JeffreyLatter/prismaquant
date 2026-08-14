@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from prismaquant import gridbook_runtime_pin as pinmod
+from prismaquant import gridbook_serving_runtime_pin as serving_pinmod
 from prismaquant.shipcard import _released_gridbook_runtime_pin
 
 
@@ -115,23 +116,68 @@ def test_exact_release_gate_rejects_an_alternate_resolved_commit():
         pinmod.require_exact_gridbook_runtime_release(pin)
 
 
-def test_shipcard_gate_accepts_the_exact_release_pin():
-    pinmod.load_gridbook_runtime_pin.cache_clear()
-    assert _released_gridbook_runtime_pin() == pinmod.load_gridbook_runtime_pin()
+def test_tracked_serving_release_commit_is_resolved_and_exact():
+    """The serving pin resolves to the reviewed v0.8.6 release.
+
+    This replaces an earlier test that asserted the SHIPPED pin was still
+    pending. That assertion was correct only while 0.8.6 was untagged; keeping
+    it would have meant the suite went red exactly when the release landed,
+    i.e. it would have been a test of the calendar rather than of the gate.
+    The gate itself is not weakened: the pending path is still exercised below
+    on a synthetic pin, and the alternate-commit path already has its own test.
+    """
+    serving_pinmod.load_gridbook_serving_runtime_pin.cache_clear()
+    pin = serving_pinmod.load_gridbook_serving_runtime_pin()
+    assert pin.commit == serving_pinmod.GRIDBOOK_SERVING_RUNTIME_RELEASE_COMMIT
+    assert (pin.wheel_sha256
+            == serving_pinmod.GRIDBOOK_SERVING_RUNTIME_RELEASE_WHEEL_SHA256)
+    assert pin.version_is_release is True
+    serving_pinmod.require_exact_gridbook_serving_runtime_release(pin)
+    # And the shipcard gate accepts it, which is the thing that was blocked.
+    _released_gridbook_runtime_pin()
 
 
-def test_shipcard_gate_rejects_an_alternate_resolved_commit(monkeypatch):
+def test_shipcard_gate_still_rejects_a_pending_serving_pin(monkeypatch):
+    """The pending sentinel must remain rejected after the release lands."""
     import prismaquant.shipcard as shipcard_module
 
-    alternate = replace(
-        pinmod.load_gridbook_runtime_pin(),
-        commit="a" * 40,
+    pending = replace(
+        serving_pinmod.load_gridbook_serving_runtime_pin(),
+        commit=serving_pinmod.GRIDBOOK_SERVING_RUNTIME_COMMIT_PENDING,
+        wheel_sha256=(
+            serving_pinmod.GRIDBOOK_SERVING_RUNTIME_WHEEL_SHA256_PENDING),
+        version_is_release=False,
     )
     monkeypatch.setattr(
         shipcard_module,
-        "load_gridbook_runtime_pin",
+        "load_gridbook_serving_runtime_pin",
+        lambda: pending,
+    )
+
+    with pytest.raises(
+        serving_pinmod.GridbookServingRuntimePinError,
+        match="still pending",
+    ):
+        shipcard_module._released_gridbook_runtime_pin()
+
+
+def test_shipcard_gate_rejects_an_alternate_resolved_serving_commit(monkeypatch):
+    import prismaquant.shipcard as shipcard_module
+
+    alternate = replace(
+        serving_pinmod.load_gridbook_serving_runtime_pin(),
+        commit="a" * 40,
+        wheel_sha256="b" * 64,
+        version_is_release=True,
+    )
+    monkeypatch.setattr(
+        shipcard_module,
+        "load_gridbook_serving_runtime_pin",
         lambda: alternate,
     )
 
-    with pytest.raises(pinmod.GridbookRuntimePinError, match="exact released"):
+    with pytest.raises(
+        serving_pinmod.GridbookServingRuntimePinError,
+        match="exact reviewed",
+    ):
         shipcard_module._released_gridbook_runtime_pin()

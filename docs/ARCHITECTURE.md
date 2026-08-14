@@ -1,7 +1,7 @@
 # PrismaQuant Architecture
 
-As of: 2026-08-13 · branch `fix/gridbook-wheel-provenance-v0121` · verified against
-implementation baseline commit `3c23cf0` plus the Gridbook wheel-attestation repair
+As of: 2026-08-13 · branch `release/dsv4flash-dspark-v0121` · verified against
+implementation baseline commit `f0747a4` plus the cherry-picked Gridbook wheel-attestation repair
 described by the named schemas and symbols below. The final integration commit is
 deliberately not predicted in this provenance stamp. This revision includes the Spark
 BF16 AURA-anchor residency and streamed-reverse lifetime corrections, the activation-safe
@@ -11,13 +11,32 @@ resume identity contract, the content-addressed campaign/release source-snapshot
 the exact Gridbook VCS-or-wheel installed-import-origin closure, the strict Gridbook runtime-contract-v3
 feature boundary, and the bundle-authoritative
 per-rung learned/lattice source-map contract, the routed-MoE learned-codebook
-producer contract, the DeepSeek DSpark source-overlay contract, the streamed CB
+producer contract, the DeepSeek DSpark source-overlay contract, the experimental
+DSpark hybrid CB/source-FP8 sidecar producer and physical/construction namespace
+contract, the finalized-assignment/render/source exact-scope closure, stable
+pre/post DSpark serving-stack fingerprint equality, claim-aware optional-slot
+verification, canonical DSpark group/layout/assignment and logical-codebook
+payload closure, canonical frozen-byte/full-file-set publication authority with
+remote parent-commit CAS, the separate current-consumer Gridbook-0.8.6 serving
+profile and paired DSpark runtime/route census, strict
+matched no-MTP/K12-MTP throughput-and-headroom release gate with a source-closed,
+lifecycle-owned arm collector, reference-only
+Entrpi long-prefill/concurrency comparison contract, the streamed CB
 cached-menu render/consume contract, and the profile-declared routed-expert
 AURA/empirical hybrid key-space contract, the offline value-closed DSv4
 WikiText gold-input contract, plus the platform-agnostic anchored-cost
 mechanism, CB mapping plugin, DSv4 one-shot acceptance-driver contract, the
 anchored-AURA allocator admission branch (P0, closed 2026-08-11), and the
-one-purpose CPU-only W8A16 readmission plus tracked pre-export handoff gate.
+one-purpose CPU-only W8A16 readmission plus the deliberately restamped v2
+pre-export handoff gate. The current handoff approval binds the 15-file
+`prismaquant.dsv4_w8a16.export_source_closure.v1` semantic closure at identity
+`7517d87cfc231e5cfa60faa74728505a272540d33d8bc15c2196c54e62fa7fca`;
+the v2 handoff implementation source is
+`ba1a7ae844a2187abe24f059037ceb22d3da73aecf2136ead39230b5cb8320de`
+and its reviewed streaming-exporter member is
+`f740ebd9b90e586fc10ffa975f2f624ee8f7f85b02bb927701e946989bc3319f`.
+older v1 handoff receipts remain dated history and are not current export
+authority.
 The external runtime record pins Gridbook **0.8.5** at exact commit
 `e992e5980c96333a48149f96392d6cff56ae9e3f`, with
 `gridbook.runtime-contract.v3` and the exact required feature map
@@ -37,6 +56,21 @@ branch also preserves the dated 2026-08-01 DeepSeek-V4-Flash-0731
 92 GB study record (§9.2) as historical candidate-era evidence. It is not promotion
 evidence for the current runtime: the release path is the separately gated
 112.690 GB AURA artifact authorized only by the exact W8A16 handoff.
+
+That 0.8.5/v3 record is deliberately immutable producer and handoff evidence;
+it is not silently repointed when the serving plugin changes. DSpark serving
+has a second, current-consumer pin in
+`gridbook_runtime/gridbook_serving_runtime_pin.json`. It names Gridbook 0.8.6,
+runtime-contract v4, the routed-MoE/source-FP8 features above, and
+`dspark_construction_physical_bridge=1`. Its release commit and published-wheel
+SHA-256 are currently explicit `PENDING_...` sentinels and
+`version_is_release=false`, so every live endpoint, quality, performance, and
+paired-DSpark gate fails closed. The final pin patch must use the wheel digest
+reported by the published PyPI file and independently match it to the GitHub
+Release asset; a local pre-tag wheel is not byte-reproducible evidence and must
+not supply that digest. `gridbook_serving_runtime.sh` then downloads or accepts
+only that exact wheel, validates its archive paths and METADATA, installs it
+from the read-only local file, and checks PEP 610 plus the v4 feature closure.
 
 This revision retains the four 2026-07-30 architecture re-vet waves documented in
 `docs/audits/architecture_re-vet_2026-07-30.md` and closes the runtime-ownership debt: the
@@ -1118,8 +1152,12 @@ remains same-snapshot and activation-safe. The exact
 Gridbook 0.8.5 pin plus its 91-test installed-wheel GPU gate back the source W8A16 route for
 export without a route-pending acknowledgement. The tracked pre-export handoff still refuses
 an unresolved/unreleased pin, any pending route, changed source/bundle/publication bytes,
-changed frozen exporter code, or an existing output. Readmission does not itself imply GPU
-measurement or export; full-artifact native parity remains a post-export shipcard gate
+changed bytes in the reviewed exporter/source semantic closure, or an existing output. The
+new `prismaquant.dsv4_w8a16.export_handoff.v2` receipt carries the closure schema, exact
+per-file SHA-256 map, and canonical closure identity above. It supersedes v1 only as current
+handoff authority; it does not rewrite or reinterpret any dated historical receipt.
+Readmission does not itself imply GPU measurement or export; full-artifact native parity
+remains a post-export shipcard gate
 (`dsv4_aura_cb_reprice`, `dsv4_w8a16_export_handoff`).
 
 **Residual CB-family activation blindness (reported; terminal shortcut gated).** Every rung of `nvfp4_cb` and
@@ -1790,8 +1828,9 @@ which is why the recipe filter here stays `mtp.` regardless of the source prefix
 `validate_mtp_assignment_coverage` `:9195-9222` **hard-fails** when the source has tensors under
 `mtp_source_prefix()`, the profile `has_mtp()`, and the recipe has no `mtp.*` entries.
 
-**DeepSeek-V4 DSpark is a source-format metadata overlay, not a second
-quantization pass.** The released Flash checkpoint already carries three complete
+**DeepSeek-V4 DSpark has two explicit producer modes.** The release-default mode is a
+source-format metadata overlay, not a second quantization pass. The released Flash checkpoint
+already carries three complete
 `mtp.{0,1,2}` stages: 2,304 routed-expert projection bases as packed MXFP4
 E2M1 + E8M0 and 25 dense/shared/attention bases as block-FP8 E4M3 + E8M0.
 `dspark_source_metadata.py` derives the released layout from model config and
@@ -1827,7 +1866,184 @@ source artifact remains unchanged. Provenance schema
 tests additionally pin the model container's SHA-256, inode, size, and mtime.
 All non-MTP config groups, ignores, and pre-existing delegated routes must remain
 identical, and a route-pending source format still requires the artifact's prior
-ship acknowledgement.
+ship acknowledgement. With `--dspark-cb-sidecar` omitted or explicitly false,
+the target artifact retains the source checkpoint's exact physical tensor
+inventory, dtype/shape map, and payload bytes and carries no sidecar/render
+attestation provenance.
+
+The experimental `--dspark-cb-sidecar` mode is the deliberate exception. Its expanded recipe
+contains all 2,328 decoder Linears, but exactly 2,325 are K12 CB. The three
+`mtp.{0,1,2}.attn.wo_a` bases remain released block-128 source-FP8 W8A16 because vLLM marks
+that projection as a grouped BMM and Gridbook's generic CB Linear implements only ordinary
+dense GEMM; flattening `[T,G,K]` would mix groups and produce the wrong output shape.
+`mtp.0.main_proj` is the fourth explicit W8A16 source base. The 2,325 logical CB decisions
+collapse to exactly 27 physical CB qweights under `mtp.{0,1,2}.*`, declared at Gridbook's
+construction names `model.layers.{L,L+1,L+2}.*`. Routed experts are validated as a closed
+3-stage × 256-expert × {gate,up,down} set and collapse into six packed expert stacks.
+
+The weight-only safetensors header is therefore exactly 82 tensors: 27 CB qweights, the
+unchanged 47 non-Linear glue tensors, and eight W8A16 source planes (`weight` + UE8M0 `scale`
+for `main_proj` and all three `wo_a`). The CB parameter count is 19,623,051,264. Relative to
+the unsafe all-CB K12 draft, retaining `wo_a` adds 78,256,128 bytes (about 74.63 MiB) before
+small JSON/header variance. The input builder refuses anything except the released
+three-stage layout and records all four physical→construction source routes. The streaming
+exporter refuses a subset other than `mtp.`, any CB `wo_a`, unexpected decoder routes,
+incomplete stages, or a non-source member of that four-base set; it records exact physical CB,
+construction CB, and source physical→construction sets in
+`prismaquant.dspark_cb_sidecar.v1` provenance. When an activation execution contract is
+present, the artifact additionally carries a validated one-to-one `dspark_target_bridge`;
+weight-only experiments intentionally omit it. All four source bases retain both physical
+planes through the raw-copy path; recognizing an MTP `.scale` sibling for source decoding does
+not consume or suppress that verbatim scale plane.
+
+The sidecar decoder gate does not trust a config-group label as its own layout proof. Every
+CB label must be a canonical producer rung from `cb_layout`; its scheme must exactly match that
+family's grid, mode, K, subtable count, superblock, group/vector dimensions, packed type size,
+activation width, and production scale-coding record. The group format is then expanded back
+to the finalized physical `provenance.tensor_formats` per-Linear assignment. In particular,
+each packed routed-expert `gate_up_proj` group must match every expert's separate `gate_proj`
+and `up_proj` decision, and `down_proj` must match every expert's separate decision. Thus a
+self-consistent label/scheme/qweight/codebook-header rewrite cannot redefine the allocator's
+assignment. The `.pqcb` header must contain exactly the canonical subtables and shapes, and
+the gate loads each real safetensors tensor and recomputes the producer definition
+`sha256(tensor.to(float16).cpu().numpy().tobytes())` against every declared
+`provenance.codebook_sha256`; changing payload values without changing dtype or shape refuses.
+
+**A production sidecar must be rendered again from a source-complete recipe.** The earlier
+research draft's `render_identity_verified=false` marker cannot be upgraded by editing JSON,
+and `--allow-unstamped-research` is never accepted by a ship gate. The input builder requires
+the streamed-model identity cache and stamps
+`prismaquant.dspark_cb_render_recipe.v1`: compact complete checkpoint identity plus exact
+digests of source `config.json`, the validated MTP safetensors header, canonical assignment,
+imatrix/column weights, and the pristine incomplete render-identity seed. During the one-pass
+export, `CBRenderSourceIdentityCollector` observes the decoded shape and content digest of
+every CB source weight exactly once. Dense weights are observed from the decoded host tensor
+before H2D, so attestation adds no immediate full-tensor D2H copy; routed-expert members are
+likewise observed as each host member is decoded. Any duplicate observation (including a
+changed value under the same qname), post-finalize mutation, or incomplete finalize refuses.
+Final output publication happens only after that observed set equals the exact assignment
+scope; the artifact then records a source-complete `cb_render_identity`,
+`render_identity_verified=true`, and the full recipe plus its digest in
+`dspark_render_attestation`. `validate_dspark_production_render_attestation` replays the
+recipe, assignment and seed digests and requires exact map equality between the finalized
+`provenance.tensor_formats` CB qname→format scope and both the render-identity and complete
+source-weight scopes. A self-consistent reduced render with recomputed column-weight, source,
+seed, recipe, and attestation digests therefore still refuses; W8A16 source/glue routes are
+correctly outside that CB map. It also rejects a missing source digest, immutable recipe
+stamp, or source-weight closure. Consequently the existing unstamped K12 draft is research
+evidence only; a fresh export from the stamped inputs is a release prerequisite.
+
+This producer does not promote the lane. The immutable Gridbook 0.8.5/v3 record remains the
+producer and source-overlay handoff evidence; it predates the physical→construction→registered
+DSpark bridge. A candidate consumer implements that bridge under
+`gridbook.runtime-contract.v4` (`contract_version=4`,
+`dspark_construction_physical_bridge=1`, `source_fp8_block128_w8a16=1`). The draft decode
+receipt requires both features: the namespace bridge and the delegated grouped-BMM W8A16 route
+are each load-bearing. The consumer must be released as Gridbook 0.8.6 and selected through
+the separate current-serving pin by its exact release commit and reviewed wheel SHA-256.
+Until both identities are resolved, serving fails closed. The separate draft artifact must
+then pass load, generation, measured residency/scratch, acceptance-by-position, and paired
+throughput evidence. It is served from its own path and never mutates the immutable target
+artifact.
+
+The MTP claim has its own paired endpoint/shipcard path rather than borrowing a target-only
+smoke result. `serve_fingerprint.py write` takes both `--artifact-dir /model` and
+`--draft-artifact-dir /draft`; `pre` and `post` snapshots must bracket one unchanged process
+tree/session and bind both exact artifact SHAs. `attestation_phase` is chronology metadata and
+is excluded from the stable serve fingerprint; every resident-extension, package,
+runtime-capability, artifact, and session field remains bound, and the attester plus compact
+receipt replay require exact pre/post fingerprint equality. Between the snapshots, the MTP
+arm of `python -m prismaquant.dspark_matched_performance_collector collect-arm` runs eight
+fixed prompts for exactly 128 tokens each (`temperature=0`, `ignore_eos=true`) and emits the
+acceptance file from that exact measured interval; the older
+`validate_dspark_target_draft run-suite` entry point remains diagnostic and is not a release
+report producer. The collector reconciles uncontaminated Prometheus before/after counters.
+Five-token DSpark drafting must be active, per-position accept counts must be
+monotone, and position zero must accept at least 0.60. `attest` additionally requires the
+exact 256K/FP8-KV/Marlin/Gridbook launch contract and server-log proof that FULL_DECODE_ONLY
+graphs for sizes `[5,6]` were captured without downgrade. The manifests are replayed through
+the separate `dspark_serving_profile.v1` receipt and exact Gridbook-0.8.6 runtime evidence,
+not the immutable 0.8.5 producer environment. The same MTP log must provide an exact 92-route
+`dspark_route_census.v1`: 70 target FP4-v2 routes, six uniform-K12 draft FP4-v2 routes, 16
+target source-FP8 inherited routes, and zero fallback/unscoped routes
+(`prismaquant/dspark_serving_profile.py:validate_dspark_serve_manifest`,
+`validate_route_census`).
+
+An MTP claim also requires a separately served target-only arm and the strict matched release
+gate in `prismaquant/dspark_matched_performance.py`. The only release-authoritative report
+producer is `prismaquant/dspark_matched_performance_collector.py`; it never starts or patches
+vLLM and accepts no operator-authored manifest, response, counter, memory, KV, graph, or route
+JSON. From one verified `prismaquant.runtime_source_snapshot.v1`, `declare-policy` first writes
+one no-clobber policy declaration shared by both arms. Inside each future serving container,
+`start-sampler` must run before vLLM and starts a fresh stdlib-only one-second
+MemAvailable/cgroup-OOM observer (so the parent package's ML import footprint is not retained);
+after READY, `collect-arm` adopts that exact one-shot process, writes the live pre manifest,
+issues one warm and one measured workload, writes the live post manifest, snapshots the real
+serve log, and only then stops the sampler. It parses graph, KV, OOM, and (for MTP) route and
+speculative-acceptance evidence from those observations before invoking the report validator
+and publishing the no-clobber report.
+
+The `python -m` spelling names the module CLI, but a release invocation runs it through
+`tools/prismaquant_source_bootstrap.py run-module --source-root <snapshot>` with module
+`prismaquant.dspark_matched_performance_collector`. That bootstrap selects the exact read-only
+snapshot without executing the package's heavyweight compatibility initialization; the
+collector then independently verifies the snapshot's complete tracked-file ledger.
+
+Each source report is self-digesting; `validate_arm_report` also records its actual JSON-file
+digest in the compact evidence. Tool schema v2 binds the collector bytes and an exact digest
+map of the stdlib observer, collector, report validator, serving profile, pair attester,
+source-snapshot/source-bootstrap boundaries, and live fingerprint writer. Full-report
+validation recomputes
+that map from the attester's local source, while the collector itself first verifies the whole
+tracked runtime snapshot closure. The reports additionally bind the exact target artifact,
+image, 0.8.6 wheel/runtime/profile, host/GPU, closed process environment, resident extensions,
+256K model limit, exactly
+1,717,986,918 bytes of FP8 KV, `max_num_seqs=1`, `max_num_batched_tokens=512`, tool-enabled
+launch, and one warm plus one measured pass of the same eight prompts × 128 fixed output
+tokens. The only permitted launch differences are DSpark K=5 plus their necessary compiled
+FULL_DECODE_ONLY graph contracts: `[1]` for no-MTP versus `[5,6]` for MTP. Distinct live
+sessions are mandatory; the MTP measured responses and interval must be the exact acceptance
+suite above, and both arms reconcile completed/generation/failure/timeout counters so another
+request contaminating the interval refuses.
+
+The threshold is predeclared in both reports and is a strict non-regression:
+`mtp_warm_output_tokens_per_second / no_mtp_warm_output_tokens_per_second >= 1.0`; the receipt
+records both that ratio and the absolute tokens/s delta. Each full report contains a continuous
+one-second `/proc/meminfo:MemAvailable` ledger (maximum 2.5-second gap) spanning startup,
+READY, warmup, measurement, and post-run. It replays model residency, startup/measured
+transients, exact 256K KV capacity, no OOM/watchdog trip, a live post-run server, and the
+existing production floors from `scripts/serve_dsv4_cb_validate.sh`: at least 110 GiB before
+startup, 8 GiB at READY/post-run, and 4 GiB throughout. Reciprocal cards retain a compact
+phase/KV/headroom receipt plus sample-ledger, report-payload, and report-file digests rather
+than duplicating thousands of sampler rows (`validate_arm_report`, `validate_matched_result`).
+A stack, budget, artifact, report, workload, counter, headroom, or route mismatch, insufficient
+256K capacity, or slower MTP is therefore a hard failure.
+
+The same claim digest-binds `dspark_baseline_comparison.v1`, an explicitly reference-only
+Entrpi `ds4-on-spark` v0.5 / `ds4` v0.5.0 GB10 record pinned by exact commits and source-file
+hashes. Its published DeepSeek-V4-Flash-0731 IQ2_XXS/Q2_K (~81-GiB) observations—about
+960 tok/s at 2K, 933 tok/s at 64K, 776.4 tok/s over 517,963 tokens, about 28 tok/s single-chat
+decode near 12K, engine-side 45.7 ms/token near 240K, and about 59 aggregate tok/s at
+12-way concurrency—are comparison coordinates, never release thresholds. Local rows bind
+the exact prompt/tokenization digest, uncached token count, prefix-cache-off/hit-zero state,
+context start/end, chunk/batch/concurrency, endpoint counters, wall and internal timings,
+loaded bytes/quant profile, and evidence-file digest. Mandatory comparability gaps record the
+different engine/container, quantization/loaded bytes, unavailable exact upstream prompts,
+and timing basis; the selected 256K profile truthfully marks the 517,963-token local row
+unavailable instead of fabricating it
+(`prismaquant/dspark_serving_profile.py:validate_baseline_comparison_evidence`). No Entrpi
+headline derives a pass.
+
+After all of those checks, `attest` writes one self-digesting paired
+receipt into reciprocal optional `mtp.dspark` slots on the target and draft shipcards, binding
+roles and peer model SHAs. The slot remains non-blocking when a target-only artifact omits it
+or leaves it null. Every present non-null recognized optional claim is automatically replayed
+by ordinary verification, while on-disk `provenance.dspark_cb_sidecar` makes `mtp.dspark`
+mandatory for the draft even if its mutable card slot is deleted or nulled. Thus normal
+publication verifies both reciprocal claims without an additional CLI flag; an operator may
+still use `--require-slot mtp.dspark` as an explicit target-only demand. The attester also
+requires a clean exact
+PrismaQuant commit, so a dirty development tree cannot produce the release claim.
 
 `_bf16_upgrade_audit` `:1965-2087` (emitted `:8622`) classifies each BF16 Linear as
 passthrough/immutable, runtime-coerced, or a genuine budget choice — a manifest, not a policy;
@@ -2052,6 +2268,7 @@ re-render, it is the render the gate declined to keep.
 | Numeric ship gate | `validate_quantized_model.py` | never by the build pipeline; the DSv4 CB eager serve driver invokes it against its already-bound live session | yes, exit 0/1; closes `ship_gate` |
 | Gold lane | `tools/measure_vllm_full_kl.py`, `tools/measure_vllm_wikitext_ppl.py` | never | manual, authoritative |
 | DSv4 CB matched-budget performance | `python -m prismaquant.validate_cb_performance` | no — operator-run after export | **blocking paired prefill/decode/mixed parity against the exact displaced container** |
+| DSv4 paired DSpark claim | `python -m prismaquant.dspark_matched_performance_collector {declare-policy,start-sampler,collect-arm}` → `python -m prismaquant.validate_dspark_target_draft attest` | no — lifecycle-owned collection around both exact operator-started serves; the collector does not launch or patch vLLM | **blocking only when `mtp.dspark` is claimed: source-closed/no-clobber arm reports, exact acceptance/routes plus matched no-MTP throughput non-regression, 256K KV, and 110/8/4-GiB headroom; target-only publication remains valid without the optional claim** |
 | Ship record | `exported/shipcard.json` (opened by the exporter) → `python -m prismaquant.shipcard_cli verify` | opened by every export | **refuses** until every serve-lane slot is closed |
 | **Publication** | `tools/publish_artifact.py` | no — operator-run | **BLOCKING**: refuses to upload (or even print the upload command) unless `shipcard.verify` passes |
 
@@ -2074,9 +2291,39 @@ so that is where the record is enforced: `tools/publish_artifact.py <artifact_di
 rdtand/<name>` calls `prismaquant.shipcard.verify` as a **library call** (never a subprocess —
 the ambient python may not have the package) and **refuses before it uploads anything or even
 prints the command it would run**, listing every unfilled or failing slot; a refusal that still
-hands over a copy-pasteable command is not a refusal. `huggingface_hub` is imported lazily, so
-in the build venv the tool verifies and then prints the exact `hf upload …` line to run
-elsewhere. The escape hatch is deliberately expensive: `--force-unverified` requires the
+hands over a copy-pasteable command is not a refusal. Model publication accepts only the
+canonical in-tree regular, non-symlink `<artifact_dir>/shipcard.json`; an external or aliased
+receipt is never publication authority, including under the escape hatch. A parseable file
+with the wrong schema, missing identity/build fields or required slot keys, or non-object slot
+records is structurally malformed and is likewise never force-overrideable; force applies only
+to a structurally valid card's unfilled or failed evidence. Allow/ignore
+filters are forbidden because excluding a claimed artifact member or the shipcard would make
+the uploaded model a different object, and model publication is repository-root only.
+
+The publication authority is a **frozen snapshot**, not a final check followed by a live path.
+After preflight (and after an override stamp, if any), the publisher opens the complete tree
+with no-follow descriptors and rejects symlinks and non-regular members. Small files are copied
+into the private snapshot as bytes. Large files stay zero-copy: one sequential pass records
+their full and per-8-MiB SHA-256 identities while retaining the open inode, the shipcard is
+replayed against an internal `/proc/self/fd` view, and the upload reader exposes a block only
+after it matches the frozen digest. Replacing an original path or swapping it to a symlink
+therefore cannot change the upload; an in-place mutation aborts before the Hub commit. This
+avoids a second 112-GB local copy while still making the uploaded bytes exactly the verified
+bytes (`tools/publish_artifact.py:_freeze_artifact`, `_VerifiedBlockReader`).
+
+Remote replacement uses the low-level Hub commit API rather than `upload_folder`. The publisher
+resolves an explicit destination revision to one full parent commit, enumerates the remote file
+set at that immutable commit, pre-uploads the frozen LFS objects with ignore rules disabled,
+then submits every local addition plus every stale-file deletion in one `create_commit` with
+both `revision` and `parent_commit`. Identical additions are deliberately retained in the
+payload so the Hub client's no-op shortcut cannot bypass CAS. A concurrent head change is a
+refusal with no automatic retry: the operator must restart the complete local freeze/verification
+and remote enumeration. Root `.gitattributes` is the one intentional Hub-managed survivor when
+the artifact does not replace it; the committed file set is enumerated again at the returned
+commit before success is reported. There is no raw `hf upload` fallback because it cannot
+preserve these guarantees; a missing compatible `huggingface_hub` is a refusal, while
+`--dry-run` reports only the locally verified frozen manifest. The escape hatch remains
+deliberately expensive: `--force-unverified` requires the
 operator to **re-type the artifact directory's basename** (interactively, or `--confirm-name`
 for scripts) and stamps `forced_unverified: true` plus the overridden problems into the
 shipcard, so the artifact itself carries the record that it shipped ungated. Tests:
@@ -2106,7 +2353,10 @@ rather than the private `.tmp-*` staging root.
 
 `python -m prismaquant.shipcard_cli verify <card>` defaults the on-disk identity check to the
 card's parent directory (an explicit `--model-dir` remains available) and exits non-zero unless
-every slot holds a *passing* record whose `model_sha` matches the artifact. CB identity adds
+every slot holds a *passing* record whose `model_sha` matches the artifact. Every recognized
+optional slot whose value is non-null joins that default replay set. Missing or null
+`mtp.dspark` remains nonblocking for a target-only artifact, but physical
+`provenance.dspark_cb_sidecar` independently makes it required. CB identity adds
 canonical `quant_config.json` with only its self-sized inventory excluded, an exporter-time
 SHA-256 manifest of every final safetensors container, plus exact `.pqcb` content digests, to
 the ordinary config-sha/per-shard-size identity. The production streaming exporter computes
@@ -2496,8 +2746,11 @@ evidence either way and should be quoted as a range.
   distribution/import-origin identities, resident extensions/readability, normalized server argv, closed
   process environment, and listener stack. It intentionally excludes the arm artifact and
   live-session identity, so independently served A/B arms can match. `serve_fingerprint`
-  remains the full per-run artifact/session attestation; legitimate arms normally have
-  different values. In-process gold-lane runs use `self_manifest` over the measurement parent
+  remains the full stable artifact/session attestation; independent arms normally have
+  different values. Observation-only creation/process fields and `attestation_phase` are
+  excluded, so DSpark pre/post observations of one unchanged server must have the exact same
+  value, while a changed resident extension, package, runtime capability, artifact, or session
+  changes it. In-process gold-lane runs use `self_manifest` over the measurement parent
   and its proven transitive descendants; DSv4 additionally requires an EngineCore/vLLM engine
   in that exact tree and unions residency across all readable address spaces.
 * **`tools/kl_ab.py A.json B.json` validates both, then compares only the performance stack.**
@@ -2791,7 +3044,7 @@ artifacts exported before the rename.
 | gemma4 | `gemma4.py` | 140 | ✅ | `vllm_packed_moe` | CT | ⚠ none | none |
 | lfm2_moe (LFM2.5) | `lfm2_moe.py` | 150 | ✅ | `vllm_packed_moe` | CT | ⚠ none | `has_mtp → False` |
 | minimax_m2 | `minimax_m2.py` | 160 | ✅ **added R22** — all 8 overrides declared | `vllm_packed_moe` **(added R22)** | CT | ⚠ none | `has_mtp → False` |
-| deepseek_v4 | `deepseek_v4.py` | 170 | ✅ | `vllm_packed_moe` **(added R22)** | CT, **nvfp4_cb** (CT) | declared by exact Gridbook 0.8.5 v3 commit `e992e59`; streaming CB export, W8A16 source passthrough, top-level loader, and routed per-role LUT ABI are wired and the installed-wheel GPU route gate passed; full-artifact served parity remains a post-export gate | `has_mtp → False`; three source-quantized DSpark stages are declared by the header-validated physical→construction overlay (§6.3), with no tensor rewrite |
+| deepseek_v4 | `deepseek_v4.py` | 170 | ✅ | `vllm_packed_moe` **(added R22)** | CT, **nvfp4_cb** (CT) | declared by exact Gridbook 0.8.5 v3 commit `e992e59`; streaming CB export, W8A16 source passthrough, top-level loader, and routed per-role LUT ABI are wired and the installed-wheel GPU route gate passed; full-artifact served parity remains a post-export gate | `has_mtp → False`; three source-quantized DSpark stages are declared by the header-validated physical→construction overlay (§6.3), with no tensor rewrite. The experimental hybrid sidecar emits 27 physical K12 CB targets plus four physical W8A16 bases (`main_proj` and three grouped-BMM `wo_a`) with exact construction declarations. It remains non-shipping until the separately pinned Gridbook 0.8.6/v4 consumer is immutable and the sidecar clears load, memory, acceptance, and paired endpoint/throughput-evidence gates. |
 | hy_v3 | `hy_v3.py` | 180 | ✅ | `gguf` (overridden, L1) | CT, nvfp4_cb, **gguf** (gguf) | declared by pinned Gridbook contract | `has_mtp → False`; MTP passthrough + out-of-band CB scripts |
 | laguna (poolside S/XS 2.x) | `laguna.py` | 190 | ✅ | `nvfp4_cb` (overridden, L1) | CT, **nvfp4_cb** (nvfp4_cb) | declared by pinned Gridbook contract; drafter still separate | `has_mtp → False` |
 | default | `default.py` | — (terminal) | n/a by design | — | CT (default) | n/a | none |
@@ -3023,6 +3276,61 @@ tree using the same 29-name allowlist plus the two immutable runtime-pin transpo
 `PYTHONSAFEPATH`, and `PYTHONPATH`; the last must be affirmatively absent, while the
 short-lived `/repo` fingerprint writer is not part of the inspected server process set.
 Every readable serving process must agree.
+
+**Separate current Gridbook-0.8.6 DSpark serving profile.** The table above remains the
+immutable 0.8.5 producer/gold authority. It is neither imported nor amended for the later
+consumer. `prismaquant/dspark_serving_profile.py` owns a literal, independently scanned
+`dspark_serving_profile.v1` profile for paired DSpark validation only. Its 29-name Gridbook
+namespace selects `PRISMAQUANT_CB_GEMV=v2`, persistent-B and its cfg both `0`, decode contract
+`v1`, fused-mid-M/grouped-trim/preload `1`, and leaves every FP8/FP4v2/W2 scheduler/rows/warps
+override absent; it additionally binds
+`PYTORCH_ALLOC_CONF=expandable_segments:True`. The inspected server tree must also resolve
+`VLLM_MOE_SKIP_PADDING=true`. A source scan of the installed 0.8.6 package must find exactly
+the profile's closed Gridbook environment namespace: an unknown prefixed knob, a missing known
+knob, a differing value/null, or a process-tree disagreement refuses. This later profile can
+therefore evolve visibly without changing the regression digest or semantics of the 0.8.5
+target-only authority.
+
+The self-digesting runtime receipt binds image digest `sha256:58862b…869`, vLLM
+`0.26.1rc1.dev693+g7f7a32cfe.d20260812` at full commit
+`7f7a32cfec0f1bc5b73c37200b86631523a1ea8f`, torch `2.13.0+cu130`, and distribution
+`flashinfer-python==0.6.18` at commit
+`9ffd99510d92b883f154fc9f2e3d5aac93e231ca`. Import metadata, installed distributions, and
+image build metadata must all agree. Capability replay then proves FlashInfer's native DSV4
+dispatch entry `(head_dim=64, topk=256)` and the exact tuned max-context
+`sparse_mla_sm120_decode_dsv4`/`SparseMlaDecodeV3Runner` cache: token buckets
+`[1,4,8,16,32,64]`, 64 heads, head dimension 512, main top-k 128, extra top-k 2048, split
+count 34, six present positive tactics, exact cache-file SHA-256, and a serve-log cache hit with
+zero fallback tactic. Package, commit, capability, source, cache-file, or log mutation fails
+closed (`collect_runtime_evidence`, `validate_runtime_evidence`,
+`validate_cache_log_evidence`).
+
+The launch half is exact K=5, 262,144 model tokens, FP8 KV, 1,717,986,918 KV bytes,
+`max_num_seqs=1`, `max_num_batched_tokens=512`, Marlin, the `deepseek_v4` tool parser, and
+FULL_DECODE_ONLY graph sizes `[5,6]` with maximum six. The 512-token scheduler budget is part
+of the KV-admission contract, not merely a prefill performance choice. In the pinned vLLM,
+default async scheduling makes `max_in_flight_tokens = 2 * max_num_batched_tokens`; DSV4's
+sliding/compressor cache specs reserve their window plus those unsettled tokens. With the
+observed packed layout (22 tuple slots at 47,808 bytes each), changing only the budget to 4096
+requires 4,378 aggregate pages, or 4,604,675,328 bytes (4.29 GiB), and its binary-search
+diagnostic correctly estimates only 3,968 tokens under the fixed 1.6-GiB pool. At the selected
+512 budget the same one-request 256K admission needs 1,541,903,616 bytes (1.44 GiB) and fits.
+The subsequently logged aggregate `GPU KV cache size` is group-aware pool capacity, not a
+promise that an arbitrary different scheduler budget can admit one max-length request. Before
+any future scheduler-budget experiment can be called comparable, its supplemental runtime
+evidence must also bind the resolved async/concurrent-batch count, derived in-flight-token bound,
+KV spec/group census, tuple/page geometry, one-request required bytes, allocated blocks,
+reported token capacity, and successful 262,144-token admission; those diagnostic additions do
+not alter this release profile's selected 512-token launch contract.
+
+Finally, route evidence is realized execution, not configuration intent: exactly 70 target and
+six draft FP4 codebook routes must report GEMV v2, 16 target source-FP8 routes must report the
+inherited path, and fallback/unscoped counts must both be zero across the exact 43 target plus
+three draft layer identities (92 routes total). `validate_dspark_serve_manifest` threads this
+profile/runtime receipt through only the paired-DSpark endpoint validator while preserving the
+shared artifact, session, listener, launch, and residency checks. Every selected environment,
+package/capability/cache, launch, and route field has a mutation refusal test; a static digest
+test separately proves the old 0.8.5 environment is unchanged.
 
 **One machine-readable contract, not parallel tables.** Gridbook packages
 `gridbook/runtime_contract.json`; it is authoritative for the runtime's quantization aliases,

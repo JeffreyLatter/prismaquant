@@ -39,7 +39,7 @@ from prismaquant.export_native_compressed import (  # noqa: E402
 )
 from prismaquant.model_profiles import detect_profile  # noqa: E402
 from prismaquant.shipcard import (  # noqa: E402
-    ALL_SLOTS,
+    CB_REQUIRED_SLOTS,
     GOLD_SLOTS,
     REQUIRED_SLOTS,
     compute_model_sha,
@@ -330,7 +330,8 @@ def test_streaming_byte_identical_dense_and_stacked(workdir):
         assert Path(card["model_dir"]) == root.resolve()
         assert card["model_sha"] == compute_model_sha(root)
         assert verify(card, model_dir=root) == [
-            f"{slot}: UNFILLED" for slot in ALL_SLOTS
+            f"{slot}: UNFILLED"
+            for slot in REQUIRED_SLOTS + CB_REQUIRED_SLOTS
         ]
         assert card["build"]["quant_method"] == "gridbook"
         assert card["artifact_bytes"] == sum(

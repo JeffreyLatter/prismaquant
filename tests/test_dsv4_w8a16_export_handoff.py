@@ -226,6 +226,19 @@ def test_exact_w8a16_handoff_returns_read_only_receipt(monkeypatch, tmp_path):
     assert receipt["unit_count"] == 120
     assert receipt["fp8_block_w8a16_count"] == 120
     assert receipt["source_checkpoint"]["content_sha256"] == "b" * 64
+    closure = receipt["frozen_export_source_closure"]
+    assert closure["schema"] == (
+        handoff.DSV4_W8A16_EXPORT_SOURCE_CLOSURE_SCHEMA
+    )
+    assert closure["files_sha256"] == handoff._FROZEN_EXPORT_SOURCE_SHA256
+    assert closure["identity_sha256"] == handoff.canonical_json_sha256(
+        {
+            "schema": closure["schema"],
+            "files_sha256": closure["files_sha256"],
+        },
+        where="test exporter/source closure",
+    )
+    assert "frozen_export_code_sha256" not in receipt
     assert receipt["output_absent"] is True
     assert not (tmp_path / "artifact").exists()
 
@@ -265,5 +278,47 @@ def test_handoff_refuses_route_pending_after_overlay(monkeypatch, tmp_path):
 
 def test_tracked_frozen_export_sources_match_reviewed_bytes():
     root = Path(__file__).resolve().parents[1]
-    observed = handoff._verify_frozen_export_code(root)
-    assert observed == handoff._FROZEN_EXPORT_CODE_SHA256
+    expected_paths = {
+        "prismaquant/artifact_completeness.py",
+        "prismaquant/cb_export_config.py",
+        "prismaquant/cb_source_decode.py",
+        "prismaquant/dspark_source_metadata.py",
+        "prismaquant/export_nvfp4_cb_streaming.py",
+        "prismaquant/export_output_safety.py",
+        "prismaquant/layer_streaming.py",
+        "prismaquant/model_profiles/__init__.py",
+        "prismaquant/model_profiles/base.py",
+        "prismaquant/model_profiles/deepseek_v4.py",
+        "prismaquant/model_profiles/registry.py",
+        "prismaquant/model_profiles/specs/deepseek_v4.json",
+        "prismaquant/nvfp4_cb_footprint.py",
+        "prismaquant/nvfp4_cb_formats.py",
+        "prismaquant/production_weight_cache.py",
+    }
+    assert set(handoff._FROZEN_EXPORT_SOURCE_SHA256) == expected_paths
+    observed = handoff._verify_frozen_export_source_closure(root)
+    assert observed["files_sha256"] == handoff._FROZEN_EXPORT_SOURCE_SHA256
+    assert observed["schema"] == (
+        handoff.DSV4_W8A16_EXPORT_SOURCE_CLOSURE_SCHEMA
+    )
+
+
+def test_frozen_export_source_closure_refuses_dependency_drift(
+    monkeypatch,
+    tmp_path,
+):
+    relative = "prismaquant/dspark_source_metadata.py"
+    root = Path(__file__).resolve().parents[1]
+    copied = tmp_path / relative
+    copied.parent.mkdir(parents=True)
+    copied.write_bytes((root / relative).read_bytes() + b"\n")
+    monkeypatch.setattr(
+        handoff,
+        "_FROZEN_EXPORT_SOURCE_SHA256",
+        {relative: handoff._FROZEN_EXPORT_SOURCE_SHA256[relative]},
+    )
+    with pytest.raises(
+        handoff.W8A16ExportHandoffError,
+        match="frozen exporter/source closure changed",
+    ):
+        handoff._verify_frozen_export_source_closure(tmp_path)

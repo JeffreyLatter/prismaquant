@@ -26,8 +26,9 @@ import sys
 from pathlib import Path
 
 from prismaquant.shipcard import (
-    ALL_SLOTS,
+    CB_REQUIRED_SLOTS,
     GOLD_SLOTS,
+    OPTIONAL_SLOTS,
     _verify_gold_record,
     compute_model_sha,
     fill_slot,
@@ -69,9 +70,14 @@ def _finite(value: object) -> bool:
 
 def _cmd_show(args: argparse.Namespace) -> int:
     card = load_shipcard(args.shipcard)
-    slots_required = required_slots(
+    blocking_slots = required_slots(
         card, model_dir=Path(args.shipcard).resolve().parent
     )
+    optional_present = tuple(
+        slot for slot in OPTIONAL_SLOTS
+        if slot in (card.get("slots") or {})
+    )
+    slots_shown = tuple(dict.fromkeys(blocking_slots + optional_present))
     print(f"shipcard: {args.shipcard}")
     print(f"  model_dir:      {card.get('model_dir')}")
     print(f"  model_sha:      {str(card.get('model_sha'))[:16]}")
@@ -81,7 +87,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
           f"  ({(build.get('achieved_bpp') or {}).get('source')})")
     print(f"  artifact_bytes: {card.get('artifact_bytes')}")
     print("  slots:")
-    for slot in slots_required:
+    for slot in slots_shown:
         record = (card.get("slots") or {}).get(slot)
         if not record:
             print(f"    [ ] {slot}  UNFILLED")
@@ -99,8 +105,10 @@ def _cmd_verify(args: argparse.Namespace) -> int:
     # break verification and a stale path embedded before publication cannot
     # suppress the on-disk identity check.
     model_dir = args.model_dir or str(Path(args.shipcard).resolve().parent)
-    slots_required = required_slots(card, model_dir=model_dir)
-    problems = verify(card, model_dir=model_dir)
+    blocking_slots = required_slots(card, model_dir=model_dir)
+    claimed_slots = tuple(args.require_slot or ())
+    slots_required = tuple(dict.fromkeys(blocking_slots + claimed_slots))
+    problems = verify(card, model_dir=model_dir, required=slots_required)
     if not problems:
         print(f"[shipcard] OK — {len(slots_required)}/{len(slots_required)} "
               f"slots filled and matching for {card.get('model_dir')}")
@@ -214,9 +222,8 @@ def _cmd_fill(args: argparse.Namespace) -> int:
         extra={"record_path": str(Path(args.record).resolve()),
                "measured_model": payload.get("model")},
     )
-    is_gridbook = required_slots(
-        card, model_dir=model_dir
-    ) == ALL_SLOTS
+    blocking_slots = required_slots(card, model_dir=model_dir)
+    is_gridbook = all(slot in blocking_slots for slot in CB_REQUIRED_SLOTS)
     replay_problems = (
         _verify_gold_record(
             args.slot,
@@ -266,6 +273,13 @@ def main(argv: list[str] | None = None) -> int:
     p_verify.add_argument("--model-dir", default=None,
                           help="recompute model_sha from this directory and "
                                "require the records to match it")
+    p_verify.add_argument(
+        "--require-slot",
+        action="append",
+        choices=sorted(OPTIONAL_SLOTS),
+        default=None,
+        help="also require a named optional claim (repeatable)",
+    )
     p_verify.set_defaults(func=_cmd_verify)
 
     p_reattest = sub.add_parser(

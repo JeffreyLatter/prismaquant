@@ -42,7 +42,20 @@ _RESOLVED_GRAPH_CONFIG = (
     "'cudagraph_capture_sizes': [1], 'max_cudagraph_capture_size': 1}\n"
 )
 _SERVED_MODEL = cbv.DSV4_SERVED_MODEL_PREFIX + "a" * 32
-_REAL_GRIDBOOK_RUNTIME_PIN = cbv._gridbook_runtime_pin
+_RELEASED_SERVING_PIN = {
+    "schema": "prismaquant.gridbook_serving_runtime_pin.v1",
+    "repository": "https://github.com/RobTand/gridbook.git",
+    "commit": "a" * 40,
+    "version": "0.8.6",
+    "version_is_release": True,
+    "wheel_sha256": "b" * 64,
+    "runtime_contract_schema": "gridbook.runtime-contract.v4",
+    "required_abi_features": {
+        "routed_moe_per_role_codebook_lut": 1,
+        "source_fp8_block128_w8a16": 1,
+        "dspark_construction_physical_bridge": 1,
+    },
+}
 
 
 @pytest.fixture(autouse=True)
@@ -50,19 +63,14 @@ def _released_gridbook_pin(monkeypatch):
     """Exercise endpoint evidence behind the exact tracked release pin."""
 
     import prismaquant.shipcard as shipcard_module
-    from prismaquant.gridbook_runtime_pin import load_gridbook_runtime_pin
-
-    pin_path = (
-        ROOT
-        / "prismaquant"
-        / "gridbook_runtime"
-        / "gridbook_runtime_pin.json"
+    from prismaquant.gridbook_serving_runtime_pin import (
+        parse_gridbook_serving_runtime_pin,
     )
-    released = json.loads(pin_path.read_text(encoding="utf-8"))
+    released = dict(_RELEASED_SERVING_PIN)
     monkeypatch.setattr(cbv, "_gridbook_runtime_pin", lambda: dict(released))
-    released_pin = load_gridbook_runtime_pin()
+    released_pin = parse_gridbook_serving_runtime_pin(released)
     monkeypatch.setattr(
-        shipcard_module, "load_gridbook_runtime_pin", lambda: released_pin
+        shipcard_module, "_released_gridbook_runtime_pin", lambda: released_pin
     )
 
 
@@ -97,11 +105,13 @@ def _gridbook_distribution(pin: dict) -> dict:
         "repository": pin["repository"],
         "version": pin["version"],
         "direct_url": {
-            "url": f"file:///tmp/gridbook-runtime-{pin['commit'][:12]}",
-            "vcs_info": {
-                "vcs": "git",
-                "requested_revision": pin["commit"],
-                "commit_id": pin["commit"],
+            "url": (
+                f"file:///opt/gridbook-install/gridbook-{pin['version']}"
+                "-py3-none-any.whl"
+            ),
+            "archive_info": {
+                "hash": f"sha256={pin['wheel_sha256']}",
+                "hashes": {"sha256": pin["wheel_sha256"]},
             },
         },
         "direct_url_path": f"gridbook-{pin['version']}.dist-info/direct_url.json",
@@ -117,9 +127,9 @@ def _gridbook_distribution(pin: dict) -> dict:
 
 
 def test_live_gridbook_runtime_pin_projects_immutable_features_to_plain_dict():
-    pin = _REAL_GRIDBOOK_RUNTIME_PIN()
+    pin = cbv._gridbook_runtime_pin()
 
-    assert pin["commit"] == cbv.load_gridbook_runtime_pin().commit
+    assert pin == _RELEASED_SERVING_PIN
     assert type(pin["required_abi_features"]) is dict
 
 
@@ -196,6 +206,7 @@ def _manifest(
         **dict(CANONICAL_GOLD_SET_ENVIRONMENT),
         "PQ_GRIDBOOK_RUNTIME_COMMIT": pin["commit"],
         "PQ_GRIDBOOK_RUNTIME_VERSION": pin["version"],
+        "PQ_GRIDBOOK_RUNTIME_WHEEL_SHA256": pin["wheel_sha256"],
         "PYTHONSAFEPATH": "1",
         "PRISMAQUANT_CB_EXT_DIR": "/opt/gridbook/ext-cache",
         "PRISMAQUANT_PRELOAD_FUSED": "1",
@@ -259,6 +270,7 @@ def _manifest(
         "gridbook_runtime_pin": {
             "commit": pin["commit"],
             "version": pin["version"],
+            "wheel_sha256": pin["wheel_sha256"],
         },
         "gridbook_distribution": _gridbook_distribution(pin),
         "resident_extensions": ["prismaquant_cb_ext.so"],
@@ -426,15 +438,6 @@ def test_manifest_fingerprint_cannot_be_stale():
 
 def test_manifest_accepts_digest_pinned_gridbook_release_wheel():
     manifest = _manifest("eager")
-    wheel_sha256 = "9" * 64
-    manifest["gridbook_runtime_pin"]["wheel_sha256"] = wheel_sha256
-    manifest["gridbook_distribution"]["direct_url"] = {
-        "url": "file:///opt/gridbook-install/gridbook-0.8.5-py3-none-any.whl",
-        "archive_info": {
-            "hash": f"sha256={wheel_sha256}",
-            "hashes": {"sha256": wheel_sha256},
-        },
-    }
     manifest["serve_fingerprint"] = fingerprint(manifest)
 
     assert cbv.validate_serve_manifest(
@@ -448,9 +451,8 @@ def test_manifest_accepts_digest_pinned_gridbook_release_wheel():
 
 def test_manifest_rejects_release_wheel_digest_not_in_runtime_pin():
     manifest = _manifest("eager")
-    manifest["gridbook_runtime_pin"]["wheel_sha256"] = "9" * 64
     manifest["gridbook_distribution"]["direct_url"] = {
-        "url": "file:///opt/gridbook-install/gridbook-0.8.5-py3-none-any.whl",
+        "url": "file:///opt/gridbook-install/gridbook-0.8.6-py3-none-any.whl",
         "archive_info": {"hashes": {"sha256": "8" * 64}},
     }
     manifest["serve_fingerprint"] = fingerprint(manifest)

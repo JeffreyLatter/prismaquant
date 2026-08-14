@@ -187,7 +187,9 @@ def test_run_tool_executes_real_write_from_snapshot_and_preserves_closure(
         "prismaquant/shipcard.py",
         "prismaquant/gridbook_environment.py",
         "prismaquant/gridbook_runtime_pin.py",
+        "prismaquant/gridbook_serving_runtime_pin.py",
         "prismaquant/gridbook_runtime/gridbook_runtime_pin.json",
+        "prismaquant/gridbook_runtime/gridbook_serving_runtime_pin.json",
         "tools/container_runtime_identity.py",
         "tools/prismaquant_runtime_snapshot.py",
         "tools/prismaquant_source_bootstrap.py",
@@ -240,6 +242,7 @@ def test_run_tool_executes_real_write_from_snapshot_and_preserves_closure(
     })
     environment.pop("PQ_GRIDBOOK_RUNTIME_COMMIT", None)
     environment.pop("PQ_GRIDBOOK_RUNTIME_VERSION", None)
+    environment.pop("PQ_GRIDBOOK_RUNTIME_WHEEL_SHA256", None)
     output = tmp_path / "serve-manifest.json"
     fake_vllm = tmp_path / "vllm-fixture"
     fake_vllm.write_text("#!/usr/bin/env bash\nsleep 30\n", encoding="utf-8")

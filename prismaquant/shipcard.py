@@ -29,6 +29,13 @@ record that produced the number — vLLM routes echo+logprobs through the draft
 model under `--speculative-config`, so a spec-decode-on gold number is the MTP
 head's NLL, not the artifact's (§7.5).
 
+The optional ``mtp.dspark`` slot is written in both the target and draft cards
+by ``validate_dspark_target_draft.py``.  A target-only artifact may omit it or
+leave it null.  Any non-null recognized optional claim is verified by default,
+and an on-disk ``provenance.dspark_cb_sidecar`` makes ``mtp.dspark`` mandatory;
+its specialized verifier replays the paired artifact, runtime, graph, and
+acceptance receipt.
+
 Stdlib only, no torch: the CLI must run anywhere the artifact is reachable.
 """
 from __future__ import annotations
@@ -48,10 +55,10 @@ from .gridbook_environment import (
     CANONICAL_GOLD_ENVIRONMENT,
     CANONICAL_GOLD_SET_ENVIRONMENT,
 )
-from .gridbook_runtime_pin import (
-    GridbookRuntimePin,
-    load_gridbook_runtime_pin,
-    require_exact_gridbook_runtime_release,
+from .gridbook_serving_runtime_pin import (
+    GridbookServingRuntimePin,
+    load_gridbook_serving_runtime_pin,
+    require_exact_gridbook_serving_runtime_release,
 )
 
 SCHEMA = "prismaquant.shipcard/1"
@@ -72,9 +79,17 @@ CB_REQUIRED_SLOTS: tuple[str, ...] = (
     "perf.matched_budget_parity",
 )
 
+#: Claims that can be attached to an already exported artifact.  Missing/null
+#: claims remain non-blocking for target-only artifacts, but every non-null
+#: recognized claim is verified automatically.  A DSpark sidecar artifact
+#: additionally requires its claim even when the card slot is missing/null.
+OPTIONAL_SLOTS: tuple[str, ...] = ("mtp.dspark",)
+
 #: The vocabulary accepted by :func:`make_record`.  Whether a member is
 #: required is artifact-specific and is resolved by :func:`required_slots`.
-ALL_SLOTS: tuple[str, ...] = REQUIRED_SLOTS + CB_REQUIRED_SLOTS
+ALL_SLOTS: tuple[str, ...] = (
+    REQUIRED_SLOTS + CB_REQUIRED_SLOTS + OPTIONAL_SLOTS
+)
 
 #: Slots whose number is invalid if it was produced against a spec-decode serve.
 GOLD_SLOTS: frozenset[str] = frozenset({"gold.kl", "gold.ppl"})
@@ -82,11 +97,11 @@ GOLD_SLOTS: frozenset[str] = frozenset({"gold.kl", "gold.ppl"})
 SHIPCARD_FILENAME = "shipcard.json"
 
 
-def _released_gridbook_runtime_pin() -> GridbookRuntimePin:
+def _released_gridbook_runtime_pin() -> GridbookServingRuntimePin:
     """Return the sole tracked pin only when it is an immutable release."""
 
-    pin = load_gridbook_runtime_pin()
-    require_exact_gridbook_runtime_release(pin)
+    pin = load_gridbook_serving_runtime_pin()
+    require_exact_gridbook_serving_runtime_release(pin)
     return pin
 
 
@@ -495,7 +510,13 @@ def build_shipcard(
     from prismaquant.export_output_safety import directory_publication_target
 
     build_payload = dict(build or {})
-    slots = ALL_SLOTS if build_payload.get("quant_method") == "gridbook" else REQUIRED_SLOTS
+    slots = list(
+        REQUIRED_SLOTS + CB_REQUIRED_SLOTS
+        if build_payload.get("quant_method") == "gridbook"
+        else REQUIRED_SLOTS
+    )
+    if _is_dspark_cb_sidecar_artifact(root):
+        slots.append("mtp.dspark")
     card = {
         "schema": SCHEMA,
         "created": _now(),
@@ -675,6 +696,25 @@ def fill_slot(
     return card
 
 
+def ensure_optional_slot(
+    path: str | os.PathLike,
+    slot: str,
+) -> dict[str, Any]:
+    """Add one recognized optional claim slot to an existing shipcard."""
+
+    if slot not in OPTIONAL_SLOTS:
+        raise KeyError(
+            f"{slot!r} is not an optional shipcard slot; "
+            f"known={list(OPTIONAL_SLOTS)}"
+        )
+    card = load_shipcard(path)
+    if slot not in card["slots"]:
+        card["slots"][slot] = None
+        card["updated"] = _now()
+        write_shipcard(path, card)
+    return card
+
+
 def fill_if_requested(
     path: str | os.PathLike | None,
     slot: str,
@@ -781,6 +821,16 @@ def verify(
                 model_dir=model_dir,
                 require_dsv4_gridbook_contract=True,
                 require_current_artifact_path=False,
+            ))
+        if slot == "mtp.dspark":
+            from .validate_dspark_target_draft import (
+                validate_dspark_shipcard_record,
+            )
+
+            problems.extend(validate_dspark_shipcard_record(
+                slot,
+                record,
+                model_dir=model_dir,
             ))
         if slot in GOLD_SLOTS:
             spec = record.get("spec_decode_detected")
@@ -971,14 +1021,28 @@ def _manifest_gridbook_runtime_pin(
     """Return a live VCS/wheel install pin only when it matches tracked code."""
 
     observed = manifest.get("gridbook_runtime_pin")
-    if not isinstance(observed, Mapping) or set(observed) not in (
-        {"commit", "version"},
-        {"commit", "version", "wheel_sha256"},
+    expected_wheel = runtime_pin.get("wheel_sha256")
+    expected_members = (
+        {"commit", "version", "wheel_sha256"}
+        if expected_wheel is not None
+        else None
+    )
+    if not isinstance(observed, Mapping) or (
+        set(observed) != expected_members
+        if expected_members is not None
+        else set(observed) not in (
+            {"commit", "version"},
+            {"commit", "version", "wheel_sha256"},
+        )
     ):
         return None
     if (
         observed.get("commit") != runtime_pin.get("commit")
         or observed.get("version") != runtime_pin.get("version")
+        or (
+            expected_wheel is not None
+            and observed.get("wheel_sha256") != expected_wheel
+        )
         or (
             "wheel_sha256" in observed
             and re.fullmatch(
@@ -2237,7 +2301,7 @@ def _verify_gridbook_performance_record(
     except Exception as exc:
         problem(f"tracked Gridbook release pin unavailable: {exc}")
         pin = None
-    if isinstance(pin, GridbookRuntimePin):
+    if isinstance(pin, GridbookServingRuntimePin):
         if metrics.get("gridbook_runtime_commit") != pin.commit:
             problem("Gridbook runtime commit is not the tracked pin")
         if metrics.get("gridbook_runtime_version") != pin.version:
@@ -2825,9 +2889,46 @@ def _verify_gridbook_performance_record(
     return problems
 
 
-def unfilled_slots(card: Mapping[str, Any]) -> list[str]:
+def unfilled_slots(
+    card: Mapping[str, Any],
+    *,
+    model_dir: str | os.PathLike | None = None,
+) -> list[str]:
     slots = card.get("slots") or {}
-    return [slot for slot in required_slots(card) if not slots.get(slot)]
+    return [
+        slot
+        for slot in required_slots(card, model_dir=model_dir)
+        if not slots.get(slot)
+    ]
+
+
+def _is_dspark_cb_sidecar_artifact(
+    model_dir: str | os.PathLike | None,
+) -> bool:
+    """Whether on-disk provenance identifies a physical DSpark sidecar.
+
+    The target artifact's ``dspark_source_overlay`` is deliberately not a
+    sidecar identity: target-only publication remains valid when no paired
+    DSpark claim was made.  Presence of a non-null sidecar value is enough to
+    retain the obligation, including when the value itself is malformed.
+    """
+    if model_dir is None:
+        return False
+    quant_path = Path(model_dir) / "quant_config.json"
+    if not quant_path.is_file():
+        return False
+    try:
+        payload = json.loads(quant_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    provenance = payload.get("provenance") if isinstance(
+        payload, Mapping
+    ) else None
+    return (
+        isinstance(provenance, Mapping)
+        and "dspark_cb_sidecar" in provenance
+        and provenance.get("dspark_cb_sidecar") is not None
+    )
 
 
 def _is_gridbook_card(
@@ -2864,10 +2965,24 @@ def required_slots(
     *,
     model_dir: str | os.PathLike | None = None,
 ) -> tuple[str, ...]:
-    """Return the blocking slot set for this artifact/container."""
+    """Return every slot default verification must replay.
+
+    Container-required slots are followed by recognized optional claims that
+    are present and non-null.  The physical DSpark sidecar additionally makes
+    ``mtp.dspark`` mandatory from on-disk provenance, so deleting or nulling
+    the mutable shipcard claim cannot erase the draft artifact's obligation.
+    """
+    required: list[str] = list(REQUIRED_SLOTS)
     if _is_gridbook_card(card, model_dir=model_dir):
-        return ALL_SLOTS
-    return REQUIRED_SLOTS
+        required.extend(CB_REQUIRED_SLOTS)
+    slots = card.get("slots")
+    if isinstance(slots, Mapping):
+        required.extend(
+            slot for slot in OPTIONAL_SLOTS if slots.get(slot) is not None
+        )
+    if _is_dspark_cb_sidecar_artifact(model_dir):
+        required.append("mtp.dspark")
+    return tuple(dict.fromkeys(required))
 
 
 # ---------------------------------------------------------------------------

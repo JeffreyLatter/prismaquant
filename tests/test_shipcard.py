@@ -18,7 +18,6 @@ if not (pathlib.Path(__file__).resolve().parents[1] / "tools").is_dir():
                 allow_module_level=True)
 
 from prismaquant.shipcard import (
-    ALL_SLOTS,
     CB_REQUIRED_SLOTS,
     GOLD_SLOTS,
     REQUIRED_SLOTS,
@@ -307,13 +306,93 @@ def test_gridbook_card_opens_plugin_performance_refusal_slot(tmp_path):
     }))
     card = build_shipcard(model_dir, build={"quant_method": "gridbook"})
 
-    assert tuple(card["slots"]) == ALL_SLOTS
-    assert required_slots(card, model_dir=model_dir) == ALL_SLOTS
-    assert unfilled_slots(card) == list(ALL_SLOTS)
+    expected = REQUIRED_SLOTS + CB_REQUIRED_SLOTS
+    assert tuple(card["slots"]) == expected
+    assert required_slots(card, model_dir=model_dir) == expected
+    assert unfilled_slots(card) == list(expected)
     problems = verify(card, model_dir=model_dir)
     assert any(
         problem == f"{CB_REQUIRED_SLOTS[0]}: UNFILLED"
         for problem in problems
+    )
+
+
+def test_target_only_dspark_claim_absent_or_null_is_nonblocking_but_claim_is_replayed(
+    tmp_path, capsys,
+):
+    model_dir = _artifact(tmp_path)
+    (model_dir / "quant_config.json").write_text(json.dumps({
+        "quant_method": "gridbook",
+        "format": "nvfp4_cb",
+    }))
+    card = build_shipcard(model_dir, build={"quant_method": "gridbook"})
+
+    assert "mtp.dspark" not in card["slots"]
+    card["slots"]["mtp.dspark"] = None
+    assert "mtp.dspark" not in unfilled_slots(card)
+    path = model_dir / "shipcard.json"
+    write_shipcard(path, card)
+    assert "mtp.dspark" not in required_slots(card, model_dir=model_dir)
+
+    # Once a recognized optional claim is non-null it is release evidence, not
+    # ignorable annotation.  Default library and CLI verification both replay
+    # it without an explicit --require-slot.
+    card["slots"]["mtp.dspark"] = make_record(
+        slot="mtp.dspark",
+        tool="test",
+        passed=False,
+        model_sha=card["model_sha"],
+        detail="unvalidated claim",
+    )
+    write_shipcard(path, card)
+    assert "mtp.dspark" in required_slots(card, model_dir=model_dir)
+    assert any(
+        problem.startswith("mtp.dspark: FAILED")
+        for problem in verify(card, model_dir=model_dir)
+    )
+    assert shipcard_cli(["verify", str(path)]) == 1
+    assert "mtp.dspark: FAILED" in capsys.readouterr().out
+    assert shipcard_cli(["show", str(path)]) == 0
+    assert "mtp.dspark" in capsys.readouterr().out
+
+
+def test_on_disk_dspark_sidecar_requires_claim_but_target_overlay_does_not(
+    tmp_path,
+):
+    draft_dir = _artifact(tmp_path, name="draft")
+    (draft_dir / "quant_config.json").write_text(json.dumps({
+        "quant_method": "gridbook",
+        "format": "nvfp4_cb",
+        "provenance": {"dspark_cb_sidecar": {"schema": "test"}},
+    }))
+    draft_card = build_shipcard(
+        draft_dir, build={"quant_method": "gridbook"}
+    )
+    assert draft_card["slots"]["mtp.dspark"] is None
+    assert required_slots(draft_card, model_dir=draft_dir)[-1] == "mtp.dspark"
+    assert "mtp.dspark: UNFILLED" in verify(
+        draft_card, model_dir=draft_dir
+    )
+
+    # Removing the mutable slot cannot erase an obligation proven by the
+    # physical sidecar's own on-disk provenance.
+    draft_card["slots"].pop("mtp.dspark")
+    assert "mtp.dspark: UNFILLED" in verify(
+        draft_card, model_dir=draft_dir
+    )
+
+    target_dir = _artifact(tmp_path, name="target")
+    (target_dir / "quant_config.json").write_text(json.dumps({
+        "quant_method": "gridbook",
+        "format": "nvfp4_cb",
+        "provenance": {"dspark_source_overlay": {"schema": "test"}},
+    }))
+    target_card = build_shipcard(
+        target_dir, build={"quant_method": "gridbook"}
+    )
+    assert "mtp.dspark" not in target_card["slots"]
+    assert "mtp.dspark" not in required_slots(
+        target_card, model_dir=target_dir
     )
 
 

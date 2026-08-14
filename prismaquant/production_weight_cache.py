@@ -3184,6 +3184,114 @@ def bind_cb_render_identity_source_weights(
     return updated
 
 
+class CBRenderSourceIdentityCollector:
+    """Incrementally bind decoded source values without retaining tensors.
+
+    Large streaming exports cannot keep every decoded source weight resident
+    merely to construct the value-bearing render identity.  This collector is
+    the one-pass equivalent of :func:`bind_cb_render_identity_source_weights`:
+    it keeps only canonical shapes and SHA-256 values, requires every source
+    qname exactly once (distinguishing duplicate-name drift), and emits the
+    same complete v2 identity after exact scope coverage.
+
+    The seed identity must be otherwise production-valid and deliberately
+    source-incomplete.  A completed identity is an input to an exporter and is
+    therefore verified directly instead of being re-attested here.
+    """
+
+    def __init__(
+        self,
+        identity: Mapping[str, object],
+        *,
+        where: str = "streaming CB render source identity",
+    ) -> None:
+        validate_cb_render_identity_metadata(
+            identity,
+            require_source_complete=False,
+            where=where,
+        )
+        if identity.get("source_weights_complete") is not False:
+            raise ValueError(
+                f"{where}: collector seed must be source-incomplete"
+            )
+        if identity.get("source_weights_shapes") or identity.get(
+            "source_weights_content_sha256"
+        ):
+            raise ValueError(
+                f"{where}: collector seed must not carry partial source values"
+            )
+        self._identity = copy.deepcopy(dict(identity))
+        self._scope = frozenset(
+            str(name) for name in identity["col_weights_qnames"]
+        )
+        self._shapes: dict[str, list[int]] = {}
+        self._content: dict[str, str] = {}
+        self._where = where
+        self._finalized = False
+
+    @property
+    def observed_qnames(self) -> frozenset[str]:
+        return frozenset(self._content)
+
+    def observe(self, qname: str, weight: torch.Tensor) -> None:
+        """Bind one exact decoded tensor, rejecting scope or value drift."""
+
+        if self._finalized:
+            raise ValueError(
+                f"{self._where}: collector is already finalized"
+            )
+        name = str(qname)
+        if name not in self._scope:
+            raise ValueError(
+                f"{self._where}: decoded source qname {name!r} is out of scope"
+            )
+        shape, digest = _source_weight_value_identity(weight)
+        if name in self._content:
+            if self._shapes[name] != shape or self._content[name] != digest:
+                raise ValueError(
+                    f"{self._where}: decoded source weight changed for "
+                    f"{name!r}"
+                )
+            raise ValueError(
+                f"{self._where}: decoded source weight {name!r} was "
+                "observed more than once"
+            )
+        self._shapes[name] = shape
+        self._content[name] = digest
+
+    def finalize(self) -> dict[str, object]:
+        """Return a source-complete identity after exact scope coverage."""
+
+        if self._finalized:
+            raise ValueError(
+                f"{self._where}: collector is already finalized"
+            )
+        missing = sorted(self._scope - set(self._content))
+        extra = sorted(set(self._content) - self._scope)
+        if missing or extra:
+            raise ValueError(
+                f"{self._where}: decoded source coverage differs: "
+                f"missing={missing[:8]}, extra={extra[:8]}"
+            )
+        updated = copy.deepcopy(self._identity)
+        updated["source_weights_shapes"] = dict(sorted(self._shapes.items()))
+        updated["source_weights_content_sha256"] = dict(
+            sorted(self._content.items())
+        )
+        updated["source_weights_complete"] = True
+        updated["source_weights_sha256"] = _combined_source_weights_sha256(
+            self._shapes,
+            self._content,
+        )
+        validate_cb_render_identity_metadata(
+            updated,
+            require_source_complete=True,
+            where=self._where,
+        )
+        self._finalized = True
+        return updated
+
+
 def bind_production_cache_cb_source_weights(
     cache: ProductionWeightCache,
     source_weights: Mapping[str, torch.Tensor],

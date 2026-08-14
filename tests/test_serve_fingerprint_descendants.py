@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+from copy import deepcopy
 import hashlib
 import json
 import os
@@ -14,10 +15,58 @@ import tools.serve_fingerprint as serve_fingerprint
 from prismaquant.gridbook_environment import GRIDBOOK_ENVIRONMENT_ALLOWLIST
 
 
+def test_stable_fingerprint_excludes_phase_but_binds_runtime_stack_fields():
+    pre = {
+        "attestation_phase": "pre",
+        "created": "2026-08-13T00:00:00Z",
+        "resident_extensions": ["gridbook/_C.so"],
+        "package_versions": {"vllm": "0.10.2"},
+        "gridbook_runtime_pin": {
+            "commit": "a" * 40,
+            "required_abi_features": {
+                "dspark_construction_physical_bridge": 1,
+            },
+        },
+        "gridbook_distribution": {
+            "runtime_capabilities": {
+                "dspark_construction_physical_bridge": 1,
+            },
+        },
+    }
+    pre["serve_fingerprint"] = serve_fingerprint.fingerprint(pre)
+    post = deepcopy(pre)
+    post["attestation_phase"] = "post"
+    post["created"] = "2026-08-13T00:02:00Z"
+    post["serve_fingerprint"] = serve_fingerprint.fingerprint(post)
+    assert post["serve_fingerprint"] == pre["serve_fingerprint"]
+
+    mutations = []
+    resident = deepcopy(post)
+    resident["resident_extensions"].append("unexpected_extension.so")
+    mutations.append(resident)
+    package = deepcopy(post)
+    package["package_versions"]["vllm"] = "0.10.3"
+    mutations.append(package)
+    capability = deepcopy(post)
+    capability["gridbook_runtime_pin"]["required_abi_features"][
+        "dspark_construction_physical_bridge"
+    ] = 2
+    mutations.append(capability)
+    distribution = deepcopy(post)
+    distribution["gridbook_distribution"]["runtime_capabilities"][
+        "dspark_construction_physical_bridge"
+    ] = 2
+    mutations.append(distribution)
+    for mutated in mutations:
+        mutated["serve_fingerprint"] = serve_fingerprint.fingerprint(mutated)
+        assert mutated["serve_fingerprint"] != pre["serve_fingerprint"]
+
+
 def test_server_environment_allowlist_is_the_full_gridbook_registry():
     assert serve_fingerprint.SERVER_ENV_ALLOWLIST == (
         "PQ_GRIDBOOK_RUNTIME_COMMIT",
         "PQ_GRIDBOOK_RUNTIME_VERSION",
+        "PQ_GRIDBOOK_RUNTIME_WHEEL_SHA256",
         "PYTHONPATH",
         "PYTHONSAFEPATH",
         *GRIDBOOK_ENVIRONMENT_ALLOWLIST,

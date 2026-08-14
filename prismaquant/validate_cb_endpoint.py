@@ -38,20 +38,20 @@ from .shipcard import (
 )
 from .gridbook_assignment import artifact_requires_moe_backend_marlin
 from .gridbook_environment import CANONICAL_GOLD_ENVIRONMENT
-from .gridbook_runtime_pin import (
-    GridbookRuntimePinError,
-    load_gridbook_runtime_pin,
-    require_exact_gridbook_runtime_release,
+from .gridbook_serving_runtime_pin import (
+    GridbookServingRuntimePinError,
+    load_gridbook_serving_runtime_pin,
+    require_exact_gridbook_serving_runtime_release,
 )
 from .allocator_candidates import ROUTE_PENDING_PASSTHROUGH_FORMATS
 
 
 DSV4_SPARK_VLLM_IMAGE = (
     "eugr/spark-vllm@sha256:"
-    "7bf752a9fa225b528b27c6a1118cb1727cddd7c383096d83281010c4f8b407bc"
+    "58862b388e0fab05a5c9b673f21d1d7b41a1123953a2d9ace49aae6c79319869"
 )
-DSV4_SPARK_VLLM_VERSION = "0.26.1rc1.dev515+g653ebb52d.d20260808"
-DSV4_SPARK_VLLM_COMMIT = "653ebb52d"
+DSV4_SPARK_VLLM_VERSION = "0.26.1rc1.dev693+g7f7a32cfe.d20260812"
+DSV4_SPARK_VLLM_COMMIT = "7f7a32cfe"
 DSV4_SPARK_GPU_NAME = "NVIDIA GB10"
 DSV4_MXFP4_WIRE_ID = "mxfp4_e2m1_ue8m0_g32"
 DSV4_GRAPH_COMPILATION_CONFIG = (
@@ -65,6 +65,20 @@ ENDPOINT_CONTRACT_SCHEMA = "prismaquant.cb_endpoint_contract.v1"
 ARTIFACT_DECODE_CONTRACT_SCHEMA = (
     "prismaquant.cb_artifact_decode_contract.v1"
 )
+ARTIFACT_DECODE_CONTRACT_SCHEMA_V2 = (
+    "prismaquant.cb_artifact_decode_contract.v2"
+)
+DSPARK_CB_SIDECAR_SCHEMA = "prismaquant.dspark_cb_sidecar.v1"
+DSPARK_CB_SIDECAR_MODE = "quantized_dspark_cb_sidecar"
+DSPARK_CB_RUNTIME_FEATURE = "dspark_construction_physical_bridge"
+DSPARK_CB_RUNTIME_FEATURE_VERSION = 1
+DSPARK_CB_SOURCE_FP8_RUNTIME_FEATURE = "source_fp8_block128_w8a16"
+DSPARK_CB_SOURCE_FP8_RUNTIME_FEATURE_VERSION = 1
+DSPARK_CB_RUNTIME_CONTRACT_SCHEMA = "gridbook.runtime-contract.v4"
+DSPARK_RENDER_RECIPE_SCHEMA = "prismaquant.dspark_cb_render_recipe.v1"
+DSPARK_RENDER_SOURCE_BINDING = "streamed_decoded_cb_source.v1"
+DSPARK_CB_RETAINED_GLUE_TENSOR_COUNT = 47
+DSPARK_CB_HYBRID_WEIGHT_ONLY_TENSOR_COUNT = 82
 ENDPOINT_RESULT_SCHEMA = "prismaquant.cb_endpoint_validation.v1"
 ENDPOINT_SESSION_SCHEMA = "prismaquant.cb_endpoint_session.v1"
 _FINGERPRINT_RE = re.compile(r"[0-9a-f]{64}")
@@ -115,11 +129,16 @@ _SERVE_VALUE_FLAGS = frozenset({
     "--gpu-memory-utilization",
     "--compilation-config",
     "--moe-backend",
+    "--tool-call-parser",
+    "--speculative-config",
+    "--default-chat-template-kwargs",
 })
 _SERVE_SWITCH_FLAGS = frozenset({
     "--trust-remote-code",
     "--no-enable-prefix-caching",
     "--enforce-eager",
+    "--enable-chunked-prefill",
+    "--enable-auto-tool-choice",
 })
 
 
@@ -129,9 +148,9 @@ class CBEndpointValidationError(RuntimeError):
 
 def _gridbook_runtime_pin() -> dict[str, Any]:
     try:
-        pin = load_gridbook_runtime_pin()
-        require_exact_gridbook_runtime_release(pin)
-    except (GridbookRuntimePinError, OSError, UnicodeError) as exc:
+        pin = load_gridbook_serving_runtime_pin()
+        require_exact_gridbook_serving_runtime_release(pin)
+    except (GridbookServingRuntimePinError, OSError, UnicodeError) as exc:
         raise CBEndpointValidationError(
             f"Gridbook runtime pin is not one strict released commit: {exc}"
         ) from exc
@@ -141,6 +160,7 @@ def _gridbook_runtime_pin() -> dict[str, Any]:
         "commit": pin.commit,
         "version": pin.version,
         "version_is_release": pin.version_is_release,
+        "wheel_sha256": pin.wheel_sha256,
         "runtime_contract_schema": pin.runtime_contract_schema,
         "required_abi_features": dict(pin.required_abi_features),
     }
@@ -151,6 +171,252 @@ def _canonical_json_sha256(payload: object) -> str:
         payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def validate_dspark_production_render_attestation(
+    quant_config: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Require a replayable, source-complete DSpark render attestation.
+
+    Structural sidecar validation remains useful for research artifacts.  A
+    release claim is stricter: it must prove the exact source tensors observed
+    by the one-pass renderer and persist the complete recipe whose digest was
+    checked against source config/header, assignment, and imatrix inputs before
+    export.  In particular, this rejects the historical K12 draft carrying
+    ``render_identity_verified=false``.
+    """
+    provenance = quant_config.get("provenance")
+    if not isinstance(provenance, Mapping):
+        raise CBEndpointValidationError(
+            "DSpark production artifact has no provenance object"
+        )
+    if provenance.get("render_identity_verified") is not True:
+        raise CBEndpointValidationError(
+            "DSpark production artifact does not attest a verified render; "
+            "re-export without --allow-unstamped-research"
+        )
+    tensor_formats = provenance.get("tensor_formats")
+    try:
+        from . import format_registry as fr
+        from .nvfp4_cb_footprint import is_cb_format
+
+        if not isinstance(tensor_formats, Mapping):
+            raise TypeError("tensor_formats is not a mapping")
+        expected_cb_scope: dict[str, list[str]] = {}
+        for raw_qname, raw_format in tensor_formats.items():
+            if not isinstance(raw_qname, str) or not raw_qname:
+                raise TypeError("tensor_formats contains an invalid qname")
+            if not isinstance(raw_format, str) or not raw_format.strip():
+                raise TypeError(
+                    f"tensor_formats[{raw_qname!r}] is not a format string"
+                )
+            canonical = fr.canonical_format_name(raw_format.strip().upper())
+            if is_cb_format(canonical):
+                expected_cb_scope[raw_qname] = [canonical]
+        expected_cb_scope = dict(sorted(expected_cb_scope.items()))
+        if not expected_cb_scope:
+            raise ValueError("finalized assignment contains no CB members")
+    except Exception as exc:
+        raise CBEndpointValidationError(
+            "DSpark artifact has no canonical finalized CB render scope: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+    render_identity = provenance.get("cb_render_identity")
+    render_scope = render_identity.get("cb_formats_by_qname") if isinstance(
+        render_identity, Mapping
+    ) else None
+    source_shapes = render_identity.get("source_weights_shapes") if isinstance(
+        render_identity, Mapping
+    ) else None
+    source_content = render_identity.get(
+        "source_weights_content_sha256"
+    ) if isinstance(render_identity, Mapping) else None
+    expected_qnames = set(expected_cb_scope)
+    if (
+        render_scope != expected_cb_scope
+        or not isinstance(source_shapes, Mapping)
+        or set(source_shapes) != expected_qnames
+        or not isinstance(source_content, Mapping)
+        or set(source_content) != expected_qnames
+    ):
+        raise CBEndpointValidationError(
+            "DSpark finalized tensor_formats CB scope differs from the exact "
+            "render/source-complete scope"
+        )
+    try:
+        from .production_weight_cache import (
+            validate_cb_render_identity_metadata,
+        )
+
+        validate_cb_render_identity_metadata(
+            render_identity,
+            expected_formats_by_qname=expected_cb_scope,
+            require_source_complete=True,
+            where="DSpark production artifact",
+        )
+    except Exception as exc:
+        raise CBEndpointValidationError(
+            "DSpark production render identity is not source-complete: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+    if not isinstance(render_identity, Mapping):  # narrowed by validator
+        raise AssertionError("validated render identity is not a mapping")
+
+    attestation = provenance.get("dspark_render_attestation")
+    attestation_keys = {
+        "schema",
+        "source_binding",
+        "recipe",
+        "recipe_sha256",
+        "source_weights_sha256",
+        "source_weights_entries",
+    }
+    if not isinstance(attestation, Mapping):
+        raise CBEndpointValidationError(
+            "DSpark production artifact has no render attestation"
+        )
+    _require_exact_keys(
+        attestation,
+        attestation_keys,
+        where="DSpark production render attestation",
+    )
+    recipe = attestation.get("recipe")
+    recipe_keys = {
+        "schema",
+        "source_binding",
+        "source_model_identity",
+        "source_config_sha256",
+        "mtp_header_identity_sha256",
+        "assignment_sha256",
+        "col_weights_sha256",
+        "render_identity_seed_sha256",
+    }
+    if not isinstance(recipe, Mapping):
+        raise CBEndpointValidationError(
+            "DSpark production render attestation has no replayable recipe"
+        )
+    _require_exact_keys(
+        recipe, recipe_keys, where="DSpark production render recipe"
+    )
+    if (
+        attestation.get("schema") != DSPARK_RENDER_RECIPE_SCHEMA
+        or attestation.get("source_binding") != DSPARK_RENDER_SOURCE_BINDING
+        or recipe.get("schema") != DSPARK_RENDER_RECIPE_SCHEMA
+        or recipe.get("source_binding") != DSPARK_RENDER_SOURCE_BINDING
+    ):
+        raise CBEndpointValidationError(
+            "DSpark production render recipe schema/source binding differs"
+        )
+    for name in (
+        "source_config_sha256",
+        "mtp_header_identity_sha256",
+        "assignment_sha256",
+        "col_weights_sha256",
+        "render_identity_seed_sha256",
+    ):
+        _require_sha256(recipe.get(name), where=f"DSpark render recipe {name}")
+    if attestation.get("recipe_sha256") != _canonical_json_sha256(recipe):
+        raise CBEndpointValidationError(
+            "DSpark production render recipe digest is stale"
+        )
+
+    source_identity = provenance.get("source_model_identity")
+    source_identity_keys = {
+        "schema",
+        "content_sha256",
+        "resolved_commit",
+        "checkpoint_shards",
+        "checkpoint_tensors",
+    }
+    if (
+        not isinstance(source_identity, Mapping)
+        or set(source_identity) != source_identity_keys
+        or source_identity.get("schema")
+        != "prismaquant.streamed_model.identity.v1"
+        or _FINGERPRINT_RE.fullmatch(
+            str(source_identity.get("content_sha256", ""))
+        ) is None
+        or any(
+            isinstance(source_identity.get(name), bool)
+            or not isinstance(source_identity.get(name), int)
+            or int(source_identity.get(name, 0)) <= 0
+            for name in ("checkpoint_shards", "checkpoint_tensors")
+        )
+        or (
+            source_identity.get("resolved_commit") is not None
+            and (
+                not isinstance(source_identity.get("resolved_commit"), str)
+                or not source_identity.get("resolved_commit")
+            )
+        )
+        or recipe.get("source_model_identity") != source_identity
+    ):
+        raise CBEndpointValidationError(
+            "DSpark render recipe is not bound to the compact complete-source "
+            "checkpoint identity"
+        )
+
+    try:
+        from .nvfp4_cb_footprint import assignment_serialization_sha256
+
+        if not isinstance(tensor_formats, Mapping):
+            raise TypeError("tensor_formats is not a mapping")
+        recipe_assignment = dict(tensor_formats)
+        # ``mtp.0.main_proj`` is immutable DSpark glue rather than an
+        # allocator-owned Linear.  The exporter adds its mandatory W8A16 route
+        # after validating the input recipe; remove only that one producer-
+        # injected route when replaying the original assignment digest.
+        if recipe_assignment.pop("mtp.0.main_proj", None) is None:
+            raise ValueError("mandatory mtp.0.main_proj route is absent")
+        assignment_sha = assignment_serialization_sha256(recipe_assignment)
+    except Exception as exc:
+        raise CBEndpointValidationError(
+            "DSpark artifact has no canonical finalized assignment: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+    if recipe.get("assignment_sha256") != assignment_sha:
+        raise CBEndpointValidationError(
+            "DSpark render recipe assignment differs from artifact provenance"
+        )
+    if recipe.get("col_weights_sha256") != render_identity.get(
+        "col_weights_sha256"
+    ):
+        raise CBEndpointValidationError(
+            "DSpark render recipe imatrix digest differs from render identity"
+        )
+
+    # The streaming collector changes only these source-value fields after it
+    # has observed every decoded CB input.  Reconstruct the pristine seed and
+    # replay the recipe's seed digest exactly.
+    render_seed = json.loads(json.dumps(render_identity))
+    render_seed["source_weights_complete"] = False
+    render_seed["source_weights_shapes"] = {}
+    render_seed["source_weights_content_sha256"] = {}
+    render_seed["source_weights_sha256"] = None
+    if recipe.get("render_identity_seed_sha256") != _canonical_json_sha256(
+        render_seed
+    ):
+        raise CBEndpointValidationError(
+            "DSpark render identity does not derive from the attested recipe seed"
+        )
+    source_content = render_identity.get("source_weights_content_sha256")
+    if (
+        attestation.get("source_weights_sha256")
+        != render_identity.get("source_weights_sha256")
+        or not isinstance(source_content, Mapping)
+        or attestation.get("source_weights_entries") != len(source_content)
+    ):
+        raise CBEndpointValidationError(
+            "DSpark render attestation source-weight closure differs"
+        )
+    return {
+        "schema": DSPARK_RENDER_RECIPE_SCHEMA,
+        "source_model_identity": dict(source_identity),
+        "recipe_sha256": str(attestation["recipe_sha256"]),
+        "source_weights_sha256": str(attestation["source_weights_sha256"]),
+        "source_weights_entries": int(attestation["source_weights_entries"]),
+        "attestation_sha256": _canonical_json_sha256(attestation),
+    }
 
 
 def _require_session_model_name(value: object) -> str:
@@ -166,12 +432,18 @@ def _expected_serve_environment(runtime_pin: Mapping[str, Any]) -> dict[str, str
     """Exact set-valued process environment for the endpoint/perf profile."""
     commit = runtime_pin.get("commit")
     version = runtime_pin.get("version")
-    if not isinstance(commit, str) or not isinstance(version, str):
+    wheel_sha256 = runtime_pin.get("wheel_sha256")
+    if (
+        not isinstance(commit, str)
+        or not isinstance(version, str)
+        or re.fullmatch(r"[0-9a-f]{64}", str(wheel_sha256 or "")) is None
+    ):
         raise CBEndpointValidationError("Gridbook runtime pin is incomplete")
     return {
         **_REQUIRED_SERVE_ENV,
         "PQ_GRIDBOOK_RUNTIME_COMMIT": commit,
         "PQ_GRIDBOOK_RUNTIME_VERSION": version,
+        "PQ_GRIDBOOK_RUNTIME_WHEEL_SHA256": str(wheel_sha256),
         "PYTHONSAFEPATH": "1",
     }
 
@@ -180,6 +452,8 @@ def _validate_closed_server_environment(
     payload: Mapping[str, Any],
     *,
     runtime_pin: Mapping[str, Any],
+    expected_environment: Mapping[str, str] | None = None,
+    expected_allowlist: Sequence[str] | None = None,
 ) -> dict[str, str]:
     """Replay the complete allowlist against every inspected server process."""
     try:
@@ -189,7 +463,34 @@ def _validate_closed_server_environment(
             "tools.serve_fingerprint is unavailable; run from the PrismaQuant tree"
         ) from exc
 
-    expected = _expected_serve_environment(runtime_pin)
+    expected = (
+        _expected_serve_environment(runtime_pin)
+        if expected_environment is None
+        else dict(expected_environment)
+    )
+    if any(
+        not isinstance(name, str)
+        or not name
+        or not isinstance(value, str)
+        for name, value in expected.items()
+    ):
+        raise CBEndpointValidationError(
+            "serve environment override is not one exact string mapping"
+        )
+    allowlist = (
+        tuple(SERVER_ENV_ALLOWLIST)
+        if expected_allowlist is None
+        else tuple(expected_allowlist)
+    )
+    if (
+        not allowlist
+        or any(not isinstance(name, str) or not name for name in allowlist)
+        or len(allowlist) != len(set(allowlist))
+        or not set(expected).issubset(allowlist)
+    ):
+        raise CBEndpointValidationError(
+            "serve environment allowlist override is incomplete"
+        )
     process_environment = payload.get("server_process_environment")
     pq_env = payload.get("pq_env")
     rows = process_environment.get("processes") if isinstance(
@@ -211,7 +512,7 @@ def _validate_closed_server_environment(
         }
         or process_environment.get("schema")
         != "prismaquant.server_process_environment/1"
-        or process_environment.get("allowlist") != sorted(SERVER_ENV_ALLOWLIST)
+        or process_environment.get("allowlist") != sorted(allowlist)
         or process_environment.get("unreadable_pids") != []
         or process_environment.get("consistent") is not True
         or process_environment.get("values") != expected
@@ -461,6 +762,8 @@ def _canonical_launch_contract(
     arm: str,
     expected_served_model: str,
     requires_moe_marlin: bool,
+    expected_options_override: Mapping[str, str] | None = None,
+    expected_switches_override: set[str] | frozenset[str] | None = None,
 ) -> dict[str, Any]:
     """Parse the complete vLLM serve CLI and reject every undeclared flag."""
     tokens = [str(value) for value in argv]
@@ -543,6 +846,8 @@ def _canonical_launch_contract(
         )
     if requires_moe_marlin:
         expected_options["--moe-backend"] = "marlin"
+    if expected_options_override is not None:
+        expected_options = dict(expected_options_override)
     if options != expected_options:
         raise CBEndpointValidationError(
             "serve argv value-option contract differs: "
@@ -555,6 +860,8 @@ def _canonical_launch_contract(
     }
     if arm == "eager":
         expected_switches.add("--enforce-eager")
+    if expected_switches_override is not None:
+        expected_switches = set(expected_switches_override)
     if switches != expected_switches:
         raise CBEndpointValidationError(
             "serve argv switch contract differs: "
@@ -578,6 +885,11 @@ def validate_serve_manifest(
     expected_served_model: str,
     requires_moe_marlin: bool,
     expected_model_sha: str | None = None,
+    expected_speculative_config: Mapping[str, Any] | None = None,
+    expected_launch_options: Mapping[str, str] | None = None,
+    expected_launch_switches: set[str] | frozenset[str] | None = None,
+    expected_server_environment: Mapping[str, str] | None = None,
+    expected_server_environment_allowlist: Sequence[str] | None = None,
 ) -> str:
     """Validate server-side identity and return its exact fingerprint."""
     if arm not in {"eager", "graph"}:
@@ -665,10 +977,23 @@ def validate_serve_manifest(
     if payload.get("kv_cache_dtype") != "fp8":
         raise CBEndpointValidationError("serve did not use --kv-cache-dtype fp8")
     speculative_config = payload.get("speculative_config")
-    if speculative_config is not None:
+    if expected_speculative_config is None and speculative_config is not None:
         raise CBEndpointValidationError(
             "speculative decoding is configured; CB eager/graph gates require it off"
         )
+    if expected_speculative_config is not None:
+        try:
+            observed_speculative_config = json.loads(
+                str(speculative_config)
+            )
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise CBEndpointValidationError(
+                "serve manifest speculative config is not strict JSON"
+            ) from exc
+        if observed_speculative_config != dict(expected_speculative_config):
+            raise CBEndpointValidationError(
+                "serve manifest speculative config differs from the DSpark recipe"
+            )
 
     argv = payload.get("launch_argv")
     if not isinstance(argv, list) or not argv:
@@ -678,6 +1003,8 @@ def validate_serve_manifest(
         arm=arm,
         expected_served_model=expected_served_model,
         requires_moe_marlin=requires_moe_marlin,
+        expected_options_override=expected_launch_options,
+        expected_switches_override=expected_launch_switches,
     )
     if payload.get("launch_flags") != elide_argv_paths(
         [str(value) for value in argv]
@@ -718,7 +1045,12 @@ def validate_serve_manifest(
             "serve manifest does not attest the exact imported Gridbook "
             f"distribution: {distribution_problems[0]}"
         )
-    _validate_closed_server_environment(payload, runtime_pin=runtime_pin)
+    _validate_closed_server_environment(
+        payload,
+        runtime_pin=runtime_pin,
+        expected_environment=expected_server_environment,
+        expected_allowlist=expected_server_environment_allowlist,
+    )
     _validate_live_server_session(
         payload,
         expected_served_model=expected_served_model,
@@ -820,41 +1152,976 @@ def validate_cb_artifact(model_dir: str | Path) -> dict[str, Any]:
     return quant_config
 
 
+def _expected_dspark_cb_physical_targets(*, n_mtp_layers: int) -> list[str]:
+    tails = (
+        "attn.wkv",
+        "attn.wo_b",
+        "attn.wq_a",
+        "attn.wq_b",
+        "ffn.experts.down_proj",
+        "ffn.experts.gate_up_proj",
+        "ffn.shared_experts.w1",
+        "ffn.shared_experts.w2",
+        "ffn.shared_experts.w3",
+    )
+    return sorted(
+        f"mtp.{stage}.{tail}"
+        for stage in range(n_mtp_layers)
+        for tail in tails
+    )
+
+
+def _expected_dspark_source_passthrough_mapping(
+    *, num_hidden_layers: int, n_mtp_layers: int
+) -> dict[str, str]:
+    return dict(sorted({
+        "mtp.0.main_proj": "model.main_proj",
+        **{
+            f"mtp.{stage}.attn.wo_a": (
+                f"model.layers.{num_hidden_layers + stage}.attn.wo_a"
+            )
+            for stage in range(n_mtp_layers)
+        },
+    }.items()))
+
+
+def _canonical_string_list(value: object, *, where: str) -> list[str]:
+    if (
+        not isinstance(value, list)
+        or any(not isinstance(item, str) or not item for item in value)
+        or value != sorted(set(value))
+    ):
+        raise CBEndpointValidationError(
+            f"{where} must be a sorted duplicate-free list of nonempty strings"
+        )
+    return list(value)
+
+
+def _validate_dspark_cb_sidecar_artifact(
+    root: Path,
+    *,
+    model_config: Mapping[str, Any],
+    quant_config: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate the physical/config namespace split of a quantized draft.
+
+    This is intentionally a header-only proof.  A sidecar's CB groups are
+    named where Gridbook constructs the decoder, while the serialized tensors
+    retain the checkpoint's ``mtp.*`` names.  Both sets, every CB companion,
+    and the four immutable W8A16 source projections (``main_proj`` plus one
+    grouped-BMM ``wo_a`` per stage) are closed here before an endpoint can
+    claim it decoded the artifact.
+    """
+    from .artifact_completeness import (
+        _read_safetensors_header,
+        read_artifact_header,
+    )
+    from .cb_export_config import (
+        _two_tier_scale_coding,
+        parse_source_passthrough_declaration,
+        source_passthrough_config_group,
+        source_passthrough_wire_id,
+    )
+    from .cb_layout import (
+        FP4_GROUP,
+        SCALE_CODING_TWO_TIER,
+        SCALE_CODING_V1,
+        SUPERBLOCK,
+        VEC_DIM,
+        codebook_subtable_shapes,
+        parse_format_name,
+        type_size,
+    )
+    from .dspark_source_metadata import (
+        DSPARK_STAGE_COUNT,
+        _released_dspark_tensor_layout,
+        dspark_cb_construction_target_for_physical_output,
+        validate_dspark_target_bridge,
+    )
+    from .export_native_compressed import _explicit_regex
+    from .nvfp4_activation_contract import (
+        FP4_GROUP_SIZE,
+        NVFP4_ACTIVATION_CONTRACT_KEY,
+        NVFP4_ACTIVATION_CONTRACT_SCHEMA,
+        NVFP4_ACTIVATION_EXECUTION,
+        NVFP4_INPUT_GLOBAL_SCALE_SUFFIX,
+    )
+
+    provenance = quant_config.get("provenance")
+    sidecar = (
+        provenance.get("dspark_cb_sidecar")
+        if isinstance(provenance, Mapping)
+        else None
+    )
+    if not isinstance(sidecar, Mapping):
+        raise CBEndpointValidationError(
+            "quantized DSpark artifact has no sidecar provenance"
+        )
+    sidecar_keys = {
+        "schema",
+        "num_hidden_layers",
+        "n_mtp_layers",
+        "physical_namespace",
+        "construction_namespace",
+        "physical_cb_targets",
+        "construction_cb_targets",
+        "source_passthrough_targets",
+        "source_passthrough_physical_to_construction",
+        "activation_bridge_present",
+    }
+    _require_exact_keys(
+        sidecar, sidecar_keys, where="DSpark CB sidecar provenance"
+    )
+    num_hidden_layers = model_config.get("num_hidden_layers")
+    n_mtp_layers = model_config.get("n_mtp_layers")
+    if (
+        not isinstance(num_hidden_layers, int)
+        or isinstance(num_hidden_layers, bool)
+        or num_hidden_layers <= 0
+        or n_mtp_layers != DSPARK_STAGE_COUNT
+        or sidecar.get("schema") != DSPARK_CB_SIDECAR_SCHEMA
+        or sidecar.get("num_hidden_layers") != num_hidden_layers
+        or sidecar.get("n_mtp_layers") != DSPARK_STAGE_COUNT
+        or sidecar.get("physical_namespace") != "mtp.{stage}"
+        or sidecar.get("construction_namespace")
+        != "model.layers.{num_hidden_layers+stage}"
+        or not isinstance(sidecar.get("activation_bridge_present"), bool)
+    ):
+        raise CBEndpointValidationError(
+            "DSpark CB sidecar provenance disagrees with model topology"
+        )
+    target_layer_ids = model_config.get("dspark_target_layer_ids")
+    if (
+        not isinstance(target_layer_ids, list)
+        or len(target_layer_ids) != DSPARK_STAGE_COUNT
+        or any(
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or value < 0
+            or value >= num_hidden_layers
+            for value in target_layer_ids
+        )
+        or len(set(target_layer_ids)) != DSPARK_STAGE_COUNT
+        or model_config.get("num_nextn_predict_layers") != 1
+        or model_config.get("n_shared_experts") != 1
+        or str(model_config.get("expert_dtype", "")).lower()
+        not in {"fp4", "mxfp4", "mx_fp4"}
+        or not isinstance(model_config.get("dspark_block_size"), int)
+        or isinstance(model_config.get("dspark_block_size"), bool)
+        or int(model_config["dspark_block_size"]) <= 0
+        or not isinstance(model_config.get("dspark_markov_rank"), int)
+        or isinstance(model_config.get("dspark_markov_rank"), bool)
+        or int(model_config["dspark_markov_rank"]) <= 0
+    ):
+        raise CBEndpointValidationError(
+            "DSpark sidecar model config is not the released three-stage "
+            "construction contract"
+        )
+
+    expected_physical = _expected_dspark_cb_physical_targets(
+        n_mtp_layers=DSPARK_STAGE_COUNT
+    )
+    physical = _canonical_string_list(
+        sidecar.get("physical_cb_targets"),
+        where="DSpark physical CB targets",
+    )
+    if physical != expected_physical:
+        raise CBEndpointValidationError(
+            "DSpark sidecar does not contain the exact three-stage decoder "
+            "target set"
+        )
+    try:
+        physical_to_construction = {
+            target: dspark_cb_construction_target_for_physical_output(
+                target, model_config
+            )
+            for target in physical
+        }
+    except Exception as exc:
+        raise CBEndpointValidationError(
+            f"DSpark sidecar namespace mapping is invalid: {exc}"
+        ) from exc
+    construction = _canonical_string_list(
+        sidecar.get("construction_cb_targets"),
+        where="DSpark construction CB targets",
+    )
+    if construction != sorted(physical_to_construction.values()):
+        raise CBEndpointValidationError(
+            "DSpark physical and construction CB targets do not map exactly"
+        )
+    expected_source_mapping = _expected_dspark_source_passthrough_mapping(
+        num_hidden_layers=num_hidden_layers,
+        n_mtp_layers=DSPARK_STAGE_COUNT,
+    )
+    if (
+        sidecar.get("source_passthrough_targets")
+        != sorted(expected_source_mapping)
+        or sidecar.get("source_passthrough_physical_to_construction")
+        != expected_source_mapping
+    ):
+        raise CBEndpointValidationError(
+            "DSpark sidecar source routes must be exactly main_proj plus one "
+            "grouped-BMM wo_a per stage, with physical/construction mapping"
+        )
+
+    groups = quant_config.get("config_groups")
+    if not isinstance(groups, Mapping) or not groups:
+        raise CBEndpointValidationError(
+            "DSpark CB sidecar has no config groups"
+        )
+    cb_schemes: dict[str, Mapping[str, Any]] = {}
+    cb_formats: dict[str, str] = {}
+    cb_layouts: dict[str, tuple[object, int]] = {}
+    source_groups: list[Mapping[str, Any]] = []
+    for raw_name, raw_group in groups.items():
+        if not isinstance(raw_group, Mapping):
+            raise CBEndpointValidationError(
+                f"DSpark config group {raw_name!r} is not an object"
+            )
+        if raw_group.get("format") == "source-passthrough":
+            source_groups.append(raw_group)
+            continue
+        scheme = raw_group.get("scheme")
+        targets = raw_group.get("targets")
+        raw_format = raw_group.get("format")
+        parsed_format = (
+            parse_format_name(raw_format)
+            if isinstance(raw_format, str)
+            else None
+        )
+        if (
+            not isinstance(scheme, Mapping)
+            or parsed_format is None
+            or not isinstance(targets, list)
+            or any(not isinstance(target, str) or not target for target in targets)
+            or targets != sorted(set(targets))
+        ):
+            raise CBEndpointValidationError(
+                f"DSpark config group {raw_name!r} is not a canonical CB group"
+            )
+        family, format_k = parsed_format
+        canonical_format = family.name(format_k)
+        if raw_format != canonical_format:
+            raise CBEndpointValidationError(
+                f"DSpark config group {raw_name!r} format label is not "
+                f"canonical: {raw_format!r} != {canonical_format!r}"
+            )
+        scale_coding = (
+            SCALE_CODING_TWO_TIER
+            if family.grid == "fp4"
+            else SCALE_CODING_V1
+        )
+        expected_layout = {
+            "grid": family.grid,
+            "mode": family.mode,
+            "k": format_k,
+            "superblock": SUPERBLOCK,
+            "group_size": FP4_GROUP if family.grid == "fp4" else 0,
+            "vec_dim": VEC_DIM,
+            "n_sub": family.n_sub,
+            "type_size": type_size(format_k, family.grid, scale_coding),
+            "act_bits": 4 if family.grid == "fp4" else 8,
+        }
+        mismatched_layout = sorted(
+            key for key, expected in expected_layout.items()
+            if scheme.get(key) != expected
+            or (
+                isinstance(expected, int)
+                and isinstance(scheme.get(key), bool)
+            )
+        )
+        expected_scheme_keys = {
+            *expected_layout,
+            "codebook_source",
+            "codebook_ref",
+            "codebook_group",
+        }
+        if family.grid == "fp4":
+            expected_scheme_keys.add("scale_coding")
+            if scheme.get("scale_coding") != _two_tier_scale_coding():
+                mismatched_layout.append("scale_coding")
+        if scheme.get("activation_contract") is not None:
+            expected_scheme_keys.add("activation_contract")
+        if set(scheme) != expected_scheme_keys:
+            raise CBEndpointValidationError(
+                f"DSpark config group {raw_name!r} scheme keys differ from "
+                f"canonical {canonical_format}: missing="
+                f"{sorted(expected_scheme_keys - set(scheme))}, extra="
+                f"{sorted(set(scheme) - expected_scheme_keys)}"
+            )
+        if mismatched_layout:
+            raise CBEndpointValidationError(
+                f"DSpark config group {raw_name!r} format/scheme layout "
+                f"disagree for {canonical_format}: "
+                f"{sorted(set(mismatched_layout))}"
+            )
+        codebook_source = scheme.get("codebook_source")
+        codebook_group = scheme.get("codebook_group")
+        if (
+            codebook_source not in {"lattice", "learned"}
+            or (codebook_source == "lattice" and codebook_group is not None)
+            or (
+                codebook_source == "learned"
+                and (not isinstance(codebook_group, str) or not codebook_group)
+            )
+        ):
+            raise CBEndpointValidationError(
+                f"DSpark config group {raw_name!r} has non-canonical "
+                "codebook source/group identity"
+            )
+        for target in targets:
+            if target in cb_schemes:
+                raise CBEndpointValidationError(
+                    f"DSpark construction target {target!r} is declared twice"
+                )
+            cb_schemes[target] = scheme
+            cb_formats[target] = canonical_format
+            cb_layouts[target] = (family, format_k)
+    if sorted(cb_schemes) != construction:
+        raise CBEndpointValidationError(
+            "DSpark config groups do not exactly cover construction targets"
+        )
+
+    tensor_formats = provenance.get("tensor_formats")
+    if not isinstance(tensor_formats, Mapping):
+        raise CBEndpointValidationError(
+            "DSpark sidecar provenance has no finalized tensor_formats assignment"
+        )
+    expected_cb_assignment: dict[str, str] = {}
+    raw_num_experts = model_config.get("n_routed_experts")
+    if (
+        isinstance(raw_num_experts, bool)
+        or not isinstance(raw_num_experts, int)
+        or raw_num_experts <= 0
+    ):
+        raise CBEndpointValidationError(
+            "DSpark sidecar model config has no positive routed-expert count"
+        )
+    num_experts = raw_num_experts
+    for physical_target, construction_target in physical_to_construction.items():
+        format_name = cb_formats[construction_target]
+        if physical_target.endswith(".ffn.experts.gate_up_proj"):
+            prefix = physical_target.removesuffix("gate_up_proj")
+            members = (
+                f"{prefix}{expert}.{projection}"
+                for expert in range(num_experts)
+                for projection in ("gate_proj", "up_proj")
+            )
+        elif physical_target.endswith(".ffn.experts.down_proj"):
+            prefix = physical_target.removesuffix("down_proj")
+            members = (
+                f"{prefix}{expert}.down_proj"
+                for expert in range(num_experts)
+            )
+        else:
+            members = (physical_target,)
+        expected_cb_assignment.update(
+            (member, format_name) for member in members
+        )
+    observed_cb_assignment: dict[str, str] = {}
+    for raw_qname, raw_format in tensor_formats.items():
+        if (
+            not isinstance(raw_qname, str)
+            or not raw_qname
+            or not isinstance(raw_format, str)
+            or not raw_format
+        ):
+            raise CBEndpointValidationError(
+                "DSpark finalized tensor_formats assignment is malformed"
+            )
+        parsed = parse_format_name(raw_format)
+        if parsed is None:
+            if "_CB_" in raw_format.upper():
+                raise CBEndpointValidationError(
+                    f"DSpark tensor_formats contains unknown CB label "
+                    f"{raw_format!r} at {raw_qname!r}"
+                )
+            continue
+        member_family, member_k = parsed
+        canonical = member_family.name(member_k)
+        if raw_format != canonical:
+            raise CBEndpointValidationError(
+                f"DSpark tensor_formats label at {raw_qname!r} is not "
+                f"canonical: {raw_format!r} != {canonical!r}"
+            )
+        observed_cb_assignment[raw_qname] = canonical
+    if observed_cb_assignment != dict(sorted(expected_cb_assignment.items())):
+        missing = sorted(
+            set(expected_cb_assignment) - set(observed_cb_assignment)
+        )
+        extra = sorted(
+            set(observed_cb_assignment) - set(expected_cb_assignment)
+        )
+        mismatched = sorted(
+            qname
+            for qname in set(expected_cb_assignment) & set(observed_cb_assignment)
+            if expected_cb_assignment[qname] != observed_cb_assignment[qname]
+        )
+        raise CBEndpointValidationError(
+            "DSpark config-group formats differ from finalized physical "
+            "tensor_formats assignment: missing="
+            f"{missing[:8]}, extra={extra[:8]}, mismatched={mismatched[:8]}"
+        )
+
+    codebook_file = quant_config.get("codebook_file")
+    codebook_path = root / str(codebook_file)
+    try:
+        codebook_header = _read_safetensors_header(codebook_path)
+    except Exception as exc:
+        raise CBEndpointValidationError(
+            f"DSpark codebook sidecar header is unreadable: {exc}"
+        ) from exc
+    referenced_codebooks: set[str] = set()
+    expected_codebook_contract: dict[str, tuple[str, list[int]]] = {}
+    for construction_target, scheme in cb_schemes.items():
+        refs = scheme.get("codebook_ref")
+        if (
+            not isinstance(refs, list)
+            or any(not isinstance(ref, str) or not ref for ref in refs)
+            or refs != list(dict.fromkeys(refs))
+        ):
+            raise CBEndpointValidationError(
+                f"{construction_target}: CB scheme has no canonical codebook refs"
+            )
+        family, k = cb_layouts[construction_target]
+        expected_shapes = codebook_subtable_shapes(
+            k, family.mode, family.n_sub
+        )
+        if len(refs) != len(expected_shapes):
+            raise CBEndpointValidationError(
+                f"{construction_target}: CB scheme refs disagree with the "
+                f"canonical {cb_formats[construction_target]} subtable layout"
+            )
+        expected_ref_suffixes = (
+            [
+                f".{cb_formats[construction_target]}.sub{index}"
+                for index in range(len(expected_shapes))
+            ]
+            if len(expected_shapes) > 1
+            else [f".{cb_formats[construction_target]}"]
+        )
+        for ref, raw_shape, suffix in zip(
+            refs, expected_shapes, expected_ref_suffixes, strict=True
+        ):
+            if not ref.startswith("cb_codebook.") or not ref.endswith(suffix):
+                raise CBEndpointValidationError(
+                    f"{construction_target}: codebook ref {ref!r} is not "
+                    f"canonical for {cb_formats[construction_target]}"
+                )
+            shape = list(raw_shape)
+            prior = expected_codebook_contract.setdefault(ref, ("F16", shape))
+            if prior != ("F16", shape):
+                raise CBEndpointValidationError(
+                    f"{ref}: CB schemes disagree on the codebook tensor shape"
+                )
+            referenced_codebooks.add(ref)
+    if set(codebook_header) != referenced_codebooks:
+        raise CBEndpointValidationError(
+            "DSpark .pqcb tensors do not exactly equal config-group refs: missing="
+            f"{sorted(referenced_codebooks - set(codebook_header))[:8]}, extra="
+            f"{sorted(set(codebook_header) - referenced_codebooks)[:8]}"
+        )
+    for name, (dtype, shape) in expected_codebook_contract.items():
+        meta = codebook_header[name]
+        if meta.get("dtype") != dtype or meta.get("shape") != shape:
+            raise CBEndpointValidationError(
+                f"{name}: codebook tensor must be {dtype} {shape}, got "
+                f"{meta.get('dtype')} {meta.get('shape')}"
+            )
+    codebook_payload_bytes = sum(
+        int(meta["data_offsets"][1]) - int(meta["data_offsets"][0])
+        for meta in codebook_header.values()
+    )
+    serialized_payload = provenance.get("serialized_payload")
+    codebook_digests = provenance.get("codebook_sha256")
+    if (
+        not isinstance(serialized_payload, Mapping)
+        or serialized_payload.get("n_tensors") != len(physical)
+        or serialized_payload.get("codebook_sidecar_bytes")
+        != codebook_payload_bytes
+        or not isinstance(serialized_payload.get("sidecars"), list)
+        or not isinstance(codebook_digests, Mapping)
+        or set(codebook_digests) != referenced_codebooks
+        or any(
+            _FINGERPRINT_RE.fullmatch(str(value)) is None
+            for value in codebook_digests.values()
+        )
+    ):
+        raise CBEndpointValidationError(
+            "DSpark CB serialized-payload/codebook provenance is incomplete"
+        )
+    sidecar_refs = {
+        str(ref)
+        for record in serialized_payload["sidecars"]
+        if isinstance(record, Mapping)
+        for ref in (record.get("codebook_ref") or ())
+    }
+    if sidecar_refs != referenced_codebooks:
+        raise CBEndpointValidationError(
+            "DSpark serialized-payload refs differ from config-group refs"
+        )
+    try:
+        import torch
+        from safetensors.torch import load_file as load_safetensors
+
+        codebook_tensors = load_safetensors(
+            str(codebook_path), device="cpu"
+        )
+        observed_codebook_digests = {
+            name: hashlib.sha256(
+                tensor.to(torch.float16).cpu().numpy().tobytes()
+            ).hexdigest()
+            for name, tensor in codebook_tensors.items()
+        }
+    except Exception as exc:
+        raise CBEndpointValidationError(
+            "DSpark .pqcb tensor payloads are unreadable: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+    if observed_codebook_digests != dict(sorted(codebook_digests.items())):
+        mismatched = sorted(
+            name for name in referenced_codebooks
+            if observed_codebook_digests.get(name) != codebook_digests.get(name)
+        )
+        raise CBEndpointValidationError(
+            "DSpark .pqcb logical FP16 tensor payload SHA-256 differs from "
+            f"provenance.codebook_sha256; mismatched={mismatched[:8]}"
+        )
+
+    expected_source_group = source_passthrough_config_group(
+        "FP8_BLOCK_UE8M0_SOURCE"
+    )
+    if len(source_groups) != 1:
+        raise CBEndpointValidationError(
+            "DSpark sidecar must have exactly one source-passthrough group"
+        )
+    observed_source_group = dict(source_groups[0])
+    source_group_targets = observed_source_group.pop("targets", None)
+    expected_source_group_targets = sorted(
+        _explicit_regex(target) for target in expected_source_mapping
+    )
+    if (
+        observed_source_group != expected_source_group
+        or source_group_targets != expected_source_group_targets
+    ):
+        raise CBEndpointValidationError(
+            "DSpark source bases are not the exact block-128 source-FP8 "
+            "W8A16 group"
+        )
+    try:
+        declared_source = parse_source_passthrough_declaration(quant_config)
+    except Exception as exc:
+        raise CBEndpointValidationError(
+            f"DSpark source-passthrough declaration is invalid: {exc}"
+        ) from exc
+    source_wire_id = source_passthrough_wire_id(
+        "FP8_BLOCK_UE8M0_SOURCE"
+    )
+    expected_source_declaration = {
+        construction: source_wire_id
+        for construction in expected_source_mapping.values()
+    }
+    if declared_source != expected_source_declaration:
+        raise CBEndpointValidationError(
+            "DSpark delegated-native declaration must contain exactly the "
+            "four W8A16 main_proj/wo_a construction routes"
+        )
+
+    execution_contracts = quant_config.get("execution_contracts")
+    execution: Mapping[str, Any] | None = None
+    if execution_contracts is not None:
+        if (
+            not isinstance(execution_contracts, Mapping)
+            or set(execution_contracts) != {NVFP4_ACTIVATION_CONTRACT_KEY}
+            or not isinstance(
+                execution_contracts.get(NVFP4_ACTIVATION_CONTRACT_KEY), Mapping
+            )
+        ):
+            raise CBEndpointValidationError(
+                "DSpark sidecar execution_contracts is not the one NVFP4 "
+                "activation contract"
+            )
+        execution = execution_contracts[NVFP4_ACTIVATION_CONTRACT_KEY]
+    bridge_present = "dspark_target_bridge" in quant_config
+    bridge = quant_config.get("dspark_target_bridge")
+    activation_present = execution is not None
+    if (
+        sidecar.get("activation_bridge_present") is not activation_present
+        or bridge_present is not activation_present
+        or (activation_present and not isinstance(bridge, Mapping))
+    ):
+        raise CBEndpointValidationError(
+            "DSpark activation execution contract and target bridge must be "
+            "wholly present or wholly absent"
+        )
+
+    activation_targets: set[str] = set()
+    if execution is not None:
+        target_names = _canonical_string_list(
+            execution.get("target_names"),
+            where="DSpark activation execution targets",
+        )
+        if (
+            execution.get("schema") != NVFP4_ACTIVATION_CONTRACT_SCHEMA
+            or execution.get("contract") != NVFP4_ACTIVATION_EXECUTION
+            or execution.get("group_size") != FP4_GROUP_SIZE
+            or execution.get("tensor_suffix")
+            != NVFP4_INPUT_GLOBAL_SCALE_SUFFIX
+            or execution.get("value_dtype") != "float32"
+            or execution.get("target_count") != len(target_names)
+            or _FINGERPRINT_RE.fullmatch(
+                str(execution.get("target_values_sha256", ""))
+            ) is None
+            or not set(target_names).issubset(physical)
+        ):
+            raise CBEndpointValidationError(
+                "DSpark activation execution contract is malformed or names "
+                "a non-CB physical target"
+            )
+        activation_targets = set(target_names)
+        contracted_construction = sorted(
+            physical_to_construction[target] for target in target_names
+        )
+        try:
+            validate_dspark_target_bridge(
+                bridge,
+                model_config,
+                contracted_cb_construction_targets=contracted_construction,
+                activation_execution_contract=execution,
+            )
+        except Exception as exc:
+            raise CBEndpointValidationError(
+                f"DSpark activation target bridge is invalid: {exc}"
+            ) from exc
+
+    for physical_target, construction_target in physical_to_construction.items():
+        scheme = cb_schemes[construction_target]
+        activation_ref = scheme.get("activation_contract")
+        if physical_target in activation_targets:
+            if (
+                scheme.get("grid") != "fp4"
+                or activation_ref != NVFP4_ACTIVATION_CONTRACT_KEY
+            ):
+                raise CBEndpointValidationError(
+                    f"{construction_target}: activation bridge target has no "
+                    "matching FP4 scheme contract"
+                )
+        elif "activation_contract" in scheme:
+            raise CBEndpointValidationError(
+                f"{construction_target}: scheme claims an activation contract "
+                "without a bridged physical target"
+            )
+
+    try:
+        header = read_artifact_header(root)
+    except Exception as exc:
+        raise CBEndpointValidationError(
+            f"DSpark sidecar safetensors headers are unreadable: {exc}"
+        ) from exc
+    try:
+        expected_source_layout, source_targets = _released_dspark_tensor_layout(
+            hidden_size=int(model_config["hidden_size"]),
+            num_heads=int(model_config["num_attention_heads"]),
+            head_dim=int(model_config["head_dim"]),
+            q_lora_rank=int(model_config["q_lora_rank"]),
+            o_groups=int(model_config["o_groups"]),
+            o_lora_rank=int(model_config["o_lora_rank"]),
+            moe_intermediate_size=int(model_config["moe_intermediate_size"]),
+            num_experts=int(model_config["n_routed_experts"]),
+            vocab_size=int(model_config["vocab_size"]),
+            markov_rank=int(model_config["dspark_markov_rank"]),
+            target_layer_count=len(model_config["dspark_target_layer_ids"]),
+            hc_mult=int(model_config.get("hc_mult", 4)),
+            fp8_block=(128, 128),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise CBEndpointValidationError(
+            f"DSpark sidecar config cannot derive the released tensor layout: {exc}"
+        ) from exc
+    expected_source_bases = set(expected_source_mapping)
+    source_decoder_bases = set(source_targets) - {"mtp.0.main_proj"}
+    source_passthrough_decoder_bases = (
+        expected_source_bases - {"mtp.0.main_proj"}
+    )
+    cb_source_decoder_bases = (
+        source_decoder_bases - source_passthrough_decoder_bases
+    )
+    source_decoder_planes = {
+        base + suffix
+        for base in source_decoder_bases
+        for suffix in (".weight", ".scale")
+    }
+    expected_glue = {
+        name: contract
+        for name, contract in expected_source_layout.items()
+        if name not in source_decoder_planes
+        and not name.startswith("mtp.0.main_proj.")
+    }
+    if len(expected_glue) != DSPARK_CB_RETAINED_GLUE_TENSOR_COUNT:
+        raise CBEndpointValidationError(
+            "internal DSpark released-layout contract no longer has exactly "
+            f"{DSPARK_CB_RETAINED_GLUE_TENSOR_COUNT} retained glue tensors; "
+            f"got {len(expected_glue)}"
+        )
+
+    source_decoder_suffixes = (
+        ".weight",
+        ".scale",
+        ".weight_scale",
+        ".weight_scale_inv",
+    )
+    duplicate_source_planes = sorted(
+        name
+        for name in header
+        for suffix in source_decoder_suffixes
+        if name.endswith(suffix)
+        and name[: -len(suffix)] in cb_source_decoder_bases
+    )
+    if duplicate_source_planes:
+        raise CBEndpointValidationError(
+            "DSpark CB sidecar also carries source planes for CB decoder "
+            "targets: "
+            f"{duplicate_source_planes[:8]}"
+        )
+
+    expected_qweights = {target + ".cb_qweight" for target in physical}
+    expected_companions = {
+        target + ".weight_scale"
+        for target, construction_target in physical_to_construction.items()
+        if cb_schemes[construction_target].get("grid") == "fp8"
+    } | {
+        target + ".input_global_scale" for target in activation_targets
+    }
+    expected_source_names = {
+        name
+        for base in expected_source_bases
+        for name in (base + ".weight", base + ".scale")
+    }
+    missing_source_contracts = sorted(
+        expected_source_names - set(expected_source_layout)
+    )
+    if missing_source_contracts:
+        raise CBEndpointValidationError(
+            "internal released DSpark layout lacks hybrid W8A16 source "
+            f"planes: {missing_source_contracts}"
+        )
+    expected_mtp_names = (
+        set(expected_glue)
+        | expected_qweights
+        | expected_companions
+        | expected_source_names
+    )
+    base_weight_only_names = (
+        set(expected_glue) | expected_qweights | expected_source_names
+    )
+    if len(base_weight_only_names) != DSPARK_CB_HYBRID_WEIGHT_ONLY_TENSOR_COUNT:
+        raise CBEndpointValidationError(
+            "internal DSpark hybrid contract must contain exactly "
+            f"{DSPARK_CB_HYBRID_WEIGHT_ONLY_TENSOR_COUNT} weight-only tensors "
+            "(27 CB qweights + 47 glue + 8 W8A16 source planes), got "
+            f"{len(base_weight_only_names)}"
+        )
+
+    observed_qweights = {
+        name for name in header if name.endswith(".cb_qweight")
+    }
+    if observed_qweights != expected_qweights:
+        raise CBEndpointValidationError(
+            "DSpark physical qweight headers do not exactly match the "
+            "construction config: missing="
+            f"{sorted(expected_qweights - observed_qweights)[:8]}, extra="
+            f"{sorted(observed_qweights - expected_qweights)[:8]}"
+        )
+
+    companion_suffixes = (".weight_scale", ".input_global_scale")
+    observed_companions = {
+        name
+        for name in header
+        if name.endswith(companion_suffixes)
+        and any(name.startswith(target + ".") for target in physical)
+    }
+    if observed_companions != expected_companions:
+        raise CBEndpointValidationError(
+            "DSpark CB companion planes do not match their scheme/activation "
+            "contracts: missing="
+            f"{sorted(expected_companions - observed_companions)[:8]}, extra="
+            f"{sorted(observed_companions - expected_companions)[:8]}"
+        )
+
+    if set(header) != expected_mtp_names:
+        raise CBEndpointValidationError(
+            "DSpark sidecar tensor namespace is not the closed decoder/glue "
+            "layout: missing="
+            f"{sorted(expected_mtp_names - set(header))[:8]}, extra="
+            f"{sorted(set(header) - expected_mtp_names)[:8]}"
+        )
+    for name, contract in expected_glue.items():
+        meta = header[name]
+        if (
+            meta.get("dtype") not in contract.dtypes
+            or meta.get("shape") != list(contract.shape)
+        ):
+            raise CBEndpointValidationError(
+                f"{name}: DSpark glue tensor differs from the released "
+                f"dtype/shape contract {sorted(contract.dtypes)} {contract.shape}"
+            )
+
+    for physical_target, construction_target in physical_to_construction.items():
+        qweight_name = physical_target + ".cb_qweight"
+        qweight_meta = header[qweight_name]
+        qweight_shape = qweight_meta.get("shape")
+        scheme = cb_schemes[construction_target]
+        source_contract = expected_source_layout.get(
+            physical_target + ".weight"
+        )
+        if source_contract is None:
+            if physical_target.endswith(".gate_up_proj"):
+                expert_source = physical_target[: -len("gate_up_proj")] + "0.w1.weight"
+                member = expected_source_layout.get(expert_source)
+                logical_shape = (
+                    int(model_config["n_routed_experts"]),
+                    2 * member.shape[0],
+                    member.shape[1] * 2,
+                ) if member is not None else None
+            elif physical_target.endswith(".down_proj"):
+                expert_source = physical_target[: -len("down_proj")] + "0.w2.weight"
+                member = expected_source_layout.get(expert_source)
+                logical_shape = (
+                    int(model_config["n_routed_experts"]),
+                    member.shape[0],
+                    member.shape[1] * 2,
+                ) if member is not None else None
+            else:
+                logical_shape = None
+        else:
+            logical_shape = source_contract.shape
+        type_size = scheme.get("type_size")
+        superblock = scheme.get("superblock")
+        if (
+            logical_shape is None
+            or not isinstance(type_size, int)
+            or isinstance(type_size, bool)
+            or type_size <= 0
+            or not isinstance(superblock, int)
+            or isinstance(superblock, bool)
+            or superblock <= 0
+            or logical_shape[-1] % superblock
+        ):
+            raise CBEndpointValidationError(
+                f"{construction_target}: scheme cannot derive an exact qweight shape"
+            )
+        expected_qweight_shape = [
+            *logical_shape[:-1],
+            logical_shape[-1] // superblock * type_size,
+        ]
+        if (
+            qweight_meta.get("dtype") != "U8"
+            or qweight_shape != expected_qweight_shape
+        ):
+            raise CBEndpointValidationError(
+                f"{qweight_name}: qweight header must be U8 "
+                f"{expected_qweight_shape}, got {qweight_meta.get('dtype')} "
+                f"{qweight_shape}"
+            )
+    for name in expected_companions:
+        meta = header[name]
+        target = name.rsplit(".", 1)[0]
+        construction_target = physical_to_construction[target]
+        qweight_shape = header[target + ".cb_qweight"]["shape"]
+        expected_shape = (
+            qweight_shape[:-1]
+            if name.endswith(".weight_scale")
+            else [1]
+        )
+        if meta.get("dtype") != "F32" or (
+            meta.get("shape") != expected_shape
+        ):
+            raise CBEndpointValidationError(
+                f"{name}: CB companion must be F32 {expected_shape}, got "
+                f"{meta.get('dtype')} {meta.get('shape')} for "
+                f"{construction_target}"
+            )
+
+    for name in sorted(expected_source_names):
+        contract = expected_source_layout[name]
+        meta = header.get(name)
+        if (
+            not isinstance(meta, Mapping)
+            or meta.get("dtype") not in contract.dtypes
+            or meta.get("shape") != list(contract.shape)
+        ):
+            raise CBEndpointValidationError(
+                f"{name}: hybrid W8A16 source plane differs from the released "
+                f"dtype/shape contract {sorted(contract.dtypes)} "
+                f"{contract.shape}"
+            )
+
+    structural_names = sorted(
+        set(expected_glue)
+        | expected_qweights
+        | expected_companions
+        | expected_source_names
+    )
+    header_contract = {
+        name: {
+            "dtype": header[name].get("dtype"),
+            "shape": header[name].get("shape"),
+        }
+        for name in structural_names
+    }
+    return {
+        "provenance": dict(sidecar),
+        "physical_to_construction": dict(sorted(physical_to_construction.items())),
+        "header_contract": header_contract,
+        "source_passthrough": dict(expected_source_declaration),
+        "activation_execution_contract": (
+            dict(execution) if execution is not None else None
+        ),
+        "dspark_target_bridge": dict(bridge) if isinstance(bridge, Mapping) else None,
+    }
+
+
 def validate_cb_artifact_decode_contract(
     model_dir: str | Path,
     quant_config: Mapping[str, Any] | None = None,
+    *,
+    runtime_pin: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Prove header completeness and the released three-stage DSpark overlay."""
+    """Prove complete source-overlay or quantized-sidecar decode coverage.
+
+    ``runtime_pin`` is optional so a producer can validate artifact structure
+    before a Gridbook release is cut.  Endpoint/release callers pass the live
+    pin and therefore cannot serve a sidecar until the namespace-bridge ABI is
+    present in that exact release.
+    """
     root = Path(model_dir)
     if quant_config is None:
         quant_config = validate_cb_artifact(root)
-    try:
-        from .artifact_completeness import assert_artifact_complete
-        from .dspark_source_metadata import (
-            discover_dspark_source_overlay_from_artifact,
+    provenance = quant_config.get("provenance")
+    if not isinstance(provenance, Mapping):
+        raise CBEndpointValidationError(
+            "CB artifact has no provenance object"
+        )
+    recorded_overlay = provenance.get("dspark_source_overlay")
+    recorded_sidecar = provenance.get("dspark_cb_sidecar")
+    if (recorded_overlay is None) == (recorded_sidecar is None):
+        raise CBEndpointValidationError(
+            "artifact provenance must contain exactly one of "
+            "dspark_source_overlay or dspark_cb_sidecar"
         )
 
-        completeness = assert_artifact_complete(root)
-        overlay = discover_dspark_source_overlay_from_artifact(root)
+    sidecar_mode = recorded_sidecar is not None
+    try:
+        from .artifact_completeness import assert_artifact_complete
+
+        completeness = assert_artifact_complete(
+            root,
+            **({"verbatim_prefixes": ()} if sidecar_mode else {}),
+        )
     except Exception as exc:
         raise CBEndpointValidationError(
             f"artifact decode coverage is incomplete: {type(exc).__name__}: {exc}"
         ) from exc
-    if overlay is None:
-        raise CBEndpointValidationError(
-            "artifact is not the released DSv4Flash three-stage DSpark topology"
-        )
-
-    overlay_provenance = overlay.provenance()
-    recorded_overlay = (
-        (quant_config.get("provenance") or {}).get("dspark_source_overlay")
-        if isinstance(quant_config.get("provenance"), Mapping)
-        else None
-    )
-    if recorded_overlay != overlay_provenance:
-        raise CBEndpointValidationError(
-            "artifact DSpark overlay provenance does not match its tensor headers"
-        )
 
     completeness_payload = asdict(completeness)
     classified = (
@@ -862,16 +2129,7 @@ def validate_cb_artifact_decode_contract(
         + len(completeness.passthrough_units)
         + len(completeness.verbatim_namespace_units)
     )
-    overlay_payload = {
-        "provenance": overlay_provenance,
-        "physical_targets": dict(overlay.physical_targets),
-        "construction_units": dict(overlay.construction_units),
-        "physical_to_construction_unit": dict(
-            overlay.physical_to_construction_unit
-        ),
-    }
-    evidence: dict[str, Any] = {
-        "schema": ARTIFACT_DECODE_CONTRACT_SCHEMA,
+    common_evidence: dict[str, Any] = {
         "complete": completeness.ok,
         "completeness_sha256": _canonical_json_sha256(completeness_payload),
         "declared_unit_count": len(completeness.declared_units),
@@ -888,14 +2146,93 @@ def validate_cb_artifact_decode_contract(
         "excluded_namespaces": sorted(
             str(value) for value in completeness.excluded_namespaces
         ),
-        "dspark_overlay": overlay_provenance,
-        "dspark_overlay_sha256": _canonical_json_sha256(overlay_payload),
         "requires_moe_backend_marlin": artifact_requires_moe_backend_marlin(
             quant_config
         ),
     }
+
+    if sidecar_mode:
+        try:
+            model_config = json.loads(
+                (root / "config.json").read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError) as exc:
+            raise CBEndpointValidationError(
+                f"DSpark sidecar model config is unreadable: {exc}"
+            ) from exc
+        if not isinstance(model_config, Mapping):
+            raise CBEndpointValidationError(
+                "DSpark sidecar model config is not an object"
+            )
+        sidecar_payload = _validate_dspark_cb_sidecar_artifact(
+            root,
+            model_config=model_config,
+            quant_config=quant_config,
+        )
+        evidence = {
+            "schema": ARTIFACT_DECODE_CONTRACT_SCHEMA_V2,
+            "mode": DSPARK_CB_SIDECAR_MODE,
+            **common_evidence,
+            "dspark_cb_sidecar": dict(recorded_sidecar),
+            "dspark_cb_sidecar_sha256": _canonical_json_sha256(
+                sidecar_payload
+            ),
+            "activation_bridge_present": bool(
+                recorded_sidecar.get("activation_bridge_present")
+            ),
+            "required_runtime_features": {
+                DSPARK_CB_RUNTIME_FEATURE: DSPARK_CB_RUNTIME_FEATURE_VERSION,
+                DSPARK_CB_SOURCE_FP8_RUNTIME_FEATURE:
+                    DSPARK_CB_SOURCE_FP8_RUNTIME_FEATURE_VERSION,
+            },
+            "required_runtime_contract_schema": (
+                DSPARK_CB_RUNTIME_CONTRACT_SCHEMA
+            ),
+        }
+        evidence["evidence_sha256"] = _canonical_json_sha256(evidence)
+        _validate_artifact_decode_record(evidence)
+        if runtime_pin is not None:
+            _require_artifact_decode_runtime_features(evidence, runtime_pin)
+        return evidence
+
+    try:
+        from .dspark_source_metadata import (
+            discover_dspark_source_overlay_from_artifact,
+        )
+
+        overlay = discover_dspark_source_overlay_from_artifact(root)
+    except Exception as exc:
+        raise CBEndpointValidationError(
+            "artifact DSpark overlay headers are invalid: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+    if overlay is None:
+        raise CBEndpointValidationError(
+            "artifact is not the released DSv4Flash three-stage DSpark topology"
+        )
+    overlay_provenance = overlay.provenance()
+    if recorded_overlay != overlay_provenance:
+        raise CBEndpointValidationError(
+            "artifact DSpark overlay provenance does not match its tensor headers"
+        )
+    overlay_payload = {
+        "provenance": overlay_provenance,
+        "physical_targets": dict(overlay.physical_targets),
+        "construction_units": dict(overlay.construction_units),
+        "physical_to_construction_unit": dict(
+            overlay.physical_to_construction_unit
+        ),
+    }
+    evidence: dict[str, Any] = {
+        "schema": ARTIFACT_DECODE_CONTRACT_SCHEMA,
+        **common_evidence,
+        "dspark_overlay": overlay_provenance,
+        "dspark_overlay_sha256": _canonical_json_sha256(overlay_payload),
+    }
     evidence["evidence_sha256"] = _canonical_json_sha256(evidence)
     _validate_artifact_decode_record(evidence)
+    if runtime_pin is not None:
+        _require_artifact_decode_runtime_features(evidence, runtime_pin)
     return evidence
 
 
@@ -916,7 +2253,248 @@ def _require_sha256(value: object, *, where: str) -> str:
     return value
 
 
+def _validate_dspark_cb_sidecar_decode_record(
+    payload: Mapping[str, Any],
+) -> None:
+    expected_keys = {
+        "schema",
+        "mode",
+        "complete",
+        "completeness_sha256",
+        "declared_unit_count",
+        "cb_unit_count",
+        "passthrough_unit_count",
+        "verbatim_namespace_unit_count",
+        "classified_unit_count",
+        "route_pending_acknowledged",
+        "excluded_namespaces",
+        "dspark_cb_sidecar",
+        "dspark_cb_sidecar_sha256",
+        "activation_bridge_present",
+        "required_runtime_features",
+        "required_runtime_contract_schema",
+        "requires_moe_backend_marlin",
+        "evidence_sha256",
+    }
+    _require_exact_keys(
+        payload, expected_keys, where="DSpark CB sidecar decode contract"
+    )
+    if (
+        payload.get("schema") != ARTIFACT_DECODE_CONTRACT_SCHEMA_V2
+        or payload.get("mode") != DSPARK_CB_SIDECAR_MODE
+        or payload.get("complete") is not True
+    ):
+        raise CBEndpointValidationError(
+            "DSpark CB sidecar decode contract does not attest complete coverage"
+        )
+    for key in (
+        "declared_unit_count",
+        "cb_unit_count",
+        "passthrough_unit_count",
+        "verbatim_namespace_unit_count",
+        "classified_unit_count",
+    ):
+        value = payload.get(key)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise CBEndpointValidationError(
+                f"DSpark CB sidecar decode contract {key} is not a "
+                "non-negative integer"
+            )
+    if (
+        payload.get("declared_unit_count", 0) <= 0
+        or payload.get("classified_unit_count", 0) <= 0
+        or payload.get("verbatim_namespace_unit_count") != 0
+        or payload.get("classified_unit_count")
+        != sum(
+            int(payload[key])
+            for key in (
+                "cb_unit_count",
+                "passthrough_unit_count",
+                "verbatim_namespace_unit_count",
+            )
+        )
+    ):
+        raise CBEndpointValidationError(
+            "DSpark CB sidecar decode accounting is incomplete or admits a "
+            "verbatim draft namespace"
+        )
+    for key, where in (
+        ("route_pending_acknowledged", "route-pending acknowledgements"),
+        ("excluded_namespaces", "excluded namespaces"),
+    ):
+        value = payload.get(key)
+        if (
+            not isinstance(value, list)
+            or value != sorted(set(str(item) for item in value))
+        ):
+            raise CBEndpointValidationError(
+                f"DSpark CB sidecar {where} are not canonical"
+            )
+    if payload.get("excluded_namespaces") != []:
+        raise CBEndpointValidationError(
+            "DSpark CB sidecar cannot exclude a namespace from decode coverage"
+        )
+    if not isinstance(payload.get("requires_moe_backend_marlin"), bool):
+        raise CBEndpointValidationError(
+            "DSpark CB sidecar has no boolean marlin-route decision"
+        )
+    _require_sha256(
+        payload.get("completeness_sha256"), where="completeness digest"
+    )
+    _require_sha256(
+        payload.get("dspark_cb_sidecar_sha256"),
+        where="DSpark CB sidecar digest",
+    )
+
+    sidecar = payload.get("dspark_cb_sidecar")
+    if not isinstance(sidecar, Mapping):
+        raise CBEndpointValidationError(
+            "DSpark CB sidecar decode contract has no provenance"
+        )
+    sidecar_keys = {
+        "schema",
+        "num_hidden_layers",
+        "n_mtp_layers",
+        "physical_namespace",
+        "construction_namespace",
+        "physical_cb_targets",
+        "construction_cb_targets",
+        "source_passthrough_targets",
+        "source_passthrough_physical_to_construction",
+        "activation_bridge_present",
+    }
+    _require_exact_keys(
+        sidecar, sidecar_keys, where="DSpark CB sidecar provenance"
+    )
+    num_hidden_layers = sidecar.get("num_hidden_layers")
+    n_mtp_layers = sidecar.get("n_mtp_layers")
+    expected_source_mapping = (
+        _expected_dspark_source_passthrough_mapping(
+            num_hidden_layers=num_hidden_layers,
+            n_mtp_layers=3,
+        )
+        if isinstance(num_hidden_layers, int)
+        and not isinstance(num_hidden_layers, bool)
+        and num_hidden_layers > 0
+        else None
+    )
+    if (
+        sidecar.get("schema") != DSPARK_CB_SIDECAR_SCHEMA
+        or not isinstance(num_hidden_layers, int)
+        or isinstance(num_hidden_layers, bool)
+        or num_hidden_layers <= 0
+        or n_mtp_layers != 3
+        or sidecar.get("physical_namespace") != "mtp.{stage}"
+        or sidecar.get("construction_namespace")
+        != "model.layers.{num_hidden_layers+stage}"
+        or sidecar.get("source_passthrough_targets")
+        != sorted(expected_source_mapping or {})
+        or sidecar.get("source_passthrough_physical_to_construction")
+        != expected_source_mapping
+        or not isinstance(sidecar.get("activation_bridge_present"), bool)
+        or sidecar.get("activation_bridge_present")
+        is not payload.get("activation_bridge_present")
+    ):
+        raise CBEndpointValidationError(
+            "DSpark CB sidecar receipt carries invalid topology or bridge state"
+        )
+    physical = _canonical_string_list(
+        sidecar.get("physical_cb_targets"),
+        where="DSpark receipt physical CB targets",
+    )
+    expected_physical = _expected_dspark_cb_physical_targets(
+        n_mtp_layers=3
+    )
+    construction = _canonical_string_list(
+        sidecar.get("construction_cb_targets"),
+        where="DSpark receipt construction CB targets",
+    )
+    expected_construction = sorted(
+        "model.layers."
+        f"{num_hidden_layers + int(target.split('.')[1])}."
+        + ".".join(target.split(".")[2:])
+        for target in expected_physical
+    )
+    if physical != expected_physical or construction != expected_construction:
+        raise CBEndpointValidationError(
+            "DSpark CB sidecar receipt target sets are not the exact "
+            "three-stage mapping"
+        )
+    if payload.get("required_runtime_features") != {
+        DSPARK_CB_RUNTIME_FEATURE: DSPARK_CB_RUNTIME_FEATURE_VERSION,
+        DSPARK_CB_SOURCE_FP8_RUNTIME_FEATURE:
+            DSPARK_CB_SOURCE_FP8_RUNTIME_FEATURE_VERSION,
+    }:
+        raise CBEndpointValidationError(
+            "DSpark CB sidecar receipt does not pin its Gridbook namespace "
+            "and source-FP8 W8A16 ABIs"
+        )
+    if (
+        payload.get("required_runtime_contract_schema")
+        != DSPARK_CB_RUNTIME_CONTRACT_SCHEMA
+    ):
+        raise CBEndpointValidationError(
+            "DSpark CB sidecar receipt does not require the Gridbook "
+            "runtime-contract v4 schema"
+        )
+
+    recorded_evidence_sha = _require_sha256(
+        payload.get("evidence_sha256"), where="artifact evidence digest"
+    )
+    unstamped = dict(payload)
+    unstamped.pop("evidence_sha256")
+    if recorded_evidence_sha != _canonical_json_sha256(unstamped):
+        raise CBEndpointValidationError(
+            "DSpark CB sidecar decode evidence digest is stale"
+        )
+
+
+def _require_artifact_decode_runtime_features(
+    artifact_decode: Mapping[str, Any],
+    runtime_pin: Mapping[str, Any],
+) -> None:
+    """Require every decode-receipt ABI from the exact serving release."""
+    required = artifact_decode.get("required_runtime_features")
+    if required is None:
+        return
+    if not isinstance(required, Mapping):
+        raise CBEndpointValidationError(
+            "artifact decode runtime feature requirements are malformed"
+        )
+    required_schema = artifact_decode.get(
+        "required_runtime_contract_schema"
+    )
+    if (
+        required_schema != DSPARK_CB_RUNTIME_CONTRACT_SCHEMA
+        or runtime_pin.get("runtime_contract_schema") != required_schema
+    ):
+        raise CBEndpointValidationError(
+            "Gridbook runtime pin does not implement the DSpark sidecar "
+            "runtime-contract schema: required="
+            f"{required_schema!r}, observed="
+            f"{runtime_pin.get('runtime_contract_schema')!r}"
+        )
+    observed = runtime_pin.get("required_abi_features")
+    if not isinstance(observed, Mapping):
+        raise CBEndpointValidationError(
+            "Gridbook runtime pin has no ABI feature map"
+        )
+    mismatches = {
+        str(name): {"required": version, "observed": observed.get(name)}
+        for name, version in required.items()
+        if observed.get(name) != version
+    }
+    if mismatches:
+        raise CBEndpointValidationError(
+            "Gridbook runtime pin does not implement the DSpark sidecar "
+            f"decode ABI: {mismatches}"
+        )
+
+
 def _validate_artifact_decode_record(payload: Mapping[str, Any]) -> None:
+    if payload.get("schema") == ARTIFACT_DECODE_CONTRACT_SCHEMA_V2:
+        _validate_dspark_cb_sidecar_decode_record(payload)
+        return
     expected_keys = {
         "schema",
         "complete",
@@ -1301,6 +2879,8 @@ def build_endpoint_contract(
 ) -> dict[str, Any]:
     """Build the path-independent receipt the shipcard verifier can replay."""
     _validate_artifact_decode_record(artifact_decode)
+    pin = _gridbook_runtime_pin()
+    _require_artifact_decode_runtime_features(artifact_decode, pin)
     served_model = _require_session_model_name(manifest.get("served_model_name"))
     launch = _canonical_launch_contract(
         manifest.get("launch_argv") or (),
@@ -1310,7 +2890,6 @@ def build_endpoint_contract(
             artifact_decode.get("requires_moe_backend_marlin")
         ),
     )
-    pin = _gridbook_runtime_pin()
     environment = manifest.get("pq_env")
     extensions = manifest.get("resident_extensions")
     if (
@@ -1459,6 +3038,7 @@ def validate_endpoint_contract_record(
     if not isinstance(stack, Mapping):
         raise CBEndpointValidationError("endpoint contract has no serving stack")
     pin = _gridbook_runtime_pin()
+    _require_artifact_decode_runtime_features(artifact_decode, pin)
     expected_stack = {
         "image": DSV4_SPARK_VLLM_IMAGE,
         "gpu_name": DSV4_SPARK_GPU_NAME,
@@ -1907,7 +3487,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         quant_config = validate_cb_artifact(model_dir)
         artifact_decode = validate_cb_artifact_decode_contract(
-            model_dir, quant_config
+            model_dir, quant_config, runtime_pin=_gridbook_runtime_pin()
         )
         model_sha = compute_model_sha(model_dir)
         card = load_shipcard(args.shipcard)

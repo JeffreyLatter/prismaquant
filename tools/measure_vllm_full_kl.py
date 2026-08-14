@@ -99,10 +99,15 @@ def _provenance(args) -> dict:
         ).encode("utf-8")).hexdigest()
         if _DSV4_GRIDBOOK_CONTRACT is not None else None
     )
-    from prismaquant.gridbook_runtime_pin import load_gridbook_runtime_pin
+    from prismaquant.gridbook_serving_runtime_pin import (
+        load_gridbook_serving_runtime_pin,
+        require_exact_gridbook_serving_runtime_release,
+    )
     from prismaquant.validate_cb_endpoint import DSV4_SPARK_VLLM_IMAGE
 
-    pin = load_gridbook_runtime_pin()
+    pin = load_gridbook_serving_runtime_pin()
+    if args.dsv4_gridbook_contract:
+        require_exact_gridbook_serving_runtime_release(pin)
     producer = gold_producer_identity("measure_vllm_full_kl")
     manifest = self_manifest(
         extra={
@@ -118,6 +123,7 @@ def _provenance(args) -> dict:
             "repository": pin.repository,
             "commit": pin.commit,
             "version": pin.version,
+            "wheel_sha256": pin.wheel_sha256,
         } if args.dsv4_gridbook_contract else None,
     )
     return {

@@ -10,7 +10,12 @@ import sys
 import pytest
 
 import prismaquant.validate_cb_performance as performance_validator
-from prismaquant.gridbook_runtime_pin import load_gridbook_runtime_pin
+from prismaquant.gridbook_runtime_pin import (
+    load_gridbook_runtime_pin as load_producer_gridbook_runtime_pin,
+)
+from prismaquant.gridbook_serving_runtime_pin import (
+    parse_gridbook_serving_runtime_pin,
+)
 from prismaquant.gridbook_environment import (
     CANONICAL_GOLD_ENVIRONMENT,
     CANONICAL_GOLD_SET_ENVIRONMENT,
@@ -78,6 +83,26 @@ _ALLOWED_DIFFERENCES = [
     "server.served_model_name",
 ]
 
+_SERVING_PIN = parse_gridbook_serving_runtime_pin({
+    "schema": "prismaquant.gridbook_serving_runtime_pin.v1",
+    "repository": "https://github.com/RobTand/gridbook.git",
+    "commit": "a" * 40,
+    "version": "0.8.6",
+    "version_is_release": True,
+    "wheel_sha256": "b" * 64,
+    "runtime_contract_schema": "gridbook.runtime-contract.v4",
+    "required_abi_features": {
+        "routed_moe_per_role_codebook_lut": 1,
+        "source_fp8_block128_w8a16": 1,
+        "dspark_construction_physical_bridge": 1,
+    },
+})
+
+
+def load_gridbook_runtime_pin():
+    """Test helper name retained for the performance-fixture call sites."""
+    return _SERVING_PIN
+
 
 @pytest.fixture(autouse=True)
 def _released_gridbook_pin(monkeypatch):
@@ -87,18 +112,24 @@ def _released_gridbook_pin(monkeypatch):
     import prismaquant.shipcard as shipcard_module
     import prismaquant.validate_cb_endpoint as endpoint_validator
 
-    released = load_gridbook_runtime_pin()
+    released = _SERVING_PIN
+    producer = load_producer_gridbook_runtime_pin()
     monkeypatch.setattr(
         sys.modules[__name__], "load_gridbook_runtime_pin", lambda: released
     )
     monkeypatch.setattr(
-        performance_validator, "load_gridbook_runtime_pin", lambda: released
+        performance_validator, "load_gridbook_serving_runtime_pin", lambda: released
     )
     monkeypatch.setattr(
-        native_feasibility, "load_gridbook_runtime_pin", lambda: released
+        performance_validator,
+        "require_exact_gridbook_serving_runtime_release",
+        lambda _pin: None,
     )
     monkeypatch.setattr(
-        shipcard_module, "load_gridbook_runtime_pin", lambda: released
+        native_feasibility, "load_gridbook_runtime_pin", lambda: producer
+    )
+    monkeypatch.setattr(
+        shipcard_module, "_released_gridbook_runtime_pin", lambda: released
     )
     monkeypatch.setattr(endpoint_validator, "_gridbook_runtime_pin", lambda: {
         "schema": released.schema,
@@ -106,6 +137,7 @@ def _released_gridbook_pin(monkeypatch):
         "commit": released.commit,
         "version": released.version,
         "version_is_release": released.version_is_release,
+        "wheel_sha256": released.wheel_sha256,
         "runtime_contract_schema": released.runtime_contract_schema,
         "required_abi_features": dict(released.required_abi_features),
     })
@@ -114,6 +146,11 @@ def _released_gridbook_pin(monkeypatch):
     )
     monkeypatch.setitem(
         _SERVER_ENVIRONMENT, "PQ_GRIDBOOK_RUNTIME_VERSION", released.version
+    )
+    monkeypatch.setitem(
+        _SERVER_ENVIRONMENT,
+        "PQ_GRIDBOOK_RUNTIME_WHEEL_SHA256",
+        released.wheel_sha256,
     )
 
 
@@ -128,12 +165,22 @@ def test_performance_gate_rejects_alternate_resolved_gridbook_commit(
 ):
     alternate = replace(
         load_gridbook_runtime_pin(),
-        commit="a" * 40,
+        commit="c" * 40,
     )
     monkeypatch.setattr(
         performance_validator,
-        "load_gridbook_runtime_pin",
+        "load_gridbook_serving_runtime_pin",
         lambda: alternate,
+    )
+    from prismaquant.gridbook_serving_runtime_pin import (
+        GridbookServingRuntimePinError,
+    )
+    monkeypatch.setattr(
+        performance_validator,
+        "require_exact_gridbook_serving_runtime_release",
+        lambda _pin: (_ for _ in ()).throw(
+            GridbookServingRuntimePinError("differs from reviewed release")
+        ),
     )
 
     with pytest.raises(
@@ -186,11 +233,13 @@ def _gridbook_distribution() -> dict:
         "repository": pin.repository,
         "version": pin.version,
         "direct_url": {
-            "url": f"file:///tmp/gridbook-runtime-{pin.commit[:12]}",
-            "vcs_info": {
-                "vcs": "git",
-                "requested_revision": pin.commit,
-                "commit_id": pin.commit,
+            "url": (
+                f"file:///opt/gridbook-install/gridbook-{pin.version}"
+                "-py3-none-any.whl"
+            ),
+            "archive_info": {
+                "hash": f"sha256={pin.wheel_sha256}",
+                "hashes": {"sha256": pin.wheel_sha256},
             },
         },
         "direct_url_path": f"gridbook-{pin.version}.dist-info/direct_url.json",
@@ -517,7 +566,11 @@ def _serve_manifest_attachment(
             "gridbook": pin.version,
             "vllm": DSV4_SPARK_VLLM_VERSION,
         },
-        "gridbook_runtime_pin": {"commit": pin.commit, "version": pin.version},
+        "gridbook_runtime_pin": {
+            "commit": pin.commit,
+            "version": pin.version,
+            "wheel_sha256": pin.wheel_sha256,
+        },
         "gridbook_distribution": _gridbook_distribution(),
         "resident_extensions": ["prismaquant_cb_v2_ext.test.so"],
         "residency_readable": True,

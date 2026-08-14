@@ -30,11 +30,11 @@ from .gridbook_environment import (
     CANONICAL_GOLD_ENVIRONMENT,
     GRIDBOOK_ENVIRONMENT_SCHEMA,
 )
-from .gridbook_runtime_pin import (
-    GridbookRuntimePin,
-    GridbookRuntimePinError,
-    load_gridbook_runtime_pin,
-    require_exact_gridbook_runtime_release,
+from .gridbook_serving_runtime_pin import (
+    GridbookServingRuntimePin,
+    GridbookServingRuntimePinError,
+    load_gridbook_serving_runtime_pin,
+    require_exact_gridbook_serving_runtime_release,
 )
 from .native_baseline_feasibility import (
     SCHEMA as NATIVE_BASELINE_FEASIBILITY_SCHEMA,
@@ -149,13 +149,13 @@ class CBPerformanceValidationError(RuntimeError):
     """The paired performance evidence is incomplete or failed parity."""
 
 
-def _exact_gridbook_runtime_pin() -> GridbookRuntimePin:
+def _exact_gridbook_runtime_pin() -> GridbookServingRuntimePin:
     """Load the one reviewed Gridbook release accepted by this validator."""
 
-    pin = load_gridbook_runtime_pin()
+    pin = load_gridbook_serving_runtime_pin()
     try:
-        require_exact_gridbook_runtime_release(pin)
-    except GridbookRuntimePinError as exc:
+        require_exact_gridbook_serving_runtime_release(pin)
+    except GridbookServingRuntimePinError as exc:
         raise CBPerformanceValidationError(
             f"performance gate requires the exact Gridbook release: {exc}"
         ) from exc
@@ -793,7 +793,8 @@ def _validate_execution_routes(
 
 
 def _validate_report(
-    report: Mapping[str, Any], *, label: str, pin_commit: str, pin_version: str
+    report: Mapping[str, Any], *, label: str, pin_commit: str,
+    pin_version: str, pin_wheel_sha256: str
 ) -> None:
     expected = {
         "schema": REPORT_SCHEMA,
@@ -936,6 +937,7 @@ def _validate_report(
         **_REQUIRED_SERVER_ENVIRONMENT,
         "PQ_GRIDBOOK_RUNTIME_COMMIT": pin_commit,
         "PQ_GRIDBOOK_RUNTIME_VERSION": pin_version,
+        "PQ_GRIDBOOK_RUNTIME_WHEEL_SHA256": pin_wheel_sha256,
     }
     if (
         not isinstance(environment_values, Mapping)
@@ -1255,6 +1257,7 @@ def _load_performance_serve_manifests(
     pin_repository: str,
     pin_commit: str,
     pin_version: str,
+    pin_wheel_sha256: str,
     label: str,
 ) -> dict[str, Any]:
     """Replay the digest-bound live-server identity attached to one report.
@@ -1455,6 +1458,7 @@ def _load_performance_serve_manifests(
     if _manifest_gridbook_runtime_pin(manifest, {
         "commit": pin_commit,
         "version": pin_version,
+        "wheel_sha256": pin_wheel_sha256,
     }) is None:
         raise CBPerformanceValidationError(f"{label} live server uses the wrong Gridbook pin")
     distribution_problems = _verify_gridbook_distribution_identity(
@@ -1464,6 +1468,7 @@ def _load_performance_serve_manifests(
             "repository": pin_repository,
             "commit": pin_commit,
             "version": pin_version,
+            "wheel_sha256": pin_wheel_sha256,
         },
         canonical_sha=_canonical_json_sha256,
     )
@@ -1509,6 +1514,7 @@ def _load_performance_serve_manifests(
         **_REQUIRED_SERVER_ENVIRONMENT,
         "PQ_GRIDBOOK_RUNTIME_COMMIT": pin_commit,
         "PQ_GRIDBOOK_RUNTIME_VERSION": pin_version,
+        "PQ_GRIDBOOK_RUNTIME_WHEEL_SHA256": pin_wheel_sha256,
     }
     if (
         not isinstance(declared_environment, Mapping)
@@ -2726,12 +2732,14 @@ def validate_cb_performance(
             label=f"cell {cell_id} candidate report",
             pin_commit=pin.commit,
             pin_version=pin.version,
+            pin_wheel_sha256=pin.wheel_sha256,
         )
         _validate_report(
             baseline_report,
             label=f"cell {cell_id} baseline report",
             pin_commit=pin.commit,
             pin_version=pin.version,
+            pin_wheel_sha256=pin.wheel_sha256,
         )
         _validate_execution_routes(
             candidate_report,
@@ -2771,6 +2779,7 @@ def validate_cb_performance(
             pin_repository=pin.repository,
             pin_commit=pin.commit,
             pin_version=pin.version,
+            pin_wheel_sha256=pin.wheel_sha256,
             label=f"cell {cell_id} candidate",
         )
         baseline_identity = baselines[str(phase)]
@@ -2792,6 +2801,7 @@ def validate_cb_performance(
             pin_repository=pin.repository,
             pin_commit=pin.commit,
             pin_version=pin.version,
+            pin_wheel_sha256=pin.wheel_sha256,
             label=f"cell {cell_id} baseline",
         )
         if {

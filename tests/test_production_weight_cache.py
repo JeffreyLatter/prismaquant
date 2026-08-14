@@ -378,6 +378,97 @@ def test_cb_render_identity_projection_recomputes_assignment_scope_hashes():
     )
 
 
+def test_cb_render_source_collector_hashes_each_source_exactly_once(monkeypatch):
+    import prismaquant.production_weight_cache as pwc
+    from prismaquant.nvfp4_cb_footprint import CBSerializationContext
+
+    fmt = "NVFP4_CB_K16"
+    col_weights = {
+        "a": torch.arange(256, dtype=torch.float32),
+        "b": torch.arange(256, dtype=torch.float32) + 1,
+    }
+    source = {
+        "a": torch.randn(2, 256),
+        "b": torch.randn(3, 256),
+    }
+    seed = pwc.build_production_cache_cb_render_identity(
+        {"a": [fmt], "b": [fmt]},
+        cb_serialization_context=CBSerializationContext.production(),
+        col_weights=col_weights,
+        render_levers={"weighted_vq": True},
+        render_mechanism_plan=[],
+    )
+    expected = pwc.bind_cb_render_identity_source_weights(seed, source)
+    calls: list[int] = []
+    real_identity = pwc._source_weight_value_identity
+
+    def counted(weight):
+        calls.append(id(weight))
+        return real_identity(weight)
+
+    monkeypatch.setattr(pwc, "_source_weight_value_identity", counted)
+    collector = pwc.CBRenderSourceIdentityCollector(seed, where="test collector")
+    collector.observe("a", source["a"])
+    collector.observe("b", source["b"])
+    completed = collector.finalize()
+
+    assert calls == [id(source["a"]), id(source["b"])]
+    assert completed == expected
+    assert seed["source_weights_complete"] is False
+    assert seed["source_weights_content_sha256"] == {}
+    with pytest.raises(ValueError, match="already finalized"):
+        collector.finalize()
+    with pytest.raises(ValueError, match="already finalized"):
+        collector.observe("a", source["a"])
+
+
+def test_cb_render_source_collector_refuses_duplicate_or_mutated_source():
+    import prismaquant.production_weight_cache as pwc
+    from prismaquant.nvfp4_cb_footprint import CBSerializationContext
+
+    col_weights = {"a": torch.arange(256, dtype=torch.float32)}
+    seed = pwc.build_production_cache_cb_render_identity(
+        {"a": ["NVFP4_CB_K16"]},
+        cb_serialization_context=CBSerializationContext.production(),
+        col_weights=col_weights,
+        render_levers={"weighted_vq": True},
+        render_mechanism_plan=[],
+    )
+    weight = torch.randn(2, 256)
+    collector = pwc.CBRenderSourceIdentityCollector(seed, where="test collector")
+    collector.observe("a", weight)
+    with pytest.raises(ValueError, match="observed more than once"):
+        collector.observe("a", weight.clone())
+
+    mutated = pwc.CBRenderSourceIdentityCollector(seed, where="test collector")
+    mutated.observe("a", weight)
+    weight.add_(1)
+    with pytest.raises(ValueError, match="source weight changed"):
+        mutated.observe("a", weight)
+
+
+def test_cb_render_source_collector_finalize_fails_closed_on_partial_scope():
+    import prismaquant.production_weight_cache as pwc
+    from prismaquant.nvfp4_cb_footprint import CBSerializationContext
+
+    col_weights = {
+        "a": torch.arange(256, dtype=torch.float32),
+        "b": torch.arange(256, dtype=torch.float32) + 1,
+    }
+    seed = pwc.build_production_cache_cb_render_identity(
+        {"a": ["NVFP4_CB_K16"], "b": ["NVFP4_CB_K16"]},
+        cb_serialization_context=CBSerializationContext.production(),
+        col_weights=col_weights,
+        render_levers={"weighted_vq": True},
+        render_mechanism_plan=[],
+    )
+    collector = pwc.CBRenderSourceIdentityCollector(seed, where="test collector")
+    collector.observe("a", torch.randn(2, 256))
+    with pytest.raises(ValueError, match=r"coverage differs: missing=\['b'\]"):
+        collector.finalize()
+    assert collector.observed_qnames == frozenset({"a"})
+
+
 def test_dense_cb_resume_rejects_preexisting_shard(tmp_path, monkeypatch):
     import prismaquant.production_weight_cache as pwc
     from prismaquant.nvfp4_cb_footprint import CBSerializationContext

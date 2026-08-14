@@ -8,11 +8,18 @@ from pathlib import Path
 import re
 import subprocess
 
+from prismaquant.gridbook_serving_runtime_pin import (
+    GRIDBOOK_SERVING_RUNTIME_COMMIT_PENDING,
+    GRIDBOOK_SERVING_RUNTIME_WHEEL_SHA256_PENDING,
+)
+
 
 REPO = Path(__file__).resolve().parents[1]
 ASSET_DIR = REPO / "prismaquant" / "gridbook_runtime"
 HELPER = ASSET_DIR / "gridbook_runtime.sh"
 PIN = ASSET_DIR / "gridbook_runtime_pin.json"
+SERVING_HELPER = ASSET_DIR / "gridbook_serving_runtime.sh"
+SERVING_PIN = ASSET_DIR / "gridbook_serving_runtime_pin.json"
 LIVE_SCRIPTS = (
     "canary_ladder.sh",
     "serve_dsv4_cb_validate.sh",
@@ -34,13 +41,13 @@ def _bash(script: str, *args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def test_gridbook_pin_has_one_exact_released_runtime_identity():
+def test_gridbook_pins_separate_immutable_producer_from_current_serving():
     pins = [
         path
         for root in (REPO / "prismaquant", REPO / "scripts")
         for path in root.rglob("*gridbook*pin*.json")
     ]
-    assert pins == [PIN]
+    assert set(pins) == {PIN, SERVING_PIN}
     payload = json.loads(PIN.read_text(encoding="utf-8"))
     assert set(payload) == {
         "schema", "repository", "commit", "version", "version_is_release",
@@ -58,6 +65,30 @@ def test_gridbook_pin_has_one_exact_released_runtime_identity():
         "routed_moe_per_role_codebook_lut": 1,
         "source_fp8_block128_w8a16": 1,
     }
+    serving = json.loads(SERVING_PIN.read_text(encoding="utf-8"))
+    assert serving == {
+        "schema": "prismaquant.gridbook_serving_runtime_pin.v1",
+        "repository": "https://github.com/RobTand/gridbook.git",
+        "commit": "dde15e04eb2e3667f78fdacf7b3bc135f0372866",
+        "version": "0.8.6",
+        "version_is_release": True,
+        "wheel_sha256":
+            "d085506a74869ac6f0b609dd399bcdcdbabb6c9ea64fb055ec0438fba49b8f3a",
+        "runtime_contract_schema": "gridbook.runtime-contract.v4",
+        "required_abi_features": {
+            "routed_moe_per_role_codebook_lut": 1,
+            "source_fp8_block128_w8a16": 1,
+            "dspark_construction_physical_bridge": 1,
+        },
+    }
+    # The pending sentinels are a BUILD-TIME state, not a shippable one: a
+    # serving pin still carrying them resolves to no verifiable runtime at all.
+    # Assert their absence separately from the equality above, so that a future
+    # edit which reintroduces a placeholder fails on the reason rather than on
+    # an opaque dict diff.
+    assert serving["commit"] != GRIDBOOK_SERVING_RUNTIME_COMMIT_PENDING
+    assert serving["wheel_sha256"] != GRIDBOOK_SERVING_RUNTIME_WHEEL_SHA256_PENDING
+    assert serving["version_is_release"] is True
 
 
 def _version_tuple(text: str) -> tuple[int, ...]:
@@ -86,7 +117,18 @@ def test_rung_tables_may_only_credit_a_runtime_that_was_actually_released():
         "when the pin advances, ADD the version key" rule already asks for.
     """
     payload = json.loads(PIN.read_text(encoding="utf-8"))
-    pin_version = payload["version"]
+    serving_payload = json.loads(SERVING_PIN.read_text(encoding="utf-8"))
+    # The ceiling is the SERVING pin, not the producer pin. `fused_mid_m` is a
+    # statement about which rungs the runtime that SERVES the artifact routes
+    # through the fused lane, so the runtime that must have resolved a version
+    # before the table may credit it is the serving runtime. The producer pin
+    # is deliberately frozen at the version that BUILT the artifact and does
+    # not advance with the serve path -- reading it here would cap the table at
+    # the build-time runtime forever and make every serving-runtime bump look
+    # like an unresolved promise. Both pins are still required to be resolved
+    # releases before their version may appear as a key, which is the property
+    # this test exists for; only which pin supplies the ceiling changed.
+    pin_version = serving_payload["version"]
     spec = json.loads(
         (REPO / "prismaquant" / "serving_profile_specs" / "nvfp4_cb.json")
         .read_text(encoding="utf-8"))
@@ -100,8 +142,14 @@ def test_rung_tables_may_only_credit_a_runtime_that_was_actually_released():
     for version in sorted(keyed):
         assert _version_tuple(version) <= _version_tuple(pin_version), (
             f"serving profile credits runtime {version}, which is newer than "
-            f"the pinned runtime {pin_version}: a rung table cannot promise a "
-            f"version the producer has never resolved")
+            f"the pinned serving runtime {pin_version}: a rung table cannot "
+            f"promise a version that has never been resolved")
+
+    if pin_version in keyed:
+        assert serving_payload["version_is_release"] is True, (
+            f"serving profile keys runtime {pin_version}, but the serving pin "
+            f"does not resolve it to a release: an unreleased pin backs "
+            f"nothing")
 
     if not payload["version_is_release"]:
         # The prospective table may be reviewed before the tag exists, but
@@ -151,10 +199,19 @@ def test_every_live_script_uses_the_one_external_runtime_helper():
     assert discovered == set(LIVE_SCRIPTS)
     for name in LIVE_SCRIPTS:
         text = (REPO / "scripts" / name).read_text(encoding="utf-8")
-        assert "gridbook_runtime.sh" in text, name
-        assert "prismaquant/gridbook_runtime/gridbook_runtime.sh" in text, name
-        assert "gridbook_runtime_prepare" in text, name
-        assert "GRIDBOOK_RUNTIME_DOCKER_ARGS" in text, name
+        if name == "serve_dsv4_cb_validate.sh":
+            assert "gridbook_serving_runtime.sh" in text, name
+            assert (
+                "prismaquant/gridbook_runtime/gridbook_serving_runtime.sh"
+                in text
+            ), name
+            assert "gridbook_serving_runtime_prepare" in text, name
+            assert "GRIDBOOK_SERVING_RUNTIME_DOCKER_ARGS" in text, name
+        else:
+            assert "gridbook_runtime.sh" in text, name
+            assert "prismaquant/gridbook_runtime/gridbook_runtime.sh" in text, name
+            assert "gridbook_runtime_prepare" in text, name
+            assert "GRIDBOOK_RUNTIME_DOCKER_ARGS" in text, name
         assert "PQ_GRIDBOOK_RUNTIME_HELPER" in text, name
         assert (
             "install-container" in text
@@ -182,7 +239,11 @@ def test_every_live_script_uses_the_one_external_runtime_helper():
 
 
 def test_helper_and_live_scripts_are_valid_bash():
-    paths = [HELPER, *(REPO / "scripts" / name for name in LIVE_SCRIPTS)]
+    paths = [
+        HELPER,
+        SERVING_HELPER,
+        *(REPO / "scripts" / name for name in LIVE_SCRIPTS),
+    ]
     for path in paths:
         proc = subprocess.run(
             ["bash", "-n", str(path)],

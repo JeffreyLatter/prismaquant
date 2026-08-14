@@ -41,7 +41,7 @@ def test_serve_driver_has_snapshot_reexec_and_repeated_closure_proofs():
     assert '-e "PYTHONNOUSERSITE=1"' in source
     assert '-n "${PYTHONPATH+x}"' in source
     assert source.index("verify_runtime_snapshot") < source.index(
-        '. "$REPO/prismaquant/gridbook_runtime/gridbook_runtime.sh"'
+        '. "$REPO/prismaquant/gridbook_runtime/gridbook_serving_runtime.sh"'
     )
 
 

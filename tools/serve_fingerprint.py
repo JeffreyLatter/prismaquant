@@ -72,6 +72,8 @@ _GOLD_PRODUCER_COMMON_FILES = (
     "prismaquant/gridbook_assignment.py",
     "prismaquant/gridbook_environment.py",
     "prismaquant/gridbook_runtime/gridbook_runtime_pin.json",
+    "prismaquant/gridbook_runtime/gridbook_serving_runtime_pin.json",
+    "prismaquant/gridbook_serving_runtime_pin.py",
     "tools/dsv4_gridbook_contract.py",
     "tools/dsv4_wikitext_inputs.py",
     "tools/prepare_dsv4_wikitext_inputs.py",
@@ -172,6 +174,7 @@ def _gridbook_environment_allowlist() -> tuple[str, ...]:
 SERVER_ENV_ALLOWLIST = (
     "PQ_GRIDBOOK_RUNTIME_COMMIT",
     "PQ_GRIDBOOK_RUNTIME_VERSION",
+    "PQ_GRIDBOOK_RUNTIME_WHEEL_SHA256",
     # The serving process must not carry an explicit Python module-search
     # override.  ``server_environment_snapshot`` records only set values, so
     # validators prove affirmative absence by requiring this allowlisted name
@@ -202,6 +205,10 @@ TRACKED_PACKAGES = (
 _FINGERPRINT_EXCLUDED = frozenset({
     "created", "launch_argv", "processes", "model", "container", "hostname",
     "serve_fingerprint", "schema", "served_model_name", "written_by",
+    # Chronology labels distinguish two observations of one live server; they
+    # must not make the serving stack itself appear to change between the
+    # required pre/post DSpark snapshots.
+    "attestation_phase",
     # Live PIDs define a session, not a numeric serving stack. Their stable
     # identities remain represented by ``processes``/``serve_session_id``.
     "measurement_parent_pid", "engine_descendant_pids",
@@ -1808,8 +1815,10 @@ def collect_manifest(
     source: str = "server",
     extra: Mapping[str, Any] | None = None,
     artifact_dir: str | os.PathLike | None = None,
+    draft_artifact_dir: str | os.PathLike | None = None,
     base_url: str | None = None,
     attestation_phase: str = "snapshot",
+    server_environment_names: Sequence[str] = SERVER_ENV_ALLOWLIST,
 ) -> dict[str, Any]:
     """Build the manifest for a live serving (or measuring) process."""
     if attestation_phase not in {"snapshot", "pre", "post"}:
@@ -1848,7 +1857,9 @@ def collect_manifest(
     extensions, readable_pids, unreadable_pids = residency_scan(pids)
     host = host_identity()
     processes = process_identities(pids, boot_id=host.get("boot_id"))
-    process_environment = server_environment_snapshot(pids)
+    process_environment = server_environment_snapshot(
+        pids, names=server_environment_names
+    )
     listener_census = process_tcp_listeners(pids)
     bound_listener = listener_binding(
         launch_argv, listener_census, base_url=base_url
@@ -1918,6 +1929,23 @@ def collect_manifest(
     if artifact_dir is not None:
         manifest["artifact_binding"] = artifact_binding(
             artifact_dir, launch_model=launch_model
+        )
+    if draft_artifact_dir is not None:
+        raw_spec = manifest.get("speculative_config")
+        try:
+            spec = json.loads(str(raw_spec))
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                "--draft-artifact-dir requires strict JSON --speculative-config"
+            ) from exc
+        draft_model = spec.get("model") if isinstance(spec, dict) else None
+        if not isinstance(draft_model, str) or not draft_model:
+            raise ValueError(
+                "DSpark speculative config must name the separate draft model"
+            )
+        manifest["draft_artifact_binding"] = artifact_binding(
+            draft_artifact_dir,
+            launch_model=draft_model,
         )
     if extra:
         annotations = dict(extra)
@@ -2094,12 +2122,35 @@ def _cmd_write(args: argparse.Namespace) -> int:
             raise ValueError(
                 "serve fingerprint shipcard import escapes the reviewed snapshot"
             )
+    extra = None
+    server_environment_names = SERVER_ENV_ALLOWLIST
+    if args.dspark_runtime_evidence is not None:
+        # Lazy and stdlib-only: the profile module imports neither torch nor
+        # vLLM.  Its separate collector already performed the explicit live
+        # imports; here we re-hash its metadata/cache files and the installed
+        # Gridbook source namespace before embedding it in this server proof.
+        from prismaquant.dspark_serving_profile import (
+            DSPARK_SERVER_ENV_ALLOWLIST,
+            load_runtime_evidence,
+        )
+
+        runtime_evidence = load_runtime_evidence(
+            args.dspark_runtime_evidence, verify_files=True
+        )
+        server_environment_names = DSPARK_SERVER_ENV_ALLOWLIST
+        extra = {
+            "dspark_serving_profile": runtime_evidence["profile_receipt"],
+            "dspark_runtime_evidence": runtime_evidence,
+        }
     manifest = collect_manifest(
         pids=None,
         image=args.image,
         artifact_dir=args.artifact_dir,
+        draft_artifact_dir=args.draft_artifact_dir,
         base_url=args.base_url,
         attestation_phase=args.attestation_phase,
+        server_environment_names=server_environment_names,
+        extra=extra,
     )
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -2141,6 +2192,11 @@ def main(argv: list[str] | None = None) -> int:
         help="exact mounted CB artifact served by this process",
     )
     p_write.add_argument(
+        "--draft-artifact-dir",
+        default=None,
+        help="exact separately quantized DSpark draft named by speculative config",
+    )
+    p_write.add_argument(
         "--base-url",
         default=None,
         help="local benchmark origin bound to the actual server listener",
@@ -2150,6 +2206,14 @@ def main(argv: list[str] | None = None) -> int:
         choices=("snapshot", "pre", "post"),
         default="snapshot",
         help="chronology role for this immutable server snapshot",
+    )
+    p_write.add_argument(
+        "--dspark-runtime-evidence",
+        default=None,
+        help=(
+            "exact runtime-preflight receipt; selects the separate 0.8.6 "
+            "paired-DSpark process-environment/profile closure"
+        ),
     )
     p_write.set_defaults(func=_cmd_write)
 

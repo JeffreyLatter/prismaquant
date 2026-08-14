@@ -358,6 +358,7 @@ def test_streaming_export_emits_metadata_overlay_without_reencoding_mtp(
     )
 
     emitted = load_file(str(artifact / "model.safetensors"))
+    assert set(emitted) == set(source_tensors)
     for name, source_tensor in source_tensors.items():
         assert name in emitted
         if source_tensor.dtype in {
@@ -370,6 +371,79 @@ def test_streaming_export_emits_metadata_overlay_without_reencoding_mtp(
             )
         else:
             assert torch.equal(emitted[name], source_tensor)
+
+
+def test_dspark_cb_sidecar_flag_off_preserves_target_golden_inventory(
+    tmp_path,
+):
+    """Flag-off retains the source checkpoint's physical target contract."""
+
+    default_root = tmp_path / "default"
+    explicit_root = tmp_path / "explicit-false"
+    default_root.mkdir()
+    explicit_root.mkdir()
+    source_root_a, artifact_a, _source_a = _export(default_root)
+    source_root_b, artifact_b, _source_b = _export(
+        explicit_root, dspark_cb_sidecar=False
+    )
+    # This is the compatibility authority: two untouched source checkpoints,
+    # created before either target artifact is read.  The assertion is not an
+    # omitted-vs-false self-consistency check; each export must preserve the
+    # complete physical inventory and exact payload bytes of its own source.
+    golden_a = load_file(str(source_root_a / "model.safetensors"))
+    golden_b = load_file(str(source_root_b / "model.safetensors"))
+    emitted_a = load_file(str(artifact_a / "model.safetensors"))
+    emitted_b = load_file(str(artifact_b / "model.safetensors"))
+    golden_inventory = {
+        name: (tuple(tensor.shape), tensor.dtype)
+        for name, tensor in golden_a.items()
+    }
+
+    assert {
+        name: (tuple(tensor.shape), tensor.dtype)
+        for name, tensor in golden_b.items()
+    } == golden_inventory
+    assert {
+        name: (tuple(tensor.shape), tensor.dtype)
+        for name, tensor in emitted_a.items()
+    } == golden_inventory
+    assert {
+        name: (tuple(tensor.shape), tensor.dtype)
+        for name, tensor in emitted_b.items()
+    } == golden_inventory
+    for name in sorted(golden_inventory):
+        assert torch.equal(
+            emitted_a[name].view(torch.uint8),
+            golden_a[name].view(torch.uint8),
+        )
+        assert torch.equal(
+            emitted_b[name].view(torch.uint8),
+            golden_b[name].view(torch.uint8),
+        )
+        assert torch.equal(
+            emitted_a[name].view(torch.uint8),
+            emitted_b[name].view(torch.uint8),
+        )
+    assert (artifact_a / "config.json").read_bytes() == (
+        artifact_b / "config.json"
+    ).read_bytes()
+    expected_config = _source_config()
+    expected_config["quantization_config"] = {
+        "quant_method": "gridbook",
+        "format": "nvfp4_cb",
+        "config_file": "quant_config.json",
+    }
+    expected_config["n_mtp_layers"] = 3
+    assert json.loads((artifact_a / "config.json").read_text()) == (
+        expected_config
+    )
+    assert (artifact_a / "quant_config.json").read_bytes() == (
+        artifact_b / "quant_config.json"
+    ).read_bytes()
+    quant = json.loads((artifact_a / "quant_config.json").read_text())
+    assert "dspark_cb_sidecar" not in quant["provenance"]
+    assert "dspark_render_attestation" not in quant["provenance"]
+    assert quant["provenance"]["dspark_source_overlay"]["tensor_bytes_rewritten"] == 0
 
 
 @pytest.mark.parametrize(

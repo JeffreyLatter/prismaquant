@@ -50,7 +50,10 @@ from prismaquant.nvfp4_cb_footprint import (
 
 
 DSV4_W8A16_EXPORT_HANDOFF_SCHEMA = (
-    "prismaquant.dsv4_w8a16.export_handoff.v1"
+    "prismaquant.dsv4_w8a16.export_handoff.v2"
+)
+DSV4_W8A16_EXPORT_SOURCE_CLOSURE_SCHEMA = (
+    "prismaquant.dsv4_w8a16.export_source_closure.v1"
 )
 _PUBLISH_MANIFEST = ".anchored_publish.json"
 _PUBLISHED_FILES = frozenset({
@@ -59,15 +62,57 @@ _PUBLISHED_FILES = frozenset({
     "pareto.knees.json",
     "cb_col_weights.pkl",
 })
-_FROZEN_EXPORT_CODE_SHA256 = {
+# This is a deliberate release boundary, not an import-graph checksum.  It
+# closes the reviewed streaming exporter plus the code that defines its CB
+# wire/accounting contract, DSpark physical namespace, DeepSeek-v4 profile and
+# decoded-source semantics, source-complete render identity, completeness, and
+# output transaction.  Unrelated pipeline/probe modules remain outside this
+# one-purpose pre-export handoff.
+_FROZEN_EXPORT_SOURCE_SHA256 = {
     "prismaquant/export_nvfp4_cb_streaming.py": (
-        "ba80d731556f8e2cfc2f6284a3e5f43e8c7e3e913e9f1572fc34ea907dfb81eb"
+        "f740ebd9b90e586fc10ffa975f2f624ee8f7f85b02bb927701e946989bc3319f"
     ),
     "prismaquant/cb_export_config.py": (
         "41ef8609736d419e12e86810d2dd005f8e09ade2ad138bf5d5c4f123087e3acb"
     ),
     "prismaquant/nvfp4_cb_formats.py": (
         "bd7cfa7a8930bf2652a86f2a87649d51bf2af497cd350890e9246c7ff01bce9f"
+    ),
+    "prismaquant/dspark_source_metadata.py": (
+        "94fac4b16922f381cffe989d7b9b1d00f211bb93d9479dfde30eb0c02ef167f7"
+    ),
+    "prismaquant/model_profiles/__init__.py": (
+        "fb20303ed1b017a5a7f3a035d5ef43880822d775e252c28a08f32a67f8104c95"
+    ),
+    "prismaquant/model_profiles/base.py": (
+        "dd472aae76b74772eb7b058e7f1f4bfa38095e556e34f9e683cc2c7047c7d746"
+    ),
+    "prismaquant/model_profiles/registry.py": (
+        "30e1509963c10b753ed73881becebdcff4974b516f83f479df72ce6f16779381"
+    ),
+    "prismaquant/model_profiles/deepseek_v4.py": (
+        "f280937e826c2262a7a3646c90aa883915daa516e78f7a2b83b586890e05cbf7"
+    ),
+    "prismaquant/model_profiles/specs/deepseek_v4.json": (
+        "b8f3b22c16484a6859494d96ff052e5c5229c9a7c3afb7ae829e9cf5e26ecbf4"
+    ),
+    "prismaquant/cb_source_decode.py": (
+        "d9a06483d008bf2361b0522bc258ab291db870d1c2432f9d4cd8d7a8cbacefbe"
+    ),
+    "prismaquant/layer_streaming.py": (
+        "5fa349dd47b024274d64f2ae17613138e35cea93a28b1ff6f016204980df471e"
+    ),
+    "prismaquant/production_weight_cache.py": (
+        "495108d5a57c1fe1ea2a89674270569318678085bd76bfe915f8bbbe5c087481"
+    ),
+    "prismaquant/nvfp4_cb_footprint.py": (
+        "2cfb677c3e180ebe71a07288bed0feb02ab17df89ba4d66e3dffb6ce06ce2e51"
+    ),
+    "prismaquant/artifact_completeness.py": (
+        "1f9723a9dfcf64ab05229e57d1859120fc8f5a4c92e55b5e54fc48dfeb2a83bf"
+    ),
+    "prismaquant/export_output_safety.py": (
+        "4af0a9d891313f1d9d031955e431e1e84c1ba0e11a9ce2605ea92de3bc3703b5"
     ),
 }
 
@@ -185,24 +230,35 @@ def _selection_contract(selection: Mapping[str, object]) -> dict[str, object]:
     return observed
 
 
-def _verify_frozen_export_code(repo_root: Path) -> dict[str, str]:
+def _verify_frozen_export_source_closure(
+    repo_root: Path,
+) -> dict[str, object]:
     if repo_root.is_symlink() or not repo_root.is_dir():
         raise W8A16ExportHandoffError(
             f"PrismaQuant root is not a real directory: {repo_root}"
         )
     observed: dict[str, str] = {}
-    for relative, expected in _FROZEN_EXPORT_CODE_SHA256.items():
+    for relative, expected in _FROZEN_EXPORT_SOURCE_SHA256.items():
         path = _real_file(
-            repo_root / relative, where=f"frozen exporter source {relative}"
+            repo_root / relative,
+            where=f"frozen exporter/source closure {relative}",
         )
         digest = _sha256(path)
         if digest != expected:
             raise W8A16ExportHandoffError(
-                f"frozen exporter source changed: {relative}; "
+                f"frozen exporter/source closure changed: {relative}; "
                 f"observed={digest}, expected={expected}"
             )
         observed[relative] = digest
-    return observed
+    closure: dict[str, object] = {
+        "schema": DSV4_W8A16_EXPORT_SOURCE_CLOSURE_SCHEMA,
+        "files_sha256": observed,
+    }
+    closure["identity_sha256"] = canonical_json_sha256(
+        closure,
+        where="DSv4 W8A16 exporter/source closure",
+    )
+    return closure
 
 
 def _verify_runtime_contract() -> dict[str, object]:
@@ -451,7 +507,7 @@ def verify_dsv4_w8a16_export_handoff(
         Path(repo_root) if repo_root is not None
         else Path(__file__).resolve(strict=True).parent.parent
     )
-    frozen = _verify_frozen_export_code(root)
+    frozen = _verify_frozen_export_source_closure(root)
     return {
         "schema": DSV4_W8A16_EXPORT_HANDOFF_SCHEMA,
         "publication": str(publication.resolve(strict=True)),
@@ -469,7 +525,7 @@ def verify_dsv4_w8a16_export_handoff(
         },
         "codebook_bundle": bundle,
         "gridbook_runtime_pin": runtime,
-        "frozen_export_code_sha256": frozen,
+        "frozen_export_source_closure": frozen,
         "output_path": str(output.resolve(strict=False)),
         "output_absent": True,
     }
@@ -477,6 +533,7 @@ def verify_dsv4_w8a16_export_handoff(
 
 __all__ = [
     "DSV4_W8A16_EXPORT_HANDOFF_SCHEMA",
+    "DSV4_W8A16_EXPORT_SOURCE_CLOSURE_SCHEMA",
     "W8A16ExportHandoffError",
     "verify_dsv4_w8a16_export_handoff",
 ]

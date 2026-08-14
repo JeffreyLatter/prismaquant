@@ -217,10 +217,18 @@
             40,
             44,
             48
+          ],
+          "0.8.6": [
+            28,
+            32,
+            36,
+            40,
+            44,
+            48
           ]
         }
       },
-      "detail": "fp8-CB's fused prologue kernel consumes the SAME per-token dynamic E4M3 QDQ as its non-fused route, so the fused mid-M lane (9 <= M <= 128, measured 1.04x/1.26x/1.45x at M = 32/64/128) is a pure kernel substitution and ships as DEFAULT, but only for the rungs the consumer actually instantiates. The backed set is K in {28,32,36,40,44,48}: k % 4 == 0 is a format-plus-TMA law, because type_size = 4k must be a 16-byte multiple and the fused mainloop's uniform CbSubW = k/4 is wrong for ragged off-law sub-tables. Historical version keys are immutable. Gridbook 0.8.3 added routed per-role LUT support inside the fused mainloop without changing the codec or rung law. Gridbook 0.8.4 explicitly attested abi_features.routed_moe_per_role_codebook_lut=1. The released 0.8.5 rung entry preserves the same codec law and is bound to exact commit e992e5980c96333a48149f96392d6cff56ae9e3f plus the v3 contract. When the runtime pin advances, ADD its released-version key rather than editing an existing list; an undeclared pinned version backs nothing, fail-closed."
+      "detail": "fp8-CB's fused prologue kernel consumes the SAME per-token dynamic E4M3 QDQ as its non-fused route, so the fused mid-M lane (9 <= M <= 128, measured 1.04x/1.26x/1.45x at M = 32/64/128) is a pure kernel substitution and ships as DEFAULT, but only for the rungs the consumer actually instantiates. The backed set is K in {28,32,36,40,44,48}: k % 4 == 0 is a format-plus-TMA law, because type_size = 4k must be a 16-byte multiple and the fused mainloop's uniform CbSubW = k/4 is wrong for ragged off-law sub-tables. Historical version keys are immutable. Gridbook 0.8.3 added routed per-role LUT support inside the fused mainloop without changing the codec or rung law. Gridbook 0.8.4 explicitly attested abi_features.routed_moe_per_role_codebook_lut=1. The released 0.8.5 rung entry preserves the same codec law and is bound to exact commit e992e5980c96333a48149f96392d6cff56ae9e3f plus the v3 contract. Gridbook 0.8.6 (tag v0.8.6, exact commit dde15e04eb2e3667f78fdacf7b3bc135f0372866) advances the runtime contract to v4 and adds abi_features.dspark_construction_physical_bridge=1 alongside the existing routed_moe_per_role_codebook_lut and source_fp8_block128_w8a16; it integrates DSpark loading and the exact GEMV v2 path. It changes NEITHER the codec NOR the k % 4 == 0 rung law NOR the fused mainloop's CbSubW = k/4, and csrc/cb_fused_gemm.cu is present at that commit, so the backed set is carried forward UNCHANGED rather than widened -- adding the key is what keeps the pin from silently backing nothing, and is not a claim that 0.8.6 serves any rung 0.8.5 did not. When the runtime pin advances, ADD its released-version key rather than editing an existing list; an undeclared pinned version backs nothing, fail-closed."
     }
   ]
 }

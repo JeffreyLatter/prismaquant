@@ -169,13 +169,13 @@ if [[ "${inner_build_git[0]:-}" != "$ARTIFACT_BUILD_COMMIT" \
   echo "REFUSE: artifact build identity changed across snapshot re-exec" >&2
   exit 2
 fi
-. "$REPO/prismaquant/gridbook_runtime/gridbook_runtime.sh"
-gridbook_runtime_prepare
+. "$REPO/prismaquant/gridbook_runtime/gridbook_serving_runtime.sh"
+gridbook_serving_runtime_prepare
 
-# DSv4 evidence pin: eugr Spark vLLM 0.26.1rc1.dev515 at g653ebb52d.
-BASE_IMAGE=eugr/spark-vllm@sha256:7bf752a9fa225b528b27c6a1118cb1727cddd7c383096d83281010c4f8b407bc
-VLLM_VERSION=0.26.1rc1.dev515+g653ebb52d.d20260808
-VLLM_COMMIT=653ebb52d
+# DSv4 evidence pin: eugr Spark vLLM 0.26.1rc1.dev693 at g7f7a32cfe.
+BASE_IMAGE=eugr/spark-vllm@sha256:58862b388e0fab05a5c9b673f21d1d7b41a1123953a2d9ace49aae6c79319869
+VLLM_VERSION=0.26.1rc1.dev693+g7f7a32cfe.d20260812
+VLLM_COMMIT=7f7a32cfec0f1bc5b73c37200b86631523a1ea8f
 GRAPH_COMPILATION_CONFIG='{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[1]}'
 if [[ -n "${SERVED_MODEL:-}" ]]; then
   echo "REFUSE: exact DSv4 gate owns the per-run served-model nonce" >&2
@@ -292,6 +292,7 @@ fi
   echo "VLLM_COMMIT=$VLLM_COMMIT"
   echo "GRIDBOOK_RUNTIME_COMMIT=$GRIDBOOK_RUNTIME_COMMIT"
   echo "GRIDBOOK_RUNTIME_VERSION=$GRIDBOOK_RUNTIME_VERSION"
+  echo "GRIDBOOK_RUNTIME_WHEEL_SHA256=$GRIDBOOK_RUNTIME_WHEEL_SHA256"
   echo "MEM_AVAILABLE_KIB=$available_kib"
   docker image inspect "$BASE_IMAGE"
   nvidia-smi
@@ -309,7 +310,7 @@ CID=$(docker create --pull=never --name "$NAME" --gpus all --ipc=host \
   -v "$MODEL:/model:ro" \
   -v "$EVIDENCE:/evidence:rw" \
   -v "$EXT_CACHE:/opt/gridbook/ext-cache:rw" \
-  "${GRIDBOOK_RUNTIME_DOCKER_ARGS[@]}" \
+  "${GRIDBOOK_SERVING_RUNTIME_DOCKER_ARGS[@]}" \
   -e "PQ_RUNTIME_PRISMAQUANT_ROOT=/repo" \
   -e "PQ_RUNTIME_PRISMAQUANT_GIT_COMMIT=$ARTIFACT_BUILD_COMMIT" \
   -e "PQ_RUNTIME_PRISMAQUANT_TREE=$PQ_RUNTIME_TREE" \

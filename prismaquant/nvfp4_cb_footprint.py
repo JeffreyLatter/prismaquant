@@ -2040,6 +2040,16 @@ def cb_serialization_metadata_from_assignment_payload(
     if context_stamp is None:
         context_stamp = payload.get("cb_serialized_payload")
     identities: dict[str, str] = {}
+    meta_identities = (
+        meta.get(CB_ASSIGNMENT_IDENTITIES_FIELD)
+        if isinstance(meta, Mapping)
+        else None
+    )
+    if isinstance(meta_identities, Mapping):
+        identities.update({
+            str(name): str(value)
+            for name, value in meta_identities.items()
+        })
     top_level = payload.get(CB_ASSIGNMENT_IDENTITIES_FIELD)
     if isinstance(top_level, Mapping):
         identities.update({str(name): str(value)
