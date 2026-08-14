@@ -1406,7 +1406,10 @@ def cost_entry_predicted_dloss(
     base = cost_entry_weight_only_dloss(stats_entry, cost_entry, gain=gain)
     if cost_entry.get(APPLIED_MARKER_KEY) is True:
         # Aggregated super item: its members were penalized individually and
-        # the result summed. Re-applying here would square the correction.
+        # the result summed. Re-applying here would square the correction. The
+        # same reasoning covers the AQUA A-side: a super item prices a format as
+        # the SUM of its members' cost_entry_predicted_dloss, so every member's
+        # act_dloss is already inside ``base``.
         return base
     if cost_entry_is_anchored_aura_supersurrogate(cost_entry):
         # Read the anchored projection directly. The P5a penalty transfers a
@@ -1419,8 +1422,56 @@ def cost_entry_predicted_dloss(
         # — and it stays correct if a future run mixes an anchored table with a
         # measured one, where falling through would silently apply another
         # family's transfer constant to a projection that is not in its units.
-        return base
-    return base * _activation_penalty(format_name, activation_pricing)
+        return base + cost_entry_act_dloss(cost_entry)
+    return (base * _activation_penalty(format_name, activation_pricing)
+            + cost_entry_act_dloss(cost_entry))
+
+
+#: AQUA-AURA: the A-side Δloss of a (unit, format), written into the cost row by
+#: ``aqua_activation_cost``. Absent on every pre-AQUA cost artifact, which is
+#: why every read goes through ``cost_entry_act_dloss`` and defaults to 0.0.
+ACT_DLOSS_KEY = "act_dloss"
+
+
+def cost_entry_act_dloss(cost_entry: dict) -> float:
+    """AQUA-AURA: the row's ACTIVATION-side Δloss, or 0.0 when absent.
+
+    WHY THIS IS ADDED, NOT MULTIPLIED, AND ONLY HERE
+    ------------------------------------------------
+    Choosing NVFP4 commits the Linear's ACTIVATIONS to 4 bits as well as its
+    weights; choosing FP8 commits them to 8; BF16 leaves them alone. A
+    weight-only surrogate cannot see any of that -- NVFP4 and NVFP4A16 render
+    weights BIT-IDENTICALLY (T1) -- so the DP was pricing a W4A4 format as if it
+    were weight-only and systematically over-buying 4-bit.
+
+    The term is a Δloss in the same currency as the weight term (both are
+    mean-Δloss over the calibration), derived from the layer's own activation
+    statistics, so it is a SUM. It is deliberately not a multiplicative penalty:
+    ``ActivationFairPricing`` (P5a) is the multiplicative, per-FAMILY, fitted
+    transfer of a weight-space number onto the measured output scale, and this
+    is a per-UNIT, mechanistic, already-output-space quantity. They compose --
+    the penalty scales the weight term it was fitted on, then the A-side is
+    added -- and they are not substitutes.
+
+    It is added ONLY on the weight-only branches. The ``_prices_from_output_mse``
+    branch is already activation-inclusive by construction (the row's own
+    output-space measurement saw the activation path), and adding here would
+    double-count it. ``cost_entry_is_exact_by_construction`` returns 0.0 for a
+    row whose activation path is an identity, so there is nothing to add there
+    either; a lossless re-encode whose SERVED activations are 4-bit is excluded
+    from the menu by ``cost_entry_prices_unmeasured_activation_at_zero`` rather
+    than priced at all.
+
+    Defaults to 0.0 rather than raising because every cost artifact written
+    before AQUA lacks the key, and those runs must remain bit-for-bit
+    reproducible. An unmeasured A-side on an activation-quantizing format is a
+    HOLE, not a zero, and is reported as such by the writer -- it is not this
+    function's job to guess.
+    """
+    try:
+        return float(cost_entry.get(ACT_DLOSS_KEY, 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 ACTIVATION_COST_UNMEASURED_REASON = "activation_cost_unmeasured"

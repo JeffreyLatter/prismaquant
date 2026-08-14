@@ -288,6 +288,47 @@ def activation_dloss(unit: SensitivityUnit, weight: np.ndarray,
     return 0.5 * (total / max(1, unit.n_tokens)) * float(gain)
 
 
+def price_activation_only(unit: SensitivityUnit, weight: np.ndarray,
+                          plugin: FormatCostPlugin, *,
+                          gain: float = 1.0) -> float | None:
+    """The A-side price of one (unit, format), with NO weight rendering.
+
+    Split out of :func:`price` so there is exactly one implementation of "how
+    much does quantizing this layer's activations cost", and so the A-side can
+    be computed on its own. That separability is a fact about the quantity, not
+    a convenience: ``activation_dloss`` reads the DENSE weight (as ``W[o,j]^2``),
+    ``g_sq_sum``, and the format's activation grid. The render basis never
+    enters it. So an A-side priced against an RTN render and one priced against
+    the production render are the SAME number, and a consumer holding a
+    production weight cost can add this term to it without re-rendering
+    anything.
+
+    That is also why the term matters more than its size on an RTN basis
+    suggests. GPTQ/JSO shrink the W-side substantially and do nothing whatever
+    to the A-side, so the better the render, the more of a W4A4 format's true
+    cost lives here.
+
+    Returns ``None`` -- never 0.0 -- when the format leaves activations alone
+    (nothing to price) or when the card cannot price them (a hole). Callers that
+    need to tell those apart read ``descriptor.quantizes_activations``.
+    """
+    desc = plugin.descriptor
+    if not desc.quantizes_activations:
+        return None
+    # Prefer a variance MEASURED through the format's own activation quantizer;
+    # fall back to the analytic uniform-grid model only when the plugin cannot
+    # supply one. Measuring beats assuming a grid shape.
+    var = None
+    measure = getattr(plugin, "activation_error_variance", None)
+    if callable(measure):
+        var = measure(unit)
+    if var is None:
+        var = analytic_act_quant_variance(unit, desc)
+    if var is None:
+        return None
+    return activation_dloss(unit, weight, var, gain)
+
+
 def uniform_act_quant_variance(unit: SensitivityUnit, act_bits: int,
                                ) -> np.ndarray | None:
     """Per-channel activation-quantization error variance for a uniform grid.
@@ -538,18 +579,8 @@ def price(unit: SensitivityUnit, weight: np.ndarray,
             w_dloss = weight_dloss_marginal(unit, dw_sq, gain)
 
     a_dloss: float | None = None
-    if model is CostModel.AQUA and desc.quantizes_activations:
-        # Prefer a variance MEASURED through the format's own activation
-        # quantizer; fall back to the analytic uniform-grid model only when the
-        # plugin cannot supply one. Measuring beats assuming a grid shape.
-        var = None
-        measure = getattr(plugin, "activation_error_variance", None)
-        if callable(measure):
-            var = measure(unit)
-        if var is None:
-            var = analytic_act_quant_variance(unit, desc)
-        if var is not None:
-            a_dloss = activation_dloss(unit, weight, var, gain)
+    if model is CostModel.AQUA:
+        a_dloss = price_activation_only(unit, weight, plugin, gain=gain)
 
     return CostComponents(
         unit_name=unit.topology.name,
