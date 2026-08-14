@@ -328,7 +328,12 @@ known to be unlicensed across a codebook-basis change.
 
 ---
 
-## 7d. MARGINAL vs SCALAR: big per-Linear repricing, mostly absorbed by fusion
+## 7d. MARGINAL vs SCALAR: fusion absorbs most of the RANKING, none of the ALLOCATION
+
+> **Read §7d-bis before quoting anything from §7d.** The rank statistics below
+> say the two tiers nearly agree once fused groups are the unit (Spearman
+> 0.965). The DP says they assign **different formats to 12.2% of units** at the
+> house-default budget. Both are true; only the second is an allocation claim.
 
 Measured 2026-08-14 on the Qwen3-0.6B marginals probe (n=8, T=512), 196 units
 (lm_head excluded), RTN render, through the shipping `price()` and
@@ -357,11 +362,16 @@ Measured 2026-08-14 on the Qwen3-0.6B marginals probe (n=8, T=512), 196 units
 
 The cancellation is **within-group**: across the 56 multi-member groups, the
 members' own MARGINAL/SCALAR ratios differ by a median factor of **1.71x**
-(NVFP4), i.e. siblings move in *opposite* directions and the sum absorbs it.
-The per-Linear riser/faller pair is `k_proj` up / `v_proj` down on both formats
-— and those are siblings in the same `attn_qkv` group, forced to one format by
-union-find promotion. **Scoring Linears the DP never decides independently
-overstates the effect.**
+(NVFP4), and the sum absorbs it. The per-Linear riser/faller pair is `k_proj`
+up / `v_proj` down on both formats — and those are siblings in the same
+`attn_qkv` group, forced to one format by union-find promotion. (The spread
+ratio measures *differential* movement, not sign; "siblings move in opposite
+directions" is supported by the k_proj/v_proj rank evidence for that pair, not
+by the spread statistic alone.)
+
+**Scoring Linears the DP never decides independently overstates the RANKING
+disagreement.** It does **not** follow that the allocation agrees — §7d-bis
+runs the solver, and it does not.
 
 **The mechanism is entirely on the column side.** The row marginal is flat
 (median unit needs 92.9% of its output rows for 99% of the mass), so the row
@@ -378,16 +388,60 @@ class is `attn_qkv` (15 of 37) — three-member groups aggregating three
 different column structures. Fusion damps the magnitude; it does not decide
 which units survive it.
 
+### 7d-bis. Then I ran the DP, and the rank statistic UNDERSTATED the effect
+
+Everything above is a statement about **cost ordering**. I first concluded from
+it that MARGINAL's "real allocation-level effect is a ~4-rank perturbation."
+**That was a claim one level above the evidence, and running the solver
+refutes it.** A multi-choice knapsack can leave the argmax untouched under a
+large reordering *or* flip it under a small one; only the DP knows which.
+
+`marginal_dp_churn.py` — same card, same weights, same 2-rung NVFP4/FP8 menu,
+same budget, the **only** difference being `CostModel.SCALAR` vs `MARGINAL`:
+
+| target bpp | raw DP churn | after `promote_fused` |
+|---|---|---|
+| 4.0 | infeasible | — |
+| 4.5 | 0 / 196 (**degenerate**, see below) | 0 / 196 |
+| **4.75 (house default)** | **24 / 196 = 12.2%** | **24 / 196 = 12.2%** |
+| 5.0 | 25 / 196 = 12.8% | 17 / 196 = 8.7% |
+| 5.5 | 27 / 196 = 13.8% | 14 / 196 = 7.1% |
+| 6.0 | 26 / 196 = 13.3% | 17 / 196 = 8.7% |
+
+**12.2% of units get a different format at the production budget, and fused
+promotion absorbs none of it there.** The 4.5 row is not agreement: 4.5 *is* the
+NVFP4 floor, both arms assign 196/196 NVFP4, and a point with no freedom cannot
+disagree.
+
+**The direction is systematic: MARGINAL is more conservative.** At 4.75 SCALAR
+lifts 26 units to FP8 (54 after promotion); MARGINAL lifts 18 (36 after). This
+follows from the median ratio 0.73 — MARGINAL scores the cheap format's Δloss
+*lower*, so NVFP4 looks relatively better and fewer units need the upgrade.
+The churn is attention-dominated at 4.75 (`v_proj`/`k_proj`/`q_proj`/`o_proj`)
+and shifts to MLP (`down_proj`/`up_proj`/`gate_proj`) by 5.5–6.0.
+
+**Calibrating 12.2%:** the decision-level uncertainty study found a cost CV of
+23% produced only **3%** churn at 4.75 and a **0σ** served effect. This is **4x
+that churn**, so it is not obviously inside the "noise the DP absorbs" regime —
+and equally, it is **not proven to matter**, because nothing here was served.
+
 **What this does NOT say.** It compares two surrogates **to each other**;
-neither is ground truth, so it says nothing about which is *better*. It is a
-screen on one 0.6B dense model under an RTN render — and per §7c, the measured
-compensated cost that would arbitrate is exactly what no plugin serves yet.
-The honest read: **MARGINAL's headline per-Linear effect is largely an artifact
-of the wrong unit of analysis, and its real allocation-level effect on a dense
-Qwen is a ~4-rank perturbation.** That is worth knowing before anyone budgets
-MARGINAL as the reason to re-probe a 27B. Expect a larger effect where fusion
-does not apply and column structure is sharper — MoE experts, and any model
-with heavier activation outliers.
+neither is ground truth, so it says nothing about which is *better* — only that
+they disagree, materially, about what to ship. It is one 0.6B dense model under
+an RTN render on a 2-rung menu, and per §7c the measured compensated cost that
+would arbitrate is exactly what no plugin serves yet.
+
+**Revised practical read** (superseding the first version of this section):
+MARGINAL is **not** a cosmetic re-ranking. It changes 12% of a production-budget
+allocation, in a consistent direction, on the model family that is the dense
+ship target. That makes arbitrating it — i.e. building the `MeasuredCostPlugin`
+of §7c and then measuring served KL on both arms — **more** valuable, not less.
+Expect a larger effect still where fusion does not apply and column structure is
+sharper: MoE experts, and models with heavier activation outliers.
+
+**Durable lesson, twice-learned tonight:** a rank correlation is not an
+allocation claim. It understated the effect here by as much as it would have
+overstated it elsewhere. Run the solver.
 
 ---
 
