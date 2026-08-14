@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import gc
 import hashlib
+import atexit
 import json
 import math
 import os
@@ -1612,6 +1613,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         if len(calib_repeats) > 1:
             _ref_dir = Path(tempfile.mkdtemp(
                 prefix="prismaquant_refs_", dir=str(work_root)))
+            # These are pure scratch and they are LARGE -- 8.14 GiB per repeat
+            # at 27B, so a 3-arm A/B would strand ~98 GiB. Keeping >=10% of the
+            # disk free is a standing rule here, and a leak this size eats the
+            # margin in one campaign. atexit covers normal exit and SIGTERM
+            # (which is what the memory watchdog sends); a SIGKILL still
+            # strands them, so the directory is prefixed for easy sweeping.
+            atexit.register(shutil.rmtree, str(_ref_dir), True)
             ref_log_prob_repeats = [
                 _SpilledRefLogProbs(
                     model,
