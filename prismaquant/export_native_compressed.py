@@ -190,8 +190,35 @@ def _to_vllm_internal_name(checkpoint_name: str) -> str:
     return name
 
 
+# The NVFP4 codebook is a CONSTANT -- the eight positive E2M1 levels -- but it
+# was being rebuilt from a Python list on every call, and the GPTQ render calls
+# it once per column-quantize. Measured on one 5120x5120 Linear with
+# gptq+static_act_order+joint_scale_opt: 11,562 calls, 2.279 s of a 3.705 s
+# render. Building a CUDA tensor from a Python list is ~200 us (Python-side
+# element walk, then an H2D copy), so 62% of the render was materializing 8
+# floats over and over while the GPU sat at 33 W.
+#
+# Memoizing is safe because the value never varies and both call sites are
+# strictly read-only (`cb[idx]`, `torch.bucketize(x, cb)`, `cb.numel()`); no
+# caller mutates or keeps an escaping alias. Keyed on (device, dtype) so a
+# mixed-device run cannot be handed a tensor from the wrong device, which would
+# be a silent correctness bug rather than a slow path.
+#
+# The cached tensor must be BIT-IDENTICAL to the freshly built one -- this runs
+# inside the production render, and a render that differs from the exported
+# bytes is the rendering confound principle 8 exists to prevent. Pinned by
+# tests/test_nvfp4_codebook_cache.py, which compares cached against fresh and
+# renders a whole Linear both ways.
+_NVFP4_CODEBOOK_CACHE: dict[tuple[str, torch.dtype], torch.Tensor] = {}
+
+
 def _nvfp4_codebook(device, dtype=torch.float32) -> torch.Tensor:
-    return torch.tensor(FLOAT_TO_E2M1, device=device, dtype=dtype)
+    key = (str(device), dtype)
+    cb = _NVFP4_CODEBOOK_CACHE.get(key)
+    if cb is None:
+        cb = torch.tensor(FLOAT_TO_E2M1, device=device, dtype=dtype)
+        _NVFP4_CODEBOOK_CACHE[key] = cb
+    return cb
 
 
 def resolve_nvfp4_scale_rule(raw: str | None = None) -> str:
