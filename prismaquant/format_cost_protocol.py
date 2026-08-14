@@ -318,7 +318,15 @@ def price(unit: SensitivityUnit, weight: np.ndarray,
 
     a_dloss: float | None = None
     if model is CostModel.AQUA and desc.act_bits is not None:
-        var = uniform_act_quant_variance(unit, desc.act_bits)
+        # Prefer a variance MEASURED through the format's own activation
+        # quantizer; fall back to the analytic uniform-grid model only when the
+        # plugin cannot supply one. Measuring beats assuming a grid shape.
+        var = None
+        measure = getattr(plugin, "activation_error_variance", None)
+        if callable(measure):
+            var = measure(unit)
+        if var is None:
+            var = uniform_act_quant_variance(unit, desc.act_bits)
         if var is not None:
             a_dloss = activation_dloss(unit, weight, var, gain)
 
