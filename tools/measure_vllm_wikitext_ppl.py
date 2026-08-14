@@ -182,24 +182,44 @@ def _load_ids(
     cache_dir: str,
     split: str,
     n_tokens: int,
+    text_file: str | None = None,
 ) -> tuple[list[int], dict[str, object]]:
+    """Tokenize the corpus prefix to score, and attest which bytes it was.
+
+    `text_file` is the materialized corpus (tools/materialize_wikitext_corpus.py).
+    The measurement containers carry no `datasets`/pyarrow/pandas, and installing
+    them at measurement time would mutate the serving stack this number is
+    fingerprinted against, so bytes-on-disk is the preferred source. The
+    `datasets` branch is unchanged for hosts that have it; the join rule is
+    identical in both, and `corpus_sha256` is what actually proves two runs
+    scored the same text.
+    """
     if isinstance(n_tokens, bool) or not isinstance(n_tokens, int) or n_tokens < 2:
         raise ValueError("n_tokens must be an integer >= 2")
-    from datasets import load_dataset
+    if text_file:
+        raw = Path(text_file).read_bytes()
+        text = raw.decode("utf-8")
+        # A materialized corpus has no `datasets` fingerprint to quote, so the
+        # content hash IS the fingerprint -- spelled so it can never be mistaken
+        # for one.
+        fingerprint = "file:sha256:" + hashlib.sha256(raw).hexdigest()
+    else:
+        from datasets import load_dataset
 
-    ds = load_dataset(
-        WIKITEXT_DATASET,
-        WIKITEXT_CONFIG,
-        split=split,
-        cache_dir=cache_dir,
-        revision=WIKITEXT_REVISION,
-    )
-    rows = [
-        row["text"]
-        for row in ds
-        if isinstance(row.get("text"), str) and row["text"].strip()
-    ]
-    text = "\n\n".join(rows)
+        ds = load_dataset(
+            WIKITEXT_DATASET,
+            WIKITEXT_CONFIG,
+            split=split,
+            cache_dir=cache_dir,
+            revision=WIKITEXT_REVISION,
+        )
+        rows = [
+            row["text"]
+            for row in ds
+            if isinstance(row.get("text"), str) and row["text"].strip()
+        ]
+        text = "\n\n".join(rows)
+        fingerprint = getattr(ds, "_fingerprint", None)
     ids = tokenizer(text, return_tensors="pt", add_special_tokens=False).input_ids[0]
     total_tokens = int(ids.numel())
     if total_tokens < n_tokens:
@@ -207,9 +227,8 @@ def _load_ids(
             "WikiText tokenization cannot satisfy the requested exact prefix: "
             f"requested={n_tokens}, available={total_tokens}"
         )
-    fingerprint = getattr(ds, "_fingerprint", None)
     if not isinstance(fingerprint, str) or not fingerprint:
-        raise RuntimeError("WikiText dataset exposes no immutable fingerprint")
+        raise RuntimeError("WikiText corpus exposes no immutable fingerprint")
     selected = ids[:n_tokens].to(dtype=torch.long, device="cpu").tolist()
     if len(selected) != n_tokens:
         raise RuntimeError("WikiText selected token prefix has the wrong length")
@@ -235,6 +254,7 @@ def _load_measurement_ids(
             cache_dir=args.dataset_cache_dir,
             split=args.split,
             n_tokens=args.n_tokens,
+            text_file=args.corpus_text_file,
         )
     if not getattr(args, "wikitext_inputs", None):
         raise ValueError(
@@ -457,6 +477,11 @@ def main() -> int:
     parser.add_argument("--model", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--dataset-cache-dir", default="/hfcache/datasets")
+    parser.add_argument("--corpus-text-file", default=None,
+                        help="Materialized corpus text (see "
+                             "tools/materialize_wikitext_corpus.py). Preferred "
+                             "over --dataset-cache-dir: the measurement "
+                             "containers carry no `datasets`/pyarrow/pandas.")
     parser.add_argument(
         "--wikitext-inputs",
         help="offline payload from tools/prepare_dsv4_wikitext_inputs.py; "

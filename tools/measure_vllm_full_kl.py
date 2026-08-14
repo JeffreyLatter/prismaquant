@@ -143,16 +143,48 @@ def _load_wikitext_calibration(
     n_samples: int,
     seqlen: int,
     window_seed: int = 42,
-) -> tuple[list[list[int]], list[int], int]:
-    from datasets import load_dataset
+    text_file: str | None = None,
+) -> tuple[list[list[int]], list[int], int, dict]:
+    """Build the calibration windows, and attest which bytes they came from.
 
-    ds = load_dataset(
-        "wikitext",
-        "wikitext-2-raw-v1",
-        split="train",
-        cache_dir=cache_dir,
-    )
-    text = "\n\n".join(row["text"] for row in ds if row.get("text", "").strip())
+    `text_file` is the materialized corpus (tools/materialize_wikitext_corpus.py)
+    and is the preferred source: the measurement containers carry no `datasets`
+    / pyarrow / pandas, and installing them at measurement time would mutate the
+    very serving stack the number is fingerprinted against. Reading bytes also
+    lets teacher and student prove they scored the SAME corpus by sha256, rather
+    than each calling load_dataset and trusting two resolutions to agree.
+
+    The `datasets` path is kept for hosts that have it, and the join rule is
+    identical in both branches -- the materializer copies it verbatim.
+    """
+    if text_file:
+        raw = Path(text_file).read_bytes()
+        text = raw.decode("utf-8")
+        corpus = {
+            "source": "text_file",
+            "path": str(text_file),
+            "bytes": len(raw),
+            "corpus_sha256": hashlib.sha256(raw).hexdigest(),
+        }
+    else:
+        from datasets import load_dataset
+
+        ds = load_dataset(
+            "wikitext",
+            "wikitext-2-raw-v1",
+            split="train",
+            cache_dir=cache_dir,
+        )
+        text = "\n\n".join(
+            row["text"] for row in ds if row.get("text", "").strip()
+        )
+        corpus = {
+            "source": "datasets",
+            "cache_dir": str(cache_dir),
+            "bytes": len(text.encode("utf-8")),
+            "corpus_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            "datasets_fingerprint": getattr(ds, "_fingerprint", None),
+        }
     ids = tokenizer(
         text,
         return_tensors="pt",
@@ -170,7 +202,8 @@ def _load_wikitext_calibration(
             for i in range(n_samples)
         ]
     calib = [ids[s : s + seqlen].tolist() for s in starts]
-    return calib, starts, int(ids.numel())
+    corpus["total_tokens"] = int(ids.numel())
+    return calib, starts, int(ids.numel()), corpus
 
 
 def _load_llm(args, *, max_model_len: int) -> "LLM":
@@ -376,12 +409,13 @@ def _teacher(args) -> int:
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
-    prompts, starts, total_tokens = _load_wikitext_calibration(
+    prompts, starts, total_tokens, corpus = _load_wikitext_calibration(
         tokenizer,
         cache_dir=args.dataset_cache_dir,
         n_samples=args.n_samples,
         seqlen=args.seqlen,
         window_seed=args.window_seed,
+        text_file=args.corpus_text_file,
     )
     print(
         f"[kl] teacher model={args.model} n={args.n_samples} "
@@ -427,6 +461,7 @@ def _teacher(args) -> int:
             "seqlen": int(args.seqlen),
             "starts": starts,
             "total_tokens": total_tokens,
+        "corpus": corpus,
             "vocab_size": int(vocab_size),
             "teacher_shape": list(topk_lps.shape),
             "topk_coverage_mean": float(cov.mean()),
@@ -443,6 +478,7 @@ def _teacher(args) -> int:
         "teacher_logprobs": logprobs,
         "calib_ids": torch.tensor(prompts, dtype=torch.long),
         "starts": starts,
+        "corpus": corpus,
         "model": args.model,
         "n_samples": int(args.n_samples),
         "seqlen": int(args.seqlen),
@@ -457,6 +493,7 @@ def _teacher(args) -> int:
         "seqlen": int(args.seqlen),
         "starts": starts,
         "total_tokens": total_tokens,
+        "corpus": corpus,
         "vocab_size": int(vocab_size),
         "teacher_shape": list(logprobs.shape),
         "elapsed_s": time.monotonic() - started,
@@ -696,6 +733,14 @@ def main() -> int:
         "required by the DSv4 Gridbook release contract",
     )
     parser.add_argument("--dataset-cache-dir", default="/hfcache/datasets")
+    parser.add_argument("--corpus-text-file", default=None,
+                        help="Materialized corpus text (see "
+                             "tools/materialize_wikitext_corpus.py). Preferred "
+                             "over --dataset-cache-dir: the measurement "
+                             "containers carry no `datasets`/pyarrow/pandas, "
+                             "and installing them at measurement time would "
+                             "mutate the serving stack the number is "
+                             "fingerprinted against.")
     parser.add_argument("--n-samples", type=int, default=8)
     parser.add_argument("--seqlen", type=int, default=512)
     parser.add_argument("--dtype", default="bfloat16")
