@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.14.0 — 2026-08-14
+
+### Added
+
+- `allocator_solver.DualInterval` and `selected_rung_dual_intervals`: each
+  selected rung's local weak-Lagrangian support interval, expressed in
+  predicted-dloss per DP-charged byte. An **empty** interval is a meaningful
+  result rather than an error — it marks an integer-knapsack choice sitting in
+  a non-convex pocket that no scalar lambda supports, which is precisely the
+  documented reason lambda-bisection was rejected as a selector and kept only
+  as a candidate generator. Diagnostic only: no pipeline stage calls it, and
+  no allocation changes.
+
+
 ## 0.13.0 — 2026-08-14
 
 ### Added
