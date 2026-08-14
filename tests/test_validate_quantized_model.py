@@ -380,3 +380,50 @@ def test_end_to_end_bimodal_fails(fake_server):
     assert not rep.passed
     ppl_check = next(c for c in rep.checks if c.name == "perplexity")
     assert not ppl_check.passed
+
+
+# ----------------------------------------------------------------
+# base_url spelling — the 2026-08-14 ship-gate hang
+# ----------------------------------------------------------------
+# Every test above passes the BARE SERVER ROOT, which is why none of them
+# caught this: the CLI default is also bare, but the compressed_tensors lane
+# spec published `http://127.0.0.1:8000/v1`, and that spelling made the gate
+# poll `/v1/health` (404) for its entire 900 s timeout without ever sending a
+# prompt. The bug lived in the gap between the two conventions, so these tests
+# drive the `/v1` spelling specifically.
+def test_server_root_strips_only_a_trailing_v1():
+    assert vqm._server_root("http://h:8000/v1") == "http://h:8000"
+    assert vqm._server_root("http://h:8000/v1/") == "http://h:8000"
+    assert vqm._server_root("http://h:8000") == "http://h:8000"
+    # A serve behind --root-path keeps its prefix; only the API segment goes.
+    assert vqm._server_root("http://h:8000/foo/v1") == "http://h:8000/foo"
+    # Not a trailing segment => untouched (no substring mangling).
+    assert vqm._server_root("http://h:8000/v1beta") == "http://h:8000/v1beta"
+
+
+def test_openai_root_spelling_still_reaches_health_and_completions(fake_server):
+    """`--base-url .../v1` must work, not hang."""
+    _FakeVLLMHandler.mode = "healthy"
+    _FakeVLLMHandler.metrics_payload = ""
+    assert vqm._health_ok(f"{fake_server}/v1") is True
+    rep = run_validation(f"{fake_server}/v1", "any", wait_seconds=5)
+    assert rep.passed, [c.detail for c in rep.checks if not c.passed]
+    # It normalized rather than merely tolerating: no /v1/v1/... was issued.
+    assert rep.base_url == fake_server
+
+
+def test_spec_decode_guard_fails_closed_when_metrics_unreachable():
+    """An unreadable /metrics must REFUSE, never read as 'spec-decode off'.
+
+    This guard exists to stop the DRAFT model's NLL being published as the
+    target's. Returning False on a fetch error made the one check that
+    prevents a silent mis-report issue a confident all-clear.
+    """
+    dead = "http://127.0.0.1:9"  # discard port: connections refused
+    with pytest.raises(vqm.SpecDecodeUndetermined):
+        vqm._spec_decode_on(dead)
+    res = check_perplexity(dead, "any", max_ppl=100.0, max_p99_nll=100.0,
+                           max_mean_nll=100.0)
+    assert not res.passed
+    assert res.metrics.get("spec_decode_detected") is None
+    assert "refusing" in res.detail

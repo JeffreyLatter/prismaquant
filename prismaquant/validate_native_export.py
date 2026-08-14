@@ -33,15 +33,42 @@ def maybe_upgrade_flashinfer(
     package_names: tuple[str, ...] = _DEFAULT_FLASHINFER_PACKAGES,
     env: dict[str, str] | None = None,
 ) -> None:
-    """Upgrade flashinfer-python and flashinfer-cubin to `version` and
+    """Raise flashinfer-python and flashinfer-cubin to at least `version` and
     set FLASHINFER_DISABLE_VERSION_CHECK=1 to bypass the AOT-cache pin
-    that lags behind PyPI. No-op if already at the target version.
+    that lags behind PyPI. No-op if the installed version is already >= target.
+
+    The profile version is a FLOOR, never an exact pin, and this comparison is
+    the whole reason why. It was `== version`, which made a newer install look
+    wrong and pip-installed the older one over it. Measured 2026-08-14 on the
+    Qwen3.8-27B native-export gate: `gridbook:0.8.6-clean-dde15e0` ships
+    flashinfer 0.6.18, the `vllm_packed_moe` profile pins 0.6.8.post1, so the
+    gate DOWNGRADED a working container and the engine died with
+    `ImportError: cannot import name 'set_autotune_process_group' from
+    'flashinfer.autotuner'` — vLLM 0.26 needs the newer API. The pin's original
+    purpose was the opposite problem (images too old to dispatch the NVFP4 MoE
+    backend on Blackwell), and a floor satisfies that intent without being able
+    to break a container that was already fine.
     """
     for key, value in (env or {"FLASHINFER_DISABLE_VERSION_CHECK": "1"}).items():
         os.environ.setdefault(key, value)
+
+    def _parts(v: str) -> tuple[int, ...]:
+        # "0.6.8.post1" -> (0, 6, 8); trailing .postN/.devN are ignored, so a
+        # post-release never reads as older than its own base version.
+        out = []
+        for chunk in str(v).split("."):
+            digits = "".join(c for c in chunk if c.isdigit())
+            if not digits or not chunk[:1].isdigit():
+                break
+            out.append(int(digits))
+        return tuple(out)
+
     try:
         import flashinfer
-        if getattr(flashinfer, "__version__", "0.0") == version:
+        installed = getattr(flashinfer, "__version__", "0.0")
+        if installed == version or _parts(installed) >= _parts(version):
+            print(f"[validate] flashinfer {installed} already satisfies the "
+                  f"{version} floor — not touching it", flush=True)
             return
     except ImportError:
         pass

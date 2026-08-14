@@ -2645,6 +2645,25 @@ down before the next loads. A failed arm exits 1 instead of raising. Flashinfer 
 the profile's `runtime_package("flashinfer")` (`:30-71`); `--speculative-config` exercises MTP
 (and marks the record `spec_decode_detected`).
 
+**The profile flashinfer version is a FLOOR, not an exact pin (2026-08-14).**
+`maybe_upgrade_flashinfer` compared `installed == version` and pip-installed the profile
+version otherwise — so a *newer* flashinfer read as wrong and got **downgraded**. Measured on
+the Qwen3.8-27B native-export gate: `gridbook:0.8.6-clean-dde15e0` ships flashinfer **0.6.18**,
+`vllm_packed_moe` pins **0.6.8.post1**, and the gate downgraded a container that had just served
+the same artifact cleanly, killing engine init with `ImportError: cannot import name
+'set_autotune_process_group' from 'flashinfer.autotuner'` (vLLM 0.26 needs the newer API). The
+upgrade runs **once per process**, before either arm, so **both arms died** — `flashinfer_autotune`
+is on the engine-init path in each. (An earlier draft of this note guessed the graph arm survived
+on a lazy path; the completed `--both-arms` log says otherwise, and the guess is corrected here
+rather than left standing.) One consequence worth keeping: because the upgrade is process-scoped
+and the arms are not, a harness-level environment fault can never present as an artifact-level
+arm difference — if the two arms disagree, the artifact is the reason.
+The comparison is now `installed >= version` with `.postN`/`.devN` suffixes ignored, preserving
+the pin's original intent (images too *old* to dispatch the NVFP4 MoE backend on Blackwell)
+while making it structurally unable to break a working container. `--no-flashinfer-upgrade`
+`:219` remains the escape hatch. Note the container is `--rm`, so the bad downgrade was discarded
+rather than persisted — do not assume that holds for a gate run in a long-lived container.
+
 **DSv4 CB two-arm native gate.** `scripts/serve_dsv4_cb_validate.sh` owns the exact one-Spark
 load/generation proof for Gridbook CB artifacts. The launcher first requires the artifact's
 `shipcard.build.git` to identify one clean full PrismaQuant commit and the bootstrap checkout to
@@ -2770,12 +2789,32 @@ CLI-overridable `:513-518`:
 | `DEFAULT_MIN_GEN_LEN` | 30 chars | per completion |
 | `DEFAULT_MIN_MTP_ACCEPT_P0` | 0.60 | position-0 draft acceptance |
 
-**Spec-decode refusal.** `_spec_decode_on` `:171-189` scrapes `/metrics` for
+**Spec-decode refusal.** `_spec_decode_on` scrapes `/metrics` for
 `vllm:spec_decode`; if present the perplexity check **refuses a verdict** rather than return
-draft-model NLL (`:292-302`). MTP artifacts need the two-serve workflow (`:37-54`): serve
+draft-model NLL. MTP artifacts need the two-serve workflow (`:37-54`): serve
 without `--speculative-config` for the PPL verdict, re-serve with it for MTP acceptance;
 ship-ready requires both. The same refusal now also guards the gold lane (§7.3) — it used to
 exist only here.
+
+**The guard fails closed, and the URL it uses is not `--base-url` verbatim (2026-08-14).**
+`--base-url` is the **server** root: the module appends `/v1/completions` itself and reads
+`/health` and `/metrics` off the root. The `compressed_tensors` lane spec published the OpenAI
+root (`http://127.0.0.1:8000/v1`), so on the Qwen3.8-27B ship gate `wait_for_ready` polled
+`/v1/health` — 404 — for 11 minutes and would have burned its whole 900 s timeout without
+sending one prompt. Worse, `_spec_decode_on` hit `/v1/metrics` the same way, swallowed the
+exception and returned `False`, i.e. **"no spec-decode detected"**: the one guard that stops a
+draft-model NLL reaching a model card was issuing a confident all-clear it had no basis for, and
+on the standard invocation it could never have fired at all. Now `_server_root` strips a trailing
+`/v1` (preserving a `--root-path` prefix), `run_validation` normalizes once at entry so
+completions is corrected too, and an unreadable `/metrics` raises `SpecDecodeUndetermined` →
+the perplexity check fails with `spec_decode_detected: None`. Regression tests drive the `/v1`
+spelling specifically; every pre-existing test passed the bare root, which is exactly why the
+gap survived. The lane spec's `ship_gate` runner now spells the server root explicitly, and its
+serve command names `gridbook:0.8.6-clean-dde15e0` — `vllm-fresh-b12x:latest` does not exist on
+this box (see §"serving image reality") — with `vllm serve` given explicitly, since the image
+ENTRYPOINT is `nvidia_entrypoint.sh` and passes argv through. The `gold.ppl` runner pointed at
+`tools/measure_wikitext_ppl.py`, which has never existed; the file is
+`tools/measure_vllm_wikitext_ppl.py`.
 
 `--shipcard` (`:594`) appends this run's whole verdict block (per-check pass/fail, metrics,
 thresholds, `base_url`, served model name, detected spec-decode state) to the `ship_gate` slot;

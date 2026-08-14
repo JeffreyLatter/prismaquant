@@ -123,6 +123,15 @@ DEFAULT_MIN_MTP_ACCEPT_P0 = 0.60       # position-0 accept fraction
 # -----------------------------------------------------------------
 # Data classes
 # -----------------------------------------------------------------
+class SpecDecodeUndetermined(RuntimeError):
+    """The spec-decode guard could not read /metrics.
+
+    Distinct from "spec-decode is off": the perplexity check refuses on this
+    rather than proceeding, because the failure mode it guards against
+    (publishing the DRAFT model's NLL as the target's) is silent.
+    """
+
+
 @dataclass
 class CheckResult:
     name: str
@@ -160,9 +169,33 @@ def _get_text(url: str, timeout: float = 30.0) -> str:
         return resp.read().decode("utf-8")
 
 
+def _server_root(base_url: str) -> str:
+    """Server root for the operational endpoints, from the OpenAI API root.
+
+    `/health` and `/metrics` are mounted at the SERVER root; the completions
+    endpoints live under `/v1`.  ``--base-url`` names the latter, so appending
+    `/health` to it yields `/v1/health`, which vLLM answers with 404.
+
+    Measured 2026-08-14 on the Qwen3.8-27B ship gate: `wait_for_ready` polled
+    `/v1/health` for 11 minutes and would have timed out at 900 s without
+    sending a single prompt, while `/metrics` failed the same way and made the
+    spec-decode guard fail OPEN (see `_spec_decode_on`).
+
+    Only a trailing `/v1` is stripped, so a serve behind `--root-path /foo`
+    (`http://h:8000/foo/v1`) resolves to `http://h:8000/foo` rather than being
+    flattened to the bare host.
+    """
+    root = base_url.rstrip("/")
+    if root.endswith("/v1"):
+        root = root[: -len("/v1")]
+    return root
+
+
 def _health_ok(base_url: str) -> bool:
     try:
-        with urllib.request.urlopen(f"{base_url}/health", timeout=5.0) as r:
+        with urllib.request.urlopen(
+            f"{_server_root(base_url)}/health", timeout=5.0
+        ) as r:
             return r.status == 200
     except Exception:
         return False
@@ -181,11 +214,24 @@ def _spec_decode_on(base_url: str) -> bool:
     the NLL values returned are the 1-layer MTP head's logprobs,
     NOT the target model's. Those are not usable for target-model
     perplexity measurement. Detecting the condition lets the
-    validator refuse to silently mis-report."""
+    validator refuse to silently mis-report.
+
+    THIS GUARD FAILS CLOSED.  It used to swallow every fetch error and
+    return False, which reads as "spec-decode is off" — so an unreachable
+    `/metrics` produced a confident all-clear from the one check whose job is
+    to stop a draft-model NLL being published.  Until 2026-08-14 the URL was
+    also wrong (`/v1/metrics`, 404), so on the standard `--base-url .../v1`
+    invocation the guard could never fire at all.  An indeterminate answer is
+    now an exception, not a False.
+    """
     try:
-        text = _get_text(f"{base_url}/metrics")
-    except Exception:
-        return False
+        text = _get_text(f"{_server_root(base_url)}/metrics")
+    except Exception as exc:  # noqa: BLE001 - re-raised as a refusal below
+        raise SpecDecodeUndetermined(
+            f"cannot read {_server_root(base_url)}/metrics ({exc}); refusing "
+            "to certify perplexity, because a guard that cannot see the "
+            "server must not report 'no spec-decode'"
+        ) from exc
     return "vllm:spec_decode" in text
 
 
@@ -289,7 +335,16 @@ def check_perplexity(base_url: str, model_name: str,
     without --speculative-config; see the module docstring for the
     standard two-serve workflow.
     """
-    if _spec_decode_on(base_url):
+    try:
+        spec_on = _spec_decode_on(base_url)
+    except SpecDecodeUndetermined as exc:
+        return CheckResult(
+            name="perplexity",
+            passed=False,
+            detail=str(exc),
+            metrics={"spec_decode_detected": None, "skipped": True},
+        )
+    if spec_on:
         return CheckResult(
             name="perplexity",
             passed=False,
@@ -387,7 +442,7 @@ def check_mtp_acceptance(base_url: str, min_p0: float) -> CheckResult:
     position-0 acceptance fraction exceeds `min_p0`. If no spec-decode
     metrics are exposed (spec-decode not enabled), passes with 'skipped'."""
     try:
-        text = _get_text(f"{base_url}/metrics")
+        text = _get_text(f"{_server_root(base_url)}/metrics")
     except Exception as e:
         return CheckResult(
             name="mtp_acceptance",
@@ -434,6 +489,14 @@ def run_validation(
     bos_token: str | None = None,
     add_special_tokens: bool = True,
 ) -> ValidationReport:
+    # `base_url` is the SERVER root, not the OpenAI API root: this module
+    # appends `/v1/completions` itself and reads `/health` and `/metrics` off
+    # the root. Callers naturally pass the OpenAI root instead (the lane spec
+    # published `http://127.0.0.1:8000/v1`), which silently yields
+    # `/v1/v1/completions` and `/v1/health` — all 404, so the run waits out its
+    # full 900 s timeout having sent no prompt. Normalizing here rather than at
+    # each call site keeps the two spellings from diverging again.
+    base_url = _server_root(base_url)
     rep = ValidationReport(
         artifact=model_name,
         base_url=base_url,
