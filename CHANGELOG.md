@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.12.2 — 2026-08-14
+
+### Fixed
+
+- Serve attestations can now actually read the environment they compare. Both
+  Gridbook runtime Docker vectors set `SPT_NOENV=1`. The environment census
+  reads `/proc/<pid>/environ`, and vLLM's EngineCore renames itself through
+  `setproctitle` (`vllm/v1/engine/core.py` → `set_process_title`), which on
+  Linux overwrites the contiguous argv+envp block and destroys that file while
+  leaving the process's real `os.environ` intact. The census therefore saw a
+  destroyed remnant for the one process that runs the CB kernels, reported
+  `consistent: false`, and refused a correct server — structurally, on every
+  lane, at every commit, and it had never once been green. Measured in the
+  pinned serve image across that single call, `/proc/self/environ` went from all
+  six probed variables to zero while `os.environ` kept all six.
+  `SPT_NOENV` confines the process title to the argv area (the title truncates,
+  which is cosmetic; kernels, memory and numerics are untouched).
+  This is not a relaxation: every allowlisted name's value is still compared
+  exactly, so a genuinely mismatched EngineCore environment still fails, and
+  `SPT_NOENV` is deliberately excluded from every compared allowlist.
+  See `docs/audits/serve_env_census_setproctitle_2026-08-14.md`; §5 records why
+  this does **not** unblock the already-built DSv4-Flash 0731 artifact, whose
+  gate is bound to its own build commit.
+
 ## 0.12.1 — 2026-08-13
 
 ### Fixed

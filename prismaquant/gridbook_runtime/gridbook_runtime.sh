@@ -417,6 +417,19 @@ gridbook_runtime_prepare() {
         --volume "${source}:${container_source}:ro"
         --volume "${contract_source}:${container_contract}:ro"
         --env "PYTHONSAFEPATH=1"
+        # Keep /proc/<pid>/environ readable on processes that rename
+        # themselves.  vLLM's EngineCore calls setproctitle
+        # (vllm/v1/engine/core.py -> vllm.utils.system_utils.set_process_title),
+        # and on Linux setproctitle overwrites the contiguous argv+envp block,
+        # destroying /proc/<pid>/environ while leaving the process's real
+        # os.environ intact.  Every serve attestation reads /proc, so without
+        # this the census sees a destroyed remnant for the one process that
+        # actually runs the kernels and refuses a correct server.  SPT_NOENV
+        # tells setproctitle to use only the argv area (the title is truncated
+        # to argv length, which is cosmetic).  This makes the attestation
+        # readable, never laxer: values are still compared exactly, so a
+        # genuinely wrong EngineCore environment still fails.
+        --env "SPT_NOENV=1"
         --env "PQ_GRIDBOOK_RUNTIME_SOURCE=${container_source}"
         --env "PQ_GRIDBOOK_RUNTIME_COMMIT=${GRIDBOOK_RUNTIME_COMMIT}"
         --env "PQ_GRIDBOOK_RUNTIME_VERSION=${GRIDBOOK_RUNTIME_VERSION}"

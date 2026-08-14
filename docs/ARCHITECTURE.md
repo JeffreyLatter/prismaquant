@@ -2683,6 +2683,21 @@ the parent and EngineCore is a child. Two guards ride on that:
   replayed by `shipcard.verify`. Each result dict carries `git_commit`,
   `serve_fingerprint`, and the full `serve_manifest`; missing, unreadable, or
   unrelated engine evidence cannot close a gold slot.
+  **The environment half of that attestation requires `SPT_NOENV=1`, which both
+  runtime Docker vectors now set** (`prismaquant/gridbook_runtime/gridbook_runtime.sh`,
+  `gridbook_serving_runtime.sh`). The census reads `/proc/<pid>/environ`, and
+  vLLM's EngineCore renames itself through `setproctitle`
+  (`vllm/v1/engine/core.py` → `vllm.utils.system_utils.set_process_title`),
+  which on Linux overwrites the contiguous argv+envp block and destroys that
+  file while leaving the process's real `os.environ` intact. Measured in the
+  pinned serve image across that one call, `/proc/self/environ` went from all
+  six probed variables to zero while `os.environ` kept all six. Without the
+  flag the census reads a destroyed remnant for the one process that runs the
+  CB kernels, `consistent` is `False`, and a correct server is refused —
+  structurally, on every lane, at every commit. `SPT_NOENV` is not a
+  relaxation and is deliberately excluded from every compared allowlist: values
+  are still matched exactly, so a genuinely mismatched EngineCore environment
+  still fails (`tests/test_gridbook_runtime_boundary.py`).
 * **Clean producer and installed-runtime closure.** Each gold manifest binds a full
   PrismaQuant commit, independently observed `git_dirty=false`, optional tree id, and byte
   descriptors for the exact common/tool source-file closure. It separately attests the

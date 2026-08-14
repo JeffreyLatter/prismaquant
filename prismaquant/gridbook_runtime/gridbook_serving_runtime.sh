@@ -218,6 +218,12 @@ gridbook_serving_runtime_prepare() {
         --volume "${contract_source}:${container_contract}:ro"
         --volume "${wheel}:${container_wheel}:ro"
         --env "PYTHONSAFEPATH=1"
+        # See gridbook_runtime.sh for the full rationale: vLLM's EngineCore
+        # renames itself with setproctitle, which on Linux overwrites the
+        # argv+envp block and destroys /proc/<pid>/environ -- the source every
+        # serve attestation reads.  SPT_NOENV confines the title to the argv
+        # area so the census can actually read the environment it compares.
+        --env "SPT_NOENV=1"
         --env "PQ_GRIDBOOK_RUNTIME_COMMIT=${GRIDBOOK_RUNTIME_COMMIT}"
         --env "PQ_GRIDBOOK_RUNTIME_VERSION=${GRIDBOOK_RUNTIME_VERSION}"
         --env "PQ_GRIDBOOK_RUNTIME_WHEEL_SHA256=${GRIDBOOK_RUNTIME_WHEEL_SHA256}"

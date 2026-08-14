@@ -394,7 +394,40 @@ def test_prepare_mounts_runtime_source_and_contract_read_only(tmp_path):
     assert "/" in args
     assert "--env" in args
     assert "PYTHONSAFEPATH=1" in args
+    assert "SPT_NOENV=1" in args
     assert all("/repo/" not in arg for arg in args)
+
+
+def test_both_runtime_vectors_keep_proc_environ_readable():
+    """Serve attestations read /proc/<pid>/environ, so it must survive a rename.
+
+    vLLM's EngineCore renames itself via setproctitle
+    (vllm/v1/engine/core.py -> vllm.utils.system_utils.set_process_title). On
+    Linux setproctitle overwrites the contiguous argv+envp block, which
+    destroys /proc/<pid>/environ while leaving the process's real os.environ
+    untouched. Measured inside the pinned serve image, same process, across
+    that one call: /proc/self/environ went from all six probed variables to
+    zero while os.environ kept all six.
+
+    That made the environment census structurally unsatisfiable -- it refused a
+    correct server because the single process that runs the CB kernels reported
+    a destroyed remnant. SPT_NOENV confines the title to the argv area.
+
+    This is deliberately not a relaxation. The census still compares every
+    allowlisted name's value exactly; SPT_NOENV only makes those values
+    legible, so a genuinely mismatched EngineCore environment still fails. The
+    guard below pins that: SPT_NOENV must never enter a compared allowlist,
+    because a variable that exists to make the measurement possible must not
+    become part of the thing being measured.
+    """
+    for helper in (HELPER, SERVING_HELPER):
+        assert 'SPT_NOENV=1' in helper.read_text(encoding="utf-8"), helper.name
+
+    from prismaquant.dspark_serving_profile import DSPARK_SERVER_ENV_ALLOWLIST
+    from tools.serve_fingerprint import SERVER_ENV_ALLOWLIST
+
+    for allowlist in (SERVER_ENV_ALLOWLIST, DSPARK_SERVER_ENV_ALLOWLIST):
+        assert "SPT_NOENV" not in allowlist
 
 
 def test_prepare_materializes_linked_worktree_as_standalone_checkout(tmp_path):
