@@ -286,6 +286,30 @@ blindness already documented in [[aura_expert_routeflip_floor_confirmed]].
   must not be quoted as a finding before then.
 - Nothing here changes a default, a menu, or a shipped artifact.
 
+## 7b. Relationship to `activation_fair_pricing.py` (the existing partial answer)
+
+This is **not** a greenfield gap — `prismaquant/activation_fair_pricing.py`
+already exists and already concedes the problem in its own docstring: on the
+weight-only branch the "activation-contract difference is *structurally
+invisible*". It prices a whole **family** with one multiplicative penalty
+
+```
+penalty(family) = exp( mean_i ln( d_measured_i / d_weight_only_i ) )
+```
+
+and its own text calls this an **"estimator-transfer calibration, not an
+isolated A-side term."** It carries a documented bias that matters here: the
+**A-side error is rung-independent while the W-side shrinks with `k`**, so the
+true ratio *grows* along a CB ladder and a single scalar per family cannot
+track it.
+
+AQUA's relationship to it is therefore precise: `activation_fair_pricing` is a
+*family-level correction factor applied to `E_w`*; AQUA is an *additive,
+per-unit, per-format `E_a` term*. The second subsumes the first if T3 holds —
+but **superseding it is a promotion decision, not a refactor**. Leave that
+module alone until AQUA has served evidence, and do not run both corrections at
+once or the A-side gets counted twice.
+
 ## 8. Relationship to the rest of the stack
 
 - Consumes the **SensitivityCard** AQUA tier (`act_sq_sum`, `act_absmax`) — no
