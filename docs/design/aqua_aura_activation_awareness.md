@@ -335,6 +335,22 @@ blindness already documented in [[aura_expert_routeflip_floor_confirmed]].
   structure**, not a measurement. T2 is what would turn it into a result. It
   must not be quoted as a finding before then.
 - Nothing here changes a default, a menu, or a shipped artifact.
+- **The analytic fallback degrades silently for block-scaled formats, and that
+  is an asymmetry in the None-discipline.** `price_format` prefers a
+  plugin-supplied `activation_error_variance` (AQUA-2, measured) and falls back
+  to `uniform_act_quant_variance` — which models a **uniform grid over
+  per-channel absmax**. For NVFP4/MX the A-side is a *block-scaled* E2M1 grid
+  whose error is set by the **per-group** absmax over 16/32 input channels, and
+  whose levels are exponentially, not uniformly, spaced. §4's AQUA-1 is the
+  right model there and is **not implemented** — it needs the group partition
+  the `FormatSpec` already declares. So a block-scaled plugin that omits
+  `activation_error_variance` gets a *plausible but wrong* number rather than a
+  refusal. Contrast the discipline applied one function over: a card lacking
+  `g_sq_sum` returns `None`, never `0.0`, precisely so an unmeasured A-side is
+  distinguishable from a free one. The grid-shape mismatch deserves the same
+  treatment — either implement AQUA-1 or have the fallback refuse when
+  `descriptor` declares a block-scaled activation grid. Left as-is deliberately
+  (nothing consumes it yet), but it must not reach a default in this state.
 
 ## 7b. Relationship to `activation_fair_pricing.py` (the existing partial answer)
 
