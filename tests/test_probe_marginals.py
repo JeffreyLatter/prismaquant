@@ -21,7 +21,10 @@ import torch
 import torch.nn as nn
 
 from prismaquant.incremental_probe import (
+    _CONTENT_META_KEYS,
     _MARGINAL_KEYS,
+    _content_meta_compatible,
+    _expected_probe_shard_meta,
     _marginal_accumulate,
     _marginal_chunk,
     _marginal_flush,
@@ -315,6 +318,62 @@ def test_flush_uses_one_transfer_and_accumulates_across_calls():
     np.testing.assert_allclose(stats[NAME]["fisher_col"], [6.0, 8.0, 10.0])
     # absmax across two identical flushes stays the bound, not 2x.
     np.testing.assert_allclose(stats[NAME]["act_absmax"], [2.0, 1.0, 4.0])
+
+
+# --- resume gating: a flag-off shard must not be reused flag-on -------
+
+class _Args:
+    """Minimal stand-in for the argparse namespace the shard-meta
+    builder reads."""
+    model = "/models/qwen3-0p6b"
+    dataset = "ultrachat_200k"
+    nsamples = 8
+    seqlen = 512
+    dtype = "bf16"
+    device = "cuda"
+    device_map = None
+    importance_weighting = True
+    h_detail_dir = None
+    activation_rows_limit = 256
+
+
+def _shard_meta():
+    return _expected_probe_shard_meta(
+        _Args(), linear_include="re:.*", shard_idx=0,
+        activation_cache_dir="/work/act")
+
+
+def test_shard_meta_carries_the_marginal_flag(monkeypatch):
+    monkeypatch.setenv("PRISMAQUANT_PROBE_MARGINALS", "1")
+    assert _shard_meta()["emit_marginals"] is True
+    monkeypatch.setenv("PRISMAQUANT_PROBE_MARGINALS", "0")
+    assert _shard_meta()["emit_marginals"] is False
+
+
+def test_flag_off_shard_is_not_poolable_into_a_flag_on_run(monkeypatch):
+    """Marginal emission decides WHICH KEYS a stats entry carries, so it
+    is a content axis, not a grouping axis: the LPS-invariant linear
+    cache must refuse to pool across it."""
+    assert "emit_marginals" in _CONTENT_META_KEYS
+
+    monkeypatch.setenv("PRISMAQUANT_PROBE_MARGINALS", "0")
+    off_shard_meta = {"incremental_shard": _shard_meta()}
+    monkeypatch.setenv("PRISMAQUANT_PROBE_MARGINALS", "1")
+    on_anchor = _shard_meta()
+
+    assert not _content_meta_compatible(off_shard_meta, on_anchor)
+    assert _content_meta_compatible(
+        {"incremental_shard": _shard_meta()}, on_anchor)
+
+
+def test_pre_flag_shard_is_not_poolable(monkeypatch):
+    """A shard written before this key existed has no `emit_marginals`
+    at all; `None != True` must rebuild loudly rather than silently
+    contribute marginal-less entries."""
+    monkeypatch.setenv("PRISMAQUANT_PROBE_MARGINALS", "1")
+    anchor = _shard_meta()
+    legacy = {k: v for k, v in anchor.items() if k != "emit_marginals"}
+    assert not _content_meta_compatible({"incremental_shard": legacy}, anchor)
 
 
 def test_accumulate_maxes_absmax_within_a_layer():

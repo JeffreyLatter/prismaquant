@@ -967,6 +967,10 @@ def _expected_probe_shard_meta(args, *,
         "activation_rows_limit": int(args.activation_rows_limit),
         "shard_idx": shard_idx,
         "router_coverage_version": _ROUTER_COVERAGE_VERSION,
+        # Not a grouping axis: it decides whether the shard's stats
+        # carry per-channel marginals at all. Reusing a flag-off shard
+        # in a flag-on run would silently ship marginal-less entries.
+        "emit_marginals": _marginals_enabled(),
     }
 
 
@@ -1001,6 +1005,11 @@ _CONTENT_META_KEYS: tuple[str, ...] = (
     "importance_weighting", "activation_cache_dir",
     "linear_exclude", "h_detail_dir", "activation_rows_limit",
     "router_coverage_version",
+    # Marginal emission changes WHICH KEYS a stats entry carries, not
+    # just its grouping, so a flag-off shard is not poolable into a
+    # flag-on run — it would contribute entries with no marginals and
+    # nothing downstream would notice.
+    "emit_marginals",
 )
 
 
@@ -3767,6 +3776,7 @@ def main():
                          if args.h_detail_dir else None),
         "activation_rows_limit": int(args.activation_rows_limit),
         "router_coverage_version": _ROUTER_COVERAGE_VERSION,
+        "emit_marginals": _marginals_enabled(),
     }
     linear_cache = scan_cached_linear_stats(shard_dir, content_meta_anchor)
     if linear_cache:
