@@ -282,6 +282,52 @@ placement, not from a few dominant output rows.
 
 ---
 
+## 7c. Why the card cannot yet reproduce a production allocation (2026-08-14)
+
+Chasing the end-to-end DP check turned up a structural gap that is worth more
+than the check itself.
+
+`price()` computes
+
+```python
+dw_sq      = plugin.weight_error(unit, weight)
+weight_mse = float(np.mean(dw_sq))
+```
+
+— i.e. the weight error **always** comes from the plugin's own render. The only
+concrete plugin, `RegistryFormatPlugin`, renders with the format's **RTN**
+quantizer. Production `weight_mse` in a shipped `cost.pkl` comes from the
+**GPTQ + JSO compensated** render. There is today **no plugin that serves a
+measured, compensated `weight_mse`**, so the card path cannot reproduce a
+production allocation — and it should not be expected to.
+
+This is exactly why the zero-churn test in §8 is scoped the way it is: it feeds
+the production `weight_mse` into `weight_dloss_scalar` *directly*, which
+isolates the **pricing arithmetic** (proven bit-identical, 22,176 pairs) from
+the **render basis** (not yet bridged). Both statements are true and neither
+implies the other.
+
+**Latent risk, and it is the project's classic one.** `render_basis` is carried
+into `CostComponents` as provenance and is **never checked** against what the
+plugin actually did. Nothing prevents a card stamped `COMPENSATED` from being
+priced by an RTN plugin, or a menu mixing bases across formats. Principle 8
+exists because the surrogate, the KL validation and the exported bytes must be
+*one* rendering — an unenforced basis stamp is precisely the "rendering
+confound" that reverted the JSO wall-off. Compare
+[[factorization_currency_dependent]]: `production-render-score` is already
+known to be unlicensed across a codebook-basis change.
+
+**Two follow-ups, in order:**
+1. **Enforce the basis.** Have the plugin *declare* the basis it renders in and
+   have `price()` refuse a mismatch against the card's provenance, rather than
+   stamping whatever it is told. Fail-closed, matching the house pattern.
+2. **Add a `MeasuredCostPlugin`** that serves `weight_mse` (and ideally `dw_sq`)
+   from an existing `cost.pkl` under `RenderBasis.COMPENSATED`. That is the
+   object that makes an end-to-end DP re-solve meaningful; only then does
+   "adopting the card changes no allocation" become testable.
+
+---
+
 ## 8. What is proven, and what is not
 
 **Proven on REAL production artifacts** (`tools/validate_card_zero_churn.py`,
