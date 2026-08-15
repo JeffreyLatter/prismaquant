@@ -216,13 +216,22 @@ if [[ "$EXPORT_CONTAINER" == "gguf" || "$EXPORT_CONTAINER" == "nvfp4_cb" ]]; the
 else
   : "${ACTIVATION_ROWS_LIMIT:=256}"
 fi
-: "${DATASET:=/home/rob/dq-runs/calibration/diverse-v1.jsonl}"
+# Calibration corpora live OUTSIDE the repo (they are built, not vendored) and
+# their location is one knob. It used to default to an absolute path under a
+# developer's home directory, which is unreachable for everyone else and failed
+# with a HuggingFace "dataset doesn't exist on the Hub" error naming that path
+# — see the fail-fast in sensitivity_probe.load_calibration. Point
+# PRISMAQUANT_CALIBRATION_DIR wherever you keep them, or set DATASET directly
+# to any .jsonl / .txt / HF dataset id.
+PIPELINE_SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+: "${PRISMAQUANT_CALIBRATION_DIR:=${PIPELINE_SCRIPT_DIR%/}/../calibration}"
+: "${DATASET:=${PRISMAQUANT_CALIBRATION_DIR%/}/diverse-v1.jsonl}"
 # MINOR-M2: packed-MoE experts use a cross-domain held-out corpus for the
 # GPTQ-vs-RTN do-no-harm gate (the served-validated recipe — arm E in
 # moe_expert_gptq_vs_rtn — beat same-corpus/in-sample gating). Must be DISJOINT
 # from DATASET. Ignored for dense models (no packed experts). Set empty to
 # reproduce the historical same-corpus in-sample gate.
-: "${EXPERT_GATE_DATASET:=/home/rob/dq-runs/calibration/xdom-gate-v1.jsonl}"
+: "${EXPERT_GATE_DATASET:=${PRISMAQUANT_CALIBRATION_DIR%/}/xdom-gate-v1.jsonl}"
 : "${DEVICE:=cuda}"
 : "${EXPORT_DEVICE:=cuda}"   # CUDA ~10× faster than CPU on NVFP4 packing
 # TARGET_PROFILE is deliberately UNSET by default (re-vet R11 / debt D4). A

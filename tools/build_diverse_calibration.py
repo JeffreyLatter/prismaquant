@@ -9,14 +9,26 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import random
 from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import Any
 
 
-DEFAULT_OUTPUT = "/home/rob/dq-runs/calibration/diverse-v1.jsonl"
-DEFAULT_TOKENIZER = "/home/rob/.cache/huggingface/qwen36-27b-bf16"
+# Repo-relative, and overridable by the same knob run-pipeline.sh reads, so the
+# builder and the pipeline agree on where corpora live without either of them
+# naming a developer's home directory.
+DEFAULT_OUTPUT = str(
+    Path(os.environ.get(
+        "PRISMAQUANT_CALIBRATION_DIR",
+        Path(__file__).resolve().parents[1] / "calibration",
+    )) / "diverse-v1.jsonl"
+)
+# No default: the corpus is tokenized to a target length, so it is only
+# reusable across models whose tokenizers agree. Guessing one silently ties the
+# corpus to a model the caller never named.
+DEFAULT_TOKENIZER = None
 DEFAULT_ROWS = 256
 DEFAULT_TARGET_TOKENS = 4096
 DEFAULT_SEED = 20260509
@@ -345,7 +357,9 @@ def write_jsonl(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", default=DEFAULT_OUTPUT)
-    parser.add_argument("--tokenizer", default=DEFAULT_TOKENIZER)
+    parser.add_argument("--tokenizer", default=DEFAULT_TOKENIZER,
+                        required=DEFAULT_TOKENIZER is None,
+                        help="model dir or HF id whose tokenizer defines the token budget")
     parser.add_argument("--rows", type=int, default=DEFAULT_ROWS)
     parser.add_argument("--target-tokens", type=int, default=DEFAULT_TARGET_TOKENS)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)

@@ -2315,6 +2315,27 @@ def load_calibration(tokenizer, source: str, n_samples: int,
     """
     import os
 
+    # A local-file source that does not exist must NOT fall through to the
+    # HuggingFace loader. It used to: the `.jsonl`/`.txt` branches were guarded
+    # by os.path.exists, so a missing file skipped to the generic `else` and
+    # HF reported `Dataset '/home/.../diverse-v1.jsonl' doesn't exist on the
+    # Hub` -- an error that names a filesystem path as a dataset id and sends
+    # the reader looking for something to download. Nothing is downloadable;
+    # the file is simply absent.
+    if (source.endswith((".jsonl", ".txt")) or os.sep in source) \
+            and not os.path.exists(source):
+        raise FileNotFoundError(
+            f"calibration file not found: {source}\n"
+            "This is a local path, not a HuggingFace dataset id, so there is "
+            "nothing to download. Either:\n"
+            "  * build the default corpus:  python tools/"
+            "build_diverse_calibration.py --output <path> --tokenizer <model>\n"
+            "  * point DATASET at your own .jsonl ({\"text\": ...} or "
+            "{\"messages\": [...]} rows) or .txt (one sample per line)\n"
+            "  * point DATASET at a HuggingFace dataset id "
+            "(e.g. ultrachat_200k)"
+        )
+
     texts: list[str] = []
     if source.endswith(".jsonl") and os.path.exists(source):
         with open(source) as f:
