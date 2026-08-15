@@ -51,6 +51,7 @@ from prismaquant.cb_layout import (
 )
 from prismaquant.cb_export_config import (
     build_quant_config,
+    build_quantized_embedding_declaration,
     codebook_tensor_names as _codebook_tensor_names,
     codebook_tensors as _codebook_tensors,
 )
@@ -763,6 +764,71 @@ def export_nvfp4_cb(
     sidecar_stock = {q for q in stock_targets
                      if _canonical_qname(q, _profile) is None}
 
+    # Quantized token embeddings (`quantized_embedding` declaration).  A third
+    # class of stock target, stricter than the sidecar: the bytes are packed by
+    # the same CT codec, but the unit is claimed by GridBook's embedding method
+    # rather than by a config group.  Both halves of that matter.
+    #
+    #   * PACKED, not verbatim.  vLLM's compressed-tensors embedding path
+    #     accepts weight-only INT schemes and RAISES for FP8/NVFP4, so a stock
+    #     config group naming the embedding does not mis-route the artifact --
+    #     it refuses to load it.  Hence the declaration, and hence the unit is
+    #     kept out of `config_groups` below.
+    #   * WEIGHT-ONLY.  A lookup has no input activation to scale, and the
+    #     serving method registers no `input_global_scale` parameter, so an
+    #     emitted one is an unmatched checkpoint key at load.  Same suppression
+    #     the visual sidecar already needs, for a different reason.
+    #
+    # Detected by two INDEPENDENT conditions that must agree: the name contract
+    # the probe and the declaration builder both use, and the checkpoint's own
+    # vocab_size.  A name that matches without the shape (or a stock target
+    # shaped like a vocab table under another name) raises rather than picking
+    # a branch quietly -- getting this wrong ships an artifact whose embedding
+    # is dispatched as a Linear, or a Linear dispatched as a lookup.
+    def _declared_vocab_size() -> int:
+        # Multimodal checkpoints keep the LM's vocab under `text_config`; a
+        # wrapper config with no top-level vocab_size would otherwise read as
+        # zero and disable the shape half of the cross-check silently.
+        cfg = json.loads((model_dir / "config.json").read_text())
+        for holder in (cfg, cfg.get("text_config") or {},
+                       cfg.get("language_config") or {}):
+            if isinstance(holder, dict) and holder.get("vocab_size"):
+                return int(holder["vocab_size"])
+        return 0
+
+    _vocab_rows = _declared_vocab_size()
+
+    def _is_embedding_name(q: str) -> bool:
+        return q == "model.embed_tokens" or q.endswith(".embed_tokens")
+
+    embedding_stock: dict[str, str] = {}
+    for _q, _f in stock_targets.items():
+        _w = skeleton.get(_try_resolve_skeleton(_q, skeleton, _profile) or "")
+        _rows = int(_w.shape[0]) if _w is not None and _w.dim() == 2 else -1
+        _named = _is_embedding_name(_q)
+        _shaped = _vocab_rows > 0 and _rows == _vocab_rows and not (
+            _q == "lm_head" or _q.endswith(".lm_head"))
+        if _named != _shaped:
+            raise ValueError(
+                f"{_q}: cannot classify as a token embedding — the name says "
+                f"{_named} but the checkpoint shape says {_shaped} "
+                f"(rows={_rows}, vocab_size={_vocab_rows}). An embedding is "
+                "served by GridBook's lookup method and a Linear by a config "
+                "group; the two dispatches are not interchangeable, so this "
+                "refuses rather than guessing.")
+        if _named:
+            embedding_stock[_q] = _f
+    if embedding_stock:
+        # Read the record back through the consumer's rules before any bytes
+        # are written: an unroutable format or an lm_head slipped into the
+        # recipe must fail the export, not the load.
+        build_quantized_embedding_declaration(embedding_stock)
+        # An embedding is not a sidecar tower: it keeps its `model.` prefix in
+        # vLLM's module tree and is claimed by the declaration, not by a
+        # weight-only config group. Both memberships would otherwise fire on a
+        # profile whose LM mapping does not name the embedding.
+        sidecar_stock -= set(embedding_stock)
+
     # FP8_SOURCE is PASSTHROUGH-ONLY (PASSTHROUGH_SOURCE_REQUIREMENTS): legal
     # only where the source `.weight` is already fp8_e4m3fn with a
     # `.weight_scale_inv` sibling. The allocator's passthrough-integrity
@@ -865,6 +931,7 @@ def export_nvfp4_cb(
         qname
         for qname, fmt in stock_targets.items()
         if fmt == "NVFP4" and qname not in sidecar_stock
+        and qname not in embedding_stock
     }
     activation_execution_contract = None
     activation_scales_by_physical_target: dict[str, float] = {}
@@ -1574,8 +1641,9 @@ def export_nvfp4_cb(
                 ),
             )
             for suffix, t in packed.items():
-                if canon in sidecar_stock and "input" in suffix:
-                    continue        # weight-only sidecar group (see above)
+                if "input" in suffix and (canon in sidecar_stock
+                                          or canon in embedding_stock):
+                    continue        # weight-only: sidecar tower / lookup table
                 out_tensors[f"{ckpt_qname}.{suffix}"] = t.cpu().contiguous()
                 if suffix == "input_global_scale":
                     emitted_activation_scale_targets.add(ckpt_qname)
@@ -1674,7 +1742,12 @@ def export_nvfp4_cb(
         assignment=assignment,
         cb_targets=cb_targets,
         source_targets=source_targets,
-        stock_targets=stock_targets,
+        # Embedding units are packed like a stock target but claimed by the
+        # `quantized_embedding` declaration, so they must not also appear in a
+        # config group -- the consumer refuses a unit owned by two dispatches.
+        stock_targets={q: f for q, f in stock_targets.items()
+                       if q not in embedding_stock},
+        quantized_embedding_units=embedding_stock or None,
         by_group=by_group,
         cb_group_target_names=cb_group_target_names,
         codebooks=codebooks,
