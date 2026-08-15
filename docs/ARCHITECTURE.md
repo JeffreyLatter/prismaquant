@@ -1,14 +1,17 @@
 # PrismaQuant Architecture
 
-As of: 2026-08-14 · branch `merge/proven-rescues` · re-stamped for
+As of: 2026-08-15 · branch `merge/proven-rescues` · re-stamped for
 `prismaquant.dense_anchored_cb` (a **dense** sibling driver for the
 platform-agnostic anchored-cost mechanism, and the first campaign to apply
 **AQUA on a CB menu** — the anchored branch adds the A-side rather than
 multiplying it by P5a's transfer, so AURA's activation blindness stops hiding
-the `NVFP4_CB`/`FP8_CB` A4↔A8 boundary; §4.3. It renders 27.5% of a full-menu
+the `NVFP4_CB`/`FP8_CB` A4↔A8 boundary; §4.3. It renders 22.5% of a full-menu
 campaign, transiently, where the stock `COST_MODE=aura` path would retain
-~865 GB. AQUA-on-CB remains a candidate until its served A/B lands.) Previously
-re-stamped at `a56c6f8`:
+~865 GB. AQUA-on-CB remains a candidate until its served A/B lands.) Recorded
+with it: a validation rung that is also the segment's **anchor** measures
+nothing — its dex is 0.0000 by construction — and `_panel_policy` now refuses
+that configuration, after the first campaign shipped 48 such vacuous cells;
+§4.3. Previously re-stamped at `a56c6f8`:
 (`run-pipeline.sh` now forwards **`ALLOW_PINNED`** to the allocator, so a
 profile-pinned `lm_head` can enter the DP budget instead of shipping at source
 dtype — 2.543 GB, 20% of a 13.0 GB card budget, on Qwen3.8-27B; §4.5. Recorded
@@ -1351,10 +1354,21 @@ Three dense-specific differences are structural rather than cosmetic:
   candidate until that served KL/PPL A/B at matched bpp lands, not a result.**
 
 The economics on Qwen3.8-27B: 496 body units × 19 rungs is 9,424 full-menu cells; the
-anchored plan renders 992 anchors + 960 panel + 192 validation = **2,592 cells, 27.5%** —
+anchored plan renders 992 anchors + 840 panel + 288 validation = **2,120 cells, 22.5%** —
 and transiently, so ~0 GB is retained. The stock `COST_MODE=aura` path would instead have
 built a *retained* format-menu cache at a measured 45.5 GB/rung (arm-b: 91 GB for two
 rungs), i.e. ~865 GB for this ladder, for a cache the exporter never reads.
+
+A validation rung must be held out on **both** axes — absent from the panel *and* not the
+segment's anchor. At the anchor the fit reproduces the measurement by construction, so
+every such cell reports dex exactly 0.0000. The first Qwen3.8-27B campaign (2026-08-15)
+listed `FP8_CB_K36`, its own fp8 anchor, as a validation rung, and 48 of its 192
+validation cells were therefore vacuous — visible in the plan report as
+`deduplicated_multi_purpose_cells: 48`. `_panel_policy` now refuses both that and a
+panel/validation overlap. The current tables validate NVFP4-CB at K12/K15/K21/K24 (the
+extremes *and* two interior rungs, so the report separates worst-case extrapolation from
+typical) and FP8-CB at K32/K44, straddling the anchor; FP8-CB gives up a panel rung to
+afford them, since only six of its rungs are on-law.
 
 ### 4.4 L2 and L3 — retired 2026-07-30 (`archive/l3_propagated_2026-07-30/`)
 

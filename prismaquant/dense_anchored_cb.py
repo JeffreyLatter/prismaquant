@@ -142,17 +142,26 @@ ANCHOR_FORMATS = {
 PANEL_RUNGS = {
     "nvfp4_cb": ("NVFP4_CB_K13", "NVFP4_CB_K16",
                  "NVFP4_CB_K20", "NVFP4_CB_K23"),
-    "fp8_cb": ("FP8_CB_K28", "FP8_CB_K32", "FP8_CB_K40", "FP8_CB_K48"),
+    "fp8_cb": ("FP8_CB_K28", "FP8_CB_K40", "FP8_CB_K48"),
 }
 # Held-out UNITS are the primary generalization axis (the fit is applied to
-# every unit, not just panel members).  The rungs differ per family on purpose:
-# NVFP4-CB is validated at the ladder's extremes, the hardest test of a fit
-# built from interior rungs; FP8-CB is validated at K36/K44, the two interior
-# rungs its panel does NOT contain, so the test is the shape law rather than a
-# rung the panel already pinned.
+# every unit, not just panel members).  A validation rung must be held out on
+# BOTH axes -- absent from the panel AND not the anchor -- or it measures
+# nothing: at the anchor the fit reproduces the measurement by construction, so
+# its dex is exactly 0.0000 and it dilutes the report with tautological passes.
+# The first Qwen3.8-27B campaign shipped FP8_CB_K36 (its own anchor) in this
+# table and 48 of 192 validation cells were therefore vacuous; `_panel_policy`
+# now refuses that configuration rather than reporting it.
+#
+# NVFP4-CB is validated at the extremes AND two interior rungs, so the report
+# separates the worst extrapolation from the typical one -- validating only at
+# K12/K24 makes a fit look worse than it is everywhere the DP actually selects.
+# FP8-CB has six legal rungs; one is the anchor, so the panel gives up a rung to
+# leave two genuine held-out rungs straddling it.
 VALIDATION_RUNGS = {
-    "nvfp4_cb": ("NVFP4_CB_K12", "NVFP4_CB_K24"),
-    "fp8_cb": ("FP8_CB_K36", "FP8_CB_K44"),
+    "nvfp4_cb": ("NVFP4_CB_K12", "NVFP4_CB_K15",
+                 "NVFP4_CB_K21", "NVFP4_CB_K24"),
+    "fp8_cb": ("FP8_CB_K32", "FP8_CB_K44"),
 }
 # The smallest role on a hybrid-attention dense model is the full-attention
 # block count (16 on Qwen3.8-27B), and plan_cb_panel_and_validation refuses a
@@ -516,6 +525,22 @@ def _authoritative_source_map(cb_context) -> dict[str, str]:
 def _panel_policy(roles: Mapping[str, str]) -> CBPanelPolicy:
     """One policy row per (family, role, basis) -- the role is load-bearing."""
     all_roles = sorted(set(roles.values()))
+    for family, rungs in VALIDATION_RUNGS.items():
+        anchor = ANCHOR_FORMATS.get((family, LATTICE_BASIS))
+        overlap = sorted(set(rungs) & set(PANEL_RUNGS.get(family, ())))
+        if anchor in rungs:
+            raise DenseCampaignError(
+                f"{family}: {anchor} is this segment's anchor and cannot also "
+                "be a validation rung -- the fit reproduces the anchor by "
+                "construction, so every such cell reports dex 0.0000 and the "
+                "held-out report reads better than the fit is. Choose a rung "
+                "the panel does not contain and the anchor is not."
+            )
+        if overlap:
+            raise DenseCampaignError(
+                f"{family}: validation rungs {overlap} are also panel rungs, "
+                "so the fit was trained on them and they measure nothing"
+            )
     return CBPanelPolicy(
         panel_rungs_by_segment={
             (family, role, LATTICE_BASIS): PANEL_RUNGS[family]
