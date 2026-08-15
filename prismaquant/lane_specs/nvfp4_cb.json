@@ -39,7 +39,7 @@
     },
     {
       "id": "ship_gate.ppl_p99nll",
-      "runner": "prismaquant.validate_quantized_model --base-url ... --shipcard",
+      "runner": "prismaquant.validate_quantized_model --base-url http://127.0.0.1:8000 --shipcard",
       "shipcard_slot": "ship_gate",
       "description": "Unchanged from the native lane: same validator, endpoint, and thresholds. For DSv4, serve_dsv4_cb_validate.sh eager invokes it before tearing down the exact nonce-bound server and explicitly verifies the resulting ship_gate slot."
     },
