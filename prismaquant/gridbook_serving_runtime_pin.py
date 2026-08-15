@@ -220,7 +220,8 @@ def require_exact_gridbook_serving_runtime_release(
 ) -> None:
     if not pin.commit_is_resolved or not pin.wheel_is_resolved:
         raise GridbookServingRuntimePinError(
-            "Gridbook 0.8.6 serving commit/wheel digest is still pending"
+            f"Gridbook {GRIDBOOK_SERVING_RUNTIME_RELEASE_VERSION} serving "
+            "commit/wheel digest is still pending"
         )
     if (
         pin.commit != GRIDBOOK_SERVING_RUNTIME_RELEASE_COMMIT
@@ -229,7 +230,8 @@ def require_exact_gridbook_serving_runtime_release(
         or pin.version_is_release is not True
     ):
         raise GridbookServingRuntimePinError(
-            "Gridbook serving runtime differs from the exact reviewed 0.8.6 release"
+            "Gridbook serving runtime differs from the exact reviewed "
+            f"{GRIDBOOK_SERVING_RUNTIME_RELEASE_VERSION} release"
         )
 
 

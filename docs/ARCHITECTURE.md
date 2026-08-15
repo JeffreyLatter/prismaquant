@@ -182,6 +182,22 @@ identifiers (`PRISMAQUANT_CB_FP8_GEMV_V2`, `PRISMAQUANT_CB_MOE_PERSISTENT_B_D2R`
 both declared and pinned **off** because they name lanes that did not exist in
 the runtime its accepted numbers were measured on.
 
+**Which pin a launcher crosses is a property of the artifact.** Until
+2026-08-15 `scripts/serve_dsv4_cb_validate.sh` was the only script sourcing
+`gridbook_serving_runtime.sh`; every other launcher sourced the build-pin
+helper and installed Gridbook 0.8.5 from source into `vllm-node:latest`. A CB
+artifact whose recipe assigns `model.embed_tokens` to NVFP4 cannot load that
+way — the quantized embedding mechanism does not exist before 0.8.7 — so the
+Qwen3.8-27B CB "A" build serves through
+`scripts/serve_qwen38_cb_a_smoke.sh`, the second serving-pin launcher, against
+`gridbook:0.8.7-clean-98916b0`. It still runs `install-container`, which here
+is a reinstall-and-verify no-op whose value is the assertion, not the install:
+it proves the running interpreter imports the exact reviewed archive. The
+membership set lives in `tests/test_gridbook_runtime_boundary.py`
+(`SERVING_PIN_SCRIPTS`); the two pins are independent and nothing cross-checks
+them, so choosing the wrong helper is a load-time failure rather than a
+warning.
+
 This revision retains the four 2026-07-30 architecture re-vet waves documented in
 `docs/audits/architecture_re-vet_2026-07-30.md` and closes the runtime-ownership debt: the
 vendored Gridbook tree and sync path are gone, producer ABI/menu/config facts have one owner,

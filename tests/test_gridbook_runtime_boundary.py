@@ -30,8 +30,19 @@ LIVE_SCRIPTS = (
     "serve_hy3_teb.sh",
     "serve_laguna_smoke.sh",
     "serve_qwen27b_smoke.sh",
+    "serve_qwen38_cb_a_smoke.sh",
     "smoke_nvfp4_cb_delegation.sh",
 )
+# Launchers that cross the *serving* pin (contract v4) rather than the build
+# pin (contract v3).  DSv4 was the only one until 2026-08-15: a CB artifact
+# whose recipe assigns model.embed_tokens to NVFP4 cannot load under the build
+# pin's Gridbook 0.8.5, because the quantized embedding mechanism ships in
+# 0.8.7.  Membership is a property of the artifact, not of the model family,
+# so this is a set rather than a name comparison.
+SERVING_PIN_SCRIPTS = frozenset({
+    "serve_dsv4_cb_validate.sh",
+    "serve_qwen38_cb_a_smoke.sh",
+})
 
 
 def _bash(script: str, *args: str) -> subprocess.CompletedProcess[str]:
@@ -206,7 +217,7 @@ def test_every_live_script_uses_the_one_external_runtime_helper():
     assert discovered == set(LIVE_SCRIPTS)
     for name in LIVE_SCRIPTS:
         text = (REPO / "scripts" / name).read_text(encoding="utf-8")
-        if name == "serve_dsv4_cb_validate.sh":
+        if name in SERVING_PIN_SCRIPTS:
             assert "gridbook_serving_runtime.sh" in text, name
             assert (
                 "prismaquant/gridbook_runtime/gridbook_serving_runtime.sh"

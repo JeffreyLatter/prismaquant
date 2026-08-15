@@ -15,6 +15,7 @@
     "scripts": [
       "scripts/serve_dsv4_cb_validate.sh",
       "scripts/serve_qwen27b_smoke.sh",
+      "scripts/serve_qwen38_cb_a_smoke.sh",
       "scripts/serve_hy3_smoke.sh",
       "scripts/serve_hy3_teb.sh",
       "scripts/serve_laguna_smoke.sh"
