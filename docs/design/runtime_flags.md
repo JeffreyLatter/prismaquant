@@ -18,6 +18,46 @@ versioned Gridbook source at the commit current on the reconciliation date
 its reading `file:line`; when a flag has several readers the row cites the one
 that decides behaviour and notes the others.
 
+## 0. Calibration corpus (`DATASET`, `PRISMAQUANT_CALIBRATION_DIR`)
+
+Calibration corpora are **built, not vendored** — the repo ships the builder,
+not the bytes, because the corpora are large and the mix is a methodological
+choice a user should make deliberately.
+
+| var | default | meaning |
+|---|---|---|
+| `PRISMAQUANT_CALIBRATION_DIR` | `<repo>/calibration` | where corpora live |
+| `DATASET` | `$PRISMAQUANT_CALIBRATION_DIR/diverse-v1.jsonl` | probe/cost/render calibration |
+| `EXPERT_GATE_DATASET` | `$PRISMAQUANT_CALIBRATION_DIR/xdom-gate-v1.jsonl` | MoE-only cross-domain GPTQ-vs-RTN gate corpus; must be DISJOINT from `DATASET`; set empty for the historical same-corpus gate |
+| `VALIDATED_FRONTIER_DATASET` | `$DATASET` | held-out KL selection corpus |
+
+`DATASET` accepts three things (`sensitivity_probe.load_calibration`): a local
+`.jsonl` (rows of `{"text": ...}` or `{"messages": [...]}`), a local `.txt`
+(one sample per line), or a HuggingFace dataset id.
+
+Build the default corpus with:
+
+```bash
+python tools/build_diverse_calibration.py \
+  --tokenizer <model dir or HF id> \
+  --output "$PRISMAQUANT_CALIBRATION_DIR/diverse-v1.jsonl"
+```
+
+It is a 40/20/20/20 prose/code/math/multilingual mix drawn from public HF
+datasets at pinned revisions, with a manifest as its first row, so it
+regenerates reproducibly on any machine. `--tokenizer` is required: rows are
+built to a token budget, so a corpus is only reusable across models whose
+tokenizers agree.
+
+**A local path that does not exist now fails immediately** and says so. It
+previously fell through to the HuggingFace loader, which reported
+`Dataset '/home/.../diverse-v1.jsonl' doesn't exist on the Hub or cannot be
+accessed` — an error naming a filesystem path as a dataset id, which reads as
+"you failed to download something" when in fact nothing is downloadable.
+There is no `xdom-gate-v1` builder in the repo yet; on a dense model that
+corpus is unused, and on MoE set `EXPERT_GATE_DATASET` to your own disjoint
+corpus (or empty, accepting the weaker same-corpus gate).
+
 All performance-critical paths can be tuned at runtime via env vars.
 Most proven probe/cost/export flags default ON and exist mostly for opt-out /
 debugging. CUDA graph flags are different: assignment-KL graph capture defaults
