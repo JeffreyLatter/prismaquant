@@ -657,25 +657,25 @@ def check_artifact_completeness(
                 report.missing_scale.append(unit)
             continue
 
-        if _unit_variants(unit) & declared.keys():
+        if _unit_variants(unit, profile) & declared.keys():
             report.passthrough_units.append(unit)
             if unit_scales:
                 claimed_scales |= unit_scales
             else:
                 report.missing_scale.append(unit)
-            if _unit_variants(unit) & ignored:
+            if _unit_variants(unit, profile) & ignored:
                 # Both statements cannot be true, and `ignore` is the one that
                 # loses the scale.
                 report.fp8_in_ignore.append(unit)
             continue
 
-        if _unit_variants(unit) & ignored:
+        if _unit_variants(unit, profile) & ignored:
             # THE ORIGINAL BUG. `ignore` means "plain unquantized floats", and
             # this tensor is not that. Checked before the config-group test so
             # a unit that is somehow both still reports the contradiction.
             report.fp8_in_ignore.append(unit)
             continue
-        if _claimed_by_self_or_ancestor(unit, group_claimed):
+        if _claimed_by_self_or_ancestor(unit, group_claimed, profile):
             report.cb_units.append(unit)
             claimed_scales |= unit_scales
             continue
@@ -685,9 +685,9 @@ def check_artifact_completeness(
         unit = _scale_unit(scale_key)
         if any(unit.startswith(prefix) for prefix in verbatim_prefixes):
             continue
-        if _claimed_by_self_or_ancestor(unit, declared):
+        if _claimed_by_self_or_ancestor(unit, declared, profile):
             continue
-        if _claimed_by_self_or_ancestor(unit, group_claimed):
+        if _claimed_by_self_or_ancestor(unit, group_claimed, profile):
             # An expert stack keeps its per-expert source scale planes only
             # when the stack was NOT collapsed; either way a group claims
             # them, so they are not orphans.
@@ -707,18 +707,42 @@ def check_artifact_completeness(
 _COLLAPSIBLE_COMPONENTS = ("shared_mlp", "shared_experts")
 
 
-def _unit_variants(unit: str) -> set[str]:
-    """Every spelling of *unit* a target may legitimately be written as."""
+def _unit_variants(unit: str, profile=None) -> set[str]:
+    """Every spelling of *unit* a target may legitimately be written as.
+
+    THE THIRD NAMESPACE. ``_checkpoint_spellings`` normalizes a claim written
+    in the RECIPE namespace into the checkpoint one, which covers CB groups and
+    passthrough declarations because Gridbook claims units by their checkpoint
+    names. A DELEGATED config group is different: compressed-tensors matches
+    its targets against vLLM's own module tree, so the exporter writes those in
+    the VLLM-INTERNAL namespace (`export_nvfp4_cb_streaming._delegated_target_
+    name` -> `profile.to_vllm_internal_name`). On every architecture this gate
+    had seen, that map was the identity and the difference was invisible. It is
+    not on a multimodal wrapper: Qwen3.8-27B stores `lm_head.weight` but vLLM
+    builds the head at `language_model.lm_head`, so a correct artifact declared
+    `re:^language_model[.]lm_head$` and the gate reported the head as claimed by
+    no mechanism at all.
+
+    Mapping the UNIT forward is what closes this, rather than inverting the
+    claim: ``to_vllm_internal_name`` is the producer's own map — the same one
+    that wrote the target — and it has no inverse to call.
+    """
 
     variants = {unit}
     parts = unit.split(".")
     for index, part in enumerate(parts):
         if part in _COLLAPSIBLE_COMPONENTS:
             variants.add(".".join(parts[:index] + parts[index + 1:]))
+    if profile is not None:
+        for spelling in tuple(variants):
+            try:
+                variants.add(profile.to_vllm_internal_name(spelling))
+            except Exception:              # pragma: no cover - defensive
+                pass
     return variants
 
 
-def _claimed_by_self_or_ancestor(unit: str, claimed) -> bool:
+def _claimed_by_self_or_ancestor(unit: str, claimed, profile=None) -> bool:
     """Whether *unit* or any dotted ancestor of it appears in *claimed*.
 
     Routed-expert groups are declared ONCE for the whole stack
@@ -730,7 +754,7 @@ def _claimed_by_self_or_ancestor(unit: str, claimed) -> bool:
     ``experts``.
     """
 
-    for variant in _unit_variants(unit):
+    for variant in _unit_variants(unit, profile):
         if variant in claimed:
             return True
         parts = variant.split(".")

@@ -68,12 +68,43 @@ _PUBLISHED_FILES = frozenset({
 # decoded-source semantics, source-complete render identity, completeness, and
 # output transaction.  Unrelated pipeline/probe modules remain outside this
 # one-purpose pre-export handoff.
+#
+# RE-FROZEN 2026-08-15 for four Qwen3.8-27B CB changes, each reviewed against
+# THIS handoff rather than merely re-hashed:
+#   export_nvfp4_cb_streaming.py -- ports the `quantized_embedding` declaration
+#     from export_nvfp4_cb (65bf9aa).  Every added branch is guarded by a
+#     non-empty `embedding_stock`, which is populated only from recipe units
+#     named `*.embed_tokens`.  A DSv4 W8A16 recipe assigns none, so
+#     `embedding_stock` is empty and each branch is inert on this lane:
+#     `sidecar_stock -= set(embedding_stock)` subtracts nothing and
+#     `(qname in sidecar_stock or qname in embedding_stock)` is unchanged.
+#   artifact_completeness.py -- also resolves a config-group target written in
+#     vLLM's module namespace (the delegated-target spelling) back to its
+#     checkpoint unit.  The change only ADDS spellings that can claim a unit,
+#     so it can turn a false failure into a pass and never the reverse, and the
+#     DeepSeek-v4 spec declares no `recipe_to_vllm` rewrite at all — on this
+#     lane the added spelling is the name the gate already tested.
+#   cb_export_config.py -- adds the `quantized_embedding` declaration builder
+#     and its wire-id table (683b605), plus comment-only text (82c0b30). The
+#     builder is called only from the embedding branch above, and its wire
+#     table admits NVFP4 alone; nothing on the W8A16 path reaches it.
+#   production_weight_cache.py -- NVFP4A16 now takes NVFP4's production render
+#     (28152ba), which changes rendered bytes only for units ASSIGNED
+#     NVFP4A16, a format this lane does not use; and a new
+#     `release_resident_tensors` method (1cb5e1c) that drops re-readable
+#     disk-backed copies while keeping every key resolvable — additive, and it
+#     cannot alter a rendered weight.
+#
+# The drift was introduced by this session's own commits and went unnoticed
+# because the gate reports only the FIRST mismatching file: refreshing one
+# digest simply advanced the error to the next. Enumerate the whole closure
+# when re-freezing.
 _FROZEN_EXPORT_SOURCE_SHA256 = {
     "prismaquant/export_nvfp4_cb_streaming.py": (
-        "f740ebd9b90e586fc10ffa975f2f624ee8f7f85b02bb927701e946989bc3319f"
+        "05ea8ece98086feccc487b036e3a746d131629f0dc7049ae38abc19f0187ba7e"
     ),
     "prismaquant/cb_export_config.py": (
-        "41ef8609736d419e12e86810d2dd005f8e09ade2ad138bf5d5c4f123087e3acb"
+        "a690dafe120c4a6fc077d34aad1b142ee4201ec4dedda9ccd35a7583dfb22770"
     ),
     "prismaquant/nvfp4_cb_formats.py": (
         "bd7cfa7a8930bf2652a86f2a87649d51bf2af497cd350890e9246c7ff01bce9f"
@@ -103,13 +134,13 @@ _FROZEN_EXPORT_SOURCE_SHA256 = {
         "5fa349dd47b024274d64f2ae17613138e35cea93a28b1ff6f016204980df471e"
     ),
     "prismaquant/production_weight_cache.py": (
-        "495108d5a57c1fe1ea2a89674270569318678085bd76bfe915f8bbbe5c087481"
+        "1cc27e3b64043f9873da528ae2aa128e37c15be303109509f713b8d738c59f36"
     ),
     "prismaquant/nvfp4_cb_footprint.py": (
         "2cfb677c3e180ebe71a07288bed0feb02ab17df89ba4d66e3dffb6ce06ce2e51"
     ),
     "prismaquant/artifact_completeness.py": (
-        "1f9723a9dfcf64ab05229e57d1859120fc8f5a4c92e55b5e54fc48dfeb2a83bf"
+        "bc6f3d23fee451f04e653633b408c0783c1905062cc50c502d18074fb1610e33"
     ),
     "prismaquant/export_output_safety.py": (
         "4af0a9d891313f1d9d031955e431e1e84c1ba0e11a9ce2605ea92de3bc3703b5"
@@ -238,6 +269,11 @@ def _verify_frozen_export_source_closure(
             f"PrismaQuant root is not a real directory: {repo_root}"
         )
     observed: dict[str, str] = {}
+    # Report the WHOLE drift, not the first file of it. Raising on the first
+    # mismatch makes a re-freeze an N-round-trip guessing game: each refreshed
+    # digest just advances the error to the next file, and the reviewer never
+    # sees the size of what they are being asked to re-approve.
+    drift: list[str] = []
     for relative, expected in _FROZEN_EXPORT_SOURCE_SHA256.items():
         path = _real_file(
             repo_root / relative,
@@ -245,11 +281,16 @@ def _verify_frozen_export_source_closure(
         )
         digest = _sha256(path)
         if digest != expected:
-            raise W8A16ExportHandoffError(
-                f"frozen exporter/source closure changed: {relative}; "
-                f"observed={digest}, expected={expected}"
+            drift.append(
+                f"{relative}; observed={digest}, expected={expected}"
             )
         observed[relative] = digest
+    if drift:
+        raise W8A16ExportHandoffError(
+            f"frozen exporter/source closure changed ({len(drift)} of "
+            f"{len(_FROZEN_EXPORT_SOURCE_SHA256)} file(s)): "
+            + "; ".join(drift)
+        )
     closure: dict[str, object] = {
         "schema": DSV4_W8A16_EXPORT_SOURCE_CLOSURE_SCHEMA,
         "files_sha256": observed,
