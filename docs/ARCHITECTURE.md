@@ -1,6 +1,14 @@
 # PrismaQuant Architecture
 
-As of: 2026-08-14 · branch `merge/proven-rescues` · re-stamped at `a56c6f8`
+As of: 2026-08-14 · branch `merge/proven-rescues` · re-stamped for
+`prismaquant.dense_anchored_cb` (a **dense** sibling driver for the
+platform-agnostic anchored-cost mechanism, and the first campaign to apply
+**AQUA on a CB menu** — the anchored branch adds the A-side rather than
+multiplying it by P5a's transfer, so AURA's activation blindness stops hiding
+the `NVFP4_CB`/`FP8_CB` A4↔A8 boundary; §4.3. It renders 27.5% of a full-menu
+campaign, transiently, where the stock `COST_MODE=aura` path would retain
+~865 GB. AQUA-on-CB remains a candidate until its served A/B lands.) Previously
+re-stamped at `a56c6f8`:
 (`run-pipeline.sh` now forwards **`ALLOW_PINNED`** to the allocator, so a
 profile-pinned `lm_head` can enter the DP budget instead of shipping at source
 dtype — 2.543 GB, 20% of a 13.0 GB card budget, on Qwen3.8-27B; §4.5. Recorded
@@ -1291,6 +1299,62 @@ eval per run. `auto` (the pre-ruling behaviour) stays selectable and is zero-add
 reports only from a measurement the run already made, otherwise recording the predicted sum with
 `measured_kl: null` and a status naming the reason. `0` disables. Either way it is a report —
 non-blocking, never touching an allocation.
+
+#### Dense CB sibling driver, and where AQUA enters the anchored lane
+
+`prismaquant.dense_anchored_cb` is the second caller of the same mechanism, for a
+**dense** model on the CB lane (first use: the Qwen3.8-27B 16 GiB gridbook artifact).
+It is a sibling of `dsv4_aura_cb_reprice`, never a refactor of it — that module is
+frozen so a shipped campaign replays byte-for-byte, and its routed/dense expert split,
+learned FP8-CB basis, two-rung routed ladder and W8A16 readmission lane have no dense
+analogue. The dense driver supplies only census, ladders, panel/validation policy,
+anchors and budget; all pricing stays in `anchored_cost` / `cb_anchored_cost`.
+
+Three dense-specific differences are structural rather than cosmetic:
+
+* **One source-payload class, so no `SourceClassFormatPlan`.** That planner splits the
+  menu into lower- and higher-rate classes and requires the expert menu to be a *strict
+  subset* of the nonexpert one; a dense model has nothing to split, and declaring a fake
+  expert menu would put a menu in the artifact no unit can take. `DensePlan` derives both
+  ladders from `format_registry` narrowed by the serving profile's production format rule
+  (which drops the research-only signed `NVFP4_CB_S13..S16`) and then, for `fp8_cb` only,
+  by `_serving_backed_family` (the `k % 4 == 0` fused mid-M law). `nvfp4_cb` declares no
+  fused rung at any version, so its whole ladder rides the documented fallback route —
+  a speed property, not a correctness one, and it restricts nothing. Module constants are
+  asserted against what was derived, so a runtime pin bump refuses instead of allocating
+  onto rungs the artifact cannot serve.
+* **One basis.** Learned codebooks are a measured null on Qwen dense (holdout ~1.00 across
+  K28–K43), so the campaign runs `CB_CODEBOOK_SOURCE_SCOPE=none` and there is no learned
+  segment. `_normalize_source_map` refuses "a global source scalar or K-range inference",
+  which is correct when a bundle is in play; scope `none` is that refusal's exact
+  complement — a declaration that *no* format takes a learned book, which entails the
+  per-format map rather than guessing it. The driver builds the map from the scope
+  explicitly and refuses every other bundle-less combination.
+* **AQUA is applied, and the anchored branch is why it can be.** AURA is
+  activation-quant-blind, so a pure anchored table prices `NVFP4_CB` (act_bits 4, group 16)
+  and `FP8_CB` (act_bits 8) identically on the A-side — the whole decision a CB menu is
+  made of. Since 2026-08-14 `allocator_candidates.cost_entry_predicted_dloss` reads the
+  anchored branch as `base + cost_entry_act_dloss(cost_entry)`: the A-side is **added**,
+  never multiplied by P5a's per-family constant, because that multiply is an estimator
+  *transfer* from weight space to output space and an anchored projection is already in
+  the right currency. So `PRISMAQUANT_ACTIVATION_FAIR_PRICING` does not gate AQUA here at
+  all. (The DSv4 driver still passes that kill switch; it landed 2026-08-11, three days
+  before AQUA-AURA, when P5a priced only the weight-only branches. Revisit it when DSv4 is
+  re-run with AQUA.)
+
+  The A-side reaches the rows through the separate `aqua_activation_cost` stage, merged
+  between pricing and the DP. It needs **no render** — `activation_dloss` reads the dense
+  `W[o,j]^2`, the card's `g_sq_sum` and the format's activation grid — so it layers onto a
+  production-rendered W-side with no rendering confound, and `--act-dir` makes its
+  `act_var` measured rather than modelled. The weight-only anchored payload is written and
+  kept, so the pre-AQUA allocation stays reproducible as the A/B arm; **AQUA-on-CB is a
+  candidate until that served KL/PPL A/B at matched bpp lands, not a result.**
+
+The economics on Qwen3.8-27B: 496 body units × 19 rungs is 9,424 full-menu cells; the
+anchored plan renders 992 anchors + 960 panel + 192 validation = **2,592 cells, 27.5%** —
+and transiently, so ~0 GB is retained. The stock `COST_MODE=aura` path would instead have
+built a *retained* format-menu cache at a measured 45.5 GB/rung (arm-b: 91 GB for two
+rungs), i.e. ~865 GB for this ladder, for a cache the exporter never reads.
 
 ### 4.4 L2 and L3 — retired 2026-07-30 (`archive/l3_propagated_2026-07-30/`)
 
