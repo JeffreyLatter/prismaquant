@@ -14,6 +14,7 @@ import pytest
 
 from prismaquant.gridbook_serving_runtime_pin import (
     GRIDBOOK_SERVING_RUNTIME_COMMIT_PENDING,
+    GRIDBOOK_SERVING_RUNTIME_RELEASE_VERSION,
     GRIDBOOK_SERVING_RUNTIME_WHEEL_SHA256_PENDING,
     GridbookServingRuntimePinError,
     load_gridbook_serving_runtime_pin,
@@ -27,7 +28,7 @@ def _resolved_payload() -> dict:
         "schema": "prismaquant.gridbook_serving_runtime_pin.v1",
         "repository": "https://github.com/RobTand/gridbook.git",
         "commit": "a" * 40,
-        "version": "0.8.6",
+        "version": GRIDBOOK_SERVING_RUNTIME_RELEASE_VERSION,
         "version_is_release": True,
         "wheel_sha256": "b" * 64,
         "runtime_contract_schema": "gridbook.runtime-contract.v4",
@@ -40,7 +41,7 @@ def _resolved_payload() -> dict:
 
 
 def test_packaged_serving_pin_is_resolved_and_loads_in_shell():
-    """The packaged pin resolves to v0.8.6, and the shell helper accepts it.
+    """The packaged pin resolves, and the shell helper accepts it.
 
     Until 2026-08-14 this asserted the opposite -- that the packaged pin was
     the PENDING sentinel and that the shell helper exited 2 on it. That was
@@ -56,7 +57,7 @@ def test_packaged_serving_pin_is_resolved_and_loads_in_shell():
     assert pin.commit != GRIDBOOK_SERVING_RUNTIME_COMMIT_PENDING
     assert pin.wheel_sha256 != GRIDBOOK_SERVING_RUNTIME_WHEEL_SHA256_PENDING
     assert pin.commit_is_resolved and pin.wheel_is_resolved
-    assert pin.version == "0.8.6"
+    assert pin.version == GRIDBOOK_SERVING_RUNTIME_RELEASE_VERSION
     assert pin.version_is_release is True
     require_exact_gridbook_serving_runtime_release(pin)
 
@@ -135,11 +136,12 @@ def test_resolved_serving_pin_requires_closed_v4_feature_set():
 
 
 def test_serving_helper_accepts_only_the_exact_resolved_wheel(tmp_path):
-    wheel = tmp_path / "gridbook-0.8.6-py3-none-any.whl"
+    wheel = tmp_path / f"gridbook-{GRIDBOOK_SERVING_RUNTIME_RELEASE_VERSION}-py3-none-any.whl"
     with zipfile.ZipFile(wheel, "w") as archive:
         archive.writestr(
-            "gridbook-0.8.6.dist-info/METADATA",
-            "Metadata-Version: 2.1\nName: gridbook\nVersion: 0.8.6\n",
+            f"gridbook-{GRIDBOOK_SERVING_RUNTIME_RELEASE_VERSION}.dist-info/METADATA",
+            "Metadata-Version: 2.1\nName: gridbook\nVersion: "
+            f"{GRIDBOOK_SERVING_RUNTIME_RELEASE_VERSION}\n",
         )
         archive.writestr("gridbook/__init__.py", "")
     payload = _resolved_payload()
@@ -310,23 +312,25 @@ def test_a_rejected_wheel_is_never_published_into_the_digest_cache(tmp_path):
     still moved into the digest directory, refusing the lane until the
     directory was removed by hand.
     """
-    good = tmp_path / "gridbook-0.8.6-py3-none-any.whl"
+    good = tmp_path / f"gridbook-{GRIDBOOK_SERVING_RUNTIME_RELEASE_VERSION}-py3-none-any.whl"
     with zipfile.ZipFile(good, "w") as archive:
         archive.writestr(
-            "gridbook-0.8.6.dist-info/METADATA",
-            "Metadata-Version: 2.1\nName: gridbook\nVersion: 0.8.6\n",
+            f"gridbook-{GRIDBOOK_SERVING_RUNTIME_RELEASE_VERSION}.dist-info/METADATA",
+            "Metadata-Version: 2.1\nName: gridbook\nVersion: "
+            f"{GRIDBOOK_SERVING_RUNTIME_RELEASE_VERSION}\n",
         )
         archive.writestr("gridbook/__init__.py", "")
     good_digest = hashlib.sha256(good.read_bytes()).hexdigest()
 
     # A DIFFERENT archive carrying the same name/version -- the shape of the
     # PyPI-vs-served-image mismatch that caused the incident.
-    other = tmp_path / "other" / "gridbook-0.8.6-py3-none-any.whl"
+    other = tmp_path / "other" / f"gridbook-{GRIDBOOK_SERVING_RUNTIME_RELEASE_VERSION}-py3-none-any.whl"
     other.parent.mkdir()
     with zipfile.ZipFile(other, "w") as archive:
         archive.writestr(
-            "gridbook-0.8.6.dist-info/METADATA",
-            "Metadata-Version: 2.1\nName: gridbook\nVersion: 0.8.6\n",
+            f"gridbook-{GRIDBOOK_SERVING_RUNTIME_RELEASE_VERSION}.dist-info/METADATA",
+            "Metadata-Version: 2.1\nName: gridbook\nVersion: "
+            f"{GRIDBOOK_SERVING_RUNTIME_RELEASE_VERSION}\n",
         )
         archive.writestr("gridbook/__init__.py", "# rebuilt\n")
     assert hashlib.sha256(other.read_bytes()).hexdigest() != good_digest
@@ -370,11 +374,12 @@ def test_a_poisoned_cache_entry_names_the_directory_to_remove(tmp_path):
     correct wheel that is never consulted.  Naming the directory is what
     makes the state recoverable.
     """
-    good = tmp_path / "gridbook-0.8.6-py3-none-any.whl"
+    good = tmp_path / f"gridbook-{GRIDBOOK_SERVING_RUNTIME_RELEASE_VERSION}-py3-none-any.whl"
     with zipfile.ZipFile(good, "w") as archive:
         archive.writestr(
-            "gridbook-0.8.6.dist-info/METADATA",
-            "Metadata-Version: 2.1\nName: gridbook\nVersion: 0.8.6\n",
+            f"gridbook-{GRIDBOOK_SERVING_RUNTIME_RELEASE_VERSION}.dist-info/METADATA",
+            "Metadata-Version: 2.1\nName: gridbook\nVersion: "
+            f"{GRIDBOOK_SERVING_RUNTIME_RELEASE_VERSION}\n",
         )
         archive.writestr("gridbook/__init__.py", "")
     payload = _resolved_payload()
@@ -385,11 +390,12 @@ def test_a_poisoned_cache_entry_names_the_directory_to_remove(tmp_path):
     destination = cache_dir / payload["wheel_sha256"]
     destination.mkdir(parents=True)
     with zipfile.ZipFile(
-        destination / "gridbook-0.8.6-py3-none-any.whl", "w"
+        destination / f"gridbook-{GRIDBOOK_SERVING_RUNTIME_RELEASE_VERSION}-py3-none-any.whl", "w"
     ) as archive:
         archive.writestr(
-            "gridbook-0.8.6.dist-info/METADATA",
-            "Metadata-Version: 2.1\nName: gridbook\nVersion: 0.8.6\n",
+            f"gridbook-{GRIDBOOK_SERVING_RUNTIME_RELEASE_VERSION}.dist-info/METADATA",
+            "Metadata-Version: 2.1\nName: gridbook\nVersion: "
+            f"{GRIDBOOK_SERVING_RUNTIME_RELEASE_VERSION}\n",
         )
         archive.writestr("gridbook/__init__.py", "# poisoned\n")
 

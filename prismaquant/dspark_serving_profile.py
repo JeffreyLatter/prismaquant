@@ -1,4 +1,4 @@
-"""Closed Gridbook-0.8.6 serving profile for the paired DSpark release gate.
+"""Closed Gridbook-0.8.7 serving profile for the paired DSpark release gate.
 
 This is deliberately separate from :mod:`prismaquant.gridbook_environment`.
 That module is the immutable Gridbook-0.8.5 producer/gold authority; changing
@@ -64,7 +64,7 @@ DSPARK_BASELINE_PREFILL_ROW_SCHEMA = (
 DSPARK_BASELINE_DECODE_ROW_SCHEMA = (
     "prismaquant.dspark_baseline_decode_row.v1"
 )
-DSPARK_PROFILE_ID = "dsv4-dspark-gridbook-0.8.6-v2-k5-256k"
+DSPARK_PROFILE_ID = "dsv4-dspark-gridbook-0.8.7-v2-k5-256k"
 
 DSPARK_IMAGE = (
     "eugr/spark-vllm@sha256:"
@@ -236,6 +236,7 @@ DSPARK_GRIDBOOK_ENVIRONMENT_ALLOWLIST = tuple(sorted((
     "PRISMAQUANT_CB_EXT_DIR",
     "PRISMAQUANT_CB_FP4V2_SCHED",
     "PRISMAQUANT_CB_FP4_FUSED_MIDM",
+    "PRISMAQUANT_CB_FP8_GEMV_V2",
     "PRISMAQUANT_CB_FP8_SCHED",
     "PRISMAQUANT_CB_FUSED_FP4",
     "PRISMAQUANT_CB_FUSED_FP4_MOE",
@@ -244,6 +245,7 @@ DSPARK_GRIDBOOK_ENVIRONMENT_ALLOWLIST = tuple(sorted((
     "PRISMAQUANT_CB_GROUPED_TRIM",
     "PRISMAQUANT_CB_MOE_PERSISTENT_B",
     "PRISMAQUANT_CB_MOE_PERSISTENT_B_CFG",
+    "PRISMAQUANT_CB_MOE_PERSISTENT_B_D2R",
     "PRISMAQUANT_CB_PREFILL",
     "PRISMAQUANT_CB_PREFILL_CHUNK_BYTES",
     "PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK",
@@ -268,6 +270,10 @@ _profile_environment = {
     "PRISMAQUANT_CB_EXT_DIR": "/opt/gridbook/ext-cache",
     "PRISMAQUANT_CB_FP4V2_SCHED": None,
     "PRISMAQUANT_CB_FP4_FUSED_MIDM": "0",
+    # v0.8.7 lanes, pinned OFF: they did not exist in the runtime this
+    # profile's accepted prefill/decode numbers were taken on, so
+    # enabling either is a measurement decision, not bookkeeping.
+    "PRISMAQUANT_CB_FP8_GEMV_V2": "0",
     "PRISMAQUANT_CB_FP8_SCHED": None,
     "PRISMAQUANT_CB_FUSED_FP4": None,
     "PRISMAQUANT_CB_FUSED_FP4_MOE": None,
@@ -276,6 +282,7 @@ _profile_environment = {
     "PRISMAQUANT_CB_GROUPED_TRIM": "1",
     "PRISMAQUANT_CB_MOE_PERSISTENT_B": "0",
     "PRISMAQUANT_CB_MOE_PERSISTENT_B_CFG": "0",
+    "PRISMAQUANT_CB_MOE_PERSISTENT_B_D2R": "0",
     "PRISMAQUANT_CB_PREFILL": None,
     "PRISMAQUANT_CB_PREFILL_CHUNK_BYTES": "1073741824",
     "PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK": None,
@@ -463,7 +470,7 @@ def _pin_payload(pin: GridbookServingRuntimePin | Mapping[str, Any]) -> dict[str
         != GRIDBOOK_SERVING_REQUIRED_ABI_FEATURES
     ):
         raise DSparkServingProfileError(
-            "Gridbook serving pin is not one exact released 0.8.6/v4 pin"
+            "Gridbook serving pin is not one exact released 0.8.7/v4 pin"
         )
     return payload
 
@@ -577,11 +584,11 @@ def expected_server_environment(
     }
 
 
-# These are the exact 0.8.6 source identifiers audited for this serving
+# These are the exact 0.8.7 source identifiers audited for this serving
 # profile.  ``VLLM_MOE_SKIP_PADDING`` is a vLLM capability mentioned by
 # Gridbook but resolved and attested through ``vllm.envs``; the W2 wildcard is
 # prose explaining the three individually registered W2 overrides.
-GRIDBOOK_086_SOURCE_NON_ENVIRONMENT_IDENTIFIERS = MappingProxyType({
+GRIDBOOK_087_SOURCE_NON_ENVIRONMENT_IDENTIFIERS = MappingProxyType({
     "PRISMAQUANT_ARTIFACT_INVENTORY_SCHEMA": "artifact schema constant",
     "PRISMAQUANT_CB_W2_": "documentation wildcard for registered W2 knobs",
     "PRISMAQUANT_OPS_CUDAGRAPH_UNSAFE": "retired no-op in a comment",
@@ -590,18 +597,18 @@ GRIDBOOK_086_SOURCE_NON_ENVIRONMENT_IDENTIFIERS = MappingProxyType({
     "VLLM_MOE_SKIP_PADDING": "resolved vLLM capability, not a Gridbook env read",
     "VLLM_TEST_FORCE_FP8_MARLIN": "external vLLM test flag in prose",
 })
-GRIDBOOK_086_VISIBLE_REGISTERED_ENVIRONMENT = frozenset(
+GRIDBOOK_087_VISIBLE_REGISTERED_ENVIRONMENT = frozenset(
     set(DSPARK_GRIDBOOK_ENVIRONMENT_ALLOWLIST)
     - {"PRISMAQUANT_CB_DECODE", "PRISMAQUANT_CB_EXPAND"}
 )
-GRIDBOOK_086_EXPECTED_SOURCE_IDENTIFIERS = frozenset({
-    *GRIDBOOK_086_VISIBLE_REGISTERED_ENVIRONMENT,
-    *GRIDBOOK_086_SOURCE_NON_ENVIRONMENT_IDENTIFIERS,
+GRIDBOOK_087_EXPECTED_SOURCE_IDENTIFIERS = frozenset({
+    *GRIDBOOK_087_VISIBLE_REGISTERED_ENVIRONMENT,
+    *GRIDBOOK_087_SOURCE_NON_ENVIRONMENT_IDENTIFIERS,
 })
 
 
 @dataclass(frozen=True)
-class Gridbook086SourceEnvironmentScan:
+class Gridbook087SourceEnvironmentScan:
     source_root: str
     identifiers: tuple[str, ...]
     registered_environment: tuple[str, ...]
@@ -644,9 +651,9 @@ def _gridbook_package_root(
     )
 
 
-def scan_gridbook_086_source_environment(
+def scan_gridbook_087_source_environment(
     source_root: str | os.PathLike[str],
-) -> Gridbook086SourceEnvironmentScan:
+) -> Gridbook087SourceEnvironmentScan:
     repo_root, package_root = _gridbook_package_root(source_root)
     locations: dict[str, set[str]] = {}
     for path in sorted(package_root.rglob("*")):
@@ -671,10 +678,10 @@ def scan_gridbook_086_source_environment(
     )
     classified = tuple(
         name for name in identifiers
-        if name in GRIDBOOK_086_SOURCE_NON_ENVIRONMENT_IDENTIFIERS
+        if name in GRIDBOOK_087_SOURCE_NON_ENVIRONMENT_IDENTIFIERS
     )
     known = set(registered) | set(classified)
-    return Gridbook086SourceEnvironmentScan(
+    return Gridbook087SourceEnvironmentScan(
         source_root=str(repo_root),
         identifiers=identifiers,
         registered_environment=registered,
@@ -683,7 +690,7 @@ def scan_gridbook_086_source_environment(
             name for name in identifiers if name not in known
         ),
         missing_expected_identifiers=tuple(sorted(
-            GRIDBOOK_086_EXPECTED_SOURCE_IDENTIFIERS - set(identifiers)
+            GRIDBOOK_087_EXPECTED_SOURCE_IDENTIFIERS - set(identifiers)
         )),
         locations=tuple(
             (name, tuple(sorted(paths)))
@@ -692,13 +699,13 @@ def scan_gridbook_086_source_environment(
     )
 
 
-def require_gridbook_086_source_compatible(
+def require_gridbook_087_source_compatible(
     source_root: str | os.PathLike[str],
-) -> Gridbook086SourceEnvironmentScan:
-    report = scan_gridbook_086_source_environment(source_root)
+) -> Gridbook087SourceEnvironmentScan:
+    report = scan_gridbook_087_source_environment(source_root)
     if report.unknown_identifiers or report.missing_expected_identifiers:
         raise DSparkServingProfileError(
-            "Gridbook 0.8.6 source environment drift: unknown="
+            "Gridbook 0.8.7 source environment drift: unknown="
             f"{list(report.unknown_identifiers)}, missing="
             f"{list(report.missing_expected_identifiers)}"
         )
@@ -713,7 +720,7 @@ def _validate_source_receipt(payload: Mapping[str, Any]) -> dict[str, Any]:
             "classified_non_environment", "unknown_identifiers",
             "missing_expected_identifiers", "locations", "receipt_sha256",
         },
-        where="Gridbook 0.8.6 source receipt",
+        where="Gridbook 0.8.7 source receipt",
     )
     unstamped = dict(payload)
     recorded = unstamped.pop("receipt_sha256")
@@ -721,21 +728,21 @@ def _validate_source_receipt(payload: Mapping[str, Any]) -> dict[str, Any]:
         payload.get("schema")
         != "prismaquant.gridbook_0_8_6_source_environment.v1"
         or payload.get("identifiers")
-        != sorted(GRIDBOOK_086_EXPECTED_SOURCE_IDENTIFIERS)
+        != sorted(GRIDBOOK_087_EXPECTED_SOURCE_IDENTIFIERS)
         or payload.get("registered_environment")
-        != sorted(GRIDBOOK_086_VISIBLE_REGISTERED_ENVIRONMENT)
+        != sorted(GRIDBOOK_087_VISIBLE_REGISTERED_ENVIRONMENT)
         or payload.get("classified_non_environment")
-        != sorted(GRIDBOOK_086_SOURCE_NON_ENVIRONMENT_IDENTIFIERS)
+        != sorted(GRIDBOOK_087_SOURCE_NON_ENVIRONMENT_IDENTIFIERS)
         or payload.get("unknown_identifiers") != []
         or payload.get("missing_expected_identifiers") != []
         or not isinstance(payload.get("locations"), list)
         or len(payload["locations"]) != len(
-            GRIDBOOK_086_EXPECTED_SOURCE_IDENTIFIERS
+            GRIDBOOK_087_EXPECTED_SOURCE_IDENTIFIERS
         )
         or any(
             not isinstance(row, list)
             or len(row) != 2
-            or row[0] not in GRIDBOOK_086_EXPECTED_SOURCE_IDENTIFIERS
+            or row[0] not in GRIDBOOK_087_EXPECTED_SOURCE_IDENTIFIERS
             or not isinstance(row[1], list)
             or not row[1]
             or row[1] != sorted(set(row[1]))
@@ -743,11 +750,11 @@ def _validate_source_receipt(payload: Mapping[str, Any]) -> dict[str, Any]:
             for row in payload["locations"]
         )
         or [row[0] for row in payload["locations"]]
-        != sorted(GRIDBOOK_086_EXPECTED_SOURCE_IDENTIFIERS)
+        != sorted(GRIDBOOK_087_EXPECTED_SOURCE_IDENTIFIERS)
         or recorded != _canonical_sha256(unstamped)
     ):
         raise DSparkServingProfileError(
-            "Gridbook 0.8.6 source namespace receipt is not closed"
+            "Gridbook 0.8.7 source namespace receipt is not closed"
         )
     return dict(payload)
 
@@ -958,14 +965,14 @@ def collect_runtime_evidence(
     gridbook_source_root: str | os.PathLike[str] | None = None,
     runtime_pin: GridbookServingRuntimePin | Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Collect one live 0.8.6/vLLM/FlashInfer preflight receipt."""
+    """Collect one live 0.8.7/vLLM/FlashInfer preflight receipt."""
 
     pin = (
         current_gridbook_serving_pin_payload()
         if runtime_pin is None else _pin_payload(runtime_pin)
     )
     attest_profile_environment()
-    source = require_gridbook_086_source_compatible(
+    source = require_gridbook_087_source_compatible(
         gridbook_source_root or _installed_gridbook_source_root()
     ).receipt()
     cache = inspect_flashinfer_tuned_cache(flashinfer_cache_path)
@@ -1103,7 +1110,7 @@ def validate_runtime_evidence(
             raise DSparkServingProfileError(
                 "FlashInfer tuned-cache bytes/capability changed"
             )
-        observed_source = require_gridbook_086_source_compatible(
+        observed_source = require_gridbook_087_source_compatible(
             _installed_gridbook_source_root()
         ).receipt()
         if observed_source != payload["gridbook_source_environment"]:
@@ -2164,7 +2171,7 @@ __all__ = [
     "ENTRPI_DSV4_REFERENCE_SHA256",
     "DSparkServingProfile",
     "DSparkServingProfileError",
-    "Gridbook086SourceEnvironmentScan",
+    "Gridbook087SourceEnvironmentScan",
     "apply_profile_environment",
     "attest_profile_environment",
     "build_baseline_comparison_evidence",
@@ -2175,8 +2182,8 @@ __all__ = [
     "expected_server_environment",
     "inspect_flashinfer_tuned_cache",
     "load_runtime_evidence",
-    "require_gridbook_086_source_compatible",
-    "scan_gridbook_086_source_environment",
+    "require_gridbook_087_source_compatible",
+    "scan_gridbook_087_source_environment",
     "serving_profile_receipt",
     "snapshot_profile_environment",
     "stamp_baseline_unit",

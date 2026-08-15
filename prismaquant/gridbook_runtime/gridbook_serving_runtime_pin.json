@@ -1,10 +1,10 @@
 {
   "schema": "prismaquant.gridbook_serving_runtime_pin.v1",
   "repository": "https://github.com/RobTand/gridbook.git",
-  "commit": "dde15e04eb2e3667f78fdacf7b3bc135f0372866",
-  "version": "0.8.6",
+  "commit": "98916b0975a174625af5503b04a09d6b270e4419",
+  "version": "0.8.7",
   "version_is_release": true,
-  "wheel_sha256": "d085506a74869ac6f0b609dd399bcdcdbabb6c9ea64fb055ec0438fba49b8f3a",
+  "wheel_sha256": "c58daf5d00d5bcb284b3b207e8f52d7751f9378f80e1a37b1ee6b530425714d4",
   "runtime_contract_schema": "gridbook.runtime-contract.v4",
   "required_abi_features": {
     "routed_moe_per_role_codebook_lut": 1,

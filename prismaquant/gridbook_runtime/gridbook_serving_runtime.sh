@@ -3,7 +3,7 @@
 #
 # This is deliberately separate from gridbook_runtime.sh.  The latter is the
 # immutable 0.8.5/v3 producer/handoff environment; current serving uses the
-# independently pinned 0.8.6/v4 release wheel and its published SHA-256.
+# independently pinned 0.8.7/v4 release wheel and its published SHA-256.
 
 _GRIDBOOK_SERVING_ASSET_DIR="$({
     cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P
@@ -43,8 +43,8 @@ if pin["schema"] != "prismaquant.gridbook_serving_runtime_pin.v1":
     raise SystemExit(f"{path}: unsupported serving-pin schema")
 if pin["repository"] != "https://github.com/RobTand/gridbook.git":
     raise SystemExit(f"{path}: unreviewed repository")
-if pin["version"] != "0.8.6" or pin["version_is_release"] is not True:
-    raise SystemExit(f"{path}: Gridbook 0.8.6 is not marked released")
+if pin["version"] != "0.8.7" or pin["version_is_release"] is not True:
+    raise SystemExit(f"{path}: Gridbook 0.8.7 is not marked released")
 if re.fullmatch(r"[0-9a-f]{40}", str(pin["commit"])) is None:
     raise SystemExit(f"{path}: release commit remains unresolved")
 if re.fullmatch(r"[0-9a-f]{64}", str(pin["wheel_sha256"])) is None:
@@ -226,6 +226,9 @@ _gridbook_serving_materialize_wheel() (
     # Observed 2026-08-14: the PyPI 0.8.6 wheel (content-identical to the
     # pinned artifact but a different archive) was cached under the pinned
     # digest and refused the lane until the directory was removed by hand.
+    # The 0.8.7 pin cannot reproduce that specific collision -- its image
+    # was built FROM the published archive, so the PyPI wheel and the pin
+    # agree -- but the fall-through defect this guards is version-agnostic.
     if ! gridbook_serving_runtime_verify_wheel "${published[0]}" >/dev/null; then
         _gridbook_serving_error \
             "materialized wheel does not match the pin; refusing to cache it"

@@ -6,6 +6,10 @@ import hashlib
 
 import pytest
 
+from prismaquant.gridbook_serving_runtime_pin import (
+    GRIDBOOK_SERVING_RUNTIME_RELEASE_VERSION,
+)
+
 import prismaquant.validate_dspark_target_draft as dsv
 
 
@@ -85,7 +89,7 @@ def _runtime_pin() -> dict:
         "schema": "prismaquant.gridbook_serving_runtime_pin.v1",
         "repository": "https://github.com/RobTand/gridbook.git",
         "commit": "a" * 40,
-        "version": "0.8.6",
+        "version": GRIDBOOK_SERVING_RUNTIME_RELEASE_VERSION,
         "version_is_release": True,
         "wheel_sha256": "b" * 64,
         "runtime_contract_schema": "gridbook.runtime-contract.v4",

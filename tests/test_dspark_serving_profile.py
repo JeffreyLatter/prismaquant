@@ -8,6 +8,9 @@ from pathlib import Path
 import pytest
 
 import prismaquant.dspark_serving_profile as dsp
+from prismaquant.gridbook_serving_runtime_pin import (
+    GRIDBOOK_SERVING_RUNTIME_RELEASE_VERSION,
+)
 import prismaquant.validate_cb_endpoint as cbv
 from prismaquant.gridbook_environment import CANONICAL_GOLD_ENVIRONMENT
 
@@ -16,7 +19,7 @@ _PIN = {
     "schema": "prismaquant.gridbook_serving_runtime_pin.v1",
     "repository": "https://github.com/RobTand/gridbook.git",
     "commit": "a" * 40,
-    "version": "0.8.6",
+    "version": GRIDBOOK_SERVING_RUNTIME_RELEASE_VERSION,
     "version_is_release": True,
     "wheel_sha256": "b" * 64,
     "runtime_contract_schema": "gridbook.runtime-contract.v4",
@@ -43,7 +46,7 @@ def _write_source_fixture(tmp_path: Path) -> Path:
     root = tmp_path / "gridbook-source"
     package = root / "gridbook"
     package.mkdir(parents=True)
-    names = sorted(dsp.GRIDBOOK_086_EXPECTED_SOURCE_IDENTIFIERS)
+    names = sorted(dsp.GRIDBOOK_087_EXPECTED_SOURCE_IDENTIFIERS)
     (package / "lane_select.py").write_text(
         "import os\n"
         "_CUDACXX = os.environ.get('CUDACXX')\n"
@@ -100,7 +103,7 @@ def _write_cache(tmp_path: Path) -> Path:
 
 
 def _runtime_evidence(tmp_path: Path) -> dict:
-    source_receipt = dsp.require_gridbook_086_source_compatible(
+    source_receipt = dsp.require_gridbook_087_source_compatible(
         _write_source_fixture(tmp_path)
     ).receipt()
     cache = dsp.inspect_flashinfer_tuned_cache(_write_cache(tmp_path))
@@ -108,13 +111,13 @@ def _runtime_evidence(tmp_path: Path) -> dict:
         "schema": dsp.DSPARK_RUNTIME_EVIDENCE_SCHEMA,
         "profile_receipt": dsp.serving_profile_receipt(_PIN),
         "packages": {
-            "gridbook": "0.8.6",
+            "gridbook": GRIDBOOK_SERVING_RUNTIME_RELEASE_VERSION,
             "vllm": dsp.DSPARK_VLLM_VERSION,
             "torch": dsp.DSPARK_TORCH_VERSION,
             dsp.DSPARK_FLASHINFER_DISTRIBUTION: dsp.DSPARK_FLASHINFER_VERSION,
         },
         "module_versions": {
-            "gridbook": "0.8.6",
+            "gridbook": GRIDBOOK_SERVING_RUNTIME_RELEASE_VERSION,
             "vllm": dsp.DSPARK_VLLM_VERSION,
             "torch": dsp.DSPARK_TORCH_VERSION,
             "flashinfer": dsp.DSPARK_FLASHINFER_VERSION,
@@ -276,7 +279,7 @@ def test_every_static_profile_leaf_rejects_a_restamped_mutation(path: tuple):
 
 def test_gridbook_0_8_6_source_namespace_is_exact_and_fail_closed(tmp_path: Path):
     root = _write_source_fixture(tmp_path)
-    report = dsp.require_gridbook_086_source_compatible(root)
+    report = dsp.require_gridbook_087_source_compatible(root)
     assert report.unknown_identifiers == ()
     assert report.missing_expected_identifiers == ()
 
@@ -284,13 +287,13 @@ def test_gridbook_0_8_6_source_namespace_is_exact_and_fail_closed(tmp_path: Path
     original = source.read_text(encoding="utf-8")
     source.write_text(original + "# PRISMAQUANT_CB_NEW_UNSCOPED\n", encoding="utf-8")
     with pytest.raises(dsp.DSparkServingProfileError, match="unknown=.*NEW_UNSCOPED"):
-        dsp.require_gridbook_086_source_compatible(root)
+        dsp.require_gridbook_087_source_compatible(root)
 
     source.write_text(
         original.replace("# PRISMAQUANT_CB_GEMV\n", ""), encoding="utf-8"
     )
     with pytest.raises(dsp.DSparkServingProfileError, match="missing=.*CB_GEMV"):
-        dsp.require_gridbook_086_source_compatible(root)
+        dsp.require_gridbook_087_source_compatible(root)
 
 
 def test_tuned_cache_requires_every_exact_2048_bucket_and_positive_tactic(tmp_path: Path):

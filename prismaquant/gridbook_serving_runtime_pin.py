@@ -1,8 +1,8 @@
 """Strict reader for the current Gridbook serving-runtime release pin.
 
 The historical ``gridbook_runtime_pin.v3`` remains immutable producer and
-handoff evidence for the 0.8.5 render.  Serving DSpark is a distinct consumer
-boundary: it requires the 0.8.6/v4 ABI and an exact reviewed wheel digest.
+handoff evidence for the 0.8.5 render.  Serving is a distinct consumer
+boundary: it requires the v4 ABI and an exact reviewed wheel digest.
 This module deliberately accepts conspicuous pending sentinels structurally
 so a release patch can be reviewed before Gridbook is cut, while every live
 serve/ship gate rejects those sentinels.
@@ -25,32 +25,39 @@ GRIDBOOK_SERVING_RUNTIME_PIN_SCHEMA = (
 GRIDBOOK_SERVING_RUNTIME_REPOSITORY = (
     "https://github.com/RobTand/gridbook.git"
 )
-GRIDBOOK_SERVING_RUNTIME_RELEASE_VERSION = "0.8.6"
+GRIDBOOK_SERVING_RUNTIME_RELEASE_VERSION = "0.8.7"
 GRIDBOOK_SERVING_RUNTIME_COMMIT_PENDING = (
-    "PENDING_GRIDBOOK_V0_8_6_RELEASE_COMMIT"
+    "PENDING_GRIDBOOK_V0_8_7_RELEASE_COMMIT"
 )
 GRIDBOOK_SERVING_RUNTIME_WHEEL_SHA256_PENDING = (
-    "PENDING_GRIDBOOK_V0_8_6_WHEEL_SHA256"
+    "PENDING_GRIDBOOK_V0_8_7_WHEEL_SHA256"
 )
-# Resolved 2026-08-14 against the v0.8.6 release.  Neither value is guessed,
+# Resolved 2026-08-15 against the v0.8.7 release.  Neither value is guessed,
 # and neither is transcribed from the other's source:
-#   commit  -- annotated tag v0.8.6, which the release workflow refuses to
+#   commit  -- annotated tag v0.8.7, which the release workflow refuses to
 #              build unless the commit is reachable from origin/master.  It is
-#              also the build recorded in the measured image tag
-#              `gridbook:0.8.6-clean-dde15e0`, i.e. the runtime the accepted
-#              prefill/decode numbers were taken on.
+#              also the build recorded in the image tag
+#              `gridbook:0.8.7-clean-98916b0`.
 #   wheel   -- read out of that image's installed distribution, from the PEP
 #              610 `direct_url.json` `archive_info.hashes.sha256` of
-#              gridbook-0.8.6-py3-none-any.whl.  This is the digest of the
+#              gridbook-0.8.7-py3-none-any.whl.  This is the digest of the
 #              wheel that is actually importable at serve time, which is the
-#              only digest a serving pin may assert; a locally rebuilt or a
-#              PyPI-published wheel is a DIFFERENT artifact and must not be
-#              substituted here without re-reading it from the served image.
+#              only digest a serving pin may assert; a locally rebuilt wheel is
+#              a DIFFERENT archive and must not be substituted here without
+#              re-reading it from the served image.
+#
+# Unlike the 0.8.6 pin, this digest IS the PyPI wheel's: the image was built by
+# installing the published `gridbook==0.8.7` archive from a local file rather
+# than rebuilding it, so `pip download gridbook==0.8.7` now satisfies the pin
+# instead of tripping the wheel-cache trap documented in
+# docs/audits/serving_wheel_cache_poisoning_2026-08-14.md.  Verified before
+# use: all 59 members of the PyPI wheel are byte-identical to a local rebuild
+# from the tag, so the published archive is this commit's content.
 GRIDBOOK_SERVING_RUNTIME_RELEASE_COMMIT = (
-    "dde15e04eb2e3667f78fdacf7b3bc135f0372866"
+    "98916b0975a174625af5503b04a09d6b270e4419"
 )
 GRIDBOOK_SERVING_RUNTIME_RELEASE_WHEEL_SHA256 = (
-    "d085506a74869ac6f0b609dd399bcdcdbabb6c9ea64fb055ec0438fba49b8f3a"
+    "c58daf5d00d5bcb284b3b207e8f52d7751f9378f80e1a37b1ee6b530425714d4"
 )
 GRIDBOOK_SERVING_RUNTIME_CONTRACT_SCHEMA = "gridbook.runtime-contract.v4"
 GRIDBOOK_SERVING_REQUIRED_ABI_FEATURES = {

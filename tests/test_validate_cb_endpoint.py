@@ -7,6 +7,10 @@ from pathlib import Path
 
 import pytest
 
+from prismaquant.gridbook_serving_runtime_pin import (
+    GRIDBOOK_SERVING_RUNTIME_RELEASE_VERSION,
+)
+
 import prismaquant.validate_cb_endpoint as cbv
 from prismaquant.gridbook_environment import (
     CANONICAL_GOLD_ENVIRONMENT,
@@ -46,7 +50,7 @@ _RELEASED_SERVING_PIN = {
     "schema": "prismaquant.gridbook_serving_runtime_pin.v1",
     "repository": "https://github.com/RobTand/gridbook.git",
     "commit": "a" * 40,
-    "version": "0.8.6",
+    "version": GRIDBOOK_SERVING_RUNTIME_RELEASE_VERSION,
     "version_is_release": True,
     "wheel_sha256": "b" * 64,
     "runtime_contract_schema": "gridbook.runtime-contract.v4",

@@ -9,6 +9,9 @@ import re
 import subprocess
 
 from prismaquant.gridbook_serving_runtime_pin import (
+    GRIDBOOK_SERVING_RUNTIME_RELEASE_COMMIT,
+    GRIDBOOK_SERVING_RUNTIME_RELEASE_WHEEL_SHA256,
+    GRIDBOOK_SERVING_RUNTIME_RELEASE_VERSION,
     GRIDBOOK_SERVING_RUNTIME_COMMIT_PENDING,
     GRIDBOOK_SERVING_RUNTIME_WHEEL_SHA256_PENDING,
 )
@@ -69,11 +72,15 @@ def test_gridbook_pins_separate_immutable_producer_from_current_serving():
     assert serving == {
         "schema": "prismaquant.gridbook_serving_runtime_pin.v1",
         "repository": "https://github.com/RobTand/gridbook.git",
-        "commit": "dde15e04eb2e3667f78fdacf7b3bc135f0372866",
-        "version": "0.8.6",
+        # Bound to the module constants rather than re-typed as literals.
+        # The invariant worth defending is that the packaged JSON and the
+        # module agree -- two files that must move together on a release.
+        # Literals additionally assert "the pin may never change", which is
+        # false, and which is exactly how the 0.8.6 -> 0.8.7 bump found this.
+        "commit": GRIDBOOK_SERVING_RUNTIME_RELEASE_COMMIT,
+        "version": GRIDBOOK_SERVING_RUNTIME_RELEASE_VERSION,
         "version_is_release": True,
-        "wheel_sha256":
-            "d085506a74869ac6f0b609dd399bcdcdbabb6c9ea64fb055ec0438fba49b8f3a",
+        "wheel_sha256": GRIDBOOK_SERVING_RUNTIME_RELEASE_WHEEL_SHA256,
         "runtime_contract_schema": "gridbook.runtime-contract.v4",
         "required_abi_features": {
             "routed_moe_per_role_codebook_lut": 1,
