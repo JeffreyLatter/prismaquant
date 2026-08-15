@@ -1,6 +1,13 @@
 # PrismaQuant Architecture
 
-As of: 2026-08-15 · branch `merge/proven-rescues` · re-stamped for
+As of: 2026-08-15 · branch `merge/proven-rescues` · re-stamped for the
+**Gridbook 0.8.7 serving pin** (advanced from 0.8.6 so the CB lane can serve a
+`quantized_embedding`, which no released runtime could; the build pin stays at
+0.8.5/v3, the serving contract stays v4 byte-for-byte, and the fused mid-M
+backed set is carried forward under a new key rather than widened — §3.2. The
+0.8.7 image was built from the *published* wheel, so the served-image digest
+rule and `pip download` now name the same archive and the 2026-08-14 cache
+collision cannot recur at this version.) Previously re-stamped for
 `prismaquant.dense_anchored_cb` (a **dense** sibling driver for the
 platform-agnostic anchored-cost mechanism, and the first campaign to apply
 **AQUA on a CB menu** — the anchored branch adds the A-side rather than
@@ -46,7 +53,7 @@ contract, the finalized-assignment/render/source exact-scope closure, stable
 pre/post DSpark serving-stack fingerprint equality, claim-aware optional-slot
 verification, canonical DSpark group/layout/assignment and logical-codebook
 payload closure, canonical frozen-byte/full-file-set publication authority with
-remote parent-commit CAS, the separate current-consumer Gridbook-0.8.6 serving
+remote parent-commit CAS, the separate current-consumer Gridbook-0.8.7 serving
 profile and paired DSpark runtime/route census, strict
 matched no-MTP/K12-MTP throughput-and-headroom release gate with a source-closed,
 lifecycle-owned arm collector, reference-only
@@ -111,12 +118,13 @@ evidence for the current runtime: the release path is the separately gated
 112.690 GB AURA artifact authorized only by the exact W8A16 handoff.
 
 That 0.8.5/v3 record is deliberately immutable producer and handoff evidence;
-it is not silently repointed when the serving plugin changes. DSpark serving
-has a second, current-consumer pin in
-`gridbook_runtime/gridbook_serving_runtime_pin.json`. It names Gridbook 0.8.6,
-runtime-contract v4, the routed-MoE/source-FP8 features above, and
+it is not silently repointed when the serving plugin changes. Serving has a
+second, current-consumer pin in
+`gridbook_runtime/gridbook_serving_runtime_pin.json`. It names Gridbook **0.8.7**
+(advanced from 0.8.6 on 2026-08-15), runtime-contract v4, the
+routed-MoE/source-FP8 features above, and
 `dspark_construction_physical_bridge=1`. **That pin is now RESOLVED** (release
-commit `dde15e04`, `version_is_release=true`), superseding this section's former
+commit `98916b09`, `version_is_release=true`), superseding this section's former
 description of it as `PENDING_...` sentinels;
 `test_packaged_serving_pin_is_resolved_and_loads_in_shell` asserts the resolved
 state from both the Python and shell readers.
@@ -128,25 +136,51 @@ first branch trusts the directory name, so caching a rejected wheel is permanent
 and bricks the lane (2026-08-14 incident; guarded and regression-tested in
 `tests/test_gridbook_serving_runtime_pin.py`).
 
-**Open policy question — which wheel the digest names.** This section formerly
-required the digest "reported by the published PyPI file", on the ground that a
-local pre-tag wheel is not byte-reproducible evidence. The shipped pin does the
-opposite, and `prismaquant/gridbook_serving_runtime_pin.py` states that rule
-normatively: the digest is read out of the **served image**
-(`gridbook:0.8.6-clean-dde15e0`) — the runtime the accepted prefill/decode
-numbers were taken on — and "a locally rebuilt or a PyPI-published wheel is a
-DIFFERENT artifact and must not be substituted here". Both cannot be the rule.
-Measured 2026-08-14: the two 0.8.6 wheels are **content-identical** (all 58
-archive members byte-for-byte equal; they differ only in zip container
-metadata), and the PyPI wheel was built by the release run from exactly the
-pinned commit `dde15e04` — so the two rules select the same *code* and differ
-only in which archive's digest is asserted. The consequence is operational, not
-semantic: because the pin names the image wheel, a plain
-`pip download gridbook==0.8.6` does **not** satisfy it, and the serving lane
-must be given `GRIDBOOK_SERVING_RUNTIME_WHEEL=<wheel extracted from the served
-image>` (or a correctly populated cache). Resolving which rule governs is
-Robert's call; until then the code is authoritative and this paragraph records
-the tension rather than hiding it.
+**Which wheel the digest names — the tension is now dissolved in practice, not
+resolved in principle.** This section formerly required the digest "reported by
+the published PyPI file", on the ground that a local pre-tag wheel is not
+byte-reproducible evidence. The shipped pin does the opposite, and
+`prismaquant/gridbook_serving_runtime_pin.py` states that rule normatively: the
+digest is read out of the **served image** — the runtime the accepted numbers
+were taken on — and "a locally rebuilt wheel is a DIFFERENT archive and must not
+be substituted here". Both cannot be the rule.
+
+At 0.8.6 the two rules genuinely disagreed on which archive to name. Measured
+2026-08-14: the two 0.8.6 wheels were **content-identical** (all 58 archive
+members byte-for-byte equal; they differ only in zip container metadata), and
+the PyPI wheel was built by the release run from exactly the pinned commit
+`dde15e04` — so the rules selected the same *code* and differed only in which
+archive's digest was asserted. The consequence was operational: a plain
+`pip download gridbook==0.8.6` did **not** satisfy that pin, and the lane had to
+be given `GRIDBOOK_SERVING_RUNTIME_WHEEL=<wheel extracted from the served image>`
+(or a correctly populated cache).
+
+**0.8.7 makes them agree.** `gridbook:0.8.7-clean-98916b0` was built by
+installing the *published* `gridbook==0.8.7` archive from a local file, so the
+image's PEP 610 `archive_info.hashes.sha256` **is** the PyPI wheel's digest
+(`c58daf5d…`). The served-image rule still governs — the pin is still read out
+of the image — but it now selects the published archive, so `pip download` and
+the cache path both satisfy it and the 2026-08-14 poisoning collision cannot
+recur at this version. Verified before use: all 59 members of the PyPI wheel are
+byte-identical to a local rebuild from the tag. Which rule is normative when
+they *don't* coincide is still Robert's call; building the image from the
+published wheel is the cheap way to keep the question moot.
+
+**What 0.8.7 changes, and what it does not.** It adds the `quantized_embedding`
+serving mechanism (`model.embed_tokens` as a Gridbook-claimed, weight-only unit
+— vLLM's compressed-tensors embedding path raises for FP4/FP8) and re-audits the
+vLLM 0.26 dense-NVFP4 preflight, which had no entry for the
+`FlashInferCutlassNvFp4LinearKernel` that 0.26's ladder actually selects and so
+failed closed on every delegated dense W4A4 group. Its three new routed-MoE
+kernel lanes are all opt-in and default-off, and `gridbook/runtime_contract.py`
+is byte-identical to 0.8.6 — contract v4 and the three-feature ABI closure carry
+over, so the **build** pin (0.8.5/v3) is untouched and the fused mid-M backed set
+`{28,32,36,40,44,48}` is carried forward under a new `0.8.7` key rather than
+widened. The DSpark serving profile shares this pin; its closed source census
+was re-run against both tags rather than assumed, and gains exactly two
+identifiers (`PRISMAQUANT_CB_FP8_GEMV_V2`, `PRISMAQUANT_CB_MOE_PERSISTENT_B_D2R`),
+both declared and pinned **off** because they name lanes that did not exist in
+the runtime its accepted numbers were measured on.
 
 This revision retains the four 2026-07-30 architecture re-vet waves documented in
 `docs/audits/architecture_re-vet_2026-07-30.md` and closes the runtime-ownership debt: the
