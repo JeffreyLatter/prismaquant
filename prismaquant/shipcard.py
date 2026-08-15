@@ -197,15 +197,33 @@ CB_PERFORMANCE_PHASE_METRICS: Mapping[str, tuple[tuple[str, str], ...]] = {
 # ---------------------------------------------------------------------------
 # Identity
 # ---------------------------------------------------------------------------
-def compute_model_sha(model_dir: str | os.PathLike) -> str:
+def compute_model_sha(
+    model_dir: str | os.PathLike,
+    *,
+    legacy_native_scope: bool = False,
+) -> str:
     """Cheap, stable identity for an exported checkpoint.
 
-    Native artifacts retain the legacy config plus per-container-size identity.
-    CB artifacts additionally bind canonical ``quant_config.json`` (excluding
-    only its self-referential inventory), the exporter-produced exact SHA-256
-    manifest of every large safetensors container, and every ``.pqcb`` sidecar
-    content hash. Routine verification validates the manifest shape/sizes and
-    uses the shipcard's stat attestation instead of rereading ~100 GB.
+    CB artifacts bind canonical ``quant_config.json`` (excluding only its
+    self-referential inventory), the exporter-produced exact SHA-256 manifest
+    of every large safetensors container, every ``.pqcb`` sidecar content hash,
+    and the content of every remaining file. Routine verification validates the
+    manifest shape/sizes and uses the shipcard's stat attestation instead of
+    rereading ~100 GB.
+
+    Native artifacts once bound only ``config.json`` plus per-container SIZES,
+    so the auxiliary files were unattested: swapping ``chat_template.jinja`` or
+    ``tokenizer.json`` left the sha bit-identical. That is not cosmetic on a
+    tool-calling model -- the chat template decides where a tool call is
+    emitted, and a served artifact with the wrong one is broken in a way no
+    weight check sees. Demonstrated 2026-08-15 on the published Qwen3.8-27B
+    native artifact: tampering with its chat template moved nothing.
+
+    Both lanes now hash auxiliary content. ``legacy_native_scope=True``
+    reproduces the pre-fix native identity so cards written under it still
+    verify -- see :func:`verify`, which tries the current scope first and
+    falls back. New cards are always written with the current scope, and the
+    legacy scope cannot produce one, so the fallback never weakens a new card.
     """
     root = Path(model_dir)
     if not root.is_dir():
@@ -257,7 +275,7 @@ def compute_model_sha(model_dir: str | os.PathLike) -> str:
     }
     if codebooks:
         payload["codebooks"] = codebooks
-    if raw_quant_cfg is not None:
+    if raw_quant_cfg is not None or not legacy_native_scope:
         excluded = {SHIPCARD_FILENAME, "quant_config.json"}
         auxiliary = {
             path.relative_to(root).as_posix(): {
@@ -399,7 +417,13 @@ def reattest_weight_stats(
             "weight content differs from the immutable export manifest; "
             "refusing to refresh the stat attestation"
         )
-    if compute_model_sha(root) != card.get("model_sha"):
+    expected_model_sha = card.get("model_sha")
+    if expected_model_sha not in {
+        compute_model_sha(root),
+        # Same legacy tolerance as `verify`: a card written before native
+        # auxiliary files were attested keeps verifying under its own identity.
+        compute_model_sha(root, legacy_native_scope=True),
+    }:
         raise ValueError("copied artifact model_sha differs from the shipcard")
     card["weight_stat_attestation"] = weight_stat_attestation(root)
     card["updated"] = _now()
@@ -752,6 +776,16 @@ def verify(
         try:
             assert_weight_stat_attestation(card, model_dir)
             on_disk = compute_model_sha(model_dir)
+            if expected_sha and on_disk != expected_sha:
+                # A card written before native auxiliary files were attested
+                # still describes its artifact faithfully under the identity it
+                # was computed with. Accept that identity rather than declaring
+                # every published native artifact changed -- but only as a
+                # fallback, so a current-scope card is never checked the weak
+                # way (the legacy scope cannot produce a current-scope sha).
+                legacy = compute_model_sha(model_dir, legacy_native_scope=True)
+                if legacy == expected_sha:
+                    on_disk = legacy
         except Exception as exc:
             problems.append(
                 "artifact changed since the shipcard was opened or its "

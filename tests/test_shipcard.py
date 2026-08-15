@@ -871,3 +871,64 @@ def test_native_lane_gold_slots_are_verified_at_all(tmp_path):
         assert any(
             p == f"{slot}: missing full producer git commit" for p in problems
         ), problems
+
+
+def test_native_model_sha_attests_the_chat_template(tmp_path):
+    """A native card used to bind config.json plus container SIZES only.
+
+    Auxiliary files went unhashed unless the artifact carried a
+    `quant_config.json` (i.e. unless it was a CB artifact), so swapping
+    `chat_template.jinja` or `tokenizer.json` on a native checkpoint left
+    `model_sha` bit-identical. Demonstrated 2026-08-15 on the published
+    Qwen3.8-27B native artifact. That is not cosmetic on a tool-calling model:
+    the chat template decides where a tool call is emitted, so a served
+    artifact with the wrong one is broken in a way no weight check sees.
+    """
+    model_dir = _artifact(tmp_path)
+    (model_dir / "chat_template.jinja").write_text("{{ messages }}")
+    (model_dir / "tokenizer.json").write_text('{"version": "1"}')
+
+    before = compute_model_sha(model_dir)
+    (model_dir / "chat_template.jinja").write_text("{{ messages }}{# swap #}")
+    assert compute_model_sha(model_dir) != before
+
+    (model_dir / "chat_template.jinja").write_text("{{ messages }}")
+    assert compute_model_sha(model_dir) == before
+    (model_dir / "tokenizer.json").write_text('{"version": "2"}')
+    assert compute_model_sha(model_dir) != before
+
+
+def test_a_card_written_under_the_legacy_native_scope_still_verifies(tmp_path):
+    """Published native cards must not all read as 'artifact changed'.
+
+    The legacy identity described its artifact faithfully under the rules it
+    was computed with, so `verify` accepts it as a FALLBACK. It must remain a
+    fallback: the legacy scope cannot produce a current-scope sha, so a card
+    written today is never checked the weak way.
+    """
+    model_dir = _artifact(tmp_path)
+    (model_dir / "chat_template.jinja").write_text("{{ messages }}")
+
+    legacy_sha = compute_model_sha(model_dir, legacy_native_scope=True)
+    assert legacy_sha != compute_model_sha(model_dir)
+
+    path = _open_card(tmp_path, model_dir)
+    card = load_shipcard(path)
+    card["model_sha"] = legacy_sha
+    write_shipcard(path, card)
+    _fill_all(path, legacy_sha)
+
+    assert verify(load_shipcard(path), model_dir=model_dir) == []
+
+    # The legacy scope hashes container SIZES, so a same-size weight swap is
+    # exactly what it could never see -- and still cannot. This test pins the
+    # tolerance as bounded, not as a hole: what it accepts is the old
+    # guarantee, never less.
+    (model_dir / "chat_template.jinja").write_text("{{ messages }}{# swap #}")
+    assert verify(load_shipcard(path), model_dir=model_dir) == []
+
+    (model_dir / "model-00001-of-00001.safetensors").write_bytes(b"longer!!")
+    assert any(
+        "artifact changed since the shipcard was opened" in problem
+        for problem in verify(load_shipcard(path), model_dir=model_dir)
+    )
