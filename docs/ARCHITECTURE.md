@@ -3621,7 +3621,24 @@ Load smoke `dq-runs/embed-smoke/` (a deliberately untied synthetic Qwen3 with
 resident-vs-disk byte equality, zero pad codes, and served lookup **bit-identical**
 to decoding the on-disk tensors — passing under **both** eager and CUDA-graph
 capture (principle 9). Serving artifact A therefore requires a gridbook release
-carrying this mechanism, and that pin bump is itself a serving promotion.
+carrying this mechanism, and that pin bump is itself a serving promotion. Note
+the smoke deliberately runs as a `PYTHONPATH` shadow, which the *pinned* serving
+path rejects by design — it proves the mechanism, not the release.
+
+**Delegated NVFP4 W4A4 was unservable on vLLM 0.26 until 2026-08-14.** Gridbook
+hands non-CB groups back to vLLM and then fails **closed** on any resolved
+backend absent from its audited table (no env bypass, on purpose — the table
+exists because Marlin's NVFP4 selector passes a W4A4 declaration and then
+rebuilds the config with both activation-scale arguments `None`, running
+weight-only arithmetic under a W4A4 label). The table knew
+`CutlassNvFp4LinearKernel`; this build's ladder selects
+`FlashInferCutlassNvFp4LinearKernel`, so **every stock NVFP4 W4A4 Linear was
+refused**. Re-audited and admitted: `input_quant_key()` is `kNvfp4Dynamic` and
+`apply_weights` feeds a real `x_blockscale` to
+`flashinfer_scaled_fp4_mm(backend="cutlass")` — the activation contract is
+honoured and the operator is CUTLASS, FlashInfer being only the wrapper. This
+matters for artifact A's recipe: a mixed CB artifact containing any stock NVFP4
+W4A4 Linear would otherwise have failed at load, after the export.
 
 **Closed Gridbook-0.8.5 measurement environment (29 names).** This is a PrismaQuant release-
 evidence profile, not a second catalog of Gridbook's general runtime defaults. The authority is
