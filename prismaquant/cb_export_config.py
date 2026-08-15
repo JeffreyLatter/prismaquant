@@ -106,6 +106,31 @@ _NO_SCALE_PLANE_DTYPE_NAMES = frozenset({"none", ""})
 SOURCE_PASSTHROUGH_DECLARATION_KEY = "source_passthrough"
 SOURCE_PASSTHROUGH_DECLARATION_VERSION = 1
 
+# The `quantized_embedding` declaration (top-level key in quant_config.json)
+# ---------------------------------------------------------------------------
+# WIRE CONTRACT, consumer side ``gridbook.embedding.SCHEMA_KEY``.  The token
+# embedding is neither a Linear nor a routed-expert group, so neither of the
+# declarations here can name it -- and it cannot go in ``config_groups``
+# either: that is compressed-tensors' closed vocabulary, whose embedding path
+# accepts weight-only INT schemes and RAISES for FP8/NVFP4.  A stock group
+# naming the embedding would not merely mis-route it, it would refuse to load
+# the artifact.  Hence a separate key that only Gridbook reads.
+#
+# ABSENCE means "the embedding ships unquantized", exactly as in every artifact
+# written before this key existed.  The producer therefore OMITS the key rather
+# than writing an empty record -- an empty ``units`` would be a positive claim
+# that the embedding was considered and left alone, which is a different
+# statement.
+#
+# The id table is hand-pinned for the same reason the passthrough one is: a
+# local rename of a registry format must not be able to silently change what a
+# shipped artifact claims at the other end.
+QUANTIZED_EMBEDDING_DECLARATION_KEY = "quantized_embedding"
+QUANTIZED_EMBEDDING_DECLARATION_VERSION = 1
+QUANTIZED_EMBEDDING_WIRE_IDS: dict[str, str] = {
+    "NVFP4": "nvfp4",
+}
+
 # PROPOSED cross-repository producer/consumer contract.  The producer emits
 # this only when at least one routed-expert family is split into more than one
 # format subgroup.  Keep the key/version beside ``source_passthrough``: both
@@ -422,6 +447,158 @@ def build_source_passthrough_declaration(
     }
 
 
+def build_quantized_embedding_declaration(
+    units: Mapping[str, str],
+) -> dict[str, Any]:
+    """Build + validate the declaration from ``{unit id: registry format}``.
+
+    A UNIT here is a module name that resolves to a ``VocabParallelEmbedding``
+    at serve time -- ``model.embed_tokens`` on every architecture shipped so
+    far.  Deliberately a map rather than a single name: a model with more than
+    one embedding table (multimodal towers, a separate MTP embedding) can name
+    each, and a model with none simply omits the key.
+
+    NOT ``lm_head``.  ``ParallelLMHead`` subclasses ``VocabParallelEmbedding``
+    in vLLM, so a producer that named the head here would get it dispatched as
+    a lookup rather than through compressed-tensors' linear method -- taking
+    the output projection off the GEMM path.  The consumer refuses that, and so
+    does this: refusing at write time turns a silent serving regression into a
+    failed export.
+    """
+
+    if not units:
+        raise ValueError(
+            "quantized_embedding needs at least one unit; an artifact whose "
+            "embedding ships unquantized must OMIT the key (its absence is "
+            "what marks every artifact written before this key existed)"
+        )
+    declared: dict[str, str] = {}
+    for unit_id, format_name in units.items():
+        unit = str(unit_id)
+        if not unit or unit != unit.strip():
+            raise ValueError(
+                f"quantized_embedding unit id {unit_id!r} is not a usable "
+                "module name"
+            )
+        leaf = unit.rsplit(".", 1)[-1]
+        if leaf == "lm_head":
+            raise ValueError(
+                f"quantized_embedding unit {unit!r} names the output "
+                "projection. ParallelLMHead subclasses VocabParallelEmbedding, "
+                "so declaring it here dispatches the head as a LOOKUP instead "
+                "of through compressed-tensors' linear method; put lm_head in "
+                "config_groups, where a quantized head is already served."
+            )
+        canonical = fr.canonical_format_name(str(format_name))
+        wire_id = QUANTIZED_EMBEDDING_WIRE_IDS.get(canonical)
+        if wire_id is None:
+            raise ValueError(
+                f"quantized_embedding unit {unit!r} declares format "
+                f"{format_name!r}, which has no consumer route "
+                f"(known: {sorted(QUANTIZED_EMBEDDING_WIRE_IDS)}). Adding one "
+                "is a serving promotion and needs its own end-to-end KL "
+                "evidence, not a table entry."
+            )
+        declared[unit] = wire_id
+    return {
+        "version": QUANTIZED_EMBEDDING_DECLARATION_VERSION,
+        "units": dict(sorted(declared.items())),
+    }
+
+
+def parse_quantized_embedding_declaration(
+    quant_config: Mapping[str, Any],
+) -> dict[str, str]:
+    """The CONSUMER's refusals, re-implemented so the producer never trips one.
+
+    Deliberately a second implementation rather than an import of
+    ``gridbook.embedding.parse_declaration``: the consumer lives in another
+    repository and needs vLLM to import, so a producer that depended on it
+    could not run in the build venv at all.  What matters is that every refusal
+    the consumer implements is a load failure at the other end, so the exporter
+    reads its own record back through these rules before the file exists.
+    """
+
+    record = quant_config.get(QUANTIZED_EMBEDDING_DECLARATION_KEY)
+    if record is None:
+        return {}
+    if not isinstance(record, Mapping):
+        raise ValueError(
+            f"{QUANTIZED_EMBEDDING_DECLARATION_KEY} must be an object, got "
+            f"{type(record).__name__}"
+        )
+    if record.get("version") != QUANTIZED_EMBEDDING_DECLARATION_VERSION:
+        raise ValueError(
+            f"unsupported {QUANTIZED_EMBEDDING_DECLARATION_KEY} version "
+            f"{record.get('version')!r}"
+        )
+    units = record.get("units")
+    if not isinstance(units, Mapping) or not units:
+        raise ValueError(
+            f"{QUANTIZED_EMBEDDING_DECLARATION_KEY} carries no units; the key "
+            "must be omitted rather than emitted empty"
+        )
+    known = set(QUANTIZED_EMBEDDING_WIRE_IDS.values())
+    out: dict[str, str] = {}
+    for unit_id, wire_id in units.items():
+        if not isinstance(unit_id, str) or not isinstance(wire_id, str):
+            raise ValueError(
+                f"{QUANTIZED_EMBEDDING_DECLARATION_KEY} units must map string "
+                "module names to string wire ids"
+            )
+        if wire_id not in known:
+            raise ValueError(
+                f"{QUANTIZED_EMBEDDING_DECLARATION_KEY} unit {unit_id!r} "
+                f"declares wire id {wire_id!r}, which no released consumer "
+                f"routes (known: {sorted(known)})"
+            )
+        out[unit_id] = wire_id
+
+    # One unit, one owner. A declared embedding that ALSO appears in a config
+    # group would be claimed by two dispatches, and which one wins is decided
+    # by branch order in the consumer rather than by anything the producer
+    # wrote -- the exact ambiguity the CB/passthrough split is refused over.
+    # ALL groups, not just CB ones: a STOCK group naming the embedding is the
+    # worse case, because compressed-tensors raises on a non-INT embedding
+    # scheme and the artifact then does not load at all.
+    claimed = _all_config_group_targets(quant_config)
+    for unit_id in out:
+        leaf = unit_id.rsplit(".", 1)[-1]
+        if unit_id in claimed or leaf in claimed:
+            raise ValueError(
+                f"unit {unit_id!r} is declared in "
+                f"{QUANTIZED_EMBEDDING_DECLARATION_KEY} and is ALSO a "
+                "config_groups target; exactly one dispatch may own a unit's "
+                "resident weights"
+            )
+    return out
+
+
+def _all_config_group_targets(quant_config: Mapping[str, Any]) -> set[str]:
+    """Target names EVERY config group claims -- CB and stock alike.
+
+    ``_cb_config_group_targets`` deliberately looks only at CB groups, because
+    the overlap that matters for a passthrough unit is with the CB decoder.
+    For the embedding the risk runs the other way: a STOCK group is the one
+    that makes compressed-tensors raise on a non-INT embedding scheme, so the
+    check that protects the embedding has to see groups this one skips.
+    """
+
+    targets: set[str] = set()
+    groups = quant_config.get("config_groups")
+    if not isinstance(groups, Mapping):
+        return targets
+    for group in groups.values():
+        if not isinstance(group, Mapping):
+            continue
+        for target in group.get("targets") or ():
+            name = str(target)
+            if name.startswith("re:^") and name.endswith("$"):
+                name = name[len("re:^"):-1].replace("[.]", ".")
+            targets.add(name)
+    return targets
+
+
 def _cb_config_group_targets(quant_config: Mapping[str, Any]) -> set[str]:
     """Target names the CB config groups claim, un-anchored."""
 
@@ -731,6 +908,7 @@ def build_quant_config(
     native_source_target_name: TargetName = _identity_target,
     requant_target_name: TargetName = _identity_target,
     source_passthrough_units: Mapping[str, str] | None = None,
+    quantized_embedding_units: Mapping[str, str] | None = None,
     per_expert_format_groups: Mapping[str, Any] | None = None,
     route_pending_passthrough_acknowledged: Iterable[str] = (),
     research_cost_selection: Mapping[str, Any] | None = None,
@@ -1017,6 +1195,13 @@ def build_quant_config(
         # failure at the other end, so the producer must never be the one to
         # generate one.
         parse_source_passthrough_declaration(quant_config)
+    if quantized_embedding_units:
+        quant_config[QUANTIZED_EMBEDDING_DECLARATION_KEY] = (
+            build_quantized_embedding_declaration(quantized_embedding_units)
+        )
+        # Same discipline as the passthrough record above: read it back
+        # through the consumer's rules before the file exists.
+        parse_quantized_embedding_declaration(quant_config)
     if per_expert_format_groups:
         declaration = deepcopy(dict(per_expert_format_groups))
         if declaration.get("version") != PER_EXPERT_FORMAT_GROUPS_VERSION:
@@ -1041,6 +1226,9 @@ def build_quant_config(
 
 __all__ = [
     "DELEGATED_NATIVE_PASSTHROUGH_FORMATS",
+    "QUANTIZED_EMBEDDING_DECLARATION_KEY",
+    "QUANTIZED_EMBEDDING_DECLARATION_VERSION",
+    "QUANTIZED_EMBEDDING_WIRE_IDS",
     "SOURCE_PASSTHROUGH_DECLARATION_KEY",
     "SOURCE_PASSTHROUGH_DECLARATION_VERSION",
     "SOURCE_PASSTHROUGH_EXPORT_FORMATS",
@@ -1052,7 +1240,9 @@ __all__ = [
     "PassthroughWire",
     "build_cb_scheme",
     "build_quant_config",
+    "build_quantized_embedding_declaration",
     "build_source_passthrough_declaration",
+    "parse_quantized_embedding_declaration",
     "cb_scheme_reuse_signature",
     "codebook_tensor_names",
     "codebook_tensors",
