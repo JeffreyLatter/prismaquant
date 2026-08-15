@@ -770,12 +770,18 @@ def _merge_aqua_a_side(
         activation_dloss_table, merge_act_dloss,
     )
     from prismaquant.allocator_candidates import ACT_DLOSS_KEY
+    from prismaquant.sensitivity_card import SensitivityCard
 
     args = prepared.args
     with weight_only_path.open("rb") as handle:
         blob = pickle.load(handle)
     costs = blob["costs"]
-    card = np.load(args.aqua_card, allow_pickle=True)
+    # The card is a SCHEMA, not an npz: its arrays are stored under per-unit
+    # prefixed keys (`<code>_g_sq_sum` ...) with the unit map in `__header__`,
+    # so a raw np.load hands activation_dloss_table something that KeyErrors on
+    # the first qname. Load and validate it exactly as the stage's own CLI does.
+    card = SensitivityCard.from_npz(args.aqua_card)
+    card.validate()
     formats = sorted({fmt for row in costs.values() for fmt in row})
     table, holes, meta = activation_dloss_table(
         card, args.model, formats, device=args.aqua_device,
@@ -791,6 +797,8 @@ def _merge_aqua_a_side(
     provenance["aqua_activation_cost"] = {
         "card_path": os.path.abspath(args.aqua_card),
         "card_sha256": _sha256(args.aqua_card),
+        "card_fingerprint": card.provenance.fingerprint(),
+        "card_units": len(card),
         "formats_priced": formats,
         "holes": {key: len(value) for key, value in holes.items()},
         "merge_report": report,
@@ -873,6 +881,45 @@ def _allocator_command(
     return command
 
 
+def _recipe_format(qname: str, value: object) -> str:
+    """Recover the selected format from one allocator recipe cell.
+
+    A CB cell is NOT a format string: the allocator emits the full render
+    identity (`data_type`, `cb_k`, activation contract, and a
+    `cb_serialized_identity` JSON blob) so the exporter reproduces the exact
+    encode. The serialized identity is authoritative because it is what the
+    export render-identity gate compares against; `data_type`+`cb_k` is the
+    fallback, and native/source cells go through the same shared parser the
+    exporter uses rather than a second interpretation of the same fields.
+    """
+    if isinstance(value, str):
+        return fr.canonical_format_name(value)
+    if not isinstance(value, Mapping):
+        raise DenseCampaignError(
+            f"allocator recipe cell for {qname} is not an object"
+        )
+    serialized = value.get("cb_serialized_identity")
+    if isinstance(serialized, str):
+        try:
+            format_name = json.loads(serialized).get("format")
+        except (TypeError, ValueError):
+            format_name = None
+        if format_name:
+            return fr.canonical_format_name(str(format_name))
+    data_type = str(value.get("data_type", "")).lower()
+    if data_type in {"nvfp4_cb", "fp8_cb"}:
+        return f"{data_type.upper()}_K{int(value['cb_k'])}"
+    try:
+        from prismaquant.layer_config import canonicalize_format
+
+        return fr.canonical_format_name(canonicalize_format(value))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise DenseCampaignError(
+            f"cannot recover the selected format for {qname} from "
+            f"data_type={data_type!r}"
+        ) from exc
+
+
 def _selected_assignment(
     layer_config: Path, units: Sequence[UnitSpec],
 ) -> dict[str, str]:
@@ -882,16 +929,7 @@ def _selected_assignment(
     for qname, value in recipe.items():
         if qname == "__prismaquant__" or qname not in known:
             continue
-        if isinstance(value, str):
-            assignment[qname] = fr.canonical_format_name(value)
-        elif isinstance(value, Mapping) and value.get("format"):
-            assignment[qname] = fr.canonical_format_name(
-                str(value["format"])
-            )
-        else:
-            raise DenseCampaignError(
-                f"allocator recipe cell for {qname} is not a format"
-            )
+        assignment[qname] = _recipe_format(qname, value)
     missing = sorted(known - set(assignment))
     if missing:
         raise DenseCampaignError(
