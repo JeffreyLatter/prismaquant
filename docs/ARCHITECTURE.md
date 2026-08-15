@@ -1,7 +1,11 @@
 # PrismaQuant Architecture
 
-As of: 2026-08-14 · branch `merge/proven-rescues` · re-stamped at `1dbf146`
-(AQUA-AURA's activation term now reaches a production allocation, and its
+As of: 2026-08-14 · branch `merge/proven-rescues` · re-stamped at `e586670`
+(the CB lane can now ship a **quantized token embedding**: a weight-only
+`quantized_embedding` wire contract that rides neither `config_groups` nor
+`ignore`, with its gridbook serving mechanism proven under eager *and*
+CUDA-graph capture — §6.2 and §9.2. Previously re-stamped at `1dbf146`:
+AQUA-AURA's activation term now reaches a production allocation, and its
 `act_var` can be measured on real cached activations rather than modelled — see
 the AQUA-AURA note below and §"Three cost tiers"). Previously verified against
 implementation baseline commit `ed4f2e0` (v0.12.3) merged with the Sensitivity
@@ -1998,6 +2002,45 @@ passes load/generation plus served speed/quality gates. Implementation:
 `artifact_completeness.py`; CPU contract coverage:
 `tests/test_per_expert_cb_export.py`.
 
+**The `quantized_embedding` wire contract (v1, gridbook lane only, 2026-08-14).**
+A token embedding is a *lookup*, not a GEMM, so it cannot ride `config_groups`:
+vLLM's compressed-tensors embedding path accepts weight-only INT (WNA16) and
+**raises** for FP8/NVFP4, meaning a stock `config_groups` entry naming the
+embedding does not mis-route the artifact, it refuses to load it. The CB lane
+therefore declares it out-of-band:
+
+```
+quantized_embedding = {"version": 1, "units": {"<module>": "<wire id>"}}
+```
+
+Producer `build_quantized_embedding_declaration` (`cb_export_config.py:450-520`),
+attached `:1198-1200`; classification and emission in `export_nvfp4_cb.py`.
+Three properties are load-bearing:
+
+- **Weight-only.** Three tensors (`weight_packed`, `weight_scale`,
+  `weight_global_scale`) and no `input_global_scale` — a lookup has no input
+  activation, the serving method registers no such parameter, and emitting one
+  is an unmatched checkpoint key at load.
+- **Out of both `config_groups` and `ignore`.** Before this, the exporter copied
+  the embedding verbatim *and* appended it to `ignore`, so the 1.70 GiB was
+  never actually recoverable.
+- **Never `lm_head`.** `ParallelLMHead` subclasses `VocabParallelEmbedding`, so
+  a producer naming the head here would take the output projection off the GEMM
+  path. Refused at write (`:484-491`), at parse, and at `create_weights`.
+
+Classification is deliberately **two independent conditions** — the name
+(`.embed_tokens`) and the shape (rows == declared vocab, and not the head) —
+which must agree or the export fails rather than guessing. The declared vocab is
+read through a `text_config` walk because multimodal checkpoints keep the LM's
+vocab there: Qwen3.8-27B has **no top-level `vocab_size`**, so a naive read would
+see zero and silently disable the shape half of the cross-check.
+
+Measured on Qwen3.8-27B (exact full-vocab KL, isolated marginal on a BF16 body;
+model total gold KL 0.0338): NVFP4 group-16 costs **0.666 GiB vs BF16's 2.368**
+at KL 0.001063 weight-only / **0.000948 under a 4-bit activation floor** — i.e.
+it gets *better* in the regime artifact A actually serves. FP8 per-row and INT8
+W8A16 are both 1.185 GiB; INT4 W4A16 g128 is 0.611 GiB at 0.001963.
+
 ### 6.3 FP8_SOURCE verbatim, MTP, audits
 
 `_build_fp8_source_map` `:5747-5854`: a tensor qualifies when `<base>.weight` has a sibling
@@ -3547,6 +3590,38 @@ cache contains its own `.git` object database and can be created from a verified
 no network access; concurrent publishers use the same temporary-directory/atomic-rename law as
 the remote-fetch path. A non-hex pending commit or `version_is_release=false` is rejected before
 checkout materialization or installation.
+
+**Quantized token embedding (`gridbook.embedding`, 2026-08-14).** The consumer
+half of the `quantized_embedding` contract in §6.2. Dispatch matches the declared
+unit against the serving prefix through `_candidate_bases`, and canonicalizes the
+*stored* keys at parse (`canonicalize=_canonical_target`), so both sides land in
+one namespace — load-bearing on Qwen3.8-27B, where three spellings are live at
+once: checkpoint `model.language_model.embed_tokens`, vLLM module
+`language_model.model.embed_tokens` (components **swapped**), and canonical
+`model.embed_tokens`. Verified across all three, both directions.
+
+Two failure modes are worth recording because neither is reachable by unit test:
+
+- **vLLM's post-load sweep is an `isinstance` check, not duck typing.**
+  `model_loader/utils.process_weights_after_loading` selects with
+  `isinstance(quant_method, QuantizeMethodBase)`. A method that implements the
+  entire surface *structurally* without being a subclass is skipped **in
+  silence**: weights load, dispatch is correct, the artifact inspects clean, and
+  the model dies on its **first forward** with a missing derived attribute. The
+  fix is virtual subclass registration (`QuantizeMethodBase.register(...)`) bound
+  from `create_weights`, which keeps `apply` ours to refuse and the module
+  importable without vLLM. Found by a load smoke; no unit test in either
+  repository could have found it, because the sweep exists only inside vLLM.
+- **Vocab padding meets packed nibbles.** vLLM pads the vocab to a multiple of 64
+  and zero-fills the pad rows. On packed uint8 that is zero *codes*, which decode
+  to 0.0 — true by arithmetic rather than by assumption, so the smoke asserts it.
+
+Load smoke `dq-runs/embed-smoke/` (a deliberately untied synthetic Qwen3 with
+`vocab=4104`, chosen non-multiple-of-64 to keep the padding path live): dispatch,
+resident-vs-disk byte equality, zero pad codes, and served lookup **bit-identical**
+to decoding the on-disk tensors — passing under **both** eager and CUDA-graph
+capture (principle 9). Serving artifact A therefore requires a gridbook release
+carrying this mechanism, and that pin bump is itself a serving promotion.
 
 **Closed Gridbook-0.8.5 measurement environment (29 names).** This is a PrismaQuant release-
 evidence profile, not a second catalog of Gridbook's general runtime defaults. The authority is

@@ -1812,7 +1812,12 @@ def main():
                          "n_params. Empty = current behavior (backwards-compat). "
                          "Shipping a quantized pinned name also needs cache "
                          "render + export packing + vLLM serving support "
-                         "(lm_head: yes; embed_tokens: serving unverified).")
+                         "(lm_head: yes, native lane; embed_tokens: yes on the "
+                         "GRIDBOOK lane only, via the quantized_embedding "
+                         "declaration -- the native compressed-tensors "
+                         "embedding path accepts weight-only INT and RAISES "
+                         "for FP8/NVFP4, so a stock config_groups entry does "
+                         "not mis-serve, it refuses to load).")
     ap.add_argument("--pareto-targets",
                     default="4.5,4.6,4.7,4.75,4.85,5.0,5.25,5.5,6.0,7.0,8.25",
                     help="Comma-separated budgets to sweep for Pareto curve")

@@ -453,8 +453,13 @@ def build_quantized_embedding_declaration(
     """Build + validate the declaration from ``{unit id: registry format}``.
 
     A UNIT here is a module name that resolves to a ``VocabParallelEmbedding``
-    at serve time -- ``model.embed_tokens`` on every architecture shipped so
-    far.  Deliberately a map rather than a single name: a model with more than
+    at serve time.  It is NOT always ``model.embed_tokens``: Qwen3.8-27B is a
+    ``Qwen3_5ForConditionalGeneration`` whose checkpoint spells it
+    ``model.language_model.embed_tokens`` while vLLM's module path swaps the
+    components to ``language_model.model.embed_tokens``.  The consumer
+    canonicalizes both the stored key and the serving prefix, so any of the
+    three vintages resolves -- verified across all three, both directions.
+    Deliberately a map rather than a single name: a model with more than
     one embedding table (multimodal towers, a separate MTP embedding) can name
     each, and a model with none simply omits the key.
 
