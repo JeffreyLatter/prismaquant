@@ -37,6 +37,9 @@ from prismaquant.export_native_compressed import (  # noqa: E402
     build_quantization_config,
     compute_nvfp4_global_real,
 )
+from prismaquant.cb_export_config import (  # noqa: E402
+    parse_quantized_embedding_declaration,
+)
 from prismaquant.model_profiles import detect_profile  # noqa: E402
 from prismaquant.shipcard import (  # noqa: E402
     CB_REQUIRED_SLOTS,
@@ -2533,3 +2536,105 @@ def test_excluded_namespace_absence_is_valid_to_the_completeness_gate(workdir):
     report = check_artifact_completeness(kept)
     assert not report.ok
     assert "mtp.0.attn.wq_a" in report.missing_scale
+
+
+def _embedding_model(mdl: Path, vocab: int = 64, hid: int = 256) -> None:
+    """A model whose config declares vocab_size, so the embedding cross-check
+    has both halves to agree on."""
+    torch.manual_seed(3)
+    mdl.mkdir(parents=True, exist_ok=True)
+    save_file({
+        "model.embed_tokens.weight":
+            (torch.randn(vocab, hid) * 0.3).to(torch.bfloat16),
+        "model.layers.0.self_attn.q_proj.weight":
+            (torch.randn(128, hid) * 0.3).to(torch.bfloat16),
+        "model.norm.weight": torch.ones(hid, dtype=torch.bfloat16),
+    }, str(mdl / "model.safetensors"))
+    (mdl / "config.json").write_text(
+        json.dumps({"hidden_size": hid, "vocab_size": vocab})
+    )
+
+
+def test_streaming_ships_the_quantized_embedding_like_the_in_memory_exporter(
+    workdir,
+):
+    """The 13.0 GB card lane needs a quantized embedding AND streaming.
+
+    The embedding declaration lived only in the in-memory exporter, which
+    materialises the whole model twice over and OOMs on a 27B. Porting it is
+    only safe if the streamed artifact is the in-memory one byte-for-byte, so
+    that is what this asserts -- alongside the two properties the consumer
+    actually depends on: the unit is claimed by the `quantized_embedding`
+    declaration and NOT by a config group (vLLM's compressed-tensors embedding
+    path raises for NVFP4), and it carries no `input_global_scale` (a lookup
+    has no input activation, so the serving method registers no such
+    parameter and an emitted one is an unmatched checkpoint key at load).
+    """
+    mdl = workdir / "model"
+    _embedding_model(mdl)
+    ap = workdir / "a.json"
+    _assign(ap, {
+        "model.embed_tokens": "NVFP4",
+        "model.layers.0.self_attn.q_proj": {"data_type": "nvfp4_cb",
+                                            "cb_k": 16},
+    })
+    cw = {"model.layers.0.self_attn.q_proj": torch.rand(256) + 0.05}
+
+    counts_mem = export_nvfp4_cb(mdl, ap, workdir / "m", cw, device="cpu")
+    counts_str = export_nvfp4_cb_streaming(
+        mdl, ap, workdir / "s", cw, device="cpu")
+    assert dict(counts_mem) == dict(counts_str)
+
+    tm = load_file(str(workdir / "m" / "model.safetensors"))
+    ts = load_file(str(workdir / "s" / "model.safetensors"))
+    assert _tensors_equal(tm, ts)
+
+    qm = json.loads((workdir / "m" / "quant_config.json").read_text())
+    qs = json.loads((workdir / "s" / "quant_config.json").read_text())
+    assert qm["config_groups"] == qs["config_groups"]
+    assert qm["ignore"] == qs["ignore"]
+
+    # The wire spelling is the consumer's lowercase one, not the recipe's.
+    declaration = parse_quantized_embedding_declaration(qs)
+    assert declaration == {"model.embed_tokens": "nvfp4"}
+    assert declaration == parse_quantized_embedding_declaration(qm)
+
+    claimed = {
+        target
+        for group in qs["config_groups"].values()
+        for target in group.get("targets", ())
+    }
+    assert not any("embed_tokens" in target for target in claimed)
+
+    embedding_keys = {k for k in ts if k.startswith("model.embed_tokens.")}
+    assert embedding_keys == {
+        "model.embed_tokens.weight_packed",
+        "model.embed_tokens.weight_scale",
+        "model.embed_tokens.weight_global_scale",
+    }
+
+
+def test_streaming_refuses_an_embedding_whose_name_and_shape_disagree(workdir):
+    """Name and checkpoint shape are INDEPENDENT conditions and must agree.
+
+    Getting this wrong ships an artifact whose embedding is dispatched as a
+    Linear, or a Linear dispatched as a lookup -- neither fails at export, both
+    fail at serve. A vocab-shaped tensor under another name must refuse.
+    """
+    mdl = workdir / "model"
+    torch.manual_seed(4)
+    mdl.mkdir(parents=True, exist_ok=True)
+    save_file({
+        # Vocab-shaped, but not named like an embedding.
+        "model.layers.0.self_attn.q_proj.weight":
+            (torch.randn(64, 256) * 0.3).to(torch.bfloat16),
+        "model.norm.weight": torch.ones(256, dtype=torch.bfloat16),
+    }, str(mdl / "model.safetensors"))
+    (mdl / "config.json").write_text(
+        json.dumps({"hidden_size": 256, "vocab_size": 64})
+    )
+    ap = workdir / "a.json"
+    _assign(ap, {"model.layers.0.self_attn.q_proj": "NVFP4"})
+
+    with pytest.raises(ValueError, match="cannot classify as a token embedding"):
+        export_nvfp4_cb_streaming(mdl, ap, workdir / "s", {}, device="cpu")

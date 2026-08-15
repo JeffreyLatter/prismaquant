@@ -85,6 +85,7 @@ from prismaquant.cb_export_config import (
     parse_source_passthrough_declaration,
     build_cb_scheme,
     build_quant_config,
+    build_quantized_embedding_declaration,
     cb_scheme_reuse_signature,
     codebook_tensor_names as _codebook_tensor_names,
     codebook_tensors as _codebook_tensors,
@@ -3151,6 +3152,65 @@ def export_nvfp4_cb_streaming(
             "tier is where vanilla NVFP4/FP8_DYNAMIC won the A/B; constrain the "
             "allocator to keep experts on CB/passthrough.")
 
+    # --- Quantized token embeddings (`quantized_embedding` declaration).
+    # Mirrors export_nvfp4_cb:767-830 exactly; see that block for the full
+    # rationale. The short version: a third class of stock target, packed by
+    # the same CT codec but claimed by GridBook's embedding method rather than
+    # by a config group (vLLM's compressed-tensors embedding path RAISES for
+    # FP8/NVFP4, so a config group naming it refuses to load), and WEIGHT-ONLY
+    # (a lookup has no input activation and the serving method registers no
+    # `input_global_scale`, so an emitted one is an unmatched checkpoint key).
+    #
+    # This lane needs it because a 13.0 GB card budget cannot afford a bf16
+    # embedding: on Qwen3.8-27B that is 2.543 GB, ~20% of the artifact, and
+    # NVFP4 buys it back for 0.715 GB at a measured 0.001063 KL.
+    #
+    # Shapes come from `_target_shape` (safetensors header only) rather than
+    # the resident tensor the in-memory exporter can afford to hold. ---
+    def _declared_vocab_size() -> int:
+        # Multimodal checkpoints keep the LM's vocab under `text_config`; a
+        # wrapper config with no top-level vocab_size would otherwise read as
+        # zero and disable the shape half of the cross-check silently.
+        cfg = json.loads((Path(model_dir) / "config.json").read_text())
+        for holder in (cfg, cfg.get("text_config") or {},
+                       cfg.get("language_config") or {}):
+            if isinstance(holder, dict) and holder.get("vocab_size"):
+                return int(holder["vocab_size"])
+        return 0
+
+    _vocab_rows = _declared_vocab_size()
+
+    def _is_embedding_name(q: str) -> bool:
+        return q == "model.embed_tokens" or q.endswith(".embed_tokens")
+
+    embedding_stock: dict[str, str] = {}
+    for _q, _f in stock_targets.items():
+        _shape = _target_shape(_q)
+        _rows = int(_shape[0]) if len(_shape) == 2 else -1
+        _named = _is_embedding_name(_q)
+        _shaped = _vocab_rows > 0 and _rows == _vocab_rows and not (
+            _q == "lm_head" or _q.endswith(".lm_head"))
+        if _named != _shaped:
+            raise ValueError(
+                f"{_q}: cannot classify as a token embedding — the name says "
+                f"{_named} but the checkpoint shape says {_shaped} "
+                f"(rows={_rows}, vocab_size={_vocab_rows}). An embedding is "
+                "served by GridBook's lookup method and a Linear by a config "
+                "group; the two dispatches are not interchangeable, so this "
+                "refuses rather than guessing.")
+        if _named:
+            embedding_stock[_q] = _f
+    if embedding_stock:
+        # Read the record back through the consumer's rules before any bytes
+        # are written: an unroutable format or an lm_head slipped into the
+        # recipe must fail the export, not the load.
+        build_quantized_embedding_declaration(embedding_stock)
+        # An embedding is not a sidecar tower: it keeps its `model.` prefix in
+        # vLLM's module tree and is claimed by the declaration, not by a
+        # weight-only config group. Both memberships would otherwise fire on a
+        # profile whose LM mapping does not name the embedding.
+        sidecar_stock -= set(embedding_stock)
+
     # --- Stock NVFP4 fused-sibling coherence (mirrors export_nvfp4_cb /
     # export_native_compressed): q/k/v and gate/up landing on NVFP4 MUST share
     # ONE weight_global_scale or vLLM's fused loader sees inconsistent
@@ -3185,6 +3245,7 @@ def export_nvfp4_cb_streaming(
         qname
         for qname, fmt in stock_targets.items()
         if fmt == "NVFP4" and qname not in sidecar_stock
+        and qname not in embedding_stock
     }
     activation_execution_contract = None
     activation_scales_by_physical_target: dict[str, float] = {}
@@ -4220,7 +4281,7 @@ def export_nvfp4_cb_streaming(
             spec
             for spec in _stock_output_specs(canon_fmt, shape)
             if not (
-                qname in sidecar_stock
+                (qname in sidecar_stock or qname in embedding_stock)
                 and "input" in spec[0]
             )
         ]
@@ -4886,7 +4947,12 @@ def export_nvfp4_cb_streaming(
         source_targets=source_targets,
         native_source_targets=native_source_targets,
         requant_targets=requant_targets,
-        stock_targets=stock_targets,
+        # Embedding units are packed like a stock target but claimed by the
+        # `quantized_embedding` declaration, so they must not also appear in a
+        # config group -- the consumer refuses a unit owned by two dispatches.
+        stock_targets={q: f for q, f in stock_targets.items()
+                       if q not in embedding_stock},
+        quantized_embedding_units=embedding_stock or None,
         by_group=by_group,
         cb_group_target_names=cb_group_target_names,
         codebooks=codebooks,
