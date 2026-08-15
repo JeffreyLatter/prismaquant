@@ -1,10 +1,16 @@
 # PrismaQuant Architecture
 
-As of: 2026-08-14 · branch `merge/proven-rescues` · re-stamped at `e586670`
-(the CB lane can now ship a **quantized token embedding**: a weight-only
-`quantized_embedding` wire contract that rides neither `config_groups` nor
-`ignore`, with its gridbook serving mechanism proven under eager *and*
-CUDA-graph capture — §6.2 and §9.2. Previously re-stamped at `1dbf146`:
+As of: 2026-08-14 · branch `merge/proven-rescues` · re-stamped at `a56c6f8`
+(`run-pipeline.sh` now forwards **`ALLOW_PINNED`** to the allocator, so a
+profile-pinned `lm_head` can enter the DP budget instead of shipping at source
+dtype — 2.543 GB, 20% of a 13.0 GB card budget, on Qwen3.8-27B; §4.5. Recorded
+with it: a **CB rung on `lm_head` exports cleanly and does not load**, because
+no gridbook method claims `ParallelLMHead` — shape legality is not servability,
+and the head rides the delegated stock-CT path instead; §9.2. Previously
+re-stamped at `e586670`: the CB lane can ship a **quantized token embedding**, a
+weight-only `quantized_embedding` wire contract that rides neither
+`config_groups` nor `ignore`, with its gridbook serving mechanism proven under
+eager *and* CUDA-graph capture — §6.2 and §9.2. Previously re-stamped at `1dbf146`:
 AQUA-AURA's activation term now reaches a production allocation, and its
 `act_var` can be measured on real cached activations rather than modelled — see
 the AQUA-AURA note below and §"Three cost tiers"). Previously verified against
@@ -520,6 +526,7 @@ COST_MODE=aura (R2 flip 2026-07-30; = COST_RENDER=cached-menu x
 PRODUCTION_RENDER_COST_SCORE_FIELD=weight_mse (M6, §4.2)
 TARGET_DISK_GB=<unset>  EXPORT_CONTAINER=compressed-tensors
 TARGET_PROFILE=<unset, spec-resolved>  TARGET_PROFILE_DEFAULT=vllm_packed_moe
+ALLOW_PINNED=<none>  (forwards allocator --allow-pinned; see §4.5)
 SELECTION_MODE=surrogate, or validated-surrogate under a TARGET_DISK_GB card
 EXPORT_PRODUCTION_CACHE_PREFETCH=require (native lane, D8)
 MTP_FORMAT=BF16  PRODUCTION_CACHE=1  PRODUCTION_RECACHE=1
@@ -1323,6 +1330,21 @@ L3's only consumer (DP/coordinate-descent polish) was already archived
 and `validation_harness` are unchanged.
 
 ### 4.5 Solver
+
+**Profile pins, and `ALLOW_PINNED` (2026-08-14).** `ModelProfile.is_pinned_name`
+force-excludes names like `lm_head` from the DP budget and ships them at source dtype.
+`allocator --allow-pinned <substrings>` lifts that for named units so the DP places them
+by budget-value instead; it enforces its own preconditions (a cost row and probe
+`n_params` for the name) and refuses rather than pricing an unpriced unit at zero.
+Until now the flag was reachable only by driving the allocator by hand, so
+`run-pipeline.sh` now forwards `ALLOW_PINNED` (default empty = historical behaviour,
+byte-identical). It matters at card scale: on Qwen3.8-27B a BF16 `lm_head` spans
+2.543 GB, **20% of a 13.0 GB whole-artifact budget**. Shipping a quantized pinned name
+additionally needs render + packing + serving support for that unit — `lm_head` has it
+on the native lane, and `embed_tokens` only on the Gridbook lane via the
+`quantized_embedding` declaration (§6.2). Note the measured counter-example: a CB rung
+on `lm_head` exports cleanly and then **fails at load** — no Gridbook method claims
+`ParallelLMHead`, so the head must ride the delegated stock-CT path (§9.2).
 
 `allocator_solver.py`. Multi-choice knapsack DP over average-bits-per-parameter bins,
 numpy-vectorized (`solve_allocation :427-520`); the baseline per Linear is its cheapest
@@ -3615,6 +3637,21 @@ Two failure modes are worth recording because neither is reachable by unit test:
 - **Vocab padding meets packed nibbles.** vLLM pads the vocab to a multiple of 64
   and zero-fills the pad rows. On packed uint8 that is zero *codes*, which decode
   to 0.0 — true by arithmetic rather than by assumption, so the smoke asserts it.
+
+**A CB rung on `lm_head` exports cleanly and does not serve (2026-08-14).**
+A recipe naming `lm_head` at `NVFP4_CB_K18` produces a well-formed artifact —
+`config_groups.group_0 = {format: NVFP4_CB_K18, targets: [lm_head]}`, empty
+`ignore`, bytes written — and vLLM then refuses it: *"There is no module or
+parameter named `lm_head.cb_qweight` … available: {`lm_head.weight`}"*. No
+Gridbook method claims `ParallelLMHead`, so it keeps its plain BF16 `weight` and
+the packed payload has nowhere to land. This is the same shape of gap as the
+`isinstance` sweep above — the producer emits a declaration nothing on the
+serving side consumes — and it means the **shape gates in
+`cb_byte_feasibility` prove legality, not servability**. On the CB lane the head
+therefore rides the *delegated stock-CT* path: `lm_head: FP8_DYNAMIC` dispatches
+to `CompressedTensorsLinearMethod` and passes the same bit-exactness smoke. The
+byte consequence is what re-opens the row-split head as a real lever: a CB head
+would price at 0.283–0.889 GB against FP8's 1.272 GB on Qwen3.8-27B.
 
 Load smoke `dq-runs/embed-smoke/` (a deliberately untied synthetic Qwen3 with
 `vocab=4104`, chosen non-multiple-of-64 to keep the padding path live): dispatch,

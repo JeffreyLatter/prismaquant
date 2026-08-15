@@ -237,6 +237,17 @@ fi
 # in-tree launch script is bit-identical.
 : "${TARGET_PROFILE:=}"
 : "${TARGET_PROFILE_DEFAULT:=vllm_packed_moe}"
+# ALLOW_PINNED forwards `allocator --allow-pinned`: comma-separated qname
+# substrings whose profile pin is lifted so the DP places them by budget-value
+# instead of force-excluding them at BF16. Empty (the default) is the historical
+# behaviour exactly. This exists because the flag was reachable only by driving
+# the allocator by hand, and a pinned lm_head is not a small rounding error on a
+# card-sized artifact: on Qwen3.8-27B its BF16 span is 2.543 GB, i.e. 20% of a
+# 13.0 GB whole-artifact budget. The allocator still enforces the flag's own
+# preconditions (a cost row and probe n_params for the name) and refuses rather
+# than silently allocating a name it cannot price; and profile pins that exist
+# for a SERVING reason are documented as not overridable there.
+: "${ALLOW_PINNED:=}"
 
 # -----------------------------------------------------------------------
 # Preflight: lane eligibility + serving-profile resolution (re-vet R6/R11).
@@ -839,6 +850,7 @@ echo "  WORK_DIR=$WORK_DIR"
 echo "  FORMATS=$FORMATS  TARGET_BITS=$TARGET_BITS"
 echo "  TARGET_DISK_GB=${TARGET_DISK_GB:-<unset>}  EXPORT_CONTAINER=$EXPORT_CONTAINER"
 echo "  TARGET_PROFILE=${TARGET_PROFILE:-<unset, spec-resolved>} -> $TARGET_PROFILE_RESOLVED (default $TARGET_PROFILE_DEFAULT)"
+echo "  ALLOW_PINNED=${ALLOW_PINNED:-<none>}"
 echo "  NSAMPLES=$NSAMPLES SEQLEN=$SEQLEN LAYERS_PER_SHARD=$LAYERS_PER_SHARD"
 echo "  PREFETCH_LOOKAHEAD=$PREFETCH_LOOKAHEAD PREFETCH_WORKERS=$PREFETCH_WORKERS"
 echo "  ACTIVATION_ROWS_LIMIT=$ACTIVATION_ROWS_LIMIT"
@@ -926,6 +938,7 @@ STAGE_SETTINGS_ENV=(
   "FORMATS=$FORMATS"
   "TARGET_BITS=$TARGET_BITS"
   "CALIBRATION_MODALITY=$CALIBRATION_MODALITY"
+  "ALLOW_PINNED=$ALLOW_PINNED"
   "ACTIVATION_ROWS_LIMIT=$ACTIVATION_ROWS_LIMIT"
   "COST_MODE=$COST_MODE"
   "SELECTION_MODE=$SELECTION_MODE"
@@ -1551,6 +1564,9 @@ fi
 ALLOCATOR_PROFILE_ARGS=(--target-profile-default "$TARGET_PROFILE_DEFAULT")
 if [[ -n "$TARGET_PROFILE" ]]; then
   ALLOCATOR_PROFILE_ARGS+=(--target-profile "$TARGET_PROFILE")
+fi
+if [[ -n "$ALLOW_PINNED" ]]; then
+  ALLOCATOR_PROFILE_ARGS+=(--allow-pinned "$ALLOW_PINNED")
 fi
 # Byte budget: the constraint is the card, the objective is measured KL
 # (re-vet R1). Selection reserves non-tensor bytes; export enforces the exact
