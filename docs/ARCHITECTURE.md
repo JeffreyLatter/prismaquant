@@ -1,6 +1,15 @@
 # PrismaQuant Architecture
 
-As of: 2026-08-15 · branch `merge/proven-rescues` · re-stamped for the
+As of: 2026-08-15 · branch `merge/proven-rescues` · re-stamped for
+**architecture-conditional naming** (a profile now receives the `model_type`/
+`architectures` the checkpoint declares, and a structure spec may carry
+`naming_variants` so a family's multimodal wrapper and its text-only carve-out
+each get the namespace vLLM will actually build them under — §"Plug-in a new
+architecture". A delegated `config_groups` target is the one string in an
+artifact that must match vLLM's module tree literally; spelled for the wrong
+class it matches nothing, the unit loads unquantized, and its orphaned scale
+kills the load. That is how a finished 12.98 GB Qwen3.8-27B CB artifact failed
+its first serve.) Previously re-stamped for the
 **Gridbook 0.8.7 serving pin** (advanced from 0.8.6 so the CB lane can serve a
 `quantized_embedding`, which no released runtime could; the build pin stays at
 0.8.5/v3, the serving contract stays v4 byte-for-byte, and the fused mid-M
@@ -3261,8 +3270,8 @@ flowchart TD
   subgraph R1["registry 1 -- model structure"]
     VLLMCLS["vLLM model class<br/>packed_modules_mapping, hf_to_vllm_mapper"]
     DERIVE["auto-derivation -- model_profiles/vllm_registry.py:25-195<br/>fused_sibling_group, fused_sibling_leaf_mapping,<br/>to_vllm_internal_name (prefix mappers only)"]
-    SPEC["structure spec JSON<br/>model_profiles/specs/ARCH.json<br/>schema prismaquant.model_structure.v1<br/>match, priority, naming, fused_groups, packed_experts,<br/>pinned_names, passthrough_prefixes, default_serving_profile,<br/>supported_lanes / preferred_lane"]
-    PROF["ModelProfile subclass -- model_profiles/ARCH.py<br/>only matches() and name are abstract (base.py:57-66)<br/>Python-only: MTP, streaming adapters, forward state"]
+    SPEC["structure spec JSON<br/>model_profiles/specs/ARCH.json<br/>schema prismaquant.model_structure.v1<br/>match, priority, naming (+ naming_variants), fused_groups, packed_experts,<br/>pinned_names, passthrough_prefixes, default_serving_profile,<br/>supported_lanes / preferred_lane"]
+    PROF["ModelProfile subclass -- model_profiles/ARCH.py<br/>only matches() and name are abstract (base.py:103-112)<br/>Python-only: MTP, streaming adapters, forward state"]
     REGY["model_profiles/registry.py _REGISTERED + detection_order()<br/>ordered by ModelProfile.priority (lower first, ties keep list order);<br/>SpecMatchProfile per unclaimed spec; DefaultProfile terminal fallback"]
   end
 
@@ -3368,7 +3377,7 @@ Every `ModelProfile` accessor resolves in one fixed order:
 vLLM class metadata  →  declarative JSON spec  →  generic hardcoded default
 ```
 
-Only `matches()` (`base.py:57-61`) and `name` (`:63-66`) are abstract — and `matches()` is now
+Only `matches()` (`base.py:103-107`) and `name` (`:109-112`) are abstract — and `matches()` is now
 also spec-expressible, via `SpecMatchProfile` (§8.1). The `match` vocabulary is deliberately
 tiny, because all nine in-tree predicates are expressible as `(model_type ∈ set, architecture
 glob)` tests:
@@ -3387,7 +3396,7 @@ agreement with its Python (it was missing the Moe exclusion) — dead config dec
 representative config in the family, the spec verdict must equal the Python verdict. Only after
 that is green for a release does a `matches()` body get deleted, one architecture at a time.
 
-What `base.py` reads off the vLLM class named by `vllm_architecture_class()` (`:68-74`, resolved
+What `base.py` reads off the vLLM class named by `vllm_architecture_class()` (`:114-120`, resolved
 lazily at `:76-84`, `None` permitted):
 
 | Derived | vLLM attribute | base.py | Spec fallback |
@@ -3395,6 +3404,30 @@ lazily at `:76-84`, `None` permitted):
 | `fused_sibling_group()` | `packed_modules_mapping` | `:89-118` | `spec.fused_groups` `:110-115` |
 | `fused_sibling_leaf_mapping()` | `packed_modules_mapping` | `:120-164` | same |
 | `to_vllm_internal_name()` | `hf_to_vllm_mapper.orig_to_new_prefix` | `:290-319` | `spec.recipe_to_vllm` rules take **precedence** `:314-318` |
+
+**One profile, one spec, more than one serving class.** A family can ship a multimodal wrapper
+and a text-only carve-out that share every structural rule *except* the namespace vLLM builds
+them under — Qwen3.5/3.6 dense is the case in tree. `Qwen3_5ForConditionalGeneration` puts the
+body at `language_model.model.` and the head at `language_model.lm_head`;
+`Qwen3_5ForCausalLM` puts them at `model.` and a bare `lm_head`, because its
+`hf_to_vllm_mapper` **strips** `model.language_model.` rather than adding a prefix. A single
+`naming` block cannot be right for both, and the wrong one is only observable by serving: the
+Qwen3.8-27B CB artifact emitted its one delegated `config_groups` target as
+`re:^language_model[.]lm_head$`, matched no module, left the head unquantized and died at load
+on an orphaned `lm_head.weight_scale` — one wrong string in 12.98 GB.
+
+So the spec may declare **`naming_variants`** (`structure.py`, `NamingVariant`): a list of
+`{when: <SpecMatch>, naming: {…}}` entries whose first `when`-match overrides only the naming
+maps it names, the rest inheriting the base block. Selection input is what the checkpoint
+declared: `registry._resolve` hands every profile its `model_type`/`architectures` via
+`ModelProfile.declare_config`, and `structure_spec()` applies `spec.for_config(...)` **only**
+when the spec declares variants — every other spec is returned untouched, and a profile
+constructed by hand declares nothing and keeps its historical derivation. `qwen3_5_dense.json`
+is the only spec with variants today. A profile that specializes naming must also specialize
+`vllm_architecture_class()` (`qwen3_5_dense.py`), or the two sources of the map disagree and a
+build host with vLLM installed would emit different names than one without. `source_tensor_name`
+is unaffected — the checkpoint legitimately spells both classes `model.language_model.*`, which
+is exactly what the text-only class's mapper exists to strip.
 
 The adapter is `model_profiles/vllm_registry.py`: `vllm_class_for_architecture` (`:25-102`)
 tries four registry APIs plus internal-table fallbacks and degrades to `None` when vLLM is
@@ -3406,7 +3439,7 @@ can now express those; `lfm2_moe.json` already does.
 Roughly 25 further accessors are pure spec reads (packed-expert names/classes, pinned names,
 unpacked expert projection names, per-expert regexes, source/recipe/live name mapping, format groups, passthrough prefixes,
 staging, layer prefixes, lm_head, probe skips, export-lane eligibility,
-`bypass_hf_fp8_module_rewrite`), `base.py:169-820`. Deliberately Python-only,
+`bypass_hf_fp8_module_rewrite`), `base.py:208-859`. Deliberately Python-only,
 because they are forward-pass *behaviour* rather than naming: MTP (`:248-272`),
 streaming-probe adapters (`:823-947` — `checkpoint_to_live_name`, `fp8_scale_pairs`,
 `head_resident_extra_prefixes`, `init_rotaries`, `expand_hidden_for_layers`,
@@ -3425,7 +3458,7 @@ code contains no DSv4 architecture literal or rank-based expert predicate.
 
 **Two plugin-contract additions landed on this branch.**
 
-`ModelProfile.probe_linear_exclude_extra()` (`base.py:208`, default `""`) makes the probe's
+`ModelProfile.probe_linear_exclude_extra()` (`base.py:247`, default `""`) makes the probe's
 Linear-exclusion regex **profile-owned**. `incremental_probe.resolve_linear_exclude()`
 (`:423-437`) ORs the profile's fragment into the router baseline and replaced four literal
 regex sites, so hook installs and the shard-reuse meta stamp (`:830`) can no longer disagree —
@@ -3440,7 +3473,7 @@ trips the allocator's coverage refusal *after* the cost run has already been pai
 override restores the 33,325-selectable-Linear inventory the DSv4 byte accounting assumes
 (`deepseek_v4.py:6`, `:127`; commit `d62bace`; `tests/test_probe_linear_exclude.py`).
 
-`ModelProfile.init_rotaries` gained an optional `base_model` kwarg (`base.py:1092`, commit
+`ModelProfile.init_rotaries` gained an optional `base_model` kwarg (`base.py:1131`, commit
 `9cee20d`) — a profile-plugin **signature** change, so the in-tree overrides moved in step
 (`gemma4.py:60`, `deepseek_v4.py:339`). It exists because the DSv4 faithful forward gives every
 compressor and indexer its **own** `rotary_emb`, and a meta-built skeleton leaves those nested
@@ -3449,7 +3482,7 @@ DSV4 override now walks the skeleton from `base_model` and materializes every ne
 not just the model-level one; the caller passes it at `streaming_model.py:217`.
 
 `structure.py`'s `build_model_graph` (five parallel name spaces per tensor) is a declared
-contract, not an executor — `base.py:999-1008`, "intentionally not called from hot paths yet";
+contract, not an executor — `base.py:1268-1278`, "intentionally not called from hot paths yet";
 production reads the accessors.
 
 ### 8.3 Adding a model, end-to-end, as it stands today
@@ -3547,7 +3580,7 @@ checking shipped artifact metadata first.
 profile class or spec exists (the sole textual mention is a comment at
 `model_profiles/default.py:6`), so it ran under
 `DefaultProfile`; the `allocator.py:1550-1554` gate would refuse that menu today. Finally, the
-never-declared `unpacked_expert_projection_names` (`base.py:470-495`) **is now declared** — by
+never-declared `unpacked_expert_projection_names` (`base.py:651-661`) **is now declared** — by
 `specs/minimax_m2.json` (R27), which also required adding it as a real
 `ModelStructureSpec` field; `base.py` had been reading it off the spec with `getattr`, so no
 declaration could ever have taken effect. Other architectures still ride the `('w1','w2','w3')`
@@ -3560,9 +3593,9 @@ These four are the canonical statement; §12 references them rather than restati
 | # | Leak | Severity |
 |---|---|---|
 | L1 | **FIXED 2026-07-30 (R11).** Was: `run-pipeline.sh` hardcoded `TARGET_PROFILE:=vllm_packed_moe` and passed it unconditionally, and `resolve_target_profile` gives an explicit request precedence (`serving_profiles.py`), so `spec.default_serving_profile` was **never consulted through the production orchestrator** — `hy_v3.json` (`gguf`) and `laguna.json` (`nvfp4_cb`) silently overridden. **The leak had a measured cost:** because export re-resolved the profile it judges legality under, on 2026-07-11 **226 dense FP8 Linears were silently demoted to BF16** on the Hy3 compressed-tensors export. **Mechanism of the fix:** (i) the shell default is now empty and `--target-profile` is passed to the allocator **only when non-empty**, with a new `--target-profile-default vllm_packed_moe` supplying the fallback for architectures that declare nothing — never `research`, whose menu is unbounded. (ii) The allocator stamps its **resolved** profile into `layer_config.json`'s reserved `__prismaquant__` metadata block (`layer_config.LAYER_CONFIG_META_KEY`, skipped by every assignment parser and by the schema), and `export_native_compressed._allocator_target_profile_for_audit` reads it, with `PRISMAQUANT_TARGET_PROFILE` kept as the operator override for direct exporter invocations. `select_validated_frontier` carries the block forward when it overwrites the layer config, so the validated path keeps it too. Allocator and export can no longer disagree, and the channel travels **with** the artifact. **Non-regression:** re-solving the shipped 27B and 35B from their stored probe/cost artifacts changed **0 of 614** and **0 of 500** assignments vs the same code without the change (the 35B differs from its *shipped* config by 32/500 for an unrelated, pre-existing reason — the Fisher renormalization fix that landed after that artifact shipped). Every in-tree launch script sets `TARGET_PROFILE` explicitly, so all eight are bit-identical. | ~~high~~ FIXED |
-| L2 | **FIXED 2026-07-30 (R12).** MTP construction bypassed the profile: `prismaquant/mtp_module.py` was Qwen3.5-specific yet imported **directly** by `incremental_probe.py`, `incremental_measure_quant_cost.py` and `export_native_compressed.py`, gated only on the arch-agnostic `profile.has_mtp()`, so `deepseek_v4` (`has_mtp → True`, `build_mtp_module → None`) would have been handed a Qwen3.5 decoder layer. **Mechanism of the fix:** a fourth accessor `ModelProfile.mtp_source_prefix()` (`base.py:255-272`, spec-expressible as `shard_regexes.mtp_source_prefix`, default `"mtp."`) plus a generic `read_mtp_source_state_dict()` (`:290-326`) and a packed-expert-aware `load_mtp_state_dict()` (`:329-396`, absorbed from the deleted `_load_into_mtp`); `build_mtp_module`'s docstring now states the naming contract (names under an `mtp` parent must equal the recipe names). The Qwen body moved verbatim into `model_profiles/qwen3_5.py:124` (`MtpModule`) and the dead near-copies in `qwen3_5.py` and `qwen3_5_dense.py` were reconciled into it; all three call sites now go through the profile and hard-fail with a named error if `has_mtp()` and `build_mtp_module()` disagree. `prismaquant/mtp_module.py` is **deleted**. DSv4 takes the hy_v3 route (`has_mtp → False` + `"mtp."` in `passthrough_prefixes`) until its nextn block is actually quantized. Gates: `tests/test_mtp_module_arch.py` pins parameter-name-set equality against the pre-move layout for both the dense and MoE profile; `tests/test_model_profile_conformance.py::test_has_mtp_implies_a_buildable_mtp_module` is the standing ratchet. | ~~high~~ FIXED |
+| L2 | **FIXED 2026-07-30 (R12).** MTP construction bypassed the profile: `prismaquant/mtp_module.py` was Qwen3.5-specific yet imported **directly** by `incremental_probe.py`, `incremental_measure_quant_cost.py` and `export_native_compressed.py`, gated only on the arch-agnostic `profile.has_mtp()`, so `deepseek_v4` (`has_mtp → True`, `build_mtp_module → None`) would have been handed a Qwen3.5 decoder layer. **Mechanism of the fix:** a fourth accessor `ModelProfile.mtp_source_prefix()` (`base.py:294-311`, spec-expressible as `shard_regexes.mtp_source_prefix`, default `"mtp."`) plus a generic `read_mtp_source_state_dict()` (`:348-365`) and a packed-expert-aware `load_mtp_state_dict()` (`:387-435`, absorbed from the deleted `_load_into_mtp`); `build_mtp_module`'s docstring now states the naming contract (names under an `mtp` parent must equal the recipe names). The Qwen body moved verbatim into `model_profiles/qwen3_5.py:124` (`MtpModule`) and the dead near-copies in `qwen3_5.py` and `qwen3_5_dense.py` were reconciled into it; all three call sites now go through the profile and hard-fail with a named error if `has_mtp()` and `build_mtp_module()` disagree. `prismaquant/mtp_module.py` is **deleted**. DSv4 takes the hy_v3 route (`has_mtp → False` + `"mtp."` in `passthrough_prefixes`) until its nextn block is actually quantized. Gates: `tests/test_mtp_module_arch.py` pins parameter-name-set equality against the pre-move layout for both the dense and MoE profile; `tests/test_model_profile_conformance.py::test_has_mtp_implies_a_buildable_mtp_module` is the standing ratchet. | ~~high~~ FIXED |
 | L3 | **FIXED 2026-07-30 (R10), ownership boundary hardened 2026-08-01.** Was: a hand-maintained `try/except ImportError` opt-in chain whose missing-line failure mode was **coherent-looking garbage generation**. Gridbook now owns the module-path registry, fill guard, and tests in its sole canonical repository. PrismaQuant owns no loader or runtime copy; its required CI job installs the exact pinned Gridbook commit, validates PEP 610 provenance, and compares the producer profile set with Gridbook's packaged `runtime_contract.json`. The runtime stamps CB expert parameters unfilled, stamps them after either loader path, and fails closed before execution if any local registered expert remains unfilled. **No env bypass.** | ~~high~~ closed |
-| L4 | **FIXED 2026-07-30 (R27).** Both MiniMax hardcodes now go through profile accessors. `streaming_model.py`'s FP8-rewrite bypass was already half config-derived (`quant_method == "fp8"` and `weight_block_size`); the architecture half is a static property, so it became `staging.bypass_hf_fp8_module_rewrite` in the spec behind `profile.bypass_hf_fp8_module_rewrite()` (`base.py`), leaving the per-checkpoint half a config read where it belongs. `incremental_probe.py`'s `type(module).__name__ == "MiniMaxM2Experts"` became `profile.packed_expert_module_class_names()` (`base.py:182-192`) — the accessor that already existed for exactly this lookup — plus the structural shape test; the declared class stays **required**, because the replacement forward implements one specific expert-loop signature and applying it to a lookalike container would silently change a forward pass. `specs/minimax_m2.json` declares both, and `unpacked_expert_projection_names` with them. | closed |
+| L4 | **FIXED 2026-07-30 (R27).** Both MiniMax hardcodes now go through profile accessors. `streaming_model.py`'s FP8-rewrite bypass was already half config-derived (`quant_method == "fp8"` and `weight_block_size`); the architecture half is a static property, so it became `staging.bypass_hf_fp8_module_rewrite` in the spec behind `profile.bypass_hf_fp8_module_rewrite()` (`base.py`), leaving the per-checkpoint half a config read where it belongs. `incremental_probe.py`'s `type(module).__name__ == "MiniMaxM2Experts"` became `profile.packed_expert_module_class_names()` (`base.py:221-231`) — the accessor that already existed for exactly this lookup — plus the structural shape test; the declared class stays **required**, because the replacement forward implements one specific expert-loop signature and applying it to a lookalike container would silently change a forward pass. `specs/minimax_m2.json` declares both, and `unpacked_expert_projection_names` with them. | closed |
 
 Cosmetic, listed so they are not re-discovered as leaks:
 `export_native_compressed.py:94,151-152` imports `Qwen3_5Profile` for `_COMPAT_QWEN_PROFILE`

@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import re
 from abc import ABC, abstractmethod
+from collections.abc import Iterable
 from pathlib import Path
 
 import torch.nn as nn
@@ -57,6 +58,44 @@ class ModelProfile(ABC):
         self._name_remapper = None
         self._structure_spec = None
         self._structure_spec_loaded = False
+        # What the checkpoint itself declared. Set by `registry._resolve`
+        # right after construction; empty for a hand-built profile, which
+        # keeps every profile's pre-declaration behavior byte-identical.
+        self._declared_model_type: str | None = None
+        self._declared_architectures: tuple[str, ...] = ()
+
+    def declare_config(
+        self,
+        model_type: str | None,
+        architectures: Iterable[str] | None,
+    ) -> None:
+        """Record the `model_type` / `architectures` this checkpoint declares.
+
+        A profile family can cover more than one serving class (a multimodal
+        wrapper and its text-only carve-out), and those classes do not share a
+        namespace. The profile cannot ask the model — it is resolved from a
+        config, before anything loads — so the declaration is handed to it, and
+        `structure_spec()` / `vllm_architecture_class()` may specialize on it.
+        """
+        self._declared_model_type = str(model_type) if model_type else None
+        self._declared_architectures = tuple(
+            str(a) for a in (architectures or ())
+        )
+        # Anything derived from the declaration must be recomputed. A spec
+        # already in hand is re-specialized rather than dropped: `SpecMatchProfile`
+        # injects the exact spec it was built from and must not fall back to a
+        # name-keyed lookup that could bind a different file.
+        if self._structure_spec is not None and self._structure_spec.naming_variants:
+            self._structure_spec = self._structure_spec.for_config(
+                self._declared_model_type, self._declared_architectures
+            )
+        self._vllm_cls = None
+        self._vllm_cls_loaded = False
+        self._name_remapper = None
+        self._fused_matcher = None
+
+    def declared_architectures(self) -> tuple[str, ...]:
+        return self._declared_architectures
 
     # ------------------------------------------------------------
     # Identity + match
@@ -1214,7 +1253,15 @@ class ModelProfile(ABC):
         from .structure import load_structure_spec
 
         if not self._structure_spec_loaded:
-            self._structure_spec = load_structure_spec(self.name)
+            spec = load_structure_spec(self.name)
+            if spec is not None and spec.naming_variants:
+                # A family whose spec declares naming variants is specialized
+                # to whatever THIS checkpoint declared; every other spec is
+                # returned unchanged.
+                spec = spec.for_config(
+                    self._declared_model_type, self._declared_architectures
+                )
+            self._structure_spec = spec
             self._structure_spec_loaded = True
         return self._structure_spec
 

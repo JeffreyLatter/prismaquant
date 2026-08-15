@@ -398,7 +398,20 @@ def test_qwen35_dense_profile_uses_dense_structure_spec():
     assert profile.serving_profile_id() == "vllm_packed_moe"
     assert profile.packed_expert_param_names() == frozenset()
     assert profile.per_expert_moe_regex() is None
+    # `*ForCausalLM` is the TEXT-ONLY class, which vLLM builds under `model.`
+    # — this assertion used to read `language_model.model.…` because the spec
+    # had a single naming block written for the multimodal wrapper. The
+    # declared architecture decides; see tests/test_qwen3_5_text_only_namespace.py.
     assert profile.to_vllm_internal_name("model.layers.0.mlp.gate_proj") == (
+        "model.layers.0.mlp.gate_proj"
+    )
+
+    wrapper = profile_from_config({
+        "model_type": "qwen3_5",
+        "architectures": ["Qwen3_5ForConditionalGeneration"],
+    })
+    assert wrapper.structure_spec().id == "qwen3_5_dense"
+    assert wrapper.to_vllm_internal_name("model.layers.0.mlp.gate_proj") == (
         "language_model.model.layers.0.mlp.gate_proj"
     )
 

@@ -92,6 +92,29 @@
       }
     ]
   },
+  "naming_variants": [
+    {
+      "when": {
+        "architectures": [
+          "Qwen3_5ForCausalLM", "Qwen3_6ForCausalLM",
+          "Qwen3.5ForCausalLM", "Qwen3.6ForCausalLM"
+        ],
+        "architectures_exclude": ["*Moe*"]
+      },
+      "naming": {
+        "recipe_to_vllm": [
+          { "prefix": "mtp.", "replace": "mtp.", "stop": true },
+          { "exact": "lm_head", "replace": "lm_head", "stop": true },
+          {
+            "prefix": "model.language_model.",
+            "replace": "model.",
+            "stop": true
+          },
+          { "prefix": "model.", "replace": "model.", "stop": true }
+        ]
+      }
+    }
+  ],
   "fused_groups": [
     {
       "target": "self_attn.qkv_proj",

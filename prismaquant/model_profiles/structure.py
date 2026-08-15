@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any
@@ -239,6 +239,70 @@ class PackageRequirement:
 
 
 @dataclass(frozen=True)
+class NamingVariant:
+    """A naming block that applies only to some of a family's architectures.
+
+    Several families ship a multimodal wrapper class and a text-only carve-out
+    that share every structural rule *except* the namespace their serving
+    runtime uses.  Qwen3.5/3.6 is the canonical case: the wrapper builds the
+    body under `language_model.model.` and the head at `language_model.lm_head`,
+    while `Qwen3_5ForCausalLM` builds `model.` and a bare `lm_head` (its
+    `hf_to_vllm_mapper` strips `model.language_model.` instead of adding it).
+    One `naming` block cannot be right for both, and picking the wrong one
+    emits `config_groups` targets that match no module: the unit loads
+    unquantized and its orphaned scale kills the load.
+
+    Only the keys a variant declares are overridden; the rest inherit the base
+    `naming` block, so a variant states the difference and nothing else.
+    """
+
+    when: SpecMatch = field(default_factory=SpecMatch)
+    live_to_recipe: tuple[NameRewriteRule, ...] | None = None
+    recipe_to_source: tuple[NameRewriteRule, ...] | None = None
+    recipe_to_vllm: tuple[NameRewriteRule, ...] | None = None
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "NamingVariant":
+        unknown = sorted(set(payload) - {"when", "naming"})
+        if unknown:
+            raise ValueError(
+                f"unsupported naming_variants keys: {unknown}; "
+                "vocabulary is ['when', 'naming']"
+            )
+        when = SpecMatch.from_dict(payload.get("when"))
+        if not when.declared:
+            raise ValueError(
+                "a naming variant must declare `when.model_type` or "
+                "`when.architectures`; an unconditional variant is just `naming`"
+            )
+        naming = payload.get("naming") or {}
+        unknown_naming = sorted(
+            set(naming) - {"live_to_recipe", "recipe_to_source", "recipe_to_vllm"}
+        )
+        if unknown_naming:
+            raise ValueError(
+                f"unsupported naming keys in a variant: {unknown_naming}"
+            )
+        if not naming:
+            raise ValueError("a naming variant must declare at least one map")
+        return cls(
+            when=when,
+            live_to_recipe=(
+                _rules(naming["live_to_recipe"])
+                if "live_to_recipe" in naming else None
+            ),
+            recipe_to_source=(
+                _rules(naming["recipe_to_source"])
+                if "recipe_to_source" in naming else None
+            ),
+            recipe_to_vllm=(
+                _rules(naming["recipe_to_vllm"])
+                if "recipe_to_vllm" in naming else None
+            ),
+        )
+
+
+@dataclass(frozen=True)
 class ModelStructureSpec:
     """Declarative model decomposition contract for one architecture family."""
 
@@ -251,6 +315,7 @@ class ModelStructureSpec:
     live_to_recipe: tuple[NameRewriteRule, ...] = ()
     recipe_to_source: tuple[NameRewriteRule, ...] = ()
     recipe_to_vllm: tuple[NameRewriteRule, ...] = ()
+    naming_variants: tuple[NamingVariant, ...] = ()
     fused_groups: tuple[FusedGroupSpec, ...] = ()
     packed_experts: PackedExpertSpec = field(default_factory=PackedExpertSpec)
     unpacked_expert_projection_names: tuple[str, ...] = ()
@@ -305,6 +370,10 @@ class ModelStructureSpec:
             live_to_recipe=_rules(naming.get("live_to_recipe")),
             recipe_to_source=_rules(naming.get("recipe_to_source")),
             recipe_to_vllm=_rules(naming.get("recipe_to_vllm")),
+            naming_variants=tuple(
+                NamingVariant.from_dict(entry)
+                for entry in payload.get("naming_variants", ())
+            ),
             fused_groups=tuple(
                 FusedGroupSpec.from_dict(entry)
                 for entry in payload.get("fused_groups", ())
@@ -351,6 +420,31 @@ class ModelStructureSpec:
             visual_config_key=_optional_str(shard_regexes.get("visual_config_key")),
             lm_head_name=_optional_str(shard_regexes.get("lm_head_name")),
         )
+
+    def for_config(
+        self,
+        model_type: str | None,
+        architectures: Iterable[str] | None,
+    ) -> "ModelStructureSpec":
+        """Return the spec specialized to one checkpoint's declared config.
+
+        Variants are consulted in declaration order; the first whose `when`
+        claims the config wins.  With no variants — every spec but
+        `qwen3_5_dense` today — this is `self`, so the specialization is a
+        no-op everywhere it is not explicitly declared.
+        """
+        if not self.naming_variants:
+            return self
+        for variant in self.naming_variants:
+            if not variant.when.claims(model_type, architectures):
+                continue
+            overrides: dict[str, Any] = {}
+            for attr in ("live_to_recipe", "recipe_to_source", "recipe_to_vllm"):
+                rules = getattr(variant, attr)
+                if rules is not None:
+                    overrides[attr] = rules
+            return replace(self, naming_variants=(), **overrides)
+        return self
 
     def rewrite_live_to_recipe(self, name: str) -> str:
         return apply_name_rewrites(name, self.live_to_recipe)

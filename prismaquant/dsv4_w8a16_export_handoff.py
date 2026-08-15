@@ -99,6 +99,22 @@ _PUBLISHED_FILES = frozenset({
 # because the gate reports only the FIRST mismatching file: refreshing one
 # digest simply advanced the error to the next. Enumerate the whole closure
 # when re-freezing.
+#
+# RE-FROZEN 2026-08-15 (second time, one Qwen3.5/3.6 dense namespace fix),
+# reviewed against THIS handoff rather than re-hashed:
+#   model_profiles/base.py + registry.py -- a profile is now handed the
+#     `model_type`/`architectures` the checkpoint declares (`declare_config`),
+#     and `structure_spec()` specializes the spec's naming block when that spec
+#     declares `naming_variants`. `specs/qwen3_5_dense.json` is the ONLY spec
+#     that declares any -- asserted over EVERY file in specs/ by
+#     tests/test_qwen3_5_text_only_namespace.py::
+#     test_qwen3_5_dense_is_the_only_spec_with_naming_variants, so the claim
+#     covers specs added later and not just a hand-picked few --
+#     so on the DeepSeek-v4 lane `for_config` is not reached and the spec this
+#     handoff's profile returns is EQUAL to the unspecialized file spec; the
+#     declaration is two otherwise-unread attributes. Verified directly:
+#     `lm_head`/`model.embed_tokens`/expert names derive exactly as before on
+#     both the vLLM-internal and checkpoint sides.
 _FROZEN_EXPORT_SOURCE_SHA256 = {
     "prismaquant/export_nvfp4_cb_streaming.py": (
         "05ea8ece98086feccc487b036e3a746d131629f0dc7049ae38abc19f0187ba7e"
@@ -116,10 +132,10 @@ _FROZEN_EXPORT_SOURCE_SHA256 = {
         "fb20303ed1b017a5a7f3a035d5ef43880822d775e252c28a08f32a67f8104c95"
     ),
     "prismaquant/model_profiles/base.py": (
-        "dd472aae76b74772eb7b058e7f1f4bfa38095e556e34f9e683cc2c7047c7d746"
+        "7355fe24fb81acd2086cc677df9cf9d81a4c98e7d16a95541c83640f9d361f66"
     ),
     "prismaquant/model_profiles/registry.py": (
-        "30e1509963c10b753ed73881becebdcff4974b516f83f479df72ce6f16779381"
+        "2fb8bcc01fbfd3b89870d387d335f804b05378f9853f223469c619e7ab766b90"
     ),
     "prismaquant/model_profiles/deepseek_v4.py": (
         "f280937e826c2262a7a3646c90aa883915daa516e78f7a2b83b586890e05cbf7"

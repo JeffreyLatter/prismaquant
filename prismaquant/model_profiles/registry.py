@@ -263,6 +263,12 @@ def _resolve(model_type: str, archs: list[str]) -> ModelProfile:
         try:
             if _claims(cls, model_type, archs):
                 inst = _new_instance(cls)
+                # Hand the profile what the checkpoint declared. A family can
+                # cover several serving classes (a multimodal wrapper and its
+                # text-only carve-out) whose namespaces differ, and only the
+                # declaration distinguishes them. Profiles that ignore it are
+                # unaffected: the stash is inert unless read.
+                inst.declare_config(model_type, archs)
                 # Some profiles need to register vendored modeling code
                 # with transformers before the model loads. Defer to
                 # the profile method (refactor #32) so callers don't

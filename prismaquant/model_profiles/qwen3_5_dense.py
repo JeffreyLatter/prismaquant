@@ -4,6 +4,13 @@ Covers:
   - Qwen3_5ForConditionalGeneration (multimodal, dense MLP, MTP retained)
   - Qwen3_5ForCausalLM (text-only, dense MLP, MTP retained)
 
+The two differ in exactly one respect that reaches an artifact: the namespace
+vLLM builds them under. The wrapper puts the body at `language_model.model.`
+and the head at `language_model.lm_head`; the text-only class puts them at
+`model.` and `lm_head`. `specs/qwen3_5_dense.json` carries the wrapper naming
+as its base block and the text-only namespace as a `naming_variants` entry,
+selected by whatever the checkpoint declares.
+
 Dense variants keep the same hybrid DeltaNet + full-attention layer-mix
 and the same MTP head as the MoE sibling, but the per-layer MLP is a
 plain gate/up/down Linear stack instead of an experts bank. This
@@ -43,9 +50,30 @@ class Qwen3_5DenseProfile(Qwen3_5Profile):
     def name(self) -> str:
         return "qwen3_5_dense"
 
+    #: Text-only carve-outs of the dense family. These are NOT the wrapper
+    #: class with the visual tower removed — vLLM serves them through
+    #: `Qwen3_5ForCausalLMBase`, whose `hf_to_vllm_mapper` STRIPS
+    #: `model.language_model.` instead of adding `language_model.`, and whose
+    #: head module is a bare `lm_head`. Same weights, different namespace.
+    TEXT_ONLY_ARCHITECTURES = frozenset({
+        "Qwen3_5ForCausalLM", "Qwen3_6ForCausalLM",
+        "Qwen3.5ForCausalLM", "Qwen3.6ForCausalLM",
+    })
+
+    def _is_text_only(self) -> bool:
+        archs = self.declared_architectures()
+        return bool(archs) and all(
+            a in self.TEXT_ONLY_ARCHITECTURES for a in archs
+        )
+
     def vllm_architecture_class(self) -> str | None:
-        # Dense vLLM class. If vLLM doesn't ship it on the host, the base
-        # profile falls back to this profile's declarative structure spec.
+        # Which class vLLM will build decides `packed_modules_mapping` and the
+        # prefix map, so it must follow the checkpoint's own declaration. A
+        # checkpoint that declares nothing (hand-built profile, older caller)
+        # keeps the historical answer, so every artifact shipped before this
+        # branch existed derives exactly as it did.
+        if self._is_text_only():
+            return "Qwen3_5ForCausalLM"
         return "Qwen3_5ForConditionalGeneration"
 
     # ------------------------------------------------------------
