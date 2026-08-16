@@ -3324,13 +3324,35 @@ def recipe_priced_bpp(
         out["reason"] = "recipe is not a mapping"
         return out
 
+    # Two recipe layouts carry these prices, and both are production. The body
+    # allocator writes per-unit mappings with `cb_serialized_identity` inside
+    # each record; the DSpark CB sidecar builder writes a flat
+    # `name -> "FORMAT"` map with the identities collected under
+    # `__prismaquant__.cb_serialized_identities`. Reading only the first shape
+    # silently downgraded the whole sidecar lane to "not applicable", which
+    # turns the gate off on an artifact that is fully priceable.
+    meta_identities: Mapping[str, Any] = {}
+    try:
+        from prismaquant.layer_config import read_layer_config_metadata
+        raw = (read_layer_config_metadata(layer_config_path) or {}).get(
+            "cb_serialized_identities"
+        )
+        if isinstance(raw, Mapping):
+            meta_identities = raw
+    except Exception:
+        meta_identities = {}
+
     total = priced = 0
     total_bytes = total_params = 0
     for name, record in payload.items():
-        if is_layer_config_meta_key(name) or not isinstance(record, Mapping):
+        if is_layer_config_meta_key(name):
             continue
         total += 1
-        identity = record.get("cb_serialized_identity")
+        identity = None
+        if isinstance(record, Mapping):
+            identity = record.get("cb_serialized_identity")
+        if not identity:
+            identity = meta_identities.get(name)
         if not identity:
             continue
         try:

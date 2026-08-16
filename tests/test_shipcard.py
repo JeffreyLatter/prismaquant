@@ -1398,3 +1398,36 @@ def test_cross_check_undershoot_is_also_coverage_gated(tmp_path):
     assert cross["claim_is_below_floor"] is True
     assert "below" in cross["detail"]
     assert verify({"build": {"achieved_bpp": got}}, model_dir=None, required=[]) == []
+
+
+def test_recipe_priced_bpp_reads_the_sidecar_flat_layout(tmp_path):
+    """Two production layouts carry per-unit prices; both must be priceable.
+
+    The body allocator writes `name -> {..., "cb_serialized_identity": ...}`.
+    The DSpark CB sidecar builder writes a flat `name -> "FORMAT"` map with the
+    identities collected under `__prismaquant__.cb_serialized_identities`.
+    Reading only the first shape reported "not applicable" for the entire
+    sidecar lane, silently disabling the gate on a shippable artifact -- the
+    real MTP draft recipe prices 2,325 of 2,328 units at exactly 1.78125 bpp
+    (K12 two_tier), the 3 exclusions being the grouped-BMM `wo_a` passthroughs.
+    """
+    from prismaquant.shipcard import recipe_priced_bpp
+
+    identity = json.dumps({
+        "format": "NVFP4_CB_K12", "params": 8388608,
+        "tensor_payload_bytes": 1867776,       # 8388608 * 57/256
+    })
+    payload = {f"mtp.0.ffn.experts.{i}.up_proj": "NVFP4_CB_K12" for i in range(4)}
+    payload["mtp.0.attn.wo_a"] = "FP8_BLOCK_UE8M0_SOURCE"   # passthrough, unpriced
+    payload["__prismaquant__"] = {
+        "cb_serialized_identities": {
+            f"mtp.0.ffn.experts.{i}.up_proj": identity for i in range(4)
+        },
+    }
+    recipe = tmp_path / "dspark_layer_config.json"
+    recipe.write_text(json.dumps(payload))
+
+    got = recipe_priced_bpp(recipe)
+    assert got["value"] == pytest.approx(1.78125)
+    assert got["priced_units"] == 4
+    assert got["total_units"] == 5
