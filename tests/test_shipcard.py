@@ -1084,6 +1084,77 @@ def test_serving_an_artifact_does_not_invalidate_its_own_card(tmp_path):
     assert compute_model_sha(model_dir) != before
 
 
+def test_documenting_an_artifact_does_not_invalidate_its_own_card(tmp_path):
+    """`README.md` in a model dir IS the HF model card, not artifact content.
+
+    `tools/publish_artifact.py` has no --model-card argument: it uploads the
+    complete local file set with no filters, so the card reaches the Hub only
+    by sitting in the artifact directory under that name. Hashing it made the
+    act of DOCUMENTING an artifact invalidate the card that documents it --
+    the same failure as the serve fingerprint above, one step earlier in the
+    release. Observed 2026-08-15 on qwen38-27b-arm-b/exported: a README
+    dropped in at 18:33 moved the identity off the 17:55 card
+    (e7ac09f8 -> 3c4a83a1) and locked the artifact out of publication.
+
+    It also decides whether an artifact can quote its own measured numbers.
+    Every gate record binds `model_sha`; gold KL/PPL only exists after the
+    gates; writing it into the card would invalidate the records that produced
+    it. Re-running the gates does not escape that -- KL drifts across docker
+    sessions -- so the exclusion is what makes a self-describing card possible.
+    """
+    model_dir = _artifact(tmp_path)
+    (model_dir / "chat_template.jinja").write_text("{{ messages }}")
+
+    path = _open_card(tmp_path, model_dir)
+    before = compute_model_sha(model_dir)
+    _fill_all(path, before)
+    assert verify(load_shipcard(path), model_dir=model_dir) == []
+
+    (model_dir / "README.md").write_text("# a model card\n")
+    assert compute_model_sha(model_dir) == before
+    assert verify(load_shipcard(path), model_dir=model_dir) == []
+
+    # And the gold numbers can be written into it afterwards.
+    (model_dir / "README.md").write_text("# a model card\n\nKL 0.0142\n")
+    assert compute_model_sha(model_dir) == before
+    assert verify(load_shipcard(path), model_dir=model_dir) == []
+
+    # One exact filename, not a category: a figure the card references, or a
+    # doc under any other name, stays attested.
+    (model_dir / "allocation-map.png").write_bytes(b"\x89PNG\r\n")
+    assert compute_model_sha(model_dir) != before
+    after_png = compute_model_sha(model_dir)
+    (model_dir / "NOTES.md").write_text("notes")
+    assert compute_model_sha(model_dir) != after_png
+
+
+def test_a_card_stamped_while_the_readme_was_hashed_still_verifies(tmp_path):
+    """The fix must not unbreak future artifacts by breaking present ones.
+
+    A card written under the old scope on a directory that already contained a
+    README verifies today only because the README was hashed into it. `verify`
+    accepts that identity as a fallback, and only as a fallback.
+    """
+    model_dir = _artifact(tmp_path)
+    (model_dir / "README.md").write_text("# an already-published card\n")
+
+    legacy_sha = compute_model_sha(model_dir, legacy_readme_hashed=True)
+    assert legacy_sha != compute_model_sha(model_dir)
+
+    path = _open_card(tmp_path, model_dir)
+    card = load_shipcard(path)
+    card["model_sha"] = legacy_sha
+    write_shipcard(path, card)
+    _fill_all(path, legacy_sha)
+    assert verify(load_shipcard(path), model_dir=model_dir) == []
+
+    # Still a fallback: editing that README moves the legacy identity too, so
+    # a card from the hashed era keeps its README attestation.
+    (model_dir / "README.md").write_text("# tampered\n")
+    assert any("artifact changed" in p
+               for p in verify(load_shipcard(path), model_dir=model_dir))
+
+
 def test_a_card_written_under_the_legacy_native_scope_still_verifies(tmp_path):
     """Published native cards must not all read as 'artifact changed'.
 

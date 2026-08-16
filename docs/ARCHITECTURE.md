@@ -1,7 +1,8 @@
 # PrismaQuant Architecture
 
 As of: 2026-08-15 · branch `merge/proven-rescues` · re-stamped for the
-**Gridbook 0.8.8 serving pin and the gold-contract lane scope** (0.8.7 shipped
+**Gridbook 0.8.8 serving pin, the gold-contract lane scope, and the
+`README.md` exclusion from `model_sha`** (0.8.7 shipped
 the quantized-embedding method and its dispatch branch, but vLLM dispatches
 quantized modules from inside the layer constructor and `qwen3_5.py` builds its
 embedding with neither a `quant_config` nor a `prefix`, so neither was ever
@@ -12,7 +13,16 @@ artifact to the **DSv4-Flash** gold contract, which pins
 lane, read fail-closed off the identity-bound `config.json`, and
 `serve_manifest.json` — the fingerprint of a *serve*, not artifact content — no
 longer moves `model_sha`, so validating an artifact stops invalidating its own
-card; §9.3. The **whole CB ship-gate stack turned out to be DSv4-shaped**, not
+card; §9.3. **`README.md` is now excluded from `model_sha` for the same
+reason**: on the Hub the README *is* the model card, so hashing it made
+documenting an artifact invalidate its own shipcard — and made an artifact
+structurally unable to quote its own gold numbers, since every gate record binds
+`model_sha` but the gold measurements only exist after the gates. Re-running the
+gates does not escape it (KL is only bit-identical *within* a docker session).
+Legacy cards stamped while the README was hashed still verify, through
+`compute_model_sha(..., legacy_readme_hashed=True)` behind a single
+`accepted_model_shas()` helper that `verify` and `reattest` share so the two
+cannot drift on which identities they accept; §9.3. The **whole CB ship-gate stack turned out to be DSv4-shaped**, not
 just the gold contract: `validate_cb_endpoint.py` pinned the served-model
 brand, `--tokenizer-mode deepseek_v4`, the eugr image and `model_type ==
 "deepseek_v4"` itself, and `perf.matched_budget_parity` structurally requires a
@@ -3253,6 +3263,31 @@ content, so hashing it made validating an artifact invalidate its own card
 (observed on Qwen3.8-27B CB-A, `677f278a` → `bf6abc17` after the eager smoke).
 Its integrity is bound where the claim is made — each record's
 `*serve_manifest_sha256`.
+
+**`README.md` is excluded on the same principle, one step later in the
+release.** On the Hub a `README.md` in the model directory *is* the model card,
+and `publish_artifact.py` takes no `--model-card`, so the card can only be
+delivered by writing that file into the artifact — which, while it was hashed,
+invalidated the very shipcard that authorizes the upload. It had already
+happened: `qwen38-27b-arm-b/exported` carries card `e7ac09f8…` against a disk
+`3c4a83a1…` and cannot publish. The deeper failure is ordering, not
+bookkeeping: every gate record binds `model_sha`, the gold KL/PPL only exist
+*after* the gates run, and writing them into the card broke the records that
+produced them — so an artifact could not quote its own measured numbers. Gating
+twice is not a way out, because KL is bit-identical only *within* a docker
+session (`kl_session_arithmetic_drift`), so a second round would print numbers
+its own records disagreed with.
+
+`compute_model_sha(..., legacy_readme_hashed=True)` reproduces the old identity
+for cards stamped before this, and both `verify` and `reattest` consult one
+`accepted_model_shas()` helper rather than each carrying its own tolerance —
+the two drifting apart on which legacy identities they accept is precisely the
+bug this shape prevents. Because the excluded set is identical either way, a
+directory that had no README when it was stamped hashes the same under both
+code paths: Qwen3.8-27B CB-A was stamped `fe89b79a…` before the patch and still
+verifies at `fe89b79a…` with its card in place. Tests:
+`test_documenting_an_artifact_does_not_invalidate_its_own_card`,
+`test_a_card_stamped_while_the_readme_was_hashed_still_verifies`.
 
 **`tools/measure_served_gold.py` — the served lane's gold tool.** Both DSv4
 tools own an in-process `LLM`, so every other lane had been measuring its gold

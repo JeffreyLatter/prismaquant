@@ -207,6 +207,7 @@ def compute_model_sha(
     model_dir: str | os.PathLike,
     *,
     legacy_native_scope: bool = False,
+    legacy_readme_hashed: bool = False,
 ) -> str:
     """Cheap, stable identity for an exported checkpoint.
 
@@ -230,6 +231,8 @@ def compute_model_sha(
     verify -- see :func:`verify`, which tries the current scope first and
     falls back. New cards are always written with the current scope, and the
     legacy scope cannot produce one, so the fallback never weakens a new card.
+    ``legacy_readme_hashed=True`` is the same tolerance for the one other
+    scope change: cards stamped while ``README.md`` was still hashed.
     """
     root = Path(model_dir)
     if not root.is_dir():
@@ -291,8 +294,34 @@ def compute_model_sha(
         # two serves of byte-identical weights.  Nothing is unbound by the
         # exclusion: every slot that cites a manifest binds it by its own
         # `*serve_manifest_sha256`, which is where its integrity belongs.
+        #
+        # `README.md` is not artifact content either.  On the Hub it IS the
+        # model card, and `tools/publish_artifact.py` has no --model-card
+        # argument -- it uploads the complete local file set with no filters --
+        # so the card reaches the Hub only by sitting in the model dir under
+        # that name.  Hashing it made the act of DOCUMENTING an artifact
+        # invalidate its own card: the same failure as the serve fingerprint,
+        # one step earlier in the release.  Observed 2026-08-15 on
+        # qwen38-27b-arm-b/exported, where a README dropped in at 18:33 moved
+        # the identity off the 17:55 card (e7ac09f8 -> 3c4a83a1) and locked the
+        # artifact out of publication.
+        #
+        # It also made an artifact unable to quote its own measured numbers:
+        # every gate record binds `model_sha`, the gold KL/PPL numbers only
+        # exist after the gates, and writing them into the card would
+        # invalidate the records that produced them.  Re-running the gates does
+        # not escape it -- KL drifts across docker sessions, so the second
+        # round would ship records disagreeing with the printed numbers.
+        #
+        # Nothing behavioural goes unbound: a README is decoded by no runtime
+        # and cannot change what the model computes, and upload integrity comes
+        # from `publish_artifact.py` freezing the complete local file set, not
+        # from `model_sha`.  One exact filename, not a category -- figures the
+        # card references stay attested.
         excluded = {SHIPCARD_FILENAME, "quant_config.json",
                     SERVE_MANIFEST_FILENAME}
+        if not legacy_readme_hashed:
+            excluded.add("README.md")
         auxiliary = {
             path.relative_to(root).as_posix(): {
                 "bytes": int(path.stat().st_size),
@@ -306,6 +335,24 @@ def compute_model_sha(
         if auxiliary:
             payload["auxiliary_files"] = auxiliary
     return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
+
+
+def accepted_model_shas(model_dir: str | os.PathLike) -> tuple[str, ...]:
+    """Current identity first, then each superseded scope as a fallback.
+
+    A card describes its artifact faithfully under the rules it was computed
+    with, so a scope change must not declare every published artifact changed.
+    Each fallback is strictly narrower than the current scope (it attests MORE,
+    or the same), and no legacy scope can produce a current-scope sha, so a
+    card written today is never checked the weak way.
+    """
+    return (
+        compute_model_sha(model_dir),
+        # Pre-2026-08-15 native cards: auxiliary files were unattested.
+        compute_model_sha(model_dir, legacy_native_scope=True),
+        # Cards stamped while `README.md` was still hashed.
+        compute_model_sha(model_dir, legacy_readme_hashed=True),
+    )
 
 
 def artifact_bytes(model_dir: str | os.PathLike) -> int:
@@ -434,12 +481,7 @@ def reattest_weight_stats(
             "refusing to refresh the stat attestation"
         )
     expected_model_sha = card.get("model_sha")
-    if expected_model_sha not in {
-        compute_model_sha(root),
-        # Same legacy tolerance as `verify`: a card written before native
-        # auxiliary files were attested keeps verifying under its own identity.
-        compute_model_sha(root, legacy_native_scope=True),
-    }:
+    if expected_model_sha not in set(accepted_model_shas(root)):
         raise ValueError("copied artifact model_sha differs from the shipcard")
     card["weight_stat_attestation"] = weight_stat_attestation(root)
     card["updated"] = _now()
@@ -792,17 +834,17 @@ def verify(
     if model_dir is not None:
         try:
             assert_weight_stat_attestation(card, model_dir)
-            on_disk = compute_model_sha(model_dir)
+            accepted = accepted_model_shas(model_dir)
+            on_disk = accepted[0]
             if expected_sha and on_disk != expected_sha:
-                # A card written before native auxiliary files were attested
-                # still describes its artifact faithfully under the identity it
-                # was computed with. Accept that identity rather than declaring
-                # every published native artifact changed -- but only as a
-                # fallback, so a current-scope card is never checked the weak
-                # way (the legacy scope cannot produce a current-scope sha).
-                legacy = compute_model_sha(model_dir, legacy_native_scope=True)
-                if legacy == expected_sha:
-                    on_disk = legacy
+                # A card written under a superseded scope still describes its
+                # artifact faithfully under the identity it was computed with.
+                # Accept that identity rather than declaring every published
+                # artifact changed -- but only as a fallback, so a
+                # current-scope card is never checked the weak way (no legacy
+                # scope can produce a current-scope sha).
+                if expected_sha in accepted[1:]:
+                    on_disk = expected_sha
         except Exception as exc:
             problems.append(
                 "artifact changed since the shipcard was opened or its "
