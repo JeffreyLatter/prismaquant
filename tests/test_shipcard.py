@@ -1308,3 +1308,93 @@ def test_achieved_bpp_cross_check_is_silent_on_a_preexisting_card():
 
     legacy = {"build": {"achieved_bpp": {"value": 4.3065, "source": "whatever"}}}
     assert verify(legacy, model_dir=None, required=[]) == []
+
+
+def _add_passthrough(recipe, count):
+    """Append FP8_SOURCE passthrough Linears, which carry no per-unit price."""
+    payload = json.loads(recipe.read_text())
+    for i in range(count):
+        payload[f"model.layers.{i}.self_attn.kv_a_proj"] = {
+            "bits": 8, "data_type": "fp8_e4m3",
+        }
+    recipe.write_text(json.dumps(payload))
+    return recipe
+
+
+def test_cross_check_does_not_refuse_a_passthrough_heavy_recipe(tmp_path):
+    """A loose floor must not false-refuse a legal artifact at publication.
+
+    Hy3 shipped 226 FP8_SOURCE Linears. Those carry no per-unit price, so they
+    leave both sums -- and because passthrough is ~8.002 bpp against CB's ~2.5,
+    the true rate sits legitimately far above the covered floor. Refusing that
+    would be a gate bug that teaches the operator to reach for
+    --force-unverified, which is a worse failure than not refusing.
+    """
+    from prismaquant.shipcard import allocator_achieved_bpp, verify
+
+    recipe = _cb_recipe(
+        tmp_path, units=4, bytes_per_unit=2654212, params_per_unit=8388608,
+        meta={"achieved_bits": 5.2},        # honest for a half-passthrough mix
+    )
+    _add_passthrough(recipe, 4)             # coverage 4/8 = 50%
+
+    cross = allocator_achieved_bpp(recipe)["cross_check"]
+    assert cross["verdict"] == "inconclusive_low_coverage"
+    assert cross["coverage_units"] == pytest.approx(0.5)
+    assert cross["relative_difference"] > 1.0       # >100% apart, still not refused
+    assert "too loose to indict" in cross["detail"]
+    assert verify(
+        {"build": {"achieved_bpp": allocator_achieved_bpp(recipe)}},
+        model_dir=None, required=[],
+    ) == []
+
+
+def test_cross_check_refuses_a_claim_below_the_blend_at_high_coverage(tmp_path):
+    """Undershoot is caught too, not just the stale-Pareto overshoot.
+
+    At near-complete coverage the unpriced remainder cannot explain a gap in
+    either direction, so a claim under the blend is as much a false public
+    number as one over it.
+    """
+    from prismaquant.shipcard import allocator_achieved_bpp, verify
+
+    recipe = _cb_recipe(
+        tmp_path, units=100, bytes_per_unit=2654212, params_per_unit=8388608,
+        meta={"achieved_bits": 1.5},        # well under the 2.53 blend
+    )
+    _add_passthrough(recipe, 2)             # coverage 100/102 = 98%
+
+    got = allocator_achieved_bpp(recipe)
+    cross = got["cross_check"]
+    assert cross["verdict"] == "DISAGREE"
+    assert cross["claim_is_below_floor"] is True
+    assert cross["coverage_units"] > 0.95
+
+    problems = verify({"build": {"achieved_bpp": got}}, model_dir=None, required=[])
+    assert any("contradicts the recipe's own serialized bytes" in p for p in problems)
+
+
+def test_cross_check_undershoot_is_also_coverage_gated(tmp_path):
+    """The tempting shortcut -- "below the blend is impossible" -- is unsound.
+
+    It holds only when every unpriced unit is HIGHER-rate than the priced
+    blend. A recipe whose priced subset is FP8_CB-heavy (~8 bpp) with plain
+    NVFP4 (4.25 bpp) unpriced has a true rate legitimately BELOW its own priced
+    blend. The sound bound is blend x PARAMETER coverage, and parameter
+    coverage is not computable from a recipe: non-CB units record no shape.
+    So undershoot is gated on coverage exactly like overshoot.
+    """
+    from prismaquant.shipcard import allocator_achieved_bpp, verify
+
+    recipe = _cb_recipe(
+        tmp_path, units=4, bytes_per_unit=2654212, params_per_unit=8388608,
+        meta={"achieved_bits": 1.5},
+    )
+    _add_passthrough(recipe, 4)             # coverage 50%
+
+    got = allocator_achieved_bpp(recipe)
+    cross = got["cross_check"]
+    assert cross["verdict"] == "inconclusive_low_coverage"
+    assert cross["claim_is_below_floor"] is True
+    assert "below" in cross["detail"]
+    assert verify({"build": {"achieved_bpp": got}}, model_dir=None, required=[]) == []

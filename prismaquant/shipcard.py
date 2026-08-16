@@ -3277,6 +3277,18 @@ def kv_shared_fisher_echo(env: Mapping[str, str] | None = None) -> dict[str, Any
 # to catch, so a trip is a defect and never a convention argument.
 RECIPE_BPP_CROSS_CHECK_TOLERANCE = 0.10
 
+# The floor is only a useful bound when it covers most of the recipe. Only CB
+# units declare a per-unit serialized price, so a recipe that mixes CB with
+# plain NVFP4 / FP8 / passthrough prices only part of itself and its true rate
+# can sit far from the covered blend in EITHER direction. Measured on the real
+# DSv4 recipes: allocation-112p69-ldlq prices 99.4% of units and lands 1.5%
+# from its claim, while allocation-112p69-raw prices 70% and lands 30.6% away
+# while still being truthful. Below this coverage a mismatch is reported as
+# inconclusive rather than as a defect: refusing on a bound you know is loose
+# is a worse failure than not refusing, because it teaches the operator to
+# reach for --force-unverified.
+RECIPE_BPP_CROSS_CHECK_MIN_COVERAGE = 0.95
+
 
 def recipe_priced_bpp(
     layer_config_path: str | os.PathLike | None,
@@ -3472,6 +3484,21 @@ def allocator_achieved_bpp(
     impossible and a claim far above it is describing something else. It is
     advisory here — :func:`verify` is where it refuses — so that a gate bug can
     never strand a finished export at card-writing time.
+
+    The floor only bounds the claim when it covers nearly the whole recipe, so
+    a mismatch under ``RECIPE_BPP_CROSS_CHECK_MIN_COVERAGE`` is reported as
+    ``inconclusive_low_coverage`` and does **not** refuse. This is not
+    timidity: the real ``allocation-112p69-raw`` recipe prices 70% of its units
+    at 2.109 bpp and truthfully claims 2.755, because its unpriced units are
+    plain NVFP4 at 4.25 bpp. A bare 10% test would have refused that correct
+    artifact at publication — and a gate that false-refuses teaches the
+    operator to reach for ``--force-unverified``, which is the worse outcome.
+
+    Both directions are gated, including undershoot. See the comment in the
+    body: "below the priced blend is impossible" holds only when every unpriced
+    unit is higher-rate than the blend, the sound bound needs *parameter*
+    coverage, and a non-CB unit records no shape in the recipe to compute it
+    from.
     """
     claim = _allocator_achieved_bpp_claim(layer_config_path)
     priced = recipe_priced_bpp(layer_config_path)
@@ -3492,21 +3519,61 @@ def allocator_achieved_bpp(
     else:
         rel = abs(float(claimed) - floor) / floor
         agree = rel <= RECIPE_BPP_CROSS_CHECK_TOLERANCE
+        coverage = priced.get("coverage_units")
+        # Both directions are gated on coverage, and the undershoot side is the
+        # non-obvious half. It is tempting to call a claim below the priced
+        # blend arithmetically impossible -- that holds only when every unpriced
+        # unit is HIGHER-rate than the blend. On the real DSv4 recipes the
+        # unpriced units are plain NVFP4 (4.25 bpp), so it does hold there; but
+        # a recipe whose priced subset is FP8_CB-heavy (~8 bpp) with NVFP4
+        # unpriced would have a true rate legitimately BELOW its own priced
+        # blend. The sound bound would be blend x parameter-coverage, and
+        # parameter coverage is not computable here: a non-CB unit records no
+        # shape in the recipe, so only UNIT coverage is observable. Rather than
+        # assert a bound the data cannot support, the floor is trusted in
+        # either direction only when it is nearly complete.
+        below = float(claimed) < floor
+        loose = (
+            coverage is None
+            or coverage < RECIPE_BPP_CROSS_CHECK_MIN_COVERAGE
+        )
+        if agree:
+            verdict = "agree"
+        elif loose:
+            verdict = "inconclusive_low_coverage"
+        else:
+            verdict = "DISAGREE"
         cross = {
-            "verdict": "agree" if agree else "DISAGREE",
+            "verdict": verdict,
             "claimed_bpp": float(claimed),
             "claimed_source": claim.get("source"),
             "recipe_priced_bpp": floor,
             "relative_difference": rel,
+            "claim_is_below_floor": below,
             "tolerance": RECIPE_BPP_CROSS_CHECK_TOLERANCE,
+            "min_coverage_units": RECIPE_BPP_CROSS_CHECK_MIN_COVERAGE,
             "priced_units": priced.get("priced_units"),
             "total_units": priced.get("total_units"),
-            "coverage_units": priced.get("coverage_units"),
+            "coverage_units": coverage,
             "tensor_payload_bytes": priced.get("tensor_payload_bytes"),
             "params": priced.get("params"),
         }
-        if not agree:
+        if verdict == "inconclusive_low_coverage":
             cross["detail"] = (
+                f"claimed {float(claimed):.4f} bpp from "
+                f"{claim.get('source')!r} sits {rel:.1%} "
+                f"{'below' if below else 'above'} the {floor:.4f} bpp priced "
+                f"blend, but only {priced.get('priced_units')} of "
+                f"{priced.get('total_units')} units carry a per-unit price "
+                f"(coverage {coverage:.1%} < "
+                f"{RECIPE_BPP_CROSS_CHECK_MIN_COVERAGE:.0%}), so the blend is "
+                "too loose to indict the claim: the unpriced units are a large "
+                "enough share to explain the gap on their own. Not refused."
+            )
+        elif not agree:
+            cross["detail"] = (
+                ("claim is BELOW an arithmetic lower bound: " if below else "")
+                + (
                 f"claimed {float(claimed):.4f} bpp from "
                 f"{claim.get('source')!r}, but the recipe's own per-unit "
                 f"serialized bytes price {priced.get('priced_units')} of "
@@ -3518,5 +3585,6 @@ def allocator_achieved_bpp(
                 "a LOWER bound, so the claim is describing a different "
                 "assignment than the recipe holds — most likely a stale "
                 "Pareto point or a superseded selection."
+                )
             )
     return {**claim, "cross_check": cross}
