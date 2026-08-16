@@ -11,7 +11,9 @@
 # embedding mechanism does not exist before Gridbook 0.8.7 -- on 0.8.5 the load
 # dies on an unrecognised `embed_tokens.cb_*`/NVFP4 embedding parameter. So
 # this lane must cross the *serving* pin (gridbook_serving_runtime.sh, contract
-# v4, 0.8.7) instead. The two pins are independent and nothing cross-checks
+# v4, 0.8.8) instead.  0.8.8 is required, not merely current: 0.8.7 shipped the
+# quantized-embedding METHOD but Qwen3.5/3.6 never calls get_quant_method for
+# its lookup table, so on 0.8.7 this artifact does not load at all. The two pins are independent and nothing cross-checks
 # them; picking the wrong one is a load-time failure, not a warning.
 #
 # The base image already carries the pinned wheel, so `install-container` is a
@@ -35,7 +37,7 @@ gridbook_serving_runtime_prepare || exit $?
 
 # The image built from the published gridbook==0.8.7 archive; its installed
 # distribution is the archive whose sha256 the serving pin names.
-BASE_IMAGE="${BASE_IMAGE:-gridbook:0.8.7-clean-98916b0}"
+BASE_IMAGE="${BASE_IMAGE:-gridbook:0.8.8-clean-064a4cb}"
 NAME=pq_qwen38_cb_a
 WORK=/home/rob/dq-runs/qwen38-27b-cb-a
 MODEL="${MODEL:-/dqruns/qwen38-27b-cb-a/exported_nvfp4_cb}"

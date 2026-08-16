@@ -175,7 +175,24 @@ byte-identical to a local rebuild from the tag. Which rule is normative when
 they *don't* coincide is still Robert's call; building the image from the
 published wheel is the cheap way to keep the question moot.
 
-**What 0.8.7 changes, and what it does not.** It adds the `quantized_embedding`
+**0.8.8: the mechanism 0.8.7 shipped was unreachable on this architecture.**
+vLLM dispatches a quantized module from inside the layer's own constructor, and
+`qwen3_5.py` builds `VocabParallelEmbedding(vocab_size, hidden_size)` with
+neither a `quant_config` nor a `prefix` — so `get_quant_method` is never called
+for the lookup table and both the method and the dispatch branch 0.8.7 added
+were dead on Qwen3.5/3.6. It fails silently at construction and surfaces later
+as vLLM refusing a parameter nothing claims (`embed_tokens.weight_global_scale`).
+`gridbook/embedding_construction.py` supplies the two arguments the model's own
+`__init__` already holds, inert unless the config is ours, declares that exact
+prefix, and the embedding was built bare. This is load-bearing for the
+Qwen3.8-27B "A" artifact: its embedding is 248320x5120 = 1.27 B parameters,
+1.83 GB of 12.98 GB, and serving it BF16 instead takes the artifact from
+12.09 GiB to 13.79 GiB — which is the 16 GiB card. `gridbook:0.8.8-clean-064a4cb`
+is built the same way (from the published wheel), so its
+`archive_info.hashes.sha256` is again the PyPI digest (`a982e884...`), verified
+60/60 members byte-identical to a local rebuild from the tag.
+
+**What 0.8.7 changed, and what it did not.** It adds the `quantized_embedding`
 serving mechanism (`model.embed_tokens` as a Gridbook-claimed, weight-only unit
 — vLLM's compressed-tensors embedding path raises for FP4/FP8) and re-audits the
 vLLM 0.26 dense-NVFP4 preflight, which had no entry for the
@@ -199,7 +216,9 @@ artifact whose recipe assigns `model.embed_tokens` to NVFP4 cannot load that
 way — the quantized embedding mechanism does not exist before 0.8.7 — so the
 Qwen3.8-27B CB "A" build serves through
 `scripts/serve_qwen38_cb_a_smoke.sh`, the second serving-pin launcher, against
-`gridbook:0.8.7-clean-98916b0`. It still runs `install-container`, which here
+`gridbook:0.8.8-clean-064a4cb` — 0.8.8 and not 0.8.7, because on 0.8.7 the
+declared NVFP4 embedding never reaches our dispatch and the artifact does not
+load at all. It still runs `install-container`, which here
 is a reinstall-and-verify no-op whose value is the assertion, not the install:
 it proves the running interpreter imports the exact reviewed archive. The
 membership set lives in `tests/test_gridbook_runtime_boundary.py`

@@ -25,39 +25,45 @@ GRIDBOOK_SERVING_RUNTIME_PIN_SCHEMA = (
 GRIDBOOK_SERVING_RUNTIME_REPOSITORY = (
     "https://github.com/RobTand/gridbook.git"
 )
-GRIDBOOK_SERVING_RUNTIME_RELEASE_VERSION = "0.8.7"
+GRIDBOOK_SERVING_RUNTIME_RELEASE_VERSION = "0.8.8"
 GRIDBOOK_SERVING_RUNTIME_COMMIT_PENDING = (
-    "PENDING_GRIDBOOK_V0_8_7_RELEASE_COMMIT"
+    "PENDING_GRIDBOOK_V0_8_8_RELEASE_COMMIT"
 )
 GRIDBOOK_SERVING_RUNTIME_WHEEL_SHA256_PENDING = (
-    "PENDING_GRIDBOOK_V0_8_7_WHEEL_SHA256"
+    "PENDING_GRIDBOOK_V0_8_8_WHEEL_SHA256"
 )
-# Resolved 2026-08-15 against the v0.8.7 release.  Neither value is guessed,
+# Resolved 2026-08-15 against the v0.8.8 release.  Neither value is guessed,
 # and neither is transcribed from the other's source:
-#   commit  -- annotated tag v0.8.7, which the release workflow refuses to
+#   commit  -- annotated tag v0.8.8, which the release workflow refuses to
 #              build unless the commit is reachable from origin/master.  It is
 #              also the build recorded in the image tag
-#              `gridbook:0.8.7-clean-98916b0`.
+#              `gridbook:0.8.8-clean-064a4cb`.
 #   wheel   -- read out of that image's installed distribution, from the PEP
 #              610 `direct_url.json` `archive_info.hashes.sha256` of
-#              gridbook-0.8.7-py3-none-any.whl.  This is the digest of the
+#              gridbook-0.8.8-py3-none-any.whl.  This is the digest of the
 #              wheel that is actually importable at serve time, which is the
 #              only digest a serving pin may assert; a locally rebuilt wheel is
 #              a DIFFERENT archive and must not be substituted here without
 #              re-reading it from the served image.
 #
-# Unlike the 0.8.6 pin, this digest IS the PyPI wheel's: the image was built by
-# installing the published `gridbook==0.8.7` archive from a local file rather
-# than rebuilding it, so `pip download gridbook==0.8.7` now satisfies the pin
+# As with 0.8.7, this digest IS the PyPI wheel's: the image was built by
+# installing the published `gridbook==0.8.8` archive from a local file rather
+# than rebuilding it, so `pip download gridbook==0.8.8` satisfies the pin
 # instead of tripping the wheel-cache trap documented in
 # docs/audits/serving_wheel_cache_poisoning_2026-08-14.md.  Verified before
-# use: all 59 members of the PyPI wheel are byte-identical to a local rebuild
+# use: all 60 members of the PyPI wheel are byte-identical to a local rebuild
 # from the tag, so the published archive is this commit's content.
+#
+# WHY 0.8.8 AND NOT 0.8.7 for the Qwen3.8-27B CB lane: 0.8.7 shipped the
+# quantized-embedding method and its dispatch branch, but vLLM dispatches from
+# inside the layer constructor and `qwen3_5.py` builds its embedding with
+# neither a quant_config nor a prefix -- so neither was ever reached and the
+# artifact did not load at all.  0.8.8 supplies those arguments.
 GRIDBOOK_SERVING_RUNTIME_RELEASE_COMMIT = (
-    "98916b0975a174625af5503b04a09d6b270e4419"
+    "064a4cb093da10d7c35be03435bb6a525280a45f"
 )
 GRIDBOOK_SERVING_RUNTIME_RELEASE_WHEEL_SHA256 = (
-    "c58daf5d00d5bcb284b3b207e8f52d7751f9378f80e1a37b1ee6b530425714d4"
+    "a982e8842d0ce183eaad8978941a375dc984fa0697be7c4519dd741efd1153a3"
 )
 GRIDBOOK_SERVING_RUNTIME_CONTRACT_SCHEMA = "gridbook.runtime-contract.v4"
 GRIDBOOK_SERVING_REQUIRED_ABI_FEATURES = {
