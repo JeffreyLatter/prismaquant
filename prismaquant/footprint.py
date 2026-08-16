@@ -443,12 +443,56 @@ def source_tensor_bytes_manifest(
     return out
 
 
+def _refuse_excluding_an_allocated_namespace(
+    prefixes: tuple[str, ...],
+    assigned_names: Iterable[str],
+    *,
+    context: str,
+) -> None:
+    """Refuse a partition that reaches into the allocator's own candidates.
+
+    Both name vintages are tested, because an operator writes whichever
+    spelling they have in hand -- ``mtp.`` is the checkpoint spelling and a
+    recipe would say ``model.mtp.`` -- and a prefix that missed only on
+    spelling would leave the double-subtraction in place while looking
+    checked.
+    """
+
+    collisions: dict[str, list[str]] = {}
+    for name in assigned_names or ():
+        text = str(name)
+        spellings = {text}
+        if text.startswith("model."):
+            spellings.add(text[len("model."):])
+        else:
+            spellings.add(f"model.{text}")
+        for prefix in prefixes:
+            if any(s.startswith(prefix) for s in spellings):
+                collisions.setdefault(prefix, []).append(text)
+    if not collisions:
+        return
+    detail = "; ".join(
+        f"{prefix!r} matches {len(names)} allocatable unit(s) "
+        f"e.g. {sorted(names)[:3]}"
+        for prefix, names in sorted(collisions.items())
+    )
+    raise ValueError(
+        f"[footprint] {context}: refusing to exclude a namespace the "
+        f"allocator can assign: {detail}. Exclusion removes these bytes from "
+        f"the priced source total, and re-encoding subtracts them from the "
+        f"floor a second time, so every rung would be priced too cheap and "
+        f"the artifact would overshoot its budget. Exclusion is only "
+        f"meaningful for FLOOR tensors the allocator never reasons about."
+    )
+
+
 def partitioned_source_total_bytes(
     manifest: Mapping[str, int],
     source_total_bytes: int,
     excluded_prefixes: Iterable[str],
     *,
     context: str,
+    assigned_names: Iterable[str] = (),
 ) -> dict:
     """Source total for an artifact that ships only PART of the checkpoint.
 
@@ -480,6 +524,15 @@ def partitioned_source_total_bytes(
     invisible: every downstream number stays self-consistent and the artifact
     still "fits".
 
+    ``assigned_names`` is the universe of names the allocator can assign. A
+    prefix reaching into it is refused, because exclusion and re-encoding
+    subtract from the same floor independently: ``assignment_artifact_bytes``
+    computes ``source_total - reencoded``, and this function has already
+    removed the excluded mass from ``source_total``, so a name in both is
+    subtracted TWICE and every rung is priced too cheap. Exclusion is only
+    meaningful for the floor — tensors the allocator never reasoned about —
+    which is the same invariant the exporter enforces on ``--exclude-namespace``.
+
     Returns ``{source_total_bytes, excluded_source_bytes, excluded_prefixes,
     excluded_names, n_excluded}``; ``source_total_bytes`` is what a caller
     passes to :func:`assignment_artifact_bytes` for THIS artifact.
@@ -506,6 +559,8 @@ def partitioned_source_total_bytes(
             )
         matched.extend(hits)
     matched = sorted(dict.fromkeys(matched))
+    _refuse_excluding_an_allocated_namespace(
+        prefixes, assigned_names, context=context)
     resolved = resolve_reencoded_source_bytes(
         manifest, matched, context=f"{context} (excluded source spans)")
     excluded = sum(resolved.values())

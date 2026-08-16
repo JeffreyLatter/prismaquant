@@ -3563,7 +3563,8 @@ def main():
     # reserve; the exporter later measures every regular file and hard-fails.
     _footprint_ctx: dict[str, object] = {}
 
-    def _partition_source_total(_fp, src_total, src_manifest, *, where):
+    def _partition_source_total(_fp, src_total, src_manifest, *, where,
+                                assigned_names=()):
         """Apply --exclude-source-prefix, or pass the total through.
 
         Raises SystemExit (not ValueError) on a bad prefix ON PURPOSE: both
@@ -3579,7 +3580,7 @@ def main():
         try:
             part = _fp.partitioned_source_total_bytes(
                 src_manifest, int(src_total), args.exclude_source_prefix,
-                context=where)
+                context=where, assigned_names=assigned_names)
         except ValueError as exc:
             raise SystemExit(f"[alloc] ERROR: {exc}") from None
         print(
@@ -3605,7 +3606,9 @@ def main():
                     model_profile, "packed_expert_parent_for_projection", None),
             )
             priced_total, _part = _partition_source_total(
-                _fp, src_total, src_manifest, where="pareto candidate footprint")
+                _fp, src_total, src_manifest,
+                where="pareto candidate footprint",
+                assigned_names={**accounting_stats, **fixed_stats, **stats})
             _footprint_ctx.update({
                 "fp": _fp,
                 "source_total_bytes": priced_total,
@@ -3944,7 +3947,8 @@ def main():
         # fit the card.
         src_total_full = int(src_total)
         src_total, source_partition = _partition_source_total(
-            _fp, src_total, src_manifest, where="byte-budget selection")
+            _fp, src_total, src_manifest, where="byte-budget selection",
+            assigned_names={**accounting_stats, **fixed_stats, **stats})
 
         # Stats view for the footprint accounting: the same three-map
         # precedence `_stats_entry_for_assignment_name` uses (aggregated DP

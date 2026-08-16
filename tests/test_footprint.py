@@ -897,3 +897,57 @@ def test_partition_refuses_to_empty_the_checkpoint(tmp_path):
     m = fp.source_tensor_bytes_manifest(str(tmp_path))
     with pytest.raises(ValueError, match="leaving nothing to price"):
         fp.partitioned_source_total_bytes(m, total, [""], context="unit")
+
+
+# --- exclusion is only legal for the FLOOR -----------------------------------
+# Exclusion and re-encoding both subtract from the same floor, independently:
+# `assignment_artifact_bytes` computes `source_total - reencoded`, and the
+# partition has already removed the excluded mass from `source_total`. A name
+# in both is subtracted twice, every rung is priced too cheap, and the artifact
+# overshoots. The exporter enforces this same invariant on --exclude-namespace.
+
+
+def test_partition_refuses_to_exclude_an_allocatable_namespace(tmp_path):
+    _partitioned_disk(tmp_path)
+    total, _ = fp.source_checkpoint_bytes(str(tmp_path))
+    m = fp.source_tensor_bytes_manifest(str(tmp_path))
+
+    with pytest.raises(ValueError, match="allocator can assign"):
+        fp.partitioned_source_total_bytes(
+            m, total, ["mtp."], context="unit",
+            assigned_names={"mtp.0.attn.wo_a": {}})
+
+
+def test_partition_catches_the_other_name_vintage(tmp_path):
+    """`mtp.` is the checkpoint spelling; a recipe says `model.mtp.`.
+
+    A prefix that missed only on spelling would leave the double-subtraction
+    in place while looking checked -- the same trap that made --mtp-format an
+    inert no-op on this probe.
+    """
+    _partitioned_disk(tmp_path)
+    total, _ = fp.source_checkpoint_bytes(str(tmp_path))
+    m = fp.source_tensor_bytes_manifest(str(tmp_path))
+
+    with pytest.raises(ValueError, match="allocator can assign"):
+        fp.partitioned_source_total_bytes(
+            m, total, ["mtp."], context="unit",
+            assigned_names={"model.mtp.0.attn.wo_a": {}})
+
+
+def test_partition_allows_the_shipping_shape(tmp_path):
+    """The DSv4 case: mtp is pure floor, the body is what gets allocated."""
+    _partitioned_disk(tmp_path)
+    total, _ = fp.source_checkpoint_bytes(str(tmp_path))
+    m = fp.source_tensor_bytes_manifest(str(tmp_path))
+
+    part = fp.partitioned_source_total_bytes(
+        m, total, ["mtp."], context="unit",
+        assigned_names={
+            "model.layers.0.self_attn.q_proj": {},
+            "model.layers.0.mlp.gate_proj": {},
+        })
+    assert part["excluded_source_bytes"] == 2048
+    # Unchanged from the no-universe call: the guard refuses, it never reprices.
+    assert part == fp.partitioned_source_total_bytes(
+        m, total, ["mtp."], context="unit")
