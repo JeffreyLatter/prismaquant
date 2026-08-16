@@ -59,6 +59,15 @@ _SCALE_PLANE_DTYPES = frozenset({"F8_E8M0"})
 #: sibling. The gate pairs a weight with whichever one is present rather than
 #: assuming a lane.
 _SCALE_SUFFIXES = (".scale", ".weight_scale", ".weight_scale_inv")
+
+#: Weight planes that are *already* undecodable-on-their-own by construction,
+#: whatever their storage dtype. A codebook-coded plane is a plane of INDICES
+#: and a packed plane is a plane of nibbles; both are U8 on disk, so the
+#: dtype test above cannot see them and every CB artifact used to be classified
+#: on the strength of whatever stray FP8 tensor it happened to ship (on a
+#: 27B NVFP4-CB export: 1 unit out of 818). Enumerating them here is what makes
+#: `undeclared` fire for a CB tensor no config group claims.
+_QUANTIZED_WEIGHT_PLANE_SUFFIXES = (".cb_qweight", ".weight_packed")
 _PER_EXPERT_FORMAT_GROUPS_KEY = "per_expert_format_groups"
 _PER_EXPERT_FORMAT_GROUPS_VERSION = 1
 _PER_EXPERT_GROUP_TOKEN = ".format_group_"
@@ -76,6 +85,10 @@ class CompletenessReport:
     declared_units: dict[str, str] = field(default_factory=dict)
     #: units resolved through a CB config group
     cb_units: list[str] = field(default_factory=list)
+    #: units resolved through the artifact's `quantized_embedding` declaration.
+    #: An embedding is quantized by its own mechanism rather than by a config
+    #: group, so it is claimed here and counted separately.
+    embedding_units: list[str] = field(default_factory=list)
     #: declared passthrough units, weight + scale both present
     passthrough_units: list[str] = field(default_factory=list)
     #: verbatim units in a namespace no serving stack builds (e.g. DSv4 `mtp.`)
@@ -597,6 +610,13 @@ def check_artifact_completeness(
         for entry in _group_claimed_units(quant_config)
         for spelling in _checkpoint_spellings(entry, profile)
     }
+    embedding_claimed = {
+        spelling
+        for entry in (
+            (quant_config.get("quantized_embedding") or {}).get("units") or {}
+        )
+        for spelling in _checkpoint_spellings(str(entry), profile)
+    }
     acknowledged = list(
         (quant_config.get("provenance") or {}).get(
             "route_pending_passthrough_acknowledged") or ())
@@ -639,12 +659,27 @@ def check_artifact_completeness(
         scales_by_unit.setdefault(_scale_unit(name), set()).add(name)
     claimed_scales: set[str] = set()
 
+    # Read the fusion map once: resolving it per unit walks the vLLM registry.
+    try:
+        fused_leaves = (
+            profile.fused_sibling_leaf_mapping() if profile is not None else {}
+        )
+    except Exception:                          # pragma: no cover - defensive
+        fused_leaves = {}
+
+    # Every unit that ships a weight plane no consumer can read on its own,
+    # whether that is an FP8 `.weight` or a coded/packed plane.
+    weight_units: dict[str, str] = {}
     for name, meta in sorted(header.items()):
-        if meta.get("dtype") not in _SCALE_BEARING_DTYPES:
+        if name.endswith(".weight") and meta.get("dtype") in _SCALE_BEARING_DTYPES:
+            weight_units.setdefault(name[: -len(".weight")], ".weight")
             continue
-        if not name.endswith(".weight"):
-            continue
-        unit = name[: -len(".weight")]
+        for suffix in _QUANTIZED_WEIGHT_PLANE_SUFFIXES:
+            if name.endswith(suffix):
+                weight_units.setdefault(name[: -len(suffix)], suffix)
+                break
+
+    for unit in sorted(weight_units):
         unit_scales = scales_by_unit.get(unit, set())
 
         if any(unit.startswith(prefix) for prefix in verbatim_prefixes):
@@ -676,6 +711,21 @@ def check_artifact_completeness(
             report.fp8_in_ignore.append(unit)
             continue
         if _claimed_by_self_or_ancestor(unit, group_claimed, profile):
+            report.cb_units.append(unit)
+            claimed_scales |= unit_scales
+            continue
+        if _claimed_by_self_or_ancestor(unit, embedding_claimed, profile):
+            report.embedding_units.append(unit)
+            claimed_scales |= unit_scales
+            continue
+        members = _fused_member_units(unit, fused_leaves)
+        if members and all(
+            _claimed_by_self_or_ancestor(member, group_claimed, profile)
+            for member in members
+        ):
+            # EVERY member, never any: a fused stack half of whose members are
+            # claimed is a mixed-format fused group, which is unservable, so it
+            # must stay a failure rather than pass on one sibling's claim.
             report.cb_units.append(unit)
             claimed_scales |= unit_scales
             continue
@@ -740,6 +790,31 @@ def _unit_variants(unit: str, profile=None) -> set[str]:
             except Exception:              # pragma: no cover - defensive
                 pass
     return variants
+
+
+def _fused_member_units(unit: str, fused_leaves) -> tuple[str, ...]:
+    """The unfused sibling units a FUSED checkpoint unit is built from.
+
+    THE FOURTH NAMESPACE. A checkpoint may store the fused stack
+    (``…experts.gate_up_proj``) while the config groups name the halves
+    (``…experts.gate_proj``, ``…experts.up_proj``) — which is what the
+    allocator's union-find promotion guarantees is legal, since fused siblings
+    must share one format. A claim written against the halves therefore covers
+    the fused tensor, and reading only the fused spelling reports a CORRECT
+    artifact as unclaimed (8 DSv4-Flash expert stacks, 2026-08-15).
+
+    The mapping is the vLLM class's own ``packed_modules_mapping`` by way of the
+    profile, so this recognizes the fusion the serving stack performs rather
+    than inventing a naming rule.
+    """
+
+    if not fused_leaves or "." not in unit:
+        return ()
+    parent, leaf = unit.rsplit(".", 1)
+    members = fused_leaves.get(leaf)
+    if not members:
+        return ()
+    return tuple(f"{parent}.{member}" for member in members)
 
 
 def _claimed_by_self_or_ancestor(unit: str, claimed, profile=None) -> bool:

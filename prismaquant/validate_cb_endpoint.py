@@ -71,6 +71,17 @@ ARTIFACT_DECODE_CONTRACT_SCHEMA = (
 ARTIFACT_DECODE_CONTRACT_SCHEMA_V2 = (
     "prismaquant.cb_artifact_decode_contract.v2"
 )
+#: The third decode topology: a CB artifact that is neither of the two DSpark
+#: shapes -- no MTP construction namespace to bridge and no FP8 source overlay
+#: to reconstruct, just config groups over the checkpoint's own tensors. It is
+#: a separate MODE rather than a version bump of either DSpark schema, because
+#: the evidence it can offer is different, not newer.
+ARTIFACT_DECODE_CONTRACT_SCHEMA_PLAIN = (
+    "prismaquant.cb_artifact_decode_contract.plain.v1"
+)
+CB_PLAIN_MODE = "cb_plain"
+CB_ROUTED_MOE_RUNTIME_FEATURE = "routed_moe_per_role_codebook_lut"
+CB_ROUTED_MOE_RUNTIME_FEATURE_VERSION = 1
 DSPARK_CB_SIDECAR_SCHEMA = "prismaquant.dspark_cb_sidecar.v1"
 DSPARK_CB_SIDECAR_MODE = "quantized_dspark_cb_sidecar"
 DSPARK_CB_RUNTIME_FEATURE = "dspark_construction_physical_bridge"
@@ -2160,6 +2171,339 @@ def _validate_dspark_cb_sidecar_artifact(
     }
 
 
+def _validate_plain_cb_artifact(
+    root: Path, quant_config: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Prove a plain CB artifact's config groups cover what it actually ships.
+
+    The DSpark modes get their substance from a topology: a construction
+    namespace to bridge, or an FP8 source to reconstruct.  A plain CB artifact
+    has neither, so its evidence has to be the cover itself -- every quantized
+    plane on disk claimed by exactly one declared mechanism, every config-group
+    target resolved to a tensor that exists, every group's units carrying the
+    SAME planes, and every codebook a group references present in the ``.pqcb``
+    with the payload digest its provenance claims.
+
+    All four are computed from the artifact's own bytes.  The provenance
+    inventories (``weight_content_manifest``, ``tensor_formats``) are claims,
+    not evidence, so they are deliberately not restated here.
+    """
+    from .artifact_completeness import (
+        _checkpoint_spellings,
+        _claimed_by_self_or_ancestor,
+        _detect_profile_quietly,
+        _group_claimed_units,
+        _QUANTIZED_WEIGHT_PLANE_SUFFIXES,
+        _SCALE_BEARING_DTYPES,
+        _read_safetensors_header,
+        read_artifact_header,
+    )
+    from .cb_layout import codebook_subtable_shapes, parse_format_name
+
+    provenance = quant_config.get("provenance")
+    if not isinstance(provenance, Mapping):
+        raise CBEndpointValidationError("CB artifact has no provenance object")
+    groups = quant_config.get("config_groups")
+    if not isinstance(groups, Mapping) or not groups:
+        raise CBEndpointValidationError("CB artifact declares no config groups")
+
+    header = read_artifact_header(root)
+    profile = _detect_profile_quietly(root)
+
+    #: unit -> every plane it ships, so a group whose members disagree on their
+    #: planes (one lost its scale) cannot pass as uniform.
+    planes_by_unit: dict[str, set[str]] = {}
+    quantized_units: set[str] = set()
+    for name, meta in header.items():
+        if "." not in name:
+            continue
+        unit, leaf = name.rsplit(".", 1)
+        planes_by_unit.setdefault(unit, set()).add(leaf)
+        if name.endswith(".weight"):
+            if meta.get("dtype") in _SCALE_BEARING_DTYPES:
+                quantized_units.add(unit)
+            continue
+        if any(
+            name.endswith(suffix) for suffix in _QUANTIZED_WEIGHT_PLANE_SUFFIXES
+        ):
+            quantized_units.add(unit)
+    if not quantized_units:
+        raise CBEndpointValidationError(
+            "CB artifact ships no quantized weight plane at all"
+        )
+
+    embedding_claimed = {
+        spelling
+        for entry in (
+            (quant_config.get("quantized_embedding") or {}).get("units") or {}
+        )
+        for spelling in _checkpoint_spellings(str(entry), profile)
+    }
+    ignored = {
+        spelling
+        for entry in (quant_config.get("ignore") or ())
+        for spelling in _checkpoint_spellings(str(entry), profile)
+    }
+
+    group_cover: list[dict[str, Any]] = []
+    claimed_by: dict[str, list[str]] = {}
+    referenced_codebooks: set[str] = set()
+    expected_codebook_contract: dict[str, tuple[str, list[int]]] = {}
+    requires_routed_moe_lut = False
+    for group_name in sorted(groups):
+        group = groups[group_name]
+        if not isinstance(group, Mapping):
+            raise CBEndpointValidationError(
+                f"{group_name}: config group is not an object"
+            )
+        targets = group.get("targets")
+        if not isinstance(targets, list) or not targets:
+            raise CBEndpointValidationError(
+                f"{group_name}: config group claims no target"
+            )
+        spellings = {
+            spelling
+            for entry in _group_claimed_units({"config_groups": {group_name: group}})
+            for spelling in _checkpoint_spellings(str(entry), profile)
+        }
+        members = sorted(
+            unit
+            for unit in quantized_units
+            if _claimed_by_self_or_ancestor(unit, spellings, profile)
+        )
+        if not members:
+            raise CBEndpointValidationError(
+                f"{group_name}: no tensor on disk answers to any of its "
+                f"{len(targets)} targets"
+            )
+        for unit in members:
+            claimed_by.setdefault(unit, []).append(group_name)
+        signatures = {
+            tuple(sorted(planes_by_unit.get(unit, ()))) for unit in members
+        }
+        if len(signatures) != 1:
+            raise CBEndpointValidationError(
+                f"{group_name}: its units do not all ship the same planes, so "
+                f"the group is half-exported: {sorted(signatures)[:3]}"
+            )
+        (signature,) = signatures
+        format_name = group.get("format")
+        parsed = parse_format_name(str(format_name)) if format_name else None
+        # A CB group carries its layout under `scheme`; a delegated stock group
+        # (the FP8 head) carries compressed-tensors' own `weights` block and no
+        # scheme at all.
+        scheme = group.get("scheme")
+        if parsed is not None and not isinstance(scheme, Mapping):
+            raise CBEndpointValidationError(
+                f"{group_name}: CB group {format_name!r} declares no scheme"
+            )
+        refs = scheme.get("codebook_ref") if isinstance(scheme, Mapping) else None
+        if parsed is None:
+            if refs:
+                raise CBEndpointValidationError(
+                    f"{group_name}: a non-CB group cannot reference a codebook"
+                )
+        else:
+            family, format_k = parsed
+            if str(format_name) != family.name(format_k):
+                raise CBEndpointValidationError(
+                    f"{group_name}: format label {format_name!r} is not canonical"
+                )
+            expected_shapes = codebook_subtable_shapes(
+                format_k, family.mode, family.n_sub
+            )
+            expected_suffixes = (
+                [f".{format_name}.sub{index}" for index in range(len(expected_shapes))]
+                if len(expected_shapes) > 1
+                else [f".{format_name}"]
+            )
+            if (
+                not isinstance(refs, list)
+                or len(refs) != len(expected_shapes)
+                or refs != list(dict.fromkeys(refs))
+            ):
+                raise CBEndpointValidationError(
+                    f"{group_name}: CB group refs disagree with the canonical "
+                    f"{format_name} subtable layout"
+                )
+            for ref, raw_shape, suffix in zip(
+                refs, expected_shapes, expected_suffixes, strict=True
+            ):
+                if (
+                    not isinstance(ref, str)
+                    or not ref.startswith("cb_codebook.")
+                    or not ref.endswith(suffix)
+                ):
+                    raise CBEndpointValidationError(
+                        f"{group_name}: codebook ref {ref!r} is not canonical "
+                        f"for {format_name}"
+                    )
+                shape = list(raw_shape)
+                prior = expected_codebook_contract.setdefault(ref, ("F16", shape))
+                if prior != ("F16", shape):
+                    raise CBEndpointValidationError(
+                        f"{ref}: CB groups disagree on the codebook tensor shape"
+                    )
+                referenced_codebooks.add(ref)
+        if any(".experts" in str(target) for target in targets):
+            requires_routed_moe_lut = True
+        group_cover.append(
+            {
+                "group": group_name,
+                "format": str(format_name),
+                "target_count": len(targets),
+                "unit_count": len(members),
+                "planes": list(signature),
+                "codebook_refs": sorted(str(ref) for ref in (refs or ())),
+            }
+        )
+
+    overclaimed = sorted(
+        unit for unit, names in claimed_by.items() if len(names) > 1
+    )
+    if overclaimed:
+        raise CBEndpointValidationError(
+            "config groups overlap -- these units are claimed more than once, "
+            f"so their format is ambiguous: {overclaimed[:8]}"
+        )
+    unclaimed = sorted(
+        unit
+        for unit in quantized_units
+        if unit not in claimed_by
+        and not _claimed_by_self_or_ancestor(unit, embedding_claimed, profile)
+    )
+    if unclaimed:
+        raise CBEndpointValidationError(
+            "quantized tensors claimed by no config group and no embedding "
+            f"declaration: {unclaimed[:8]}"
+        )
+    contradicted = sorted(
+        unit
+        for unit in quantized_units
+        if _claimed_by_self_or_ancestor(unit, ignored, profile)
+    )
+    if contradicted:
+        raise CBEndpointValidationError(
+            "quantized tensors are also listed in `ignore`, which claims they "
+            f"are plain floats: {contradicted[:8]}"
+        )
+
+    codebook_file = quant_config.get("codebook_file")
+    codebook_digests = provenance.get("codebook_sha256")
+    if referenced_codebooks:
+        if not isinstance(codebook_file, str) or not codebook_file.endswith(".pqcb"):
+            raise CBEndpointValidationError(
+                "CB artifact references codebooks but declares no .pqcb sidecar"
+            )
+        try:
+            codebook_header = _read_safetensors_header(root / codebook_file)
+        except Exception as exc:
+            raise CBEndpointValidationError(
+                f"CB codebook sidecar header is unreadable: {exc}"
+            ) from exc
+        if set(codebook_header) != referenced_codebooks:
+            raise CBEndpointValidationError(
+                ".pqcb tensors do not exactly equal config-group refs: missing="
+                f"{sorted(referenced_codebooks - set(codebook_header))[:8]}, "
+                f"extra={sorted(set(codebook_header) - referenced_codebooks)[:8]}"
+            )
+        for name, (dtype, shape) in expected_codebook_contract.items():
+            meta = codebook_header[name]
+            if meta.get("dtype") != dtype or meta.get("shape") != shape:
+                raise CBEndpointValidationError(
+                    f"{name}: codebook tensor must be {dtype} {shape}, got "
+                    f"{meta.get('dtype')} {meta.get('shape')}"
+                )
+        if (
+            not isinstance(codebook_digests, Mapping)
+            or set(codebook_digests) != referenced_codebooks
+            or any(
+                _FINGERPRINT_RE.fullmatch(str(value)) is None
+                for value in codebook_digests.values()
+            )
+        ):
+            raise CBEndpointValidationError(
+                "provenance.codebook_sha256 does not digest exactly the "
+                "codebooks the config groups reference"
+            )
+        try:
+            import torch
+            from safetensors.torch import load_file as load_safetensors
+
+            observed = {
+                name: hashlib.sha256(
+                    tensor.to(torch.float16).cpu().numpy().tobytes()
+                ).hexdigest()
+                for name, tensor in load_safetensors(
+                    str(root / codebook_file), device="cpu"
+                ).items()
+            }
+        except Exception as exc:
+            raise CBEndpointValidationError(
+                f".pqcb tensor payloads are unreadable: {type(exc).__name__}: {exc}"
+            ) from exc
+        mismatched = sorted(
+            name
+            for name in referenced_codebooks
+            if observed.get(name) != codebook_digests.get(name)
+        )
+        if mismatched:
+            raise CBEndpointValidationError(
+                ".pqcb payload SHA-256 differs from provenance.codebook_sha256; "
+                f"mismatched={mismatched[:8]}"
+            )
+
+    renderer_abi = provenance.get("renderer_abi")
+    if not isinstance(renderer_abi, str) or not renderer_abi:
+        raise CBEndpointValidationError(
+            "CB artifact declares no renderer ABI"
+        )
+
+    # Derived, never asserted: a feature is required because the artifact
+    # SHIPS the thing that needs it.  A pin missing a feature the artifact
+    # never uses must not refuse it, and a pin missing one it does use must.
+    required_features: dict[str, int] = {}
+    if requires_routed_moe_lut:
+        required_features[CB_ROUTED_MOE_RUNTIME_FEATURE] = (
+            CB_ROUTED_MOE_RUNTIME_FEATURE_VERSION
+        )
+    if any(
+        isinstance(group, Mapping)
+        and group.get("source_format") == "FP8_BLOCK_UE8M0_SOURCE"
+        for group in groups.values()
+    ):
+        required_features[DSPARK_CB_SOURCE_FP8_RUNTIME_FEATURE] = (
+            DSPARK_CB_SOURCE_FP8_RUNTIME_FEATURE_VERSION
+        )
+
+    return {
+        "renderer_abi": renderer_abi,
+        "codebook_file": str(codebook_file) if codebook_file else None,
+        "codebook_ref_count": len(referenced_codebooks),
+        "quantized_unit_count": len(quantized_units),
+        "tensor_count": len(header),
+        "group_cover": group_cover,
+        "required_runtime_features": required_features,
+        "cover_sha256": _canonical_json_sha256(
+            {
+                "claimed_by": {
+                    unit: names[0] for unit, names in sorted(claimed_by.items())
+                },
+                "embedding_units": sorted(
+                    unit
+                    for unit in quantized_units
+                    if unit not in claimed_by
+                ),
+                "ignore": sorted(ignored),
+                "planes_by_unit": {
+                    unit: sorted(planes_by_unit.get(unit, ()))
+                    for unit in sorted(quantized_units)
+                },
+            }
+        ),
+    }
+
+
 def validate_cb_artifact_decode_contract(
     model_dir: str | Path,
     quant_config: Mapping[str, Any] | None = None,
@@ -2183,19 +2527,39 @@ def validate_cb_artifact_decode_contract(
         )
     recorded_overlay = provenance.get("dspark_source_overlay")
     recorded_sidecar = provenance.get("dspark_cb_sidecar")
-    if (recorded_overlay is None) == (recorded_sidecar is None):
+    lane = cb_serving_lane(root)
+    if recorded_overlay is not None and recorded_sidecar is not None:
         raise CBEndpointValidationError(
-            "artifact provenance must contain exactly one of "
-            "dspark_source_overlay or dspark_cb_sidecar"
+            "artifact provenance declares both dspark_source_overlay and "
+            "dspark_cb_sidecar, which are alternative topologies"
+        )
+    if lane == CB_LANE_DSV4_FLASH:
+        # The DSv4 release IS one of the two DSpark topologies; a DSv4 artifact
+        # presenting itself as plain would shed the bridge contract its serving
+        # stack depends on.
+        if recorded_overlay is None and recorded_sidecar is None:
+            raise CBEndpointValidationError(
+                "DSv4 artifact provenance must contain exactly one of "
+                "dspark_source_overlay or dspark_cb_sidecar"
+            )
+    elif recorded_overlay is not None or recorded_sidecar is not None:
+        raise CBEndpointValidationError(
+            f"artifact on lane {lane!r} declares a DSpark topology, which only "
+            f"the {CB_LANE_DSV4_FLASH!r} lane serves"
         )
 
+    plain_mode = recorded_overlay is None and recorded_sidecar is None
     sidecar_mode = recorded_sidecar is not None
     try:
         from .artifact_completeness import assert_artifact_complete
 
         completeness = assert_artifact_complete(
             root,
-            **({"verbatim_prefixes": ()} if sidecar_mode else {}),
+            **(
+                {"verbatim_prefixes": ()}
+                if sidecar_mode or plain_mode
+                else {}
+            ),
         )
     except Exception as exc:
         raise CBEndpointValidationError(
@@ -2229,6 +2593,39 @@ def validate_cb_artifact_decode_contract(
             quant_config
         ),
     }
+
+    if plain_mode:
+        cover = _validate_plain_cb_artifact(root, quant_config)
+        embedding_unit_count = len(getattr(completeness, "embedding_units", ()))
+        if cover["quantized_unit_count"] != classified + embedding_unit_count:
+            raise CBEndpointValidationError(
+                "plain CB decode accounting differs from the completeness "
+                f"classification: {cover['quantized_unit_count']} quantized "
+                f"unit(s) on disk vs {classified + embedding_unit_count} "
+                "classified"
+            )
+        evidence = {
+            "schema": ARTIFACT_DECODE_CONTRACT_SCHEMA_PLAIN,
+            "mode": CB_PLAIN_MODE,
+            **common_evidence,
+            "embedding_unit_count": embedding_unit_count,
+            "renderer_abi": cover["renderer_abi"],
+            "codebook_file": cover["codebook_file"],
+            "codebook_ref_count": cover["codebook_ref_count"],
+            "quantized_unit_count": cover["quantized_unit_count"],
+            "tensor_count": cover["tensor_count"],
+            "group_cover": cover["group_cover"],
+            "cover_sha256": cover["cover_sha256"],
+            "required_runtime_features": cover["required_runtime_features"],
+            "required_runtime_contract_schema": (
+                DSPARK_CB_RUNTIME_CONTRACT_SCHEMA
+            ),
+        }
+        evidence["evidence_sha256"] = _canonical_json_sha256(evidence)
+        _validate_artifact_decode_record(evidence)
+        if runtime_pin is not None:
+            _require_artifact_decode_runtime_features(evidence, runtime_pin)
+        return evidence
 
     if sidecar_mode:
         try:
@@ -2570,7 +2967,227 @@ def _require_artifact_decode_runtime_features(
         )
 
 
+def _validate_cb_plain_decode_record(payload: Mapping[str, Any]) -> None:
+    """Replay a plain CB decode receipt with no disk and no server.
+
+    Everything here is a number that could have come out differently: drop a
+    target and a group's unit count stops matching, lose a scale plane and its
+    group's plane signature stops being uniform, rebuild the books and the
+    codebook ref count moves.  A receipt whose numbers are structurally fixed
+    proves nothing, which is why the unit counts are required to be positive
+    and to add up rather than merely to be present.
+    """
+    expected_keys = {
+        "schema",
+        "mode",
+        "complete",
+        "completeness_sha256",
+        "declared_unit_count",
+        "cb_unit_count",
+        "passthrough_unit_count",
+        "verbatim_namespace_unit_count",
+        "classified_unit_count",
+        "embedding_unit_count",
+        "route_pending_acknowledged",
+        "excluded_namespaces",
+        "renderer_abi",
+        "codebook_file",
+        "codebook_ref_count",
+        "quantized_unit_count",
+        "tensor_count",
+        "group_cover",
+        "cover_sha256",
+        "required_runtime_features",
+        "required_runtime_contract_schema",
+        "requires_moe_backend_marlin",
+        "evidence_sha256",
+    }
+    _require_exact_keys(payload, expected_keys, where="plain CB decode contract")
+    if (
+        payload.get("schema") != ARTIFACT_DECODE_CONTRACT_SCHEMA_PLAIN
+        or payload.get("mode") != CB_PLAIN_MODE
+        or payload.get("complete") is not True
+    ):
+        raise CBEndpointValidationError(
+            "plain CB decode contract does not attest complete coverage"
+        )
+    for key in (
+        "declared_unit_count",
+        "cb_unit_count",
+        "passthrough_unit_count",
+        "verbatim_namespace_unit_count",
+        "classified_unit_count",
+        "embedding_unit_count",
+        "codebook_ref_count",
+        "quantized_unit_count",
+        "tensor_count",
+    ):
+        value = payload.get(key)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise CBEndpointValidationError(
+                f"plain CB decode contract {key} is not a non-negative integer"
+            )
+    if payload.get("verbatim_namespace_unit_count") != 0:
+        raise CBEndpointValidationError(
+            "a plain CB artifact has no namespace that ships undeclared on "
+            "purpose, so it cannot claim verbatim units"
+        )
+    if payload.get("classified_unit_count") != sum(
+        int(payload[key])
+        for key in (
+            "cb_unit_count",
+            "passthrough_unit_count",
+            "verbatim_namespace_unit_count",
+        )
+    ):
+        raise CBEndpointValidationError(
+            "plain CB decode classified-unit accounting differs"
+        )
+    if payload.get("quantized_unit_count") != int(
+        payload["classified_unit_count"]
+    ) + int(payload["embedding_unit_count"]):
+        raise CBEndpointValidationError(
+            "plain CB decode leaves quantized tensors unclassified"
+        )
+    if payload.get("cb_unit_count", 0) <= 0:
+        raise CBEndpointValidationError(
+            "plain CB decode contract classified no CB unit at all"
+        )
+    if int(payload["tensor_count"]) < int(payload["quantized_unit_count"]):
+        raise CBEndpointValidationError(
+            "plain CB decode contract counts more quantized units than tensors"
+        )
+    for key, where in (
+        ("route_pending_acknowledged", "route-pending acknowledgements"),
+        ("excluded_namespaces", "excluded namespaces"),
+    ):
+        value = payload.get(key)
+        if not isinstance(value, list) or value != sorted(
+            set(str(item) for item in value)
+        ):
+            raise CBEndpointValidationError(
+                f"plain CB decode {where} are not canonical"
+            )
+    if payload.get("excluded_namespaces") != []:
+        raise CBEndpointValidationError(
+            "a plain CB artifact cannot exclude a namespace from decode coverage"
+        )
+    if not isinstance(payload.get("requires_moe_backend_marlin"), bool):
+        raise CBEndpointValidationError(
+            "plain CB decode contract has no boolean marlin-route decision"
+        )
+    renderer_abi = payload.get("renderer_abi")
+    if not isinstance(renderer_abi, str) or not renderer_abi:
+        raise CBEndpointValidationError(
+            "plain CB decode contract names no renderer ABI"
+        )
+    codebook_file = payload.get("codebook_file")
+    if int(payload["codebook_ref_count"]) > 0:
+        if not isinstance(codebook_file, str) or not codebook_file.endswith(
+            ".pqcb"
+        ):
+            raise CBEndpointValidationError(
+                "plain CB decode contract references codebooks with no .pqcb"
+            )
+    elif codebook_file is not None and not isinstance(codebook_file, str):
+        raise CBEndpointValidationError(
+            "plain CB decode contract codebook file is malformed"
+        )
+    cover = payload.get("group_cover")
+    if not isinstance(cover, list) or not cover:
+        raise CBEndpointValidationError(
+            "plain CB decode contract covers no config group"
+        )
+    covered_units = 0
+    seen_groups: set[str] = set()
+    for entry in cover:
+        if not isinstance(entry, Mapping):
+            raise CBEndpointValidationError(
+                "plain CB decode group cover entry is not an object"
+            )
+        _require_exact_keys(
+            entry,
+            {
+                "group",
+                "format",
+                "target_count",
+                "unit_count",
+                "planes",
+                "codebook_refs",
+            },
+            where="plain CB decode group cover",
+        )
+        name = entry.get("group")
+        if not isinstance(name, str) or not name or name in seen_groups:
+            raise CBEndpointValidationError(
+                "plain CB decode group cover repeats or omits a group name"
+            )
+        seen_groups.add(name)
+        for key in ("target_count", "unit_count"):
+            value = entry.get(key)
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise CBEndpointValidationError(
+                    f"{name}: plain CB decode {key} is not a positive integer"
+                )
+        planes = entry.get("planes")
+        if (
+            not isinstance(planes, list)
+            or not planes
+            or planes != sorted(set(str(plane) for plane in planes))
+        ):
+            raise CBEndpointValidationError(
+                f"{name}: plain CB decode plane signature is empty or "
+                "not canonical"
+            )
+        refs = entry.get("codebook_refs")
+        if not isinstance(refs, list) or refs != sorted(
+            set(str(ref) for ref in refs)
+        ):
+            raise CBEndpointValidationError(
+                f"{name}: plain CB decode codebook refs are not canonical"
+            )
+        covered_units += int(entry["unit_count"])
+    if covered_units != int(payload["cb_unit_count"]):
+        raise CBEndpointValidationError(
+            "plain CB decode group cover does not sum to the classified CB "
+            f"units: {covered_units} vs {payload['cb_unit_count']}"
+        )
+    features = payload.get("required_runtime_features")
+    if not isinstance(features, Mapping) or any(
+        not isinstance(name, str)
+        or not isinstance(version, int)
+        or isinstance(version, bool)
+        for name, version in features.items()
+    ):
+        raise CBEndpointValidationError(
+            "plain CB decode runtime feature requirements are malformed"
+        )
+    if payload.get("required_runtime_contract_schema") != (
+        DSPARK_CB_RUNTIME_CONTRACT_SCHEMA
+    ):
+        raise CBEndpointValidationError(
+            "plain CB decode contract does not name the Gridbook runtime "
+            "contract schema"
+        )
+    _require_sha256(
+        payload.get("completeness_sha256"), where="completeness digest"
+    )
+    _require_sha256(payload.get("cover_sha256"), where="plain CB cover digest")
+    recorded_evidence_sha = _require_sha256(
+        payload.get("evidence_sha256"), where="artifact evidence digest"
+    )
+    unstamped = dict(payload)
+    unstamped.pop("evidence_sha256")
+    if recorded_evidence_sha != _canonical_json_sha256(unstamped):
+        raise CBEndpointValidationError(
+            "plain CB decode evidence digest is stale"
+        )
+
+
 def _validate_artifact_decode_record(payload: Mapping[str, Any]) -> None:
+    if payload.get("schema") == ARTIFACT_DECODE_CONTRACT_SCHEMA_PLAIN:
+        _validate_cb_plain_decode_record(payload)
+        return
     if payload.get("schema") == ARTIFACT_DECODE_CONTRACT_SCHEMA_V2:
         _validate_dspark_cb_sidecar_decode_record(payload)
         return

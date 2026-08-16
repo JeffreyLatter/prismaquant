@@ -3205,6 +3205,48 @@ in **both** directions. Scoping the *demand* for `perf.matched_budget_parity`
 does not create a hole in the *check* — a card that volunteers the slot off-lane
 is still fully replayed.
 
+**A third decode topology, and the vacuous pass it exposed** (2026-08-15). The
+same survey reached `validate_cb_artifact_decode_contract`, which demanded
+"exactly one of `dspark_source_overlay` or `dspark_cb_sidecar`" — two DSpark
+topologies a plain Gridbook CB export has neither of. It now dispatches on the
+lane: the DSv4 lane still requires exactly one (declaring neither would shed the
+bridge contract its stack depends on), declaring *both* is refused everywhere,
+and declaring a DSpark topology off the DSv4 lane is refused too. Off-lane
+artifacts take `CB_PLAIN_MODE` under
+`ARTIFACT_DECODE_CONTRACT_SCHEMA_PLAIN` — a distinct mode, not a version bump,
+because the evidence it can offer is *different*, not newer.
+
+Writing that mode surfaced the real defect. `artifact_completeness` enumerated
+candidate units by "`.weight` in an FP8 dtype", which no codebook-coded tensor
+is: on the 27B NVFP4-CB export it classified **1 unit out of 818** and returned
+`complete: True`. A cover proof over one tensor is a gate no artifact can fail,
+which is the same defect as a gate no artifact can pass. The enumerator now also
+reads `.cb_qweight` and `.weight_packed` planes, recognizes the artifact's
+`quantized_embedding` declaration as a claiming mechanism, and bridges a
+**fourth** namespace — a fused checkpoint unit (`…gate_up_proj`) claimed by its
+unfused halves, via the profile's `fused_sibling_leaf_mapping`, requiring
+*every* member to be claimed since a half-claimed fused group is unservable.
+Qwen3.8-27B CB-A goes from 1 classified unit to 498 (497 CB + 1 NVFP4
+embedding).
+
+The plain mode's evidence is the cover itself, all of it recomputed from the
+artifact's bytes rather than restated from `weight_content_manifest` /
+`tensor_formats`: every quantized plane claimed by exactly one mechanism, every
+group's targets resolved to tensors that exist, every group's units carrying an
+identical plane signature (so a half-exported group refuses), and every
+`codebook_ref` present in the `.pqcb` with the F16 payload digest its provenance
+claims. `required_runtime_features` is *derived* — a pin missing a feature the
+artifact never uses must not refuse it, and one missing a feature it does use
+must — so a dense CB artifact requires none and a routed-MoE one requires the
+per-role LUT.
+
+*Open, DSv4 lane:* the stricter enumerator reports 8 `…ffn.experts.gate_up_proj`
+stacks on `artifact-aura-cb-112p69` as claimed by nothing, because 8 of its
+layers spell the targets unfused while 35 spell them fused, and
+`DeepseekV4Profile.fused_sibling_leaf_mapping()` is empty in the host venv (the
+vLLM class lives only in the serving container). That is a real inconsistency to
+settle before the DSv4 ship (task #14), not a Qwen3.8 blocker.
+
 `serve_manifest.json` is excluded from `compute_model_sha` for the same reason
 it is written at all: it is the R15 fingerprint of a *serve*, not artifact
 content, so hashing it made validating an artifact invalidate its own card
