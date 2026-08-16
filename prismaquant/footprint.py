@@ -443,6 +443,88 @@ def source_tensor_bytes_manifest(
     return out
 
 
+def partitioned_source_total_bytes(
+    manifest: Mapping[str, int],
+    source_total_bytes: int,
+    excluded_prefixes: Iterable[str],
+    *,
+    context: str,
+) -> dict:
+    """Source total for an artifact that ships only PART of the checkpoint.
+
+    ``assignment_artifact_bytes`` models an artifact as the source checkpoint
+    with the re-encoded Linears swapped out: anything absent from the
+    assignment stays counted at source precision, which is exactly right for a
+    tensor that ships verbatim. It is exactly WRONG for a tensor that does not
+    ship in this artifact at all, and there is no way to say so through the
+    assignment — a name simply cannot be "assigned absent".
+
+    DSv4-Flash is the live case. The draft head ships as its own directory at
+    NVFP4-CB K12, so the target artifact holds no ``mtp.*`` tensor, yet the
+    probe carries no MTP Linear (33,325 stats rows, zero MTP), so the recipe
+    cannot mention them and ``--mtp-format`` is inert: the 10.863 GB of source
+    MTP spans stay in the floor and every rung is priced ~10.9 GB heavier than
+    it ships. Under a hard byte budget that does not overshoot, it UNDERSHOOTS
+    — the DP buys ~10.9 GB less body than the card can hold, and nothing
+    fail-closed catches it because the artifact comes in under budget.
+
+    So the partition is declared here instead, against the same per-tensor
+    manifest the floor is built from. Resolution goes through
+    :func:`resolve_reencoded_source_bytes`, which charges each checkpoint span
+    at most once and refuses a prefix whose matches overlap (the packed-expert
+    aliases are stored twice on purpose) rather than silently subtracting the
+    same bytes twice.
+
+    A prefix matching nothing is a HARD ERROR. A typo'd prefix that quietly
+    excludes zero bytes is precisely the 10.9 GB undershoot above, and it is
+    invisible: every downstream number stays self-consistent and the artifact
+    still "fits".
+
+    Returns ``{source_total_bytes, excluded_source_bytes, excluded_prefixes,
+    excluded_names, n_excluded}``; ``source_total_bytes`` is what a caller
+    passes to :func:`assignment_artifact_bytes` for THIS artifact.
+    """
+    prefixes = tuple(dict.fromkeys(str(p) for p in excluded_prefixes))
+    if not prefixes:
+        return {
+            "source_total_bytes": int(source_total_bytes),
+            "excluded_source_bytes": 0,
+            "excluded_prefixes": (),
+            "excluded_names": (),
+            "n_excluded": 0,
+        }
+    matched: list[str] = []
+    for prefix in prefixes:
+        hits = sorted(n for n in manifest if n.startswith(prefix))
+        if not hits:
+            raise ValueError(
+                f"[footprint] {context}: excluded source prefix {prefix!r} "
+                "matched no tensor in the source manifest. A prefix that "
+                "excludes nothing silently prices this artifact as if it "
+                "shipped the whole checkpoint; fix the prefix rather than "
+                "dropping it."
+            )
+        matched.extend(hits)
+    matched = sorted(dict.fromkeys(matched))
+    resolved = resolve_reencoded_source_bytes(
+        manifest, matched, context=f"{context} (excluded source spans)")
+    excluded = sum(resolved.values())
+    remaining = int(source_total_bytes) - int(excluded)
+    if remaining <= 0:
+        raise ValueError(
+            f"[footprint] {context}: excluding {prefixes} removes "
+            f"{excluded}B of a {int(source_total_bytes)}B checkpoint, "
+            "leaving nothing to price"
+        )
+    return {
+        "source_total_bytes": remaining,
+        "excluded_source_bytes": int(excluded),
+        "excluded_prefixes": prefixes,
+        "excluded_names": tuple(matched),
+        "n_excluded": len(matched),
+    }
+
+
 def resolve_reencoded_source_bytes(
     manifest: Mapping[str, int],
     reencoded_names: Iterable[str],
