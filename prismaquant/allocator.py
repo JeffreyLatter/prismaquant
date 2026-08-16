@@ -3751,6 +3751,9 @@ def main():
                             args.artifact_overhead_reserve_bytes
                         ),
                         selection_assignment=assignment,
+                        excluded_source_prefixes=(
+                            getattr(args, "exclude_source_prefix", None) or ()
+                        ),
                     )
             payload = {
                 "schema": "prismaquant.allocator.pareto_assignment.v2",
@@ -4486,6 +4489,9 @@ def main():
             ),
             selection_non_tensor_reserve_bytes=overhead_reserve_bytes,
             selection_assignment=chosen_info["assignment"],
+            excluded_source_prefixes=(
+                getattr(args, "exclude_source_prefix", None) or ()
+            ),
         )
         selection.update({
             "has_slack": bool(has_slack),
