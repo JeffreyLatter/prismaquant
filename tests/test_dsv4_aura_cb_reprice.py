@@ -1407,3 +1407,66 @@ def test_routed_bundle_origins_are_bound_to_supplied_selection(monkeypatch):
         _validate_routed_bundle_selection_identity(
             "/bundle.pqcb", selected_sha,
         )
+
+
+def test_run_budget_is_separable_from_the_frozen_w8a16_approval():
+    """Retargeting the campaign must not rewrite an approval record.
+
+    These were one constant until 2026-08-16. `--target-disk-gb` is a
+    whole-artifact hard budget for THIS run, while
+    DSV4_W8A16_APPROVED_SELECTION is an sha256-attested record of the 112.69 GB
+    artifact that dsv4_w8a16_export_handoff re-checks. Sharing a name meant
+    allocating to a smaller artifact would silently mutate the approval.
+    """
+    from prismaquant import dsv4_aura_cb_reprice as drv
+
+    assert drv.DSV4_W8A16_APPROVED_BUDGET_BYTES == 112_690_000_000
+    assert (
+        drv.DSV4_W8A16_APPROVED_SELECTION["budget_bytes"]
+        == drv.DSV4_W8A16_APPROVED_BUDGET_BYTES
+    )
+
+    # 92 GB total, less the 4.597 GB MTP draft that ships as its own directory.
+    retargeted = SimpleNamespace(budget_bytes=87_403_000_000)
+    assert drv.run_budget_bytes(retargeted) == 87_403_000_000
+    # ... and the approval is untouched by that.
+    assert (
+        drv.DSV4_W8A16_APPROVED_SELECTION["budget_bytes"] == 112_690_000_000
+    )
+
+    assert drv.run_budget_bytes(SimpleNamespace(budget_bytes=None)) == (
+        drv.DSV4_DEFAULT_BUDGET_BYTES
+    )
+    assert drv.run_budget_bytes(SimpleNamespace()) == (
+        drv.DSV4_DEFAULT_BUDGET_BYTES
+    )
+
+
+def test_budget_override_reaches_the_allocator_target_disk_gb():
+    """The flag has to land on --target-disk-gb, not just parse."""
+    from prismaquant import dsv4_aura_cb_reprice as drv
+
+    source = inspect.getsource(drv._allocator_command)
+    assert '"--target-disk-gb", f"{run_budget_bytes(args) / 1e9:.9f}"' in source
+    assert "DSV4_DEFAULT_BUDGET_BYTES" not in source, (
+        "the allocator must read the run budget, not the default constant"
+    )
+    assert '"--artifact-overhead-reserve-bytes"' in source, (
+        "a whole-artifact budget is refused without an operator reserve"
+    )
+
+
+def test_budget_below_the_non_tensor_reserve_is_refused():
+    """tensor_payload + reserve <= budget is unsatisfiable below the reserve."""
+    from prismaquant import dsv4_aura_cb_reprice as drv
+
+    with pytest.raises(SystemExit):
+        drv.main([
+            "--model", "m", "--probe", "p", "--activation-cache-dir", "a",
+            "--col-weights", "c", "--dataset", "d", "--work-dir", "w",
+            "--expert-formats", "FP8_CB_K28", "--nonexpert-formats",
+            "FP8_CB_K28", "--routed-book-selection", "r",
+            "--checkpoint-dir", "k", "--cost-mode", "aura",
+            "--require-production-cache",
+            "--budget-bytes", str(drv.DSV4_ARTIFACT_RESERVE_BYTES),
+        ])

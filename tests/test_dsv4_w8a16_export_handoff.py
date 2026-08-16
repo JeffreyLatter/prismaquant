@@ -95,7 +95,7 @@ def _fixture(monkeypatch, tmp_path: Path):
         tmp_path,
         "raw",
         assignment,
-        provenance={"budget_bytes": handoff.DSV4_BUDGET_BYTES},
+        provenance={"budget_bytes": handoff.DSV4_W8A16_APPROVED_BUDGET_BYTES},
         assignment_sha256=assignment_sha256,
     )
     monkeypatch.setattr(
@@ -144,7 +144,7 @@ def _fixture(monkeypatch, tmp_path: Path):
         "selection": dict(handoff.DSV4_W8A16_APPROVED_SELECTION),
     }
     provenance = {
-        "budget_bytes": handoff.DSV4_BUDGET_BYTES,
+        "budget_bytes": handoff.DSV4_W8A16_APPROVED_BUDGET_BYTES,
         "cpu_replay": {
             "schema": handoff.DSV4_W8A16_READMISSION_SCHEMA,
             "measurement_invoked": False,

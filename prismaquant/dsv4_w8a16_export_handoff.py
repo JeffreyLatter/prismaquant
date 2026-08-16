@@ -26,7 +26,7 @@ from prismaquant.cb_anchored_cost import (
 )
 from prismaquant.cost_stage_checkpoint import canonical_json_sha256
 from prismaquant.dsv4_aura_cb_reprice import (
-    DSV4_BUDGET_BYTES,
+    DSV4_W8A16_APPROVED_BUDGET_BYTES,
     DSV4_TOTAL_UNITS,
     DSV4_W8A16_APPROVED_ASSIGNMENT_SHA256,
     DSV4_W8A16_APPROVED_CB_COL_WEIGHTS_SHA256,
@@ -481,7 +481,7 @@ def verify_dsv4_w8a16_export_handoff(
         not isinstance(stamp, Mapping)
         or stamp.get("schema") != CB_ANCHORED_COST_SCHEMA
         or stamp.get("cost_currency") != AURA_CURRENCY
-        or stamp.get("budget_bytes") != DSV4_BUDGET_BYTES
+        or stamp.get("budget_bytes") != DSV4_W8A16_APPROVED_BUDGET_BYTES
         or selection.get("aura_cb_reprice") != stamp
         or selection.get("cost_currency") != AURA_CURRENCY
         or selection.get("feasible") is not True

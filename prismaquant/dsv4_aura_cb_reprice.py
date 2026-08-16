@@ -84,7 +84,23 @@ DSV4_TOTAL_UNITS = 33_325
 DSV4_EXPERT_UNITS = 43 * 256 * 3
 DSV4_NONEXPERT_UNITS = 301
 DSV4_EXPECTED_ANCHORS = 66_951
-DSV4_BUDGET_BYTES = 112_690_000_000
+# Two budgets that happened to be equal, and must not be spelled the same.
+#
+# The frozen one is part of an approval RECORD: DSV4_W8A16_APPROVED_SELECTION
+# below is attested by sha256, and dsv4_w8a16_export_handoff re-checks the
+# stamp's budget_bytes against it. It describes the 112.69 GB artifact that was
+# approved and can never change.
+#
+# The default one is this run's CONSTRAINT, overridable with --budget-bytes.
+# They were a single name until 2026-08-16, which meant retargeting the
+# campaign to a smaller artifact would have silently rewritten the W8A16
+# approval it has nothing to do with.
+DSV4_W8A16_APPROVED_BUDGET_BYTES = 112_690_000_000
+DSV4_DEFAULT_BUDGET_BYTES = 112_690_000_000
+# --target-disk-gb is a whole-artifact hard budget over all regular files
+# recursive, so the selector needs an operator reserve for safetensors headers,
+# JSON and copied tokenizer files. 256 MiB is what the 112.69 GB artifact ran
+# with; it actually consumed 7.1 MB, so the margin is deliberate and cheap.
 DSV4_ARTIFACT_RESERVE_BYTES = 268_435_456
 # Spark has one unified CPU/GPU memory pool.  The worst DSv4 anchor layer's
 # exact FP32 dW plane is 51.3 GiB, so source weights must never retain or
@@ -127,7 +143,7 @@ DSV4_W8A16_APPROVED_CB_COL_WEIGHTS_SHA256 = (
     "df045bde786f7d092e501bfa856984243106a13f05594f4a11fe30270fb09379"
 )
 DSV4_W8A16_APPROVED_SELECTION = {
-    "budget_bytes": DSV4_BUDGET_BYTES,
+    "budget_bytes": DSV4_W8A16_APPROVED_BUDGET_BYTES,
     "chosen_achieved_bits": 2.7555507482797204,
     "predicted_dloss": 0.35597906499701,
     "selection_tensor_payload_bytes": 112_349_756_664,
@@ -1907,6 +1923,19 @@ def _load_and_audit_completed_streamed_payload(
     return sanitized, replay
 
 
+def run_budget_bytes(args: object) -> int:
+    """This run's whole-artifact hard budget, in bytes.
+
+    Distinct from :data:`DSV4_W8A16_APPROVED_BUDGET_BYTES`, which is a frozen
+    approval record. Note the scope: `--target-disk-gb` bounds ONE artifact
+    directory recursively, so when MTP ships as a separate `/draft` artifact
+    (the `dspark_cb_sidecar` topology) the draft's bytes are NOT inside this
+    number and the operator must split the total across the two directories.
+    """
+    value = getattr(args, "budget_bytes", None)
+    return DSV4_DEFAULT_BUDGET_BYTES if value is None else int(value)
+
+
 def _allocator_command(
     prepared: PreparedDSv4Campaign,
     *,
@@ -1979,7 +2008,7 @@ def _allocator_command(
         "--costs", str(cost_path),
         "--model-override", str(args.model),
         "--target-profile", DSV4_TARGET_PROFILE,
-        "--target-disk-gb", f"{DSV4_BUDGET_BYTES / 1e9:.9f}",
+        "--target-disk-gb", f"{run_budget_bytes(args) / 1e9:.9f}",
         "--artifact-overhead-reserve-bytes",
         str(DSV4_ARTIFACT_RESERVE_BYTES),
         "--cb-scale-coding", "two_tier",
@@ -2385,7 +2414,7 @@ def _finish_dsv4_campaign(
         invocation_provenance={
             "cost_currency": AURA_CURRENCY,
             "activation_fair_pricing": False,
-            "budget_bytes": DSV4_BUDGET_BYTES,
+            "budget_bytes": run_budget_bytes(args),
             "cost_payload_sha256": _sha256(cost_path),
             "format_plan_identity_sha256": (
                 prepared.format_plan.identity_sha256
@@ -2478,7 +2507,7 @@ def _finish_dsv4_campaign(
     report = {
         "schema": DSV4_CAMPAIGN_SCHEMA,
         "cost_currency": AURA_CURRENCY,
-        "budget_bytes": DSV4_BUDGET_BYTES,
+        "budget_bytes": run_budget_bytes(args),
         "plan": dict(prepared.plan_report),
         "panel": dict(prepared.panel_report),
         "validation": validation,
@@ -2879,6 +2908,18 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--budget-bytes",
+        type=int,
+        default=None,
+        help=(
+            "whole-artifact hard budget in bytes for THIS run's allocation "
+            f"(default {DSV4_DEFAULT_BUDGET_BYTES}, the 112.69 GB artifact). "
+            "Scope is one artifact directory measured recursively, so if MTP "
+            "ships as a separate /draft artifact its bytes are NOT included "
+            "here and the total must be split across the two directories."
+        ),
+    )
+    parser.add_argument(
         "--w8a16-readmission",
         action="store_true",
         help=(
@@ -2895,6 +2936,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if not args.require_production_cache:
         parser.error("DSv4 anchors require the production render arm")
+    if args.budget_bytes is not None and (
+        args.budget_bytes <= DSV4_ARTIFACT_RESERVE_BYTES
+    ):
+        parser.error(
+            f"--budget-bytes must exceed the {DSV4_ARTIFACT_RESERVE_BYTES}B "
+            "non-tensor reserve; the selection contract is "
+            "tensor_payload + reserve <= budget"
+        )
     if args.format_plan:
         parser.error(
             "DSv4 format plan is derived from the exact source census; "
@@ -2921,7 +2970,9 @@ if __name__ == "__main__":  # pragma: no cover - frozen shell entrypoint
 
 __all__ = [
     "DSV4_BOUNDED_CAMPAIGN_WORKER",
-    "DSV4_BUDGET_BYTES",
+    "DSV4_DEFAULT_BUDGET_BYTES",
+    "DSV4_W8A16_APPROVED_BUDGET_BYTES",
+    "run_budget_bytes",
     "DSV4_EXPECTED_ANCHORS",
     "DSV4_EXPERT_UNITS",
     "DSV4_NONEXPERT_UNITS",
