@@ -139,6 +139,14 @@ _PUBLISHED_FILES = frozenset({
 #     test_without_a_sidecar_declaration_the_construction_bridge_is_inert, and
 #     confirmed on real bytes: artifact-aura-cb-112p69 reports the same 100
 #     declared passthrough / 25 verbatim / COMPLETE before and after.
+#     (3) `per_expert_format_groups` is now recognized as a claiming mechanism
+#     in the classifier, closing the same omission 1ccdf58 left for split
+#     expert banks: those tensors were already owned in both directions by
+#     `_validate_per_expert_format_groups`, so the classifier was reporting
+#     them a second time as claimed by nothing. Undeclared split tensors still
+#     fail through that validator, pinned by a negative control. This lane
+#     ships no split bank -- it writes no `per_expert_format_groups` key at
+#     all, so the claimed set is empty and the branch is unreachable.
 #   nvfp4_cb_footprint.py -- `whole_artifact_budget_stamp` gained an optional
 #     `excluded_source_prefixes` that emits its field only when non-empty, its
 #     reader validates that field, and two exclusion helpers were added. This
@@ -193,7 +201,7 @@ _FROZEN_EXPORT_SOURCE_SHA256 = {
         "02d5790a80b5f9e21eb9ac2f7bfc6ca0fb5a33e9fcbeca27c9863ffa002dd9d4"
     ),
     "prismaquant/artifact_completeness.py": (
-        "02139abc8bd750e05ae620b47c6707143b58802b3e948247ddda3fb878474098"
+        "eebde735e886a8a6ad4f20a29252d69f6ce6e54b6fd7d1c4b9e486dfd8b663fb"
     ),
     "prismaquant/export_output_safety.py": (
         "4af0a9d891313f1d9d031955e431e1e84c1ba0e11a9ce2605ea92de3bc3703b5"

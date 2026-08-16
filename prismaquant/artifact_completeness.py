@@ -618,6 +618,27 @@ def check_artifact_completeness(
         )
         for spelling in _checkpoint_spellings(str(entry), profile)
     }
+    # A SPLIT expert bank is claimed by the `per_expert_format_groups`
+    # declaration, not by a config group: one mixed-rung stack ships as
+    # `…gate_up_proj.format_group_<wire>` per rung, and each is named by a
+    # declared `tensor_prefix`. `_validate_per_expert_format_groups` owns those
+    # tensors completely — it requires every declared prefix to have its planes
+    # AND every split tensor in the header to be declared — so the classifier
+    # must recognize the mechanism rather than report them a second time as
+    # claimed by nothing. Undeclared split tensors still fail, through that
+    # validator's `undeclared_group_tensors`.
+    group_split_claimed = {
+        str(entry["tensor_prefix"])
+        for families in (
+            (quant_config.get(_PER_EXPERT_FORMAT_GROUPS_KEY) or {})
+            .get("layers") or {}
+        ).values()
+        if isinstance(families, dict)
+        for entries in families.values()
+        if isinstance(entries, list)
+        for entry in entries
+        if isinstance(entry, dict) and entry.get("tensor_prefix")
+    }
     acknowledged = list(
         (quant_config.get("provenance") or {}).get(
             "route_pending_passthrough_acknowledged") or ())
@@ -712,6 +733,14 @@ def check_artifact_completeness(
             report.fp8_in_ignore.append(unit)
             continue
         if _claimed_by_self_or_ancestor(unit, group_claimed, profile, dspark):
+            report.cb_units.append(unit)
+            claimed_scales |= unit_scales
+            continue
+        if unit in group_split_claimed:
+            # Exact name, no variant walk: `tensor_prefix` is written in the
+            # same namespace as the tensor it names, and an ancestor match here
+            # would let the UNSPLIT parent's claim cover a split tensor whose
+            # own rung was never declared.
             report.cb_units.append(unit)
             claimed_scales |= unit_scales
             continue
