@@ -592,6 +592,7 @@ def check_artifact_completeness(
     header = read_artifact_header(root)
 
     profile = _detect_profile_quietly(root)
+    dspark = _dspark_construction_resolver(root, quant_config)
     raw_declared = dict(
         (quant_config.get("source_passthrough") or {}).get("units") or {})
     # Resolve every declaration/ignore/CB key into the checkpoint namespace the
@@ -692,35 +693,35 @@ def check_artifact_completeness(
                 report.missing_scale.append(unit)
             continue
 
-        if _unit_variants(unit, profile) & declared.keys():
+        if _unit_variants(unit, profile, dspark) & declared.keys():
             report.passthrough_units.append(unit)
             if unit_scales:
                 claimed_scales |= unit_scales
             else:
                 report.missing_scale.append(unit)
-            if _unit_variants(unit, profile) & ignored:
+            if _unit_variants(unit, profile, dspark) & ignored:
                 # Both statements cannot be true, and `ignore` is the one that
                 # loses the scale.
                 report.fp8_in_ignore.append(unit)
             continue
 
-        if _unit_variants(unit, profile) & ignored:
+        if _unit_variants(unit, profile, dspark) & ignored:
             # THE ORIGINAL BUG. `ignore` means "plain unquantized floats", and
             # this tensor is not that. Checked before the config-group test so
             # a unit that is somehow both still reports the contradiction.
             report.fp8_in_ignore.append(unit)
             continue
-        if _claimed_by_self_or_ancestor(unit, group_claimed, profile):
+        if _claimed_by_self_or_ancestor(unit, group_claimed, profile, dspark):
             report.cb_units.append(unit)
             claimed_scales |= unit_scales
             continue
-        if _claimed_by_self_or_ancestor(unit, embedding_claimed, profile):
+        if _claimed_by_self_or_ancestor(unit, embedding_claimed, profile, dspark):
             report.embedding_units.append(unit)
             claimed_scales |= unit_scales
             continue
         members = _fused_member_units(unit, fused_leaves)
         if members and all(
-            _claimed_by_self_or_ancestor(member, group_claimed, profile)
+            _claimed_by_self_or_ancestor(member, group_claimed, profile, dspark)
             for member in members
         ):
             # EVERY member, never any: a fused stack half of whose members are
@@ -735,9 +736,9 @@ def check_artifact_completeness(
         unit = _scale_unit(scale_key)
         if any(unit.startswith(prefix) for prefix in verbatim_prefixes):
             continue
-        if _claimed_by_self_or_ancestor(unit, declared, profile):
+        if _claimed_by_self_or_ancestor(unit, declared, profile, dspark):
             continue
-        if _claimed_by_self_or_ancestor(unit, group_claimed, profile):
+        if _claimed_by_self_or_ancestor(unit, group_claimed, profile, dspark):
             # An expert stack keeps its per-expert source scale planes only
             # when the stack was NOT collapsed; either way a group claims
             # them, so they are not orphans.
@@ -757,7 +758,60 @@ def check_artifact_completeness(
 _COLLAPSIBLE_COMPONENTS = ("shared_mlp", "shared_experts")
 
 
-def _unit_variants(unit: str, profile=None) -> set[str]:
+def _dspark_construction_resolver(root: Path, quant_config: dict):
+    """Resolve a physical DSpark unit to the construction name its target uses.
+
+    THE FIFTH NAMESPACE, and the one a sidecar artifact cannot avoid. A DSpark
+    draft ships its tensors under the PHYSICAL ``mtp.{stage}.<tail>`` names, but
+    vLLM builds those blocks as ordinary body layers past the end of the body,
+    so the exporter writes their config-group targets under
+    ``model.layers.{num_hidden_layers+stage}.<tail>``
+    (``export_nvfp4_cb_streaming._cb_target_name`` ->
+    ``dspark_cb_construction_target_for_physical_output``). A target artifact
+    never shows this because ``mtp.`` is a verbatim prefix there; a SIDECAR
+    passes ``verbatim_prefixes=()`` on purpose — proving those units is the
+    whole point of the artifact — so all 27 CB units reported as claimed by no
+    mechanism at all.
+
+    Recomputed with the producer's own function rather than read back from the
+    sidecar's recorded ``physical_cb_targets``/``construction_cb_targets``
+    pairing: a completeness gate that accepted the artifact's own statement of
+    which name claims which tensor could be satisfied by writing the pairing
+    down. Only the ACTIVATION is taken from provenance; the layer arithmetic
+    comes from the model config, so a claim naming the wrong construction slot
+    still fails.
+
+    Returns ``None`` when the artifact declares no sidecar, which leaves every
+    other lane's spellings byte-identical.
+    """
+
+    provenance = quant_config.get("provenance")
+    if not isinstance(provenance, dict):
+        return None
+    if provenance.get("dspark_cb_sidecar") is None:
+        return None
+    try:
+        from prismaquant.dspark_source_metadata import (
+            dspark_cb_construction_target_for_physical_output,
+        )
+        config = json.loads((root / "config.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ImportError):
+        return None
+
+    def resolve(unit: str) -> str | None:
+        # `main_proj`, the `wo_a` BMM and anything else off the CB surface
+        # raise rather than return a name; those units are claimed by the
+        # W8A16 route under their physical spelling and need no bridge.
+        try:
+            return dspark_cb_construction_target_for_physical_output(
+                unit, config)
+        except (ValueError, KeyError):
+            return None
+
+    return resolve
+
+
+def _unit_variants(unit: str, profile=None, dspark=None) -> set[str]:
     """Every spelling of *unit* a target may legitimately be written as.
 
     THE THIRD NAMESPACE. ``_checkpoint_spellings`` normalizes a claim written
@@ -789,6 +843,11 @@ def _unit_variants(unit: str, profile=None) -> set[str]:
                 variants.add(profile.to_vllm_internal_name(spelling))
             except Exception:              # pragma: no cover - defensive
                 pass
+    if dspark is not None:
+        for spelling in tuple(variants):
+            construction = dspark(spelling)
+            if construction:
+                variants.add(construction)
     return variants
 
 
@@ -817,7 +876,9 @@ def _fused_member_units(unit: str, fused_leaves) -> tuple[str, ...]:
     return tuple(f"{parent}.{member}" for member in members)
 
 
-def _claimed_by_self_or_ancestor(unit: str, claimed, profile=None) -> bool:
+def _claimed_by_self_or_ancestor(
+    unit: str, claimed, profile=None, dspark=None
+) -> bool:
     """Whether *unit* or any dotted ancestor of it appears in *claimed*.
 
     Routed-expert groups are declared ONCE for the whole stack
@@ -829,7 +890,7 @@ def _claimed_by_self_or_ancestor(unit: str, claimed, profile=None) -> bool:
     ``experts``.
     """
 
-    for variant in _unit_variants(unit, profile):
+    for variant in _unit_variants(unit, profile, dspark):
         if variant in claimed:
             return True
         parts = variant.split(".")

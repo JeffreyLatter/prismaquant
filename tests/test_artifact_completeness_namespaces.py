@@ -159,3 +159,103 @@ def test_without_a_profile_the_gate_falls_back_to_the_literal_name(tmp_path,
     )
     with pytest.raises(ArtifactIncomplete, match="claimed by no mechanism"):
         assert_artifact_complete(root)
+
+
+# --- THE FIFTH NAMESPACE: DSpark physical vs construction ------------------
+#
+# A DSpark draft ships its tensors as `mtp.{stage}.<tail>` but vLLM builds those
+# blocks as body layers past the end of the body, so the exporter writes their
+# config-group targets as `model.layers.{num_hidden_layers+stage}.<tail>`
+# (`_cb_target_name` -> `dspark_cb_construction_target_for_physical_output`).
+# A TARGET artifact never shows this because `mtp.` is a verbatim prefix there.
+# A SIDECAR passes `verbatim_prefixes=()` on purpose — proving those units is
+# the entire point of the artifact — so all 27 CB units reported as claimed by
+# no mechanism at all.
+
+_SIDECAR_BODY_LAYERS = 3
+_SIDECAR_STAGES = 3
+
+#: One CB unit, in the physical namespace its tensors actually ship under.
+_DSPARK_UNIT = (
+    ("mtp.0.attn.wkv.cb_qweight", "U8", (32, 8), 32 * 8),
+)
+
+
+def _write_dspark_sidecar_artifact(
+    root: Path, *, targets, declare_sidecar: bool = True,
+) -> None:
+    """A minimal sidecar: the physical tensor, plus the config/provenance the
+    bridge keys off. `declare_sidecar=False` writes the same bytes with no
+    sidecar declaration, which is how the inertness control is expressed."""
+
+    _write_artifact(root, targets=targets, tensors=_DSPARK_UNIT)
+    (root / "config.json").write_text(json.dumps({
+        "model_type": "deepseek_v4",
+        "num_hidden_layers": _SIDECAR_BODY_LAYERS,
+        "n_mtp_layers": _SIDECAR_STAGES,
+    }), encoding="utf-8")
+    quant = json.loads((root / "quant_config.json").read_text())
+    if declare_sidecar:
+        quant["provenance"] = {"dspark_cb_sidecar": {
+            "schema": "prismaquant.dspark_cb_sidecar.v1",
+            "num_hidden_layers": _SIDECAR_BODY_LAYERS,
+            "n_mtp_layers": _SIDECAR_STAGES,
+        }}
+    (root / "quant_config.json").write_text(
+        json.dumps(quant), encoding="utf-8")
+
+
+@pytest.fixture()
+def no_profile(monkeypatch):
+    """The bridge is architecture arithmetic, not a profile map: it must work
+    with no profile at all, which is also what a synthetic artifact detects."""
+
+    monkeypatch.setattr(
+        completeness, "_detect_profile_quietly", lambda _root: None)
+
+
+def test_construction_spelled_target_claims_its_physical_dspark_unit(
+        tmp_path, no_profile):
+    """The exact shape of the sidecar failure: stage 0 of a 3-layer body is
+    built at `model.layers.3`, and that is what the correct artifact claims."""
+
+    root = tmp_path / "artifact"
+    _write_dspark_sidecar_artifact(
+        root, targets=["re:^model[.]layers[.]3[.]attn[.]wkv$"])
+    report = check_artifact_completeness(root, verbatim_prefixes=())
+    assert report.undeclared == []
+    assert report.cb_units == ["mtp.0.attn.wkv"]
+    assert report.ok
+    assert_artifact_complete(root, verbatim_prefixes=())
+
+
+def test_a_construction_target_for_the_wrong_stage_still_fails(
+        tmp_path, no_profile):
+    """The negative control, and the reason the layer arithmetic is recomputed
+    from the model config rather than read back from the sidecar's own recorded
+    physical->construction pairing. `model.layers.4` is stage 1; claiming it
+    does not claim stage 0's tensor, and an off-by-one the gate forgave would
+    ship a draft whose blocks load into the wrong slots."""
+
+    root = tmp_path / "artifact"
+    _write_dspark_sidecar_artifact(
+        root, targets=["re:^model[.]layers[.]4[.]attn[.]wkv$"])
+    with pytest.raises(ArtifactIncomplete, match="claimed by no mechanism"):
+        assert_artifact_complete(root, verbatim_prefixes=())
+
+
+def test_without_a_sidecar_declaration_the_construction_bridge_is_inert(
+        tmp_path, no_profile):
+    """Additive, like every other bridge here. The construction spelling is
+    only a legitimate claim on an artifact that declares itself a DSpark
+    sidecar; on anything else — every target artifact ever shipped — the same
+    target must still leave the unit unclaimed."""
+
+    root = tmp_path / "artifact"
+    _write_dspark_sidecar_artifact(
+        root,
+        targets=["re:^model[.]layers[.]3[.]attn[.]wkv$"],
+        declare_sidecar=False,
+    )
+    with pytest.raises(ArtifactIncomplete, match="claimed by no mechanism"):
+        assert_artifact_complete(root, verbatim_prefixes=())

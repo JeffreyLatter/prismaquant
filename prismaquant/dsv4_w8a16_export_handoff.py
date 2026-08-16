@@ -115,9 +115,46 @@ _PUBLISHED_FILES = frozenset({
 #     declaration is two otherwise-unread attributes. Verified directly:
 #     `lm_head`/`model.embed_tokens`/expert names derive exactly as before on
 #     both the vLLM-internal and checkpoint sides.
+#
+# RE-FROZEN 2026-08-16 (third time). Whole closure enumerated per the note
+# above; THREE files drifted, reviewed against THIS handoff rather than
+# re-hashed:
+#   artifact_completeness.py -- two changes. (1) 1ccdf58 widened the
+#     enumerator from "`.weight` in an FP8 dtype" to also read
+#     `.cb_qweight`/`.weight_packed` planes, added `quantized_embedding` as a
+#     claiming mechanism, and bridged a fused checkpoint unit claimed by its
+#     unfused halves. The widening can only ADD units to classify, i.e. it can
+#     only turn a pass into a failure, and on this lane it adds none: a DSv4
+#     W8A16 artifact ships `FP8_BLOCK_UE8M0_SOURCE` blocks as `.weight` +
+#     `.scale` and carries no coded or packed plane. The embedding branch needs
+#     a `quantized_embedding` key this lane never writes (same argument as the
+#     first re-freeze's `embedding_stock`). The fused bridge is the only
+#     pass-ward change, and it is unreachable here: this lane's units resolve
+#     through their `source_passthrough` declaration several branches earlier,
+#     and it fires only when EVERY member is separately claimed. (2) The DSpark
+#     construction bridge below, which is gated on a non-null
+#     `provenance.dspark_cb_sidecar`; a W8A16 or target artifact declares none,
+#     so the resolver is None and `_unit_variants` is byte-identical. Pinned by
+#     tests/test_artifact_completeness_namespaces.py::
+#     test_without_a_sidecar_declaration_the_construction_bridge_is_inert, and
+#     confirmed on real bytes: artifact-aura-cb-112p69 reports the same 100
+#     declared passthrough / 25 verbatim / COMPLETE before and after.
+#   nvfp4_cb_footprint.py -- `whole_artifact_budget_stamp` gained an optional
+#     `excluded_source_prefixes` that emits its field only when non-empty, its
+#     reader validates that field, and two exclusion helpers were added. This
+#     handoff imports `assignment_serialization_sha256` and
+#     `cb_serialization_metadata_from_assignment_payload` and neither was
+#     touched; a caller that passes no exclusions gets a byte-identical stamp,
+#     pinned by tests/test_cb_serialization_contract.py::
+#     test_budget_stamp_is_byte_identical_without_exclusions.
+#   export_nvfp4_cb_streaming.py -- `_validate_namespace_exclusions` now
+#     cross-checks the exclusion set against the budget stamp that priced the
+#     allocation. It returns early when there is no stamp, and on a lane that
+#     excludes nothing the check compares two empty sets, so it can refuse only
+#     an export whose exclusions contradict its own price.
 _FROZEN_EXPORT_SOURCE_SHA256 = {
     "prismaquant/export_nvfp4_cb_streaming.py": (
-        "05ea8ece98086feccc487b036e3a746d131629f0dc7049ae38abc19f0187ba7e"
+        "33ab70dd2b234095b58351f81a3708b076c12a6469c3f1c6cc47478a12b47c48"
     ),
     "prismaquant/cb_export_config.py": (
         "a690dafe120c4a6fc077d34aad1b142ee4201ec4dedda9ccd35a7583dfb22770"
@@ -153,10 +190,10 @@ _FROZEN_EXPORT_SOURCE_SHA256 = {
         "1cc27e3b64043f9873da528ae2aa128e37c15be303109509f713b8d738c59f36"
     ),
     "prismaquant/nvfp4_cb_footprint.py": (
-        "2cfb677c3e180ebe71a07288bed0feb02ab17df89ba4d66e3dffb6ce06ce2e51"
+        "02d5790a80b5f9e21eb9ac2f7bfc6ca0fb5a33e9fcbeca27c9863ffa002dd9d4"
     ),
     "prismaquant/artifact_completeness.py": (
-        "bc6f3d23fee451f04e653633b408c0783c1905062cc50c502d18074fb1610e33"
+        "02139abc8bd750e05ae620b47c6707143b58802b3e948247ddda3fb878474098"
     ),
     "prismaquant/export_output_safety.py": (
         "4af0a9d891313f1d9d031955e431e1e84c1ba0e11a9ce2605ea92de3bc3703b5"
