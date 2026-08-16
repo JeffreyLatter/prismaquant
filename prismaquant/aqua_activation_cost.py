@@ -59,7 +59,7 @@ def log(m: str) -> None:
     print(f"[aqua-cost] {m}", flush=True)
 
 
-def build_weight_resolver(weight_map: dict) -> dict:
+def build_weight_resolver(weight_map: dict, profile=None) -> dict:
     """Map a card unit name to its checkpoint tensor key.
 
     These differ, and not cosmetically. A card's unit names come from the module
@@ -72,6 +72,25 @@ def build_weight_resolver(weight_map: dict) -> dict:
     So index every ``.weight`` key under its own base name AND a de-nested
     alias. The alias is registered with ``setdefault`` so a real ``model.layers``
     key stays authoritative over one.
+
+    THAT IS NOT ENOUGH IN GENERAL, and the de-nesting alias above is the tell:
+    it is one architecture's rename hardcoded here. Some checkpoints rename the
+    LEAVES too, not just the path. DSv4-Flash stores
+    ``model.layers.0.mlp.experts.0.down_proj`` as
+    ``layers.0.ffn.experts.0.w2.weight`` -- no ``model.`` prefix, ``mlp``
+    renamed to ``ffn``, and the Mixtral ``w1/w2/w3`` leaf convention. No amount
+    of path aliasing recovers that, and the failure is silent: resolution drops
+    to 0/33325, every unit becomes unpriced, and because ``cost_entry_act_dloss``
+    defaults to 0.0 the DP cannot distinguish "unmeasured" from "free".
+
+    So when a ``profile`` is supplied, invert its own
+    ``checkpoint_to_live_name`` over the weight map. That mapping is the
+    architecture's declared, tested source-of-truth -- the same one the probe,
+    the cost stage and the exporter resolve names through -- rather than
+    another rename guessed here (principle 2: no heuristics when an explicit
+    exists). Note the *forward* direction is not usable for this:
+    ``source_tensor_name`` rewrites the path but not the leaf, so it yields
+    ``layers.0.ffn.experts.0.down_proj``, which is not a key.
     """
     idx: dict[str, str] = {}
     for key in weight_map:
@@ -83,7 +102,106 @@ def build_weight_resolver(weight_map: dict) -> dict:
         base = key[: -len(".weight")]
         if ".language_model." in base:
             idx.setdefault(base.replace("model.language_model.", "model."), key)
+    if profile is not None:
+        mapped = 0
+        for key in weight_map:
+            if not key.endswith(".weight"):
+                continue
+            try:
+                live = profile.checkpoint_to_live_name(key)
+            except Exception:
+                continue
+            if live and live.endswith(".weight"):
+                # setdefault: a key that already indexes under its own name
+                # stays authoritative; this only ADDS reachable aliases.
+                if idx.setdefault(live[: -len(".weight")], key) is key:
+                    mapped += 1
+        log(f"profile {type(profile).__name__} contributed {mapped} "
+            f"checkpoint-name aliases")
     return idx
+
+
+#: Dtypes a checkpoint tensor may have and simply BE the dense weight. Anything
+#: else is an encoding that must be decoded (or refused), never cast.
+_DENSE_FLOAT_DTYPES = ("float64", "float32", "float16", "bfloat16")
+
+
+def materialize_source_weight(name: str, weight, scale, fp8_map):
+    """Dense fp32 ``(out, in)`` weight from whatever the checkpoint stores.
+
+    ``activation_dloss`` needs the SOURCE weight as a dense float matrix, but a
+    native-quantized checkpoint does not store one: DSv4-Flash keeps its routed
+    experts as MXFP4 nibble-packs (int8 ``(out, in/2)`` + per-32 E8M0 scales)
+    and everything else as block-FP8 (e4m3 + a 128x128 E8M0 scale grid).
+    Reading those bytes as a weight is not approximately right, it is garbage
+    -- the packed expert has half the columns and fp8 codes cast to float land
+    in the code range, not the value range.
+
+    DISPATCH IS DECLARATION-DRIVEN, NEVER SHAPE-INFERRED. ``fp8_map`` is the
+    streaming loader's own ``_build_fp8_scale_inv_map`` product -- the same map
+    the probe, the cost stage and the exporter loaded this model through -- so
+    membership (and ``mxfp4_names``, and the dequant ``block``) come from the
+    checkpoint's declarations, and this function's output agrees with the
+    weights the loader installs. Decoders are REUSED, not re-derived:
+
+      * MXFP4: ``mxfp4_widen.dequantize_mxfp4_source`` (documented mirror of
+        ``layer_streaming._read_layer_to_device`` step 3b -- same LUT, same
+        low-nibble-first order, same 0xFF NaN rule), in fp32. The loader's
+        installed tensor is this value downcast to bf16.
+      * block-FP8: ``layer_streaming._dequant_fp8_block_weight`` with the
+        map's declared block. Torch decodes the ``float8_e8m0fnu`` scale in
+        ``.to(bfloat16)`` (0xFF -> NaN included), and the aligned path is the
+        same bf16 tile multiply as the loader's batched step 3, so the bf16
+        result is bit-identical to the loader install; the fp32 upcast is
+        lossless. Note the ``.scale`` sibling is a MULTIPLIER (the loader
+        multiplies by it), despite the legacy ``scale_inv`` spelling.
+
+    Every mismatch RAISES -- a unit this stage cannot materialize must never
+    be silently skipped, because an unpriced A-side reads as 0.0 (= free) to
+    the DP, which is the exact mispricing the stage exists to remove. And the
+    encodings are uniform per tensor class, so the first bad unit means a
+    systematic bug: dying on it costs seconds, not a wrong 33k-unit artifact.
+    """
+    import torch
+
+    from .layer_streaming import (_FLOAT8_DTYPES, _check_mxfp4_packed_grid,
+                                  _dequant_fp8_block_weight,
+                                  _fp8_dequant_block)
+    from .mxfp4_widen import dequantize_mxfp4_source
+
+    entry = fp8_map.get(name + ".weight") if fp8_map else None
+    is_dense_float = str(weight.dtype).split(".")[-1] in _DENSE_FLOAT_DTYPES
+    if entry is None:
+        if is_dense_float:
+            return weight.to(torch.float32)
+        raise RuntimeError(
+            f"{name}: source tensor has dtype {weight.dtype} but no scale "
+            f"entry in the streaming loader's fp8/mxfp4 map "
+            f"(_build_fp8_scale_inv_map). Casting these bytes to float would "
+            f"install code-range values, not weights -- the historical "
+            f"fp8-range bug. Check the checkpoint's scale-sibling naming "
+            f"against the model profile's fp8_scale_pairs.")
+    if scale is None:
+        raise RuntimeError(
+            f"{name}: the scale map declares a sibling for this weight but "
+            f"none was supplied to materialize_source_weight")
+    if is_dense_float:
+        raise RuntimeError(
+            f"{name}: source tensor is already a dense float "
+            f"({weight.dtype}) yet the scale map has an entry for it; "
+            f"applying a block scale to a dense weight would corrupt it. "
+            f"The map and the checkpoint disagree -- refusing to guess.")
+    if name + ".weight" in getattr(fp8_map, "mxfp4_names", frozenset()):
+        _check_mxfp4_packed_grid(name + ".weight", weight, scale)
+        return dequantize_mxfp4_source(weight, scale, dtype=torch.float32)
+    if weight.dtype not in _FLOAT8_DTYPES:
+        raise RuntimeError(
+            f"{name}: mapped as block-FP8 but the tensor dtype is "
+            f"{weight.dtype}, not a float8 wire; the declaration and the "
+            f"bytes disagree.")
+    return _dequant_fp8_block_weight(
+        weight, scale, block=_fp8_dequant_block(fp8_map),
+        name=name).to(torch.float32)
 
 
 def cached_act_path(act_dir: str, name: str) -> str:
@@ -116,6 +234,7 @@ def measured_act_var(spec, x_cpu, device: str):
 def activation_dloss_table(card, model_path: str, formats: list[str], *,
                            device: str = "cpu", names=None,
                            act_dir: str | None = None,
+                           profile=None,
                            ) -> tuple[dict, dict, dict]:
     """``{unit: {format: act_dloss}}`` plus a report of what could not be priced.
 
@@ -133,13 +252,44 @@ def activation_dloss_table(card, model_path: str, formats: list[str], *,
 
     with open(os.path.join(model_path, "model.safetensors.index.json")) as fh:
         weight_map = json.load(fh)["weight_map"]
-    resolver = build_weight_resolver(weight_map)
+    resolver = build_weight_resolver(weight_map, profile=profile)
 
     wanted = list(names) if names is not None else [u.topology.name
                                                    for u in card.units()]
     resolvable = [n for n in wanted if n in resolver]
     log(f"weight-key resolution: {len(resolvable)}/{len(wanted)} card units "
         f"found in the checkpoint")
+    # Refuse rather than write a no-op. "Nothing resolved" is never a valid
+    # outcome for this stage, and the artifact it would otherwise produce is
+    # indistinguishable from a real one -- same units, same formats, an A-side
+    # that is absent and therefore read as 0.0 (free) by the DP. Only the
+    # unambiguous case is a refusal; no coverage threshold is invented here,
+    # because any such number would be a heuristic (principle 2). Partial
+    # coverage is already reported per-format through `holes`.
+    if wanted and not resolvable:
+        raise SystemExit(
+            f"REFUSE: 0 of {len(wanted)} card units resolve to a checkpoint "
+            f"tensor, so there is nothing to price. This is a NAME-SPACE "
+            f"mismatch, not an empty menu: card units come from the module "
+            f"tree the probe walked, while the checkpoint may rename both the "
+            f"path and the leaf. Pass a model profile (--model-path must be a "
+            f"directory `detect_profile` recognises) so the architecture's own "
+            f"`checkpoint_to_live_name` can supply the aliases. Sample card "
+            f"name {wanted[0]!r}; sample checkpoint key "
+            f"{next(iter(weight_map))!r}."
+        )
+
+    # The streaming loader's own scale map -- fp8/mxfp4 declarations, scale
+    # sibling keys, and the checkpoint-declared dequant block. Empty for a
+    # dense checkpoint, in which case every path below is byte-identical to
+    # the pre-quantized-source behaviour (plain get_tensor + fp32 cast).
+    from .layer_streaming import _build_fp8_scale_inv_map
+    fp8_map = _build_fp8_scale_inv_map(model_path)
+    if fp8_map:
+        log(f"quantized-source checkpoint: {len(fp8_map)} scale-mapped "
+            f"weights ({len(fp8_map.mxfp4_names)} declared MXFP4, dequant "
+            f"block {fp8_map.block}); units will be materialized through "
+            f"the streaming loader's decoders")
 
     # SHARD-AT-A-TIME. ``safe_open(device="cpu")`` mmaps the shard and
     # ``get_tensor`` faults its pages in; while the handle lives those pages stay
@@ -163,10 +313,34 @@ def activation_dloss_table(card, model_path: str, formats: list[str], *,
     for shard in sorted(by_shard):
         with safe_open(os.path.join(model_path, shard),
                        framework="pt", device="cpu") as handle:
+            shard_keys = set(handle.keys()) if fp8_map else frozenset()
             for name in by_shard[shard]:
                 unit = card[name]
-                w_np = handle.get_tensor(resolver[name]).to(
-                    torch.float32).numpy()
+                raw = handle.get_tensor(resolver[name])
+                scale_t = None
+                entry = fp8_map.get(name + ".weight") if fp8_map else None
+                if entry is not None:
+                    scale_shard, scale_key = entry
+                    if scale_key in shard_keys:
+                        scale_t = handle.get_tensor(scale_key)
+                    else:
+                        # Scale sibling serialized in a different shard than
+                        # its weight -- rare, but the map records the shard
+                        # so honour it rather than assume co-location.
+                        with safe_open(scale_shard, framework="pt",
+                                       device="cpu") as sh:
+                            scale_t = sh.get_tensor(scale_key)
+                w_t = materialize_source_weight(name, raw, scale_t, fp8_map)
+                if tuple(w_t.shape) != (unit.out_features, unit.in_features):
+                    raise RuntimeError(
+                        f"{name}: materialized weight has shape "
+                        f"{tuple(w_t.shape)}, expected "
+                        f"({unit.out_features}, {unit.in_features}) from the "
+                        f"probe stats (source dtype {raw.dtype}, "
+                        f"{'scale-mapped' if entry else 'dense'}); refusing "
+                        f"to price a wrong-shaped W")
+                w_np = w_t.to(torch.float32).numpy()
+                del raw, scale_t, w_t
                 # Real input rows if the probe cached them for this Linear.
                 # Loaded once per unit and reused across formats -- the tensor
                 # is the same batch, only the quantizer differs.
@@ -292,11 +466,36 @@ def main() -> int:
                else sorted({f for r in costs.values() for f in r}))
     log(f"cost artifact: {len(costs)} units, formats {formats}")
 
+    # The architecture's declared name mapping. Optional by design: a model
+    # whose checkpoint names match its module tree needs none, and a path that
+    # no profile claims must not become a hard failure for those models. When
+    # one IS detected it supplies the checkpoint aliases the generic index
+    # cannot derive (see build_weight_resolver).
+    profile = None
+    try:
+        from .model_profiles.registry import detect_profile
+        profile = detect_profile(args.model_path)
+    except Exception as exc:
+        log(f"no model profile for {args.model_path} ({exc}); "
+            f"falling back to generic name matching")
+    if profile is not None:
+        log(f"model profile: {type(profile).__name__}")
+
     table, holes, meta = activation_dloss_table(
         card, args.model_path, formats, device=args.device,
-        names=[n for n in costs], act_dir=args.act_dir)
+        names=[n for n in costs], act_dir=args.act_dir, profile=profile)
     report = merge_act_dloss(costs, table)
     log(f"merge: {report}")
+    # Belt and braces on the silent-no-op: resolution can succeed while every
+    # price still comes back None (e.g. a scalar-only card with no g_sq_sum).
+    if not report["entries_merged"]:
+        raise SystemExit(
+            "REFUSE: the merge wrote 0 entries, so --cost-out would be a "
+            "byte-equivalent copy of --cost-in carrying the AQUA name. Most "
+            "likely the card has no `g_sq_sum` (a scalar-only card built from "
+            "a probe predating marginal emission); `activation_dloss` returns "
+            "None for every unit in that case."
+        )
 
     prov = dict(blob.get("provenance") or {})
     prov["aqua_activation_cost"] = {

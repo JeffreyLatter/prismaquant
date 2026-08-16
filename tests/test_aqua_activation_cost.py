@@ -268,3 +268,185 @@ def _synthetic_unit(card_mod):
         act_sq_sum=rng.uniform(0.5, 1.5, n_in).astype(np.float64),
         act_absmax=rng.uniform(2.0, 6.0, n_in).astype(np.float64),
     )
+
+
+# --- name resolution -------------------------------------------------------
+# A card unit name and a checkpoint tensor key are different namespaces, and
+# when they diverge this stage fails SILENTLY: nothing resolves, nothing is
+# priced, and because `cost_entry_act_dloss` defaults to 0.0 the DP reads every
+# 4-bit-activation format as free. DSv4-Flash is the live example -- it renames
+# the path (`model.layers.N.mlp` -> `layers.N.ffn`) AND the leaf
+# (`down_proj` -> `w2`), which no path-aliasing recovers.
+
+class _RenamingProfile:
+    """Minimal stand-in for a ModelProfile that renames path and leaf."""
+
+    _LEAF = {"gate_proj": "w1", "down_proj": "w2", "up_proj": "w3"}
+
+    def checkpoint_to_live_name(self, key: str, *, multimodal: bool = False):
+        if not key.startswith("layers."):
+            return None
+        live = "model." + key.replace(".ffn.", ".mlp.")
+        for proj, w in self._LEAF.items():
+            live = live.replace(f".{w}.", f".{proj}.")
+        return live
+
+
+def test_resolver_uses_the_profile_when_the_checkpoint_renames_leaves():
+    from prismaquant.aqua_activation_cost import build_weight_resolver
+    weight_map = {"layers.0.ffn.experts.0.w2.weight": "s0.safetensors",
+                  "layers.0.ffn.experts.0.w1.weight": "s0.safetensors"}
+    card_name = "model.layers.0.mlp.experts.0.down_proj"
+
+    generic = build_weight_resolver(weight_map)
+    assert card_name not in generic, (
+        "if the generic index ever resolves this, the regression it guards is "
+        "gone and this test is meaningless")
+
+    resolved = build_weight_resolver(weight_map, profile=_RenamingProfile())
+    assert resolved[card_name] == "layers.0.ffn.experts.0.w2.weight"
+
+
+def test_resolver_keeps_direct_keys_authoritative_over_profile_aliases():
+    """A profile alias must only ADD reachability, never shadow a real key."""
+    from prismaquant.aqua_activation_cost import build_weight_resolver
+
+    class _Colliding:
+        def checkpoint_to_live_name(self, key, *, multimodal=False):
+            return "model.layers.0.mlp.down_proj.weight"
+
+    weight_map = {"model.layers.0.mlp.down_proj.weight": "s0.safetensors",
+                  "layers.0.ffn.w2.weight": "s1.safetensors"}
+    resolved = build_weight_resolver(weight_map, profile=_Colliding())
+    assert resolved["model.layers.0.mlp.down_proj"] == \
+        "model.layers.0.mlp.down_proj.weight"
+
+
+# --- quantized-source materialization --------------------------------------
+# `activation_dloss` needs the DENSE source weight, but DSv4-Flash stores its
+# routed experts as MXFP4 nibble-packs and everything else as block-FP8 with
+# E8M0 `.scale` siblings. `materialize_source_weight` dispatches on the
+# streaming loader's own scale map (declaration-driven, never shape-inferred)
+# and reuses the loader's decoders, so the W it prices is the W the probe ran
+# on. Every mismatch must RAISE: an unpriced A-side reads as 0.0 (= free) to
+# the DP, which is the exact mispricing this stage exists to remove.
+
+
+def _torch_and_map(mxfp4=(), entries=(), block=(128, 128)):
+    torch = pytest.importorskip("torch")
+    if not hasattr(torch, "float8_e8m0fnu"):
+        pytest.skip("torch lacks float8_e8m0fnu")
+    from prismaquant.layer_streaming import Fp8ScaleInvMap
+    data = {k: ("shard", k) for k in (*entries, *mxfp4)}
+    return torch, Fp8ScaleInvMap(data, block if data else None,
+                                 mxfp4_names=frozenset(mxfp4))
+
+
+def test_materialize_mxfp4_source_shape_and_values():
+    """Nibble-pack decode: hand-computed values, not just a shape.
+
+    Byte 0x21 is (low=0x1, high=0x2) -> (0.5, 1.0) in E2M1, low nibble first.
+    Scale bytes are E8M0 exponents: 127 -> 2^0, 128 -> 2^1. One scale per 32
+    logical elements, so a (2, 32)-byte pack is logically (2, 64) with a
+    (2, 2) scale plane.
+    """
+    torch, fp8_map = _torch_and_map(mxfp4=("u.weight",))
+    from prismaquant.aqua_activation_cost import materialize_source_weight
+    packed = torch.full((2, 32), 0x21, dtype=torch.uint8)
+    scale = torch.tensor([[127, 128], [129, 127]],
+                         dtype=torch.uint8).view(torch.float8_e8m0fnu)
+    w = materialize_source_weight("u", packed, scale, fp8_map)
+    assert w.dtype == torch.float32 and tuple(w.shape) == (2, 64)
+    base = np.tile([0.5, 1.0], 32)
+    expect = np.stack([
+        np.concatenate([base[:32] * 1.0, base[32:] * 2.0]),
+        np.concatenate([base[:32] * 4.0, base[32:] * 1.0]),
+    ])
+    assert np.array_equal(w.numpy(), expect), (
+        "decode must be exact: E2M1 values and power-of-two scales are all "
+        "representable, so there is no tolerance to hide behind")
+
+
+def test_materialize_fp8_block_source_shape_and_values():
+    """Block-FP8 decode: the E8M0 `.scale` sibling is a MULTIPLIER.
+
+    All-ones e4m3 weight (1.0 is exact), block (2, 2), scale exponents
+    [[127, 128], [129, 127]] -> [[1, 2], [4, 1]]. The result must be the
+    block-broadcast product, exactly.
+    """
+    torch, fp8_map = _torch_and_map(entries=("u.weight",), block=(2, 2))
+    from prismaquant.aqua_activation_cost import materialize_source_weight
+    weight = torch.ones(4, 4, dtype=torch.float8_e4m3fn)
+    scale = torch.tensor([[127, 128], [129, 127]],
+                         dtype=torch.uint8).view(torch.float8_e8m0fnu)
+    w = materialize_source_weight("u", weight, scale, fp8_map)
+    assert w.dtype == torch.float32 and tuple(w.shape) == (4, 4)
+    expect = np.kron([[1.0, 2.0], [4.0, 1.0]], np.ones((2, 2)))
+    assert np.array_equal(w.numpy(), expect)
+
+
+def test_materialize_dense_passthrough_is_a_noop():
+    """Requirement for every already-dense checkpoint (Qwen3.8-27B et al.):
+    no scale entry + dense float dtype -> the same values, fp32, untouched."""
+    torch, fp8_map = _torch_and_map()
+    from prismaquant.aqua_activation_cost import materialize_source_weight
+    src = torch.tensor([[0.25, -1.5], [3.0, 0.0]], dtype=torch.bfloat16)
+    w = materialize_source_weight("u", src, None, fp8_map)
+    assert w.dtype == torch.float32
+    assert np.array_equal(w.numpy(), src.to(torch.float32).numpy())
+    # An empty/absent map must behave identically (plain dicts are legal).
+    w2 = materialize_source_weight("u", src, None, {})
+    assert np.array_equal(w2.numpy(), w.numpy())
+
+
+def test_materialize_fails_loud_never_silent():
+    """The full refusal matrix. None of these may return a plausible W."""
+    torch, fp8_map = _torch_and_map(entries=("u.weight",), block=(2, 2))
+    from prismaquant.aqua_activation_cost import materialize_source_weight
+    scale = torch.tensor([[127, 127], [127, 127]],
+                         dtype=torch.uint8).view(torch.float8_e8m0fnu)
+    # 1. Quantized bytes with no scale entry: casting would install
+    #    code-range values (the historical fp8-range bug).
+    for bad in (torch.ones(4, 4, dtype=torch.float8_e4m3fn),
+                torch.ones(4, 4, dtype=torch.int8)):
+        with pytest.raises(RuntimeError, match="no scale entry"):
+            materialize_source_weight("v", bad, None, fp8_map)
+    # 2. Scale entry declared but no scale supplied.
+    with pytest.raises(RuntimeError, match="none was supplied"):
+        materialize_source_weight(
+            "u", torch.ones(4, 4, dtype=torch.float8_e4m3fn), None, fp8_map)
+    # 3. Dense float WITH a scale entry: the map and the checkpoint disagree.
+    with pytest.raises(RuntimeError, match="refusing to guess"):
+        materialize_source_weight(
+            "u", torch.ones(4, 4, dtype=torch.float32), scale, fp8_map)
+    # 4. Mapped as block-FP8 but the bytes are not a float8 wire.
+    with pytest.raises(RuntimeError, match="not a float8 wire"):
+        materialize_source_weight(
+            "u", torch.ones(4, 4, dtype=torch.int8), scale, fp8_map)
+    # 5. Declared MXFP4 but the packed grid does not match: the loader's own
+    #    assertion fires (reused, not re-derived).
+    _, mx_map = _torch_and_map(mxfp4=("m.weight",))
+    with pytest.raises(ValueError, match="declared MXFP4"):
+        materialize_source_weight(
+            "m", torch.ones(2, 32, dtype=torch.uint8),
+            torch.ones(2, 7, dtype=torch.uint8).view(torch.float8_e8m0fnu),
+            mx_map)
+
+
+def test_zero_resolution_refuses_instead_of_writing_a_no_op(tmp_path):
+    """0/N resolved must raise, not produce a plausible-looking artifact.
+
+    The artifact it would otherwise write has the right units and the right
+    formats and an A-side that is simply absent -- i.e. free. That is the one
+    outcome this stage exists to prevent, so it must never be reachable.
+    """
+    from prismaquant.aqua_activation_cost import activation_dloss_table
+    import json
+
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps(
+        {"weight_map": {"layers.0.ffn.experts.0.w2.weight": "s0.safetensors"}}))
+    with pytest.raises(SystemExit) as exc:
+        activation_dloss_table(
+            object(), str(tmp_path), ["NVFP4"],
+            names=["model.layers.0.mlp.experts.0.down_proj"])
+    assert "NAME-SPACE" in str(exc.value)

@@ -152,6 +152,29 @@ W-side to 0.07%, which produced a Pareto byte-identical to the weight-only one.
 (`1dbf146`; the two differ by 3.23% of Linears at 5.0–5.5 bpp). It is **still
 research** — there is no served KL/PPL A/B against the weight-only arm at
 matched bpp, and that A/B is the promotion gate.
+Name resolution goes through the **model profile**: the stage inverts
+`checkpoint_to_live_name` over the safetensors index, because a card's unit
+names come from the module tree the probe walked while a checkpoint may rename
+both the path and the leaf (DSv4-Flash stores
+`model.layers.N.mlp.experts.E.down_proj` as `layers.N.ffn.experts.E.w2`, which
+resolved **0 of 33,325** units under the previous path-only aliasing). The
+forward direction is not usable — `source_tensor_name` rewrites the path but
+not the leaf. Two failures that were previously silent now **refuse**: zero
+name resolution, and a merge that writes zero entries (the signature of a
+scalar-only card with no `g_sq_sum`). Both would otherwise emit an artifact
+with the right units and formats and an absent A-side, which
+`cost_entry_act_dloss` reads as 0.0 — i.e. free — making "unmeasured"
+indistinguishable from "costless" to the DP.
+On a **quantized-source** checkpoint the resolved tensor is not a dense weight
+(DSv4-Flash: MXFP4 nibble-packed routed experts, block-FP8 everything else,
+both with E8M0 `.scale` siblings), so `materialize_source_weight` dispatches on
+the streaming loader's own `_build_fp8_scale_inv_map` — declaration-driven,
+never shape-inferred — and reuses the loader's decoders
+(`dequantize_mxfp4_source`, `_dequant_fp8_block_weight`); the materialized W is
+bit-identical to the weights the loader installs for the probe. Dense
+checkpoints hit the map-empty passthrough and behave exactly as before; any
+tensor that cannot be materialized to the card's `(out, in)` **raises** rather
+than pricing a wrong-shaped or code-range W.
 The external runtime record pins Gridbook **0.8.5** at exact commit
 `e992e5980c96333a48149f96392d6cff56ae9e3f`, with
 `gridbook.runtime-contract.v3` and the exact required feature map
