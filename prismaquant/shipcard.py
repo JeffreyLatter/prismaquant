@@ -871,6 +871,22 @@ def verify(
         problems.append(
             "Gridbook artifact lacks the required weight-stat attestation"
         )
+
+    # The published bpp is a load-bearing public claim: every matched-bpp
+    # comparison against this artifact inherits it. A card whose claim
+    # contradicts the bytes its own recipe declares has shipped twice (see
+    # allocator_achieved_bpp), so refuse here rather than at card-writing time
+    # — an export that already cost GPU hours should fail at PUBLICATION, the
+    # blocking point, not lose its artifact to a gate. A card written before
+    # this check existed carries no verdict and is left alone.
+    achieved = ((card.get("build") or {}).get("achieved_bpp") or {})
+    cross = achieved.get("cross_check") if isinstance(achieved, Mapping) else None
+    if isinstance(cross, Mapping) and cross.get("verdict") == "DISAGREE":
+        problems.append(
+            "build.achieved_bpp contradicts the recipe's own serialized "
+            f"bytes: {cross.get('detail')}"
+        )
+
     if required is None:
         required = required_slots(card, model_dir=model_dir)
     for slot in required:
@@ -3254,7 +3270,93 @@ def kv_shared_fisher_echo(env: Mapping[str, str] | None = None) -> dict[str, Any
     }
 
 
-def allocator_achieved_bpp(
+# A claimed bpp may legitimately sit a few percent above the priced floor
+# below (the floor omits whatever units carry no per-unit price, and those
+# only ever ADD bytes), and label scope differs by a pin or two. 10% is far
+# wider than any such drift and far narrower than the 57% error this exists
+# to catch, so a trip is a defect and never a convention argument.
+RECIPE_BPP_CROSS_CHECK_TOLERANCE = 0.10
+
+
+def recipe_priced_bpp(
+    layer_config_path: str | os.PathLike | None,
+) -> dict[str, Any]:
+    """Price the recipe from the per-unit bytes the recipe itself declares.
+
+    This is deliberately NOT a second opinion about accounting convention. It
+    sums ``cb_serialized_identity.tensor_payload_bytes`` and ``.params`` over
+    the units that carry them, so numerator and denominator come from the same
+    entries and the result is scope-matched *by construction* — no probe, no
+    source manifest, no sidecar or header estimate.
+
+    The result is a **lower bound** on the recipe's true rate: units without a
+    per-unit price (FP8_SOURCE passthrough Linears, for instance) are excluded
+    from both sums, and they can only add bytes. ``coverage_units`` reports how
+    much of the recipe was priced so a caller can judge the bound's tightness.
+
+    Returns ``value=None`` with a ``reason`` when nothing is priceable, which
+    is the normal case for a non-CB recipe. That is a "not applicable", not a
+    failure.
+    """
+    out: dict[str, Any] = {"value": None, "reason": None}
+    if not layer_config_path:
+        out["reason"] = "no recipe path"
+        return out
+    try:
+        from prismaquant.layer_config import is_layer_config_meta_key
+        payload = json.loads(Path(layer_config_path).read_text())
+    except Exception as exc:
+        out["reason"] = f"recipe unreadable: {exc!r}"
+        return out
+    if not isinstance(payload, Mapping):
+        out["reason"] = "recipe is not a mapping"
+        return out
+
+    total = priced = 0
+    total_bytes = total_params = 0
+    for name, record in payload.items():
+        if is_layer_config_meta_key(name) or not isinstance(record, Mapping):
+            continue
+        total += 1
+        identity = record.get("cb_serialized_identity")
+        if not identity:
+            continue
+        try:
+            if isinstance(identity, str):
+                identity = json.loads(identity)
+            nbytes = int(identity["tensor_payload_bytes"])
+            nparams = int(identity["params"])
+        except Exception:
+            continue
+        if nparams <= 0:
+            continue
+        priced += 1
+        total_bytes += nbytes
+        total_params += nparams
+
+    if not priced or total_params <= 0:
+        out["reason"] = (
+            "no unit carries a per-unit serialized price "
+            f"(0 of {total} recipe entries)"
+        )
+        return out
+    out.update(
+        value=8.0 * total_bytes / total_params,
+        reason=None,
+        priced_units=priced,
+        total_units=total,
+        coverage_units=priced / total if total else None,
+        tensor_payload_bytes=total_bytes,
+        params=total_params,
+        note=(
+            "lower bound: summed over the units that declare a per-unit "
+            "serialized price; unpriced units only add bytes"
+        ),
+    )
+    return out
+
+
+def _allocator_achieved_bpp_claim(
     layer_config_path: str | os.PathLike | None,
 ) -> dict[str, Any]:
     """Best-effort achieved bpp, with its provenance named.
@@ -3339,3 +3441,82 @@ def allocator_achieved_bpp(
         }
     except Exception:
         return {"value": None, "source": None}
+
+
+def allocator_achieved_bpp(
+    layer_config_path: str | os.PathLike | None,
+) -> dict[str, Any]:
+    """The claimed achieved bpp, cross-checked against the recipe's own bytes.
+
+    The claim is whatever upstream stamped (see
+    :func:`_allocator_achieved_bpp_claim`), and it is reported unchanged. What
+    is added here is a ``cross_check`` block, because this exact class of
+    defect has now shipped twice:
+
+    * **Qwen3.8-27B arm B** — the card claimed the surrogate knee's 5.9994 for
+      bytes that were the validated 4.7496 (1.25 bpp wide), which is what the
+      ``selected_by`` precedence above was written to fix.
+    * **DSv4-Flash `artifact-aura-cb-112p69`** — the card claimed 4.3065, read
+      from a Pareto point (``allocator_target_4p5000_achieved_4p3065``) that
+      was internally consistent but described an assignment that was **never
+      exported**. The recipe it shipped prices to 2.7385. That is 57% wide and
+      no precedence rule catches it, because the stale number is not the wrong
+      *field* — it is the right field describing the wrong *point*.
+
+    Both are the same failure: the label describes a different assignment than
+    the recipe holds. A false public bpp silently breaks every matched-bpp
+    comparison built on it, so it is worth a gate rather than a convention.
+
+    The check is a **floor test**, not an equality test. The priced value is a
+    lower bound (see :func:`recipe_priced_bpp`), so a claim below it is
+    impossible and a claim far above it is describing something else. It is
+    advisory here — :func:`verify` is where it refuses — so that a gate bug can
+    never strand a finished export at card-writing time.
+    """
+    claim = _allocator_achieved_bpp_claim(layer_config_path)
+    priced = recipe_priced_bpp(layer_config_path)
+    claimed = claim.get("value")
+    floor = priced.get("value")
+
+    if floor is None:
+        cross: dict[str, Any] = {
+            "verdict": "not_applicable",
+            "detail": priced.get("reason"),
+        }
+    elif claimed is None:
+        cross = {
+            "verdict": "no_claim",
+            "recipe_priced_bpp": floor,
+            "detail": "nothing to cross-check; the recipe declares no bpp",
+        }
+    else:
+        rel = abs(float(claimed) - floor) / floor
+        agree = rel <= RECIPE_BPP_CROSS_CHECK_TOLERANCE
+        cross = {
+            "verdict": "agree" if agree else "DISAGREE",
+            "claimed_bpp": float(claimed),
+            "claimed_source": claim.get("source"),
+            "recipe_priced_bpp": floor,
+            "relative_difference": rel,
+            "tolerance": RECIPE_BPP_CROSS_CHECK_TOLERANCE,
+            "priced_units": priced.get("priced_units"),
+            "total_units": priced.get("total_units"),
+            "coverage_units": priced.get("coverage_units"),
+            "tensor_payload_bytes": priced.get("tensor_payload_bytes"),
+            "params": priced.get("params"),
+        }
+        if not agree:
+            cross["detail"] = (
+                f"claimed {float(claimed):.4f} bpp from "
+                f"{claim.get('source')!r}, but the recipe's own per-unit "
+                f"serialized bytes price {priced.get('priced_units')} of "
+                f"{priced.get('total_units')} units at "
+                f"{priced.get('tensor_payload_bytes')} bytes over "
+                f"{priced.get('params')} params = {floor:.4f} bpp "
+                f"({rel:.1%} apart, tolerance "
+                f"{RECIPE_BPP_CROSS_CHECK_TOLERANCE:.0%}). The priced value is "
+                "a LOWER bound, so the claim is describing a different "
+                "assignment than the recipe holds — most likely a stale "
+                "Pareto point or a superseded selection."
+            )
+    return {**claim, "cross_check": cross}

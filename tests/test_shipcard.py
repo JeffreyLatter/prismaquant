@@ -1189,3 +1189,122 @@ def test_a_card_written_under_the_legacy_native_scope_still_verifies(tmp_path):
         "artifact changed since the shipcard was opened" in problem
         for problem in verify(load_shipcard(path), model_dir=model_dir)
     )
+
+
+def _cb_recipe(tmp_path, *, units, bytes_per_unit, params_per_unit, meta):
+    """A CB recipe whose units carry the per-unit serialized price."""
+    payload = {}
+    for i in range(units):
+        payload[f"model.layers.{i}.mlp.up_proj"] = {
+            "bits": 4,
+            "cb_serialized_identity": json.dumps({
+                "format": "NVFP4_CB_K18",
+                "params": params_per_unit,
+                "tensor_payload_bytes": bytes_per_unit,
+            }),
+        }
+    payload["__prismaquant__"] = meta
+    recipe = tmp_path / "layer_config.json"
+    recipe.write_text(json.dumps(payload))
+    return recipe
+
+
+def test_recipe_priced_bpp_is_scope_matched_and_a_lower_bound(tmp_path):
+    """Numerator and denominator come from the SAME entries, so no sidecar noise.
+
+    K18 on (4096, 2048) is 2,654,212 payload bytes over 8,388,608 params --
+    2,654,208 packed (2.53125 bpp exactly: 2.25 index + 0.28125 fp4 group
+    scale) plus the 4-byte input global scale, so 2.5312538. These are the
+    literal numbers the shipped DSv4 recipe's own identities declare.
+    Units without a per-unit price are excluded from BOTH sums, which is what
+    makes the result a lower bound rather than an estimate.
+    """
+    from prismaquant.shipcard import recipe_priced_bpp
+
+    recipe = _cb_recipe(
+        tmp_path, units=4, bytes_per_unit=2654212, params_per_unit=8388608,
+        meta={"achieved_bits": 2.53125},
+    )
+    # One FP8_SOURCE passthrough Linear, priced by nobody.
+    payload = json.loads(recipe.read_text())
+    payload["model.layers.9.self_attn.wkv"] = {"bits": 8, "data_type": "fp8_e4m3"}
+    recipe.write_text(json.dumps(payload))
+
+    got = recipe_priced_bpp(recipe)
+    assert got["value"] == pytest.approx(2.53125, rel=1e-5)
+    assert got["priced_units"] == 4
+    assert got["total_units"] == 5
+    assert got["coverage_units"] == pytest.approx(0.8)
+
+
+def test_recipe_priced_bpp_is_not_applicable_without_per_unit_prices(tmp_path):
+    """A non-CB recipe declares no per-unit bytes; that is not a failure."""
+    from prismaquant.shipcard import recipe_priced_bpp
+
+    recipe = tmp_path / "layer_config.json"
+    recipe.write_text(json.dumps({
+        "model.layers.0.mlp.up_proj": {"bits": 4},
+        "__prismaquant__": {"achieved_bits": 4.75},
+    }))
+    got = recipe_priced_bpp(recipe)
+    assert got["value"] is None
+    assert "no unit carries a per-unit serialized price" in got["reason"]
+
+
+def test_achieved_bpp_cross_check_catches_a_label_describing_another_point(tmp_path):
+    """The DSv4 `artifact-aura-cb-112p69` failure, reproduced.
+
+    That card published 4.3065 bpp read from a sibling `pareto.knees.json`
+    while the recipe it named priced to 2.7385 -- a 57% false public claim that
+    would silently break every matched-bpp comparison built on it. No
+    precedence rule catches it on its own, because the stale number is not the
+    wrong FIELD, it is the right field describing the wrong POINT.
+    """
+    from prismaquant.shipcard import allocator_achieved_bpp, verify
+
+    recipe = _cb_recipe(
+        tmp_path, units=4, bytes_per_unit=2654212, params_per_unit=8388608,
+        meta={"schema": "prismaquant.layer_config_meta.v1"},   # declares no bpp
+    )
+    (tmp_path / "pareto.knees.json").write_text(json.dumps({
+        "primary": "log_error",
+        "log_error": {"achieved_bits": 4.306515854190045, "target_bits": 4.5},
+    }))
+
+    got = allocator_achieved_bpp(recipe)
+    assert got["value"] == pytest.approx(4.306515854190045)
+    assert got["source"] == "pareto.knees.json:log_error"
+
+    cross = got["cross_check"]
+    assert cross["verdict"] == "DISAGREE"
+    assert cross["recipe_priced_bpp"] == pytest.approx(2.53125, rel=1e-5)
+    assert cross["relative_difference"] > 0.5
+
+    problems = verify({"build": {"achieved_bpp": got}}, model_dir=None, required=[])
+    assert any("contradicts the recipe's own serialized bytes" in p for p in problems)
+
+
+def test_achieved_bpp_cross_check_passes_a_truthful_claim(tmp_path):
+    """A claim slightly ABOVE the floor is expected, not a defect.
+
+    The floor omits unpriced passthrough units, which only add bytes -- so the
+    real DSv4 recipe claims 2.7555 against a 2.7385 floor (0.6% apart) and must
+    pass. This pins the gate as a floor test, not an equality test.
+    """
+    from prismaquant.shipcard import allocator_achieved_bpp, verify
+
+    recipe = _cb_recipe(
+        tmp_path, units=4, bytes_per_unit=2654212, params_per_unit=8388608,
+        meta={"achieved_bits": 2.53125 * 1.006},
+    )
+    got = allocator_achieved_bpp(recipe)
+    assert got["cross_check"]["verdict"] == "agree"
+    assert verify({"build": {"achieved_bpp": got}}, model_dir=None, required=[]) == []
+
+
+def test_achieved_bpp_cross_check_is_silent_on_a_preexisting_card():
+    """A card written before this gate carries no verdict and is left alone."""
+    from prismaquant.shipcard import verify
+
+    legacy = {"build": {"achieved_bpp": {"value": 4.3065, "source": "whatever"}}}
+    assert verify(legacy, model_dir=None, required=[]) == []
