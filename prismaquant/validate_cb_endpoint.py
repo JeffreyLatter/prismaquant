@@ -1181,12 +1181,19 @@ def validate_cb_artifact(model_dir: str | Path) -> dict[str, Any]:
         set(str(value) for value in acknowledgements)
     ):
         raise CBEndpointValidationError(
-            "DSv4 artifact route-pending acknowledgements are not canonical"
+            "CB artifact route-pending acknowledgements are not canonical"
         )
     groups = quant_config.get("config_groups")
     if not isinstance(groups, dict) or not groups:
         raise CBEndpointValidationError("CB artifact has no config_groups")
-    if not any(
+    # An FP8 block-scaled source overlay is a property of the SOURCE, not of
+    # CB: DSv4-Flash ships native FP8 weights that must be declared as
+    # passthrough rather than silently requantized, and demanding the overlay
+    # is how that is enforced.  A BF16-source model has nothing to declare, so
+    # requiring it refused every such artifact.  The real invariant -- that
+    # whatever passthrough formats ARE declared carry their route-pending
+    # acknowledgements -- is checked below and stays on every lane.
+    if cb_serving_lane(root) == CB_LANE_DSV4_FLASH and not any(
         isinstance(group, Mapping)
         and group.get("format") == "source-passthrough"
         and group.get("source_format") == "FP8_BLOCK_UE8M0_SOURCE"
@@ -1210,7 +1217,7 @@ def validate_cb_artifact(model_dir: str | Path) -> dict[str, Any]:
     )
     if missing_acknowledgements:
         raise CBEndpointValidationError(
-            "DSv4 artifact did not record required route-pending "
+            "CB artifact did not record required route-pending "
             f"acknowledgements: {missing_acknowledgements}"
         )
     codebook_file = quant_config.get("codebook_file")
