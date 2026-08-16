@@ -1,6 +1,18 @@
 # PrismaQuant Architecture
 
-As of: 2026-08-15 · branch `merge/proven-rescues` · re-stamped for
+As of: 2026-08-15 · branch `merge/proven-rescues` · re-stamped for the
+**Gridbook 0.8.8 serving pin and the gold-contract lane scope** (0.8.7 shipped
+the quantized-embedding method and its dispatch branch, but vLLM dispatches
+quantized modules from inside the layer constructor and `qwen3_5.py` builds its
+embedding with neither a `quant_config` nor a `prefix`, so neither was ever
+reached — §3.2. Recorded with it: `shipcard.verify` was holding *every* CB
+artifact to the **DSv4-Flash** gold contract, which pins
+`tokenizer_mode=deepseek_v4`; the first CB artifact off that lane therefore had
+`gold.kl`/`gold.ppl` slots that no measurement could fill. The flag is now the
+lane, read fail-closed off the identity-bound `config.json`, and
+`serve_manifest.json` — the fingerprint of a *serve*, not artifact content — no
+longer moves `model_sha`, so validating an artifact stops invalidating its own
+card; §9.3.) Previously re-stamped for
 **architecture-conditional naming** (a profile now receives the `model_type`/
 `architectures` the checkpoint declares, and a structure spec may carry
 `naming_variants` so a family's multimodal wrapper and its text-only carve-out
@@ -3136,8 +3148,36 @@ its persistent `PRISMAQUANT_CB_EXT_DIR`). The result carries the exact kwargs/en
 receipt and shipcard verification derives the expected Marlin choice again from the on-disk
 artifact.
 
-Both tools own an in-process `LLM`; on current vLLM the measurement process is
-the parent and EngineCore is a child. Two guards ride on that:
+**That contract belongs to the DSv4 lane, not to CB** (corrected 2026-08-15).
+`shipcard.verify` gated `_verify_dsv4_gridbook_gold_contract` on
+`is_gridbook_cb`, which was true when `80a1c25` introduced it — DSv4 was then
+the only CB lane with gold slots — and is not a property of CB. The contract
+pins `tokenizer_mode=deepseek_v4` and `max_logprobs=248320`, so the first CB
+artifact off that lane (Qwen3.8-27B CB) could not fill `gold.kl`/`gold.ppl` at
+any effort: a gate no correct artifact can pass is a measurement gap, not a
+missing measurement (§2.1 principle 1), the same class as the
+`TOKENIZER_IDENTITY_SHA256` module constant that already refused this lane's
+gold-inputs tool. The flag is now the lane itself,
+`shipcard._is_dsv4_gridbook_artifact`, read off `config.json` —
+already bound into `model_sha` as `config_sha`, so the lane cannot be flipped
+without breaking artifact identity — and **fail-closed**: an artifact whose
+architecture cannot be read keeps the strict contract, so a DSv4 release can
+never shed it by hiding or corrupting its config. Both call sites move
+together (`shipcard.verify`, `shipcard_cli._cmd_fill`), because a fill that is
+stricter than publication would refuse evidence that ships fine and a looser
+one would defer the refusal to the last gate. Everything generic stays on every
+lane: finite slot metric, exact serve fingerprint, full producer commit,
+position/token counts, and `score_positions=all`.
+
+`serve_manifest.json` is excluded from `compute_model_sha` for the same reason
+it is written at all: it is the R15 fingerprint of a *serve*, not artifact
+content, so hashing it made validating an artifact invalidate its own card
+(observed on Qwen3.8-27B CB-A, `677f278a` → `bf6abc17` after the eager smoke).
+Its integrity is bound where the claim is made — each record's
+`*serve_manifest_sha256`.
+
+Both DSv4 tools own an in-process `LLM`; on current vLLM the measurement process
+is the parent and EngineCore is a child. Two guards ride on that:
 
 * **Spec-decode refusal** (`tools/spec_decode_guard.py`). Rung-1 authority had no spec-decode
   guard at all until R13 — the refusal existed only in §7.2. `_load_llm` now inspects the live

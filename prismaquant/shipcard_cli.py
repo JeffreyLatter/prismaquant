@@ -29,6 +29,7 @@ from prismaquant.shipcard import (
     CB_REQUIRED_SLOTS,
     GOLD_SLOTS,
     OPTIONAL_SLOTS,
+    _is_dsv4_gridbook_artifact,
     _verify_gold_record,
     compute_model_sha,
     fill_slot,
@@ -229,7 +230,14 @@ def _cmd_fill(args: argparse.Namespace) -> int:
             args.slot,
             record,
             model_dir=model_dir,
-            require_dsv4_gridbook_contract=True,
+            # Must track `verify()`: filling with a stricter contract than
+            # publication replays would refuse evidence that ships fine, and
+            # filling with a looser one would defer a refusal to the very last
+            # gate. The DSv4 release contract belongs to the DSv4 lane, not to
+            # CB -- `shipcard._is_dsv4_gridbook_artifact`.
+            require_dsv4_gridbook_contract=_is_dsv4_gridbook_artifact(
+                model_dir
+            ),
             require_current_artifact_path=True,
         )
         if is_gridbook and structurally_valid

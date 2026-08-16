@@ -121,6 +121,8 @@ CB_PERFORMANCE_TOOL = "validate_cb_performance.py"
 DSV4_GRIDBOOK_CONTRACT_SCHEMA = "prismaquant.dsv4_gridbook_llm_contract/1"
 SERVED_ARTIFACT_BINDING_SCHEMA = "prismaquant.served_artifact_binding/1"
 SERVE_MANIFEST_SCHEMA = "prismaquant.serve_manifest/1"
+# The name `scripts/lib/serve_manifest.sh` writes beside the artifact.
+SERVE_MANIFEST_FILENAME = "serve_manifest.json"
 FULL_KL_TEACHER_EVIDENCE_SCHEMA = "prismaquant.full_kl_teacher_evidence/1"
 WIKITEXT_GOLD_CALIBRATION_SCHEMA = "prismaquant.wikitext_gold_calibration/1"
 WIKITEXT_PPL_CALIBRATION_SCHEMA = "prismaquant.wikitext_ppl_calibration/1"
@@ -276,7 +278,17 @@ def compute_model_sha(
     if codebooks:
         payload["codebooks"] = codebooks
     if raw_quant_cfg is not None or not legacy_native_scope:
-        excluded = {SHIPCARD_FILENAME, "quant_config.json"}
+        # `serve_manifest.json` is not artifact content: it is the R15 serve
+        # fingerprint, written INTO the model dir by `scripts/lib/
+        # serve_manifest.sh` after a server comes up, and it records the
+        # serving stack (image, argv, loaded .so set, hostname, boot id,
+        # timestamp).  Hashing it would make the act of VALIDATING an artifact
+        # invalidate its own card, and would make the identity differ between
+        # two serves of byte-identical weights.  Nothing is unbound by the
+        # exclusion: every slot that cites a manifest binds it by its own
+        # `*serve_manifest_sha256`, which is where its integrity belongs.
+        excluded = {SHIPCARD_FILENAME, "quant_config.json",
+                    SERVE_MANIFEST_FILENAME}
         auxiliary = {
             path.relative_to(root).as_posix(): {
                 "bytes": int(path.stat().st_size),
@@ -854,13 +866,21 @@ def verify(
             # shipping artifacts today -- had its gold slots checked for nothing
             # but spec-decode: no finite metric, no serve fingerprint, no
             # producer commit, no position count. The DSv4/Gridbook contract
-            # stays CB-gated via the flag; the generic evidence requirements
+            # stays lane-gated via the flag; the generic evidence requirements
             # were never CB-specific and should never have been behind it.
+            #
+            # The flag was `is_gridbook_cb` until 2026-08-15. That was DSv4's
+            # own release contract standing in for "CB", which no CB artifact
+            # off that lane can satisfy -- see
+            # `_is_dsv4_gridbook_artifact`. It is now the lane itself, read
+            # fail-closed off the identity-bound `config.json`.
             problems.extend(_verify_gold_record(
                 slot,
                 record,
                 model_dir=model_dir,
-                require_dsv4_gridbook_contract=is_gridbook_cb,
+                require_dsv4_gridbook_contract=(
+                    is_gridbook_cb and _is_dsv4_gridbook_artifact(model_dir)
+                ),
                 require_current_artifact_path=False,
             ))
         if slot == "mtp.dspark":
@@ -2986,6 +3006,69 @@ def _is_dspark_cb_sidecar_artifact(
         and "dspark_cb_sidecar" in provenance
         and provenance.get("dspark_cb_sidecar") is not None
     )
+
+
+#: `model_type` values whose gold lane IS the DSv4-Flash release contract.
+_DSV4_MODEL_TYPES = frozenset({"deepseek_v4"})
+_DSV4_ARCHITECTURE_RE = re.compile(r"^DeepseekV4[A-Za-z0-9_]*$")
+
+
+def _is_dsv4_gridbook_artifact(
+    model_dir: str | os.PathLike | None,
+) -> bool:
+    """Whether the DSv4-Flash gold contract is this artifact's contract.
+
+    `_verify_dsv4_gridbook_gold_contract` replays ONE lane's release contract:
+    it pins `tokenizer_mode="deepseek_v4"`, `max_logprobs=248_320` (the DSv4
+    vocabulary), `moe_backend="marlin"`, an in-process `LLM(**kwargs)` shape,
+    and an exact 8x512/4088-position workload. It was introduced by `80a1c25`
+    ("ship: harden DSv4Flash AURA Gridbook release") and gated on
+    `is_gridbook_cb`, because DSv4 was then the only CB lane with gold slots --
+    a proxy that was true when written and is not a property of CB.
+
+    Qwen3.8-27B CB is the first CB artifact off that lane, and the proxy makes
+    its `gold.kl`/`gold.ppl` unfillable by construction: no Qwen artifact can
+    ever report `tokenizer_mode="deepseek_v4"`. A gate no correct artifact can
+    pass is a measurement gap, not a missing measurement (principle 1) -- the
+    same class as the `TOKENIZER_IDENTITY_SHA256` module constant that already
+    refused this lane's gold-inputs tool. The generic gold requirements (finite
+    slot metric, exact serve fingerprint, producer commit, position counts,
+    `score_positions=all`) were never CB-specific and still apply to every lane.
+
+    Read off `config.json`, which `compute_model_sha` already binds as
+    `config_sha`: the lane cannot be flipped without breaking artifact
+    identity. Fail-closed -- an artifact whose architecture cannot be read is
+    treated as on-lane, so a DSv4 release can never shed the contract by
+    hiding or corrupting its config.
+    """
+    if model_dir is None:
+        return True
+    config_path = Path(model_dir) / "config.json"
+    if not config_path.is_file():
+        return True
+    try:
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return True
+    if not isinstance(payload, Mapping):
+        return True
+    model_type = payload.get("model_type")
+    architectures = payload.get("architectures")
+    if isinstance(model_type, str) and model_type in _DSV4_MODEL_TYPES:
+        return True
+    if isinstance(architectures, (list, tuple)) and any(
+        isinstance(name, str) and _DSV4_ARCHITECTURE_RE.fullmatch(name)
+        for name in architectures
+    ):
+        return True
+    # Positively identified as some other architecture.
+    if isinstance(model_type, str) and model_type:
+        return False
+    if isinstance(architectures, (list, tuple)) and any(
+        isinstance(name, str) and name for name in architectures
+    ):
+        return False
+    return True
 
 
 def _is_gridbook_card(

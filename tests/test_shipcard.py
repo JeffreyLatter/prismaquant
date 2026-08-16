@@ -348,6 +348,105 @@ def test_gridbook_card_opens_plugin_performance_refusal_slot(tmp_path):
     )
 
 
+def _cb_card(tmp_path, *, model_type, architectures, name="exported"):
+    """A Gridbook CB artifact whose architecture is the one thing that varies."""
+    model_dir = _artifact(tmp_path, name=name)
+    (model_dir / "config.json").write_text(json.dumps({
+        "model_type": model_type, "architectures": architectures,
+    }))
+    (model_dir / "quant_config.json").write_text(json.dumps({
+        "quant_method": "gridbook", "format": "nvfp4_cb",
+    }))
+    path = model_dir / "shipcard.json"
+    write_shipcard(
+        path, build_shipcard(model_dir, build={"quant_method": "gridbook"}))
+    return model_dir, path
+
+
+def _gold_problems(model_dir, path, slot):
+    _fill_all(path, compute_model_sha(model_dir))
+    return [p for p in verify(load_shipcard(path), model_dir=model_dir)
+            if p.startswith(f"{slot}:")]
+
+
+@pytest.mark.parametrize("slot", sorted(GOLD_SLOTS))
+def test_the_dsv4_gold_contract_is_required_on_the_dsv4_lane(tmp_path, slot):
+    """A DSv4-Flash CB release still replays its own release contract."""
+    model_dir, path = _cb_card(
+        tmp_path, model_type="deepseek_v4",
+        architectures=["DeepseekV4ForCausalLM"])
+    assert any("DSv4 Gridbook gold contract" in p
+               for p in _gold_problems(model_dir, path, slot))
+
+
+@pytest.mark.parametrize("slot", sorted(GOLD_SLOTS))
+def test_a_cb_artifact_off_the_dsv4_lane_is_not_held_to_dsv4s_contract(
+    tmp_path, slot,
+):
+    """The contract pins ONE lane; `is_gridbook_cb` was only ever its proxy.
+
+    `_verify_dsv4_gridbook_gold_contract` requires `tokenizer_mode
+    ="deepseek_v4"` and `max_logprobs=248_320` — the DSv4 vocabulary — so a
+    Qwen CB artifact could not fill `gold.kl`/`gold.ppl` at any effort. A gate
+    no correct artifact can pass is a measurement gap, not a missing
+    measurement (principle 1). Caught 2026-08-15 publishing Qwen3.8-27B CB,
+    the first CB artifact off the DSv4 lane.
+
+    What stays: every generic gold requirement, which is what the rest of this
+    file pins. This test only asserts that the DSv4-specific one is gone.
+    """
+    model_dir, path = _cb_card(
+        tmp_path, model_type="qwen3_5_text",
+        architectures=["Qwen3_5ForCausalLM"])
+    assert _gold_problems(model_dir, path, slot) == []
+
+
+@pytest.mark.parametrize("config_text", [
+    None,                                     # no config.json at all
+    "{not json",                              # unreadable
+    "[]",                                     # not an object
+    '{"architectures": []}',                  # says nothing about the arch
+])
+def test_an_unreadable_architecture_keeps_the_strict_contract(
+    tmp_path, config_text,
+):
+    """Fail-closed: a DSv4 release cannot shed its contract by hiding config.
+
+    `config.json` is bound into `model_sha` as `config_sha`, so corrupting it
+    already breaks the card — but the lane test must not be the weak link that
+    turns a corrupt config into a LOOSER gate.
+    """
+    model_dir, path = _cb_card(
+        tmp_path, model_type="deepseek_v4",
+        architectures=["DeepseekV4ForCausalLM"])
+    if config_text is None:
+        (model_dir / "config.json").unlink()
+    else:
+        (model_dir / "config.json").write_text(config_text)
+    assert any("DSv4 Gridbook gold contract" in p
+               for p in _gold_problems(model_dir, path, "gold.kl"))
+
+
+def test_the_lane_is_read_off_disk_not_off_the_mutable_card(tmp_path):
+    """Same reasoning as `_is_gridbook_card`: the receipt is mutated as gates
+    close, so the obligation is resolved from the artifact."""
+    from prismaquant.shipcard import _is_dsv4_gridbook_artifact
+
+    model_dir, _ = _cb_card(
+        tmp_path, model_type="deepseek_v4",
+        architectures=["DeepseekV4ForCausalLM"])
+    assert _is_dsv4_gridbook_artifact(model_dir) is True
+    assert _is_dsv4_gridbook_artifact(None) is True
+
+    # The architecture list alone is enough, in both directions.
+    (model_dir / "config.json").write_text(
+        json.dumps({"architectures": ["DeepseekV4ForCausalLM"]}))
+    assert _is_dsv4_gridbook_artifact(model_dir) is True
+    (model_dir / "config.json").write_text(
+        json.dumps({"architectures": ["Qwen3_5ForCausalLM"]}))
+    assert _is_dsv4_gridbook_artifact(model_dir) is False
+
+
 def test_target_only_dspark_claim_absent_or_null_is_nonblocking_but_claim_is_replayed(
     tmp_path, capsys,
 ):
@@ -895,6 +994,45 @@ def test_native_model_sha_attests_the_chat_template(tmp_path):
     (model_dir / "chat_template.jinja").write_text("{{ messages }}")
     assert compute_model_sha(model_dir) == before
     (model_dir / "tokenizer.json").write_text('{"version": "2"}')
+    assert compute_model_sha(model_dir) != before
+
+
+def test_serving_an_artifact_does_not_invalidate_its_own_card(tmp_path):
+    """`serve_manifest.json` is evidence ABOUT a serve, not artifact content.
+
+    `scripts/lib/serve_manifest.sh` writes the R15 serve fingerprint INTO the
+    model dir after a server comes up. It records the serving stack -- image,
+    argv, the loaded `.so` set, hostname, boot id, timestamp -- so it differs
+    between two serves of byte-identical weights. Hashing it made the act of
+    VALIDATING an artifact invalidate the card that validation was for:
+    observed 2026-08-15 on Qwen3.8-27B CB-A, where the eager smoke moved
+    `model_sha` 677f278a -> bf6abc17 and `verify` then reported "artifact
+    changed since the shipcard was opened".
+
+    Nothing goes unbound: every slot that cites a manifest binds it by its own
+    `*serve_manifest_sha256`, which is where a claim about a serve belongs.
+    """
+    model_dir = _artifact(tmp_path)
+    (model_dir / "chat_template.jinja").write_text("{{ messages }}")
+
+    path = _open_card(tmp_path, model_dir)
+    before = compute_model_sha(model_dir)
+    _fill_all(path, before)
+    assert verify(load_shipcard(path), model_dir=model_dir) == []
+
+    (model_dir / "serve_manifest.json").write_text(
+        '{"schema": "prismaquant.serve_manifest/1", "boot_id": "a"}')
+    assert compute_model_sha(model_dir) == before
+    assert verify(load_shipcard(path), model_dir=model_dir) == []
+
+    # A second serve writes a DIFFERENT manifest; the identity must not move.
+    (model_dir / "serve_manifest.json").write_text(
+        '{"schema": "prismaquant.serve_manifest/1", "boot_id": "b"}')
+    assert compute_model_sha(model_dir) == before
+
+    # The exclusion is by exact name, not by shape: a file that merely looks
+    # like it stays attested.
+    (model_dir / "serve_manifest.json.bak").write_text("{}")
     assert compute_model_sha(model_dir) != before
 
 
