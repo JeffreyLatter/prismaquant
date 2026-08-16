@@ -178,15 +178,18 @@ def _manifest(
     *,
     requires_marlin: bool = False,
     model_sha: str = "c" * 64,
+    lane: str = cbv.CB_LANE_DSV4_FLASH,
 ) -> dict:
     pin = cbv._gridbook_runtime_pin()
+    lane_spec = cbv.cb_lane_spec(lane)
+    served_model = lane_spec["served_model_prefix"] + "a" * 32
     argv = [
         "/usr/local/bin/vllm", "serve", "/model",
-        "--served-model-name", _SERVED_MODEL,
+        "--served-model-name", served_model,
         "--host", "0.0.0.0",
         "--port", "8000",
         "--trust-remote-code",
-        "--tokenizer-mode", "deepseek_v4",
+        "--tokenizer-mode", lane_spec["tokenizer_mode"],
         "--generation-config", "vllm",
         "--quantization", "gridbook",
         "--tensor-parallel-size", "1",
@@ -252,15 +255,15 @@ def _manifest(
         "socket_inode": "98765",
         "pids": [process_pids[0]],
     }
-    models_raw = json.dumps(_models_payload()).encode("utf-8")
+    models_raw = json.dumps(_models_payload(served_model)).encode("utf-8")
     payload = {
         "schema": MANIFEST_SCHEMA,
         "hostname": host_identity["hostname"],
         "host_identity": host_identity,
         "source": "server",
-        "image": cbv.DSV4_SPARK_VLLM_IMAGE,
+        "image": lane_spec["image"],
         "model": "/model",
-        "served_model_name": _SERVED_MODEL,
+        "served_model_name": served_model,
         "launch_argv": argv,
         "launch_flags": elide_argv_paths(argv),
         "enforce_eager": arm == "eager",
@@ -316,7 +319,7 @@ def _manifest(
             models_endpoint_binding_from_bytes(
                 models_raw,
                 request_url="http://127.0.0.1:8000/v1/models",
-                expected_served_model=_SERVED_MODEL,
+                expected_served_model=served_model,
             )
         ),
     }
@@ -384,6 +387,65 @@ def _smoke_metrics() -> dict:
 
 
 @pytest.mark.parametrize("arm", ["eager", "graph"])
+def test_the_generic_gridbook_lane_serves_its_own_stack(arm):
+    """The gate was DSv4-pinned in five places, so no non-DSv4 CB artifact
+    could ever fill `native_export.*` -- and none ever had.
+
+    Each pin named a real property (`deepseek_v4` is a tokenizer only DSv4's
+    vendored code registers; the eugr digest is the container carrying its
+    runtime), but named it as a constant rather than as a lane's value.
+    """
+    lane = cbv.CB_LANE_GRIDBOOK_GENERIC
+    manifest = _manifest(arm, lane=lane)
+    assert cbv.validate_serve_manifest(
+        manifest,
+        arm=arm,
+        lane=lane,
+        expected_served_model=manifest["served_model_name"],
+        requires_moe_marlin=False,
+        expected_model_sha="c" * 64,
+    ) == manifest["serve_fingerprint"]
+
+
+@pytest.mark.parametrize(
+    ("lane", "other"),
+    [
+        (cbv.CB_LANE_DSV4_FLASH, cbv.CB_LANE_GRIDBOOK_GENERIC),
+        (cbv.CB_LANE_GRIDBOOK_GENERIC, cbv.CB_LANE_DSV4_FLASH),
+    ],
+)
+def test_a_lanes_stack_cannot_be_borrowed_by_the_other_lane(lane, other):
+    """Fail-closed in BOTH directions: generalizing must not let a DSv4
+    artifact be validated on the lighter contract, or vice versa."""
+    manifest = _manifest("eager", lane=other)
+    with pytest.raises(cbv.CBEndpointValidationError):
+        cbv.validate_serve_manifest(
+            manifest,
+            arm="eager",
+            lane=lane,
+            expected_served_model=manifest["served_model_name"],
+            requires_moe_marlin=False,
+            expected_model_sha="c" * 64,
+        )
+
+
+def test_an_unknown_lane_is_refused_rather_than_defaulted():
+    with pytest.raises(cbv.CBEndpointValidationError, match="unknown CB serving lane"):
+        cbv.cb_lane_spec("some_lane_nobody_declared")
+
+
+def test_every_lane_passes_the_tokenizer_flag_explicitly():
+    """An exact-match option contract must have no absent-flag case, or an
+    omitted tokenizer silently becomes whatever vLLM happens to default to."""
+    for lane in cbv.CB_SERVING_LANE_SPECS:
+        spec = cbv.cb_lane_spec(lane)
+        assert spec["tokenizer_mode"], lane
+        assert spec["image"].count("@sha256:") == 1, (
+            f"{lane} must pin its serving container by content digest")
+        assert spec["served_model_prefix"].endswith("-"), lane
+
+
+@pytest.mark.parametrize("arm", ["eager", "graph"])
 def test_manifest_validation_binds_each_arm_to_exact_stack(arm):
     manifest = _manifest(arm)
     assert cbv.validate_serve_manifest(
@@ -404,7 +466,8 @@ def test_manifest_validation_binds_each_arm_to_exact_stack(arm):
         (lambda m: m.update(quantization="compressed-tensors"), "gridbook"),
         (lambda m: m.update(kv_cache_dtype="auto"), "fp8"),
         (lambda m: m.update(residency_readable=False), "address space"),
-        (lambda m: m.update(image="eugr/spark-vllm:latest"), "exact DSv4 image"),
+        (lambda m: m.update(image="eugr/spark-vllm:latest"),
+         "exact dsv4_flash image"),
         (lambda m: m.update(gpu_count=2), "one NVIDIA GB10"),
         (lambda m: m.update(model="/different"), "exact /model"),
         (lambda m: m.update(resident_extensions=[]), "Gridbook-native CUDA extension"),
@@ -1112,7 +1175,12 @@ def test_deferred_commit_refuses_mutated_hashed_evidence(
 def test_driver_and_lane_declare_two_isolated_arms_and_guards():
     text = DRIVER.read_text(encoding="utf-8")
     subprocess.run(["bash", "-n", str(DRIVER)], check=True)
-    assert cbv.DSV4_SPARK_VLLM_IMAGE in text
+    # The image is no longer a literal here: it is READ from the same lane
+    # table the validator replays against, so the launcher cannot serve a
+    # container the gate would then refuse. Restating it would reintroduce
+    # exactly the two-sided drift this generalization removed.
+    assert "cb_lane_spec" in text and "cb_serving_lane" in text
+    assert cbv.DSV4_SPARK_VLLM_IMAGE not in text
     assert cbv.DSV4_SPARK_VLLM_VERSION in text
     assert cbv.DSV4_SPARK_VLLM_COMMIT in text
     assert 'install-container' in text
@@ -1145,7 +1213,11 @@ def test_driver_and_lane_declare_two_isolated_arms_and_guards():
     assert 'record.get("base_url") != base_url' in text
     assert 'record.get("model_sha_source") != model_dir' in text
     assert 'openssl rand -hex 16' in text
-    assert 'SERVED_MODEL=dsv4-flash-gridbook-${SERVE_NONCE}' in text
+    # The BRAND is lane-derived; the 32-hex NONCE is not -- it is the
+    # per-run freshness proof that a receipt cannot be replayed from an
+    # earlier serve, and every lane keeps it.
+    assert 'SERVED_MODEL=${SERVED_MODEL_PREFIX}${SERVE_NONCE}' in text
+    assert '^[0-9a-f]{32}$' in text
     assert '--base-url http://127.0.0.1:8000' in text
     assert 'commit_deferred_result' in text
     assert 'docker stop -t 30 "$CID"' in text

@@ -12,7 +12,15 @@ artifact to the **DSv4-Flash** gold contract, which pins
 lane, read fail-closed off the identity-bound `config.json`, and
 `serve_manifest.json` — the fingerprint of a *serve*, not artifact content — no
 longer moves `model_sha`, so validating an artifact stops invalidating its own
-card; §9.3.) Previously re-stamped for
+card; §9.3. The **whole CB ship-gate stack turned out to be DSv4-shaped**, not
+just the gold contract: `validate_cb_endpoint.py` pinned the served-model
+brand, `--tokenizer-mode deepseek_v4`, the eugr image and `model_type ==
+"deepseek_v4"` itself, and `perf.matched_budget_parity` structurally requires a
+displaced container a net-new size class does not have. No CB artifact on this
+box — DSv4's included — had ever had a single slot filled, so the stack had
+never run end-to-end. The three genuinely lane-varying constants now come from
+one table, `CB_SERVING_LANE_SPECS`, that the launcher *reads* rather than
+restates; §9.3.) Previously re-stamped for
 **architecture-conditional naming** (a profile now receives the `model_type`/
 `architectures` the checkpoint declares, and a structure spec may carry
 `naming_variants` so a family's multimodal wrapper and its text-only carve-out
@@ -3168,6 +3176,34 @@ stricter than publication would refuse evidence that ships fine and a looser
 one would defer the refusal to the last gate. Everything generic stays on every
 lane: finite slot metric, exact serve fingerprint, full producer commit,
 position/token counts, and `score_positions=all`.
+
+**The rest of the CB ship-gate stack was DSv4-shaped too** (2026-08-15). Fixing
+the gold contract exposed that it was one instance of a pattern, not the
+defect. A survey of every CB shipcard on this box found **none with a single
+filled slot — DSv4's own included** — so the stack had never been executed
+end-to-end, and every DSv4 constant in it had been written as a constant rather
+than as a lane's value:
+
+| Pin | Where | Verdict |
+|---|---|---|
+| `dsv4-flash-gridbook-` served-model prefix | `_SESSION_MODEL_RE` | lane-varying (brand only; the 32-hex nonce is the freshness proof and stays) |
+| `--tokenizer-mode deepseek_v4` | `_canonical_launch_contract` | lane-varying — names a tokenizer only DSv4's vendored code registers |
+| eugr Spark image digest | `validate_serve_manifest`, both `stack` blocks | lane-varying — which container carries the Gridbook wheel |
+| `model_type == "deepseek_v4"` | `validate_cb_artifact` | **removed** — this gate proves the bytes are the shipcard's `nvfp4_cb` export served by the pinned stack; the architecture selects the lane, it does not gate admission |
+| `perf.matched_budget_parity` required | `CB_REQUIRED_SLOTS` | lane-varying — its verifier needs five `displaced_container_*` digests, which a net-new size class cannot produce |
+| vLLM version/commit, GPU, graph-capture config, the 8192/1-seq/1 GiB-KV/0.90-util gate parameters, the environment profile | throughout | **lane-invariant, unchanged** — the Gridbook image is built *from* the eugr base and reports the identical vLLM version and commit |
+
+The three that vary live in one table, `validate_cb_endpoint.CB_SERVING_LANE_SPECS`,
+keyed by `shipcard.cb_serving_lane`. `scripts/serve_dsv4_cb_validate.sh` (name
+historical; the launcher is now lane-generic) **reads** that table instead of
+restating it, so a serve it can produce is exactly a serve the gate accepts —
+restating the constants on both sides is what let them drift apart. The
+contract records its lane and publication re-derives the lane from
+`config.json` independently: a receipt may declare which contract it was built
+against, but not which contract it is judged by, and lane mismatch is refused
+in **both** directions. Scoping the *demand* for `perf.matched_budget_parity`
+does not create a hole in the *check* — a card that volunteers the slot off-lane
+is still fully replayed.
 
 `serve_manifest.json` is excluded from `compute_model_sha` for the same reason
 it is written at all: it is the R15 fingerprint of a *serve*, not artifact

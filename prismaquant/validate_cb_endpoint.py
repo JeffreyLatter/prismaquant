@@ -28,8 +28,11 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from .shipcard import (
+    CB_LANE_DSV4_FLASH,
+    CB_LANE_GRIDBOOK_GENERIC,
     _manifest_gridbook_runtime_pin,
     _verify_gridbook_distribution_identity,
+    cb_serving_lane,
     compute_model_sha,
     fill_slot,
     git_provenance,
@@ -85,9 +88,52 @@ _FINGERPRINT_RE = re.compile(r"[0-9a-f]{64}")
 _GRAPH_CAPTURE_RE = re.compile(
     r"Graph capturing finished in [0-9]+ secs, took -?[0-9.]+ GiB"
 )
-_SESSION_MODEL_RE = re.compile(
-    re.escape(DSV4_SERVED_MODEL_PREFIX) + r"[0-9a-f]{32}"
+GRIDBOOK_SERVED_MODEL_PREFIX = "pq-cb-gridbook-"
+#: The Gridbook 0.8.8 serving image, by content digest.  It is built FROM the
+#: eugr Spark base above and reports the identical vLLM version/commit, so the
+#: two lanes differ only in which container carries the Gridbook wheel and
+#: which tokenizer the architecture needs.
+GRIDBOOK_SPARK_VLLM_IMAGE = (
+    "gridbook@sha256:"
+    "6810398e6ae81a3f9a3b97734f281cc62d72c49882aa885dd3b85381bd24759e"
 )
+
+#: Per-lane serving constants.  Everything OUTSIDE this table -- vLLM
+#: version/commit, GPU, the graph compilation config, the whole gate parameter
+#: set (8192 len / 1 seq / 1 GiB KV / 0.90 util), the environment profile --
+#: was verified lane-invariant and stays a single shared pin.
+#:
+#: Only three things actually vary: the tokenizer the architecture requires,
+#: the container that carries the Gridbook wheel, and the served-model brand.
+#: The 32-hex nonce is NOT a lane property -- it is the per-run freshness proof
+#: that a receipt cannot be replayed from an earlier serve, and every lane
+#: keeps it.
+CB_SERVING_LANE_SPECS: Mapping[str, Mapping[str, str]] = {
+    CB_LANE_DSV4_FLASH: {
+        "served_model_prefix": DSV4_SERVED_MODEL_PREFIX,
+        "tokenizer_mode": "deepseek_v4",
+        "image": DSV4_SPARK_VLLM_IMAGE,
+    },
+    CB_LANE_GRIDBOOK_GENERIC: {
+        "served_model_prefix": GRIDBOOK_SERVED_MODEL_PREFIX,
+        "tokenizer_mode": "auto",
+        "image": GRIDBOOK_SPARK_VLLM_IMAGE,
+    },
+}
+
+
+def cb_lane_spec(lane: str) -> Mapping[str, str]:
+    """Return one lane's serving constants, refusing an unknown lane."""
+    spec = CB_SERVING_LANE_SPECS.get(lane)
+    if spec is None:
+        raise CBEndpointValidationError(f"unknown CB serving lane {lane!r}")
+    return spec
+
+
+_SESSION_MODEL_RES = {
+    lane: re.compile(re.escape(spec["served_model_prefix"]) + r"[0-9a-f]{32}")
+    for lane, spec in CB_SERVING_LANE_SPECS.items()
+}
 _FULL_DECODE_CONFIG_RE = re.compile(
     r"Initializing a V1 LLM engine .*?compilation_config=\{.*?"
     r"'cudagraph_mode': <CUDAGraphMode\.FULL_DECODE_ONLY:.*?"
@@ -419,11 +465,22 @@ def validate_dspark_production_render_attestation(
     }
 
 
-def _require_session_model_name(value: object) -> str:
-    if not isinstance(value, str) or _SESSION_MODEL_RE.fullmatch(value) is None:
+def _require_session_model_name(value: object, *, lane: str) -> str:
+    """The served-model name must be this lane's brand plus a fresh nonce.
+
+    Fail-closed in BOTH directions: a DSv4 artifact served under the generic
+    prefix is refused exactly as a generic artifact served under the DSv4 one
+    is, so the brand cannot be borrowed to satisfy a lane's contract.
+    """
+    pattern = _SESSION_MODEL_RES.get(lane)
+    if pattern is None:
+        raise CBEndpointValidationError(f"unknown CB serving lane {lane!r}")
+    if not isinstance(value, str) or pattern.fullmatch(value) is None:
         raise CBEndpointValidationError(
-            "served model name must contain the fixed DSv4 prefix plus a fresh "
-            "128-bit lowercase hexadecimal session nonce"
+            f"served model name must be the fixed {lane} prefix "
+            f"{cb_lane_spec(lane)['served_model_prefix']!r} plus a fresh "
+            "128-bit lowercase hexadecimal session nonce; "
+            f"got {value!r}"
         )
     return value
 
@@ -760,6 +817,7 @@ def _canonical_launch_contract(
     argv: Sequence[object],
     *,
     arm: str,
+    lane: str = CB_LANE_DSV4_FLASH,
     expected_served_model: str,
     requires_moe_marlin: bool,
     expected_options_override: Mapping[str, str] | None = None,
@@ -829,7 +887,11 @@ def _canonical_launch_contract(
         "--served-model-name": expected_served_model,
         "--host": "0.0.0.0",
         "--port": "8000",
-        "--tokenizer-mode": "deepseek_v4",
+        # Lane-derived: `deepseek_v4` names a tokenizer only the DSv4 vendored
+        # code registers.  Every lane still passes the flag EXPLICITLY -- an
+        # exact-match contract must never have an absent-flag case, or an
+        # omitted tokenizer silently becomes whatever vLLM defaults to.
+        "--tokenizer-mode": cb_lane_spec(lane)["tokenizer_mode"],
         "--generation-config": "vllm",
         "--quantization": "gridbook",
         "--tensor-parallel-size": "1",
@@ -880,7 +942,8 @@ def validate_serve_manifest(
     payload: Mapping[str, Any],
     *,
     arm: str,
-    expected_image: str = DSV4_SPARK_VLLM_IMAGE,
+    lane: str = CB_LANE_DSV4_FLASH,
+    expected_image: str | None = None,
     expected_vllm_version: str = DSV4_SPARK_VLLM_VERSION,
     expected_served_model: str,
     requires_moe_marlin: bool,
@@ -894,7 +957,10 @@ def validate_serve_manifest(
     """Validate server-side identity and return its exact fingerprint."""
     if arm not in {"eager", "graph"}:
         raise CBEndpointValidationError(f"unknown validation arm {arm!r}")
-    _require_session_model_name(expected_served_model)
+    lane_spec = cb_lane_spec(lane)
+    if expected_image is None:
+        expected_image = lane_spec["image"]
+    _require_session_model_name(expected_served_model, lane=lane)
 
     # Import the existing canonicalization only here so ordinary module import
     # remains stdlib + shipcard.  This validator is run from a repository mount
@@ -931,7 +997,8 @@ def validate_serve_manifest(
         )
     if payload.get("image") != expected_image:
         raise CBEndpointValidationError(
-            f"serve image {payload.get('image')!r} != exact DSv4 image {expected_image!r}"
+            f"serve image {payload.get('image')!r} != exact {lane} image "
+            f"{expected_image!r}"
         )
     if payload.get("model") != "/model":
         raise CBEndpointValidationError(
@@ -1001,6 +1068,7 @@ def validate_serve_manifest(
     _canonical_launch_contract(
         argv,
         arm=arm,
+        lane=lane,
         expected_served_model=expected_served_model,
         requires_moe_marlin=requires_moe_marlin,
         expected_options_override=expected_launch_options,
@@ -1083,11 +1151,15 @@ def validate_cb_artifact(model_dir: str | Path) -> dict[str, Any]:
         quant_config = json.loads(quant_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise CBEndpointValidationError(f"CB artifact JSON is unreadable: {exc}") from exc
-    if not isinstance(model_config, dict) or model_config.get(
-        "model_type"
-    ) != "deepseek_v4":
+    # The architecture is NOT pinned here.  What this gate proves is that the
+    # bytes on disk are the shipcard's Gridbook nvfp4_cb export and that the
+    # pinned stack served them; which architecture they encode is the lane's
+    # business (`cb_serving_lane`), and it selects the tokenizer and container
+    # rather than gating admission.  Pinning `deepseek_v4` here refused every
+    # correct non-DSv4 CB artifact -- the same defect as the DSv4 gold contract.
+    if not isinstance(model_config, dict) or not model_config.get("model_type"):
         raise CBEndpointValidationError(
-            f"artifact is not DSv4: model_type={getattr(model_config, 'get', lambda *_: None)('model_type')!r}"
+            "CB artifact config.json declares no model_type"
         )
     if not isinstance(quant_config, dict) or quant_config.get(
         "quant_method"
@@ -2870,6 +2942,7 @@ def run_endpoint_smoke(
 def build_endpoint_contract(
     *,
     arm: str,
+    lane: str = CB_LANE_DSV4_FLASH,
     model_sha: str,
     manifest: Mapping[str, Any],
     manifest_sha256: str,
@@ -2881,10 +2954,14 @@ def build_endpoint_contract(
     _validate_artifact_decode_record(artifact_decode)
     pin = _gridbook_runtime_pin()
     _require_artifact_decode_runtime_features(artifact_decode, pin)
-    served_model = _require_session_model_name(manifest.get("served_model_name"))
+    lane_spec = cb_lane_spec(lane)
+    served_model = _require_session_model_name(
+        manifest.get("served_model_name"), lane=lane
+    )
     launch = _canonical_launch_contract(
         manifest.get("launch_argv") or (),
         arm=arm,
+        lane=lane,
         expected_served_model=served_model,
         requires_moe_marlin=bool(
             artifact_decode.get("requires_moe_backend_marlin")
@@ -2913,6 +2990,7 @@ def build_endpoint_contract(
     contract: dict[str, Any] = {
         "schema": ENDPOINT_CONTRACT_SCHEMA,
         "arm": arm,
+        "lane": lane,
         "model_sha": model_sha,
         "artifact_decode": dict(artifact_decode),
         "serve_manifest": {
@@ -2921,7 +2999,7 @@ def build_endpoint_contract(
             "artifact_binding": manifest.get("artifact_binding"),
         },
         "stack": {
-            "image": DSV4_SPARK_VLLM_IMAGE,
+            "image": lane_spec["image"],
             "gpu_name": DSV4_SPARK_GPU_NAME,
             "gpu_count": 1,
             "vllm_version": DSV4_SPARK_VLLM_VERSION,
@@ -2943,6 +3021,7 @@ def build_endpoint_contract(
     validate_endpoint_contract_record(
         contract,
         arm=arm,
+        lane=lane,
         model_sha=model_sha,
         serve_fingerprint=str(manifest.get("serve_fingerprint")),
     )
@@ -2953,15 +3032,34 @@ def validate_endpoint_contract_record(
     payload: Mapping[str, Any],
     *,
     arm: str,
+    lane: str | None = None,
     model_sha: str | None = None,
     serve_fingerprint: str | None = None,
 ) -> None:
-    """Replay every structural assertion encoded in a native CB receipt."""
+    """Replay every structural assertion encoded in a native CB receipt.
+
+    `lane` is the caller's INDEPENDENT determination -- publication re-derives
+    it from the artifact's own `config.json` (`cb_serving_lane`).  The receipt
+    also names its lane, and the two must agree: a receipt may declare which
+    contract it was built against, but it may not choose which contract it is
+    judged by.  `None` means "no independent opinion" and checks only that the
+    declared lane is one this validator knows.
+    """
     if arm not in {"eager", "graph"}:
         raise CBEndpointValidationError(f"invalid endpoint-contract arm {arm!r}")
+    declared_lane = payload.get("lane")
+    if not isinstance(declared_lane, str):
+        raise CBEndpointValidationError("endpoint contract declares no serving lane")
+    lane_spec = cb_lane_spec(declared_lane)
+    if lane is not None and declared_lane != lane:
+        raise CBEndpointValidationError(
+            f"endpoint contract declares lane {declared_lane!r}, but the "
+            f"artifact on disk is on lane {lane!r}"
+        )
     expected_keys = {
         "schema",
         "arm",
+        "lane",
         "model_sha",
         "artifact_decode",
         "serve_manifest",
@@ -3040,7 +3138,7 @@ def validate_endpoint_contract_record(
     pin = _gridbook_runtime_pin()
     _require_artifact_decode_runtime_features(artifact_decode, pin)
     expected_stack = {
-        "image": DSV4_SPARK_VLLM_IMAGE,
+        "image": lane_spec["image"],
         "gpu_name": DSV4_SPARK_GPU_NAME,
         "gpu_count": 1,
         "vllm_version": DSV4_SPARK_VLLM_VERSION,
@@ -3073,7 +3171,7 @@ def validate_endpoint_contract_record(
     requires_marlin = artifact_decode.get("requires_moe_backend_marlin")
     if (
         not isinstance(served_model, str)
-        or _SESSION_MODEL_RE.fullmatch(served_model) is None
+        or _SESSION_MODEL_RES[declared_lane].fullmatch(served_model) is None
         or launch.get("model") != "/model"
         or not isinstance(options, Mapping)
         or not isinstance(switches, list)
@@ -3087,6 +3185,7 @@ def validate_endpoint_contract_record(
     replayed = _canonical_launch_contract(
         replay_argv,
         arm=arm,
+        lane=declared_lane,
         expected_served_model=served_model,
         requires_moe_marlin=bool(requires_marlin),
     )
@@ -3399,6 +3498,7 @@ def commit_deferred_result(
     validate_endpoint_contract_record(
         contract,
         arm=arm,
+        lane=cb_serving_lane(model_dir),
         model_sha=record.get("model_sha"),
         serve_fingerprint=record.get("serve_fingerprint"),
     )
@@ -3485,6 +3585,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise CBEndpointValidationError(
                 "exact endpoint gate requires its canonical prompt and 8-token smoke"
             )
+        lane = cb_serving_lane(model_dir)
+        metrics["serving_lane"] = lane
         quant_config = validate_cb_artifact(model_dir)
         artifact_decode = validate_cb_artifact_decode_contract(
             model_dir, quant_config, runtime_pin=_gridbook_runtime_pin()
@@ -3514,6 +3616,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         serve_fingerprint = validate_serve_manifest(
             manifest,
             arm=args.arm,
+            lane=lane,
             expected_served_model=args.model_name,
             requires_moe_marlin=bool(
                 artifact_decode["requires_moe_backend_marlin"]
@@ -3561,6 +3664,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         metrics["endpoint_contract"] = build_endpoint_contract(
             arm=args.arm,
+            lane=lane,
             model_sha=model_sha,
             manifest=manifest,
             manifest_sha256=manifest_sha256,

@@ -1,5 +1,13 @@
 #!/usr/bin/env bash
-# Exact-pin, one-Spark DSv4 CB load/generation gate.
+# Exact-pin, one-Spark Gridbook CB load/generation gate.
+#
+# The filename is historical: this launcher was written for DSv4 and is now
+# lane-generic.  The serving LANE is derived from the artifact's own
+# config.json (`prismaquant.shipcard.cb_serving_lane`) and selects exactly
+# three things -- the container image, the tokenizer mode, and the
+# served-model brand.  Every other pin here (vLLM version/commit, GPU, the
+# 8192/1-seq/1 GiB-KV/0.90-util gate parameters, the environment profile) was
+# verified lane-invariant and stays shared.
 #
 # Run each arm separately; each invocation creates a fresh container and
 # installs Gridbook from the immutable PrismaQuant runtime pin inside it:
@@ -172,13 +180,45 @@ fi
 . "$REPO/prismaquant/gridbook_runtime/gridbook_serving_runtime.sh"
 gridbook_serving_runtime_prepare
 
-# DSv4 evidence pin: eugr Spark vLLM 0.26.1rc1.dev693 at g7f7a32cfe.
-BASE_IMAGE=eugr/spark-vllm@sha256:58862b388e0fab05a5c9b673f21d1d7b41a1123953a2d9ace49aae6c79319869
+# The lane, its image, its tokenizer mode and its served-model brand come from
+# the SAME table the validator replays against (`CB_SERVING_LANE_SPECS`), so a
+# serve this launcher can produce is exactly a serve the gate can accept.
+# Reading them here rather than restating them is what stopped the two sides
+# from drifting apart in the first place.
+readarray -t lane_fields < <(env -u PYTHONPATH PYTHONNOUSERSITE=1 \
+  PYTHONSAFEPATH=1 python3 -P - "$MODEL" "$REPO" <<'PY'
+import sys
+
+# The attested snapshot, never the cwd: there is more than one PrismaQuant
+# checkout on this box and safe-path mode deliberately drops the implicit one.
+sys.path.insert(0, sys.argv[2])
+from prismaquant.shipcard import cb_serving_lane
+from prismaquant.validate_cb_endpoint import cb_lane_spec
+
+lane = cb_serving_lane(sys.argv[1])
+spec = cb_lane_spec(lane)
+print(lane)
+print(spec["image"])
+print(spec["tokenizer_mode"])
+print(spec["served_model_prefix"])
+PY
+)
+SERVE_LANE=${lane_fields[0]:-}
+BASE_IMAGE=${lane_fields[1]:-}
+TOKENIZER_MODE=${lane_fields[2]:-}
+SERVED_MODEL_PREFIX=${lane_fields[3]:-}
+if [[ -z "$SERVE_LANE" || -z "$BASE_IMAGE" || -z "$TOKENIZER_MODE" \
+      || -z "$SERVED_MODEL_PREFIX" ]]; then
+  echo "REFUSE: could not resolve the artifact's CB serving lane" >&2
+  exit 2
+fi
+# Lane-invariant: the Gridbook image is built FROM the eugr Spark base and
+# reports this identical vLLM version/commit.
 VLLM_VERSION=0.26.1rc1.dev693+g7f7a32cfe.d20260812
 VLLM_COMMIT=7f7a32cfec0f1bc5b73c37200b86631523a1ea8f
 GRAPH_COMPILATION_CONFIG='{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[1]}'
 if [[ -n "${SERVED_MODEL:-}" ]]; then
-  echo "REFUSE: exact DSv4 gate owns the per-run served-model nonce" >&2
+  echo "REFUSE: the exact CB gate owns the per-run served-model nonce" >&2
   exit 2
 fi
 if command -v openssl >/dev/null 2>&1; then
@@ -190,7 +230,7 @@ if [[ ! "$SERVE_NONCE" =~ ^[0-9a-f]{32}$ ]]; then
   echo "REFUSE: could not generate a 128-bit served-model session nonce" >&2
   exit 2
 fi
-SERVED_MODEL=dsv4-flash-gridbook-${SERVE_NONCE}
+SERVED_MODEL=${SERVED_MODEL_PREFIX}${SERVE_NONCE}
 PORT=${PORT:-8000}
 EXPECTED_GPU_LOCK=/home/rob/dq-runs/gpu.lock
 LOCK=${GPU_LOCK:-$EXPECTED_GPU_LOCK}
@@ -321,6 +361,7 @@ CID=$(docker create --pull=never --name "$NAME" --gpus all --ipc=host \
   -e "PYTHONNOUSERSITE=1" \
   -e "PQ_ARM=$ARM" \
   -e "PQ_SERVED_MODEL=$SERVED_MODEL" \
+  -e "PQ_TOKENIZER_MODE=$TOKENIZER_MODE" \
   -e "PQ_VLLM_VERSION=$VLLM_VERSION" \
   -e "PQ_GRAPH_COMPILATION_CONFIG=$GRAPH_COMPILATION_CONFIG" \
   -e XDG_CACHE_HOME=/opt/gridbook/ext-cache/xdg \
@@ -382,7 +423,7 @@ PY
       --served-model-name "$PQ_SERVED_MODEL" \
       --host 0.0.0.0 --port 8000 \
       --trust-remote-code \
-      --tokenizer-mode deepseek_v4 \
+      --tokenizer-mode "$PQ_TOKENIZER_MODE" \
       --generation-config vllm \
       --quantization gridbook \
       --tensor-parallel-size 1 \

@@ -38,10 +38,13 @@ from prismaquant.shipcard import (
 from prismaquant.shipcard_cli import main as shipcard_cli
 
 
-def _artifact(tmp_path, *, name="exported", weight_bytes=b"weights"):
+def _artifact(
+    tmp_path, *, name="exported", weight_bytes=b"weights", model_type="qwen3",
+):
     model_dir = tmp_path / name
     model_dir.mkdir()
-    (model_dir / "config.json").write_text('{"model_type": "qwen3"}')
+    (model_dir / "config.json").write_text(
+        json.dumps({"model_type": model_type}))
     (model_dir / "model-00001-of-00001.safetensors").write_bytes(weight_bytes)
     return model_dir
 
@@ -330,7 +333,7 @@ def test_fresh_card_refuses_every_slot(tmp_path):
 
 
 def test_gridbook_card_opens_plugin_performance_refusal_slot(tmp_path):
-    model_dir = _artifact(tmp_path)
+    model_dir = _artifact(tmp_path, model_type="deepseek_v4")
     (model_dir / "quant_config.json").write_text(json.dumps({
         "quant_method": "gridbook",
         "format": "nvfp4_cb",
@@ -346,6 +349,51 @@ def test_gridbook_card_opens_plugin_performance_refusal_slot(tmp_path):
         problem == f"{CB_REQUIRED_SLOTS[0]}: UNFILLED"
         for problem in problems
     )
+
+
+def test_a_cb_artifact_that_displaces_nothing_is_not_held_to_parity(tmp_path):
+    """`perf.matched_budget_parity` is a DSv4 *release argument*.
+
+    Its verifier requires five `displaced_container_*` digests naming the exact
+    eligible container the release replaces at the same byte budget. A net-new
+    size class -- the Qwen3.8 5080 CB artifact -- displaces nothing, so it can
+    never produce them: a gate no correct artifact can pass, the same defect as
+    the DSv4 gold contract. It is not opened, not required, and not silently
+    marked satisfied.
+    """
+    model_dir = _artifact(tmp_path, model_type="qwen3_5_text")
+    (model_dir / "quant_config.json").write_text(json.dumps({
+        "quant_method": "gridbook",
+        "format": "nvfp4_cb",
+    }))
+    card = build_shipcard(model_dir, build={"quant_method": "gridbook"})
+
+    assert CB_REQUIRED_SLOTS[0] not in card["slots"]
+    assert required_slots(card, model_dir=model_dir) == REQUIRED_SLOTS
+    assert not any(
+        problem.startswith(CB_REQUIRED_SLOTS[0])
+        for problem in verify(card, model_dir=model_dir)
+    )
+
+
+def test_a_parity_claim_that_is_made_off_lane_is_still_verified(tmp_path):
+    """Scoping the DEMAND must not create a hole in the CHECK: a card that
+    volunteers the slot is held to it wherever it lives."""
+    model_dir = _artifact(tmp_path, model_type="qwen3_5_text")
+    (model_dir / "quant_config.json").write_text(json.dumps({
+        "quant_method": "gridbook",
+        "format": "nvfp4_cb",
+    }))
+    card = build_shipcard(model_dir, build={"quant_method": "gridbook"})
+    card["slots"][CB_REQUIRED_SLOTS[0]] = {
+        "slot": CB_REQUIRED_SLOTS[0], "passed": True, "tool": "handmade",
+    }
+
+    assert CB_REQUIRED_SLOTS[0] in required_slots(card, model_dir=model_dir)
+    assert any(
+        problem.startswith(CB_REQUIRED_SLOTS[0])
+        for problem in verify(card, model_dir=model_dir)
+    ), "an off-lane parity claim must still be replayed, not waved through"
 
 
 def _cb_card(tmp_path, *, model_type, architectures, name="exported"):
@@ -527,7 +575,7 @@ def test_on_disk_dspark_sidecar_requires_claim_but_target_overlay_does_not(
 
 
 def test_on_disk_gridbook_identity_prevents_receipt_slot_erasure(tmp_path):
-    model_dir = _artifact(tmp_path)
+    model_dir = _artifact(tmp_path, model_type="deepseek_v4")
     (model_dir / "quant_config.json").write_text(json.dumps({
         "quant_method": "gridbook",
         "format": "nvfp4_cb",

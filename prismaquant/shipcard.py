@@ -18,11 +18,15 @@ Base slots (required for every artifact):
 | `gold.kl` | `python -m prismaquant.shipcard_cli fill --slot gold.kl --record <full_kl json>` |
 | `gold.ppl` | `python -m prismaquant.shipcard_cli fill --slot gold.ppl --record <ppl json>` |
 
-Gridbook CB artifacts open one additional blocking slot,
+Gridbook CB artifacts on the **DSv4 lane** open one additional blocking slot,
 ``perf.matched_budget_parity``.  It can only be filled by the paired DSv4
 performance validator after the candidate clears the predeclared served matrix
 against the exact eligible container this release displaces under the same
-byte budget.  The generic record importer cannot close this slot.
+byte budget.  The generic record importer cannot close this slot.  A CB
+artifact that displaces no container -- a net-new size class -- cannot satisfy
+the verifier's five ``displaced_container_*`` digests at all, so the slot is
+blocking only on the lane whose release argument it encodes (`cb_serving_lane`);
+elsewhere it is honoured when present and not demanded when absent.
 
 The two `gold.*` slots additionally require `spec_decode_detected: false` on the
 record that produced the number — vLLM routes echo+logprobs through the draft
@@ -549,6 +553,7 @@ def build_shipcard(
     slots = list(
         REQUIRED_SLOTS + CB_REQUIRED_SLOTS
         if build_payload.get("quant_method") == "gridbook"
+        and cb_serving_lane(root) == CB_LANE_DSV4_FLASH
         else REQUIRED_SLOTS
     )
     if _is_dspark_cb_sidecar_artifact(root):
@@ -851,7 +856,11 @@ def verify(
         if is_gridbook_cb and slot in {
             "native_export.eager", "native_export.graph"
         }:
-            problems.extend(_verify_gridbook_native_record(slot, record))
+            problems.extend(_verify_gridbook_native_record(
+                slot,
+                record,
+                model_dir=model_dir,
+            ))
         if is_gridbook_cb and slot == "perf.matched_budget_parity":
             problems.extend(_verify_gridbook_performance_record(
                 slot,
@@ -2199,8 +2208,15 @@ def _verify_ship_gate_record(
 def _verify_gridbook_native_record(
     slot: str,
     record: Mapping[str, Any],
+    *,
+    model_dir: str | os.PathLike | None = None,
 ) -> list[str]:
-    """Structural proof that a CB native slot came from the exact validator."""
+    """Structural proof that a CB native slot came from the exact validator.
+
+    `model_dir` selects the serving lane whose stack the contract must name.
+    It is re-derived from disk here rather than read out of the receipt, so a
+    receipt cannot nominate the lane whose contract it happens to satisfy.
+    """
     problems: list[str] = []
     arm = slot.rsplit(".", 1)[-1]
     if record.get("tool") != "validate_cb_endpoint.py":
@@ -2253,6 +2269,7 @@ def _verify_gridbook_native_record(
                 arm=arm,
                 model_sha=record.get("model_sha"),
                 serve_fingerprint=fingerprint,
+                lane=cb_serving_lane(model_dir),
             )
         except Exception as exc:
             problems.append(f"{slot}: invalid endpoint contract — {exc}")
@@ -3012,6 +3029,27 @@ def _is_dspark_cb_sidecar_artifact(
 _DSV4_MODEL_TYPES = frozenset({"deepseek_v4"})
 _DSV4_ARCHITECTURE_RE = re.compile(r"^DeepseekV4[A-Za-z0-9_]*$")
 
+#: Lane identifiers.  A CB *lane* is the (architecture, serving stack) pair a
+#: gate replays against.  `validate_cb_endpoint` owns the per-lane serving
+#: constants; this module owns only which lane an artifact is on, because the
+#: answer is read off `config.json` -- already bound by `compute_model_sha` as
+#: `config_sha`, so the lane cannot be flipped without breaking identity.
+CB_LANE_DSV4_FLASH = "dsv4_flash"
+CB_LANE_GRIDBOOK_GENERIC = "gridbook_generic"
+
+
+def cb_serving_lane(model_dir: str | os.PathLike | None) -> str:
+    """Which CB serving lane's contract this artifact is held to.
+
+    Fail-closed: an unreadable architecture is the DSv4 lane, so a DSv4
+    release can never shed its contract by hiding or corrupting its config.
+    """
+    return (
+        CB_LANE_DSV4_FLASH
+        if _is_dsv4_gridbook_artifact(model_dir)
+        else CB_LANE_GRIDBOOK_GENERIC
+    )
+
 
 def _is_dsv4_gridbook_artifact(
     model_dir: str | os.PathLike | None,
@@ -3114,7 +3152,26 @@ def required_slots(
     """
     required: list[str] = list(REQUIRED_SLOTS)
     if _is_gridbook_card(card, model_dir=model_dir):
-        required.extend(CB_REQUIRED_SLOTS)
+        # `perf.matched_budget_parity` is a DSv4 *release argument*: it proves
+        # the candidate displaces one exact eligible container at the same byte
+        # budget.  Its verifier structurally requires that container
+        # (`displaced_container_model_sha` and four sibling digests), so an
+        # artifact that displaces nothing -- a net-new size class, which is
+        # what the Qwen3.8 5080 CB artifact is -- cannot fill it by
+        # construction.  Requiring it there is the same gate-no-correct-
+        # artifact-can-pass defect as the DSv4 gold contract, so it is scoped
+        # to the same lane.  A card that nonetheless CARRIES the slot is still
+        # held to it below, via OPTIONAL_SLOTS-style presence.
+        if cb_serving_lane(model_dir) == CB_LANE_DSV4_FLASH:
+            required.extend(CB_REQUIRED_SLOTS)
+        else:
+            slots_present = card.get("slots")
+            if isinstance(slots_present, Mapping):
+                required.extend(
+                    slot
+                    for slot in CB_REQUIRED_SLOTS
+                    if slots_present.get(slot) is not None
+                )
     slots = card.get("slots")
     if isinstance(slots, Mapping):
         required.extend(
