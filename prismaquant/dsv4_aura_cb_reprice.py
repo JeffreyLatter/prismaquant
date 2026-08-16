@@ -200,9 +200,30 @@ DSV4_PANEL_POLICY = CBPanelPolicy(
         },
     },
     validation_rungs_by_segment={
+        # NVFP4-CB shipped with NO held-out validation on the first pass, so
+        # 233,275 of the 334,454 legal DP cells -- 69.7% -- were priced by a
+        # fit nothing ever checked.  (The 471,065 in the 2026-08-11 handover
+        # predates the gridbook k %% 4 fused-kernel law narrowing the FP8
+        # ladders; it was right then and is not the live menu.)  K13/K14/K17 are legal on this ladder and used by
+        # neither the panel nor the anchor, so two of them are free two-axis
+        # hold-outs: K13 sits between panel rungs K12 and K15, K17 between
+        # K16 and K18, and together they straddle the K15 anchor.
+        **{
+            ("nvfp4_cb", role, LATTICE_BASIS): (
+                "NVFP4_CB_K13", "NVFP4_CB_K17",
+            )
+            for role in _ALL_ROLES
+        },
+        # K36 is the one learned FP8 rung the panel does not contain and the
+        # anchor is not, so it is the only two-axis hold-out this segment
+        # admits (K48 is lattice, not learned).  K40 is a panel rung and is
+        # kept as a unit-axis hold-out: it satisfies the >=2-rungs-per-unit
+        # requirement and still tests transfer to held-out units.  K28/K44
+        # were both panel rungs, so the previous pair tested only the unit
+        # axis and the report could not say so.
         **{
             ("fp8_cb", role, LEARNED_BASIS): (
-                "FP8_CB_K28", "FP8_CB_K44",
+                "FP8_CB_K36", "FP8_CB_K40",
             )
             for role in _ALL_ROLES
         },
@@ -2295,7 +2316,8 @@ def _finish_dsv4_campaign(
         prepared.validation_requests, streamed_payload
     )
     validation = heldout_validation_report(
-        validation_observations, anchors, fits
+        validation_observations, anchors, fits,
+        panel_requests=prepared.panel_requests,
     )
     hulls = fitted_cb_hull_report(prepared.units, prepared.plugin, fits)
     cells = price_anchored_candidates(

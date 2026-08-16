@@ -570,6 +570,9 @@ def plan_cb_panel_and_validation(
             fr.canonical_format_name(fmt)
             for fmt in policy.panel_rungs_by_segment.get(key, ())
         )
+        anchor = plugin.anchor_formats.get(
+            (segment.family, segment.equivalence_class)
+        )
         if len(ladder_formats[segment]) == 1:
             # A one-rung segment has no shape law to fit and no room to fit
             # one: the anchor is forced onto that rung, so pricing reduces to
@@ -590,6 +593,9 @@ def plan_cb_panel_and_validation(
                 "validation_units": 0,
                 "validation_rungs": [],
                 "validation_render_cells": 0,
+                "validation_rungs_two_axis": [],
+                "validation_rungs_unit_axis_only": [],
+                "anchor_rung": anchor,
                 "design_rank": 0,
                 "design_rank_required": 0,
                 "single_rung_measured": True,
@@ -635,6 +641,29 @@ def plan_cb_panel_and_validation(
             fr.canonical_format_name(fmt)
             for fmt in policy.validation_rungs_by_segment.get(key, ())
         )
+        # Two hold-out axes, and only one of them is ever vacuous.  At the
+        # anchor rung the prediction is anchor x ratio(anchor, anchor) =
+        # anchor x 1.0, i.e. the measurement itself: the cell reports dex
+        # 0.0000 by construction and dilutes the report with tautological
+        # passes.  That is refused here for every driver -- it is the defect
+        # that silently zeroed 48 of the first Qwen3.8-27B campaign's 192
+        # validation cells.  A validation rung that the PANEL also contains is
+        # a different thing and is NOT refused: the shape at that rung was
+        # fitted from panel units, but this cell applies it to a held-out
+        # unit's own anchor, so it genuinely tests cross-unit transfer.  On a
+        # two-rung ladder whose second rung is the anchor (DSv4 routed
+        # experts: K28, K32=anchor) it is also the ONLY validation that can
+        # structurally exist, so refusing it would ban validating routed
+        # experts at all.  It is classified and reported instead -- see
+        # ``held_out_axes`` in ``heldout_validation_report``.
+        if anchor is not None and anchor in validation_formats:
+            raise AnchoredCostError(
+                f"{segment.stamp}: {anchor} is this segment's anchor and "
+                "cannot also be a validation rung -- the fit reproduces the "
+                "anchor by construction, so every such cell reports dex "
+                "0.0000 and the held-out report reads better than the fit "
+                "is. Choose a rung the anchor is not."
+            )
         if validation_formats and len(validation_formats) < 2:
             raise AnchoredCostError(
                 f"validation policy needs >=2 rungs for {segment.stamp}"
@@ -656,6 +685,21 @@ def plan_cb_panel_and_validation(
             "validation_render_cells": (
                 len(heldout_units) * len(validation_formats)
             ),
+            # Which axes each validation rung actually holds out.  A rung the
+            # panel does not contain tests unit AND rung generalization; a
+            # panel rung tests unit generalization only.  A segment whose
+            # every validation rung is panel-trained has NO evidence that the
+            # fitted shape law extends off the panel, and the report must say
+            # so rather than let the reader assume otherwise.
+            "validation_rungs_two_axis": [
+                fmt for fmt in validation_formats
+                if fmt not in set(panel_formats)
+            ],
+            "validation_rungs_unit_axis_only": [
+                fmt for fmt in validation_formats
+                if fmt in set(panel_formats)
+            ],
+            "anchor_rung": anchor,
             "design_rank": rank,
             "design_rank_required": required_rank,
         }
@@ -1015,10 +1059,26 @@ def heldout_validation_report(
     anchors: Mapping[tuple[str, SegmentKey], AnchorScalar],
     fits: Mapping[SegmentKey, ShapeFit],
     *,
+    panel_requests: Sequence[RenderRequest],
     basis: str = LEARNED_BASIS,
     dex_bar: float = 0.05,
 ) -> dict[str, object]:
-    """Strict-JSON, report-only factorisation validation."""
+    """Strict-JSON, report-only factorisation validation.
+
+    ``panel_requests`` is the panel the fit was actually trained on -- the
+    rendered cells, not the policy literal -- and it is required rather than
+    optional because it is what separates the report's two hold-out axes.  A
+    validation cell at a rung the panel does not contain tests both cross-unit
+    transfer and off-panel rung behaviour; a cell at a panel rung tests only
+    the first.  Both are real evidence and both are reported, but a summary
+    that cannot tell them apart lets a single-axis hold-out read as a
+    two-axis one, which is precisely how a weak validation design survives
+    review.  ``max_abs_dex`` and ``n_above_bar`` are therefore also broken out
+    per axis.
+    """
+    panel_rungs_by_segment: dict[SegmentKey, set[str]] = defaultdict(set)
+    for request in panel_requests:
+        panel_rungs_by_segment[request.segment].add(request.format_name)
     by_unit: dict[tuple[str, SegmentKey], set[str]] = defaultdict(set)
     rows: list[dict[str, object]] = []
     for observation in observations:
@@ -1053,6 +1113,9 @@ def heldout_validation_report(
         else:
             dex_error = abs(math.log10(max(predicted, 1e-300) / measured))
             reason = None
+        two_axis = observation.format_name not in panel_rungs_by_segment[
+            observation.segment
+        ]
         rows.append({
             "qname": observation.qname,
             "segment": basis_segment_dict(observation.segment),
@@ -1064,6 +1127,7 @@ def heldout_validation_report(
             "within_dex_bar": (
                 dex_error is not None and dex_error <= dex_bar
             ),
+            "held_out_axes": ["unit", "rung"] if two_axis else ["unit"],
         })
     insufficient = [
         f"{qname}|{segment.stamp}"
@@ -1083,6 +1147,22 @@ def heldout_validation_report(
         row["absolute_dex_error"] is None for row in rows
     )
     failures = nonfinite + sum(value > dex_bar for value in finite)
+
+    def _axis_slice(axes: list[str]) -> dict[str, object]:
+        subset = [row for row in rows if row["held_out_axes"] == axes]
+        values = [
+            float(row["absolute_dex_error"]) for row in subset
+            if row["absolute_dex_error"] is not None
+        ]
+        blank = sum(row["absolute_dex_error"] is None for row in subset)
+        return {
+            "n_cells": len(subset),
+            "n_above_bar": blank + sum(value > dex_bar for value in values),
+            "n_nonfinite_dex": blank,
+            "max_abs_dex": max(values, default=None),
+        }
+
+    two_axis = _axis_slice(["unit", "rung"])
     report = {
         "reported_not_gated": True,
         "basis": basis,
@@ -1094,6 +1174,14 @@ def heldout_validation_report(
         "status": (
             "BAD_FACTORISATION_SIGNAL" if failures else "within_bar"
         ),
+        # The headline counts pool both hold-out axes.  These do not, because
+        # they answer different questions and a pooled number can hide a
+        # segment that never tested one of them at all.
+        "by_held_out_axes": {
+            "unit+rung": two_axis,
+            "unit_only": _axis_slice(["unit"]),
+        },
+        "off_panel_rung_evidence": two_axis["n_cells"] > 0,
         "rows": rows,
     }
     # Enforce the portable JSON contract at construction time.

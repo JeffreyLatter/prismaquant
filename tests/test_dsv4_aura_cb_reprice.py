@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+from dataclasses import replace
 import inspect
 import json
 from pathlib import Path
@@ -313,9 +314,12 @@ def test_panel_policy_is_exact_segment_keyed_ranked_and_held_out():
     )
 
     assert len(panel) == 7 * 32 * (4 + 4) == 1_792
-    assert len(validation) == 7 * 4 * 2 == 56
+    # Both fitted families are validated now.  NVFP4-CB shipped with none on
+    # the first pass, which left 233,275 of 334,454 legal DP cells -- 69.7% --
+    # priced by a fit nothing checked.
+    assert len(validation) == 7 * 4 * 2 * 2 == 112
     assert report["panel_render_cells"] == 1_792
-    assert report["validation_render_cells"] == 56
+    assert report["validation_render_cells"] == 112
     assert report["segment_count"] == 7 * 3
     assert {request.qname for request in panel}.isdisjoint(
         request.qname for request in validation
@@ -343,6 +347,23 @@ def test_panel_policy_is_exact_segment_keyed_ranked_and_held_out():
             == row["segment"]["basis"]
             for row in (nv, learned, lattice)
         )
+        # No validation rung may be its segment's anchor -- there the fit
+        # reproduces the measurement by construction (ratio == 1.0) and the
+        # cell reports dex 0.0000 whatever the fit is worth.
+        for row in (nv, learned, lattice):
+            assert row["anchor_rung"] not in row["validation_rungs"]
+        # Which hold-out axes each rung actually exercises, stated rather
+        # than assumed.  NVFP4 has spare rungs so both are two-axis; the
+        # learned FP8 ladder admits exactly one non-anchor rung outside the
+        # panel (K48 is lattice), so K40 rides along on the unit axis only.
+        assert nv["anchor_rung"] == "NVFP4_CB_K15"
+        assert nv["validation_rungs_two_axis"] == [
+            "NVFP4_CB_K13", "NVFP4_CB_K17",
+        ]
+        assert nv["validation_rungs_unit_axis_only"] == []
+        assert learned["anchor_rung"] == "FP8_CB_K32"
+        assert learned["validation_rungs_two_axis"] == ["FP8_CB_K36"]
+        assert learned["validation_rungs_unit_axis_only"] == ["FP8_CB_K40"]
 
     assert all(len(key) == 3 for key in DSV4_PANEL_POLICY.panel_rungs_by_segment)
     assert all(
@@ -355,8 +376,8 @@ def test_panel_policy_is_exact_segment_keyed_ranked_and_held_out():
         units, plugin, anchors, panel, validation,
     )
     assert len(anchors) == 7 * 36 * 3 == 756
-    assert union["physical_union_render_cells"] == 2_156
-    assert union["logical_total"] == 756 + 1_792 + 56
+    assert union["physical_union_render_cells"] == 2_212
+    assert union["logical_total"] == 756 + 1_792 + 112
 
 
 def test_panel_fits_are_separate_and_currency_invariance_is_diagnostic():
@@ -671,6 +692,7 @@ def test_heldout_zero_is_strict_json_bad_signal_not_a_gate():
     )
     report = heldout_validation_report(
         validation_observations, anchor_values, fits,
+        panel_requests=panel,
     )
 
     assert report["reported_not_gated"] is True
@@ -685,6 +707,82 @@ def test_heldout_zero_is_strict_json_bad_signal_not_a_gate():
         "measured_predicted_dloss_is_nonpositive"
     )
     json.dumps(report, allow_nan=False)
+
+    # Every cell says which hold-out axes it exercises, and the summary is
+    # broken out the same way: a pooled max_abs_dex cannot distinguish a fit
+    # validated off the panel from one validated only on it.
+    panel_rungs = {request.format_name for request in panel}
+    for row in report["rows"]:
+        assert row["held_out_axes"] == (
+            ["unit"] if row["format"] in panel_rungs else ["unit", "rung"]
+        )
+    axes = report["by_held_out_axes"]
+    assert (
+        axes["unit+rung"]["n_cells"] + axes["unit_only"]["n_cells"]
+        == report["n_cells"]
+    )
+    assert (
+        axes["unit+rung"]["n_above_bar"] + axes["unit_only"]["n_above_bar"]
+        == report["n_above_bar"]
+    )
+    # This basis is learned FP8, whose ladder admits exactly one non-anchor
+    # rung outside the panel, so the fit does have off-panel evidence -- and
+    # the report states that rather than leaving it to be inferred.
+    assert report["off_panel_rung_evidence"] is True
+    assert axes["unit+rung"]["n_cells"] == 4
+    assert axes["unit_only"]["n_cells"] == 4
+
+
+def test_a_validation_rung_that_is_the_anchor_is_refused_for_every_driver():
+    """The defect that silently zeroed 48 of artifact A's 192 cells.
+
+    At the anchor rung the prediction is ``anchor x ratio(anchor, anchor)``
+    = ``anchor x 1.0``, i.e. the measurement itself, so the cell reports dex
+    0.0000 however bad the fit is.  The guard lives in the shared planner --
+    not in a driver -- because ``dense_anchored_cb`` is a ``__main__`` with no
+    importers, so a copy there would have left this very campaign unguarded.
+    """
+    plugin = _plugin()
+    units = build_cb_units(tuple(
+        _declaration(
+            f"layers.{index}.wq_a", role="wq_a", nonexpert=True,
+        )
+        for index in range(36)
+    ), plugin)
+    poisoned = replace(
+        DSV4_PANEL_POLICY,
+        validation_rungs_by_segment={
+            **DSV4_PANEL_POLICY.validation_rungs_by_segment,
+            ("fp8_cb", "wq_a", LEARNED_BASIS): (
+                "FP8_CB_K32", "FP8_CB_K36",   # K32 is this segment's anchor
+            ),
+        },
+    )
+    with pytest.raises(AnchoredCostError, match="is this segment's anchor"):
+        plan_cb_panel_and_validation(units, plugin, poisoned)
+
+    # A validation rung the PANEL contains is a different thing and is NOT
+    # refused: it still tests transfer to a held-out unit, and on a two-rung
+    # ladder whose second rung is the anchor it is the only validation that
+    # can structurally exist.  Refusing it would ban validating DSv4's routed
+    # experts (K28, K32=anchor) outright.
+    panel_only = replace(
+        DSV4_PANEL_POLICY,
+        validation_rungs_by_segment={
+            **DSV4_PANEL_POLICY.validation_rungs_by_segment,
+            ("fp8_cb", "wq_a", LEARNED_BASIS): (
+                "FP8_CB_K28", "FP8_CB_K40",   # both are panel rungs
+            ),
+        },
+    )
+    _panel, _validation, report = plan_cb_panel_and_validation(
+        units, plugin, panel_only,
+    )
+    segment = report["segments"]["fp8_cb|wq_a|learned"]
+    assert segment["validation_rungs_two_axis"] == []
+    assert segment["validation_rungs_unit_axis_only"] == [
+        "FP8_CB_K28", "FP8_CB_K40",
+    ]
 
 
 def test_cb_adapter_is_model_agnostic_and_provenance_names_generic_segment():

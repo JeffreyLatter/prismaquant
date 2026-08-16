@@ -145,13 +145,20 @@ PANEL_RUNGS = {
     "fp8_cb": ("FP8_CB_K28", "FP8_CB_K40", "FP8_CB_K48"),
 }
 # Held-out UNITS are the primary generalization axis (the fit is applied to
-# every unit, not just panel members).  A validation rung must be held out on
-# BOTH axes -- absent from the panel AND not the anchor -- or it measures
-# nothing: at the anchor the fit reproduces the measurement by construction, so
-# its dex is exactly 0.0000 and it dilutes the report with tautological passes.
-# The first Qwen3.8-27B campaign shipped FP8_CB_K36 (its own anchor) in this
-# table and 48 of 192 validation cells were therefore vacuous; `_panel_policy`
-# now refuses that configuration rather than reporting it.
+# every unit, not just panel members).  A validation rung must never be the
+# ANCHOR: there the fit reproduces the measurement by construction, so its dex
+# is exactly 0.0000 and it dilutes the report with tautological passes.  The
+# first Qwen3.8-27B campaign shipped FP8_CB_K36 (its own anchor) in this table
+# and 48 of 192 validation cells were therefore vacuous;
+# `plan_cb_panel_and_validation` now refuses that configuration on EVERY CB
+# driver rather than reporting it.
+#
+# Being absent from the PANEL is a second, weaker requirement, and it is
+# deliberately not enforced: a panel rung on a held-out unit still tests
+# whether the fitted shape transfers to that unit, and on a two-rung ladder
+# whose second rung is the anchor it is the only validation that can exist at
+# all.  This lane has rungs to spare and takes the stronger design anyway; the
+# report tags each cell's `held_out_axes` so a reader can tell which was used.
 #
 # NVFP4-CB is validated at the extremes AND two interior rungs, so the report
 # separates the worst extrapolation from the typical one -- validating only at
@@ -523,24 +530,17 @@ def _authoritative_source_map(cb_context) -> dict[str, str]:
 
 
 def _panel_policy(roles: Mapping[str, str]) -> CBPanelPolicy:
-    """One policy row per (family, role, basis) -- the role is load-bearing."""
+    """One policy row per (family, role, basis) -- the role is load-bearing.
+
+    The anchor-is-not-a-validation-rung and panel/validation-disjointness
+    checks are NOT here: they live in ``plan_cb_panel_and_validation``, which
+    every CB driver calls and which reads the anchors off the plugin rather
+    than off a module constant.  A copy here would have protected this driver
+    only -- and this driver is a ``__main__`` with no importers, so the
+    campaign that actually shipped the defect (DSv4, which builds its own
+    policy literal) would have gone unguarded.
+    """
     all_roles = sorted(set(roles.values()))
-    for family, rungs in VALIDATION_RUNGS.items():
-        anchor = ANCHOR_FORMATS.get((family, LATTICE_BASIS))
-        overlap = sorted(set(rungs) & set(PANEL_RUNGS.get(family, ())))
-        if anchor in rungs:
-            raise DenseCampaignError(
-                f"{family}: {anchor} is this segment's anchor and cannot also "
-                "be a validation rung -- the fit reproduces the anchor by "
-                "construction, so every such cell reports dex 0.0000 and the "
-                "held-out report reads better than the fit is. Choose a rung "
-                "the panel does not contain and the anchor is not."
-            )
-        if overlap:
-            raise DenseCampaignError(
-                f"{family}: validation rungs {overlap} are also panel rungs, "
-                "so the fit was trained on them and they measure nothing"
-            )
     return CBPanelPolicy(
         panel_rungs_by_segment={
             (family, role, LATTICE_BASIS): PANEL_RUNGS[family]
@@ -989,7 +989,8 @@ def finish_campaign(
         prepared.validation_requests, streamed_payload
     )
     validation = heldout_validation_report(
-        validation_observations, anchors, fits, basis=LATTICE_BASIS
+        validation_observations, anchors, fits, basis=LATTICE_BASIS,
+        panel_requests=prepared.panel_requests,
     )
     hulls = fitted_cb_hull_report(prepared.units, prepared.plugin, fits)
     cells = price_anchored_candidates(

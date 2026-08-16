@@ -55,9 +55,19 @@ the `NVFP4_CB`/`FP8_CB` A4↔A8 boundary; §4.3. It renders 22.5% of a full-menu
 campaign, transiently, where the stock `COST_MODE=aura` path would retain
 ~865 GB. AQUA-on-CB remains a candidate until its served A/B lands.) Recorded
 with it: a validation rung that is also the segment's **anchor** measures
-nothing — its dex is 0.0000 by construction — and `_panel_policy` now refuses
-that configuration, after the first campaign shipped 48 such vacuous cells;
-§4.3. Previously re-stamped at `a56c6f8`:
+nothing — its dex is 0.0000 by construction — and the **shared planner**
+`plan_cb_panel_and_validation` now refuses that configuration for every CB
+driver, after the first campaign shipped 48 such vacuous cells; §4.3. The
+guard originally landed in `dense_anchored_cb._panel_policy`, which has **no
+importers** — it is a `__main__` — so it protected nothing on the DSv4 lane
+that builds its own policy literal. A validation rung the *panel* also
+contains is a weaker but genuinely different case and is **not** refused: it
+still tests transfer to a held-out unit, and on a two-rung ladder whose second
+rung is the anchor (DSv4 routed experts: K28, K32=anchor) it is the only
+validation that can structurally exist. Every validation cell is now tagged
+`held_out_axes` (`["unit","rung"]` vs `["unit"]`) and the factorisation report
+breaks its counts out per axis, so a single-axis hold-out can no longer read
+as a two-axis one; §4.3. Previously re-stamped at `a56c6f8`:
 (`run-pipeline.sh` now forwards **`ALLOW_PINNED`** to the allocator, so a
 profile-pinned `lm_head` can enter the DP budget instead of shipping at source
 dtype — 2.543 GB, 20% of a 13.0 GB card budget, on Qwen3.8-27B; §4.5. Recorded
@@ -1467,16 +1477,50 @@ and transiently, so ~0 GB is retained. The stock `COST_MODE=aura` path would ins
 built a *retained* format-menu cache at a measured 45.5 GB/rung (arm-b: 91 GB for two
 rungs), i.e. ~865 GB for this ladder, for a cache the exporter never reads.
 
-A validation rung must be held out on **both** axes — absent from the panel *and* not the
-segment's anchor. At the anchor the fit reproduces the measurement by construction, so
-every such cell reports dex exactly 0.0000. The first Qwen3.8-27B campaign (2026-08-15)
-listed `FP8_CB_K36`, its own fp8 anchor, as a validation rung, and 48 of its 192
-validation cells were therefore vacuous — visible in the plan report as
-`deduplicated_multi_purpose_cells: 48`. `_panel_policy` now refuses both that and a
-panel/validation overlap. The current tables validate NVFP4-CB at K12/K15/K21/K24 (the
-extremes *and* two interior rungs, so the report separates worst-case extrapolation from
-typical) and FP8-CB at K32/K44, straddling the anchor; FP8-CB gives up a panel rung to
-afford them, since only six of its rungs are on-law.
+A validation cell holds out up to **two** axes, and only one of them is ever vacuous. At
+the segment's **anchor** the fit reproduces the measurement by construction — the
+prediction is `anchor × ratio(anchor, anchor)` = `anchor × 1.0` — so every such cell
+reports dex exactly 0.0000 however bad the fit is. The first Qwen3.8-27B campaign
+(2026-08-15) listed `FP8_CB_K36`, its own fp8 anchor, as a validation rung, and 48 of its
+192 validation cells were therefore vacuous — visible in the plan report as
+`deduplicated_multi_purpose_cells: 48`. **`cb_anchored_cost.plan_cb_panel_and_validation`
+refuses that configuration for every CB driver.** The guard first landed in
+`dense_anchored_cb._panel_policy`, but that module is a `__main__` with no importers, so
+it did not cover the DSv4 lane, which builds its own policy literal and calls the shared
+planner directly; keying the check off `plugin.anchor_formats` inside the planner covers
+both paths and any future one by construction.
+
+A validation rung the **panel** also contains is a different, weaker case and is *not*
+refused. The shape at that rung was fitted from panel units, but the cell applies it to a
+held-out unit's own anchor, so it genuinely tests cross-unit transfer — and on a two-rung
+ladder whose second rung is the anchor (DSv4 routed experts: K28, K32=anchor) it is the
+only validation that can structurally exist, so a hard refusal would ban validating routed
+experts at all. Instead each cell carries `held_out_axes` (`["unit","rung"]` or
+`["unit"]`) and `heldout_validation_report` reports `n_cells` / `n_above_bar` /
+`max_abs_dex` **per axis** alongside the pooled figures, plus `off_panel_rung_evidence`.
+A pooled statistic cannot distinguish a fit validated off the panel from one validated
+only on it; that is the difference the split makes visible.
+
+Current tables. Dense: NVFP4-CB at K12/K15/K21/K24 (the extremes *and* two interior rungs,
+so the report separates worst-case extrapolation from typical) and FP8-CB at K32/K44,
+straddling the anchor; FP8-CB gives up a panel rung to afford them, since only six of its
+rungs are on-law. DSv4: NVFP4-CB at **K13/K17** — it previously had **no** validation at
+all, leaving 233,275 of 334,454 legal DP cells (**69.7%**) priced by a fit nothing
+checked; the total is the inventory's own census, 233,275 NVFP4 + 66,048 routed FP8 +
+1,806 dense FP8 + 33,325 exact source terminals — and
+FP8-CB learned at **K36/K40**, where K36 is the sole non-anchor rung outside the panel
+(K48 is lattice, not learned) and K40 rides along on the unit axis, replacing a K28/K44
+pair that was entirely panel-trained without saying so.
+
+**Known hole, measured not re-architected.** A cohort is drawn only from units legal at
+every panel *and* validation rung of their role, so on DSv4 the fp8-learned cohorts are
+dense-only: the fit is trained on ≤32 and validated on 4 dense units, then applied to
+~33,153 routed experts that are structurally excluded from both (they stop at K33). A
+routed expert's whole exposure to the fit is one scalar — its own measured K32 anchor ×
+the shared K28/K32 ratio — so ratio error is common-mode across all experts in a role and
+shifts the K28/K32 boundary rather than the per-expert ranking, which the project's own
+churn precedent (cost CV 23% → 3% churn → 0σ served) bounds. The DSv4 card must state how
+routed experts were validated, or that they were spot-checked with N and dex quoted.
 
 ### 4.4 L2 and L3 — retired 2026-07-30 (`archive/l3_propagated_2026-07-30/`)
 
