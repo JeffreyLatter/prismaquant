@@ -90,6 +90,13 @@ _GOLD_PRODUCER_TOOL_FILES = {
         "tools/full_kl_teacher_payload.py",
         "tools/measure_vllm_wikitext_ppl.py",
     ),
+    # The served-lane gold tool.  It owns no `LLM`, so it needs neither the
+    # teacher payload nor the DSv4 in-process contract -- the common files
+    # above already bind the serve fingerprint and spec-decode guard it does
+    # use.
+    "measure_served_gold": (
+        "tools/measure_served_gold.py",
+    ),
 }
 
 _GRIDBOOK_SOURCE_SUFFIXES = frozenset({

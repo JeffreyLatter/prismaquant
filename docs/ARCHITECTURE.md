@@ -3176,6 +3176,32 @@ content, so hashing it made validating an artifact invalidate its own card
 Its integrity is bound where the claim is made — each record's
 `*serve_manifest_sha256`.
 
+**`tools/measure_served_gold.py` — the served lane's gold tool.** Both DSv4
+tools own an in-process `LLM`, so every other lane had been measuring its gold
+numbers with run-local scripts that emitted a bare metric and none of the
+identity a ship record binds. This one talks to an ordinary
+`vllm serve` + `/v1/completions` and emits records
+`shipcard_cli fill` accepts: `dump` saves one arm's top-K prompt logprobs,
+`kl` folds a teacher and a student dump into a `gold.kl` record, `ppl`
+teacher-forces a `gold.ppl` record at `prompt_logprobs=0`. The serve
+fingerprint is *read* from the in-container `serve_manifest.json`, never
+computed client-side (the measuring client cannot see the server's address
+space — §7.4), and the tool refuses a manifest that describes a different
+served model, a manifest recording a speculative config, a `/metrics`
+spec-decode state that is not a clean `false`, two arms dumped at different
+top-K, and two arms that scored different text. Producer identity comes from
+`serve_fingerprint.gold_producer_identity`, which refuses a dirty tree.
+**The one honest caveat, carried on every record rather than in prose:** a
+served endpoint returns top-K prompt logprobs, so this is a top-K KL with a
+declared tail, not the exact full-vocab KL of §2.4 authority #1. Records carry
+`prompt_top_k`, recomputed `topk_coverage_mean`/`topk_coverage_min`, and
+`student_tail_model` — the untabulated tail is the max-entropy
+`log(residual / (V − K))` clamped at the K-th value, because the K-th logprob
+is an upper bound on everything below it and substituting it (what the ad-hoc
+script did) can only make the student look closer than it is. `kl_mean` over
+all positions is floor-inflated; `kl_confident_mean`, restricted to teacher
+top-1 > 0.5, is the number to quote.
+
 Both DSv4 tools own an in-process `LLM`; on current vLLM the measurement process
 is the parent and EngineCore is a child. Two guards ride on that:
 
