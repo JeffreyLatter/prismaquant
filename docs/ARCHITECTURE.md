@@ -1,6 +1,12 @@
 # PrismaQuant Architecture
 
-As of: 2026-08-15 · branch `merge/proven-rescues` · re-stamped for the
+As of: 2026-08-16 · branch `fix/shipcard-bpp-crosscheck` · re-stamped for the
+**published-bpp cross-check** — `shipcard.verify` now refuses a card whose
+`build.achieved_bpp` contradicts the per-unit serialized bytes the recipe it
+names declares (§7). Precedence alone could not catch a right field describing
+the wrong point: DSv4-Flash `artifact-aura-cb-112p69` published 4.3065 bpp from
+a sibling `pareto.knees.json` for a recipe that prices to 2.7385, 57% wide.
+Previously re-stamped for the
 **Gridbook 0.8.8 serving pin, the gold-contract lane scope, and the
 `README.md` exclusion from `model_sha`** (0.8.7 shipped
 the quantized-embedding method and its dispatch branch, but vLLM dispatches
@@ -2840,7 +2846,30 @@ point, else the allocator's `achieved_bits`, and only then falling back to `pare
 The knee file is a *separate* artifact describing the **surrogate** frontier, so under
 `SELECTION_MODE=validated-surrogate` it does not describe the recipe beside it — reading it
 first put a 1.25 bpp false claim on the Qwen3.8-27B arm-B card, 5.9994 for bytes that were the
-validated 4.7496), exact `artifact_bytes`, format histogram, the render-lever
+validated 4.7496.
+
+**That precedence is now backed by a cross-check, because precedence alone cannot catch a
+right field naming the wrong point.** `shipcard.recipe_priced_bpp` sums
+`cb_serialized_identity.tensor_payload_bytes` and `.params` over the units that declare them,
+so numerator and denominator come from the same recipe entries and the result is scope-matched
+by construction — no probe, no source manifest, no header or sidecar estimate. It is a **lower
+bound**: units carrying no per-unit price (FP8_SOURCE passthrough Linears) leave both sums, and
+they can only add bytes. `allocator_achieved_bpp` attaches the comparison as a `cross_check`
+block on the card (advisory at export, so a gate bug can never strand a finished export), and
+`shipcard.verify` **refuses** on `verdict == "DISAGREE"` — publication is the blocking point,
+per R16. Tolerance is `RECIPE_BPP_CROSS_CHECK_TOLERANCE = 0.10`, far wider than label-scope
+drift and far narrower than what it exists to catch. A card written before the gate existed
+carries no verdict and is left alone. The motivating case is DSv4-Flash
+`artifact-aura-cb-112p69`, which published **4.3065** bpp read from a sibling
+`pareto.knees.json` for a recipe that prices to **2.7385** — 57% wide, and a false public bpp
+silently breaks every matched-bpp comparison built on it. (Post-mortem: that recipe's own
+metadata *did* carry the correct 2.7555, byte-identical to the `layer_config_sha` the card
+recorded, so the precedence fix above already closes that specific instance; the cross-check is
+the independent net that does not depend on getting precedence right.) Tests:
+`tests/test_shipcard.py::test_recipe_priced_bpp_*`,
+`::test_achieved_bpp_cross_check_*`.
+
+Also on the card: exact `artifact_bytes`, format histogram, the render-lever
 echo (`_render_lever_provenance()`, shared with the export cache's fingerprint so the two
 cannot drift), and the `PRISMAQUANT_ALLOW_KV_SHARED_FISHER` / `PRISMAQUANT_KV_COTANGENT` state
 so an allocation that rode an unvalidated Fisher correction is visible on the artifact rather
