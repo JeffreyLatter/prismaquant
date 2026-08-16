@@ -31,6 +31,7 @@ Run standalone::
 from __future__ import annotations
 
 import json
+import re
 import struct
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -748,7 +749,7 @@ def check_artifact_completeness(
             report.embedding_units.append(unit)
             claimed_scales |= unit_scales
             continue
-        members = _fused_member_units(unit, fused_leaves)
+        members = _fused_member_units(unit, fused_leaves, profile)
         if members and all(
             _claimed_by_self_or_ancestor(member, group_claimed, profile, dspark)
             for member in members
@@ -880,29 +881,71 @@ def _unit_variants(unit: str, profile=None, dspark=None) -> set[str]:
     return variants
 
 
-def _fused_member_units(unit: str, fused_leaves) -> tuple[str, ...]:
+def _fused_member_units(unit: str, fused_leaves, profile=None) -> tuple[str, ...]:
     """The unfused sibling units a FUSED checkpoint unit is built from.
 
     THE FOURTH NAMESPACE. A checkpoint may store the fused stack
     (``…experts.gate_up_proj``) while the config groups name the halves
-    (``…experts.gate_proj``, ``…experts.up_proj``) — which is what the
-    allocator's union-find promotion guarantees is legal, since fused siblings
-    must share one format. A claim written against the halves therefore covers
-    the fused tensor, and reading only the fused spelling reports a CORRECT
-    artifact as unclaimed (8 DSv4-Flash expert stacks, 2026-08-15).
+    (``…experts.gate_proj``, ``…experts.up_proj``). A claim written against the
+    halves therefore covers the fused tensor, and reading only the fused
+    spelling reports a CORRECT artifact as unclaimed (8 DSv4-Flash expert
+    stacks, 2026-08-15).
 
     The mapping is the vLLM class's own ``packed_modules_mapping`` by way of the
     profile, so this recognizes the fusion the serving stack performs rather
     than inventing a naming rule.
+
+    ROUTED EXPERTS NEED A SECOND SOURCE. On a routed-MoE stack the halves are
+    not merely a legal alternative spelling, they are the only one the ABI
+    permits: per-role learned codebooks fit one book per ``(layer, projection)``,
+    and a packed ``gate_up_proj`` target can bind exactly one ``codebook_ref``,
+    so a per-role layer *must* name gate and up separately. (Lattice layers
+    share one book and legally name the packed stack; both spellings coexisting
+    across layers is the designed ABI, not an inconsistency.) But
+    ``packed_modules_mapping`` describes the *dense* fusions vLLM performs and
+    DeepseekV4 exposes none at all — ``fused_sibling_leaf_mapping()`` is ``{}``
+    there — so the vLLM source can never cover routed experts on that
+    architecture, and every correct per-role artifact reports as unclaimed.
+
+    For routed units we therefore fall back to the profile's declarative
+    packed-expert decomposition, which is the *same* mapping the exporter used
+    to emit the halves (``deepseek_v4.json`` ``packed_experts.projection_splits``).
+    The consumer keeps its own copy for the identical reason — Gridbook carries
+    a ``_FUSED_FALLBACK`` table precisely because DeepseekV4 has no
+    ``packed_modules_mapping`` — so this teaches the checker the table the
+    serving stack already uses rather than inventing a rule.
+
+    The EVERY-member requirement at the call site is untouched, and Gridbook
+    refuses a partially-declared stack the same way, so checker and consumer
+    still refuse in lockstep.
     """
 
-    if not fused_leaves or "." not in unit:
+    if "." not in unit:
         return ()
     parent, leaf = unit.rsplit(".", 1)
-    members = fused_leaves.get(leaf)
+    members = (fused_leaves or {}).get(leaf)
+    if not members and profile is not None and _is_routed_expert_unit(parent):
+        try:
+            candidate = profile.packed_expert_projection_names(leaf)
+        except Exception:                      # pragma: no cover - defensive
+            candidate = ()
+        # A leaf that decomposes to itself is not a fusion; only a genuine
+        # split (gate_up_proj -> gate_proj, up_proj) may claim by members.
+        if len(candidate) > 1:
+            members = candidate
     if not members:
         return ()
     return tuple(f"{parent}.{member}" for member in members)
+
+
+def _is_routed_expert_unit(parent: str) -> bool:
+    """Whether *parent* is a routed-expert container, on dotted boundaries.
+
+    Anchored so ``experts2`` never matches ``experts``, the same discipline
+    :func:`_claimed_by_self_or_ancestor` applies to ancestry.
+    """
+
+    return re.search(r"(?:^|[.])experts(?:[.]|$)", str(parent)) is not None
 
 
 def _claimed_by_self_or_ancestor(

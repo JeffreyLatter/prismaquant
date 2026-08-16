@@ -160,6 +160,52 @@ _PUBLISHED_FILES = frozenset({
 #     allocation. It returns early when there is no stamp, and on a lane that
 #     excludes nothing the check compares two empty sets, so it can refuse only
 #     an export whose exclusions contradict its own price.
+#
+# RE-FROZEN 2026-08-16 (fourth time). Whole closure enumerated per the note
+# above; exactly ONE file drifted, and unlike the previous three re-freezes the
+# honest review is NOT "inert on this lane" -- it changes this lane's verdict,
+# so it is written out in full rather than waved through:
+#   artifact_completeness.py -- `_fused_member_units` gained a second fusion
+#     source for ROUTED expert units only. Its first source is
+#     `profile.fused_sibling_leaf_mapping()`, i.e. vLLM's
+#     `packed_modules_mapping`, which describes DENSE fusions; DeepseekV4
+#     exposes no vLLM architecture class, so that mapping is `{}` and
+#     `specs/deepseek_v4.json` declares no `fused_groups`. The bridge the third
+#     re-freeze called "unreachable here" was in fact unreachable EVERYWHERE on
+#     this architecture, which is why the 8 expert stacks 1ccdf58 recorded as
+#     task #14 were still failing. The fallback consults
+#     `profile.packed_expert_projection_names`, the declarative
+#     `packed_experts.projection_splits` the exporter itself used to emit the
+#     halves, and the same table Gridbook keeps as `_FUSED_FALLBACK` for the
+#     identical reason.
+#
+#     WHAT THIS CHANGES HERE, stated plainly: on `artifact-aura-cb-112p69` the
+#     verdict moves from 8 undeclared / NOT complete to 0 undeclared / COMPLETE
+#     (259->267 cb_units; passthrough 184, verbatim 25, fp8_in_ignore 0,
+#     missing_scale 0 all unchanged). That is task #14 closing, not a gate being
+#     widened to admit a defect: a per-role LEARNED codebook fits one book per
+#     `(layer, projection)` and a packed `gate_up_proj` target binds exactly one
+#     `codebook_ref`, so a per-role layer CANNOT name the packed stack -- the
+#     halves are the only spelling the ABI permits. Pinned Gridbook 0.8.5
+#     resolves it (`config.py:1487-1503` `_moe_target_keys` accepts the half
+#     leaves, `:1401-1454` builds `codebook_ref_by_role`, `moe.py:512-527`
+#     consumes it) and covers it with its own tests
+#     (`test_routed_per_role_codebooks.py`). Correspondingly, 1ccdf58's message
+#     calls the dual spelling a "real inconsistency" -- that framing is wrong
+#     and is retracted here; lattice layers share one book and legally name the
+#     packed stack, so both spellings coexist in one correct artifact.
+#
+#     The pass-ward reach is bounded on three sides: the parent must be a
+#     routed-expert container (dotted-boundary anchored, so `experts2` never
+#     matches `experts`), the leaf must decompose to MORE than itself, and the
+#     call site's EVERY-member rule is untouched, so a half-claimed stack still
+#     fails -- Gridbook refuses that same partial. A W8A16 `.weight` + `.scale`
+#     block still resolves through its `source_passthrough` declaration several
+#     branches earlier and never reaches this code. Pinned by
+#     tests/test_artifact_completeness_routed_per_role.py (6 tests: both-halves
+#     claims, one-half still fails, packed spelling still works, the dense
+#     fusion does NOT get the routed fallback, the vLLM mapping still covers
+#     dense, and the `experts2` boundary).
 _FROZEN_EXPORT_SOURCE_SHA256 = {
     "prismaquant/export_nvfp4_cb_streaming.py": (
         "33ab70dd2b234095b58351f81a3708b076c12a6469c3f1c6cc47478a12b47c48"
@@ -201,7 +247,7 @@ _FROZEN_EXPORT_SOURCE_SHA256 = {
         "02d5790a80b5f9e21eb9ac2f7bfc6ca0fb5a33e9fcbeca27c9863ffa002dd9d4"
     ),
     "prismaquant/artifact_completeness.py": (
-        "eebde735e886a8a6ad4f20a29252d69f6ce6e54b6fd7d1c4b9e486dfd8b663fb"
+        "d3dc3f93472c82f7cda02325567bebfb9a988d8547749eb59461bc9a30922d62"
     ),
     "prismaquant/export_output_safety.py": (
         "4af0a9d891313f1d9d031955e431e1e84c1ba0e11a9ce2605ea92de3bc3703b5"
