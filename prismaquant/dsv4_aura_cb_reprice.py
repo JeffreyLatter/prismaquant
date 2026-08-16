@@ -2011,6 +2011,16 @@ def _allocator_command(
         "--target-disk-gb", f"{run_budget_bytes(args) / 1e9:.9f}",
         "--artifact-overhead-reserve-bytes",
         str(DSV4_ARTIFACT_RESERVE_BYTES),
+        # Deliberately NOT implied by --budget-bytes. Tying the partition to
+        # the budget would be the same implicit coupling that let one constant
+        # mean both this run's target and a frozen approval: the 112.69 GB
+        # approval was priced WITH MTP in the payload, and a retarget that
+        # silently changed the partition would rewrite what that number meant.
+        *(
+            arg
+            for prefix in (getattr(args, "exclude_source_prefix", None) or ())
+            for arg in ("--exclude-source-prefix", str(prefix))
+        ),
         "--cb-scale-coding", "two_tier",
         "--cb-codebook-source", "learned",
         "--cb-codebook-source-scope", "fp8",
@@ -2917,6 +2927,22 @@ def _build_parser() -> argparse.ArgumentParser:
             "Scope is one artifact directory measured recursively, so if MTP "
             "ships as a separate /draft artifact its bytes are NOT included "
             "here and the total must be split across the two directories."
+        ),
+    )
+    parser.add_argument(
+        "--exclude-source-prefix",
+        action="append",
+        default=None,
+        metavar="PREFIX",
+        help=(
+            "Passed through to the allocator. Declares that this artifact "
+            "does not ship the source tensors under PREFIX because they ship "
+            "separately. REQUIRED when MTP goes to its own /draft directory: "
+            "the probe has zero MTP rows, so the recipe cannot mention MTP "
+            "and --mtp-format is inert, and without this flag MTP's 10.863 GB "
+            "is priced into every rung. That under-fills the budget by the "
+            "excluded mass, which the exporter's fail-closed recursive stat "
+            "cannot catch because the artifact lands UNDER budget."
         ),
     )
     parser.add_argument(

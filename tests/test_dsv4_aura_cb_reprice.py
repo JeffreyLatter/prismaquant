@@ -1470,3 +1470,52 @@ def test_budget_below_the_non_tensor_reserve_is_refused():
             "--require-production-cache",
             "--budget-bytes", str(drv.DSV4_ARTIFACT_RESERVE_BYTES),
         ])
+
+
+def _prepared_for_command(tmp_path, **arg_overrides):
+    return SimpleNamespace(
+        args=SimpleNamespace(
+            probe=tmp_path / "probe.pkl",
+            model=tmp_path / "model",
+            col_weights=tmp_path / "col.pkl",
+            **arg_overrides,
+        ),
+        cb_context=SimpleNamespace(
+            codebook_bundle_path=tmp_path / "bundle.pqcb"
+        ),
+    )
+
+
+def test_exclude_source_prefix_is_passed_through(tmp_path):
+    command = _allocator_command(
+        _prepared_for_command(tmp_path, exclude_source_prefix=["mtp."]),
+        cost_path=tmp_path / "cost.pkl",
+        output_dir=tmp_path / "allocator",
+    )
+    assert "--exclude-source-prefix" in command
+    assert command[command.index("--exclude-source-prefix") + 1] == "mtp."
+
+
+def test_exclude_source_prefix_is_not_implied_by_a_retarget(tmp_path):
+    """The partition must be explicit. Tying it to --budget-bytes would repeat
+    the coupling that let one constant mean both this run's target and a
+    frozen approval: the 112.69 GB approval was priced WITH MTP in the
+    payload, so a retarget that silently changed the partition would rewrite
+    what that approved number meant."""
+    command = _allocator_command(
+        _prepared_for_command(tmp_path, budget_bytes=87_403_000_000),
+        cost_path=tmp_path / "cost.pkl",
+        output_dir=tmp_path / "allocator",
+    )
+    assert "--exclude-source-prefix" not in command
+    assert "--target-disk-gb" in command
+    assert command[command.index("--target-disk-gb") + 1] == "87.403000000"
+
+    # ...and the default run is unpartitioned too, so the approved 112.69 GB
+    # payload keeps the scope it was approved with.
+    default = _allocator_command(
+        _prepared_for_command(tmp_path),
+        cost_path=tmp_path / "cost.pkl",
+        output_dir=tmp_path / "allocator",
+    )
+    assert "--exclude-source-prefix" not in default
