@@ -369,6 +369,19 @@ JUDGE_ONLY_PATHS: tuple[str, ...] = (
     # The W8A16 export handoff's frozen-closure declaration. Consulted by
     # tools/verify_dsv4_w8a16_export_handoff.py at export time, never at serve.
     "prismaquant/dsv4_w8a16_export_handoff.py",
+    # The launcher itself. The judge snapshot's copy is the one that executes;
+    # the runtime snapshot's copy is never run by anything, in or out of the
+    # container.
+    "scripts/serve_dsv4_cb_validate.sh",
+    # This file. It is the one entry here that the CONTAINER also executes -- as
+    # `/repo/tools/prismaquant_runtime_snapshot.py verify`, from the runtime
+    # snapshot, so at the build commit. That is safe for a specific reason
+    # rather than by assertion: the launcher runs the runtime snapshot's copy
+    # host-side, with the identical `verify --snapshot --expected-commit
+    # --expected-tree --expected-closure-sha256` surface, at every checkpoint
+    # and before any container starts. A newer judge that broke that CLI would
+    # therefore fail on the host first, loudly, with no GPU reserved.
+    "tools/prismaquant_runtime_snapshot.py",
 )
 
 

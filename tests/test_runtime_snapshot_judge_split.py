@@ -193,5 +193,64 @@ def test_the_judge_only_list_stays_short_and_named(tmp_path: Path) -> None:
     exact = [p for p in snapshot_tool.JUDGE_ONLY_PATHS if not p.endswith("/")]
 
     assert sorted(subtrees) == ["docs/", "tests/"]
-    assert all(p.endswith(".py") for p in exact)
-    assert len(exact) <= 5, "judge-only code files should be few and justified"
+    assert all(p.endswith((".py", ".sh")) for p in exact)
+    assert len(exact) <= 6, "judge-only code files should be few and justified"
+
+
+def test_the_snapshot_tool_is_the_one_entry_the_container_also_runs(
+    tmp_path: Path,
+) -> None:
+    """It is allowed for a stated reason, so state the reason as a test.
+
+    The container executes `/repo/tools/prismaquant_runtime_snapshot.py verify`
+    from the RUNTIME snapshot. Letting the judge's copy differ is safe only
+    because the launcher exercises the runtime copy host-side with the identical
+    `verify` CLI, at every checkpoint and before any container starts -- so a
+    judge that broke that surface fails on the host, with no GPU reserved. If
+    that host-side exercise ever leaves the launcher, this entry must leave the
+    allowlist with it.
+    """
+
+    driver = (
+        Path(__file__).resolve().parents[1]
+        / "scripts" / "serve_dsv4_cb_validate.sh"
+    ).read_text(encoding="utf-8")
+
+    assert "tools/prismaquant_runtime_snapshot.py" in snapshot_tool.JUDGE_ONLY_PATHS
+    assert '"$PQ_RUNTIME_SNAPSHOT/tools/prismaquant_runtime_snapshot.py" verify' in driver
+    assert "/repo/tools/prismaquant_runtime_snapshot.py verify" in driver
+    for flag in ("--expected-commit", "--expected-tree", "--expected-closure-sha256"):
+        assert flag in driver
+
+
+def test_the_two_gate_files_of_this_very_change_are_allowed(tmp_path: Path) -> None:
+    """The guard caught this commit's own launcher edit before it was justified.
+
+    Keeping the case: a change to the launcher or the snapshot tool is judge-
+    side, but only these two -- `scripts/` is NOT a blanket subtree allowance.
+    """
+
+    runtime = _write_snapshot(tmp_path / "runtime", {
+        **_RUNTIME_FILES,
+        "scripts/serve_dsv4_cb_validate.sh": "launcher v1",
+        "scripts/export_something.sh": "producer v1",
+        "tools/prismaquant_runtime_snapshot.py": "snapshot v1",
+    })
+    judge = _write_snapshot(tmp_path / "judge", {
+        **_RUNTIME_FILES,
+        "scripts/serve_dsv4_cb_validate.sh": "launcher v2",
+        "scripts/export_something.sh": "producer v1",
+        "tools/prismaquant_runtime_snapshot.py": "snapshot v2",
+    })
+
+    report = snapshot_tool.judge_divergence(runtime, judge)
+    assert report["divergent_count"] == 2
+
+    moved_producer = _write_snapshot(tmp_path / "judge2", {
+        **_RUNTIME_FILES,
+        "scripts/serve_dsv4_cb_validate.sh": "launcher v1",
+        "scripts/export_something.sh": "producer v2",
+        "tools/prismaquant_runtime_snapshot.py": "snapshot v1",
+    })
+    with pytest.raises(snapshot_tool.SnapshotError, match="export_something.sh"):
+        snapshot_tool.judge_divergence(runtime, moved_producer)
