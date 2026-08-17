@@ -53,7 +53,16 @@ RUN_ROOT="${RUN_ROOT:-/home/rob/dq-runs/dsv4-flash-0731}"
 if [[ "$TARGET" == "dsv4" ]]; then
   MODEL_PATH="${MODEL_PATH:-${RUN_ROOT}/source}"
   WORK_DIR="${WORK_DIR:-${RUN_ROOT}/aura-cb-reprice}"
-  CB_COL_WEIGHTS="${CB_COL_WEIGHTS:-${RUN_ROOT}/prod-cal-0p7/artifacts/cb_col_weights.pkl}"
+  # ONE calibration tree feeds the probe, the activation cache and the imatrix.
+  # They are three views of the same forward pass, so they move together or not
+  # at all -- mixing a probe from one calibration with an imatrix from another
+  # is a silent correctness bug, not a configuration. Hardcoding prod-cal-0p7
+  # in three places (mount, --probe, --activation-cache-dir) made re-running the
+  # campaign against a REBUILT calibration impossible without editing the
+  # launcher, which is exactly what the 2026-08-16 rope fix required. Default
+  # is byte-identical to the hardcode it replaces.
+  CALIB_DIR="${CALIB_DIR:-${RUN_ROOT}/prod-cal-0p7}"
+  CB_COL_WEIGHTS="${CB_COL_WEIGHTS:-${CALIB_DIR}/artifacts/cb_col_weights.pkl}"
   # The worst routed layer retains 25.62 GiB of BF16 anchor deltas alongside
   # 12.18 GiB of source weights and its activation/cotangent state. Parameter
   # gradients are harvested inside backward, but a multi-layer source cache
@@ -413,8 +422,9 @@ if [[ "$TARGET" == "dsv4" ]]; then
     # synchronizes and empty_cache()s after the last transient anchor and
     # before backward, which is the actual lifetime boundary.
     -e "PYTORCH_NO_CUDA_MEMORY_CACHING=0"
-    -v "$RUN_ROOT/prod-cal-0p7:$RUN_ROOT/prod-cal-0p7:ro"
+    -v "$CALIB_DIR:$CALIB_DIR:ro"
     -e "RUN_ROOT=$RUN_ROOT"
+    -e "CALIB_DIR=$CALIB_DIR"
     -e "CB_ROUTED_MOE_BOOK_SELECTION=$CB_ROUTED_MOE_BOOK_SELECTION"
   )
   # A routed selection is not one file: load_routed_moe_cbl_selection requires
@@ -559,8 +569,8 @@ python3 /pq/tools/container_runtime_identity.py verify-mounted \
   --expected-git-commit "$PQ_RUNTIME_PRISMAQUANT_GIT_COMMIT"
 exec python3 -m prismaquant.dsv4_aura_cb_reprice \
   --model "$MODEL_PATH" \
-  --probe "$RUN_ROOT/prod-cal-0p7/artifacts/probe.pkl" \
-  --activation-cache-dir "$RUN_ROOT/prod-cal-0p7/act" \
+  --probe "$CALIB_DIR/artifacts/probe.pkl" \
+  --activation-cache-dir "$CALIB_DIR/act" \
   --col-weights "$CB_COL_WEIGHTS" \
   --dataset "$DATASET" \
   --work-dir "$WORK_DIR" \
