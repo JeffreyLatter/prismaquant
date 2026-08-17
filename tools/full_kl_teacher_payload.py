@@ -166,9 +166,26 @@ def topk_coverage_summary(
             f"{TOPK_PROBABILITY_MASS_ABS_TOLERANCE:g} absolute tolerance"
         )
     if coverage_min < TOPK_MINIMUM_COVERAGE:
+        # Report the shortfall, not just its existence. This refusal costs a
+        # full streamed teacher pass over the source model, and the payload is
+        # not written when it fires, so a bare "below 0.90" leaves the operator
+        # with no way to tell a near-miss (raise K) from a genuinely flat
+        # predictive distribution (the top-K formulation does not fit this
+        # model) without paying for the pass again.
+        below = coverage < TOPK_MINIMUM_COVERAGE
+        n_below = int(below.sum().item())
+        n_total = int(coverage.numel())
+        quantiles = torch.tensor([0.001, 0.01, 0.05, 0.50], dtype=torch.float64)
+        q = torch.quantile(coverage.flatten(), quantiles).tolist()
         raise TeacherPayloadError(
             "teacher top-k coverage falls below the declared "
-            f"{TOPK_MINIMUM_COVERAGE:.2f} per-position minimum"
+            f"{TOPK_MINIMUM_COVERAGE:.2f} per-position minimum: "
+            f"K={int(topk_ids.shape[-1])} over vocab={vocab_size}; "
+            f"min={coverage_min:.4f} mean={coverage_mean:.4f}; "
+            f"{n_below}/{n_total} positions short "
+            f"({100.0 * n_below / max(n_total, 1):.2f}%); "
+            f"coverage quantiles p0.1={q[0]:.4f} p1={q[1]:.4f} "
+            f"p5={q[2]:.4f} p50={q[3]:.4f}"
         )
     return {
         "topk_coverage_mean": coverage_mean,
