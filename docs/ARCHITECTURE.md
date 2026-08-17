@@ -200,28 +200,36 @@ W-side to 0.07%, which produced a Pareto byte-identical to the weight-only one.
 research** — there is no served KL/PPL A/B against the weight-only arm at
 matched bpp, and that A/B is the promotion gate.
 
-**The A-side belongs to the SERVING LANE, not to the format registry (2026-08-17).**
-Whether choosing NVFP4 actually quantizes activations is a property of the
-runtime that will serve the artifact, not of the format. Gridbook's CB runtime
-decodes CB weights to BF16 and runs a BF16 GEMM — its own "exact native BF16
-bridge" — unless a **process-global** env selector picks a fused mode
-(`PRISMAQUANT_CB_FUSED_FP4`, `..._FP4_MOE`), and every gate and gold serve on
-the `nvfp4_cb` lane leaves both unset. On that lane the true A-side is exactly
-zero, and the artifact's per-scheme `activation_contract` is *permission* for a
-fused mode rather than selection of one — so there is no per-unit A4/A16 choice
-to allocate over either. Pricing an A-side there is not a conservative
-overestimate but a **currency error** in the principle-8 sense, and it cost
-bytes: at 87.403 GB it drove DSv4-Flash from 96.8% `nvfp4_cb` (K16 bulk) to
-73.7% with **25.4% promoted to FP8_CB** and the bulk rung crushed **K16 → K12**,
-buying its way out of a cost the served artifact never pays. The Qwen3.8-27B
-CB-A allocation used the same AQUA-merged cost on the same bridge-served lane.
-Lanes therefore declare `served_activation_quantization.executes`
-(`lane_spec.LaneActivationContract`, `lane_specs/nvfp4_cb.json` — empty for CB),
-`activation_dloss_table` **requires** it and refuses to fall back on the
-registry's W4A4 claim, and a lane that executes nothing refuses the merge
-outright rather than writing an all-zero A-side that is indistinguishable later
-from a real one. Pass `--lane-executes-all-activation-grids` for a lane that
-genuinely serves every activation grid fused.
+**The A-side belongs to the SERVING LANE, not to the format registry, and the
+lane answers per FAMILY (2026-08-17).** Whether choosing a format actually
+quantizes activations is a property of the runtime that will serve the
+artifact. On the `nvfp4_cb` lane gridbook answers **two different ways**:
+`FP8_CB_*` genuinely is W8A8 — `gridbook/linear.py` hands quantized `xq` with
+per-token dynamic scales to `native_cutlass_scaled_mm`, and `moe.py` declares
+`_FP8_GROUPED_CONTRACT = "fp8_per_token_dynamic"` — while `NVFP4_CB_*` is not:
+it decodes to BF16 and runs a BF16 GEMM, gridbook's own "exact native BF16
+bridge", unless a **process-global** env selector picks a fused mode
+(`PRISMAQUANT_CB_FUSED_FP4`, `..._FP4_MOE`), which every gate and gold serve on
+this lane leaves unset. So an `NVFP4_CB` unit's true A-side is exactly zero,
+the artifact's per-scheme `activation_contract` is *permission* for a fused
+mode rather than selection of one, and there is no per-unit A4/A16 choice to
+allocate over. Pricing that half is not a conservative overestimate but a
+**currency error** in the principle-8 sense, and it cost bytes: at 87.403 GB it
+drove DSv4-Flash from 96.8% `nvfp4_cb` (K16 bulk) to 73.7% with **25.4%
+promoted to FP8_CB** and the bulk rung crushed **K16 → K12** — the DP spending
+real weight bits to escape a cost the served artifact never pays, while the
+FP8 promotions it bought were priced against a *phantom* alternative. The
+Qwen3.8-27B CB-A allocation used the same AQUA-merged cost on the same lane.
+Lanes therefore declare `served_activation_quantization.executes` as **glob
+patterns over format names** (`lane_spec.LaneActivationContract`,
+`lane_specs/nvfp4_cb.json` — `["FP8_CB_*"]`), because the answer is per family
+and rungs within a family are open-ended; enumerating rungs would under-declare
+silently the day one is added. `activation_dloss_table` **requires** the
+pattern set and refuses to fall back on the registry's W4A4 claim; a lane that
+declares an empty set refuses the merge outright rather than writing an
+all-zero A-side that is indistinguishable later from a real one. Pass
+`--lane-executes-all-activation-grids` for a lane that genuinely serves every
+activation grid fused.
 Name resolution goes through the **model profile**: the stage inverts
 `checkpoint_to_live_name` over the safetensors index, because a card's unit
 names come from the module tree the probe walked while a checkpoint may rename

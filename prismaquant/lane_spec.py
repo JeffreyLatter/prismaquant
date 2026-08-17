@@ -23,6 +23,7 @@ and a test pins it, so a future flip is a deliberate edit rather than a drift.
 """
 from __future__ import annotations
 
+import fnmatch
 import json
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -111,13 +112,27 @@ class LaneActivationContract:
     the Qwen3.8-27B CB-A allocation, which used `cost_aura_anchored_aqua.pkl`
     while serving with the same selectors unset.
 
-    ``executes`` is the authority the A-side pricing must intersect with. An
-    empty set is a meaningful, common answer -- not a missing declaration.
+    ``executes`` is the authority the A-side pricing must intersect with. It is
+    a set of **glob patterns** over format names, because the answer is per
+    FAMILY and the rungs within a family are open-ended: the CB lane bridges
+    every ``NVFP4_CB_K*`` but genuinely serves every ``FP8_CB_K*`` as W8A8
+    (`gridbook/linear.py` feeds quantized ``xq`` with per-token dynamic scales
+    into ``native_cutlass_scaled_mm``; `moe.py` declares
+    ``_FP8_GROUPED_CONTRACT = "fp8_per_token_dynamic"``). Listing rungs
+    explicitly would silently under-declare the day a new one is added, which
+    is the same silent-default failure this class exists to remove.
+
+    An empty set is a meaningful answer -- not a missing declaration.
     """
 
     executes: frozenset[str]
     rationale: str
     selectors_must_be_unset: tuple[str, ...] = ()
+
+    def matches(self, format_name: str) -> bool:
+        """Does this lane execute ``format_name``'s activation quantization?"""
+        return any(fnmatch.fnmatchcase(format_name, pattern)
+                   for pattern in self.executes)
 
     @classmethod
     def from_dict(

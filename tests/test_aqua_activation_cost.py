@@ -494,22 +494,37 @@ class TestServedActivationContractGovernsTheASide:
                                    executed_activation_formats=frozenset())
         assert "executes NO format's activation quantization" in str(exc.value)
 
-    def test_the_cb_lane_declares_that_it_executes_nothing(self):
-        """The declaration must live on the lane, with its reasoning.
+    def test_the_cb_lane_answers_PER_FAMILY_not_per_lane(self):
+        """The CB lane does two different things and must say so.
 
-        `executes == []` is the substantive claim; if someone enables a fused
-        mode they must change this and re-price, which is exactly the review
-        moment that did not exist before.
+        FP8_CB really is W8A8 (`linear.py` hands `xq` + per-token dynamic scales
+        to native_cutlass_scaled_mm; moe.py's `_FP8_GROUPED_CONTRACT` is
+        "fp8_per_token_dynamic"). NVFP4_CB really is not -- it takes the exact
+        BF16 bridge. A blanket answer either way is wrong: "nothing" drops a
+        real FP8 cost, "everything" reinstates the phantom NVFP4 one.
         """
         from prismaquant.lane_spec import load_lane_spec
 
         contract = load_lane_spec("nvfp4_cb").served_activation_quantization
         assert contract is not None, (
             "the CB lane must declare its served activation contract")
-        assert contract.executes == frozenset()
+        for fmt in ("FP8_CB_K28", "FP8_CB_K48"):
+            assert contract.matches(fmt), f"{fmt} is served W8A8"
+        for fmt in ("NVFP4_CB_K12", "NVFP4_CB_K18",
+                    "FP8_BLOCK_UE8M0_SOURCE", "BF16", "MXFP4_SOURCE"):
+            assert not contract.matches(fmt), (
+                f"{fmt} takes the bridge / is passthrough; its A-side is zero")
         assert set(contract.selectors_must_be_unset) == {
             "PRISMAQUANT_CB_FUSED_FP4", "PRISMAQUANT_CB_FUSED_FP4_MOE"}
         assert "BF16 bridge" in contract.rationale
+
+    def test_a_family_pattern_covers_a_rung_added_tomorrow(self):
+        """Patterns, not enumerated rungs: an unlisted rung must not go free."""
+        from prismaquant.lane_spec import LaneActivationContract
+
+        c = LaneActivationContract.from_dict({"executes": ["FP8_CB_*"]})
+        assert c.matches("FP8_CB_K99")
+        assert not c.matches("NVFP4_CB_K99")
 
     def test_an_absent_declaration_is_not_read_as_an_empty_one(self):
         from prismaquant.lane_spec import LaneActivationContract

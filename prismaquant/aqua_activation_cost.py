@@ -11,15 +11,24 @@ was buying 4-bit formats at a discount to their true cost.
 
 "ON A LANE THAT SERVES IT FUSED" IS LOAD-BEARING AND WAS ONCE MISSING HERE.
 Whether activations are quantized is a property of the RUNTIME, not of the
-format. Gridbook's CB runtime decodes CB weights to BF16 and runs a BF16 GEMM
--- "the exact native BF16 bridge" -- unless a process-global env selector picks
-a fused mode, and every gate and gold serve on the nvfp4_cb lane leaves those
-selectors unset. On that lane an NVFP4_CB unit's true A-side is exactly zero,
-and pricing one is not conservative, it is wrong in a direction that costs
-bytes: the DSv4-Flash 92 GB body paid for FP8 promotions by dropping the bulk
-of the model from codebook rung K16 to K12 to escape an activation cost it
-never pays. ``activation_dloss_table`` therefore REQUIRES the lane's
-``served_activation_quantization.executes`` and refuses to guess it.
+format, and one lane can answer differently per FAMILY. Gridbook's CB runtime:
+
+  * ``FP8_CB_*`` is genuinely W8A8 -- ``linear.py`` feeds quantized ``xq`` with
+    per-token dynamic scales into ``native_cutlass_scaled_mm``, and ``moe.py``
+    declares ``_FP8_GROUPED_CONTRACT = "fp8_per_token_dynamic"``. Real A-side.
+  * ``NVFP4_CB_*`` is NOT -- it decodes to BF16 and runs a BF16 GEMM ("the
+    exact native BF16 bridge") unless a PROCESS-GLOBAL env selector picks a
+    fused mode, and every CB gate and gold serve leaves those unset. A-side
+    exactly zero.
+
+Charging the NVFP4 family a phantom A4 is not conservative, it is wrong in a
+direction that costs bytes: it made FP8 look relatively cheap and the DSv4-Flash
+92 GB body bought it, going from 96.8% ``nvfp4_cb`` (K16 bulk) to 25.4%
+``FP8_CB`` with the bulk rung crushed K16 -> K12 -- paying weight bits to escape
+a cost it never incurs. Keeping the REAL FP8 term is what stops the correction
+from overshooting the other way. ``activation_dloss_table`` therefore REQUIRES
+the lane's ``served_activation_quantization.executes`` (glob patterns over
+format names) and refuses to guess it.
 
 This stage exists as its own step, rather than inside the cost stage, because
 the A-side is genuinely separable:
@@ -52,6 +61,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import fnmatch
 import json
 import os
 import pickle
@@ -286,7 +296,7 @@ def resolve_executed_activation_formats(*, lane_id: str | None,
         f"{sorted(contract.executes) or '(nothing)'}")
     if contract.rationale:
         log(f"  rationale: {contract.rationale}")
-    return contract.executes
+    return frozenset(contract.executes)
 
 
 def activation_dloss_table(card, model_path: str, formats: list[str], *,
@@ -329,9 +339,13 @@ def activation_dloss_table(card, model_path: str, formats: list[str], *,
             "a valid, common answer), or the string \"all\" for a lane that "
             "genuinely serves every format's activation grid fused.")
     executes_all = executed_activation_formats == "all"
-    executed = (frozenset() if executes_all
-                else frozenset(executed_activation_formats))
-    if not executes_all and not executed:
+    # GLOB PATTERNS, not names: the answer is per FAMILY and rungs are
+    # open-ended. `FP8_CB_*` must keep covering a rung added tomorrow, or the
+    # A-side silently vanishes for it -- the same silent default this argument
+    # exists to remove.
+    patterns = (("*",) if executes_all
+                else tuple(executed_activation_formats))
+    if not executes_all and not patterns:
         raise SystemExit(
             "REFUSE: this lane executes NO format's activation quantization, "
             "so every A-side price is exactly zero and merging one would only "
@@ -469,7 +483,9 @@ def activation_dloss_table(card, model_path: str, formats: list[str], *,
                     # The format quantizes activations; this lane may still not
                     # execute that. Same outcome (no A-side), different reason,
                     # so it is reported separately below rather than folded in.
-                    if not executes_all and fmt not in executed:
+                    if not executes_all and not any(
+                            fnmatch.fnmatchcase(fmt, pat)
+                            for pat in patterns):
                         not_executed.add(fmt)
                         del plugin
                         continue
