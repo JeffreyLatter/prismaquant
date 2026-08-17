@@ -15,6 +15,7 @@ from prismaquant.gridbook_environment import (
     CANONICAL_GOLD_SET_ENVIRONMENT,
 )
 from prismaquant.gridbook_runtime_pin import load_gridbook_runtime_pin
+from tools.full_kl_teacher_payload import PROMPT_TOP_K
 from prismaquant.shipcard import (
     DSV4_TOKENIZER_IDENTITY_SHA256,
     DSV4_WIKITEXT_CORPUS_SHA256,
@@ -213,7 +214,7 @@ def _teacher_evidence() -> dict:
         "calib_ids_sha256": "3" * 64,
         "scoring": {
             "positions": "all",
-            "prompt_top_k": 1024,
+            "prompt_top_k": PROMPT_TOP_K,
             "logprob_dtype": "float32",
             "tail_bucket": True,
         },
@@ -232,7 +233,7 @@ def _teacher_evidence() -> dict:
         "topk_coverage_min": 0.91,
         "topk_coverage_policy": {
             "schema": "prismaquant.topk_tail_coverage_policy/1",
-            "top_k": 1024,
+            "top_k": PROMPT_TOP_K,
             "minimum_probability_mass_per_position": 0.90,
             "maximum_probability_mass": 1.0,
             "probability_mass_absolute_tolerance": 1e-6,
@@ -454,7 +455,7 @@ def _gold_record(root: Path, *, slot: str = "gold.kl") -> tuple[dict, dict]:
     metrics = {
         "mode": "student",
         "score_positions": "all",
-        "prompt_top_k": 1024,
+        "prompt_top_k": PROMPT_TOP_K,
         "model": str(root),
         "quantization": "gridbook",
         "n_samples": 8,

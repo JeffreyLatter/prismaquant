@@ -1,6 +1,16 @@
 # PrismaQuant Architecture
 
 As of: 2026-08-16 · branch `fix/aqua-profile-aware-resolver` · re-stamped for
+the **DSv4 gold lane's first execution**, which found two defects that made it
+unrunnable as written (§7.3). Its teacher support widens from top-1024 to
+**top-8192** — measured, not chosen: at 1024 the BF16 teacher misses the 0.90
+per-position coverage floor on 34 of 4,088 positions, so the gate refused every
+teacher the lane could build; 8192 is the smallest swept K that clears it, and
+the floor itself is unchanged. And the lane now installs the **0.8.8/v4 serving
+pin** rather than the 0.8.5/v3 producer pin, because both gold measurement tools
+attest the serving pin against the live runtime and would refuse a producer-pin
+container after the teacher pass had already been paid for.
+Previously re-stamped for
 the **judge/runtime split in the serve gate**, and with it the
 **split-release decode topology and the per-role cover** (§9.3). The gate bound
 the *judge* to the artifact's build commit as well as the served stack, which
@@ -451,7 +461,7 @@ Highest first. A claim is worth exactly the rung it was measured on.
 
 | # | Metric | Contract | Where |
 |---|---|---|---|
-| 1 | Served-artifact vLLM KL-vs-BF16 at matched bpp: exact full vocabulary where feasible; DSv4Flash all-position top-1024 support plus one tail bucket | n=8 × seqlen=512 | `tools/measure_vllm_full_kl.py`; DSv4 source builder `tools/build_streamed_full_kl_teacher.py` with the offline input from `tools/prepare_dsv4_wikitext_inputs.py` — invoked **manually**, never by the pipeline |
+| 1 | Served-artifact vLLM KL-vs-BF16 at matched bpp: exact full vocabulary where feasible; DSv4Flash all-position top-8192 support plus one tail bucket | n=8 × seqlen=512 | `tools/measure_vllm_full_kl.py`; DSv4 source builder `tools/build_streamed_full_kl_teacher.py` with the offline input from `tools/prepare_dsv4_wikitext_inputs.py` — invoked **manually**, never by the pipeline |
 | 2 | Direct WikiText PPL on the served artifact | pinned WikiText test revision; 8,192-token prefix in 16 non-overlapping 512-token windows; 8,176 scored positions | `tools/measure_vllm_wikitext_ppl.py` with that same offline input, contract `prismaquant.wikitext_ppl_calibration/1` — manual |
 | 3 | Mean NLL alongside PPL; KL-vs-BF16 (`/home/rob/dq-runs/kl_tool.py`) for IT/BOS-sensitive models where raw PPL is meaningless | — | §7.5 |
 | 4 | Downstream suite on materialized artifacts: GSM8K, IFEval, MMLU, **ToolEvalBench** (`--no-think --hardmode --parallel 1`) | — | tool-use fidelity is the deep reason KL matters: a small probability shift at a decision point flips a tool call |
@@ -1138,7 +1148,7 @@ seam defect from a campaign convention into a checked plugin contract.
 and the **112.690 GB exact-byte budget** into that mechanism. It remains a one-shot campaign
 rather than a four-phase `run-pipeline.sh` cost mode: rank the weights, solve once, and export
 the resulting assignment blind. There is no contested set, certificate, or cost-driven
-iteration. The only quality gate is the served artifact: all-position top-1024-plus-tail-bucket
+iteration. The only quality gate is the served artifact: all-position top-8192-plus-tail-bucket
 vLLM KL-vs-BF16 plus direct WikiText PPL against `artifact-112p69-raw` at matched bpp. Qwen3.8-27B can reuse the
 same generic mechanism and CB plugin while supplying its own model profile, source-gated unit
 classes, budget, and acceptance driver.
@@ -3189,8 +3199,32 @@ into `native_export.eager`.
 **Served-artifact vLLM KL-vs-BF16** — `tools/measure_vllm_full_kl.py` retains the
 exact-full-vocabulary path for teachers that fit its ordinary vLLM two-pass
 workflow. DSv4Flash must instead use the digest-bound streamed-teacher path; its
-release statistic is explicitly **all-position top-1024 support plus one tail
+release statistic is explicitly **all-position top-8192 support plus one tail
 bucket**, not full-vocabulary KL.
+
+**Why 8192 and not the 1024 this lane originally specified.** The support width
+is set by measurement, not convention. The contract requires every one of the
+4,088 scored positions to carry ≥ 0.90 probability mass inside the teacher's
+top-K. On the first execution of this lane — it had never been run, on either
+DSv4 artifact — a K=1024 teacher missed that floor on 34 positions (worst
+0.6943), so the gate refused every teacher the lane could build. Sweeping K in
+one pass over the pinned calibration (`topk` returns sorted, so a single K=16384
+reduction yields every smaller K) gives min coverage 0.6943 / 0.7829 / 0.8606 /
+0.9231 / 0.9658 at K = 1024 / 2048 / 4096 / 8192 / 16384. K=8192 is the smallest
+width clearing the floor. **The 0.90 floor is unchanged** — the support was
+widened until it could meet the guarantee, rather than the guarantee lowered to
+fit a support that could not. `PROMPT_TOP_K` in `tools/full_kl_teacher_payload.py`
+is the single source of that number; `shipcard.py`'s three DSv4 gold literals and
+`tests/test_shipcard_gold_replay.py` all track it.
+
+**Gridbook version on this lane.** The gold measurement tools bind the **serving**
+pin: both call `load_gridbook_serving_runtime_pin()` and hand the attestation to
+`self_manifest`, which compares it against the live runtime. A driver that
+installs the 0.8.5/v3 *producer* pin therefore cannot complete the KL step —
+`run_gold_after_export.sh` does exactly that, which is consistent with that lane
+never having produced a gold result. `run_gold_92gb.sh` installs the 0.8.8/v4
+serving pin, matching both the tools and the pair that carried the artifact
+through the serve gate.
 
 The exact DSv4 serving image intentionally does not install Hugging Face
 `datasets`. Before either GPU measurement,
@@ -3207,7 +3241,7 @@ mode is refused rather than silently recovering the corpus at runtime.
 `tools/build_streamed_full_kl_teacher.py` extends the existing
 `cost_streaming.build_streamed_causal_lm` layer streamer: BF16 source weights,
 one source `LayerCache` slot, one prefetch worker, and zero lookahead. It reduces
-logits to FP32 top-1024 log probabilities on GPU before releasing the streamed
+logits to FP32 top-8192 log probabilities on GPU before releasing the streamed
 model. The closed calibration is WikiText-2 raw **train** revision
 `b08601e04326c79dfdd32d625aee71d232d685c3`, verbatim nonempty rows joined by
 two newlines, tokenizer special tokens disabled, Python window seed 42,

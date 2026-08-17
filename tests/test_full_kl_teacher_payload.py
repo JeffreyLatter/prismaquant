@@ -115,7 +115,9 @@ def _payload(tmp_path: Path) -> dict:
         "model": str(tmp_path),
         "n_samples": N_SAMPLES,
         "seqlen": SEQLEN,
-        "vocab_size": 4096,
+        # Must exceed the top-K support, so derive it rather than hardcoding a
+        # number that silently becomes invalid when PROMPT_TOP_K moves.
+        "vocab_size": PROMPT_TOP_K * 4,
         "source_model_identity": identity,
         "source_model": compact_source_model_identity(identity),
         "source_model_identity_sha256": canonical_sha256(identity),

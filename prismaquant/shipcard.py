@@ -1418,7 +1418,7 @@ def _verify_dsv4_gridbook_gold_contract(
         workload = {
             "mode": "student",
             "score_positions": "all",
-            "prompt_top_k": 1024,
+            "prompt_top_k": 8192,
             "n_samples": 8,
             "seqlen": 512,
             "n_positions": 4088,
@@ -1463,7 +1463,7 @@ def _verify_dsv4_gridbook_gold_contract(
             coverage_policy = teacher.get("topk_coverage_policy")
             expected_coverage_policy = {
                 "schema": TOPK_COVERAGE_POLICY_SCHEMA,
-                "top_k": 1024,
+                "top_k": 8192,
                 "minimum_probability_mass_per_position": 0.90,
                 "maximum_probability_mass": 1.0,
                 "probability_mass_absolute_tolerance": 1e-6,
@@ -1574,7 +1574,7 @@ def _verify_dsv4_gridbook_gold_contract(
                     or not sha(calibration.get("calib_ids_sha256"))
                     or calibration.get("scoring") != {
                         "positions": "all",
-                        "prompt_top_k": 1024,
+                        "prompt_top_k": 8192,
                         "logprob_dtype": "float32",
                         "tail_bucket": True,
                     }

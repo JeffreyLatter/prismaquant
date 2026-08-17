@@ -36,7 +36,25 @@ WIKITEXT_REVISION = "b08601e04326c79dfdd32d625aee71d232d685c3"
 N_SAMPLES = 8
 SEQLEN = 512
 WINDOW_SEED = 42
-PROMPT_TOP_K = 1024
+# Measured, not chosen. At K=1024 the DSv4-Flash BF16 teacher misses the 0.90
+# per-position floor on 34 of these 4,088 positions (worst 0.6943), so the gate
+# refused every teacher this lane could build. A single sweep over the pinned
+# calibration -- topk returns sorted, so one pass at 16384 yields every smaller
+# K -- gives the coverage minimum as a function of K:
+#
+#     K       min     mean    #<0.90
+#     1024  0.6943  0.9905      34
+#     2048  0.7829  0.9949      18
+#     4096  0.8606  0.9975       8
+#     8192  0.9231  0.9990       0
+#     16384 0.9658  0.9997       0
+#
+# 8192 is the smallest K clearing the floor. The floor itself is unchanged at
+# 0.90: this widens the teacher's support until it can meet the guarantee,
+# rather than lowering the guarantee to fit a support that could not. These
+# windows are pinned (seed 42, fixed starts, fixed digest), so the margin above
+# is exact for the shipping workload and not a sample that could drift.
+PROMPT_TOP_K = 8192
 EXPECTED_POSITIONS = N_SAMPLES * (SEQLEN - 1)
 
 # FP32 log-softmax values can round the reconstructed probability sum a few
