@@ -448,5 +448,91 @@ def test_zero_resolution_refuses_instead_of_writing_a_no_op(tmp_path):
     with pytest.raises(SystemExit) as exc:
         activation_dloss_table(
             object(), str(tmp_path), ["NVFP4"],
-            names=["model.layers.0.mlp.experts.0.down_proj"])
+            names=["model.layers.0.mlp.experts.0.down_proj"],
+            executed_activation_formats="all")
     assert "NAME-SPACE" in str(exc.value)
+
+
+class TestServedActivationContractGovernsTheASide:
+    """The A-side belongs to the RUNTIME, not to the format registry.
+
+    Regression cover for 2026-08-17: the DSv4-Flash 92 GB body and the
+    Qwen3.8-27B CB-A allocation were both priced from an AQUA-merged cost while
+    their lane served every CB unit through gridbook's exact BF16 bridge, which
+    quantizes no activations at all. The A-side was a phantom, and the DP paid
+    for it in weight bits -- ~19k units dropped from codebook rung K16 to K12
+    to fund FP8 promotions that escaped a cost of zero.
+    """
+
+    def test_pricing_refuses_to_guess_the_served_contract(self, tmp_path):
+        import json
+        from prismaquant.aqua_activation_cost import activation_dloss_table
+
+        (tmp_path / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": {"a.weight": "s0.safetensors"}}))
+        with pytest.raises(SystemExit) as exc:
+            activation_dloss_table(object(), str(tmp_path), ["NVFP4"],
+                                   names=["a"])
+        assert "executed_activation_formats is required" in str(exc.value)
+
+    def test_a_lane_that_executes_nothing_refuses_rather_than_charging_zero(
+            self, tmp_path):
+        """An all-zero A-side must be a REFUSAL, not a silently merged no-op.
+
+        Merging zeros would produce a cost artifact carrying the AQUA name that
+        is byte-equivalent to the weight-only arm -- indistinguishable later
+        from a real A-side priced against a lane that does serve fused.
+        """
+        import json
+        from prismaquant.aqua_activation_cost import activation_dloss_table
+
+        (tmp_path / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": {"a.weight": "s0.safetensors"}}))
+        with pytest.raises(SystemExit) as exc:
+            activation_dloss_table(object(), str(tmp_path), ["NVFP4"],
+                                   names=["a"],
+                                   executed_activation_formats=frozenset())
+        assert "executes NO format's activation quantization" in str(exc.value)
+
+    def test_the_cb_lane_declares_that_it_executes_nothing(self):
+        """The declaration must live on the lane, with its reasoning.
+
+        `executes == []` is the substantive claim; if someone enables a fused
+        mode they must change this and re-price, which is exactly the review
+        moment that did not exist before.
+        """
+        from prismaquant.lane_spec import load_lane_spec
+
+        contract = load_lane_spec("nvfp4_cb").served_activation_quantization
+        assert contract is not None, (
+            "the CB lane must declare its served activation contract")
+        assert contract.executes == frozenset()
+        assert set(contract.selectors_must_be_unset) == {
+            "PRISMAQUANT_CB_FUSED_FP4", "PRISMAQUANT_CB_FUSED_FP4_MOE"}
+        assert "BF16 bridge" in contract.rationale
+
+    def test_an_absent_declaration_is_not_read_as_an_empty_one(self):
+        from prismaquant.lane_spec import LaneActivationContract
+
+        with pytest.raises(ValueError, match="must state `executes`"):
+            LaneActivationContract.from_dict({"rationale": "..."})
+
+    def test_resolver_refuses_a_lane_with_no_declaration(self, monkeypatch):
+        import dataclasses
+
+        from prismaquant import aqua_activation_cost as aqc
+        from prismaquant.lane_spec import load_lane_spec
+
+        spec = load_lane_spec("nvfp4_cb")
+        bare = dataclasses.replace(spec, served_activation_quantization=None)
+        monkeypatch.setattr(
+            "prismaquant.lane_spec.load_lane_spec", lambda _id: bare)
+        with pytest.raises(SystemExit, match="does not declare"):
+            aqc.resolve_executed_activation_formats(lane_id="nvfp4_cb")
+
+    def test_a_genuinely_fused_lane_still_prices_the_full_a_side(self):
+        from prismaquant.aqua_activation_cost import (
+            resolve_executed_activation_formats)
+
+        assert resolve_executed_activation_formats(
+            lane_id=None, executes_all=True) == "all"

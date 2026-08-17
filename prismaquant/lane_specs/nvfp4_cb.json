@@ -4,7 +4,9 @@
   "export_container": "nvfp4_cb",
   "runtime": "vllm+gridbook_plugin",
   "description": "NVFP4-CB / FP8-CB codebook container, served by the separately released Gridbook plugin pinned in prismaquant/gridbook_runtime/gridbook_runtime_pin.json. PrismaQuant does not vendor the runtime. Load/generation validation is endpoint-driven and has separate eager and graph receipts because Gridbook is installed in an exact-pinned serving container rather than imported into the build environment.",
-  "serving_profiles": ["nvfp4_cb"],
+  "serving_profiles": [
+    "nvfp4_cb"
+  ],
   "endpoint": {
     "kind": "openai",
     "base_url": "http://127.0.0.1:8000/v1",
@@ -21,7 +23,8 @@
       "scripts/serve_laguna_smoke.sh"
     ],
     "command": [
-      "bash", "${SERVE_SCRIPT}"
+      "bash",
+      "${SERVE_SCRIPT}"
     ]
   },
   "gates": [
@@ -65,7 +68,16 @@
   "kl_evaluator": {
     "kind": "validate_assignments_kl",
     "entrypoint": "prismaquant.validate_assignments_kl:main",
-    "note": "Reachable on this lane since CB Milestone C (R3): the production cache renders CB rungs imatrix-weighted via --col-weights, so a frontier KL measures the bytes the exporter ships. Selection on this lane is still SURROGATE by default — validated-frontier CB selection is enabled, not promoted."
+    "note": "Reachable on this lane since CB Milestone C (R3): the production cache renders CB rungs imatrix-weighted via --col-weights, so a frontier KL measures the bytes the exporter ships. Selection on this lane is still SURROGATE by default \u2014 validated-frontier CB selection is enabled, not promoted."
+  },
+  "served_activation_quantization": {
+    "executes": [],
+    "rationale": "Gridbook's CB runtime takes the exact native BF16 bridge unless a fused activation mode is selected by a PROCESS-GLOBAL env selector (gridbook/moe.py `_requested_fused_fp4_moe_mode`, gridbook/linear.py PRISMAQUANT_CB_FUSED_FP4). Every gate and gold serve on this lane leaves both unset -- serve_dsv4_cb_validate.sh asserts 'PRISMAQUANT_CB_FUSED_FP4: expected <unset>' -- so no format's activation grid is executed here and every A-side price is exactly zero. The artifact's per-scheme `activation_contract` is PERMISSION for a fused mode, not selection of one; there is no per-unit A4/A16 choice on this lane because the selector is not per-unit.",
+    "selectors_must_be_unset": [
+      "PRISMAQUANT_CB_FUSED_FP4",
+      "PRISMAQUANT_CB_FUSED_FP4_MOE"
+    ],
+    "if_this_changes": "Selecting a fused mode makes the A-side REAL and AQUA applicable: list the formats whose activation grid the selected mode executes, and re-price. Do not edit this to silence a refusal."
   },
   "advisory_gates": true,
   "notes": [

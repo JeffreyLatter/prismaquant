@@ -91,6 +91,52 @@ class LaneKLEvaluator:
 
 
 @dataclass(frozen=True)
+class LaneActivationContract:
+    """Which formats' activation quantization this lane's runtime EXECUTES.
+
+    The format registry declares NVFP4 a W4A4 format. That is a fact about the
+    FORMAT, not about the LANE. Gridbook's CB runtime decodes to BF16 and runs
+    a BF16 GEMM -- what its own docstring calls "the exact native BF16 bridge"
+    -- unless a fused activation mode is explicitly selected by a
+    process-global env selector. Every gate and gold serve on the nvfp4_cb lane
+    leaves those selectors unset, so an NVFP4_CB unit's activations are never
+    quantized there and its A-side cost is exactly zero.
+
+    Pricing an A-side the runtime does not execute is a CURRENCY error, not a
+    conservative overestimate. It makes a format look more expensive than it
+    is, and the DP then spends real weight bytes escaping a cost of zero: on
+    DSv4-Flash at 87.403 GB it promoted 2,307 units to FP8_CB and funded that
+    by dropping the bulk of the model from codebook rung K16 to K12 (four fewer
+    index bits on ~19k units). Discovered 2026-08-17; the same mispricing is on
+    the Qwen3.8-27B CB-A allocation, which used `cost_aura_anchored_aqua.pkl`
+    while serving with the same selectors unset.
+
+    ``executes`` is the authority the A-side pricing must intersect with. An
+    empty set is a meaningful, common answer -- not a missing declaration.
+    """
+
+    executes: frozenset[str]
+    rationale: str
+    selectors_must_be_unset: tuple[str, ...] = ()
+
+    @classmethod
+    def from_dict(
+        cls, payload: Mapping[str, Any]
+    ) -> "LaneActivationContract":
+        if "executes" not in payload:
+            raise ValueError(
+                "served_activation_quantization must state `executes` "
+                "explicitly; an absent list is not an empty list, and "
+                "guessing it is the bug this field exists to prevent")
+        return cls(
+            executes=frozenset(str(f) for f in payload["executes"]),
+            rationale=str(payload.get("rationale", "")),
+            selectors_must_be_unset=tuple(
+                str(s) for s in payload.get("selectors_must_be_unset", ())),
+        )
+
+
+@dataclass(frozen=True)
 class LaneSpec:
     id: str
     export_container: str
@@ -104,6 +150,7 @@ class LaneSpec:
     serving_profiles: tuple[str, ...] = ()
     advisory_gates: bool = True
     notes: tuple[str, ...] = field(default=())
+    served_activation_quantization: LaneActivationContract | None = None
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "LaneSpec":
@@ -126,6 +173,11 @@ class LaneSpec:
                 str(p) for p in payload.get("serving_profiles", ())),
             advisory_gates=bool(payload.get("advisory_gates", True)),
             notes=tuple(str(n) for n in payload.get("notes", ())),
+            served_activation_quantization=(
+                LaneActivationContract.from_dict(
+                    payload["served_activation_quantization"])
+                if payload.get("served_activation_quantization") is not None
+                else None),
         )
 
     def gate(self, gate_id: str) -> LaneGate | None:
