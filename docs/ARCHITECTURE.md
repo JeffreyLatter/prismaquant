@@ -1,6 +1,11 @@
 # PrismaQuant Architecture
 
-As of: 2026-08-16 · branch `fix/shipcard-bpp-crosscheck` · re-stamped for the
+As of: 2026-08-16 · branch `fix/aqua-profile-aware-resolver` · re-stamped for
+the **split-release decode topology and the per-role cover** — a DSv4 release
+may now ship as two artifacts, with the body declaring itself by *recording* the
+`mtp.` omission; and a routed packed expert stack is covered per **role** rather
+than per tensor, because the CB ABI binds one codebook per role (§9.3).
+Previously re-stamped for the
 **published-bpp cross-check** — `shipcard.verify` now refuses a card whose
 `build.achieved_bpp` contradicts the per-unit serialized bytes the recipe it
 names declares (§7). Precedence alone could not catch a right field describing
@@ -3315,8 +3320,9 @@ is still fully replayed.
 same survey reached `validate_cb_artifact_decode_contract`, which demanded
 "exactly one of `dspark_source_overlay` or `dspark_cb_sidecar`" — two DSpark
 topologies a plain Gridbook CB export has neither of. It now dispatches on the
-lane: the DSv4 lane still requires exactly one (declaring neither would shed the
-bridge contract its stack depends on), declaring *both* is refused everywhere,
+lane: the DSv4 lane requires a declared topology (declaring neither would shed
+the bridge contract its stack depends on — unless the omission is itself
+declared, see the split release below), declaring *both* is refused everywhere,
 and declaring a DSpark topology off the DSv4 lane is refused too. Off-lane
 artifacts take `CB_PLAIN_MODE` under
 `ARTIFACT_DECODE_CONTRACT_SCHEMA_PLAIN` — a distinct mode, not a version bump,
@@ -3346,12 +3352,61 @@ artifact never uses must not refuse it, and one missing a feature it does use
 must — so a dense CB artifact requires none and a routed-MoE one requires the
 per-role LUT.
 
-*Open, DSv4 lane:* the stricter enumerator reports 8 `…ffn.experts.gate_up_proj`
-stacks on `artifact-aura-cb-112p69` as claimed by nothing, because 8 of its
-layers spell the targets unfused while 35 spell them fused, and
-`DeepseekV4Profile.fused_sibling_leaf_mapping()` is empty in the host venv (the
-vLLM class lives only in the serving container). That is a real inconsistency to
-settle before the DSv4 ship (task #14), not a Qwen3.8 blocker.
+**A fourth topology: the body half of a split release** (2026-08-16). At 92 GB
+the DSv4-Flash body ships with `mtp.` excluded and the draft as a *second*
+artifact, so it declares neither DSpark topology — and the lane guard refused
+it. Both old branches were the wrong reading: it is not an in-band overlay and
+it is not the sidecar. A DSv4 artifact may now decline both **iff** it records
+`mtp.` in `provenance.excluded_namespaces`. The omission is the declaration, so
+a body that merely *lost* its overlay (records nothing) still refuses, and
+overlay-plus-exclusion is refused as a contradiction — the overlay is
+constructed from exactly those source layers. It then takes `CB_PLAIN_MODE`, and
+the disk-free receipt replay accepts exactly the one permitted omission (`[]` or
+`["mtp."]`, a closed set — not "any exclusion").
+
+Running the plain cover against a real FP8-source artifact for the first time
+then broke three assumptions it had never had to hold (all 2026-08-16):
+
+- **A group's target is a tensor.** 22 of 48 groups resolved to zero tensors,
+  because 11 learned layers name the *halves* (`…experts.gate_proj`) of a packed
+  `gate_up_proj` stack. That is the CB ABI, not a defect: a packed target binds
+  exactly one `codebook_ref`, so a per-role learned book must be named per role,
+  while a lattice layer's single shared book legally names the packed stack.
+  Cover is now computed per **role**, decomposed through the profile's
+  `packed_expert_projection_names` — matching gridbook 0.8.5
+  `_resolve_moe_codebook_roles` read *at the pin* rather than widening past it —
+  and a stack whose roles are only partly claimed is refused as unservable, the
+  same rule the fused-sibling bridge already applies.
+- **`source_passthrough` did not exist to the cover.** The third declared
+  claiming mechanism was invisible, so 336 verbatim-FP8 units read as claimed by
+  nothing. It is now read exactly as `artifact_completeness` reads it: by exact
+  variant, not by ancestry. A unit legitimately carries **both** a passthrough
+  declaration and a scheme-less config group — the group states LAYOUT, the
+  declaration states ROUTING (`cb_export_config.py`) — and 272 of the 336 carry
+  the pair, so refusing it would refuse every FP8-source release.
+- **Groups partition units.** `covered == cb_unit_count` cannot hold once two
+  per-role groups share one packed stack (398 vs 115). The assembly site, which
+  holds both sets, now asserts set equality against the classified CB units
+  after subtracting passthrough; the disk-free replay, which does not hold them,
+  keeps only the bound it can honestly assert — the cover may not fall *short*.
+
+With those, `artifact-aura-cb-92gb` validates `cb_plain` complete: 115 CB + 336
+passthrough over 1736 tensors. `artifact-aura-cb-112p69`'s `evidence_sha256` is
+byte-identical across the change, and the ordinary plain fixture's
+`cover_sha256`/`evidence_sha256` are pinned in
+`tests/test_validate_cb_endpoint_plain.py` from the pre-change code, so a future
+cover change cannot silently move every artifact's receipt.
+
+*Closed with them:* the 8 `…ffn.experts.gate_up_proj` stacks previously reported
+on `artifact-aura-cb-112p69` as claimed by nothing were the same per-role blind
+spot mirrored in `artifact_completeness`, not a `fused_sibling_leaf_mapping`
+gap.
+
+*Open, DSv4 lane:* `scripts/serve_dsv4_cb_validate.sh` binds the gate to the
+artifact's build commit and materializes the snapshot **at that commit**. The
+92 GB body was built at `c327cf3`, which predates both fixes, so the gate cannot
+execute them against the existing bytes — the artifact must be re-exported at a
+commit containing them, or validated out of band.
 
 `serve_manifest.json` is excluded from `compute_model_sha` for the same reason
 it is written at all: it is the R15 fingerprint of a *serve*, not artifact

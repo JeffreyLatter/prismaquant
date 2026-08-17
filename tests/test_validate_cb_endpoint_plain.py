@@ -168,9 +168,6 @@ _PINNED_PLAIN_EVIDENCE_SHA256 = (
 def test_a_plain_cb_artifact_proves_its_own_cover(plain_case) -> None:
     evidence = _validate(plain_case)
 
-    assert evidence["cover_sha256"] == _PINNED_PLAIN_COVER_SHA256
-    assert evidence["evidence_sha256"] == _PINNED_PLAIN_EVIDENCE_SHA256
-
     assert evidence["schema"] == cbv.ARTIFACT_DECODE_CONTRACT_SCHEMA_PLAIN
     assert evidence["mode"] == cbv.CB_PLAIN_MODE
     assert evidence["complete"] is True
@@ -279,22 +276,25 @@ def test_a_dsv4_lane_artifact_cannot_present_as_plain(plain_case) -> None:
         cbv.validate_cb_artifact_decode_contract(root, quant_config)
 
 
-def test_the_plain_receipt_digest_is_stable_for_an_ordinary_artifact() -> None:
+def test_the_plain_receipt_digest_is_stable_for_an_ordinary_artifact(
+    plain_case,
+) -> None:
     """Pinned so a cover change cannot silently move every artifact's receipt.
 
     Per-role routed claims and source passthrough both changed how the cover is
     computed (2026-08-16). Neither may move the numbers for an artifact that has
     neither, which is every plain CB artifact validated before that date. If a
     future change to the cover legitimately alters this, recompute BOTH digests
-    and say in the commit why the receipt is allowed to move.
+    from the pre-change code and say in the commit why the receipt may move.
+
+    The digests are recomputed from the fixture here rather than compared to
+    themselves -- a receipt pin that cannot fail is not a pin.
     """
 
-    assert _PINNED_PLAIN_COVER_SHA256 == (
-        "f4127eb51b5b586852ffb27b30de8cf90dda67608bf020480b77cfb285a8f4ac"
-    )
-    assert _PINNED_PLAIN_EVIDENCE_SHA256 == (
-        "e604772c53b1e3cba9783c0f961a62e5d0d89f45d077df69da4a89f8df50f223"
-    )
+    evidence = _validate(plain_case)
+
+    assert evidence["cover_sha256"] == _PINNED_PLAIN_COVER_SHA256
+    assert evidence["evidence_sha256"] == _PINNED_PLAIN_EVIDENCE_SHA256
 
 
 def test_a_dspark_topology_off_the_dsv4_lane_is_refused(plain_case) -> None:
