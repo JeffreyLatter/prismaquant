@@ -1,10 +1,16 @@
 # PrismaQuant Architecture
 
 As of: 2026-08-16 · branch `fix/aqua-profile-aware-resolver` · re-stamped for
-the **split-release decode topology and the per-role cover** — a DSv4 release
+the **judge/runtime split in the serve gate**, and with it the
+**split-release decode topology and the per-role cover** (§9.3). The gate bound
+the *judge* to the artifact's build commit as well as the served stack, which
+made a validator bug incurable for bytes already on disk; the container still
+runs the artifact's own build commit, but the host-side verdict now runs at
+HEAD, guarded by a descendant check and a `judge-divergence` proof that every
+differing closure path is judge-only. The fixes that exposed it: a DSv4 release
 may now ship as two artifacts, with the body declaring itself by *recording* the
 `mtp.` omission; and a routed packed expert stack is covered per **role** rather
-than per tensor, because the CB ABI binds one codebook per role (§9.3).
+than per tensor, because the CB ABI binds one codebook per role.
 Previously re-stamped for the
 **published-bpp cross-check** — `shipcard.verify` now refuses a card whose
 `build.achieved_bpp` contradicts the per-unit serialized bytes the recipe it
@@ -3402,11 +3408,47 @@ on `artifact-aura-cb-112p69` as claimed by nothing were the same per-role blind
 spot mirrored in `artifact_completeness`, not a `fused_sibling_leaf_mapping`
 gap.
 
-*Open, DSv4 lane:* `scripts/serve_dsv4_cb_validate.sh` binds the gate to the
-artifact's build commit and materializes the snapshot **at that commit**. The
-92 GB body was built at `c327cf3`, which predates both fixes, so the gate cannot
-execute them against the existing bytes — the artifact must be re-exported at a
-commit containing them, or validated out of band.
+**The gate could not run its own fix** (2026-08-16). Both fixes above landed
+after the 92 GB body was built, and `scripts/serve_dsv4_cb_validate.sh` refused
+unless `REPO_HEAD == ARTIFACT_BUILD_COMMIT`, then materialized and re-exec'd the
+snapshot **at that commit**. So the gate would have executed the *pre-fix*
+validator against the artifact, and the only remedy it admitted for a wrong
+verdict was rebuilding bytes that were never wrong — five to six GPU-hours to
+reproduce the same tensors under a newer stamp. That is a defect in the gate,
+not a property of the artifact: the binding covered the **judge** as well as the
+**runtime**, and `validate_cb_endpoint.py` decodes nothing.
+
+The two roles are now separate identities, and the launcher materializes and
+verifies **both**:
+
+| | commit | role |
+|---|---|---|
+| **runtime** | artifact `build.git.commit` | mounted at `/repo`, sources the Gridbook serving runtime, executes every in-container step |
+| **judge** | the live checkout's `HEAD` | runs the launcher and every host-side verdict |
+
+Nothing about the serve is relaxed — the container still runs exactly the stack
+the bytes were made for, and its in-container closure verify still expects the
+build commit. What changed is that a gate fix now reaches artifacts already on
+disk. Two guards keep it from becoming a way to judge with unrelated code. The
+judge must be a **descendant** of the build commit (`git merge-base
+--is-ancestor`) — forward only, never older than the producer. And
+`prismaquant_runtime_snapshot.py judge-divergence` proves every closure path
+that differs between the two snapshots is in `JUDGE_ONLY_PATHS`: `docs/`,
+`tests/`, and three named host-side modules. A divergence anywhere in the serve
+path refuses, because a judge that also moved the serve path may be expecting
+something the build-commit runtime does not produce — and *there* re-export is
+the honest answer. The claim is re-proved at every `verify_runtime_snapshot`
+checkpoint rather than trusted once at bootstrap, and `evidence/judge_split.json`
+records both identities with the divergence list, so a receipt can always say
+which code rendered its verdict. On the 92 GB body the divergent set is exactly
+the eight paths of `1467c90` + `2027c60` + this entry.
+
+Two subtleties the split had to respect. `PQ_RUNTIME_PRISMAQUANT_ROOT` is the
+*source-bootstrap* contract — `activate_prismaquant_source` refuses unless it
+equals the directory of the tool being run — so on the host it names the judge
+root, while the container keeps its own explicit `/repo`. And
+`PRISMAQUANT_IDENTITY_GIT_COMMIT` stays the **artifact build commit**: a judge
+running newer does not restamp what produced the bytes.
 
 `serve_manifest.json` is excluded from `compute_model_sha` for the same reason
 it is written at all: it is the R15 fingerprint of a *serve*, not artifact
