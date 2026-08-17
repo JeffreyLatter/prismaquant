@@ -206,6 +206,45 @@ _PUBLISHED_FILES = frozenset({
 #     claims, one-half still fails, packed spelling still works, the dense
 #     fusion does NOT get the routed fallback, the vLLM mapping still covers
 #     dense, and the `experts2` boundary).
+#
+# RE-FROZEN 2026-08-16 (fifth time). Whole closure enumerated per the note
+# above; THREE files drifted, all for one fix, and the honest review is that
+# this lane's verdict is UNCHANGED -- the drift is confined to the streamed
+# FORWARD path, which no exporter calls:
+#   layer_streaming.py -- `_compute_position_embeddings` gained an optional
+#     `profile` argument and now re-keys a multi-rope dict from ROPE AXIS to
+#     ATTENTION LAYER TYPE, and `_call_layer` lost its silent
+#     `position_embeddings["main"]` fallback (an unresolved layer type raises).
+#     DSv4-Flash's rotary is keyed `("main","compress")` while its layers
+#     report `sliding_attention`/`compressed_sparse_attention`/
+#     `heavily_compressed_attention`, so the lookup missed EVERY layer and the
+#     fallback rotated 41 of 46 layers on base 10000 with YaRN off instead of
+#     160000 with YaRN. That is the defect behind the perplexity-262 BF16
+#     teacher, and it is a reintroduction of the bug PATCH 06 had already
+#     fixed inside the vendored forward (modeling_deepseek_v4.py:1514-1521).
+#   model_profiles/base.py -- new `rope_axis_for_layer_type` hook, default
+#     None, which is exactly the pre-change behaviour for every other arch.
+#   model_profiles/deepseek_v4.py -- overrides it by DELEGATING to
+#     `DeepseekV4RotaryEmbedding.rope_axis_for_layer_type`, so the mapping has
+#     one definition that `DeepseekV4Model.forward` resolves through too.
+#
+#     WHAT THIS CHANGES HERE, stated plainly: nothing. The two touched
+#     functions have exactly five callers -- `cost_streaming.py:137`,
+#     `incremental_probe.py:1542`/`:2706`, `sensitivity_probe.py:3219`/`:3274`
+#     -- which are the teacher, the Fisher probe and the sensitivity probe.
+#     No export path reaches them, the `LayerCache`/residency machinery this
+#     handoff does depend on is untouched, and no already-written byte moves.
+#     What DOES change is every FUTURE probe/cost pass on DSv4-Flash, whose
+#     forward was previously wrong on 41 of 46 layers; the allocation behind
+#     the current artifacts was produced through the defective path, and
+#     whether to re-probe is being decided on gold KL against a valid teacher
+#     rather than assumed here. Pinned by tests/test_multilayer_rope_forward.py
+#     (6 new tests: the re-key, compressed layers receiving `compress` rope,
+#     Gemma-style passthrough, a profile returning None, the removed fallback
+#     now raising, and a profile naming an axis the rotary lacks) and
+#     test_deepseek_v4_profile.py::test_rope_axis_mapping_matches_the_vendored_definition,
+#     which asserts the model forward still resolves through the shared
+#     definition so the two cannot drift apart again.
 _FROZEN_EXPORT_SOURCE_SHA256 = {
     "prismaquant/export_nvfp4_cb_streaming.py": (
         "33ab70dd2b234095b58351f81a3708b076c12a6469c3f1c6cc47478a12b47c48"
@@ -223,13 +262,13 @@ _FROZEN_EXPORT_SOURCE_SHA256 = {
         "fb20303ed1b017a5a7f3a035d5ef43880822d775e252c28a08f32a67f8104c95"
     ),
     "prismaquant/model_profiles/base.py": (
-        "7355fe24fb81acd2086cc677df9cf9d81a4c98e7d16a95541c83640f9d361f66"
+        "2ed0bd76c6adf4bee550d55a56a59c148ee8bf50f3616631228cd7028d9b1fbb"
     ),
     "prismaquant/model_profiles/registry.py": (
         "2fb8bcc01fbfd3b89870d387d335f804b05378f9853f223469c619e7ab766b90"
     ),
     "prismaquant/model_profiles/deepseek_v4.py": (
-        "f280937e826c2262a7a3646c90aa883915daa516e78f7a2b83b586890e05cbf7"
+        "b288c184c938b09498591430725c6cc52b35926efee51441c8df9b9a1c989c65"
     ),
     "prismaquant/model_profiles/specs/deepseek_v4.json": (
         "b8f3b22c16484a6859494d96ff052e5c5229c9a7c3afb7ae829e9cf5e26ecbf4"
@@ -238,7 +277,7 @@ _FROZEN_EXPORT_SOURCE_SHA256 = {
         "d9a06483d008bf2361b0522bc258ab291db870d1c2432f9d4cd8d7a8cbacefbe"
     ),
     "prismaquant/layer_streaming.py": (
-        "5fa349dd47b024274d64f2ae17613138e35cea93a28b1ff6f016204980df471e"
+        "5344f30043be08baf0c1509d77be511f6d2fbe963ce4d7b32afd8072a48a9da4"
     ),
     "prismaquant/production_weight_cache.py": (
         "1cc27e3b64043f9873da528ae2aa128e37c15be303109509f713b8d738c59f36"

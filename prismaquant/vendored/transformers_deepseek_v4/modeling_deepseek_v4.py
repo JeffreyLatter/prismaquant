@@ -93,6 +93,31 @@ class DeepseekV4RotaryEmbedding(nn.Module):
     inv_freq: torch.Tensor  # fix linting for `register_buffer`
     layer_types = ("main", "compress")
 
+    @staticmethod
+    def rope_axis_for_layer_type(layer_type: str) -> str:
+        """Which of the two rotary tables a decoder layer's Q/KV rotation uses.
+
+        model.py:481-487: a layer's table depends on its compress ratio --
+        ratio==0 (``sliding_attention``) rotates on ``rope_theta`` with YaRN
+        DISABLED, and every compressed layer (CSA/HCA) rotates on
+        ``compress_rope_theta`` WITH YaRN.  Note the two namespaces this
+        function bridges: the argument is an *attention schedule* type from
+        ``config.layer_types``, and the result is a *rope axis* naming one of
+        ``DeepseekV4RotaryEmbedding.layer_types``.  Conflating them is not
+        hypothetical -- it is the bug PATCH 06 fixed below (see
+        :meth:`DeepseekV4Model.forward`), and PrismaQuant's streamed per-layer
+        driver, which bypasses that forward entirely, reintroduced it and fed
+        ``main`` rope to all 41 compressed layers of V4-Flash: base 10000
+        instead of 160000, YaRN off, an angle error growing with position.  A
+        BF16 teacher built that way scored perplexity 262.
+
+        This is therefore the SINGLE definition of the mapping.  The model's
+        own forward and any external per-layer driver must both resolve the
+        axis through it, so a streamed pass cannot silently disagree with the
+        model it is supposed to reproduce.
+        """
+        return "main" if layer_type == "sliding_attention" else "compress"
+
     def __init__(self, config: "DeepseekV4Config", device=None):
         super().__init__()
         self.max_seq_len_cached = config.max_position_embeddings
@@ -1525,7 +1550,9 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
         }
 
         for layer in self.layers:
-            layer_rope = "main" if self.config.layer_types[layer.layer_idx] == "sliding_attention" else "compress"
+            layer_rope = DeepseekV4RotaryEmbedding.rope_axis_for_layer_type(
+                self.config.layer_types[layer.layer_idx]
+            )
             hidden_states = layer(
                 hidden_states,
                 position_embeddings=cos_sin_by_type[layer_rope],

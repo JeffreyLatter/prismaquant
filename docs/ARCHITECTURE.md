@@ -1,6 +1,15 @@
 # PrismaQuant Architecture
 
 As of: 2026-08-16 · branch `fix/aqua-profile-aware-resolver` · re-stamped for
+the **streamed rope-axis fix** (§4.1): `_call_layer` bypasses `Model.forward`,
+and where DSv4-Flash's rotary keys (*rope axes* `main`/`compress`) failed to
+match a layer's reported *attention schedule*, the streamed driver silently
+substituted `main` — rotating 41 of 46 layers on base 10000 with YaRN off
+instead of 160000 with YaRN. That is the defect behind the perplexity-262
+teacher, it is a reintroduction of the bug PATCH 06 had already fixed inside
+the vendored forward, and it reached the teacher, the incremental probe and the
+sensitivity probe alike. The mapping now has one definition and the silent
+fallback raises. Re-stamped with it for
 the **teacher forward-fidelity gate** (§7.3): the DSv4 gold lane's first
 execution built a BF16 teacher whose *own* teacher-forced perplexity was 262 —
 far worse than the 2.34-bpp student it was grading — and every existing gate
@@ -1017,6 +1026,38 @@ allocator-consumable cost table falls out of it for free — §6.5.2.
 The probe is streamed shard-by-shard through `layer_streaming` — head resident, body paged,
 MTP a built-in shard kind (`incremental_probe.py:2-17`); a modality guard aborts on
 probe/`CALIBRATION_MODALITY` mismatch (`:562-599`).
+
+**The streamed driver must reproduce the model's own forward, and where it
+cannot observe a rule it must not guess one.** `_call_layer` drives one decoder
+layer at a time and therefore bypasses `Model.forward` entirely, so everything
+that forward does *between* layers has to be re-supplied: the profile's
+`expand_hidden_for_layers`/`collapse_hidden_after_layers` (DSv4's `hc_mult=4`
+streams), `extra_layer_kwargs` (DSv4 hash-routed layers' `input_ids`),
+`new_forward_pass_state` (Gemma4 shared K/V), the mask, and the rope. Rope is
+the subtle one, because two namespaces collide: a multi-rope model's rotary is
+keyed by *rope axis*, while a layer can only report its *attention schedule*.
+On Gemma3/Gemma4 those coincide. On DSv4-Flash they never do — axes are
+`main`/`compress`, schedules are `sliding_attention` /
+`compressed_sparse_attention` / `heavily_compressed_attention` — so the lookup
+missed every layer, and the code answered the miss by substituting `main`.
+That silently rotated 41 of V4-Flash's 46 layers on base 10000 with YaRN
+disabled where `DeepseekV4Model.forward` uses `compress_rope_theta` 160000 with
+YaRN, an angle error that grows with position. The BF16 teacher built through
+that path scored perplexity **262** — worse than the 2.34-bpp student it
+existed to grade — while the served artifact was healthy, and it was used as a
+gold KL reference. The bug is notable twice over: PATCH 06 had already found
+and fixed exactly it *inside* the vendored forward
+(`modeling_deepseek_v4.py:1514-1521`), and the streamed path reintroduced it.
+The mapping now has a single definition,
+`DeepseekV4RotaryEmbedding.rope_axis_for_layer_type`, which the model's forward
+and `ModelProfile.rope_axis_for_layer_type` both resolve through;
+`_compute_position_embeddings` re-keys the rope dict by attention layer type so
+every `_call_layer` caller is fixed at once; and the `main` fallback is gone —
+an unresolved layer type now raises. Guarded by
+`tests/test_multilayer_rope_forward.py` and
+`tests/test_deepseek_v4_profile.py::test_rope_axis_mapping_matches_the_vendored_definition`.
+See also the teacher forward-fidelity gate (§7.3), which is what makes a
+teacher this broken impossible to ship silently.
 
 `h_trace` is the empirical CE Fisher diagonal trace. Additive model:
 `0.5 · h_trace · weight_mse · gain` (`allocator_solver.py:60-63`, derivation
