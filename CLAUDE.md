@@ -188,9 +188,16 @@ within 1–2%. The decision-unit *framing* from CLADO is kept
    on its own. Hardcoded format bans, streak limits, "demote because it looks
    dangerous", post-allocator rewrites — all **vetoed**, debug-only. *Mixed
    quantization is fine; every individual format is fine; errors must be bounded
-   by the platform, not by constraints on what the allocator may choose.* When
-   stuck, ask: **measurement gap or optimizer gap? It is almost always a
-   measurement gap.**
+   by the platform, not by constraints on what the allocator may choose.* *One
+   carve-out, and it is principle 9's, not an exception:* a **measured platform
+   fact** — the pinned runtime has no native route for these bytes on the
+   declared target — may fail export closed (`allocator_candidates.py`
+   route-status doctrine, `:133-137`). It never removes an honestly priced rung
+   from the menu: an allocator that wants an unbacked route is *reporting a
+   serving gap*, and that signal is the point. The line sits between "the
+   runtime measurably does not serve this natively" (legitimate, P9) and "this
+   format looks risky/ugly/slow to me" (vetoed). When stuck, ask: **measurement
+   gap or optimizer gap? It is almost always a measurement gap.**
 2. **No heuristics when an explicit exists.** Derive thresholds and decisions
    from the objective, never from intuition. The only acceptable constants come
    from the numerical precision of a dtype.
@@ -220,20 +227,41 @@ within 1–2%. The decision-unit *framing* from CLADO is kept
    pressure on a hot path is a **bug** — the fix is to use/repair/extend the
    prefetch path so resident data is ready, never to tolerate the slow path.
    `run-pipeline.sh` and `gpu_guard.require_cuda_hot_path` refuse to run on CPU.
-8. **One cache mechanism.** Rendered weights flow *only* through
-   `ProductionWeightCache`; activations through `PerturbedActivationCache` / the
-   streaming activation path. No parallel stores. `pipeline.py`
-   `APPROVED_RESOURCE_OWNERS` is the declarative contract and validation layer;
-   runtime enforcement lives in the stage code and fail-fast cache/prefetch gates.
-   **Why it matters:** the surrogate, the KL validation, and the exported bytes
-   must be *identical* — otherwise an A/B has a "rendering confound" (the exact
-   reason the JSO wall-off was reverted).
-9. **vLLM/kernel reality gates every format.** Production-eligible only when:
-   correctly represented in `compressed-tensors` metadata, accepted by vLLM on
-   real shapes, routed to a *performant* kernel (not a slow fallback), passes
-   eager **and** graph-mode load+generate smokes, and doesn't break MTP/spec-decode
-   (or is gated away). Registry support alone is not enough; a format may live in
-   the research menu without being a default.
+8. **One cache mechanism — and one execution contract.** Rendered weights flow
+   *only* through `ProductionWeightCache`; activations through
+   `PerturbedActivationCache` / the streaming activation path. No parallel
+   stores. `pipeline.py` `APPROVED_RESOURCE_OWNERS` is the declarative contract
+   and validation layer; runtime enforcement lives in the stage code and
+   fail-fast cache/prefetch gates. **Why it matters:** the surrogate, the KL
+   validation, the exported bytes, *and the activation/kernel contract the
+   serving runtime executes on them* must be *identical* — a mismatch on any
+   link is a confound (a "rendering confound" is the exact reason the JSO
+   wall-off was reverted). Rendering identity **without** execution identity
+   priced a real A-side at zero: NVFP4_CB, 2026-08-17. The executed contract is
+   a fact about the pinned runtime and is established per principle 14, never
+   asserted locally.
+9. **Serving reality gates every format — per lane, and per artifact.** A
+   format is production-eligible only when its lane's **pinned runtime**
+   (vanilla vLLM for `compressed-tensors`, llama.cpp/vLLM-GGUF for GGUF, the
+   pinned Gridbook release for CB — the sanctioned three, per `AGENTS.md`)
+   loads it on real shapes, generates correctly eager **and** graph-mode,
+   doesn't break MTP/spec-decode (or is gated away), and routes it to a
+   **native** kernel for the declared target platform — tensor cores on the
+   hardware the artifact names, not an older-architecture schedule or a slow
+   fallback. Eligibility is judged **per artifact, at export**: the
+   serving-route provenance (`selection_serving_lane_provenance`) is a *gate
+   input*, not a log — export fails closed when any selected unit's activation
+   contract resolves to an unbacked route, unless the artifact explicitly
+   declares a non-native target platform or carries an explicit per-run
+   override, and either is stamped on the shipcard. Route status lives in a
+   **structured** `route_status` field on every serving-profile lane
+   (`backed | backed_with_serve_flag | unbacked`, plus `requires_serve_flags`),
+   never in prose a gate cannot read. Registry support alone is not enough; a
+   format may live in the research menu without being exportable.
+   *(2026-08-17: 73.7% of a built 92 GB body rode a CUTLASS `arch::Sm80`
+   fallback on sm121 Blackwell, recorded in its own `selection.json`, refused
+   by nothing. Provenance that nothing consumes is not a gate; it is a
+   confession log.)*
 10. **CUDA graphs everywhere applicable** — by default, not on request. Eval paths
     are launch-overhead-bound (96% util at 11 W = launching tiny kernels). Capture
     fixed-shape forwards; env-gate the fallback; bit-exactness with capture *off*
@@ -243,11 +271,17 @@ within 1–2%. The decision-unit *framing* from CLADO is kept
     when the source tensor is *already* that precision; never synthesize them
     (synthesizing BF16 from dequant'd FP8 wastes 8 bpp — *"shame!!"*). Enforced by
     `PASSTHROUGH_SOURCE_REQUIREMENTS` + a post-allocation assertion.
-12. **Report bpp over *quantizable* parameters only** — exclude `lm_head`,
-    profile-pinned Linears, MTP/visual sidecars. Published comparisons against
-    uniform NVFP4 must use the same convention. (Beware: bpp labels are *not*
-    comparable across accounting eras — the public "5.31" artifact's body bpp is
-    ~4.76 under current accounting.)
+12. **Report bpp over *quantizable* parameters only — and report the serving
+    route with the same honesty.** Exclude `lm_head`, profile-pinned Linears,
+    MTP/visual sidecars. Published comparisons against uniform NVFP4 must use
+    the same convention. (Beware: bpp labels are *not* comparable across
+    accounting eras — the public "5.31" artifact's body bpp is ~4.76 under
+    current accounting.) Every published size or quality claim carries the
+    artifact's **activation-contract / route histogram** (from
+    `selection_serving_lane_provenance`): a bpp or KL win on units riding a
+    fallback route says so, on the card, in the same table as the bpp. A screen
+    is not a result, and **a win on a non-native kernel is not a win on the
+    named hardware** until the route is native or the card says otherwise.
 13. **`docs/ARCHITECTURE.md` stays current — same commit, not later.** Any
     change to pipeline defaults, the stage graph, the format menu, the plugin
     contract, serving-lane defaults, or ship gates updates `docs/ARCHITECTURE.md`
@@ -255,7 +289,32 @@ within 1–2%. The decision-unit *framing* from CLADO is kept
     provenance block. Handovers and results docs are append-only history and
     never substitute for this. `tests/test_docs_staleness.py` +
     `tests/test_architecture_doc.py` enforce the mechanical half; the
-    judgment half is on you.
+    judgment half is on you. **Currency is not truth:** a doc updated in
+    lockstep with a false belief is current *and wrong* (both `a24fce2` and its
+    parent updated this file while encoding one). Claims about runtime
+    behaviour are grounded per principle 14, not by doc discipline.
+14. **A claim about another runtime is attested, never asserted.** Any
+    producer-side spec field that states what a serving runtime *does* —
+    executed activation contracts, kernel routes, backed rungs — is either
+    **derived from** a machine-readable table the pinned runtime publishes, or
+    **refused**. Prose `detail`/`rationale` fields explain; they are never the
+    value a gate or a cost model reads. Concretely: Gridbook publishes its
+    executed-activation-contract table (it already computes it —
+    `nvfp4_activation_contract.bridge_contract`, per-scheme
+    `activation_contract` strings) inside its packaged `runtime_contract.json`;
+    the producer preflight asserts every lane spec's `executes` list equals the
+    pinned contract's table and refuses on mismatch, exactly as the R6 profile
+    preflight already refuses producer/consumer profile drift. Second leg,
+    serve-side: `validate_native_export` compares the artifact's priced
+    `activation_contracts` histogram against the routes the serve actually
+    emitted (`emit_route` telemetry) and refuses on disagreement — the priced
+    contract and the served contract must be the same object. The test may not
+    `import gridbook` (`AGENTS.md:38` forbids vendoring the runtime); the
+    attestation travels in the contract file. **Corollary for prose:** a
+    recorded blocker or capability claim inherits the scope of the artifact it
+    was measured on — record the scope or do not record the claim. *Two of our
+    own spec files disagreed about one runtime; the runtime was never
+    ambiguous.*
 
 ---
 

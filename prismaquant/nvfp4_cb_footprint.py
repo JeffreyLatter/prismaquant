@@ -11,7 +11,7 @@ particular, production FP4-CB uses layout-v2 ``4k + 9`` byte superblocks,
 FP8-CB carries ``4 * output_rows`` scale bytes, and neither CB family has an
 NVFP4-style *weight* global-scale scalar.  The versioned static W4A4 execution
 variant adds exactly one four-byte ``input_global_scale`` to each FP4-CB target;
-historical/research v2 artifacts do not. Product and signed codebook sizes are
+historical/research v2 artifacts do not. Product codebook sizes are
 derived from the exact subtable shapes emitted by
 :mod:`prismaquant.export_nvfp4_cb`.
 
@@ -1760,14 +1760,6 @@ def lattice_codebook_content_sha256(format_name: str) -> tuple[str, ...]:
         tables = tuple(
             cb.fixed_lattice(bits, grid, sub_dim)
             for bits in subtable_bit_widths(k, mode, n_sub)
-        )
-    elif mode == "signed":
-        n_sub = family_for(grid, mode).n_sub
-        (magnitude_bits,) = subtable_bit_widths(k, mode, n_sub)
-        tables = (
-            cb.fixed_lattice(
-                magnitude_bits, grid, _VEC_DIM, positive=True
-            ),
         )
     else:
         tables = (cb.fixed_lattice(k, grid, _VEC_DIM),)

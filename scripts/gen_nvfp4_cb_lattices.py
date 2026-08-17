@@ -1,7 +1,7 @@
 """Generate the committed NVFP4-CB universal lattice cache.
 
 Builds the grid-snapped Lloyd lattices used as the fixed (no-sidecar)
-codebooks. Production product/signed coverage is derived from
+codebooks. Production product coverage is derived from
 ``prismaquant.cb_layout``; only the explicit full-mode research tables are
 listed locally.
 
@@ -40,7 +40,15 @@ def required_lattice_specs() -> tuple[tuple[int, str, int, bool], ...]:
         add((k, "fp4", VEC_DIM, False))
 
     for family in FAMILIES:
-        positive = family.mode == "signed"
+        # The positive-magnitude (half-grid) lattice existed only for the
+        # signed family, deleted 2026-08-17; every surviving family codes a
+        # sign-symmetric table. Fail closed rather than let a future mode
+        # silently inherit `positive=False` and get the wrong lattice.
+        if family.mode not in ("product", "full"):
+            raise ValueError(
+                f"{family.prefix}: unhandled CB mode {family.mode!r} -- declare "
+                "whether its lattice is positive-magnitude before generating")
+        positive = False
         for k in family.rungs:
             widths = subtable_bit_widths(k, family.mode, family.n_sub)
             shapes = codebook_subtable_shapes(

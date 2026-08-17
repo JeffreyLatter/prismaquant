@@ -166,20 +166,6 @@ def test_fp8_cb_codebook_is_four_fp16_subtables_for_both_sources():
     assert learned["total_bytes"] == base["total_bytes"]
 
 
-def test_signed_codebook_shape_and_assignment_deduplication():
-    fmt = "NVFP4_CB_S16"
-    ctx = _learned_context(fmt, "q_proj")
-    assignment = {"layer.0.q_proj": fmt, "layer.1.q_proj": fmt}
-    shapes = {name: (64, 256) for name in assignment}
-    result = cb_assignment_payload_breakdown(
-        assignment, shapes, context=ctx
-    )
-    assert codebook_subtable_shapes(fmt) == ((256, 8),)
-    assert result["codebook_sidecar_bytes"] == 256 * 8 * 2
-    assert len(result["sidecars"]) == 1
-    assert result["global_scale_bytes"] == 0
-
-
 def test_odd_product_k_splits_larger_subtables_first():
     assert codebook_subtable_shapes("NVFP4_CB_K13") == (
         (128, 4),
@@ -189,7 +175,6 @@ def test_odd_product_k_splits_larger_subtables_first():
 
 _REGISTERED_CB_FORMATS = (
     [f"NVFP4_CB_K{k}" for k in range(12, 25)]
-    + [f"NVFP4_CB_S{k}" for k in range(13, 17)]
     + [f"FP8_CB_K{k}" for k in range(28, 49)]
 )
 

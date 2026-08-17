@@ -4,6 +4,14 @@ This is the provenance record for excluding `NVFP4_CB_S13..S16` from new
 production allocations while retaining their exporter and decoder support.
 It is a local quantization-error screen, not served KL/PPL evidence.
 
+> **Status 2026-08-17 — the family was DELETED, not merely de-menued.** This
+> screen stands as written and is the quality half of the case. The deciding
+> fact came later and is a serving one: `n_sub = 1` fails the predicate every
+> native Gridbook FP4 route tests (`n_sub == 2 and type_size == 4*k + 9`), so
+> no signed rung could ever reach a native kernel. Exporter and decoder
+> support has been removed; `NVFP4_CB_S*` no longer parses. See
+> `docs/ARCHITECTURE.md` §9.2.
+
 ## Reproduction identity
 
 - Command: `scripts/run_0p8b_s_rung_headtohead.sh`

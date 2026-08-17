@@ -1,6 +1,23 @@
 # PrismaQuant Architecture
 
-As of: 2026-08-15 · branch `merge/proven-rescues` · re-stamped for the
+As of: 2026-08-17 · branch `merge/proven-rescues` · re-stamped for the
+**deletion of the signed `NVFP4_CB_S*` family and the per-regime correction to
+native-execution reporting** (§9.2). The signed family is gone from the registry,
+encoder, exporter, footprint and serving profile: every native Gridbook FP4 route
+tests the unsigned two-tier product layout exactly
+(`n_sub == 2 and type_size == 4*k + 9`), so an `n_sub = 1` rung could only ever
+ride a fallback, and it had already lost 78.48% of matched weight-MSE comparisons.
+`subtable_bit_widths(..., "signed", ...)` and a recipe carrying `cb_mode: "signed"`
+now **refuse** rather than silently resolve to the product rung of the same `k` —
+a silent fall-through would hand a stale caller a different subtable geometry
+under the same name. No allocation on disk referenced a signed rung, so no
+assignment changed. Recorded with it: **`fused_mid_m` is one lane for one
+batch-size regime, not a whole-unit verdict.** NVFP4-CB *decode* is native and
+default-on on both the routed (`T <= 16`) and dense (`M <= 8`) paths; only the
+batch regime rides the Sm80 BF16 bridge, and the mid-M fused lane is dense-only
+and can never cover a routed expert. The DSv4 92 GB body's "73.7% unbacked" was
+that misreading — its decode path is 100% native — and native execution is now
+reported per regime. Previously re-stamped for the
 **Gridbook 0.8.8 serving pin, the gold-contract lane scope, and the
 `README.md` exclusion from `model_sha`** (0.8.7 shipped
 the quantized-embedding method and its dispatch branch, but vLLM dispatches
@@ -1438,10 +1455,13 @@ Three dense-specific differences are structural rather than cosmetic:
   subset* of the nonexpert one; a dense model has nothing to split, and declaring a fake
   expert menu would put a menu in the artifact no unit can take. `DensePlan` derives both
   ladders from `format_registry` narrowed by the serving profile's production format rule
-  (which drops the research-only signed `NVFP4_CB_S13..S16`) and then, for `fp8_cb` only,
-  by `_serving_backed_family` (the `k % 4 == 0` fused mid-M law). `nvfp4_cb` declares no
-  fused rung at any version, so its whole ladder rides the documented fallback route —
-  a speed property, not a correctness one, and it restricts nothing. Module constants are
+  (which used to drop the research-only signed `NVFP4_CB_S13..S16`; that family was
+  **deleted 2026-08-17**, so there is no signed rung left to drop) and then, for `fp8_cb`
+  only, by `_serving_backed_family` (the `k % 4 == 0` fused mid-M law). `nvfp4_cb` declares
+  no fused rung at any version, so its whole ladder rides the documented fallback route —
+  a speed property, not a correctness one, and it restricts nothing. **Read that narrowly:**
+  `fused_mid_m` is one lane for one batch-size regime, never a whole-unit verdict; NVFP4-CB
+  decode is native and default-on (§9.2). Module constants are
   asserted against what was derived, so a runtime pin bump refuses instead of allocating
   onto rungs the artifact cannot serve.
 * **One basis.** Learned codebooks are a measured null on Qwen dense (holdout ~1.00 across
@@ -2017,7 +2037,7 @@ pricing and emulation. Registry-vs-callable consistency is pinned by
 | `NVFP4A16`, `MXFP4`, `MXFP6_E3M2/E2M3`, `MXFP8A16`, `MXFP8_E5M2`, `FP8_E5M2`, `INT8_W8A16`, `INT4_W4A16_g128` | `:678-795` | — | — | Research / registry-only |
 | GGUF k-quants + IQ | `:884-902` | `_make_gguf_spec :864` | 2.0625–8.5 | GGUF lane (§9.3) |
 | `NVFP4_CB_K12..K24` / `FP8_CB_K28..K48` | `:913`, `:954` | product-VQ codebook, g256 | 1.78125–3.28125 serialized body / 3.5–6.0 index stream plus row scales | one production Gridbook CB menu: FP8 K28–K46 render learned, FP8 K47/K48 render lattice by measured policy (§9.2) |
-| `NVFP4_CB_S13..S16` | `:932` | signed codebook, g256 | legacy/research layout | decoder/export compatible, production-menu denied (§9.2) |
+| ~~`NVFP4_CB_S13..S16`~~ | — | signed codebook, g256 | — | **DELETED 2026-08-17** — every native Gridbook FP4 route requires the unsigned two-tier product layout (`n_sub == 2 and type_size == 4*k + 9`), so a signed rung could only ever ride a fallback; it had already lost 78.48% of matched weight-MSE comparisons. Registry, encoder, exporter and footprint branches removed; `cb_layout.subtable_bit_widths(..., "signed", ...)` and a recipe carrying `cb_mode: "signed"` now **refuse** rather than resolve to the product rung of the same `k` (§9.2) |
 
 MXFP8 is de-menued rather than denied — `vllm_packed_moe` still allows `MXFP8_E4M3` — because
 its E8M0 pow2 scale wastes ~√2 of a binade and exact-scale FP8 Pareto-dominates it; offered
@@ -4205,6 +4225,46 @@ exact commit. The installed-wheel GB10/sm121 gate backs the source route, while 
 artifact must still close eager/graph, performance, and quality gates. The canceled gfx1151/ROCm
 prototype was removed rather than maintained as an unqualified second backend.
 
+**Native execution is a per-REGIME property, and NVFP4-CB decode is already native.**
+Gridbook dispatches CB by batch size, and the dense and routed thresholds differ
+(0.8.8 / `064a4cb`):
+
+| path | regime | route | opt-in upgrades |
+|---|---|---|---|
+| routed MoE | `T <= 16` (`moe_mixed.py:557,570`) | `ops.cb_moe_gemv_fp4_v2` (`:740`) | — (**native, default-on**) |
+| routed MoE | `T > 16` | `cb_expand_fp4_v2` → BF16 grouped GEMM (CUTLASS 2.x `DefaultGemmGrouped`, `arch::Sm80`) | ladder, cheapest requalification first: `PRISMAQUANT_CB_BF16_SM120` (sm12x schedule, same expand) → `PRISMAQUANT_CB_MOE_PERSISTENT_B` (decode-in-mainloop, deletes the `[E,N,K]` BF16 transient; FP4-CB-v2 only) → `PRISMAQUANT_CB_FUSED_FP4_MOE` (changes the activation contract) |
+| dense | `M <= 8` (`CUDA_GEMV_M_MAX`, `linear.py:67`) | FP4-v2 GEMV (`:1090`) | — (**native, default-on**) |
+| dense | `9 <= M <= 128` | fused mid-M (`fp4v2_fused_midm_lane.py:33,36`) | `PRISMAQUANT_CB_FP4_FUSED_MIDM`, **DENSE ONLY** |
+| dense | `M > 128` | BF16 bridge | `PRISMAQUANT_CB_BF16_SM120` (`linear.py:1140`) → `PRISMAQUANT_CB_FUSED_FP4` (contract change) |
+
+Two consequences a gate must respect. First, `fused_mid_m.rungs_by_runtime_version: {}`
+on the `nvfp4_cb_quality_path` lane is **one lane for one regime** — it says nothing
+about decode, and reading it as a whole-unit verdict is how the DSv4 92 GB body was
+reported as 73.7% "unbacked" when its decode path is 100% native (33,325/33,325 units).
+Second, the mid-M fused lane **can never cover a routed expert**, so it must not be
+counted for an MoE body; it is a lever for a *dense* artifact only. `route_status` in
+`serving_profile_specs/*.json` is therefore per regime, never a single verdict per lane,
+and `check_native_execution.py` reports `--regime decode|batch` separately.
+
+Turning the batch regime native needs no kernel work and no re-export — every opt-in
+rung is runnable on today's artifacts — but the ladder splits on the *requalification
+surface*. The two contract-preserving rungs (`PRISMAQUANT_CB_BF16_SM120` and
+`PRISMAQUANT_CB_MOE_PERSISTENT_B`) consume the same packed weights and the same
+`fp4_group16_rtn` QDQ payload and differ from the bridge only in FP32 reduction order —
+reassociation-class, the surface the promoted FP8 mid-M kernel cleared. Persistent-B is
+the high-value rung: it deletes the per-forward `[E,N,K]` BF16 expansion (2 B/weight
+written and re-read over *every* expert, routed or not, vs ~0.22 B/weight packed at K12),
+which gridbook's 2026-08-02 whole-operator microbenchmark measures at 20.9–46.7% of the
+default operator, winning every cell at 1.05–3.36× (proposal data; promotion is blocked
+solely on the served NATIVE-PARITY protocol, never run as of 2026-08-17).
+`PRISMAQUANT_CB_FUSED_FP4_MOE`, by contrast, executes a *different activation QDQ*
+(native global scale + UE4M3 group factors) than the bridge QDQ the cost table priced.
+Today's default serve is the bridge, so the priced and executed contracts agree
+(principle 8); flipping *that* flag moves them apart. The A/B that qualifies it
+(`scripts/validate_fused_nvfp4_ab.py --mode moe256`, shipped by gridbook) is therefore a
+**pricing-identity gate, not only a speed gate**. Any batch flag a serve relies on —
+contract-preserving or not — must be stamped on the shipcard as `requires_serve_flags`.
+
 **Storage format.** Product vector quantization onto a codebook whose every entry lies exactly
 on a hardware grid, so a decoded tile *is* a bit-standard NVFP4/FP8 tensor and dequantization
 is a gather rather than arithmetic. A weight vector is d=8 wide; a k-bit index selects a
@@ -4214,11 +4274,18 @@ ladders, every integer rung: `NVFP4_CB_K12–K24` (E2M1 grid, 1.78125–3.28125
 serialized body bpw under production layout v2) and `FP8_CB_K28–K48`
 (E4M3 grid, 3.5–6.0 bpw) — `prismaquant/cb_layout.py`, sourced into
 `serving_profile_specs/nvfp4_cb.json`. A third, signed-codebook ladder
-`NVFP4_CB_S13–S16` remains codec/export/decoder compatible for legacy and
-explicit research use, but is **excluded from new production allocations**.
-The 2026-07-22 Qwen3.5-0.8B matched-rung screen found product K lower in
-609/776 weight-MSE comparisons (78.48%); only six signed units survived the
-2.6-bpp allocation. The reproducible command, comparison definition, source
+`NVFP4_CB_S13–S16` existed until **2026-08-17, when it was deleted outright**
+(Rob: *"they are not performant. We don't support them. We can delete them."*).
+The 2026-07-22 Qwen3.5-0.8B matched-rung screen had already found product K
+lower in 609/776 weight-MSE comparisons (78.48%), with only six signed units
+surviving the 2.6-bpp allocation; the deciding fact is that its `n_sub = 1`
+layout fails the predicate every native Gridbook FP4 route tests
+(`linear.py::_require_fp4_v2_product`: `n_sub == 2 and type_size == 4*k + 9`),
+so no signed rung could ever reach a native kernel. No allocation on disk and
+no shipped artifact referenced a signed rung, so the deletion changed no
+assignment. Gridbook still *declares* the family; the cross-repo attestation in
+`tests/test_gridbook_runtime_contract.py` asserts producer ⊆ runtime, so a
+producer that emits fewer rungs than the runtime publishes still passes. The reproducible command, comparison definition, source
 identity, and artifact checksums are in
 `docs/results/qwen35_0p8b_s_rung_headtohead_2026-07-22.md`. Keeping decoder
 support preserves already exported artifacts without advertising a losing rung

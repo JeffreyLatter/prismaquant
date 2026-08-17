@@ -15,18 +15,18 @@ from prismaquant.nvfp4_cb_footprint import CBSerializationContext
 
 def _config_inputs():
     q_product = "model.layers.0.self_attn.q_proj"
-    q_signed = "model.layers.0.self_attn.k_proj"
+    q_second = "model.layers.0.self_attn.k_proj"
     q_fp8 = "model.layers.0.self_attn.v_proj"
     q_stock = "model.layers.0.self_attn.o_proj"
     q_source = "model.layers.0.mlp.gate_proj"
     cb_targets = {
         q_product: ("fp4", "product", 12),
-        q_signed: ("fp4", "signed", 13),
+        q_second: ("fp4", "product", 13),
         q_fp8: ("fp8", "product", 28),
     }
     by_group = {
         ("lattice", "NVFP4_CB_K12"): [q_product],
-        ("k_proj", "NVFP4_CB_S13"): [q_signed],
+        ("k_proj", "NVFP4_CB_K13"): [q_second],
         ("lattice", "FP8_CB_K28"): [q_fp8],
     }
     codebooks = {
@@ -34,7 +34,10 @@ def _config_inputs():
             torch.zeros(64, 4),
             torch.zeros(64, 4),
         ),
-        ("k_proj", "NVFP4_CB_S13"): torch.zeros(32, 8),
+        ("k_proj", "NVFP4_CB_K13"): (
+            torch.zeros(128, 4),
+            torch.zeros(64, 4),
+        ),
         ("lattice", "FP8_CB_K28"): tuple(
             torch.zeros(128, 2) for _ in range(4)
         ),
@@ -46,7 +49,7 @@ def _config_inputs():
     }
     assignment = {
         q_product: "NVFP4_CB_K12",
-        q_signed: "NVFP4_CB_S13",
+        q_second: "NVFP4_CB_K13",
         q_fp8: "FP8_CB_K28",
         q_stock: "NVFP4",
         q_source: "FP8_SOURCE",
@@ -60,7 +63,7 @@ def _config_inputs():
         "codebooks": codebooks,
         "col_weights": {
             q_product: torch.tensor([1.0]),
-            q_signed: torch.tensor([2.0]),
+            q_second: torch.tensor([2.0]),
             q_fp8: torch.tensor([3.0]),
         },
         "codebook_tensors_by_name": blobs,
@@ -100,7 +103,7 @@ def test_resident_and_streaming_emit_identical_schemes_for_same_inputs():
     assert _schemes(resident) == _schemes(streaming)
     assert set(_schemes(resident)) == {
         "NVFP4_CB_K12",
-        "NVFP4_CB_S13",
+        "NVFP4_CB_K13",
         "FP8_CB_K28",
     }
     assert resident["layout_version"] == streaming["layout_version"] == 2

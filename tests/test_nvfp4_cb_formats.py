@@ -127,7 +127,7 @@ def _sweep_total_err(w, cw, grid, mode, k, scale):
 
 
 @pytest.mark.parametrize("grid,mode,k", [
-    ("fp4", "full", 13), ("fp4", "product", 14), ("fp4", "signed", 14),
+    ("fp4", "full", 13), ("fp4", "product", 14),
     ("fp8", "product", 40),
 ])
 def test_scale_sweep_never_worse_than_one_shot(grid, mode, k):
@@ -146,7 +146,7 @@ def test_scale_sweep_never_worse_than_one_shot(grid, mode, k):
 
 
 @pytest.mark.parametrize("mode,k", [
-    ("full", 13), ("product", 14), ("signed", 14)])
+    ("full", 13), ("product", 14)])
 def test_scale_sweep_fp4_scales_are_e4m3_legal(mode, k):
     torch.manual_seed(1)
     w = torch.randn(48, 512) * 0.3
@@ -159,7 +159,7 @@ def test_scale_sweep_fp4_scales_are_e4m3_legal(mode, k):
 
 
 @pytest.mark.parametrize("device", _DEVICES)
-@pytest.mark.parametrize("mode", ["full", "product", "signed"])
+@pytest.mark.parametrize("mode", ["full", "product"])
 def test_scale_sweep_determinism(device, mode):
     torch.manual_seed(2)
     w = (torch.randn(48, 512, device=device) * 0.3)
@@ -194,117 +194,6 @@ def test_scale_sweep_does_not_change_effective_bits():
     for k in (12, 14):
         spec = fr.get_format(f"NVFP4_CB_K{k}")
         assert spec.effective_bits == pytest.approx(k / 8 + 0.5, abs=1e-9)
-
-
-# signed mode: 8 explicit sign bits + (k-8)-bit positive-grid magnitude index.
-_SIGNED_KS = [13, 14, 15, 16]
-
-
-@pytest.mark.parametrize("k", _SIGNED_KS)
-def test_signed_effective_bits_exact(k):
-    spec = fr.get_format(f"NVFP4_CB_S{k}")
-    assert spec.effective_bits == pytest.approx(k / 8 + 0.5, abs=1e-9)
-    assert spec.effective_bits_for_shape((64, 2048)) == pytest.approx(
-        k / 8 + 0.5, abs=1e-9)
-
-
-@pytest.mark.parametrize("k", _SIGNED_KS)
-def test_signed_decode_on_pos_grid_times_scale(k):
-    torch.manual_seed(8)
-    w = torch.randn(48, 512)
-    w[0, :16] = 0.0                       # zero coords: sign must be +1-safe
-    fields = cb.nvfp4_cb_fields(w, k, grid="fp4", mode="signed")
-    assert torch.equal(
-        fields["signs"].abs(), torch.ones_like(fields["signs"]))
-    recon = cb.nvfp4_cb_reconstruct(fields, k, grid="fp4", mode="signed")
-    pes = cb._per_element_scale(fields["scales"], "fp4", 512)
-    q = (recon / pes).abs()               # |value| on the positive half-grid
-    pos = torch.tensor(cb._E2M1_VALUES)
-    dist = (q.unsqueeze(-1) - pos).abs().min(dim=-1).values
-    assert float(dist.max()) < 1e-5
-    # magnitude codebook itself is non-negative and grid-valued
-    mag = fields["codebook"]
-    assert bool((mag >= 0).all())
-    assert torch.equal(cb._snap_to_grid(mag, "fp4"), mag)
-
-
-def test_signed_separable_encode_is_joint_optimum():
-    # For c >= 0 the optimal sign is sign(x) independent of the codeword, so
-    # weighted argmin over |x| + explicit signs must EXACTLY match the
-    # exhaustive joint search over all 2^8 sign patterns x magnitudes.
-    torch.manual_seed(9)
-    w = torch.randn(8, 256)
-    cwq = torch.rand(256) + 0.05
-    # sign-separability is a property of the fixed-scale encode; pin the
-    # one-shot scale so the joint search below sees the same scaled vectors.
-    fields = cb.nvfp4_cb_fields(w, 13, grid="fp4", mode="signed",
-                                col_weights=cwq, scale_sweep=False)
-    mag = fields["codebook"]
-    vecs, _, _ = cb._scale_and_vectorize(w, "fp4")
-    wq = cb._col_weight_vectors(
-        torch.broadcast_to(cwq, (8, 256)).reshape(8, 256))
-    signs_all = torch.tensor(
-        [[1.0 if (s >> j) & 1 == 0 else -1.0 for j in range(8)]
-         for s in range(256)])
-    joint = (signs_all.unsqueeze(1) * mag.unsqueeze(0)).reshape(-1, 8)
-    idx_joint = cb._vq_assign(vecs, joint, wq)
-    err_joint = (wq * (vecs - joint[idx_joint]).pow(2)).sum()
-    rec_sep = mag[fields["indices"].reshape(-1)] * fields["signs"].reshape(
-        -1, 8)
-    err_sep = (wq * (vecs - rec_sep).pow(2)).sum()
-    assert float(err_sep) <= float(err_joint) + 1e-3
-
-
-def test_signed_extends_ladder_beyond_flat_ceiling():
-    # k=15,16 have no flat-full twin (MAX_FLAT_K=14); signed reaches them
-    # with tiny tables. At the one-shot scale signed edges product there
-    # (the scale sweep narrows this to a wash — see the module note); the
-    # durable invariant is that signed extends the exhaustive-optimal ladder.
-    torch.manual_seed(10)
-    w = torch.randn(128, 1024)
-    cw = torch.rand(1024) + 0.05
-    for k in (15, 16):
-        rs = cb.make_nvfp4_cb_qdq(k, "fp4", "signed", scale_sweep=False)(w)
-        rp = cb.make_nvfp4_cb_qdq(k, "fp4", "product", scale_sweep=False)(w)
-        assert _wmse(w, rs, cw) <= _wmse(w, rp, cw) + 1e-9
-        with pytest.raises(ValueError, match="infeasible"):
-            cb.fixed_lattice(k, "fp4", 8)
-
-
-@pytest.mark.parametrize("device", _DEVICES)
-def test_signed_determinism_per_device(device):
-    torch.manual_seed(11)
-    w = torch.randn(48, 512, device=device)
-    qdq = cb.make_nvfp4_cb_qdq(14, "fp4", "signed")
-    assert torch.equal(qdq(w), qdq(w))
-
-
-def test_signed_learned_magnitude_roundtrip():
-    torch.manual_seed(12)
-    w = torch.randn(96, 512)
-    cw = torch.rand(512) + 0.05
-    vecs, _, _ = cb._scale_and_vectorize(w, "fp4")
-    mag = cb.learn_codebook(vecs.abs(), 6, grid="fp4", positive=True,
-                            iters=6)
-    assert mag.shape == (64, 8)
-    assert bool((mag >= 0).all())
-    f_fix = cb.nvfp4_cb_fields(w, 14, grid="fp4", mode="signed",
-                               col_weights=cw)
-    f_lrn = cb.nvfp4_cb_fields(w, 14, grid="fp4", mode="signed",
-                               col_weights=cw, codebook=mag)
-    r_fix = cb.nvfp4_cb_reconstruct(f_fix, 14, grid="fp4", mode="signed")
-    r_lrn = cb.nvfp4_cb_reconstruct(f_lrn, 14, grid="fp4", mode="signed",
-                                    codebook=mag)
-    assert _wmse(w, r_lrn, cw) <= _wmse(w, r_fix, cw) + 1e-9
-    # negative-entry codebooks are rejected (breaks sign optimality)
-    with pytest.raises(ValueError, match="non-negative"):
-        cb.nvfp4_cb_fields(w, 14, grid="fp4", mode="signed",
-                           codebook=mag - 1.0)
-
-
-def test_signed_needs_more_than_sign_bits():
-    with pytest.raises(ValueError, match="signed CB requires"):
-        cb.nvfp4_cb_fields(torch.randn(8, 256), 8, grid="fp4", mode="signed")
 
 
 # FP8_CB: every registered rung is functional through the qdq closure —
@@ -404,7 +293,6 @@ def test_flat_k_ceiling_raises():
 # whole set, per family, structurally.
 _MENU_LADDERS = (
     ("NVFP4_CB_K", tuple(range(12, 25)), lambda k: k / 8 + 0.5),
-    ("NVFP4_CB_S", (13, 14, 15, 16), lambda k: k / 8 + 0.5),
     ("FP8_CB_K", tuple(range(28, 49)), lambda k: k / 8),
 )
 
@@ -418,9 +306,6 @@ def test_menu_registers_and_resolves():
     # dict-form canonicalization (custom quant-config JSON shape).
     assert lc.canonicalize_format(
         {"data_type": "nvfp4_cb", "cb_k": 20}) == "NVFP4_CB_K20"
-    assert lc.canonicalize_format(
-        {"data_type": "nvfp4_cb", "cb_k": 14, "cb_mode": "signed"},
-    ) == "NVFP4_CB_S14"
     assert lc.canonicalize_format(
         {"data_type": "fp8_cb", "cb_k": 44}) == "FP8_CB_K44"
     # The registered menu is EXACTLY the ladder the layer-config parser
@@ -444,11 +329,10 @@ def test_menu_registers_and_resolves():
 # Milestone B — byte packers (format-pipeline.md §1 / LAYOUT.md contract).
 # ===========================================================================
 
-# (grid, mode, k): full/product/signed × both grids, the required matrix.
+# (grid, mode, k): full/product × both grids, the required matrix.
 _PACK_CASES = [
     ("fp4", "product", 12), ("fp4", "product", 14), ("fp4", "product", 16),
     ("fp4", "full", 12), ("fp4", "full", 14), ("fp4", "full", 16),
-    ("fp4", "signed", 16),
     ("fp8", "product", 36), ("fp8", "product", 44),
 ]
 
@@ -771,7 +655,7 @@ def test_two_tier_compose_exact_exhaustive():
 
 # T1b — encoder fuzz: emitted (super, sub) pairs are always legal and the
 # stored plane equals the composition.
-@pytest.mark.parametrize("mode", ["full", "product", "signed"])
+@pytest.mark.parametrize("mode", ["full", "product"])
 def test_two_tier_encoder_emits_only_legal_pairs(mode):
     k = 13 if mode == "full" else 14
     w = _real_magnitude_w(seed=1)
@@ -788,7 +672,7 @@ def test_two_tier_encoder_emits_only_legal_pairs(mode):
 
 
 # T2 — pack -> unpack -> reconstruct == emulation, bit-exact, all modes.
-@pytest.mark.parametrize("mode", ["full", "product", "signed"])
+@pytest.mark.parametrize("mode", ["full", "product"])
 def test_two_tier_pack_unpack_matches_emulation(mode):
     k = 13 if mode == "full" else 14
     w = _real_magnitude_w(seed=2)
@@ -921,7 +805,7 @@ def test_two_tier_candidate_diversity_vs_v1():
 # on subnormal-band tensors (v2's real win is bytes — 0.28 vs 0.5 bpw scale).
 # The v1 balanced encoder now scans an EXHAUSTIVE scale grid (>= the old
 # greedy hill's reach), so v1 error ties v2 here rather than trailing it.
-@pytest.mark.parametrize("mode", ["product", "signed"])
+@pytest.mark.parametrize("mode", ["product"])
 def test_two_tier_beats_one_shot_and_v1_sweep(mode):
     w = _real_magnitude_w(seed=9)
     cw = torch.rand(512) + 0.05
@@ -1242,7 +1126,7 @@ def test_moe_expert_uniformity_across_cb_rungs():
                 for p in ("gate_up_proj", "down_proj")]
     assignment = {
         names_l0[0]: "NVFP4_CB_K14",       # mixed WITHIN layer 0's unit
-        names_l0[1]: "NVFP4_CB_S16",
+        names_l0[1]: "NVFP4_CB_K16",
         names_l1[0]: "NVFP4_CB_K12",       # uniform in layer 1
         names_l1[1]: "NVFP4_CB_K12",
         "model.layers.0.self_attn.q_proj": "NVFP4_CB_K20",   # non-expert
@@ -1253,8 +1137,8 @@ def test_moe_expert_uniformity_across_cb_rungs():
         sorted(fam, key=lambda s: s.effective_bits))}
     promoted = promote_serving_units(assignment, rank,
                                      profile=_CBMoEProfile())
-    # layer 0: promoted to ONE rung = the max-rank member (S16 = 2.5 bpw)
-    assert promoted[names_l0[0]] == promoted[names_l0[1]] == "NVFP4_CB_S16"
+    # layer 0: promoted to ONE rung = the max-rank member (K16 = 2.5 bpw)
+    assert promoted[names_l0[0]] == promoted[names_l0[1]] == "NVFP4_CB_K16"
     # layer 1: untouched (mix across layers is legal)
     assert promoted[names_l1[0]] == promoted[names_l1[1]] == "NVFP4_CB_K12"
     # non-expert Linear not dragged into the unit
@@ -1266,7 +1150,7 @@ def test_cb_legality_rejects_odd_shapes_falls_back():
 
     # in_features % 256 != 0: every CB rung is illegal (the 256-superblock
     # legality doubles as the vector-tiling gate); BF16 stays legal.
-    for fmt in ("NVFP4_CB_K14", "NVFP4_CB_S16", "FP8_CB_K44"):
+    for fmt in ("NVFP4_CB_K14", "NVFP4_CB_K16", "FP8_CB_K44"):
         v = check_format_applicability((64, 320), fmt)
         assert not v.legal and v.reason == "group_divisibility"
         assert check_format_applicability((64, 512), fmt).legal

@@ -1259,11 +1259,13 @@ def load_bundle(path: str | Path) -> CBLearnedBundle:
                     raise ValueError(
                         f"{path}: missing or malformed physical table {ref!r}"
                     )
-                positive = family.mode == "signed"
+                # Every surviving family is an unsigned product family, so the
+                # grid is always the full signed value grid. The signed
+                # (magnitude-only, positive=True) family was deleted 2026-08-17.
                 snapped = cb._snap_to_grid(
                     tensors[ref].to(torch.float32),
                     family.grid,
-                    positive=positive,
+                    positive=False,
                 )
                 if not torch.equal(tensors[ref].to(torch.float32), snapped):
                     raise ValueError(

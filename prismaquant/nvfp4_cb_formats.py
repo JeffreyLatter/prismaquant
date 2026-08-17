@@ -19,11 +19,16 @@ Three VQ modes:
 * ``product`` (default) — the 8-dim vector splits into two 4-dim halves, each
   with its own ``2^(k/2)`` sub-codebook (ceil/floor bit split for odd k). Feasible
   for the whole NVFP4-CB ladder (k=12..24).
-* ``signed`` — sign-magnitude factorization (the IQ-family move): 8 explicit
-  sign bits + an ``m = k-8``-bit index into a MAGNITUDE codebook over the
-  positive half-grid. A flat codebook burns most of its entries covering sign
-  patterns (~2^8 per magnitude shape at d=8, leaving ~2^(k-8) effective
-  magnitude shapes); factoring the signs out spends all 2^m entries on
+* ``signed`` — DELETED 2026-08-17. Sign-magnitude factorization (the
+  IQ-family move) was a real serialized mode until then, but Gridbook's native
+  FP4 path is written against the UNSIGNED two-tier product layout
+  (``n_sub=2, type_size=4*k+9``) and has no quality-preserving prefill kernel
+  for ``n_sub=1``, so a signed rung could only ever ride a fallback route. It
+  had also lost 78.48% of matched weight-MSE comparisons. The historical
+  rationale, for the record: 8 explicit sign bits + an ``m = k-8``-bit index
+  into a MAGNITUDE codebook over the positive half-grid, because a flat
+  codebook burns most of its entries covering sign patterns (~2^8 per
+  magnitude shape at d=8); factoring the signs out spent all 2^m entries on
   magnitude shapes (exp-1 diagnosis: this is why IQ2_S beat flat CB +66% at
   matched bytes). Encode is exactly separable under weighted L2 (see
   ``_fields_block``); tables are tiny (m=5..8 -> 32..256 entries).
@@ -196,8 +201,8 @@ def _snap_to_grid(t: torch.Tensor, grid: str,
                   positive: bool = False) -> torch.Tensor:
     """Project every coordinate onto the element grid (nearest).
 
-    ``positive=True`` restricts to the non-negative half-grid (magnitude
-    codebooks for signed mode): clamp to >=0 first — the nearest full-grid
+    ``positive=True`` restricts to the non-negative half-grid (a
+    magnitude-only codebook): clamp to >=0 first — the nearest full-grid
     value of a non-negative input is itself non-negative, so a plain snap
     then lands on the half-grid."""
     if positive:
@@ -390,7 +395,7 @@ def _build_lattice(k: int, grid: str, d: int,
         samples = vectors.reshape(-1, d)[:m].contiguous()
     if positive:
         # Magnitude lattice: train on |x| of the same post-normalization
-        # distribution (exactly what the signed-mode encoder searches over).
+        # distribution.
         samples = samples.abs()
     if torch.cuda.is_available():
         samples = samples.cuda()
@@ -413,7 +418,7 @@ def learn_codebook(vectors: torch.Tensor, k: int, *, grid: str,
                    seed: int = 0, positive: bool = False) -> torch.Tensor:
     """Weighted Lloyd codebook on the element grid. Returns a (2^k, d)
     grid-valued tensor (positive half-grid when ``positive=True`` — pass
-    ``|vectors|`` to learn a signed-mode magnitude codebook). Deterministic
+    ``|vectors|`` to learn a magnitude-only codebook). Deterministic
     given ``seed`` + ``init`` on CPU; on CUDA the index_add_ float atomics
     can flip grid-snap ties across runs, so ship the resulting codebook
     rather than regenerating it."""
@@ -464,29 +469,10 @@ def _resolve_codebook(k: int, grid: str, mode: str,
                 f"not match canonical serialized shapes {expected_shapes}"
             )
         return tuple(t.to(device, torch.float32) for t in tables)
-    if mode == "signed":
-        n_sub = family_for(grid, mode).n_sub
-        (m,) = subtable_bit_widths(k, mode, n_sub)
-        (expected_shape,) = codebook_subtable_shapes(k, mode, n_sub)
-        if codebook is None:
-            cb = fixed_lattice(m, grid, VEC_DIM, positive=True)
-        else:
-            cb = codebook
-        cb = cb.to(device, torch.float32)
-        actual_shape = tuple(int(dim) for dim in cb.shape)
-        if actual_shape != expected_shape:
-            raise ValueError(
-                f"{grid} {mode} k={k} codebook shape {actual_shape} does "
-                f"not match canonical serialized shape {expected_shape}"
-            )
-        if bool((cb < 0).any()):
-            raise ValueError(
-                "signed-mode magnitude codebook must be non-negative "
-                "(sign-optimality requires codewords on the positive "
-                "half-grid)")
-        return cb
     raise ValueError(
-        f"unknown mode {mode!r} (expected 'full', 'product' or 'signed')")
+        f"unknown mode {mode!r} (expected 'full' or 'product'; the 'signed' "
+        "sign-magnitude mode was deleted 2026-08-17 -- no native Gridbook "
+        "kernel serves the n_sub=1 layout)")
 
 
 # ---------------------------------------------------------------------------
@@ -545,19 +531,9 @@ def _col_weight_vectors(cw2d: torch.Tensor) -> torch.Tensor:
 def _mode_encode(vectors: torch.Tensor, mode: str, cb, wq,
                  wq_period: int | None = None) -> dict:
     """VQ-assign scaled ``vectors`` (nvec, 8) under one mode. Returns per-mode
-    index fields ({"idx": (nvec,) or (nvec, n_sub)}, + "signs" for signed)."""
+    index fields ({"idx": (nvec,) or (nvec, n_sub)})."""
     if mode == "full":
         return {"idx": _vq_assign(vectors, cb, wq, wq_period)}
-    if mode == "signed":
-        # Exactly separable under weighted L2: for any magnitude codeword
-        # c >= 0, sum_j w_j (x_j - s_j c_j)^2 is minimized over s_j in {+-1}
-        # by s_j = sign(x_j) (the cross-term -2 w_j s_j x_j c_j is largest
-        # when s_j x_j >= 0, independent of which codeword is chosen), and at
-        # that sign the objective equals sum_j w_j (|x_j| - c_j)^2. So the
-        # weighted argmin over |x| plus signs = sign(x) IS the joint optimum
-        # — no sign x magnitude search needed. Zero-safe: sign(0) -> +1.
-        return {"idx": _vq_assign(vectors.abs(), cb, wq, wq_period),
-                "signs": torch.where(vectors < 0, -1.0, 1.0)}
     n_sub = len(cb)
     sub_dim = VEC_DIM // n_sub
     idxs = []
@@ -572,8 +548,6 @@ def _mode_decode(enc: dict, mode: str, cb) -> torch.Tensor:
     """Scaled-domain grid reconstruction (nvec, 8) from index fields."""
     if mode == "full":
         return cb[enc["idx"]]
-    if mode == "signed":
-        return cb[enc["idx"]] * enc["signs"]
     parts = [table[enc["idx"][:, i]] for i, table in enumerate(cb)]
     return torch.cat(parts, dim=-1)
 
@@ -582,9 +556,6 @@ def _enc_to_fields(enc: dict, mode: str, cb, rows: int, in_f: int,
                    nvec_per_row: int) -> dict:
     if mode == "full":
         return {"indices": enc["idx"].reshape(rows, nvec_per_row)}
-    if mode == "signed":
-        return {"indices": enc["idx"].reshape(rows, nvec_per_row),
-                "signs": enc["signs"].reshape(rows, in_f)}
     return {"indices": enc["idx"].reshape(rows, nvec_per_row, len(cb))}
 
 
@@ -853,12 +824,9 @@ def _score_argmin(A, B, s):
 
 def _mode_streams(wvec: torch.Tensor, mode: str, cb, wq):
     """Per-sub scoring streams [(x, wq_sub, table)] in the ORIGINAL weight
-    domain. signed scores on |w| (err (w - s*sign(w)*t)^2 == (|w| - s*t)^2
-    for t >= 0); product splits sub-vectors (independent argmins)."""
+    domain. product splits sub-vectors (independent argmins)."""
     if mode == "full":
         return [(wvec, wq, cb)]
-    if mode == "signed":
-        return [(wvec.abs(), wq, cb)]
     n_sub = len(cb)
     sd = VEC_DIM // n_sub
     return [(wvec[:, i * sd:(i + 1) * sd],
@@ -959,8 +927,6 @@ def _scan_and_assign(moms, wvec, grid_s_c, mode, cb, grid, in_f,
     idxs = [torch.gather(i, -1, col_v).squeeze(-1) for i in per_stream_idx]
     if mode == "full":
         enc = {"idx": idxs[0]}
-    elif mode == "signed":
-        enc = {"idx": idxs[0], "signs": torch.where(wvec < 0, -1.0, 1.0)}
     else:
         enc = {"idx": torch.stack(idxs, dim=-1)}
     dec = _mode_decode(enc, mode, cb).reshape(rc, in_f)
@@ -981,8 +947,6 @@ def _argmin_from_moments(moms, wvec, s_g, mode, cb, grid, in_f,
         idxs.append(i)
     if mode == "full":
         enc = {"idx": idxs[0]}
-    elif mode == "signed":
-        enc = {"idx": idxs[0], "signs": torch.where(wvec < 0, -1.0, 1.0)}
     else:
         enc = {"idx": torch.stack(idxs, dim=-1)}
     err = err_v.reshape(rc, G, vec_per_group).sum(dim=-1)
@@ -2700,8 +2664,7 @@ def ldlq_reassign_cb_fields(
     matrix deliberately shares one Hessian across the stack.
     """
     if mode != "product":
-        # Full/signed assignments use different indivisible atoms; signed
-        # signs in particular are coupled by the dense local metric.  Keep the
+        # Full assignments use different indivisible atoms.  Keep the
         # already valid raw fields until an exact search is implemented.
         return dict(fields)
     if weight.ndim == 2:
@@ -3204,14 +3167,6 @@ def ldlq_reassign_cb_fields_gated(
         mixed_indices = torch.cat(mixed_slices, dim=0)
         updated = dict(candidate_fields if any(keep_mask) else fields)
         updated["indices"] = mixed_indices
-        if mode == "signed":
-            raw_sign_slices = [fields["signs"][e*rows_per_expert:(e+1)*rows_per_expert] for e in range(len(keep_mask))]
-            ldlq_sign_slices = [candidate_fields["signs"][e*rows_per_expert:(e+1)*rows_per_expert] for e in range(len(keep_mask))]
-            mixed_signs = [
-                ldlq_sign_slices[e] if keep_mask[e] else raw_sign_slices[e]
-                for e in range(len(keep_mask))
-            ]
-            updated["signs"] = torch.cat(mixed_signs, dim=0)
         return updated, {
             "gate": "mixed_per_expert", "kept_ldlq": keep_mask, **telemetry,
         }
@@ -3295,9 +3250,6 @@ def nvfp4_cb_reconstruct(fields: dict, k: int, *, grid: str = "fp4",
     if mode == "full":
         vecs = cb[indices]                                   # (rows, nvec, 8)
         recon = vecs.reshape(rows, in_f)
-    elif mode == "signed":
-        vecs = cb[indices]                                   # (rows, nvec, 8)
-        recon = vecs.reshape(rows, in_f) * fields["signs"]
     else:
         parts = [table[indices[..., i]] for i, table in enumerate(cb)]
         recon = torch.cat(parts, dim=-1).reshape(rows, in_f)
@@ -3438,20 +3390,11 @@ def _vector_codes(fields: dict, k: int, grid: str, mode: str) -> torch.Tensor:
       * product— the n_sub sub-indices contiguous, sub0 in the low bits
                  (bit widths ``subtable_bit_widths(k, "product", n_sub)``,
                  ceil-first);
-      * signed — 8 sign bits (bit j == coord j is negative) in the low byte,
-                 then the (k-8)-bit magnitude index above them.
     """
     idx = fields["indices"]
     rows = idx.shape[0]
     if mode == "full":
         return idx.reshape(rows, -1).to(torch.int64)
-    if mode == "signed":
-        mag = idx.reshape(rows, -1).to(torch.int64)               # (rows, nvec)
-        signs = fields["signs"].reshape(rows, -1, VEC_DIM)        # (rows,nvec,8)
-        neg = (signs < 0).to(torch.int64)
-        shifts = torch.arange(VEC_DIM, device=neg.device)
-        sign_byte = (neg << shifts).sum(dim=-1)                   # (rows, nvec)
-        return sign_byte | (mag << VEC_DIM)
     # product: idx is (rows, nvec, canonical family n_sub)
     n_sub = family_for(grid, mode).n_sub
     if idx.shape[-1] != n_sub:
@@ -3643,13 +3586,6 @@ def nvfp4_cb_unpack(packed: torch.Tensor, k: int, grid: str, mode: str,
 
     if mode == "full":
         fields: dict = {"indices": codes.reshape(rows, nvec)}
-    elif mode == "signed":
-        sign_byte = codes & 0xFF
-        mag = codes >> VEC_DIM
-        shifts = torch.arange(VEC_DIM, device=codes.device)
-        neg = ((sign_byte.unsqueeze(-1) >> shifts) & 1).bool()  # (rows,nvec,8)
-        signs = torch.where(neg, -1.0, 1.0).reshape(rows, in_f)
-        fields = {"indices": mag.reshape(rows, nvec), "signs": signs}
     elif mode == "product":
         n_sub = family_for(grid, "product").n_sub
         bits = subtable_bit_widths(k, "product", n_sub)

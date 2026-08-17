@@ -349,7 +349,16 @@ def test_partial_dead_hessian_keeps_raw_fields_for_coupled_atoms():
     assert updated["codebook"] is fields["codebook"]
 
 
-def test_unsupported_signed_mode_fails_closed_with_gate_telemetry():
+def test_unsupported_mode_fails_closed_with_gate_telemetry():
+    """LDLQ supports ONLY product mode; anything else must pass through.
+
+    This used to be exercised on ``signed``, which was deleted 2026-08-17.
+    Retargeted to ``full`` rather than removed: the property under test is
+    LDLQ's fail-closed behaviour on a mode whose assignment atoms it cannot
+    reassign, and that property outlived the particular mode that motivated
+    it. ``full`` is now the only such mode, so it is the only remaining way to
+    reach this branch at all.
+    """
     generator = _generator(70)
     weight = torch.randn(2, 256, generator=generator) * 0.2
     col_weights = torch.rand(256, generator=generator) + 0.1
@@ -357,7 +366,7 @@ def test_unsupported_signed_mode_fails_closed_with_gate_telemetry():
         weight,
         13,
         grid="fp4",
-        mode="signed",
+        mode="full",
         col_weights=col_weights,
         scale_sweep=False,
         encode_tier="max",
@@ -369,17 +378,16 @@ def test_unsupported_signed_mode_fails_closed_with_gate_telemetry():
         col_weights,
         activations,
         grid="fp4",
-        mode="signed",
+        mode="full",
     )
     assert direct["indices"] is fields["indices"]
-    assert direct["signs"] is fields["signs"]
     gated, info = cb.ldlq_reassign_cb_fields_gated(
         weight,
         fields,
         col_weights,
         activations,
         grid="fp4",
-        mode="signed",
+        mode="full",
         k=13,
     )
     assert gated is fields

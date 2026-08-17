@@ -7,7 +7,7 @@ menu rungs alongside plain NVFP4/FP8_DYNAMIC/BF16 (the mixed container,
 PLAN.md decision #1 / format-pipeline.md §5), namely:
 
   - serving_profile_specs/nvfp4_cb.json loads, is discoverable, allows both
-    product-VQ ladders + NVFP4/FP8_DYNAMIC/BF16, excludes signed S-rungs from
+    product-VQ ladders + NVFP4/FP8_DYNAMIC/BF16 (the signed S-rungs were
     production allocation while retaining research/codec compatibility, and
     enforces the in_features%256 shape rule (mirrors gguf.json);
   - a mixed menu (NVFP4_CB_K14,NVFP4_CB_K16,FP8_CB_K44,NVFP4,FP8_DYNAMIC,BF16)
@@ -66,8 +66,7 @@ _PRODUCT_CB_RUNGS = (
     [f"NVFP4_CB_K{k}" for k in range(12, 25)]
     + [f"FP8_CB_K{k}" for k in range(28, 49)]
 )
-_SIGNED_CB_RUNGS = [f"NVFP4_CB_S{k}" for k in (13, 14, 15, 16)]
-_ALL_CB_RUNGS = _PRODUCT_CB_RUNGS + _SIGNED_CB_RUNGS
+_ALL_CB_RUNGS = list(_PRODUCT_CB_RUNGS)
 _CB_CONTEXT = CBSerializationContext.production()
 
 
@@ -151,40 +150,11 @@ def test_nvfp4_cb_profile_allows_all_product_rungs_and_carriers_only():
     for name in _PRODUCT_CB_RUNGS + ["NVFP4", "FP8_DYNAMIC", "BF16"]:
         d = prof.check_format(None, name)
         assert d.legal, f"nvfp4_cb profile must allow {name}: {d.reason} {d.detail}"
-    for name in _SIGNED_CB_RUNGS:
-        d = prof.check_format(None, name)
-        assert not d.legal
-        assert d.rule == "nvfp4_cb_container_formats"
-
-
-def test_allocator_masks_signed_rungs_from_production_but_not_research():
-    name = "model.layers.0.self_attn.o_proj"
-    specs = [fr.get_format(rung) for rung in _SIGNED_CB_RUNGS] + [
-        fr.get_format("BF16")
-    ]
-    stats = {name: {"h_trace": 0.8, "n_params": 512 * 512,
-                    "in_features": 512, "out_features": 512}}
-    costs = {name: _costs_for(specs, 0.8)}
-
-    research = build_candidates(
-        stats,
-        costs,
-        specs,
-        target_profile="research",
-        cb_serialization_context=_CB_CONTEXT,
-    )
-    production = build_candidates(
-        stats,
-        costs,
-        specs,
-        target_profile="nvfp4_cb",
-        cb_serialization_context=_CB_CONTEXT,
-    )
-
-    assert {candidate.fmt for candidate in research[name]} == {
-        *_SIGNED_CB_RUNGS, "BF16"
-    }
-    assert [candidate.fmt for candidate in production[name]] == ["BF16"]
+    # The signed S-rungs used to be registered-but-denied here. They were
+    # DELETED 2026-08-17, so assert the strictly stronger property: nothing
+    # signed survives anywhere in the registry or the profile's menu.
+    assert not [n for n in fr.REGISTRY if n.startswith("NVFP4_CB_S")]
+    assert not [n for n in _ALL_CB_RUNGS if n.startswith("NVFP4_CB_S")]
 
 
 def test_nvfp4_cb_profile_denies_out_of_family_format():
@@ -195,7 +165,7 @@ def test_nvfp4_cb_profile_denies_out_of_family_format():
     assert not d.legal and d.reason == "profile_mismatch"
 
 
-@pytest.mark.parametrize("rung", ["NVFP4_CB_K12", "NVFP4_CB_S16", "FP8_CB_K44"])
+@pytest.mark.parametrize("rung", ["NVFP4_CB_K12", "NVFP4_CB_K16", "FP8_CB_K44"])
 def test_nvfp4_cb_profile_shape_rule_256(rung):
     ok = sp.check_serving_shape(
         "nvfp4_cb", rung, in_features=2048, out_features=512)
@@ -684,7 +654,7 @@ def test_task_example_mixed_menu_flows_end_to_end(tmp_path, monkeypatch):
 #     broken in batched mode, which run-pipeline.sh uses). Mirrors
 #     test_gguf_formats.test_batched_cost_path_matches_unbatched.
 # ---------------------------------------------------------------------------
-_CB_COST_RUNGS = ["NVFP4_CB_K16", "NVFP4_CB_S16", "FP8_CB_K44"]
+_CB_COST_RUNGS = ["NVFP4_CB_K16", "NVFP4_CB_K20", "FP8_CB_K44"]
 
 
 def _set_explicit_cb_render_env(monkeypatch):

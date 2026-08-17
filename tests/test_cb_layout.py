@@ -88,20 +88,39 @@ def test_exact_accountant_uses_layout_subtable_shapes():
 
 def test_family_and_subtable_rules_are_canonical():
     fp4_product = cb_layout.family_for("fp4", "product")
-    fp4_signed = cb_layout.family_for("FP4", "SIGNED")
     fp8_product = cb_layout.family_for("fp8", "product")
 
     assert fp4_product.n_sub == 2
-    assert fp4_signed.n_sub == 1
     assert fp8_product.n_sub == 4
     assert cb_layout.subtable_bit_widths(13, "product", 2) == (7, 6)
-    assert cb_layout.subtable_bit_widths(13, "signed", 1) == (5,)
     assert cb_layout.subtable_bit_widths(29, "product", 4) == (8, 7, 7, 7)
 
     with pytest.raises(ValueError, match="unknown CB grid/mode"):
         cb_layout.family_for("fp4", "full")
-    with pytest.raises(ValueError, match="signed CB requires"):
-        cb_layout.subtable_bit_widths(13, "signed", 2)
+
+
+def test_signed_family_is_deleted_and_refused_not_silently_reinterpreted():
+    """The signed sign-magnitude family was deleted 2026-08-17.
+
+    Gridbook's native FP4 path requires the UNSIGNED two-tier product layout
+    (``n_sub=2, type_size=4*k+9``) and has no quality-preserving prefill kernel
+    for ``n_sub=1``, so a signed rung could only ever ride a fallback route.
+
+    Both halves matter. The family must be gone, AND ``subtable_bit_widths``
+    must REFUSE the mode rather than fall through to the product split: a
+    silent fall-through would hand a stale caller a different subtable geometry
+    under the same name, which is a serialized-layout corruption rather than an
+    error.
+    """
+    assert not any(f.mode == "signed" for f in cb_layout.FAMILIES)
+    assert not any(n.startswith("NVFP4_CB_S") for n in cb_layout.CB_FORMATS)
+    assert cb_layout.parse_format_name("NVFP4_CB_S16") is None
+
+    with pytest.raises(ValueError, match="unknown CB grid/mode"):
+        cb_layout.family_for("fp4", "signed")
+    for n_sub in (1, 2):
+        with pytest.raises(ValueError, match="signed CB mode was deleted"):
+            cb_layout.subtable_bit_widths(13, "signed", n_sub)
 
 
 def test_product_menu_and_lattice_generator_derive_from_layout():

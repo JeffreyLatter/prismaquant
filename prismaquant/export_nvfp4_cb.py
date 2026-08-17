@@ -113,8 +113,9 @@ def _git_commit() -> str:
 
 
 def _parse_cb_format(fmt: str) -> tuple[str, str, int] | None:
-    """``NVFP4_CB_K{k}`` -> (fp4, product, k); ``NVFP4_CB_S{k}`` -> (fp4,
-    signed, k); ``FP8_CB_K{k}`` -> (fp8, product, k). None for non-CB."""
+    """``NVFP4_CB_K{k}`` -> (fp4, product, k); ``FP8_CB_K{k}`` -> (fp8,
+    product, k). None for non-CB. (``NVFP4_CB_S{k}`` was the signed family,
+    deleted 2026-08-17; `parse_format_name` no longer recognizes it.)"""
     parsed = parse_format_name(str(fmt).strip().upper())
     if parsed is None:
         return None
@@ -525,8 +526,9 @@ def _vecs_and_wq(w: torch.Tensor, cw: torch.Tensor | None, grid: str):
 def _train_shared_codebook(weights, cws, *, grid, mode, k, seed, iters,
                            train_cap):
     """One learned codebook over a role's pooled scaled vectors (the exp1b
-    shared-per-role logic): signed -> positive magnitude table; product ->
-    n_sub grid-snapped sub-tables; full -> one (2^k, 8) table."""
+    shared-per-role logic): product -> n_sub grid-snapped sub-tables; full ->
+    one (2^k, 8) table. (The signed positive-magnitude mode was deleted
+    2026-08-17 -- no native Gridbook kernel serves the n_sub=1 layout.)"""
     vlist, wlist = [], []
     for w, cw in zip(weights, cws):
         v, wq = _vecs_and_wq(w, cw, grid)
@@ -539,15 +541,6 @@ def _train_shared_codebook(weights, cws, *, grid, mode, k, seed, iters,
         idx = torch.randperm(vec.shape[0], generator=g)[:train_cap].to(
             vec.device)
         vec, wq = vec[idx], wq[idx]
-    if mode == "signed":
-        signed_bits = subtable_bit_widths(
-            k,
-            "signed",
-            family_for(grid, "signed").n_sub,
-        )[0]
-        return cb.learn_codebook(vec.abs(), signed_bits, grid=grid,
-                                 col_weights=wq, positive=True, iters=iters,
-                                 seed=seed).cpu()
     if mode == "product":
         n_sub = family_for(grid, mode).n_sub
         sub_dim = cb.VEC_DIM // n_sub

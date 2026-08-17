@@ -415,9 +415,12 @@ def _derive_dense_plan(profile, body: Sequence[str]) -> DensePlan:
     Neither ladder is a CLI opinion or a constant taken on trust:
 
     * the registered family is narrowed by the serving profile's production
-      format rule, which is what drops the signed ``NVFP4_CB_S13..S16`` rungs
-      (codec-compatible but research-only after losing 78.48% of matched
-      weight-MSE comparisons);
+      format rule. This used to be what dropped the signed ``NVFP4_CB_S13..S16``
+      rungs (research-only after losing 78.48% of matched weight-MSE
+      comparisons); that family was DELETED 2026-08-17, since every native
+      Gridbook FP4 route requires the unsigned two-tier product layout
+      (``n_sub == 2 and type_size == 4*k + 9``), so the narrowing now has no
+      signed rung left to drop;
     * ``fp8_cb`` is narrowed again to the fused mid-M rungs the pinned Gridbook
       release backs -- ``k % 4 == 0``, because ``type_size = 4k`` must be a
       16-byte multiple and the fused mainloop's uniform ``CbSubW = k/4`` is
@@ -425,6 +428,16 @@ def _derive_dense_plan(profile, body: Sequence[str]) -> DensePlan:
     * ``nvfp4_cb`` declares no fused rung at any version, so every rung rides
       the documented fallback route. That is a speed property, not a
       correctness one, and it restricts nothing.
+
+      Read that bullet narrowly: ``fused_mid_m`` is ONE lane for ONE
+      batch-size regime. It is not a whole-unit verdict, and reading it as one
+      is how a gate came to report a 73.7% "unbacked" share for an artifact
+      whose decode path is 100% native and default-on (``cb_moe_gemv_fp4_v2``
+      for routed ``T <= 16``; the FP4-v2 GEMV for dense ``M <= 8``). Above
+      those thresholds NVFP4-CB does ride a BF16 bridge unless
+      ``PRISMAQUANT_CB_FUSED_FP4[_MOE]`` is set, and the mid-M fused lane is
+      DENSE-ONLY -- it can never cover a routed expert. Report native
+      execution per regime or not at all.
 
     The module constants are then asserted against what was derived, so a
     runtime pin bump that moves a rung set refuses here instead of silently

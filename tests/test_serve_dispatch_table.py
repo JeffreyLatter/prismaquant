@@ -236,7 +236,6 @@ def test_decode_tok_s_reference_converts_to_ms_per_token():
     ("FP8_CB_K36", "FP8_CB"),
     ("FP8_CB_K28", "FP8_CB"),
     ("NVFP4_CB_K16", "NVFP4_CB"),
-    ("NVFP4_CB_S13", "NVFP4_CB"),
     ("NVFP4", "NVFP4"),
     ("FP8_E4M3", "FP8_E4M3"),
     ("BF16", "BF16"),

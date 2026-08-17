@@ -64,7 +64,14 @@ IMATRIX_SEQLEN = 1024
 SUPERBLOCK = 256
 EPS = 1e-8
 FP4_PRODUCT_N_SUB = family_for("fp4", "product").n_sub
-FP4_SIGNED_N_SUB = family_for("fp4", "signed").n_sub
+# The signed sign-magnitude family was DELETED 2026-08-17 (no native Gridbook
+# kernel serves the n_sub=1 layout). This script is kept as the HISTORICAL
+# record of the CB-vs-IQ comparison that retired it -- the arm table and the
+# report text below quote its measured results -- so the constant is inlined
+# rather than resolved from the (now absent) family. The signed ARMS are no
+# longer runnable: the encoder mode is gone, and _build_shared_codebook below
+# refuses them explicitly instead of failing deep in a VQ assign.
+FP4_SIGNED_N_SUB = 1  # historical: family_for("fp4", "signed").n_sub
 
 # ---------------------------------------------------------------------------
 # Arm table. `fmt` is the emulation format name (a dynamically-registered
@@ -789,6 +796,11 @@ def train_shared_codebooks(model, targets, imatrix, *, mode, k, seed,
             idx = torch.randperm(vec.shape[0], generator=g)[:train_cap].to(vec.device)
             vec, wq = vec[idx], wq[idx]
         if mode == "signed":
+            raise RuntimeError(
+                "signed CB mode was deleted 2026-08-17; this arm is retained "
+                "only as the historical record of the comparison that retired "
+                "it and can no longer be executed")
+        if False:
             (magnitude_bits,) = subtable_bit_widths(
                 k, mode, FP4_SIGNED_N_SUB
             )

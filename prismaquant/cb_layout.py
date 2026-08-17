@@ -51,9 +51,25 @@ class CBFamily:
 
 
 NVFP4_PRODUCT_RUNGS = tuple(range(12, 25))
-NVFP4_SIGNED_RUNGS = (13, 14, 15, 16)
 FP8_PRODUCT_RUNGS = tuple(range(28, 49))
 
+# The signed sign-magnitude family (``NVFP4_CB_S13..S16``, mode="signed",
+# n_sub=1) was DELETED on 2026-08-17 (Rob: "we can get entirely rid of the
+# signed versions. they are not performant. We don't support them.").
+#
+# It was already excluded from production allocation by the serving profile's
+# format rule -- research-only after losing 78.48% of matched weight-MSE
+# comparisons -- so no shipped artifact and no allocation on disk references an
+# ``NVFP4_CB_S*`` rung, and removing it changes no assignment.
+#
+# The durable reason it can never come back without new kernels: Gridbook's
+# native FP4 path is written against the UNSIGNED two-tier product layout and
+# tests for it exactly -- ``is_fp4 and is_v2 and n_sub == 2 and
+# type_size == 4*k + 9`` (gridbook ``linear.py::_require_fp4_v2_product``).
+# A signed n_sub=1 rung has decode support in older kernels but "no native
+# quality-preserving dense prefill kernel", and it trips the v2 GEMV's own
+# ``cb_elems`` check (gridbook ``moe_gemv_select.py:307``). Serving it would
+# mean one layer changing numeric implementation with batch size.
 FAMILIES = (
     CBFamily(
         prefix="NVFP4_CB_K",
@@ -61,15 +77,6 @@ FAMILIES = (
         mode="product",
         n_sub=2,
         rungs=NVFP4_PRODUCT_RUNGS,
-        layout_versions=(1, 2),
-        moe_layout_versions=(2,),
-    ),
-    CBFamily(
-        prefix="NVFP4_CB_S",
-        grid="fp4",
-        mode="signed",
-        n_sub=1,
-        rungs=NVFP4_SIGNED_RUNGS,
         layout_versions=(1, 2),
         moe_layout_versions=(2,),
     ),
@@ -115,7 +122,7 @@ FP8_CB_FORMAT_NAMES = frozenset(
     if family.grid == "fp8"
     for k in family.rungs
 )
-_FORMAT_RE = re.compile(r"^(NVFP4_CB_[KS]|FP8_CB_K)(\d+)$")
+_FORMAT_RE = re.compile(r"^(NVFP4_CB_K|FP8_CB_K)(\d+)$")
 
 
 def bit_split(k: int, n_sub: int) -> tuple[int, ...]:
@@ -147,21 +154,25 @@ def subtable_bit_widths(
 ) -> tuple[int, ...]:
     """Index bits represented by each serialized codebook subtable.
 
-    Product families split all ``k`` bits ceil-first. Signed families spend
-    the low ``VEC_DIM`` bits on signs, so their sole magnitude table represents
-    only ``k - VEC_DIM`` bits. Full mode has one table representing all bits.
+    Product families split all ``k`` bits ceil-first. Full mode has one table
+    representing all bits.
+
+    ``signed`` is refused rather than merely absent: it was a real serialized
+    mode until 2026-08-17, so a stale caller passing it must fail loudly
+    instead of falling through to the product split, which would silently
+    produce a different subtable geometry for the same name.
     """
 
     k = int(k)
     mode = str(mode).lower()
     n_sub = int(n_sub)
     if mode == "signed":
-        if n_sub != 1 or k <= VEC_DIM:
-            raise ValueError(
-                f"signed CB requires n_sub=1 and k > {VEC_DIM}, got "
-                f"{(k, n_sub)!r}"
-            )
-        return (k - VEC_DIM,)
+        raise ValueError(
+            "signed CB mode was deleted 2026-08-17: Gridbook's native FP4 path "
+            "requires the unsigned two-tier product layout (n_sub=2, "
+            "type_size=4*k+9) and has no quality-preserving prefill kernel for "
+            "n_sub=1. Use an NVFP4_CB_K* product rung."
+        )
     if mode == "full":
         if n_sub != 1:
             raise ValueError(f"full CB requires n_sub=1, got {n_sub}")
@@ -246,7 +257,6 @@ __all__ = [
     "INDEX_BYTES_PER_K",
     "LAYOUT_FOR_SCALE_CODING",
     "NVFP4_PRODUCT_RUNGS",
-    "NVFP4_SIGNED_RUNGS",
     "PRODUCT_CB_FORMAT_NAMES",
     "PRODUCT_CB_FORMATS",
     "SCALE_CODINGS",

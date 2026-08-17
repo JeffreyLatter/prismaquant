@@ -15,7 +15,7 @@
       "FP8_BLOCK_UE8M0_SOURCE"
     ],
     "reason": "exporter_cannot_emit",
-    "detail": "The exporter's codec surface remains the structural upper bound: NVFP4_CB_K12..K24, research-compatible NVFP4_CB_S13..S16, FP8_CB_K28..K48, delegated NVFP4/FP8_DYNAMIC, FP8_SOURCE, and BF16. The production format rule below deliberately narrows that emittable set by excluding signed S13..S16; their decoder/export support remains available for legacy and explicitly research-scoped artifacts. INT4_W4A16 remains a registry-only research format until the approved Gridbook-owned packing/profile/loader/delegation work is implemented and validated. Anything outside the exporter declaration hard-fails rather than silently BF16-coercing a Linear and blowing the allocated byte budget."
+    "detail": "The exporter's codec surface remains the structural upper bound: NVFP4_CB_K12..K24, FP8_CB_K28..K48, delegated NVFP4/FP8_DYNAMIC, FP8_SOURCE, and BF16. The signed NVFP4_CB_S13..S16 family was DELETED 2026-08-17: it was already research-only here, and Gridbook's native FP4 path is written against the unsigned two-tier product layout (n_sub=2, type_size=4*k+9) with no quality-preserving prefill kernel for n_sub=1, so a signed rung could only ever ride a fallback route. INT4_W4A16 remains a registry-only research format until the approved Gridbook-owned packing/profile/loader/delegation work is implemented and validated. Anything outside the exporter declaration hard-fails rather than silently BF16-coercing a Linear and blowing the allocated byte budget."
   },
   "format_rules": [
     {

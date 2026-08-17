@@ -80,8 +80,18 @@ def canonicalize_format(entry: dict | str | int) -> str:
                 raise ValueError(f"unsupported gguf scheme: {entry!r}")
             return gguf_type
         if dt == "nvfp4_cb":
-            rung = "S" if str(entry.get("cb_mode", "")) == "signed" else "K"
-            name = f"NVFP4_CB_{rung}{int(entry['cb_k'])}"
+            # ``cb_mode`` no longer selects a prefix: the signed family was
+            # deleted 2026-08-17, so every NVFP4-CB rung is an unsigned
+            # product rung. Refuse a stale recipe that still asks for signed
+            # rather than silently serving it the product rung of the same k,
+            # which is a different codebook with the same name.
+            if str(entry.get("cb_mode", "")) == "signed":
+                raise ValueError(
+                    "signed NVFP4-CB rungs (NVFP4_CB_S*) were deleted "
+                    "2026-08-17 -- no native Gridbook kernel serves the "
+                    f"n_sub=1 layout. Re-allocate on a product rung: {entry!r}"
+                )
+            name = f"NVFP4_CB_K{int(entry['cb_k'])}"
             if name not in _NVFP4_CB_FORMAT_NAMES:
                 raise ValueError(f"unsupported nvfp4_cb scheme: {entry!r}")
             return name

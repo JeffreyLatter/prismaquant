@@ -76,7 +76,7 @@ PASSTHROUGH_FORMATS = {"BF16", "FP8_SOURCE"}
 # shipped bytes, never chunked (moe_cb_design.md §3).
 _CB_FAMILIES = {"nvfp4_cb", "fp8_cb"}
 # Both CB families carry k-rung ladders (k index bits per 8-weight vector).
-# Ladders are PER (family, mode) — NVFP4_CB_K, NVFP4_CB_S, FP8_CB_K are
+# Ladders are PER (family, mode) — NVFP4_CB_K and FP8_CB_K are
 # different grids/codings and never share one log-linear fit. The RD-law fit
 # is holdout-gated per unit, so admitting a family costs nothing when the law
 # fails there (falls back to full measurement).

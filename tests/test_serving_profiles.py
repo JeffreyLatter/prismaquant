@@ -412,41 +412,6 @@ def test_vllm_lane_denies_the_a16_rungs_with_a_structural_reason():
         assert decision.reason == "exporter_cannot_emit", fmt
 
 
-@pytest.mark.parametrize("qname,packed_expert", NVFP4_CB_SCOPE_CASES)
-@pytest.mark.parametrize(
-    "fmt", ["NVFP4_CB_S13", "NVFP4_CB_S14", "NVFP4_CB_S15", "NVFP4_CB_S16"]
-)
-def test_nvfp4_cb_signed_rungs_are_research_only_in_every_scope(
-    fmt, qname, packed_expert
-):
-    """Codec compatibility must not make a signed rung production-selectable."""
-    emittable = lane_emittable_formats("nvfp4_cb")
-    assert emittable is not None and fmt in emittable
-    assert fmt in fr.REGISTRY
-    assert check_serving_format(
-        "research", qname, fmt, packed_expert=packed_expert
-    ).legal
-
-    decision = check_serving_format(
-        "nvfp4_cb", qname, fmt, packed_expert=packed_expert
-    )
-    assert not decision.legal
-    assert decision.reason == "profile_mismatch"
-    assert decision.rule == "nvfp4_cb_container_formats"
-
-
-def test_nvfp4_cb_signed_rungs_retain_legacy_shape_compatibility():
-    for fmt in ("NVFP4_CB_S13", "NVFP4_CB_S14", "NVFP4_CB_S15", "NVFP4_CB_S16"):
-        assert check_serving_shape(
-            "nvfp4_cb", fmt, in_features=2048, out_features=512
-        ).legal
-        decision = check_serving_shape(
-            "nvfp4_cb", fmt, in_features=2064, out_features=512
-        )
-        assert not decision.legal
-        assert decision.reason == "kernel_shape"
-
-
 def test_nvfp4_cb_all_product_rungs_remain_in_every_production_scope():
     product_rungs = (
         *(f"NVFP4_CB_K{k}" for k in range(12, 25)),

@@ -62,7 +62,9 @@ Two caveats to settle against the real checkpoint before acting:
 ## 4. What the format menu can supply
 
 Sub-4 bpp is CB territory. The registry already carries the rungs:
-`NVFP4_CB_K12` … `NVFP4_CB_K24` (group 256, A4) and `NVFP4_CB_S13`…`S16`.
+`NVFP4_CB_K12` … `NVFP4_CB_K24` (group 256, A4). (The signed
+`NVFP4_CB_S13`…`S16` rungs were deleted 2026-08-17 — no native kernel serves
+their `n_sub = 1` layout.)
 `FP8_CB_K28`…`K48` cover the 8-bit-activation CB family.
 
 Two standing constraints apply when picking rungs:

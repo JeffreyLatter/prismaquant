@@ -76,7 +76,7 @@ def _shape_decision(fmt, *, out_features, in_features=1024):
 
 @pytest.mark.parametrize("out_features", [8, 16, 24, 512, 4096])
 def test_fp4_cb_rungs_load_on_out_features_multiple_of_8(out_features):
-    for fmt in ("NVFP4_CB_K12", "NVFP4_CB_K24", "NVFP4_CB_S16"):
+    for fmt in ("NVFP4_CB_K12", "NVFP4_CB_K24"):
         assert _shape_decision(fmt, out_features=out_features).legal
 
 
@@ -288,7 +288,7 @@ def test_the_fp4_opt_in_fused_mid_m_lane_is_available_not_backed():
                 if l.id == "nvfp4_cb_quality_path")
     assert lane.fused_mid_m_rungs_by_runtime_version == ()
     assert "PRISMAQUANT_CB_FP4_FUSED_MIDM" in lane.detail
-    for fmt in ("NVFP4_CB_K12", "NVFP4_CB_K24", "NVFP4_CB_S16"):
+    for fmt in ("NVFP4_CB_K12", "NVFP4_CB_K24"):
         route = sp.serving_lane_route(_PROFILE, fmt)
         assert not route.fused_mid_m_backed, fmt
         assert route.rungs_source == "lane_declares_no_fused_mid_m_lane"

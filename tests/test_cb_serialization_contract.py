@@ -42,7 +42,7 @@ from prismaquant.nvfp4_cb_footprint import (
 from prismaquant.validate_assignments_kl import _assignment_bpp_details
 
 
-@pytest.mark.parametrize("mode,k", [("product", 12), ("signed", 13)])
+@pytest.mark.parametrize("mode,k", [("product", 12)])
 @pytest.mark.parametrize("shape", [(2, 256), (2, 2, 256)])
 @pytest.mark.parametrize("scale_coding", ["v1", "two_tier"])
 def test_cost_qdq_matches_serialized_pack_unpack(
@@ -59,7 +59,7 @@ def test_cost_qdq_matches_serialized_pack_unpack(
     col_weights = torch.rand(*shape[:-2], 1, shape[-1]) + 0.05
     if len(shape) == 2:
         col_weights = col_weights.reshape(-1)
-    spec = fr.get_format(f"NVFP4_CB_{'S' if mode == 'signed' else 'K'}{k}")
+    spec = fr.get_format(f"NVFP4_CB_K{k}")
 
     measured = _cb_cost_quantize_dequantize(
         spec,
@@ -624,7 +624,7 @@ def _write_canonical_lattice_sidecar(path, payload):
         fmt = sidecar["format"]
         family, rung = fmt.split("_CB_", 1)
         grid = "fp4" if family == "NVFP4" else "fp8"
-        mode = "signed" if rung.startswith("S") else "product"
+        mode = "product"
         k = int(rung[1:])
         codebook = cb._resolve_codebook(
             k, grid, mode, None, torch.device("cpu")
