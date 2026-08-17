@@ -5,7 +5,7 @@ This is the one-Spark source-teacher path.  It deliberately extends the
 repository's existing StreamingContext instead of inventing a second offload
 or residency mechanism.  The complete BF16 source never has to be resident at
 once; one decoder layer is installed at a time and logits are reduced to the
-fixed top-1024 gold support on GPU.
+fixed top-K gold support (PROMPT_TOP_K) on GPU.
 """
 
 from __future__ import annotations
@@ -40,7 +40,9 @@ try:  # package mode
         build_calibration_contract,
         canonical_sha256,
         compact_source_model_identity,
+        format_forward_fidelity_profile,
         payload_semantic_sha256,
+        teacher_forward_fidelity_summary,
         teacher_meta,
         tokenizer_identity,
         validate_teacher_payload,
@@ -61,7 +63,9 @@ except ImportError:  # direct script mode
         build_calibration_contract,
         canonical_sha256,
         compact_source_model_identity,
+        format_forward_fidelity_profile,
         payload_semantic_sha256,
+        teacher_forward_fidelity_summary,
         teacher_meta,
         tokenizer_identity,
         validate_teacher_payload,
@@ -241,6 +245,21 @@ def _build_payload(args: argparse.Namespace) -> dict:
     }
     payload["payload_semantic_sha256"] = payload_semantic_sha256(payload)
     validate_teacher_payload(payload)
+    # Report the forward-fidelity profile on every build, refusal or not, so
+    # the teacher's own teacher-forced NLL is in the log alongside the payload
+    # it graded students with.  validate_teacher_payload has already run this
+    # gate; a refusal propagates from there and main() never reaches the write.
+    print(
+        format_forward_fidelity_profile(
+            teacher_forward_fidelity_summary(
+                payload["topk_ids"],
+                payload["topk_lps"],
+                payload["calib_ids"],
+                vocab_size=int(payload["vocab_size"]),
+            )
+        ),
+        flush=True,
+    )
     return payload
 
 

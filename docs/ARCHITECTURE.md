@@ -1,8 +1,15 @@
 # PrismaQuant Architecture
 
 As of: 2026-08-16 · branch `fix/aqua-profile-aware-resolver` · re-stamped for
-the **DSv4 gold lane's first execution**, which found two defects that made it
-unrunnable as written (§7.3). Its teacher support widens from top-1024 to
+the **teacher forward-fidelity gate** (§7.3): the DSv4 gold lane's first
+execution built a BF16 teacher whose *own* teacher-forced perplexity was 262 —
+far worse than the 2.34-bpp student it was grading — and every existing gate
+passed it, because top-K coverage cannot distinguish a confidently wrong
+distribution from a correct one. The new gate enforces **context-monotonicity**
+on the teacher's own NLL, recovered from the payload alone, and refuses at
+build, `teacher_meta` and `load_teacher_evidence` alike. Re-stamped with it for
+the **DSv4 gold lane's first execution**, which found two further defects that
+made it unrunnable as written (§7.3). Its teacher support widens from top-1024 to
 **top-8192** — measured, not chosen: at 1024 the BF16 teacher misses the 0.90
 per-position coverage floor on 34 of 4,088 positions, so the gate refused every
 teacher the lane could build; 8192 is the smallest swept K that clears it, and
@@ -3264,6 +3271,34 @@ probability mass is finite and at most `1 + 1e-6`. Contract
 `prismaquant.topk_tail_coverage_policy/1` additionally requires **at least 0.90 mass at every
 position** (therefore at most 0.10 declared tail mass), and records recomputed mean/minimum
 coverage; a caller-supplied summary is never trusted.
+
+**Coverage is not fidelity, and a second gate says so.** A confidently *wrong*
+distribution is still sharply peaked, so the coverage policy above is silent on
+whether the teacher's forward pass is correct at all. On 2026-08-16 that
+silence shipped a teacher whose own teacher-forced perplexity was 262 — far
+worse than the 2.34-bpp student it was grading — and every existing gate
+passed. `teacher_forward_fidelity_summary` (`tools/full_kl_teacher_payload.py`,
+contract `prismaquant.teacher_forward_fidelity_policy/1`) closes it, and runs
+inside `validate_teacher_payload`, so build, `teacher_meta` and
+`load_teacher_evidence` all refuse: an unfaithful payload cannot be replayed
+into shipcard evidence either. It recovers the teacher's own per-position NLL
+from the payload alone — no extra forward — imputing out-of-support targets by
+the two exact bounds the row already carries (declared tail mass, and the
+smallest probability in a sorted top-K), which is a *lower* bound, so the
+imputation can never manufacture a refusal. Positions are partitioned into
+octaves of available context (the scale-free partition of a power law, and
+fully determined by `SEQLEN`), and every ordered octave pair is compared by a
+one-sided Welch t-test on per-position NLL. The enforced property is
+**context-monotonicity**: a correct autoregressive model on contiguous natural
+text improves with context and never inverts, whatever its absolute quality —
+so the gate is scale-free and needs no absolute NLL threshold. "Materially
+worse" is measured in the payload's own dispersion; the only convention is the
+significance level, fixed at family-wise `1/scored_positions` split Bonferroni
+across the comparisons, and the verdict is insensitive to it across ~60 decades.
+A secondary absolute ceiling of `ln(vocab_size)` refuses a teacher no more
+informative than uniform over its own vocabulary. Both the profile and the
+worst comparison print on every build, refusal or not.
+
 Student measurement must load and replay both files, carry the compact
 `teacher_evidence` into its result, report exactly 4,088 positions, and require
 the teacher source identity to equal the candidate artifact's source identity.

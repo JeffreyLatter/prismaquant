@@ -10,7 +10,7 @@ serialized file are all digest-bound.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 import hashlib
 import json
 import math
@@ -63,11 +63,21 @@ EXPECTED_POSITIONS = N_SAMPLES * (SEQLEN - 1)
 # teacher distribution.
 TOPK_PROBABILITY_MASS_ABS_TOLERANCE = 1e-6
 # The tail bucket makes the statistic defined below this point, but allowing a
-# mostly-tail distribution would make the top-1024 comparison uninformative.
+# mostly-tail distribution would make the top-K comparison uninformative.
 # Requiring 90% support caps the declared aggregated teacher tail at 10% per
-# scored position while remaining conservative for a language-model top-1024.
+# scored position while remaining conservative for a language-model top-K.
 TOPK_MINIMUM_COVERAGE = 0.90
 TOPK_COVERAGE_POLICY_SCHEMA = "prismaquant.topk_tail_coverage_policy/1"
+
+FORWARD_FIDELITY_POLICY_SCHEMA = "prismaquant.teacher_forward_fidelity_policy/1"
+# Continued-fraction iteration cap for the regularized incomplete beta below.
+# This is a fail-closed numerical guard, not a decision threshold: exceeding it
+# raises rather than returning an unconverged tail probability.
+_BETA_CF_MAX_ITERATIONS = 1024
+# Largest NLL whose perplexity is representable.  Reporting-only: a mean NLL
+# past this point is shown as an infinite perplexity instead of raising an
+# overflow.  Derived from the float64 range, not chosen.
+_MAX_REPORTABLE_NLL = math.log(float(torch.finfo(torch.float64).max))
 
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _TENSOR_KEYS = ("calib_ids", "topk_ids", "topk_lps")
@@ -210,6 +220,424 @@ def topk_coverage_summary(
         "topk_coverage_min": coverage_min,
         "topk_coverage_policy": topk_coverage_policy(),
     }
+
+
+def _beta_continued_fraction(a: float, b: float, x: float) -> float:
+    """Lentz evaluation of the continued fraction for the incomplete beta."""
+    eps = float(torch.finfo(torch.float64).eps)
+    tiny = float(torch.finfo(torch.float64).tiny)
+    qab, qap, qam = a + b, a + 1.0, a - 1.0
+    c = 1.0
+    d = 1.0 - qab * x / qap
+    if abs(d) < tiny:
+        d = tiny
+    d = 1.0 / d
+    h = d
+    for m in range(1, _BETA_CF_MAX_ITERATIONS + 1):
+        m2 = 2 * m
+        for numerator in (
+            m * (b - m) * x / ((qam + m2) * (a + m2)),
+            -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2)),
+        ):
+            d = 1.0 + numerator * d
+            if abs(d) < tiny:
+                d = tiny
+            c = 1.0 + numerator / c
+            if abs(c) < tiny:
+                c = tiny
+            d = 1.0 / d
+            h *= d * c
+        if abs(d * c - 1.0) <= eps:
+            return h
+    raise TeacherPayloadError(
+        "incomplete beta continued fraction did not converge to float64 "
+        f"precision within {_BETA_CF_MAX_ITERATIONS} iterations"
+    )
+
+
+def _regularized_incomplete_beta(a: float, b: float, x: float) -> float:
+    """Return I_x(a, b) in float64 without depending on SciPy."""
+    if not (math.isfinite(a) and math.isfinite(b)) or a <= 0.0 or b <= 0.0:
+        raise TeacherPayloadError("incomplete beta parameters are invalid")
+    if x <= 0.0:
+        return 0.0
+    if x >= 1.0:
+        return 1.0
+    log_front = (
+        math.lgamma(a + b)
+        - math.lgamma(a)
+        - math.lgamma(b)
+        + a * math.log(x)
+        + b * math.log1p(-x)
+    )
+    front = math.exp(log_front)
+    if x < (a + 1.0) / (a + b + 2.0):
+        return front * _beta_continued_fraction(a, b, x) / a
+    return 1.0 - front * _beta_continued_fraction(b, a, 1.0 - x) / b
+
+
+def student_t_upper_tail(statistic: float, degrees_of_freedom: float) -> float:
+    """Return P(T > statistic) for Student's t with the given d.o.f.
+
+    Implemented here rather than imported so the gate is deterministic and has
+    no optional dependency: a fidelity gate that silently weakens when SciPy is
+    absent is not a gate.  ``tests`` cross-check it against ``scipy.stats.t``.
+    """
+    if degrees_of_freedom <= 0.0 or not math.isfinite(degrees_of_freedom):
+        raise TeacherPayloadError("Student-t degrees of freedom are invalid")
+    if math.isnan(statistic):
+        raise TeacherPayloadError("Student-t statistic is not a number")
+    if math.isinf(statistic):
+        return 0.0 if statistic > 0.0 else 1.0
+    half = 0.5 * _regularized_incomplete_beta(
+        0.5 * degrees_of_freedom,
+        0.5,
+        degrees_of_freedom / (degrees_of_freedom + statistic * statistic),
+    )
+    return half if statistic >= 0.0 else 1.0 - half
+
+
+def _octave_position_blocks(scored_positions: int) -> list[tuple[int, int]]:
+    """Partition scored indices into octaves of available context length.
+
+    Scored index ``t`` predicts the token after a prefix of ``t + 1`` tokens,
+    and an autoregressive language model's expected NLL falls roughly like a
+    power law in that prefix length.  The scale-free partition of a power law
+    is by octave, so the blocks are context lengths ``[2**j, 2**(j+1))``.  The
+    block count is ``floor(log2(scored_positions)) + 1`` -- fully determined by
+    ``SEQLEN``, with no partition choice left to the caller.
+    """
+    if scored_positions < 1:
+        raise TeacherPayloadError("teacher payload scores no positions")
+    blocks: list[tuple[int, int]] = []
+    lower = 1
+    while lower <= scored_positions:
+        upper = min(2 * lower, scored_positions + 1)
+        # Stored as scored-index bounds; context length is index + 1.
+        blocks.append((lower - 1, upper - 1))
+        lower = upper
+    return blocks
+
+
+def teacher_forward_fidelity_policy(
+    *,
+    scored_positions: int,
+    comparisons: int,
+) -> dict[str, object]:
+    """Return the closed acceptance policy for the context-monotonicity gate."""
+    family_alpha = 1.0 / float(scored_positions)
+    return {
+        "schema": FORWARD_FIDELITY_POLICY_SCHEMA,
+        "statistic": "per-position teacher-forced NLL, nats",
+        "partition": "octaves of available context length",
+        "test": "Welch one-sided t, later block mean > earlier block mean",
+        "scored_positions": int(scored_positions),
+        "comparisons": int(comparisons),
+        "family_wise_alpha": family_alpha,
+        "per_comparison_alpha": family_alpha / float(max(comparisons, 1)),
+        "absolute_ceiling": "ln(vocab_size)",
+    }
+
+
+def teacher_forward_nll_per_position(
+    topk_ids: torch.Tensor,
+    topk_lps: torch.Tensor,
+    calib_ids: torch.Tensor,
+    *,
+    vocab_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Recover the teacher's own teacher-forced NLL from the payload alone.
+
+    Scored row ``t`` is the distribution over the token at ``t + 1``, so the
+    target log probability is already serialized whenever the target survives
+    the top-K truncation.  When it does not, the payload still bounds the
+    target's probability from above by two exact facts about the same row:
+
+    * it cannot exceed the tail mass ``1 - sum(exp(topk_lps))`` -- everything
+      outside the support shares that mass; and
+    * it cannot exceed ``exp(topk_lps[..., -1])`` -- a larger probability would
+      have placed the token inside a sorted top-K.
+
+    The NLL is therefore imputed as ``-log(min(tail, p_K))``, a *lower* bound.
+    Imputing a lower bound can only understate degradation, so a refusal is
+    never manufactured by the imputation.  The bound is floored at
+    ``K * eps(float32)``, the resolution at which a tail mass reconstructed
+    from ``K`` serialized float32 log probabilities is still meaningful; that
+    floor comes from the storage dtype, not from a chosen probability.
+
+    Returns ``(nll, missing)`` shaped like the scored grid.
+    """
+    if calib_ids.ndim != 2 or topk_ids.ndim != 3:
+        raise TeacherPayloadError("teacher fidelity inputs have invalid rank")
+    n_samples, sequence = (int(value) for value in calib_ids.shape)
+    if list(topk_ids.shape[:2]) != [n_samples, sequence - 1]:
+        raise TeacherPayloadError(
+            "teacher top-k grid does not match the calibration windows"
+        )
+    if int(calib_ids.min()) < 0 or int(calib_ids.max()) >= vocab_size:
+        raise TeacherPayloadError("teacher calibration ids are out of vocabulary")
+    support = int(topk_ids.shape[-1])
+    # The reconstructed tail is a sum of `support` float32 terms; below this
+    # magnitude it is rounding, not probability.
+    tail_resolution = support * float(torch.finfo(torch.float32).eps)
+
+    nll = torch.empty((n_samples, sequence - 1), dtype=torch.float64)
+    missing = torch.empty((n_samples, sequence - 1), dtype=torch.bool)
+    for sample in range(n_samples):
+        ids = topk_ids[sample]
+        lps = topk_lps[sample].to(dtype=torch.float64)
+        targets = calib_ids[sample, 1:].to(dtype=ids.dtype).unsqueeze(-1)
+        hit = ids == targets
+        found = hit.any(dim=-1)
+        # Top-K ids are already validated unique, so at most one term survives.
+        target_lp = torch.where(hit, lps, torch.zeros((), dtype=torch.float64))
+        target_lp = target_lp.sum(dim=-1)
+        tail = (1.0 - lps.exp().sum(dim=-1)).clamp_min(0.0)
+        smallest_in_support = lps[..., -1].exp()
+        bound = torch.minimum(tail, smallest_in_support).clamp_min(tail_resolution)
+        nll[sample] = torch.where(found, -target_lp, -bound.log())
+        missing[sample] = ~found
+    if not torch.isfinite(nll).all():
+        raise TeacherPayloadError("teacher per-position NLL is non-finite")
+    return nll, missing
+
+
+def _block_statistics(
+    nll: torch.Tensor,
+    missing: torch.Tensor,
+    blocks: Sequence[tuple[int, int]],
+) -> list[dict[str, object]]:
+    profile: list[dict[str, object]] = []
+    for first, last in blocks:
+        values = nll[:, first:last].reshape(-1)
+        count = int(values.numel())
+        mean = float(values.mean().item())
+        variance = (
+            float(values.var(unbiased=True).item()) if count > 1 else float("nan")
+        )
+        profile.append({
+            "context_first": first + 1,
+            "context_last": last,
+            "positions": count,
+            "nll_mean": mean,
+            "perplexity": math.exp(mean) if mean < _MAX_REPORTABLE_NLL else math.inf,
+            "nll_stdev": math.sqrt(variance) if count > 1 else None,
+            "out_of_support_targets": int(
+                missing[:, first:last].sum().item()
+            ),
+            "variance": variance,
+        })
+    return profile
+
+
+def format_forward_fidelity_profile(summary: Mapping[str, Any]) -> str:
+    """Render the per-block context profile as a fixed-width table."""
+    lines = [
+        "[teacher-fidelity] per-position teacher-forced NLL by context octave",
+        "  context      positions    NLL     PPL   out-of-support",
+    ]
+    for block in summary["blocks"]:
+        stdev = block["nll_stdev"]
+        lines.append(
+            f"  {block['context_first']:>5d}-{block['context_last']:<5d} "
+            f"{block['positions']:>9d} "
+            f"{block['nll_mean']:>7.3f} "
+            f"{block['perplexity']:>9.2f} "
+            f"{block['out_of_support_targets']:>10d}"
+            + (f"   (sd {stdev:.3f})" if stdev is not None else "")
+        )
+    lines.append(
+        f"  overall NLL {summary['nll_mean']:.4f} "
+        f"PPL {summary['perplexity']:.3f} over "
+        f"{summary['scored_positions']} positions; "
+        f"uniform-vocabulary ceiling ln(V)={summary['uniform_nll_ceiling']:.4f}"
+    )
+    worst = summary.get("worst_comparison")
+    if worst is not None:
+        lines.append(
+            "  worst context-monotonicity comparison: octave "
+            f"{worst['earlier_context_first']}-{worst['earlier_context_last']} "
+            f"(NLL {worst['earlier_nll_mean']:.3f}) -> "
+            f"{worst['later_context_first']}-{worst['later_context_last']} "
+            f"(NLL {worst['later_nll_mean']:.3f}); "
+            f"welch_t={worst['welch_t']:.3f} df={worst['degrees_of_freedom']:.1f} "
+            f"p={worst['p_value']:.3e} vs alpha={summary['per_comparison_alpha']:.3e}"
+        )
+    return "\n".join(lines)
+
+
+def teacher_forward_fidelity_summary(
+    topk_ids: torch.Tensor,
+    topk_lps: torch.Tensor,
+    calib_ids: torch.Tensor,
+    *,
+    vocab_size: int,
+) -> dict[str, object]:
+    """Refuse a teacher whose own NLL degrades as its context grows.
+
+    Top-K coverage says nothing about faithfulness -- a confidently *wrong*
+    distribution is still sharply peaked, which is exactly how a streamed
+    teacher whose own perplexity was 262 passed every existing gate on
+    2026-08-16 and was used as a KL reference for a 9.05-PPL student.  The
+    signature of that defect is structural rather than absolute: teacher NLL
+    got monotonically *worse* with more context (PPL 7.6 at 32-64 tokens,
+    1013.2 at 384-511).  A correct autoregressive model on contiguous natural
+    text improves with context and never inverts that way, whatever its
+    absolute quality, so context-monotonicity is the property to enforce.
+
+    The statistic is the teacher's own teacher-forced NLL per scored position,
+    recovered from the payload alone (see
+    :func:`teacher_forward_nll_per_position`); no additional model forward is
+    required.  Positions are partitioned into octaves of available context
+    (see :func:`_octave_position_blocks`), and every ordered pair of octaves
+    ``(earlier, later)`` is compared with a one-sided Welch t-test on the
+    per-position NLL.
+
+    "Materially worse" is therefore measured in units of the payload's own
+    dispersion -- the acceptance region is ``t_crit`` pooled standard errors
+    wide, and the standard errors come from the per-position NLL spread -- and
+    never as a ratio or an absolute NLL.  The one remaining convention is the
+    significance level, and it is fixed by the payload's shape rather than
+    chosen: the family-wise level is ``1 / scored_positions``, the finest
+    false-alarm rate a payload of this size can meaningfully assert, split
+    across the ``C(B, 2)`` ordered comparisons by Bonferroni.  The verdict is
+    insensitive to that convention by many decades -- on the 2026-08-16
+    payload's profile the worst pair's t statistic is far past the critical
+    value at any level between 0.05 and 1e-12 -- so the gate does not rest on
+    it.  A deterministic parametric test is used rather than a bootstrap
+    because this repository quarantines irreproducible numbers, and a
+    resampled p-value cannot resolve a level this small in any case.
+
+    Octaves holding fewer than two positions cannot supply dispersion and are
+    reported but excluded from the comparison family.
+
+    A second, absolute check uses ``ln(vocab_size)``: the NLL of the uniform
+    distribution over the teacher's own vocabulary.  A teacher no more
+    informative than uniform is refused outright.  That anchor is derived from
+    the payload's vocabulary, not picked.
+
+    Raises ``TeacherPayloadError`` -- carrying the full block profile -- when
+    either check fails; otherwise returns the profile.
+    """
+    nll, missing = teacher_forward_nll_per_position(
+        topk_ids, topk_lps, calib_ids, vocab_size=vocab_size
+    )
+    scored_positions = int(nll.numel())
+    blocks = _octave_position_blocks(int(nll.shape[1]))
+    profile = _block_statistics(nll, missing, blocks)
+    testable = [
+        (index, block)
+        for index, block in enumerate(profile)
+        if int(block["positions"]) > 1
+    ]
+    comparisons: list[dict[str, object]] = []
+    for position, (_, earlier) in enumerate(testable):
+        for _, later in testable[position + 1:]:
+            n_earlier = int(earlier["positions"])
+            n_later = int(later["positions"])
+            spread = (
+                float(earlier["variance"]) / n_earlier
+                + float(later["variance"]) / n_later
+            )
+            difference = float(later["nll_mean"]) - float(earlier["nll_mean"])
+            if spread <= 0.0:
+                # Exactly separated blocks with no within-block dispersion.
+                welch_t = math.inf if difference > 0.0 else -math.inf
+                degrees_of_freedom = math.inf
+                p_value = 0.0 if difference > 0.0 else 1.0
+            else:
+                welch_t = difference / math.sqrt(spread)
+                degrees_of_freedom = (spread * spread) / (
+                    (float(earlier["variance"]) / n_earlier) ** 2 / (n_earlier - 1)
+                    + (float(later["variance"]) / n_later) ** 2 / (n_later - 1)
+                )
+                p_value = student_t_upper_tail(welch_t, degrees_of_freedom)
+            comparisons.append({
+                "earlier_context_first": earlier["context_first"],
+                "earlier_context_last": earlier["context_last"],
+                "earlier_nll_mean": float(earlier["nll_mean"]),
+                "later_context_first": later["context_first"],
+                "later_context_last": later["context_last"],
+                "later_nll_mean": float(later["nll_mean"]),
+                "nll_increase": difference,
+                "welch_t": welch_t,
+                "degrees_of_freedom": degrees_of_freedom,
+                "p_value": p_value,
+            })
+
+    policy = teacher_forward_fidelity_policy(
+        scored_positions=scored_positions,
+        comparisons=len(comparisons),
+    )
+    per_comparison_alpha = float(policy["per_comparison_alpha"])
+    overall_mean = float(nll.mean().item())
+    summary: dict[str, object] = {
+        "schema": FORWARD_FIDELITY_POLICY_SCHEMA,
+        "scored_positions": scored_positions,
+        "nll_mean": overall_mean,
+        "perplexity": (
+            math.exp(overall_mean)
+            if overall_mean < _MAX_REPORTABLE_NLL
+            else math.inf
+        ),
+        "out_of_support_targets": int(missing.sum().item()),
+        "uniform_nll_ceiling": math.log(float(vocab_size)),
+        "per_comparison_alpha": per_comparison_alpha,
+        "blocks": [
+            {key: value for key, value in block.items() if key != "variance"}
+            for block in profile
+        ],
+        "worst_comparison": (
+            min(comparisons, key=lambda item: float(item["p_value"]))
+            if comparisons
+            else None
+        ),
+        "forward_fidelity_policy": policy,
+    }
+
+    uniform_ceiling = float(summary["uniform_nll_ceiling"])
+    above_ceiling = [
+        block for block in profile if float(block["nll_mean"]) >= uniform_ceiling
+    ]
+    if overall_mean >= uniform_ceiling or above_ceiling:
+        raise TeacherPayloadError(
+            "teacher is no more informative than the uniform distribution over "
+            f"its own {vocab_size}-token vocabulary "
+            f"(ln(V)={uniform_ceiling:.4f} nats): overall NLL "
+            f"{overall_mean:.4f}, {len(above_ceiling)} context octave(s) at or "
+            "above the ceiling\n" + format_forward_fidelity_profile(summary)
+        )
+
+    regressions = [
+        item for item in comparisons
+        if float(item["p_value"]) < per_comparison_alpha
+    ]
+    if regressions:
+        detail = "\n".join(
+            "    octave "
+            f"{item['earlier_context_first']}-{item['earlier_context_last']} "
+            f"NLL {item['earlier_nll_mean']:.3f} -> "
+            f"{item['later_context_first']}-{item['later_context_last']} "
+            f"NLL {item['later_nll_mean']:.3f} "
+            f"(+{item['nll_increase']:.3f} nats, welch_t={item['welch_t']:.3f}, "
+            f"df={item['degrees_of_freedom']:.1f}, p={item['p_value']:.3e})"
+            for item in sorted(regressions, key=lambda item: float(item["p_value"]))
+        )
+        raise TeacherPayloadError(
+            "teacher forward fidelity is not context-monotone: "
+            f"{len(regressions)} of {len(comparisons)} ordered octave "
+            "comparisons show later context significantly worse than earlier "
+            f"at the derived per-comparison alpha "
+            f"{per_comparison_alpha:.3e} "
+            f"(family-wise 1/{scored_positions} over {len(comparisons)} "
+            "comparisons). A correct autoregressive teacher improves with "
+            "context; this one degrades, so any KL measured against it is "
+            "meaningless.\n"
+            + format_forward_fidelity_profile(summary)
+            + "\n  significant regressions:\n"
+            + detail
+        )
+    return summary
 
 
 def safe_load_torch_payload(path: str | os.PathLike) -> object:
@@ -481,6 +909,13 @@ def validate_teacher_payload(payload: object) -> dict[str, Any]:
     ) != expected_topk_shape:
         raise TeacherPayloadError("teacher topk_lps shape/dtype is invalid")
     topk_coverage_summary(topk_ids, topk_lps, vocab_size=vocab_size)
+    # Coverage cannot see an unfaithful forward: a confidently wrong teacher is
+    # still sharply peaked.  The context-monotonicity gate can, and it runs on
+    # every validation -- build, sidecar and replay -- so a payload that fails
+    # it is never written and never grades a student.
+    teacher_forward_fidelity_summary(
+        topk_ids, topk_lps, calib_ids, vocab_size=vocab_size
+    )
     identity = payload.get("source_model_identity")
     try:
         from prismaquant.cost_streaming import validate_streamed_model_identity
@@ -666,6 +1101,7 @@ def load_teacher_evidence(
 __all__ = [
     "CALIBRATION_SCHEMA",
     "EXPECTED_POSITIONS",
+    "FORWARD_FIDELITY_POLICY_SCHEMA",
     "N_SAMPLES",
     "PROMPT_TOP_K",
     "SEQLEN",
@@ -687,9 +1123,14 @@ __all__ = [
     "canonical_sha256",
     "compact_source_model_identity",
     "file_sha256",
+    "format_forward_fidelity_profile",
     "load_teacher_evidence",
     "payload_semantic_sha256",
     "safe_load_torch_payload",
+    "student_t_upper_tail",
+    "teacher_forward_fidelity_policy",
+    "teacher_forward_fidelity_summary",
+    "teacher_forward_nll_per_position",
     "teacher_meta",
     "tensor_descriptor",
     "topk_coverage_policy",
