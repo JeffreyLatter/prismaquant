@@ -367,10 +367,21 @@ from pathlib import Path
 
 judge_root, runtime_root, out = sys.argv[1:]
 sys.path.insert(0, str(Path(judge_root) / "tools"))
-from prismaquant_runtime_snapshot import judge_divergence, verify_snapshot
+from prismaquant_runtime_snapshot import (
+    MANIFEST,
+    _load_manifest,
+    _validate_manifest_shape,
+    judge_divergence,
+)
 
-runtime = verify_snapshot(Path(runtime_root))
-judge = verify_snapshot(Path(judge_root))
+# Read the ledgers rather than re-verify. `verify_runtime_snapshot` re-hashes
+# both closures at the top of this pass and again in the preflight just below,
+# so another full pass over every file here buys nothing but wall-clock.
+def _identity(root):
+    return _validate_manifest_shape(_load_manifest(Path(root) / MANIFEST))
+
+runtime = _identity(runtime_root)
+judge = _identity(judge_root)
 payload = {
     "schema": "prismaquant.serve_gate_judge_split.v1",
     "runtime": {
