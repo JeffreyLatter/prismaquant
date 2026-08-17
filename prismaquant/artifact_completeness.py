@@ -617,6 +617,7 @@ def check_artifact_completeness(
         )
         for spelling in _checkpoint_spellings(str(entry), profile)
     }
+    sidecar_alias = _dspark_sidecar_aliases(artifact_dir, quant_config)
     acknowledged = list(
         (quant_config.get("provenance") or {}).get(
             "route_pending_passthrough_acknowledged") or ())
@@ -718,6 +719,13 @@ def check_artifact_completeness(
             report.embedding_units.append(unit)
             claimed_scales |= unit_scales
             continue
+        alias = sidecar_alias.get(unit)
+        if alias is not None and _claimed_by_self_or_ancestor(
+            alias, group_claimed, profile
+        ):
+            report.cb_units.append(unit)
+            claimed_scales |= unit_scales
+            continue
         members = _fused_member_units(unit, fused_leaves)
         if members and all(
             _claimed_by_self_or_ancestor(member, group_claimed, profile)
@@ -741,6 +749,11 @@ def check_artifact_completeness(
             # An expert stack keeps its per-expert source scale planes only
             # when the stack was NOT collapsed; either way a group claims
             # them, so they are not orphans.
+            continue
+        alias = sidecar_alias.get(unit)
+        if alias is not None and _claimed_by_self_or_ancestor(
+            alias, group_claimed, profile
+        ):
             continue
         report.orphan_scale.append(scale_key)
 
@@ -792,6 +805,58 @@ def _unit_variants(unit: str, profile=None) -> set[str]:
     return variants
 
 
+def _dspark_sidecar_aliases(artifact_dir: Path, quant_config: dict) -> dict[str, str]:
+    """THE FIFTH NAMESPACE: a DSpark CB sidecar's physical -> construction map.
+
+    A quantized MTP sidecar SERIALIZES its planes under ``mtp.{stage}`` but its
+    config groups name them where the serving stack CONSTRUCTS them,
+    ``model.layers.{num_hidden_layers+stage}`` — the draft is materialized as
+    body layers past the end of the body. Both spellings are correct and the
+    artifact publishes the bijection itself, schema
+    ``prismaquant.dspark_cb_sidecar.v1``.
+
+    So the bridge is READ, never inferred: the pairing comes from the same
+    resolver `validate_cb_endpoint` uses against the artifact's own
+    ``config.json``, not from zipping the two published lists (they are each
+    sorted independently, and ``mtp.9/10/11`` vs ``layers.9/10/11`` do not sort
+    alike once a stage index crosses a decimal digit). The explicit
+    passthrough dict is taken verbatim where the producer published one.
+
+    Empty for every artifact without a sidecar, which is all of them but one.
+    """
+
+    sidecar = (quant_config.get("provenance") or {}).get("dspark_cb_sidecar")
+    if not isinstance(sidecar, dict) or not sidecar:
+        return {}
+
+    aliases: dict[str, str] = {
+        str(physical): str(construction)
+        for physical, construction in (
+            sidecar.get("source_passthrough_physical_to_construction") or {}
+        ).items()
+    }
+    try:
+        import json as _json
+
+        from prismaquant.dspark_source_metadata import (
+            dspark_cb_construction_target_for_physical_output,
+        )
+
+        config = _json.loads((artifact_dir / "config.json").read_text())
+        for physical in sidecar.get("physical_cb_targets") or ():
+            aliases[str(physical)] = (
+                dspark_cb_construction_target_for_physical_output(
+                    str(physical), config
+                )
+            )
+    except Exception:                          # pragma: no cover - defensive
+        # A sidecar whose namespace cannot be resolved keeps whatever explicit
+        # pairs it published; its unresolved planes then report as undeclared,
+        # which is the honest answer rather than a silent pass.
+        pass
+    return aliases
+
+
 def _fused_member_units(unit: str, fused_leaves) -> tuple[str, ...]:
     """The unfused sibling units a FUSED checkpoint unit is built from.
 
@@ -810,11 +875,25 @@ def _fused_member_units(unit: str, fused_leaves) -> tuple[str, ...]:
 
     if not fused_leaves or "." not in unit:
         return ()
-    parent, leaf = unit.rsplit(".", 1)
+
+    # A per-expert split-format unit spells its group token AFTER the
+    # projection (`…experts.gate_up_proj.format_group_fp8_cb_k28`), so the
+    # fusion map has to be applied to the projection and the token re-attached
+    # to each member. Reading the trailing token as the leaf finds nothing in
+    # `packed_modules_mapping` and reports a correctly-claimed split-format
+    # stack as unclaimed — which is what it did, on every split export.
+    stem, token = unit, ""
+    head, sep, tail = unit.rpartition(".")
+    if sep and tail.startswith(_PER_EXPERT_GROUP_TOKEN.lstrip(".")):
+        stem, token = head, f".{tail}"
+    if "." not in stem:
+        return ()
+
+    parent, leaf = stem.rsplit(".", 1)
     members = fused_leaves.get(leaf)
     if not members:
         return ()
-    return tuple(f"{parent}.{member}" for member in members)
+    return tuple(f"{parent}.{member}{token}" for member in members)
 
 
 def _claimed_by_self_or_ancestor(unit: str, claimed, profile=None) -> bool:

@@ -159,3 +159,54 @@ def test_without_a_profile_the_gate_falls_back_to_the_literal_name(tmp_path,
     )
     with pytest.raises(ArtifactIncomplete, match="claimed by no mechanism"):
         assert_artifact_complete(root)
+
+
+def test_split_format_group_fused_units_resolve_through_the_projection():
+    """A per-expert split-format unit spells its group token AFTER the
+    projection, so the fusion map has to be applied to the projection and the
+    token re-attached.
+
+    Reading `format_group_fp8_cb_k28` as the leaf finds nothing in
+    `packed_modules_mapping`, and a split export — whose config groups MUST
+    name the unfused halves, since vLLM canonical scheme names are a hard
+    serving invariant — then reports every fused stack it ships as unclaimed.
+    """
+
+    fused = {"gate_up_proj": ("gate_proj", "up_proj")}
+    stack = "model.layers.0.mlp.experts.gate_up_proj"
+
+    assert completeness._fused_member_units(stack, fused) == (
+        "model.layers.0.mlp.experts.gate_proj",
+        "model.layers.0.mlp.experts.up_proj",
+    )
+    assert completeness._fused_member_units(
+        f"{stack}.format_group_fp8_cb_k28", fused
+    ) == (
+        "model.layers.0.mlp.experts.gate_proj.format_group_fp8_cb_k28",
+        "model.layers.0.mlp.experts.up_proj.format_group_fp8_cb_k28",
+    )
+    # An UNFUSED projection carrying the same token stays unmapped: the bridge
+    # must not invent members for a unit the fusion map says nothing about.
+    assert completeness._fused_member_units(
+        "model.layers.0.mlp.experts.down_proj.format_group_fp8_cb_k28", fused
+    ) == ()
+
+
+def test_a_sidecar_alias_map_is_empty_without_a_published_sidecar(tmp_path):
+    """The fifth namespace is opt-in: no `dspark_cb_sidecar` record, no alias,
+    and therefore no way for the bridge to launder an unclaimed plane."""
+
+    assert completeness._dspark_sidecar_aliases(tmp_path, {}) == {}
+    assert completeness._dspark_sidecar_aliases(
+        tmp_path, {"provenance": {"dspark_cb_sidecar": {}}}
+    ) == {}
+    # Published explicit pairs survive even when config.json cannot be read,
+    # while the CB planes it could not resolve simply stay unaliased.
+    assert completeness._dspark_sidecar_aliases(
+        tmp_path,
+        {"provenance": {"dspark_cb_sidecar": {
+            "source_passthrough_physical_to_construction": {
+                "mtp.0.attn.wo_a": "model.layers.3.attn.wo_a"},
+            "physical_cb_targets": ["mtp.0.attn.wkv"],
+        }}},
+    ) == {"mtp.0.attn.wo_a": "model.layers.3.attn.wo_a"}
