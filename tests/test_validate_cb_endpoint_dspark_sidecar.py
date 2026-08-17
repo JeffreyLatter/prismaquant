@@ -774,11 +774,12 @@ def test_decode_contract_requires_overlay_sidecar_provenance_xor(
     # Both directions still refuse; they say different things because they are
     # different faults. Declaring both is a contradiction on any lane, while
     # declaring neither is only a fault on the lane whose serving stack needs
-    # one of the two bridges.
+    # one of the two bridges -- or, since the split release, a declaration that
+    # the artifact is the body half, which this fixture does not make.
     expected = (
         "declares both dspark_source_overlay and dspark_cb_sidecar"
         if provenance_state == "both"
-        else "exactly one of dspark_source_overlay or dspark_cb_sidecar"
+        else "one of dspark_source_overlay or dspark_cb_sidecar"
     )
     with pytest.raises(cbv.CBEndpointValidationError, match=expected):
         cbv.validate_cb_artifact_decode_contract(root, quant)

@@ -89,6 +89,13 @@ DSPARK_CB_RUNTIME_FEATURE_VERSION = 1
 DSPARK_CB_SOURCE_FP8_RUNTIME_FEATURE = "source_fp8_block128_w8a16"
 DSPARK_CB_SOURCE_FP8_RUNTIME_FEATURE_VERSION = 1
 DSPARK_CB_RUNTIME_CONTRACT_SCHEMA = "gridbook.runtime-contract.v4"
+#: The source namespace holding DeepSeek-V4's MTP layers. A DSv4 release either
+#: constructs its DSpark stages FROM this namespace (the in-band overlay), IS
+#: this namespace (the draft sidecar), or deliberately OMITS it because the
+#: draft ships as a second artifact. Spelled here rather than shared because
+#: every other site that needs it is a `startswith("mtp.")` literal already;
+#: unifying them is a refactor, not part of this contract.
+DSPARK_MTP_SOURCE_PREFIX = "mtp."
 DSPARK_RENDER_RECIPE_SCHEMA = "prismaquant.dspark_cb_render_recipe.v1"
 DSPARK_RENDER_SOURCE_BINDING = "streamed_decoded_cb_source.v1"
 DSPARK_CB_RETAINED_GLUE_TENSOR_COUNT = 47
@@ -2171,6 +2178,49 @@ def _validate_dspark_cb_sidecar_artifact(
     }
 
 
+def _unit_claim_names(unit: str, profile, is_routed_expert_unit) -> tuple[str, ...]:
+    """The names a config group has to claim to fully cover *unit*.
+
+    Almost always that is the unit itself, and the caller's cover is then a
+    plain per-tensor cover exactly as before.
+
+    A PACKED ROUTED EXPERT STACK is the exception: one physical tensor
+    carrying two logical roles, where the CB ABI binds a codebook *per role*.
+    A per-role learned layer therefore ships two config groups naming
+    ``…experts.gate_proj`` and ``…experts.up_proj``, and neither of them names
+    the ``…experts.gate_up_proj`` that is actually on disk.  Read per tensor,
+    both groups look empty and the tensor looks unclaimed -- a correct
+    artifact reported as broken, the same blind spot the completeness gate had
+    (11 DSv4-Flash stacks, 2026-08-16).  Read per role, each group covers the
+    role it names and the stack is covered when both roles are.
+
+    This is the pinned runtime's own resolution rule rather than a widening.
+    Gridbook 0.8.5 ``_resolve_moe_codebook_roles`` gathers ``codebook_ref`` per
+    role across the targets matching a stack, refuses two targets claiming one
+    role with different books, and refuses a stack naming no book for some
+    role.  Checker and consumer thus still refuse together.  The decomposition
+    is the profile's declarative ``packed_experts.projection_splits`` -- the
+    table the exporter used to emit the halves, and the one Gridbook keeps as
+    ``_FUSED_FALLBACK`` because DeepseekV4 has no ``packed_modules_mapping``.
+
+    Bounded like the completeness fix: routed-expert parent on dotted
+    boundaries, and a leaf that decomposes only to itself is not multi-role.
+    """
+
+    if "." not in unit:
+        return (unit,)
+    parent, leaf = unit.rsplit(".", 1)
+    if not is_routed_expert_unit(parent):
+        return (unit,)
+    try:
+        members = tuple(profile.packed_expert_projection_names(leaf))
+    except Exception:                          # pragma: no cover - defensive
+        members = ()
+    if len(members) < 2:
+        return (unit,)
+    return tuple(f"{parent}.{member}" for member in members)
+
+
 def _validate_plain_cb_artifact(
     root: Path, quant_config: Mapping[str, Any]
 ) -> dict[str, Any]:
@@ -2193,9 +2243,11 @@ def _validate_plain_cb_artifact(
         _claimed_by_self_or_ancestor,
         _detect_profile_quietly,
         _group_claimed_units,
+        _is_routed_expert_unit,
         _QUANTIZED_WEIGHT_PLANE_SUFFIXES,
         _SCALE_BEARING_DTYPES,
         _read_safetensors_header,
+        _unit_variants,
         read_artifact_header,
     )
     from .cb_layout import codebook_subtable_shapes, parse_format_name
@@ -2244,10 +2296,51 @@ def _validate_plain_cb_artifact(
         for entry in (quant_config.get("ignore") or ())
         for spelling in _checkpoint_spellings(str(entry), profile)
     }
+    # THE THIRD DECLARED MECHANISM. An FP8-source model can ship a Linear as a
+    # verbatim copy of its source bytes -- quantized, scale-bearing, on disk,
+    # and deliberately in no config group. `artifact_completeness` has always
+    # recognized it (`source_passthrough.units`, 336 of them on the DSv4-Flash
+    # body); this cover was written against artifacts that carried none, so it
+    # read every passthrough Linear as claimed by nothing. Same key path and
+    # same spelling normalization as the completeness gate, so the two agree on
+    # which units are declared. Matched by EXACT variant rather than by
+    # ancestry, also to match that gate: a passthrough declaration names one
+    # tensor's own bytes, and letting `layers.0.attn` cover everything under it
+    # would silently exempt siblings that were never declared.
+    passthrough_declared = {
+        spelling
+        for entry in (
+            (quant_config.get("source_passthrough") or {}).get("units") or {}
+        )
+        for spelling in _checkpoint_spellings(str(entry), profile)
+    }
+
+    def _is_passthrough(unit: str) -> bool:
+        return bool(_unit_variants(unit, profile) & passthrough_declared)
+
+    #: unit -> the claim names that together cover it. One entry per unit
+    #: everywhere except a packed routed expert stack, which needs one per
+    #: role; see :func:`_unit_claim_names`.
+    claim_names_by_unit = {
+        unit: _unit_claim_names(unit, profile, _is_routed_expert_unit)
+        for unit in quantized_units
+    }
+    unit_by_claim_name = {
+        claim: unit
+        for unit, claims in claim_names_by_unit.items()
+        for claim in claims
+    }
 
     group_cover: list[dict[str, Any]] = []
+    #: claim name -> the groups claiming it. Keyed by claim rather than by unit
+    #: so the two roles of one packed stack are two distinct claims: gate and
+    #: up carrying different books is the ABI, not an overlap.
     claimed_by: dict[str, list[str]] = {}
     referenced_codebooks: set[str] = set()
+    #: Every distinct unit some config group covers. Kept as a SET because two
+    #: per-role groups legitimately cover one packed stack, so summing the
+    #: per-group counts would count that stack twice.
+    group_units: set[str] = set()
     expected_codebook_contract: dict[str, tuple[str, list[int]]] = {}
     requires_routed_moe_lut = False
     for group_name in sorted(groups):
@@ -2266,18 +2359,31 @@ def _validate_plain_cb_artifact(
             for entry in _group_claimed_units({"config_groups": {group_name: group}})
             for spelling in _checkpoint_spellings(str(entry), profile)
         }
-        members = sorted(
-            unit
-            for unit in quantized_units
-            if _claimed_by_self_or_ancestor(unit, spellings, profile)
-        )
-        if not members:
+        claims: list[str] = []
+        for unit, unit_claims in claim_names_by_unit.items():
+            if _claimed_by_self_or_ancestor(unit, spellings, profile):
+                # A target naming the packed tensor -- or any ancestor of it,
+                # e.g. the whole `…ffn.experts` stack -- speaks for every role
+                # it carries with the one book it declares. That is the lattice
+                # spelling, and it stays legal.
+                claims.extend(unit_claims)
+                continue
+            if len(unit_claims) == 1:
+                continue
+            claims.extend(
+                claim
+                for claim in unit_claims
+                if _claimed_by_self_or_ancestor(claim, spellings, profile)
+            )
+        claims = sorted(claims)
+        if not claims:
             raise CBEndpointValidationError(
                 f"{group_name}: no tensor on disk answers to any of its "
                 f"{len(targets)} targets"
             )
-        for unit in members:
-            claimed_by.setdefault(unit, []).append(group_name)
+        members = sorted({unit_by_claim_name[claim] for claim in claims})
+        for claim in claims:
+            claimed_by.setdefault(claim, []).append(group_name)
         signatures = {
             tuple(sorted(planes_by_unit.get(unit, ()))) for unit in members
         }
@@ -2347,6 +2453,7 @@ def _validate_plain_cb_artifact(
                 referenced_codebooks.add(ref)
         if any(".experts" in str(target) for target in targets):
             requires_routed_moe_lut = True
+        group_units.update(members)
         group_cover.append(
             {
                 "group": group_name,
@@ -2359,23 +2466,51 @@ def _validate_plain_cb_artifact(
         )
 
     overclaimed = sorted(
-        unit for unit, names in claimed_by.items() if len(names) > 1
+        claim for claim, names in claimed_by.items() if len(names) > 1
     )
     if overclaimed:
         raise CBEndpointValidationError(
             "config groups overlap -- these units are claimed more than once, "
             f"so their format is ambiguous: {overclaimed[:8]}"
         )
+    # Refused even when the duplicate claims agree on their book, which
+    # Gridbook's `setdefault` would tolerate. Stricter than the consumer is the
+    # fail-closed direction, and a shipped artifact declaring one role twice is
+    # an exporter bug worth surfacing rather than absorbing.
     unclaimed = sorted(
         unit
         for unit in quantized_units
-        if unit not in claimed_by
+        if not any(claim in claimed_by for claim in claim_names_by_unit[unit])
         and not _claimed_by_self_or_ancestor(unit, embedding_claimed, profile)
+        and not _is_passthrough(unit)
     )
     if unclaimed:
         raise CBEndpointValidationError(
             "quantized tensors claimed by no config group and no embedding "
             f"declaration: {unclaimed[:8]}"
+        )
+    # NO contradiction check for passthrough-and-grouped. The two records are
+    # complementary by design, not alternatives: `source_passthrough_config_group`
+    # emits a scheme-less group stating LAYOUT while the declaration states
+    # ROUTING ("routing is stated once, in the `source_passthrough`
+    # declaration", cb_export_config.py). On the DSv4-Flash body 272 of 336
+    # passthrough units carry both, and the served 112.69 artifact has the same
+    # population -- refusing the pair would refuse every FP8-source release.
+    half_claimed = sorted(
+        f"{unit} (missing "
+        f"{[claim for claim in claim_names_by_unit[unit] if claim not in claimed_by]})"
+        for unit in quantized_units
+        if any(claim in claimed_by for claim in claim_names_by_unit[unit])
+        and not all(claim in claimed_by for claim in claim_names_by_unit[unit])
+    )
+    if half_claimed:
+        # EVERY role, never any -- the mirror of Gridbook's own refusal to
+        # decode a stack that names no book for some role. A half-declared
+        # packed stack would otherwise pass here and then decode the
+        # undeclared rows with the other role's codebook.
+        raise CBEndpointValidationError(
+            "packed routed stacks whose roles are only partly claimed, so the "
+            f"unclaimed rows have no codebook: {half_claimed[:8]}"
         )
     contradicted = sorted(
         unit
@@ -2480,6 +2615,12 @@ def _validate_plain_cb_artifact(
         "renderer_abi": renderer_abi,
         "codebook_file": str(codebook_file) if codebook_file else None,
         "codebook_ref_count": len(referenced_codebooks),
+        # Internal: cross-checked against the completeness classification by
+        # the caller, deliberately NOT emitted into the receipt. A receipt
+        # carries per-group counts and no unit names, so it cannot dedupe a
+        # stack two per-role groups share; the exact check belongs where the
+        # sets exist.
+        "group_units": sorted(group_units),
         "quantized_unit_count": len(quantized_units),
         "tensor_count": len(header),
         "group_cover": group_cover,
@@ -2487,12 +2628,22 @@ def _validate_plain_cb_artifact(
         "cover_sha256": _canonical_json_sha256(
             {
                 "claimed_by": {
-                    unit: names[0] for unit, names in sorted(claimed_by.items())
+                    claim: names[0] for claim, names in sorted(claimed_by.items())
                 },
+                # Units no group claims. Passthrough is excluded so the label
+                # stays true; it is deliberately NOT added as a new key, which
+                # would move this digest for every artifact ever validated,
+                # and it cannot hide a real difference -- a unit that is
+                # passthrough here and CB elsewhere shows up in `claimed_by`
+                # there, and one that is passthrough here and nothing there is
+                # refused there.
                 "embedding_units": sorted(
                     unit
                     for unit in quantized_units
-                    if unit not in claimed_by
+                    if not any(
+                        claim in claimed_by for claim in claim_names_by_unit[unit]
+                    )
+                    and not _is_passthrough(unit)
                 ),
                 "ignore": sorted(ignored),
                 "planes_by_unit": {
@@ -2502,6 +2653,22 @@ def _validate_plain_cb_artifact(
             }
         ),
     }
+
+
+def _recorded_excluded_namespaces(
+    provenance: Mapping[str, Any],
+) -> frozenset[str]:
+    """Namespaces the producer recorded as deliberately omitted.
+
+    Absent or malformed reads as "nothing was omitted", which is the
+    fail-closed direction: the caller uses this to grant a permission, so an
+    unreadable declaration must not grant it.
+    """
+
+    recorded = provenance.get("excluded_namespaces")
+    if not isinstance(recorded, (list, tuple)):
+        return frozenset()
+    return frozenset(str(value) for value in recorded)
 
 
 def validate_cb_artifact_decode_contract(
@@ -2534,13 +2701,49 @@ def validate_cb_artifact_decode_contract(
             "dspark_cb_sidecar, which are alternative topologies"
         )
     if lane == CB_LANE_DSV4_FLASH:
-        # The DSv4 release IS one of the two DSpark topologies; a DSv4 artifact
-        # presenting itself as plain would shed the bridge contract its serving
-        # stack depends on.
+        # The DSv4 release IS a DSpark topology; a DSv4 artifact presenting
+        # itself as plain would shed the bridge contract its serving stack
+        # depends on. There are THREE topologies, not two:
+        #
+        #   in-band  -- one artifact carrying the MTP construction stages,
+        #               declared as `dspark_source_overlay`;
+        #   draft    -- the `mtp.`-subset draft alone, declared as
+        #               `dspark_cb_sidecar` (what `--dspark-cb-sidecar` builds,
+        #               and it requires exactly `--subset-prefix mtp.`);
+        #   split    -- the BODY half of a two-artifact release, whose `mtp.`
+        #               namespace was deliberately excluded because the draft
+        #               above ships beside it.
+        #
+        # The split body declares neither topology object, because neither
+        # describes it: it constructs no MTP stages and it is not the draft.
+        # What it does declare is the omission itself. Requiring that
+        # declaration is what keeps this from becoming a hole -- an artifact
+        # that merely LOST its bridge records no exclusion and still refuses,
+        # so the gate still fails closed on the case it was written for.
+        # (`excluded_namespaces` is producer-written: the exporter records the
+        # `--exclude-namespace` set it was given.)
         if recorded_overlay is None and recorded_sidecar is None:
+            if DSPARK_MTP_SOURCE_PREFIX not in _recorded_excluded_namespaces(
+                provenance
+            ):
+                raise CBEndpointValidationError(
+                    "DSv4 artifact provenance must declare one of "
+                    "dspark_source_overlay or dspark_cb_sidecar, or record "
+                    f"{DSPARK_MTP_SOURCE_PREFIX!r} in excluded_namespaces to "
+                    "declare itself the body half of a split release"
+                )
+        elif recorded_overlay is not None and (
+            DSPARK_MTP_SOURCE_PREFIX in _recorded_excluded_namespaces(
+                provenance
+            )
+        ):
+            # The overlay is BUILT from the source MTP layers. Claiming both
+            # would promise construction stages out of bytes the artifact
+            # states it did not ship.
             raise CBEndpointValidationError(
-                "DSv4 artifact provenance must contain exactly one of "
-                "dspark_source_overlay or dspark_cb_sidecar"
+                "DSv4 artifact declares dspark_source_overlay while recording "
+                f"{DSPARK_MTP_SOURCE_PREFIX!r} as an excluded namespace; the "
+                "overlay is constructed from exactly those source layers"
             )
     elif recorded_overlay is not None or recorded_sidecar is not None:
         raise CBEndpointValidationError(
@@ -2603,6 +2806,23 @@ def validate_cb_artifact_decode_contract(
                 f"classification: {cover['quantized_unit_count']} quantized "
                 f"unit(s) on disk vs {classified + embedding_unit_count} "
                 "classified"
+            )
+        # The exact form of the receipt's cover/CB cross-check, done here
+        # because this is the only place holding both the cover's DISTINCT unit
+        # set and the completeness classification; the replay keeps a weaker
+        # bound for the same reason it cannot dedupe. Passthrough is subtracted
+        # rather than filtered out of the cover: the classifier gives a
+        # passthrough declaration precedence over a group claim, so a unit with
+        # both is counted there as passthrough and must be counted the same way
+        # here.
+        covered_cb = set(cover["group_units"]) - set(completeness.passthrough_units)
+        if covered_cb != set(completeness.cb_units):
+            raise CBEndpointValidationError(
+                "plain CB decode group cover does not account for exactly the "
+                "classified CB units: covered-not-classified="
+                f"{sorted(covered_cb - set(completeness.cb_units))[:6]}, "
+                "classified-not-covered="
+                f"{sorted(set(completeness.cb_units) - covered_cb)[:6]}"
             )
         evidence = {
             "schema": ARTIFACT_DECODE_CONTRACT_SCHEMA_PLAIN,
@@ -3068,9 +3288,17 @@ def _validate_cb_plain_decode_record(payload: Mapping[str, Any]) -> None:
             raise CBEndpointValidationError(
                 f"plain CB decode {where} are not canonical"
             )
-    if payload.get("excluded_namespaces") != []:
+    if payload.get("excluded_namespaces") not in ([], [DSPARK_MTP_SOURCE_PREFIX]):
+        # A plain artifact covers everything it ships, with exactly one named
+        # exception: the body half of a split DSv4 release omits `mtp.` because
+        # the draft is a second artifact with its own receipt. Spelled as a
+        # closed set rather than "any exclusion is fine" -- this replay has no
+        # disk and no lane, so the only thing keeping it honest is that the one
+        # permitted omission is named here.
         raise CBEndpointValidationError(
-            "a plain CB artifact cannot exclude a namespace from decode coverage"
+            "a plain CB artifact cannot exclude a namespace from decode "
+            f"coverage other than {DSPARK_MTP_SOURCE_PREFIX!r}: "
+            f"{payload.get('excluded_namespaces')!r}"
         )
     if not isinstance(payload.get("requires_moe_backend_marlin"), bool):
         raise CBEndpointValidationError(
@@ -3147,9 +3375,15 @@ def _validate_cb_plain_decode_record(payload: Mapping[str, Any]) -> None:
                 f"{name}: plain CB decode codebook refs are not canonical"
             )
         covered_units += int(entry["unit_count"])
-    if covered_units != int(payload["cb_unit_count"]):
+    if covered_units < int(payload["cb_unit_count"]):
+        # A BOUND, not the equality it used to be. Two per-role groups may
+        # cover one packed stack, so this sum is an upper-bound view of a set
+        # the replay cannot dedupe: it holds no unit names. What it can still
+        # prove is that the cover does not fall SHORT of the classification,
+        # i.e. no classified CB unit went uncovered. Exact set equality is
+        # asserted where the sets exist, at the assembly site.
         raise CBEndpointValidationError(
-            "plain CB decode group cover does not sum to the classified CB "
+            "plain CB decode group cover falls short of the classified CB "
             f"units: {covered_units} vs {payload['cb_unit_count']}"
         )
     features = payload.get("required_runtime_features")
