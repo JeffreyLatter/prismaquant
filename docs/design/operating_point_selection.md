@@ -36,39 +36,71 @@ same x1.72 KL improvement. Three consequences:
 
 ## Anchors considered
 
-**A. Task-parity saturation (RECOMMENDED as the default when no card is
-named).** KL is unbounded-resolution and never saturates; the metric
-ladder's top -- bounded task metrics (ToolEvalBench hardmode, GSM8K, IFEval,
-p99-NLL) -- does. "Bang" measured at the top of the ladder genuinely stops
-at BF16 parity: bits past parity buy quality no sanctioned metric can see.
-The pick rule: **ship the cheapest bpp whose task suite is statistically at
-BF16 parity**, with parity defined against the suite's own measured
-replicate noise (BF16-vs-BF16 reruns), not a chosen epsilon.
+**A. Offline parity certificate (RECOMMENDED as the default when no card is
+named).** The anchor is "statistically the same as BF16", and the oracle must
+be numerical, deterministic, and analyzable offline -- task suites are out
+(TEB is non-deterministic and needs a serving loop). Rev 2 (2026-08-18)
+replaces the task-suite oracle with statistics computed from the full-vocab
+teacher/student distributions the KL evaluator already materializes on the
+canonical held-out contract. No model runs at analysis time; the only live
+work is the validated sweep the pipeline performs anyway, plus a ONE-TIME
+calibration of the measurement system itself.
 
-The fitted frontier makes this a 2-3 measurement procedure instead of a
-sweep: the KL fit is the interpolator, task runs are the oracle.
+The statistical core: with paired per-draw measurements, a null-hypothesis
+test will call ANY bpp "different from BF16" given enough tokens -- excess
+loss is strictly positive. Equivalence therefore needs a margin, and the only
+non-arbitrary margins are measured properties of the shop's own measurement
+system:
 
-  1. Run the validated sweep as today; fit log10(KL) = alpha - beta*bpp
-     (`tools/operating_point.py`). Require R^2 >= 0.99; below that the
-     regime assumption failed -- stop and look.
-  2. Measure the suite's replicate noise once (BF16 vs BF16).
-  3. Start from the family prior (Qwen3.6-27B evidence: every artifact at
-     KL <= 0.03 landed inside TEB noise of BF16 -- 0.0292 -> TEB 88 vs 90,
-     0.0151 -> 85 vs 86, ~0.009 -> 91 vs 86; the KL 0.0475 artifact landed
-     at the bottom, TEB 84. Prior bracket: KL_parity in [0.03, 0.05]).
-     Convert with the fit: on Qwen3.8 that bracket is **bpp 5.04 -> 5.98**.
-  4. Bisect with real suite runs on rendered artifacts (2-3 total; the
-     already-published point is the free first probe). Smallest parity bpp,
-     to +-0.25 bpp, is **b_parity**.
-  5. Ship `min(b_parity, card budget)`. Never above b_parity. Below it,
-     print the priced tradeoff on the card: each -0.5 bpp = x1.31 KL =
-     -1.5 GB (this model). KL_parity is a *measured, per-model* threshold;
-     the 0.03 folklore is a prior, never the answer.
+  * **The publication envelope** (primary): the cross-session / cross-stack
+    reproducibility of the gold numbers themselves (the class of drift the
+    house already documents: KL readings moving 4-8x across sessions until
+    provenance-pinned, +-0.7 % on the pinned gridbook gold lane, conf-KL
+    +-17 % under a CUDA-extension change). A quality difference smaller than
+    what the shop could reproducibly CLAIM is, by its own epistemics, not a
+    claimable difference. Measured once per model+stack by re-running the
+    gold evaluator on one fixed artifact across sessions/serving modes.
+  * **The serving stack's own BF16 nondeterminism** (for the behavioral
+    leg): eager-vs-graph and session-to-session argmax flips of the BF16
+    model at near-tie positions -- real, accepted by every deployment, and
+    the exact meaning of "a different seed of the same model".
 
-  Tail discipline (principle 4): the parity suite includes p99-NLL and the
-  adversarial tool-call set. On Qwen3.8 the tail tracks the mean
-  (kl_max slope -0.239 vs mean -0.236); where it does not, the tail curve
-  gets its own fit and the anchor tests both.
+The certificate: parity(b) holds when, on the canonical contract
+(n=8x512, --calib-repeats >= 4, held-out draws), ALL of:
+
+  1. **Mean leg**: paired excess NLL (student minus teacher on the same
+     draws) is inside the publication envelope of the BF16 PPL reading.
+  2. **Tail leg** (principle 4): p99 per-prompt excess NLL and kl_max inside
+     the same envelope scaled to their own reference readings.
+  3. **Behavior leg**: greedy top-1 flip rate vs the teacher <= the BF16
+     self-flip rate across sanctioned schedules (eager/graph, cross-session),
+     per-sequence paired sign test.
+
+Pick `b_parity` = the smallest bpp on the fitted line whose measured point
+passes; the log-linear fit interpolates between sweep points, so localizing
+to +-0.25 bpp costs at most one extra rendered point, and usually zero.
+
+Plumbing this needs (small, evaluator-side): persist `teacher_nll_*`
+alongside the existing `nll_*` fields; log per-position argmax agreement
+(the evaluator already holds both full-vocab distributions); measure the
+one-time envelope + BF16 self-flip reference per model+stack. All three land
+in `validate_assignments_kl` output, so `tools/operating_point.py` can test
+the certificate offline from JSON alone.
+
+Task suites stay where the metric ladder already puts them: the promotion
+backstop for materialized artifacts (a certificate pass that regresses
+ToolEvalBench still demotes), never the pick oracle.
+
+Current placement on Qwen3.8-27B, prior pending the envelope measurement:
+the Qwen3.6-family evidence (KL <= 0.03 landing inside task noise of BF16)
+converts through the fit to **bpp 5.04-5.98**; the certificate's own
+threshold replaces that prior the first time the envelope is measured.
+
+For the model card, the detection-budget reading of KL is worth printing
+regardless of the anchor: a likelihood-ratio distinguisher needs roughly
+3/KL tokens of output to separate the artifact from BF16 at 95 %
+(KL 0.03 -> ~100 tokens; KL 0.008 -> ~370). It prices what a KL number
+MEANS without another measurement.
 
 **B. Card budget** (existing rule, unchanged): when a card is named,
 `TARGET_DISK_GB` fits it exactly -- but A caps it: past b_parity, spend the
@@ -106,5 +138,5 @@ dressed as such. The floor is where the menu closes (the assignment
 degenerates toward uniform NVFP4 and the allocator has nothing left to
 choose); the ceiling is where FP8-uniform becomes the honest artifact. The
 anchor above picks *within* the open band; on current evidence it lands at
-**~5.0-6.0 on Qwen3.8-27B**, pending the two task-suite runs that turn the
-prior into a measurement.
+**~5.0-6.0 on Qwen3.8-27B**, pending the one-time envelope measurement that
+turns the family prior into this model's own threshold.
