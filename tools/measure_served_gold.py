@@ -338,12 +338,19 @@ def _tail_logprob(row: Mapping[str, float], vocab_size: int) -> float:
     what the ad-hoc script did -- systematically UNDERSTATES the divergence,
     because the K-th logprob is an upper bound on every value below it.
     """
-    tabulated = sum(math.exp(value) for value in row.values())
-    untabulated = max(vocab_size - len(row), 1)
-    residual = max(1.0 - tabulated, 0.0)
-    if residual <= 0.0:
+    if vocab_size <= len(row):
+        # Every token is tabulated; there is no untabulated set to estimate.
         return min(row.values())
-    return min(math.log(residual / untabulated), min(row.values()))
+    tabulated = sum(math.exp(value) for value in row.values())
+    residual = 1.0 - tabulated
+    # exp() round-trips are libm-dependent: a row whose true mass is exactly
+    # 1.0 can re-exponentiate to 1.0 minus a few ulps, and log() of that
+    # phantom residual is ~-36, not "no residual".  The only defensible floor
+    # is the dtype's own rounding: summing len(row) values each <= 1 accrues
+    # at most one ulp(1.0) of error per addition.
+    if residual <= math.ulp(1.0) * len(row):
+        return min(row.values())
+    return min(math.log(residual / (vocab_size - len(row))), min(row.values()))
 
 
 def _cmd_kl(args: argparse.Namespace) -> int:

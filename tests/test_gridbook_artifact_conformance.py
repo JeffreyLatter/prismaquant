@@ -29,8 +29,13 @@ _ASSIGNMENT = {
     "model.layers.0.mlp.gate_proj": {
         "data_type": "nvfp4_cb", "cb_k": 12,
     },
+    # A second fp4 rung at a different k. This leaf carried the SIGNED family
+    # until the producer deleted it (2026-08-17: n_sub=1 can never satisfy
+    # gridbook's native-FP4 predicate and no allocation ever chose it); the
+    # runtime contract still lists signed as decodable, but this test exports
+    # through the producer, so it can only exercise what the producer emits.
     "model.layers.1.mlp.up_proj": {
-        "data_type": "nvfp4_cb", "cb_mode": "signed", "cb_k": 13,
+        "data_type": "nvfp4_cb", "cb_k": 13,
     },
     "model.layers.2.mlp.down_proj": {
         "data_type": "fp8_cb", "cb_k": 28,
@@ -151,23 +156,16 @@ def _gridbook_cpu_decode(
 
     codewords = _extract_codewords(packed, k=k, type_size=type_size)
     values = torch.empty(rows, n_superblocks, 32, 8, dtype=torch.float32)
-    if mode == "signed":
-        assert n_sub == 1
-        magnitudes = subtables[0][codewords >> 8]
-        coordinates = torch.arange(8, dtype=torch.int64)
-        negative = ((codewords.unsqueeze(-1) >> coordinates) & 1).bool()
-        values.copy_(torch.where(negative, -magnitudes, magnitudes))
-    else:
-        assert mode == "product"
-        widths = _ceil_first_widths(k, n_sub)
-        sub_dim = 8 // n_sub
-        bit_offset = 0
-        for index, width in enumerate(widths):
-            sub_index = (codewords >> bit_offset) & ((1 << width) - 1)
-            values[..., index * sub_dim:(index + 1) * sub_dim] = (
-                subtables[index][sub_index]
-            )
-            bit_offset += width
+    assert mode == "product"
+    widths = _ceil_first_widths(k, n_sub)
+    sub_dim = 8 // n_sub
+    bit_offset = 0
+    for index, width in enumerate(widths):
+        sub_index = (codewords >> bit_offset) & ((1 << width) - 1)
+        values[..., index * sub_dim:(index + 1) * sub_dim] = (
+            subtables[index][sub_index]
+        )
+        bit_offset += width
 
     if grid == "fp8":
         assert weight_scale is not None
@@ -290,6 +288,4 @@ def test_tiny_export_is_gridbook_config_sidecar_and_decode_compatible(
             ).float()
             assert torch.equal(decoded, expected), (coding, format_name, qname)
 
-    assert seen_modes == {
-        ("fp4", "product"), ("fp4", "signed"), ("fp8", "product")
-    }
+    assert seen_modes == {("fp4", "product"), ("fp8", "product")}
