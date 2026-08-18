@@ -708,6 +708,41 @@ def test_gold_receipt_survives_a_model_card_but_no_other_file(tmp_path):
     assert any("differ from inventory" in p for p in problems)
 
 
+def test_gold_receipt_accepts_the_publishers_frozen_fd_links_only(tmp_path):
+    """The publisher replays this contract on its frozen view, where large
+    files are `/proc/self/fd/N` links to its own held descriptors; the freeze
+    opens sources O_NOFOLLOW so a real symlink can never reach that view.
+    The walk follows exactly that form and refuses every other symlink."""
+    import os
+
+    root, _card = _artifact(tmp_path)
+    record, _metrics = _gold_record(root)
+    kwargs = dict(model_dir=root, require_current_artifact_path=True)
+    assert _verify_dsv4_gridbook_gold_contract(
+        "gold.kl", record, record["metrics"], **kwargs
+    ) == []
+
+    weights = root / "model.safetensors"
+    backing = tmp_path / "held-backing.bin"
+    backing.write_bytes(weights.read_bytes())
+    fd = os.open(backing, os.O_RDONLY)
+    try:
+        weights.unlink()
+        weights.symlink_to(f"/proc/self/fd/{fd}")
+        assert _verify_dsv4_gridbook_gold_contract(
+            "gold.kl", record, record["metrics"], **kwargs
+        ) == []
+
+        weights.unlink()
+        weights.symlink_to(backing)  # an ordinary symlink still refuses
+        problems = _verify_dsv4_gridbook_gold_contract(
+            "gold.kl", record, record["metrics"], **kwargs
+        )
+        assert any("contains a symlink" in p for p in problems)
+    finally:
+        os.close(fd)
+
+
 def test_gold_receipt_survives_move_and_weight_reattest(tmp_path, monkeypatch):
     root, card = _artifact(tmp_path)
     record, _metrics = _gold_record(root)

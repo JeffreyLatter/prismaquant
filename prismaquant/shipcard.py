@@ -48,6 +48,7 @@ import hashlib
 import json
 import math
 import os
+import stat
 import re
 import statistics
 import subprocess
@@ -2070,7 +2071,30 @@ def _verify_dsv4_gridbook_gold_contract(
             observed_files: dict[str, int] = {}
             for path in sorted(root.rglob("*")):
                 if path.is_symlink():
-                    raise ValueError("artifact inventory contains a symlink")
+                    # `tools/publish_artifact.py` replays this contract on its
+                    # frozen view, where large files are links to the
+                    # publisher's own held descriptors (`/proc/self/fd/N`).
+                    # The freeze opens every source entry O_NOFOLLOW and so
+                    # can never ingest a real symlink, which means a link of
+                    # this exact form inside a replayed tree is the freeze's
+                    # representation of a regular file, not artifact content.
+                    # Any other symlink -- including one an artifact tries to
+                    # ship literally -- still refuses, and the exporter's
+                    # inventory can never contain one.
+                    target = os.readlink(path)
+                    if not target.startswith("/proc/self/fd/"):
+                        raise ValueError(
+                            "artifact inventory contains a symlink"
+                        )
+                    followed = path.stat()
+                    if not stat.S_ISREG(followed.st_mode):
+                        raise ValueError(
+                            "artifact inventory contains a symlink"
+                        )
+                    observed_files[path.relative_to(root).as_posix()] = int(
+                        followed.st_size
+                    )
+                    continue
                 if path.is_file():
                     rel = path.relative_to(root).as_posix()
                     if rel == "README.md":
