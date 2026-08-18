@@ -115,6 +115,25 @@ _PUBLISHED_FILES = frozenset({
 #     declaration is two otherwise-unread attributes. Verified directly:
 #     `lm_head`/`model.embed_tokens`/expert names derive exactly as before on
 #     both the vLLM-internal and checkpoint sides.
+# RE-FROZEN 2026-08-18 (third time, the merge/proven-rescues line), reviewed
+# against THIS handoff rather than re-hashed:
+#   nvfp4_cb_formats.py + nvfp4_cb_footprint.py -- the signed CB family
+#     (S13..S16, mode="signed") is deleted (c2c72a9). Lane-inert twice over:
+#     no allocation in any campaign ever assigned a signed rung (the family
+#     lost 78.48% of matched weight-MSE comparisons and was research-only),
+#     and the W8A16 lane exports the FP8 block-source passthrough, which
+#     never touches a CB codec. The footprint change removes the signed
+#     branch of lattice_codebook_content_sha256 plus one docstring word;
+#     every surviving branch's bytes are unchanged.
+#   artifact_completeness.py -- three checker-read fixes (5d75fc4, 1ccdf58,
+#     fcda875): the completeness gate learns to READ delegated-target
+#     namespaces, per-expert split-format group tokens, and the DSpark
+#     sidecar's physical->construction bijection (the fifth namespace,
+#     resolved from the artifact's own published mapping, never inferred).
+#     Post-export verifier only: it classifies claims over already-written
+#     bytes and renders nothing; every change widens what a correctly
+#     declared artifact can prove, and undeclared tensors still fail through
+#     the same refusal paths.
 _FROZEN_EXPORT_SOURCE_SHA256 = {
     "prismaquant/export_nvfp4_cb_streaming.py": (
         "05ea8ece98086feccc487b036e3a746d131629f0dc7049ae38abc19f0187ba7e"
@@ -123,7 +142,7 @@ _FROZEN_EXPORT_SOURCE_SHA256 = {
         "a690dafe120c4a6fc077d34aad1b142ee4201ec4dedda9ccd35a7583dfb22770"
     ),
     "prismaquant/nvfp4_cb_formats.py": (
-        "bd7cfa7a8930bf2652a86f2a87649d51bf2af497cd350890e9246c7ff01bce9f"
+        "1f29d3c08af0272f8a709a1b820da9caeafa4e27865fa552e1d99432d4cb74f9"
     ),
     "prismaquant/dspark_source_metadata.py": (
         "94fac4b16922f381cffe989d7b9b1d00f211bb93d9479dfde30eb0c02ef167f7"
@@ -153,10 +172,10 @@ _FROZEN_EXPORT_SOURCE_SHA256 = {
         "1cc27e3b64043f9873da528ae2aa128e37c15be303109509f713b8d738c59f36"
     ),
     "prismaquant/nvfp4_cb_footprint.py": (
-        "2cfb677c3e180ebe71a07288bed0feb02ab17df89ba4d66e3dffb6ce06ce2e51"
+        "e8adaaeea27ee67a038c67932338616d3d5e87aeabffb1fceb85baf536ebb253"
     ),
     "prismaquant/artifact_completeness.py": (
-        "bc6f3d23fee451f04e653633b408c0783c1905062cc50c502d18074fb1610e33"
+        "c14a8237d4670677471c3b9dc32ababfca1c5f7314d4cf8f4b9d21f8a907c1ee"
     ),
     "prismaquant/export_output_safety.py": (
         "4af0a9d891313f1d9d031955e431e1e84c1ba0e11a9ce2605ea92de3bc3703b5"
