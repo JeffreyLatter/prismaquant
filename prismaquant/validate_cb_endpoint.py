@@ -107,13 +107,13 @@ _GRAPH_CAPTURE_RE = re.compile(
     r"Graph capturing finished in [0-9]+ secs, took -?[0-9.]+ GiB"
 )
 GRIDBOOK_SERVED_MODEL_PREFIX = "pq-cb-gridbook-"
-#: The Gridbook 0.8.8 serving image, by content digest.  It is built FROM the
+#: The Gridbook 0.8.9 serving image, by content digest.  It is built FROM the
 #: eugr Spark base above and reports the identical vLLM version/commit, so the
 #: two lanes differ only in which container carries the Gridbook wheel and
 #: which tokenizer the architecture needs.
 GRIDBOOK_SPARK_VLLM_IMAGE = (
     "gridbook@sha256:"
-    "6810398e6ae81a3f9a3b97734f281cc62d72c49882aa885dd3b85381bd24759e"
+    "9033493b9b8b77835dd5eed392304e824e463acf7c2d1304a0f5fbe4b9d63922"
 )
 
 #: Per-lane serving constants.  Everything OUTSIDE this table -- vLLM

@@ -1,6 +1,30 @@
 # PrismaQuant Architecture
 
 As of: 2026-08-18 · branch `fix/aqua-profile-aware-resolver` · re-stamped for
+the **Gridbook 0.8.9 serving pin — the qualified CB kernels default on**:
+three selectors became tri-state with unset → auto in Gridbook 0.8.9
+(`PRISMAQUANT_CB_MOE_PERSISTENT_B` — both persistent-B payload families
+engage where the load-time predicate and the extension attest, and per-role
+FP8-CB split books keep the expand+grouped bridge, announced per layer — plus
+`PRISMAQUANT_CB_GEMV` and `PRISMAQUANT_CB_FP8_GEMV_V2` in the routed M ≤ 16
+band). Every EXPLICIT spelling keeps its exact 0.8.8 semantics, so the
+canonical gold environment (`PERSISTENT_B=0`, `CB_GEMV=inherited`) replays
+gold routes unchanged; `PRISMAQUANT_CB_FP8_GEMV_V2` stays outside the closed
+Gridbook-0.8.5 measurement registry by design (that profile is release
+evidence and its scan refuses namespace changes), and the 0.8.9 default-state
+served leg on the shipped clean 87 GB body measured kl_mean +0.17 % /
+PPL −0.06 % vs its gold record, inside the ±0.7 % cross-session KL envelope.
+The serving pin moves to 0.8.9/v4 with the wheel digest read from
+`gridbook:0.8.9-clean-23a3955`'s PEP 610 record (the published PyPI archive
+is byte-identical to a rebuild from tag v0.8.9, 60/60 members);
+`fp8_cb_fused_mid_m` gains its omitted 0.8.8 backed-set key plus 0.8.9 — the
+packaged runtime contract is byte-unchanged since 0.8.6 so both mirror the
+attested table — and the fp4-CB lane's detail now records that its
+"MoE T > 16 expands to BF16 + Ampere grouped GEMM" sentence describes
+runtimes BEFORE 0.8.9 and the announced fallbacks after it. Recorded evidence
+is untouched: gold drivers bind their pin from the runtime snapshot that
+carried the artifact, so shipped-era replays stay on 0.8.8 by construction.
+Previously re-stamped, the same day, for
 the **card-figure `model_sha` exclusion** (`CARD_FIGURE_FILENAMES`, §9.3 — the
 README doctrine now also covers `allocation-map.png`/`byte-budget.png`, with a
 legacy fallback) and, previously the same day, for
