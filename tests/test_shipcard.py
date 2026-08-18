@@ -396,6 +396,67 @@ def test_a_parity_claim_that_is_made_off_lane_is_still_verified(tmp_path):
     ), "an off-lane parity claim must still be replayed, not waved through"
 
 
+def test_a_body_only_dsv4_artifact_is_not_held_to_parity(tmp_path):
+    """A namespace-excluded DSv4 export cannot pass the parity census.
+
+    The parity verifier walks every construction unit of the displaced
+    container; a body-only export moves the excluded units (`mtp.`, the
+    DSpark draft) into a separate sidecar artifact by construction, so the
+    census fires on every correct body-only rebuild -- the same
+    gate-no-correct-artifact-can-pass defect as the off-lane case above.
+    The scoping key is `quant_config.json` provenance, which
+    `compute_model_sha` binds, so it cannot be flipped without breaking
+    artifact identity.
+    """
+    model_dir = _artifact(tmp_path, model_type="deepseek_v4")
+    (model_dir / "quant_config.json").write_text(json.dumps({
+        "quant_method": "gridbook",
+        "format": "nvfp4_cb",
+        "provenance": {"excluded_namespaces": ["mtp."]},
+    }))
+    card = build_shipcard(model_dir, build={"quant_method": "gridbook"})
+
+    assert CB_REQUIRED_SLOTS[0] not in required_slots(
+        card, model_dir=model_dir
+    )
+    assert not any(
+        problem.startswith(CB_REQUIRED_SLOTS[0])
+        for problem in verify(card, model_dir=model_dir)
+    )
+    # An exporter that OPENED the slot before this scoping existed left an
+    # opened-but-null record; that is an honest "scoped out", not a demand.
+    card_with_open_slot = dict(card)
+    card_with_open_slot["slots"] = dict(card["slots"])
+    card_with_open_slot["slots"][CB_REQUIRED_SLOTS[0]] = None
+    assert CB_REQUIRED_SLOTS[0] not in required_slots(
+        card_with_open_slot, model_dir=model_dir
+    )
+    assert not any(
+        problem.startswith(CB_REQUIRED_SLOTS[0])
+        for problem in verify(card_with_open_slot, model_dir=model_dir)
+    )
+
+
+def test_a_body_only_dsv4_parity_claim_is_still_verified(tmp_path):
+    """Scoping the DEMAND must not create a hole in the CHECK (body-only)."""
+    model_dir = _artifact(tmp_path, model_type="deepseek_v4")
+    (model_dir / "quant_config.json").write_text(json.dumps({
+        "quant_method": "gridbook",
+        "format": "nvfp4_cb",
+        "provenance": {"excluded_namespaces": ["mtp."]},
+    }))
+    card = build_shipcard(model_dir, build={"quant_method": "gridbook"})
+    card["slots"][CB_REQUIRED_SLOTS[0]] = {
+        "slot": CB_REQUIRED_SLOTS[0], "passed": True, "tool": "handmade",
+    }
+
+    assert CB_REQUIRED_SLOTS[0] in required_slots(card, model_dir=model_dir)
+    assert any(
+        problem.startswith(CB_REQUIRED_SLOTS[0])
+        for problem in verify(card, model_dir=model_dir)
+    ), "a body-only parity claim must still be replayed, not waved through"
+
+
 def _cb_card(tmp_path, *, model_type, architectures, name="exported"):
     """A Gridbook CB artifact whose architecture is the one thing that varies."""
     model_dir = _artifact(tmp_path, name=name)

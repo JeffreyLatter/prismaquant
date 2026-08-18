@@ -3083,6 +3083,40 @@ def _is_dspark_cb_sidecar_artifact(
     )
 
 
+def _cb_body_excludes_source_namespaces(
+    model_dir: str | os.PathLike | None,
+) -> bool:
+    """Whether this CB artifact was exported with source namespaces excluded.
+
+    A namespace-excluded export is a *body-only* artifact: the excluded
+    construction units (DSv4: the ``mtp.`` draft stack) live in a separate
+    sidecar artifact by construction.  Read off ``quant_config.json``
+    ``provenance.excluded_namespaces``, which ``compute_model_sha`` binds with
+    the artifact bytes, so this scoping cannot be flipped without breaking
+    artifact identity.  Fail-closed: absent or unreadable provenance is a
+    full-source artifact, so a release can never shed an obligation by hiding
+    or corrupting its quant config.
+    """
+    if model_dir is None:
+        return False
+    quant_path = Path(model_dir) / "quant_config.json"
+    if not quant_path.is_file():
+        return False
+    try:
+        payload = json.loads(quant_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    provenance = payload.get("provenance") if isinstance(
+        payload, Mapping
+    ) else None
+    if not isinstance(provenance, Mapping):
+        return False
+    excluded = provenance.get("excluded_namespaces")
+    return isinstance(excluded, (list, tuple)) and any(
+        isinstance(ns, str) and ns for ns in excluded
+    )
+
+
 #: `model_type` values whose gold lane IS the DSv4-Flash release contract.
 _DSV4_MODEL_TYPES = frozenset({"deepseek_v4"})
 _DSV4_ARCHITECTURE_RE = re.compile(r"^DeepseekV4[A-Za-z0-9_]*$")
@@ -3220,7 +3254,21 @@ def required_slots(
         # artifact-can-pass defect as the DSv4 gold contract, so it is scoped
         # to the same lane.  A card that nonetheless CARRIES the slot is still
         # held to it below, via OPTIONAL_SLOTS-style presence.
-        if cb_serving_lane(model_dir) == CB_LANE_DSV4_FLASH:
+        #
+        # Body-only scoping (2026-08-18): the parity verifier's census walks
+        # every construction unit of the displaced container, and a
+        # namespace-excluded export moves the excluded units into a separate
+        # sidecar artifact by construction (DSv4: `mtp.` lives in the
+        # 4.597 GB DSpark draft).  No body-only artifact can produce that
+        # census -- the same defect class, scoped by the same principle, and
+        # keyed on `quant_config.json` provenance that `compute_model_sha`
+        # binds.  An opened-but-null parity slot on such a card is an honest
+        # record that the demand was scoped out, not a waiver channel; a
+        # NON-null parity claim is still replayed via the presence branch.
+        if (
+            cb_serving_lane(model_dir) == CB_LANE_DSV4_FLASH
+            and not _cb_body_excludes_source_namespaces(model_dir)
+        ):
             required.extend(CB_REQUIRED_SLOTS)
         else:
             slots_present = card.get("slots")

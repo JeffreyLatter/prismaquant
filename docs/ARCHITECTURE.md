@@ -1,6 +1,15 @@
 # PrismaQuant Architecture
 
-As of: 2026-08-17 · branch `fix/aqua-profile-aware-resolver` · re-stamped for
+As of: 2026-08-18 · branch `fix/aqua-profile-aware-resolver` · re-stamped for
+the **body-only parity scoping** (§9.3): `perf.matched_budget_parity`'s
+verifier census walks every construction unit of the displaced container, and
+a namespace-excluded (body-only) export moves the excluded units into a
+separate sidecar artifact by construction (DSv4: `mtp.` lives in the 4.597 GB
+DSpark draft) — a gate no correct body-only artifact can pass. `required_slots`
+now scopes the demand out for such artifacts, keyed on `quant_config.json`
+`provenance.excluded_namespaces` (bound by `compute_model_sha`, so not
+flippable without breaking identity); a non-null parity claim on any card is
+still replayed. Previously re-stamped for
 the **served activation contract governing the A-side** (§"AQUA-AURA"): whether
 a format quantizes activations is a property of the RUNTIME, not of the format
 registry. Gridbook's CB lane decodes to BF16 and runs a BF16 GEMM unless a
@@ -79,7 +88,11 @@ cannot drift on which identities they accept; §9.3. The **whole CB ship-gate st
 just the gold contract: `validate_cb_endpoint.py` pinned the served-model
 brand, `--tokenizer-mode deepseek_v4`, the eugr image and `model_type ==
 "deepseek_v4"` itself, and `perf.matched_budget_parity` structurally requires a
-displaced container a net-new size class does not have. No CB artifact on this
+displaced container a net-new size class does not have — nor can a *body-only*
+(namespace-excluded) DSv4 artifact satisfy its census, whose walk demands the
+construction units living in the separate DSpark draft; both scopings are keyed
+on identity-bound artifact provenance, and a volunteered parity claim is still
+replayed wherever it appears. No CB artifact on this
 box — DSv4's included — had ever had a single slot filled, so the stack had
 never run end-to-end. The three genuinely lane-varying constants now come from
 one table, `CB_SERVING_LANE_SPECS`, that the launcher *reads* rather than
