@@ -1204,13 +1204,42 @@ def test_documenting_an_artifact_does_not_invalidate_its_own_card(tmp_path):
     assert compute_model_sha(model_dir) == before
     assert verify(load_shipcard(path), model_dir=model_dir) == []
 
-    # One exact filename, not a category: a figure the card references, or a
-    # doc under any other name, stays attested.
+    # Exact filenames, not a category: the card figures share the exclusion
+    # (2026-08-18 -- they are rendered FROM the attested quant_config after
+    # the gates by construction), and a doc under any other name stays
+    # attested.
     (model_dir / "allocation-map.png").write_bytes(b"\x89PNG\r\n")
-    assert compute_model_sha(model_dir) != before
-    after_png = compute_model_sha(model_dir)
+    assert compute_model_sha(model_dir) == before
+    (model_dir / "byte-budget.png").write_bytes(b"\x89PNG\r\n")
+    assert compute_model_sha(model_dir) == before
+    assert verify(load_shipcard(path), model_dir=model_dir) == []
     (model_dir / "NOTES.md").write_text("notes")
-    assert compute_model_sha(model_dir) != after_png
+    assert compute_model_sha(model_dir) != before
+
+
+def test_a_card_stamped_while_the_figures_were_hashed_still_verifies(tmp_path):
+    """Same tolerance as the README scope change, for the card figures.
+
+    An artifact published with a hashed allocation-map.png keeps verifying via
+    the `legacy_figures_hashed` fallback -- and keeps its figure attestation:
+    tampering with the figure still moves the legacy identity.
+    """
+    model_dir = _artifact(tmp_path)
+    (model_dir / "allocation-map.png").write_bytes(b"\x89PNG\r\nv1")
+
+    legacy_sha = compute_model_sha(model_dir, legacy_figures_hashed=True)
+    assert legacy_sha != compute_model_sha(model_dir)
+
+    path = _open_card(tmp_path, model_dir)
+    card = load_shipcard(path)
+    card["model_sha"] = legacy_sha
+    write_shipcard(path, card)
+    _fill_all(path, legacy_sha)
+    assert verify(load_shipcard(path), model_dir=model_dir) == []
+
+    (model_dir / "allocation-map.png").write_bytes(b"\x89PNG\r\ntampered")
+    assert any("artifact changed" in p
+               for p in verify(load_shipcard(path), model_dir=model_dir))
 
 
 def test_a_card_stamped_while_the_readme_was_hashed_still_verifies(tmp_path):

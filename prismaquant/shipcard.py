@@ -128,6 +128,13 @@ SERVED_ARTIFACT_BINDING_SCHEMA = "prismaquant.served_artifact_binding/1"
 SERVE_MANIFEST_SCHEMA = "prismaquant.serve_manifest/1"
 # The name `scripts/lib/serve_manifest.sh` writes beside the artifact.
 SERVE_MANIFEST_FILENAME = "serve_manifest.json"
+
+# Card figures: rendered FROM the artifact's own attested metadata (the
+# allocation map is drawn from quant_config.json), referenced only by the
+# model card, decoded by no runtime. They share README.md's exclusion from
+# `compute_model_sha` for the same three reasons documented there. Exact
+# filenames, not a category -- anything else in the dir stays attested.
+CARD_FIGURE_FILENAMES = ("allocation-map.png", "byte-budget.png")
 FULL_KL_TEACHER_EVIDENCE_SCHEMA = "prismaquant.full_kl_teacher_evidence/1"
 WIKITEXT_GOLD_CALIBRATION_SCHEMA = "prismaquant.wikitext_gold_calibration/1"
 WIKITEXT_PPL_CALIBRATION_SCHEMA = "prismaquant.wikitext_ppl_calibration/1"
@@ -209,6 +216,7 @@ def compute_model_sha(
     *,
     legacy_native_scope: bool = False,
     legacy_readme_hashed: bool = False,
+    legacy_figures_hashed: bool = False,
 ) -> str:
     """Cheap, stable identity for an exported checkpoint.
 
@@ -234,6 +242,8 @@ def compute_model_sha(
     legacy scope cannot produce one, so the fallback never weakens a new card.
     ``legacy_readme_hashed=True`` is the same tolerance for the one other
     scope change: cards stamped while ``README.md`` was still hashed.
+    ``legacy_figures_hashed=True`` likewise reproduces identities stamped
+    before the card figures (``CARD_FIGURE_FILENAMES``) joined the exclusion.
     """
     root = Path(model_dir)
     if not root.is_dir():
@@ -317,12 +327,18 @@ def compute_model_sha(
         # Nothing behavioural goes unbound: a README is decoded by no runtime
         # and cannot change what the model computes, and upload integrity comes
         # from `publish_artifact.py` freezing the complete local file set, not
-        # from `model_sha`.  One exact filename, not a category -- figures the
-        # card references stay attested.
+        # from `model_sha`.  Exact filenames, not a category.  The card
+        # figures (2026-08-18) earn the same exclusion by the same argument:
+        # they are rendered FROM the attested quant_config after the gates by
+        # construction -- the allocation being drawn only exists once the
+        # export finalized -- so hashing them made ILLUSTRATING an artifact
+        # invalidate the records that measured it, exactly the README failure.
         excluded = {SHIPCARD_FILENAME, "quant_config.json",
                     SERVE_MANIFEST_FILENAME}
         if not legacy_readme_hashed:
             excluded.add("README.md")
+        if not legacy_figures_hashed:
+            excluded.update(CARD_FIGURE_FILENAMES)
         auxiliary = {
             path.relative_to(root).as_posix(): {
                 "bytes": int(path.stat().st_size),
@@ -353,6 +369,8 @@ def accepted_model_shas(model_dir: str | os.PathLike) -> tuple[str, ...]:
         compute_model_sha(model_dir, legacy_native_scope=True),
         # Cards stamped while `README.md` was still hashed.
         compute_model_sha(model_dir, legacy_readme_hashed=True),
+        # Cards stamped while the card figures were still hashed.
+        compute_model_sha(model_dir, legacy_figures_hashed=True),
     )
 
 
@@ -2097,13 +2115,14 @@ def _verify_dsv4_gridbook_gold_contract(
                     continue
                 if path.is_file():
                     rel = path.relative_to(root).as_posix()
-                    if rel == "README.md":
+                    if rel == "README.md" or rel in CARD_FIGURE_FILENAMES:
                         # `compute_model_sha` deliberately excludes the model
-                        # card -- one exact filename -- so that DOCUMENTING an
-                        # artifact cannot invalidate the records that measured
-                        # it (an artifact must be able to quote its own gold
-                        # numbers; see the exclusion doctrine there).  The
-                        # exporter's finalized inventory predates any card by
+                        # card and its figures -- exact filenames -- so that
+                        # DOCUMENTING an artifact cannot invalidate the records
+                        # that measured it (an artifact must be able to quote
+                        # its own gold numbers and draw its own allocation; see
+                        # the exclusion doctrine there).  The exporter's
+                        # finalized inventory predates any card by
                         # construction, so this replay honors the same
                         # exclusion or no documented artifact can ever pass.
                         continue

@@ -701,6 +701,14 @@ def test_gold_receipt_survives_a_model_card_but_no_other_file(tmp_path):
         "gold.kl", record, record["metrics"], **kwargs
     ) == []
 
+    # The card figures share the doctrine (rendered from the attested
+    # quant_config after the gates); any other name stays a violation.
+    (root / "allocation-map.png").write_bytes(b"\x89PNG\r\n")
+    (root / "byte-budget.png").write_bytes(b"\x89PNG\r\n")
+    assert _verify_dsv4_gridbook_gold_contract(
+        "gold.kl", record, record["metrics"], **kwargs
+    ) == []
+
     (root / "extra.bin").write_bytes(b"\0")
     problems = _verify_dsv4_gridbook_gold_contract(
         "gold.kl", record, record["metrics"], **kwargs

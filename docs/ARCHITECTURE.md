@@ -1,6 +1,9 @@
 # PrismaQuant Architecture
 
 As of: 2026-08-18 · branch `fix/aqua-profile-aware-resolver` · re-stamped for
+the **card-figure `model_sha` exclusion** (`CARD_FIGURE_FILENAMES`, §9.3 — the
+README doctrine now also covers `allocation-map.png`/`byte-budget.png`, with a
+legacy fallback) and, previously the same day, for
 the **body-only parity scoping** (§9.3): `perf.matched_budget_parity`'s
 verifier census walks every construction unit of the displaced container, and
 a namespace-excluded (body-only) export moves the excluded units into a
@@ -84,7 +87,14 @@ gates does not escape it (KL is only bit-identical *within* a docker session).
 Legacy cards stamped while the README was hashed still verify, through
 `compute_model_sha(..., legacy_readme_hashed=True)` behind a single
 `accepted_model_shas()` helper that `verify` and `reattest` share so the two
-cannot drift on which identities they accept; §9.3. The **whole CB ship-gate stack turned out to be DSv4-shaped**, not
+cannot drift on which identities they accept; §9.3. **The card figures
+(`CARD_FIGURE_FILENAMES`: `allocation-map.png`, `byte-budget.png`) joined that
+exclusion 2026-08-18** by the same argument — they are rendered *from* the
+attested `quant_config.json` after the gates by construction, decoded by no
+runtime, and hashing them made illustrating an artifact invalidate the records
+that measured it; exact filenames, not a category, with a
+`legacy_figures_hashed=True` fallback in `accepted_model_shas()` and the same
+exclusion honored by the gold inventory replay. The **whole CB ship-gate stack turned out to be DSv4-shaped**, not
 just the gold contract: `validate_cb_endpoint.py` pinned the served-model
 brand, `--tokenizer-mode deepseek_v4`, the eugr image and `model_type ==
 "deepseek_v4"` itself, and `perf.matched_budget_parity` structurally requires a
