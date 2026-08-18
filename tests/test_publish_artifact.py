@@ -126,6 +126,12 @@ class _FakeAdd:
         if isinstance(self.path_or_fileobj, bytes):
             yield io.BytesIO(self.path_or_fileobj)
             return
+        if isinstance(self.path_or_fileobj, (str, pathlib.Path)):
+            # Production hands large files over as the frozen view's link
+            # path (the Xet transport cannot read a Python file object).
+            with open(self.path_or_fileobj, "rb") as handle:
+                yield handle
+            return
         previous = self.path_or_fileobj.tell()
         self.path_or_fileobj.seek(0)
         try:
@@ -200,10 +206,13 @@ def _install_fake_hub(monkeypatch, state: _FakeHubState):
                     operation._upload_mode = "regular"
                     continue
                 operation._upload_mode = "lfs"
+                # Bytes are captured AT UPLOAD TIME, before create_commit --
+                # exactly like the real LFS/Xet transports. The fake hub does
+                # not verify declared digests here: detecting divergence is
+                # the publisher's post-commit replay's job, which these tests
+                # exercise.
                 with operation.as_file() as handle:
                     data = _read_all(handle)
-                assert len(data) == operation.upload_info.size
-                assert hashlib.sha256(data).digest() == operation.upload_info.sha256
                 state.uploaded_lfs[operation.path_in_repo] = data
                 operation._is_uploaded = True
 
@@ -590,9 +599,16 @@ def test_frozen_snapshot_survives_original_path_and_symlink_swaps(
     assert "stale_deleted=1" in capsys.readouterr().out
 
 
-def test_in_place_mutation_after_freeze_aborts_before_commit(
+def test_in_place_mutation_after_freeze_is_detected_after_commit(
     tmp_path, capsys, monkeypatch,
 ):
+    """Same-inode mutation across the upload window fails the publish loudly.
+
+    The Xet transport consumes paths, not the streaming verified reader, so a
+    same-inode mutation after freeze IS uploaded; the publisher's post-commit
+    replay of the declared digests across its held descriptors detects it and
+    refuses to report success (the commit exists and the operator is told to
+    inspect before announcing)."""
     model_dir = _artifact(tmp_path)
     _close_all_slots(model_dir)
     weight = model_dir / "model-00001-of-00001.safetensors"
@@ -612,8 +628,10 @@ def test_in_place_mutation_after_freeze_aborts_before_commit(
         "--repo-id",
         "rdtand/test-artifact",
     ]) == 1
-    assert state.create_calls == []
-    assert "mutated after verification" in capsys.readouterr().err
+    assert len(state.create_calls) == 1
+    err = capsys.readouterr().err
+    assert "post-commit re-verification" in err
+    assert "inspect the repository" in err
 
 
 def test_in_place_mutation_after_preupload_cannot_change_committed_bytes(
@@ -631,11 +649,16 @@ def test_in_place_mutation_after_preupload_cannot_change_committed_bytes(
     )
     _install_fake_hub(monkeypatch, state)
 
+    # The upload captured the frozen bytes before the mutation, so the
+    # committed object is unchanged -- and the post-commit digest replay
+    # still fails the run loudly because the local inode diverged during
+    # the publish window (fail-safe: never report clean success over a
+    # mid-publish mutation, even a harmless-to-the-commit one).
     assert publish_cli([
         str(model_dir),
         "--repo-id",
         "rdtand/test-artifact",
-    ]) == 0
+    ]) == 1
     assert state.remote[weight.name] == original_weight
 
 
