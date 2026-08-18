@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.15.1 — 2026-08-18
+
+### Changed
+
+- **Gridbook serving pin 0.8.10** (commit `f4b3274`, wheel sha `7a7c98e1…`
+  read from `gridbook:0.8.10-clean-f4b3274`'s PEP 610 record; PyPI archive
+  verified member-byte-identical to a tag rebuild, 60/60). 0.8.10 is 0.8.9
+  plus a fix for a load regression 0.8.9's own suite could not see: the
+  tri-state refactor renamed a `moe_gemv_select` symbol that
+  `gridbook/moe_mixed.py` still imported, so any artifact declaring
+  `per_expert_format_groups` (a split-bank mixed expert stack) died with an
+  ImportError at config dispatch. Uniform stacks — every published artifact —
+  were unaffected; the pin supersedes 0.8.9 with zero serving-behaviour delta
+  on everything shipped today. `fp8_cb_fused_mid_m` gains the 0.8.10
+  backed-set key carried forward unchanged (the packaged runtime contract is
+  byte-unchanged since 0.8.6); the fp4-CB lane ADDENDUM, the CB endpoint
+  image digest, and the Qwen3.8 smoke BASE_IMAGE follow.
+
 ## 0.15.0 — 2026-08-18
 
 Merge of two parallel lines: the DSv4-Flash release campaign
