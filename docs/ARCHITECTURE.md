@@ -2,8 +2,21 @@
 
 As of: 2026-08-18 · `main` — merge of the `merge/proven-rescues` and
 `fix/aqua-profile-aware-resolver` lines; both lines' stamps follow, newest
-first, each recording its own branch and date. Re-stamped (2026-08-18,
-`main`) for the **Gridbook 0.8.10 serving pin**: 0.8.10 is 0.8.9 plus a fix
+first, each recording its own branch and date. Re-stamped (2026-08-18, `main`) for
+the **CB-lane A-side correction — both families execute** (§"AQUA-AURA"):
+`lane_specs/nvfp4_cb.json` `served_activation_quantization.executes` is now
+`["NVFP4_CB_*", "FP8_CB_*"]`. The 2026-08-17 entry (`["FP8_CB_*"]`) rested on
+reading gridbook's "exact native BF16 bridge" as activations-left-exact; the
+runtime QDQs NVFP4_CB activations to E2M1 group-16 on every served route
+(`linear.py` `fp4_act_qdq_or_codec`, moe.py's three routed sites, `codec.py`
+`fp4_group16_act_qdq`), so the bridge names a GEMM schedule, not an activation
+precision — retracted the same day; spec, tests, and this doc caught up here.
+Measured on the Qwen3.8-27B card: the corrected merge re-allocates identically
+to the shipped artifact, while the stale entry moves 337/496 body units (272
+FP8_CB → NVFP4_CB family flips). Derivation debt stands per principle 14: the
+packaged Gridbook runtime contract publishes no activation table yet, so the
+spec cites runtime call sites instead of asserting preflight equality.
+Previously re-stamped (2026-08-18, `main`) for the **Gridbook 0.8.10 serving pin**: 0.8.10 is 0.8.9 plus a fix
 for a load regression 0.8.9's own suite could not see — the tri-state
 refactor renamed a `moe_gemv_select` symbol that `gridbook/moe_mixed.py`
 still imported, so any artifact declaring `per_expert_format_groups` (a
@@ -284,36 +297,49 @@ W-side to 0.07%, which produced a Pareto byte-identical to the weight-only one.
 research** — there is no served KL/PPL A/B against the weight-only arm at
 matched bpp, and that A/B is the promotion gate.
 
-**The A-side belongs to the SERVING LANE, not to the format registry, and the
-lane answers per FAMILY (2026-08-17).** Whether choosing a format actually
-quantizes activations is a property of the runtime that will serve the
-artifact. On the `nvfp4_cb` lane gridbook answers **two different ways**:
-`FP8_CB_*` genuinely is W8A8 — `gridbook/linear.py` hands quantized `xq` with
-per-token dynamic scales to `native_cutlass_scaled_mm`, and `moe.py` declares
-`_FP8_GROUPED_CONTRACT = "fp8_per_token_dynamic"` — while `NVFP4_CB_*` is not:
-it decodes to BF16 and runs a BF16 GEMM, gridbook's own "exact native BF16
-bridge", unless a **process-global** env selector picks a fused mode
-(`PRISMAQUANT_CB_FUSED_FP4`, `..._FP4_MOE`), which every gate and gold serve on
-this lane leaves unset. So an `NVFP4_CB` unit's true A-side is exactly zero,
-the artifact's per-scheme `activation_contract` is *permission* for a fused
-mode rather than selection of one, and there is no per-unit A4/A16 choice to
-allocate over. Pricing that half is not a conservative overestimate but a
-**currency error** in the principle-8 sense, and it cost bytes: at 87.403 GB it
-drove DSv4-Flash from 96.8% `nvfp4_cb` (K16 bulk) to 73.7% with **25.4%
-promoted to FP8_CB** and the bulk rung crushed **K16 → K12** — the DP spending
-real weight bits to escape a cost the served artifact never pays, while the
-FP8 promotions it bought were priced against a *phantom* alternative. The
-Qwen3.8-27B CB-A allocation used the same AQUA-merged cost on the same lane.
-Lanes therefore declare `served_activation_quantization.executes` as **glob
-patterns over format names** (`lane_spec.LaneActivationContract`,
-`lane_specs/nvfp4_cb.json` — `["FP8_CB_*"]`), because the answer is per family
-and rungs within a family are open-ended; enumerating rungs would under-declare
-silently the day one is added. `activation_dloss_table` **requires** the
-pattern set and refuses to fall back on the registry's W4A4 claim; a lane that
-declares an empty set refuses the merge outright rather than writing an
-all-zero A-side that is indistinguishable later from a real one. Pass
+**The A-side belongs to the SERVING LANE, not to the format registry — and on
+this lane BOTH CB families execute their activation grids (corrected
+2026-08-18).** Whether choosing a format actually quantizes activations is a
+property of the runtime that will serve the artifact, so
+`activation_dloss_table` refuses the format registry's word for it and resolves
+the executed set from the lane spec. On `nvfp4_cb` gridbook executes both:
+`FP8_CB_*` is W8A8 — `gridbook/linear.py` hands quantized `xq` with per-token
+dynamic scales to `native_cutlass_scaled_mm`, and `moe.py` declares
+`_FP8_GROUPED_CONTRACT = "fp8_per_token_dynamic"` — and `NVFP4_CB_*` rounds
+activations onto the E2M1 group-16 grid before every GEMM (`linear.py`
+`fp4_act_qdq_or_codec`; `moe.py`'s three routed `fp4_act_qdq` sites;
+`codec.py` `fp4_group16_act_qdq`, which mirrors
+`format_registry._make_rtn("fp4_e2m1", 16)`). Gridbook's "exact native BF16
+bridge" is a **GEMM-schedule** statement, not an activation-precision one: the
+BF16 operand has already been rounded onto the E2M1 grid, and
+`nvfp4_activation_contract.bridge_contract` documents that every quality route
+consumes the exact native QDQ the decode path uses, differing only in GEMM
+schedule. A 2026-08-17 revision read "exact" as "activations left exact" and
+scoped the lane's executes to `["FP8_CB_*"]`; it was retracted the same day —
+the runtime was never ambiguous — and the spec, this section, and the tests
+were corrected on 2026-08-18. The shipped DSv4 92 GB body and the shipped
+Qwen3.8 13 GB artifact were priced with both A-sides and are correct as
+shipped. The stakes are measured, not argued: re-allocating the Qwen3.8 card
+under the stale entry moves **337 of 496 body units** (272 of them FP8_CB →
+NVFP4_CB family flips — the DP floods into the family whose real activation
+error the cost stopped seeing, reporting predicted_dloss 0.0486 vs the shipped
+0.0735 only because it prices less of reality), while the corrected entry
+re-allocates to the shipped `layer_config.json` **byte-for-byte**. Fresh cost cards consume this list **silently**
+(`dense_anchored_cb` resolves `lane_id="nvfp4_cb"` with no flag; any non-empty
+set means no refusal), which is why the value carries runtime call-site
+citations, and — per principle 14 — should graduate to a preflight equality
+assert once gridbook packages its per-scheme activation contracts in
+`runtime_contract.json` (it computes them today; it does not package them).
+Lanes declare `served_activation_quantization.executes` as **glob patterns
+over format names** (`lane_spec.LaneActivationContract`,
+`lane_specs/nvfp4_cb.json` — `["NVFP4_CB_*", "FP8_CB_*"]`), because rungs
+within a family are open-ended; enumerating rungs would under-declare silently
+the day one is added. `activation_dloss_table` **requires** the pattern set
+and refuses to fall back on the registry's W4A4 claim; a lane that declares an
+empty set refuses the merge outright rather than writing an all-zero A-side
+that is indistinguishable later from a real one. Pass
 `--lane-executes-all-activation-grids` for a lane that genuinely serves every
-activation grid fused.
+activation grid.
 Name resolution goes through the **model profile**: the stage inverts
 `checkpoint_to_live_name` over the safetensors index, because a card's unit
 names come from the module tree the probe walked while a checkpoint may rename

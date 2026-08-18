@@ -494,29 +494,34 @@ class TestServedActivationContractGovernsTheASide:
                                    executed_activation_formats=frozenset())
         assert "executes NO format's activation quantization" in str(exc.value)
 
-    def test_the_cb_lane_answers_PER_FAMILY_not_per_lane(self):
-        """The CB lane does two different things and must say so.
+    def test_the_cb_lane_executes_BOTH_families_activation_grids(self):
+        """Both CB families QDQ activations on every served route.
 
-        FP8_CB really is W8A8 (`linear.py` hands `xq` + per-token dynamic scales
-        to native_cutlass_scaled_mm; moe.py's `_FP8_GROUPED_CONTRACT` is
-        "fp8_per_token_dynamic"). NVFP4_CB really is not -- it takes the exact
-        BF16 bridge. A blanket answer either way is wrong: "nothing" drops a
-        real FP8 cost, "everything" reinstates the phantom NVFP4 one.
+        NVFP4_CB: gridbook rounds activations onto the E2M1 group-16 grid
+        before every GEMM (`linear.py` `fp4_act_qdq_or_codec`, moe.py's three
+        routed `fp4_act_qdq` sites, codec.py `fp4_group16_act_qdq`); the
+        "exact BF16 bridge" is a GEMM-schedule statement, not an
+        activation-precision one. FP8_CB is W8A8 (`linear.py` hands `xq` +
+        per-token dynamic scales to native_cutlass_scaled_mm; moe.py's
+        `_FP8_GROUPED_CONTRACT` is "fp8_per_token_dynamic"). Passthrough
+        sources and BF16 stay outside the list. A 2026-08-17 revision briefly
+        zeroed the NVFP4_CB side by misreading "exact"; retracted same day --
+        this test pins the corrected answer.
         """
         from prismaquant.lane_spec import load_lane_spec
 
         contract = load_lane_spec("nvfp4_cb").served_activation_quantization
         assert contract is not None, (
             "the CB lane must declare its served activation contract")
-        for fmt in ("FP8_CB_K28", "FP8_CB_K48"):
-            assert contract.matches(fmt), f"{fmt} is served W8A8"
         for fmt in ("NVFP4_CB_K12", "NVFP4_CB_K18",
-                    "FP8_BLOCK_UE8M0_SOURCE", "BF16", "MXFP4_SOURCE"):
+                    "FP8_CB_K28", "FP8_CB_K48"):
+            assert contract.matches(fmt), (
+                f"{fmt} executes its activation grid when served")
+        for fmt in ("FP8_BLOCK_UE8M0_SOURCE", "BF16", "MXFP4_SOURCE"):
             assert not contract.matches(fmt), (
-                f"{fmt} takes the bridge / is passthrough; its A-side is zero")
-        assert set(contract.selectors_must_be_unset) == {
-            "PRISMAQUANT_CB_FUSED_FP4", "PRISMAQUANT_CB_FUSED_FP4_MOE"}
-        assert "BF16 bridge" in contract.rationale
+                f"{fmt} is passthrough / >=16-bit activations; A-side zero")
+        assert "GEMM-SCHEDULE" in contract.rationale, (
+            "the rationale must keep the exact-bridge misreading's correction")
 
     def test_a_family_pattern_covers_a_rung_added_tomorrow(self):
         """Patterns, not enumerated rungs: an unlisted rung must not go free."""
