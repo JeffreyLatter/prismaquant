@@ -706,6 +706,17 @@ def write_shipcard(path: str | os.PathLike, card: Mapping[str, Any]) -> Path:
         if isinstance(reserved, bool) or not isinstance(reserved, int) or reserved <= 0:
             raise ValueError("shipcard reserved_file_bytes must be a positive integer")
         if len(encoded) > reserved:
+            # A full card outgrows pretty-printing long before it outgrows its
+            # reservation: indent=2 inflates this schema ~1.5x, and a six-slot
+            # DSv4 card crossed the line on the LAST slot fill -- dropping a
+            # record every gate had already passed.  The reservation is a byte
+            # contract (the file's size is part of the frozen artifact
+            # inventory), not a formatting contract; fall back to compact JSON
+            # before refusing.
+            encoded = (
+                json.dumps(card, separators=(",", ":"), default=str) + "\n"
+            ).encode("utf-8")
+        if len(encoded) > reserved:
             raise ValueError(
                 f"shipcard needs {len(encoded)} bytes but its fixed reservation "
                 f"is {reserved} bytes; refusing to invalidate the artifact inventory"

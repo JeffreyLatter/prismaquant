@@ -725,6 +725,30 @@ def test_shipcard_reservation_overflow_preserves_previous_record(tmp_path):
     assert path.read_bytes() == before
 
 
+def test_shipcard_write_falls_back_to_compact_before_refusing(tmp_path):
+    """indent=2 inflates the card ~1.5x; a card that only overflows the
+    reservation pretty-printed must be written compact, not dropped.  The
+    six-slot DSv4 card crossed this line on its LAST slot fill (the graph
+    endpoint record, 2026-08-18) after every gate had already passed."""
+    model_dir = _artifact(tmp_path)
+    path = _open_card(tmp_path, model_dir)
+    card = load_shipcard(path)
+    reserved = card["reserved_file_bytes"]
+    # Grow the card until pretty-printed exceeds the reservation but compact
+    # still fits: many small fields inflate most under indentation.
+    filler = {f"k{i}": i for i in range(reserved // 18)}
+    card["build"]["filler"] = filler
+    pretty = len(json.dumps(card, indent=2, default=str)) + 1
+    compact = len(json.dumps(card, separators=(",", ":"), default=str)) + 1
+    assert pretty > reserved > compact, (pretty, reserved, compact)
+
+    write_shipcard(path, card)
+
+    raw = path.read_bytes()
+    assert len(raw) == reserved, "the byte contract must hold exactly"
+    assert load_shipcard(path)["build"]["filler"] == filler
+
+
 def test_record_from_another_build_is_refused(tmp_path):
     model_dir = _artifact(tmp_path)
     path = _open_card(tmp_path, model_dir)
