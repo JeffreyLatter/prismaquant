@@ -32,7 +32,7 @@ import math
 import re
 import struct
 import warnings
-from collections.abc import Mapping, MutableMapping, Sequence
+from collections.abc import Iterable, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -2078,8 +2078,17 @@ def whole_artifact_budget_stamp(
     selection_tensor_payload_bytes: int,
     selection_non_tensor_reserve_bytes: int,
     selection_assignment: Mapping[str, str],
+    excluded_source_prefixes: Iterable[str] = (),
 ) -> dict:
-    """Persist the conservative selection contract consumed by exporters."""
+    """Persist the conservative selection contract consumed by exporters.
+
+    ``excluded_source_prefixes`` records the source namespaces this price was
+    computed WITHOUT. It travels because the price and the artifact are two
+    halves of one statement: the allocator can only spend the excluded bytes
+    on the body if the exporter actually omits them, and nothing else in the
+    artifact records that they were meant to be absent. Omitted when empty, so
+    a run that excludes nothing writes a byte-identical stamp.
+    """
     values = {
         "budget_bytes": budget_bytes,
         "selection_tensor_payload_bytes": selection_tensor_payload_bytes,
@@ -2096,10 +2105,18 @@ def whole_artifact_budget_stamp(
             "selection whole-artifact upper bound exceeds its hard budget: "
             f"{upper_bound}B > {budget_bytes}B"
         )
+    excluded = tuple(
+        dict.fromkeys(
+            str(prefix).strip()
+            for prefix in (excluded_source_prefixes or ())
+            if str(prefix).strip()
+        )
+    )
     return {
         "schema": WHOLE_ARTIFACT_BUDGET_SCHEMA,
         "scope": "all_regular_files_recursive",
         "budget_bytes": budget_bytes,
+        **({"excluded_source_prefixes": list(excluded)} if excluded else {}),
         "selection_tensor_payload_bytes": selection_tensor_payload_bytes,
         "selection_non_tensor_reserve_bytes": selection_non_tensor_reserve_bytes,
         "selection_whole_artifact_upper_bound_bytes": upper_bound,
@@ -2183,7 +2200,81 @@ def whole_artifact_budget_from_assignment_payload(
                 f"{assignment_digest}, but the assignment being consumed "
                 f"hashes to {actual_digest}"
             )
+    raw_excluded = raw.get("excluded_source_prefixes")
+    if raw_excluded is not None:
+        if not isinstance(raw_excluded, (list, tuple)) or not all(
+            isinstance(p, str) and p.strip() for p in raw_excluded
+        ):
+            raise ValueError(
+                f"{where}: whole-artifact budget field "
+                "'excluded_source_prefixes' must be a list of non-empty "
+                "strings"
+            )
     return dict(raw)
+
+
+def budget_stamp_excluded_prefixes(
+    stamp: Mapping[str, object] | None,
+) -> tuple[str, ...]:
+    """The source namespaces a budget stamp was priced WITHOUT.
+
+    Absent means "none excluded", which is both the pre-existing behaviour and
+    the correct reading of every stamp written before the field existed: those
+    prices charged the whole checkpoint.
+    """
+
+    if not stamp:
+        return ()
+    return tuple(
+        dict.fromkeys(
+            str(p).strip()
+            for p in (stamp.get("excluded_source_prefixes") or ())
+            if str(p).strip()
+        )
+    )
+
+
+def assert_exclusions_match_budget_stamp(
+    stamp: Mapping[str, object] | None,
+    excluded_namespaces: Iterable[str],
+    *,
+    where: str,
+) -> None:
+    """Refuse an artifact whose contents contradict the price that justified it.
+
+    A namespace exclusion is one statement made in two places: the allocator
+    declines to CHARGE for the namespace, which hands those bytes to the body,
+    and the exporter declines to WRITE it. Make only the first and the artifact
+    overshoots its budget by the excluded mass -- caught, but only by the final
+    recursive stat, hours later. Make only the second and the artifact comes in
+    UNDER budget by that mass, having bought less quality than it paid for, and
+    nothing catches it at all: the selection reconciles, the export passes, the
+    shipcard agrees. That asymmetry is why this is an equality check and not a
+    bound.
+
+    No stamp means no claim: namespace exclusion is a legitimate operation on
+    its own, and an unbudgeted export has nothing to contradict. The check
+    binds only once a price has been asserted.
+    """
+
+    if not stamp:
+        return
+    priced = set(budget_stamp_excluded_prefixes(stamp))
+    written = {
+        str(p).strip() for p in (excluded_namespaces or ()) if str(p).strip()
+    }
+    if priced == written:
+        return
+    raise ValueError(
+        f"{where}: namespace exclusions disagree with the budget stamp that "
+        f"priced this assignment. The price was computed WITHOUT "
+        f"{sorted(priced) or '[]'}; this export omits {sorted(written) or '[]'}. "
+        f"Priced-but-written ({sorted(priced - written) or '[]'}) overshoots "
+        f"the budget by those bytes; written-but-priced "
+        f"({sorted(written - priced) or '[]'}) silently ships under budget, "
+        f"having bought less quality than the budget paid for. Re-run the "
+        f"allocation and the export with the same exclusion set."
+    )
 
 
 def recursive_regular_file_bytes(path: str | Path) -> int:

@@ -48,6 +48,7 @@ import hashlib
 import json
 import math
 import os
+import stat
 import re
 import statistics
 import subprocess
@@ -127,6 +128,13 @@ SERVED_ARTIFACT_BINDING_SCHEMA = "prismaquant.served_artifact_binding/1"
 SERVE_MANIFEST_SCHEMA = "prismaquant.serve_manifest/1"
 # The name `scripts/lib/serve_manifest.sh` writes beside the artifact.
 SERVE_MANIFEST_FILENAME = "serve_manifest.json"
+
+# Card figures: rendered FROM the artifact's own attested metadata (the
+# allocation map is drawn from quant_config.json), referenced only by the
+# model card, decoded by no runtime. They share README.md's exclusion from
+# `compute_model_sha` for the same three reasons documented there. Exact
+# filenames, not a category -- anything else in the dir stays attested.
+CARD_FIGURE_FILENAMES = ("allocation-map.png", "byte-budget.png")
 FULL_KL_TEACHER_EVIDENCE_SCHEMA = "prismaquant.full_kl_teacher_evidence/1"
 WIKITEXT_GOLD_CALIBRATION_SCHEMA = "prismaquant.wikitext_gold_calibration/1"
 WIKITEXT_PPL_CALIBRATION_SCHEMA = "prismaquant.wikitext_ppl_calibration/1"
@@ -208,6 +216,7 @@ def compute_model_sha(
     *,
     legacy_native_scope: bool = False,
     legacy_readme_hashed: bool = False,
+    legacy_figures_hashed: bool = False,
 ) -> str:
     """Cheap, stable identity for an exported checkpoint.
 
@@ -233,6 +242,8 @@ def compute_model_sha(
     legacy scope cannot produce one, so the fallback never weakens a new card.
     ``legacy_readme_hashed=True`` is the same tolerance for the one other
     scope change: cards stamped while ``README.md`` was still hashed.
+    ``legacy_figures_hashed=True`` likewise reproduces identities stamped
+    before the card figures (``CARD_FIGURE_FILENAMES``) joined the exclusion.
     """
     root = Path(model_dir)
     if not root.is_dir():
@@ -316,12 +327,18 @@ def compute_model_sha(
         # Nothing behavioural goes unbound: a README is decoded by no runtime
         # and cannot change what the model computes, and upload integrity comes
         # from `publish_artifact.py` freezing the complete local file set, not
-        # from `model_sha`.  One exact filename, not a category -- figures the
-        # card references stay attested.
+        # from `model_sha`.  Exact filenames, not a category.  The card
+        # figures (2026-08-18) earn the same exclusion by the same argument:
+        # they are rendered FROM the attested quant_config after the gates by
+        # construction -- the allocation being drawn only exists once the
+        # export finalized -- so hashing them made ILLUSTRATING an artifact
+        # invalidate the records that measured it, exactly the README failure.
         excluded = {SHIPCARD_FILENAME, "quant_config.json",
                     SERVE_MANIFEST_FILENAME}
         if not legacy_readme_hashed:
             excluded.add("README.md")
+        if not legacy_figures_hashed:
+            excluded.update(CARD_FIGURE_FILENAMES)
         auxiliary = {
             path.relative_to(root).as_posix(): {
                 "bytes": int(path.stat().st_size),
@@ -352,6 +369,8 @@ def accepted_model_shas(model_dir: str | os.PathLike) -> tuple[str, ...]:
         compute_model_sha(model_dir, legacy_native_scope=True),
         # Cards stamped while `README.md` was still hashed.
         compute_model_sha(model_dir, legacy_readme_hashed=True),
+        # Cards stamped while the card figures were still hashed.
+        compute_model_sha(model_dir, legacy_figures_hashed=True),
     )
 
 
@@ -706,6 +725,17 @@ def write_shipcard(path: str | os.PathLike, card: Mapping[str, Any]) -> Path:
         if isinstance(reserved, bool) or not isinstance(reserved, int) or reserved <= 0:
             raise ValueError("shipcard reserved_file_bytes must be a positive integer")
         if len(encoded) > reserved:
+            # A full card outgrows pretty-printing long before it outgrows its
+            # reservation: indent=2 inflates this schema ~1.5x, and a six-slot
+            # DSv4 card crossed the line on the LAST slot fill -- dropping a
+            # record every gate had already passed.  The reservation is a byte
+            # contract (the file's size is part of the frozen artifact
+            # inventory), not a formatting contract; fall back to compact JSON
+            # before refusing.
+            encoded = (
+                json.dumps(card, separators=(",", ":"), default=str) + "\n"
+            ).encode("utf-8")
+        if len(encoded) > reserved:
             raise ValueError(
                 f"shipcard needs {len(encoded)} bytes but its fixed reservation "
                 f"is {reserved} bytes; refusing to invalidate the artifact inventory"
@@ -871,6 +901,22 @@ def verify(
         problems.append(
             "Gridbook artifact lacks the required weight-stat attestation"
         )
+
+    # The published bpp is a load-bearing public claim: every matched-bpp
+    # comparison against this artifact inherits it. A card whose claim
+    # contradicts the bytes its own recipe declares has shipped twice (see
+    # allocator_achieved_bpp), so refuse here rather than at card-writing time
+    # — an export that already cost GPU hours should fail at PUBLICATION, the
+    # blocking point, not lose its artifact to a gate. A card written before
+    # this check existed carries no verdict and is left alone.
+    achieved = ((card.get("build") or {}).get("achieved_bpp") or {})
+    cross = achieved.get("cross_check") if isinstance(achieved, Mapping) else None
+    if isinstance(cross, Mapping) and cross.get("verdict") == "DISAGREE":
+        problems.append(
+            "build.achieved_bpp contradicts the recipe's own serialized "
+            f"bytes: {cross.get('detail')}"
+        )
+
     if required is None:
         required = required_slots(card, model_dir=model_dir)
     for slot in required:
@@ -1402,7 +1448,7 @@ def _verify_dsv4_gridbook_gold_contract(
         workload = {
             "mode": "student",
             "score_positions": "all",
-            "prompt_top_k": 1024,
+            "prompt_top_k": 8192,
             "n_samples": 8,
             "seqlen": 512,
             "n_positions": 4088,
@@ -1447,7 +1493,7 @@ def _verify_dsv4_gridbook_gold_contract(
             coverage_policy = teacher.get("topk_coverage_policy")
             expected_coverage_policy = {
                 "schema": TOPK_COVERAGE_POLICY_SCHEMA,
-                "top_k": 1024,
+                "top_k": 8192,
                 "minimum_probability_mass_per_position": 0.90,
                 "maximum_probability_mass": 1.0,
                 "probability_mass_absolute_tolerance": 1e-6,
@@ -1558,7 +1604,7 @@ def _verify_dsv4_gridbook_gold_contract(
                     or not sha(calibration.get("calib_ids_sha256"))
                     or calibration.get("scoring") != {
                         "positions": "all",
-                        "prompt_top_k": 1024,
+                        "prompt_top_k": 8192,
                         "logprob_dtype": "float32",
                         "tail_bucket": True,
                     }
@@ -2043,11 +2089,44 @@ def _verify_dsv4_gridbook_gold_contract(
             observed_files: dict[str, int] = {}
             for path in sorted(root.rglob("*")):
                 if path.is_symlink():
-                    raise ValueError("artifact inventory contains a symlink")
-                if path.is_file():
+                    # `tools/publish_artifact.py` replays this contract on its
+                    # frozen view, where large files are links to the
+                    # publisher's own held descriptors (`/proc/self/fd/N`).
+                    # The freeze opens every source entry O_NOFOLLOW and so
+                    # can never ingest a real symlink, which means a link of
+                    # this exact form inside a replayed tree is the freeze's
+                    # representation of a regular file, not artifact content.
+                    # Any other symlink -- including one an artifact tries to
+                    # ship literally -- still refuses, and the exporter's
+                    # inventory can never contain one.
+                    target = os.readlink(path)
+                    if not target.startswith("/proc/self/fd/"):
+                        raise ValueError(
+                            "artifact inventory contains a symlink"
+                        )
+                    followed = path.stat()
+                    if not stat.S_ISREG(followed.st_mode):
+                        raise ValueError(
+                            "artifact inventory contains a symlink"
+                        )
                     observed_files[path.relative_to(root).as_posix()] = int(
-                        path.stat().st_size
+                        followed.st_size
                     )
+                    continue
+                if path.is_file():
+                    rel = path.relative_to(root).as_posix()
+                    if rel == "README.md" or rel in CARD_FIGURE_FILENAMES:
+                        # `compute_model_sha` deliberately excludes the model
+                        # card and its figures -- exact filenames -- so that
+                        # DOCUMENTING an artifact cannot invalidate the records
+                        # that measured it (an artifact must be able to quote
+                        # its own gold numbers and draw its own allocation; see
+                        # the exclusion doctrine there).  The exporter's
+                        # finalized inventory predates any card by
+                        # construction, so this replay honors the same
+                        # exclusion or no documented artifact can ever pass.
+                        continue
+                    observed_files[rel] = int(path.stat().st_size)
             if dict(declared_files) != observed_files or sum(
                 observed_files.values()
             ) != binding.get("artifact_bytes"):
@@ -3067,6 +3146,40 @@ def _is_dspark_cb_sidecar_artifact(
     )
 
 
+def _cb_body_excludes_source_namespaces(
+    model_dir: str | os.PathLike | None,
+) -> bool:
+    """Whether this CB artifact was exported with source namespaces excluded.
+
+    A namespace-excluded export is a *body-only* artifact: the excluded
+    construction units (DSv4: the ``mtp.`` draft stack) live in a separate
+    sidecar artifact by construction.  Read off ``quant_config.json``
+    ``provenance.excluded_namespaces``, which ``compute_model_sha`` binds with
+    the artifact bytes, so this scoping cannot be flipped without breaking
+    artifact identity.  Fail-closed: absent or unreadable provenance is a
+    full-source artifact, so a release can never shed an obligation by hiding
+    or corrupting its quant config.
+    """
+    if model_dir is None:
+        return False
+    quant_path = Path(model_dir) / "quant_config.json"
+    if not quant_path.is_file():
+        return False
+    try:
+        payload = json.loads(quant_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    provenance = payload.get("provenance") if isinstance(
+        payload, Mapping
+    ) else None
+    if not isinstance(provenance, Mapping):
+        return False
+    excluded = provenance.get("excluded_namespaces")
+    return isinstance(excluded, (list, tuple)) and any(
+        isinstance(ns, str) and ns for ns in excluded
+    )
+
+
 #: `model_type` values whose gold lane IS the DSv4-Flash release contract.
 _DSV4_MODEL_TYPES = frozenset({"deepseek_v4"})
 _DSV4_ARCHITECTURE_RE = re.compile(r"^DeepseekV4[A-Za-z0-9_]*$")
@@ -3204,7 +3317,21 @@ def required_slots(
         # artifact-can-pass defect as the DSv4 gold contract, so it is scoped
         # to the same lane.  A card that nonetheless CARRIES the slot is still
         # held to it below, via OPTIONAL_SLOTS-style presence.
-        if cb_serving_lane(model_dir) == CB_LANE_DSV4_FLASH:
+        #
+        # Body-only scoping (2026-08-18): the parity verifier's census walks
+        # every construction unit of the displaced container, and a
+        # namespace-excluded export moves the excluded units into a separate
+        # sidecar artifact by construction (DSv4: `mtp.` lives in the
+        # 4.597 GB DSpark draft).  No body-only artifact can produce that
+        # census -- the same defect class, scoped by the same principle, and
+        # keyed on `quant_config.json` provenance that `compute_model_sha`
+        # binds.  An opened-but-null parity slot on such a card is an honest
+        # record that the demand was scoped out, not a waiver channel; a
+        # NON-null parity claim is still replayed via the presence branch.
+        if (
+            cb_serving_lane(model_dir) == CB_LANE_DSV4_FLASH
+            and not _cb_body_excludes_source_namespaces(model_dir)
+        ):
             required.extend(CB_REQUIRED_SLOTS)
         else:
             slots_present = card.get("slots")
@@ -3254,7 +3381,127 @@ def kv_shared_fisher_echo(env: Mapping[str, str] | None = None) -> dict[str, Any
     }
 
 
-def allocator_achieved_bpp(
+# A claimed bpp may legitimately sit a few percent above the priced floor
+# below (the floor omits whatever units carry no per-unit price, and those
+# only ever ADD bytes), and label scope differs by a pin or two. 10% is far
+# wider than any such drift and far narrower than the 57% error this exists
+# to catch, so a trip is a defect and never a convention argument.
+RECIPE_BPP_CROSS_CHECK_TOLERANCE = 0.10
+
+# The floor is only a useful bound when it covers most of the recipe. Only CB
+# units declare a per-unit serialized price, so a recipe that mixes CB with
+# plain NVFP4 / FP8 / passthrough prices only part of itself and its true rate
+# can sit far from the covered blend in EITHER direction. Measured on the real
+# DSv4 recipes: allocation-112p69-ldlq prices 99.4% of units and lands 1.5%
+# from its claim, while allocation-112p69-raw prices 70% and lands 30.6% away
+# while still being truthful. Below this coverage a mismatch is reported as
+# inconclusive rather than as a defect: refusing on a bound you know is loose
+# is a worse failure than not refusing, because it teaches the operator to
+# reach for --force-unverified.
+RECIPE_BPP_CROSS_CHECK_MIN_COVERAGE = 0.95
+
+
+def recipe_priced_bpp(
+    layer_config_path: str | os.PathLike | None,
+) -> dict[str, Any]:
+    """Price the recipe from the per-unit bytes the recipe itself declares.
+
+    This is deliberately NOT a second opinion about accounting convention. It
+    sums ``cb_serialized_identity.tensor_payload_bytes`` and ``.params`` over
+    the units that carry them, so numerator and denominator come from the same
+    entries and the result is scope-matched *by construction* — no probe, no
+    source manifest, no sidecar or header estimate.
+
+    The result is a **lower bound** on the recipe's true rate: units without a
+    per-unit price (FP8_SOURCE passthrough Linears, for instance) are excluded
+    from both sums, and they can only add bytes. ``coverage_units`` reports how
+    much of the recipe was priced so a caller can judge the bound's tightness.
+
+    Returns ``value=None`` with a ``reason`` when nothing is priceable, which
+    is the normal case for a non-CB recipe. That is a "not applicable", not a
+    failure.
+    """
+    out: dict[str, Any] = {"value": None, "reason": None}
+    if not layer_config_path:
+        out["reason"] = "no recipe path"
+        return out
+    try:
+        from prismaquant.layer_config import is_layer_config_meta_key
+        payload = json.loads(Path(layer_config_path).read_text())
+    except Exception as exc:
+        out["reason"] = f"recipe unreadable: {exc!r}"
+        return out
+    if not isinstance(payload, Mapping):
+        out["reason"] = "recipe is not a mapping"
+        return out
+
+    # Two recipe layouts carry these prices, and both are production. The body
+    # allocator writes per-unit mappings with `cb_serialized_identity` inside
+    # each record; the DSpark CB sidecar builder writes a flat
+    # `name -> "FORMAT"` map with the identities collected under
+    # `__prismaquant__.cb_serialized_identities`. Reading only the first shape
+    # silently downgraded the whole sidecar lane to "not applicable", which
+    # turns the gate off on an artifact that is fully priceable.
+    meta_identities: Mapping[str, Any] = {}
+    try:
+        from prismaquant.layer_config import read_layer_config_metadata
+        raw = (read_layer_config_metadata(layer_config_path) or {}).get(
+            "cb_serialized_identities"
+        )
+        if isinstance(raw, Mapping):
+            meta_identities = raw
+    except Exception:
+        meta_identities = {}
+
+    total = priced = 0
+    total_bytes = total_params = 0
+    for name, record in payload.items():
+        if is_layer_config_meta_key(name):
+            continue
+        total += 1
+        identity = None
+        if isinstance(record, Mapping):
+            identity = record.get("cb_serialized_identity")
+        if not identity:
+            identity = meta_identities.get(name)
+        if not identity:
+            continue
+        try:
+            if isinstance(identity, str):
+                identity = json.loads(identity)
+            nbytes = int(identity["tensor_payload_bytes"])
+            nparams = int(identity["params"])
+        except Exception:
+            continue
+        if nparams <= 0:
+            continue
+        priced += 1
+        total_bytes += nbytes
+        total_params += nparams
+
+    if not priced or total_params <= 0:
+        out["reason"] = (
+            "no unit carries a per-unit serialized price "
+            f"(0 of {total} recipe entries)"
+        )
+        return out
+    out.update(
+        value=8.0 * total_bytes / total_params,
+        reason=None,
+        priced_units=priced,
+        total_units=total,
+        coverage_units=priced / total if total else None,
+        tensor_payload_bytes=total_bytes,
+        params=total_params,
+        note=(
+            "lower bound: summed over the units that declare a per-unit "
+            "serialized price; unpriced units only add bytes"
+        ),
+    )
+    return out
+
+
+def _allocator_achieved_bpp_claim(
     layer_config_path: str | os.PathLike | None,
 ) -> dict[str, Any]:
     """Best-effort achieved bpp, with its provenance named.
@@ -3339,3 +3586,138 @@ def allocator_achieved_bpp(
         }
     except Exception:
         return {"value": None, "source": None}
+
+
+def allocator_achieved_bpp(
+    layer_config_path: str | os.PathLike | None,
+) -> dict[str, Any]:
+    """The claimed achieved bpp, cross-checked against the recipe's own bytes.
+
+    The claim is whatever upstream stamped (see
+    :func:`_allocator_achieved_bpp_claim`), and it is reported unchanged. What
+    is added here is a ``cross_check`` block, because this exact class of
+    defect has now shipped twice:
+
+    * **Qwen3.8-27B arm B** — the card claimed the surrogate knee's 5.9994 for
+      bytes that were the validated 4.7496 (1.25 bpp wide), which is what the
+      ``selected_by`` precedence above was written to fix.
+    * **DSv4-Flash `artifact-aura-cb-112p69`** — the card claimed 4.3065, read
+      from a Pareto point (``allocator_target_4p5000_achieved_4p3065``) that
+      was internally consistent but described an assignment that was **never
+      exported**. The recipe it shipped prices to 2.7385. That is 57% wide and
+      no precedence rule catches it, because the stale number is not the wrong
+      *field* — it is the right field describing the wrong *point*.
+
+    Both are the same failure: the label describes a different assignment than
+    the recipe holds. A false public bpp silently breaks every matched-bpp
+    comparison built on it, so it is worth a gate rather than a convention.
+
+    The check is a **floor test**, not an equality test. The priced value is a
+    lower bound (see :func:`recipe_priced_bpp`), so a claim below it is
+    impossible and a claim far above it is describing something else. It is
+    advisory here — :func:`verify` is where it refuses — so that a gate bug can
+    never strand a finished export at card-writing time.
+
+    The floor only bounds the claim when it covers nearly the whole recipe, so
+    a mismatch under ``RECIPE_BPP_CROSS_CHECK_MIN_COVERAGE`` is reported as
+    ``inconclusive_low_coverage`` and does **not** refuse. This is not
+    timidity: the real ``allocation-112p69-raw`` recipe prices 70% of its units
+    at 2.109 bpp and truthfully claims 2.755, because its unpriced units are
+    plain NVFP4 at 4.25 bpp. A bare 10% test would have refused that correct
+    artifact at publication — and a gate that false-refuses teaches the
+    operator to reach for ``--force-unverified``, which is the worse outcome.
+
+    Both directions are gated, including undershoot. See the comment in the
+    body: "below the priced blend is impossible" holds only when every unpriced
+    unit is higher-rate than the blend, the sound bound needs *parameter*
+    coverage, and a non-CB unit records no shape in the recipe to compute it
+    from.
+    """
+    claim = _allocator_achieved_bpp_claim(layer_config_path)
+    priced = recipe_priced_bpp(layer_config_path)
+    claimed = claim.get("value")
+    floor = priced.get("value")
+
+    if floor is None:
+        cross: dict[str, Any] = {
+            "verdict": "not_applicable",
+            "detail": priced.get("reason"),
+        }
+    elif claimed is None:
+        cross = {
+            "verdict": "no_claim",
+            "recipe_priced_bpp": floor,
+            "detail": "nothing to cross-check; the recipe declares no bpp",
+        }
+    else:
+        rel = abs(float(claimed) - floor) / floor
+        agree = rel <= RECIPE_BPP_CROSS_CHECK_TOLERANCE
+        coverage = priced.get("coverage_units")
+        # Both directions are gated on coverage, and the undershoot side is the
+        # non-obvious half. It is tempting to call a claim below the priced
+        # blend arithmetically impossible -- that holds only when every unpriced
+        # unit is HIGHER-rate than the blend. On the real DSv4 recipes the
+        # unpriced units are plain NVFP4 (4.25 bpp), so it does hold there; but
+        # a recipe whose priced subset is FP8_CB-heavy (~8 bpp) with NVFP4
+        # unpriced would have a true rate legitimately BELOW its own priced
+        # blend. The sound bound would be blend x parameter-coverage, and
+        # parameter coverage is not computable here: a non-CB unit records no
+        # shape in the recipe, so only UNIT coverage is observable. Rather than
+        # assert a bound the data cannot support, the floor is trusted in
+        # either direction only when it is nearly complete.
+        below = float(claimed) < floor
+        loose = (
+            coverage is None
+            or coverage < RECIPE_BPP_CROSS_CHECK_MIN_COVERAGE
+        )
+        if agree:
+            verdict = "agree"
+        elif loose:
+            verdict = "inconclusive_low_coverage"
+        else:
+            verdict = "DISAGREE"
+        cross = {
+            "verdict": verdict,
+            "claimed_bpp": float(claimed),
+            "claimed_source": claim.get("source"),
+            "recipe_priced_bpp": floor,
+            "relative_difference": rel,
+            "claim_is_below_floor": below,
+            "tolerance": RECIPE_BPP_CROSS_CHECK_TOLERANCE,
+            "min_coverage_units": RECIPE_BPP_CROSS_CHECK_MIN_COVERAGE,
+            "priced_units": priced.get("priced_units"),
+            "total_units": priced.get("total_units"),
+            "coverage_units": coverage,
+            "tensor_payload_bytes": priced.get("tensor_payload_bytes"),
+            "params": priced.get("params"),
+        }
+        if verdict == "inconclusive_low_coverage":
+            cross["detail"] = (
+                f"claimed {float(claimed):.4f} bpp from "
+                f"{claim.get('source')!r} sits {rel:.1%} "
+                f"{'below' if below else 'above'} the {floor:.4f} bpp priced "
+                f"blend, but only {priced.get('priced_units')} of "
+                f"{priced.get('total_units')} units carry a per-unit price "
+                f"(coverage {coverage:.1%} < "
+                f"{RECIPE_BPP_CROSS_CHECK_MIN_COVERAGE:.0%}), so the blend is "
+                "too loose to indict the claim: the unpriced units are a large "
+                "enough share to explain the gap on their own. Not refused."
+            )
+        elif not agree:
+            cross["detail"] = (
+                ("claim is BELOW an arithmetic lower bound: " if below else "")
+                + (
+                f"claimed {float(claimed):.4f} bpp from "
+                f"{claim.get('source')!r}, but the recipe's own per-unit "
+                f"serialized bytes price {priced.get('priced_units')} of "
+                f"{priced.get('total_units')} units at "
+                f"{priced.get('tensor_payload_bytes')} bytes over "
+                f"{priced.get('params')} params = {floor:.4f} bpp "
+                f"({rel:.1%} apart, tolerance "
+                f"{RECIPE_BPP_CROSS_CHECK_TOLERANCE:.0%}). The priced value is "
+                "a LOWER bound, so the claim is describing a different "
+                "assignment than the recipe holds — most likely a stale "
+                "Pareto point or a superseded selection."
+                )
+            )
+    return {**claim, "cross_check": cross}

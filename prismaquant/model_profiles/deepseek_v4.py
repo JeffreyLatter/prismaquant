@@ -383,6 +383,31 @@ class DeepseekV4Profile(ModelProfile):
                     self._init_one_rotary(mod, cfg, device)
         return True
 
+    def rope_axis_for_layer_type(self, layer_type: str) -> str | None:
+        """Resolve DSv4's attention schedule to one of its two rope tables.
+
+        Delegates to the vendored model so the mapping has exactly one
+        definition: `DeepseekV4Model.forward` selects the axis through the
+        same staticmethod, and a streamed per-layer pass therefore cannot
+        drift from the forward it reproduces. See
+        `DeepseekV4RotaryEmbedding.rope_axis_for_layer_type` for why that
+        matters -- feeding `main` rope to a compressed layer rotates it on
+        base 10000 with YaRN off instead of 160000 with YaRN, an error that
+        grows with position."""
+        # Import through the REGISTERED name: the vendored package's own
+        # `__init__` does `from ...utils import _LazyModule`, a
+        # Transformers-relative import that only resolves once the arch is
+        # installed into `transformers.models`, so importing it by its
+        # `prismaquant.vendored...` path raises ModuleNotFoundError on
+        # `prismaquant.utils`.
+        import importlib
+
+        self.register_vendored_modeling()
+        modeling = importlib.import_module(
+            "transformers.models.deepseek_v4.modeling_deepseek_v4")
+        return modeling.DeepseekV4RotaryEmbedding.rope_axis_for_layer_type(
+            layer_type)
+
     def expand_hidden_for_layers(self, hidden, base_model):
         """Expand single-stream `[B, T, H]` to multi-stream
         `[B, T, hc_mult, H]` (mirrors `DeepseekV4Model.forward`)."""

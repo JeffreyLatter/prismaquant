@@ -4,7 +4,9 @@
   "export_container": "nvfp4_cb",
   "runtime": "vllm+gridbook_plugin",
   "description": "NVFP4-CB / FP8-CB codebook container, served by the separately released Gridbook plugin pinned in prismaquant/gridbook_runtime/gridbook_runtime_pin.json. PrismaQuant does not vendor the runtime. Load/generation validation is endpoint-driven and has separate eager and graph receipts because Gridbook is installed in an exact-pinned serving container rather than imported into the build environment.",
-  "serving_profiles": ["nvfp4_cb"],
+  "serving_profiles": [
+    "nvfp4_cb"
+  ],
   "endpoint": {
     "kind": "openai",
     "base_url": "http://127.0.0.1:8000/v1",
@@ -21,7 +23,8 @@
       "scripts/serve_laguna_smoke.sh"
     ],
     "command": [
-      "bash", "${SERVE_SCRIPT}"
+      "bash",
+      "${SERVE_SCRIPT}"
     ]
   },
   "gates": [
@@ -65,7 +68,19 @@
   "kl_evaluator": {
     "kind": "validate_assignments_kl",
     "entrypoint": "prismaquant.validate_assignments_kl:main",
-    "note": "Reachable on this lane since CB Milestone C (R3): the production cache renders CB rungs imatrix-weighted via --col-weights, so a frontier KL measures the bytes the exporter ships. Selection on this lane is still SURROGATE by default — validated-frontier CB selection is enabled, not promoted."
+    "note": "Reachable on this lane since CB Milestone C (R3): the production cache renders CB rungs imatrix-weighted via --col-weights, so a frontier KL measures the bytes the exporter ships. Selection on this lane is still SURROGATE by default \u2014 validated-frontier CB selection is enabled, not promoted."
+  },
+  "served_activation_quantization": {
+    "executes": [
+      "FP8_CB_*"
+    ],
+    "rationale": "PER FAMILY, because this lane does two different things. FP8_CB is genuinely W8A8: gridbook/linear.py feeds quantized `xq` with per-token dynamic scales into native_cutlass_scaled_mm, and moe.py declares _FP8_GROUPED_CONTRACT = 'fp8_per_token_dynamic'. NVFP4_CB is NOT: the CB runtime takes the exact native BF16 bridge unless a PROCESS-GLOBAL env selector picks a fused mode, and every gate and gold serve leaves both unset -- serve_dsv4_cb_validate.sh asserts 'PRISMAQUANT_CB_FUSED_FP4: expected <unset>'. So an NVFP4_CB unit's A-side is exactly zero here while an FP8_CB unit's is real. The artifact's per-scheme `activation_contract` is PERMISSION for a fused mode, not selection of one, and the selector is not per-unit, so there is no per-unit A4/A16 choice to allocate over. Source passthrough (FP8_BLOCK_UE8M0_SOURCE) is W8A16 -- fp8_source_w8a16.py: 'Raw block128 FP8 weights with unquantized BF16 activations' -- so it is absent here too.",
+    "selectors_must_be_unset": [
+      "PRISMAQUANT_CB_FUSED_FP4",
+      "PRISMAQUANT_CB_FUSED_FP4_MOE"
+    ],
+    "why_this_matters": "Charging NVFP4_CB a phantom A4 made FP8 look relatively cheap and the DP bought it with weight bits: DSv4-Flash at 87.403 GB went from 96.8% nvfp4_cb (K16 bulk) to 25.4% FP8_CB with the bulk rung crushed K16 -> K12. Keeping the REAL FP8 A8 term is what stops the correction from over-shooting back the other way.",
+    "if_this_changes": "Selecting a fused mode makes NVFP4_CB's A-side real too: add the family here and re-price. Do not edit this to silence a refusal."
   },
   "advisory_gates": true,
   "notes": [

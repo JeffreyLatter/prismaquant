@@ -1695,6 +1695,26 @@ def main():
         ),
     )
     ap.add_argument(
+        "--exclude-source-prefix",
+        action="append",
+        default=None,
+        metavar="PREFIX",
+        help=(
+            "Repeatable. Declare that this artifact does NOT ship the source "
+            "tensors under PREFIX, because they ship as a separate artifact. "
+            "Byte accounting otherwise counts every unassigned source tensor "
+            "at source precision (correct for a verbatim tensor, wrong for "
+            "one that is not here at all), which UNDER-fills a byte budget by "
+            "the excluded mass and is invisible downstream because the "
+            "artifact still comes in under budget. Live case: DSv4-Flash "
+            "ships its draft head as its own directory, so the target "
+            "artifact passes --exclude-source-prefix mtp. and the 10.863 GB "
+            "of MTP spans leave the floor. Exact (resolved against the "
+            "per-tensor source manifest, each span charged at most once); a "
+            "prefix matching nothing is a hard error."
+        ),
+    )
+    ap.add_argument(
         "--cb-scale-coding",
         choices=("v1", "two_tier"),
         default=None,
@@ -3543,22 +3563,57 @@ def main():
     # reserve; the exporter later measures every regular file and hard-fails.
     _footprint_ctx: dict[str, object] = {}
 
+    def _partition_source_total(_fp, src_total, src_manifest, *, where,
+                                assigned_names=()):
+        """Apply --exclude-source-prefix, or pass the total through.
+
+        Raises SystemExit (not ValueError) on a bad prefix ON PURPOSE: both
+        callers of the pricing scalars sit behind `except Exception` clauses
+        that degrade to "pricing unavailable", and a prefix that silently
+        excluded nothing is the exact failure this flag exists to prevent —
+        it under-fills the budget by the excluded mass and every downstream
+        number stays self-consistent. SystemExit is a BaseException, so it
+        passes through those clauses to the operator.
+        """
+        if not getattr(args, "exclude_source_prefix", None):
+            return int(src_total), None
+        try:
+            part = _fp.partitioned_source_total_bytes(
+                src_manifest, int(src_total), args.exclude_source_prefix,
+                context=where, assigned_names=assigned_names)
+        except ValueError as exc:
+            raise SystemExit(f"[alloc] ERROR: {exc}") from None
+        print(
+            f"[alloc] source partition ({where}): excluding "
+            f"{', '.join(part['excluded_prefixes'])} removes "
+            f"{part['n_excluded']} source tensors / "
+            f"{part['excluded_source_bytes'] / 1e9:.3f} GB; this artifact is "
+            f"priced against {part['source_total_bytes'] / 1e9:.3f} GB of "
+            f"{int(src_total) / 1e9:.3f} GB",
+            flush=True)
+        return int(part["source_total_bytes"]), part
+
     def _footprint_scalars():
         if _footprint_ctx or not probe_model_path:
             return _footprint_ctx or None
         from . import footprint as _fp
         try:
             src_total, src_by_dtype = _fp.source_checkpoint_bytes(probe_model_path)
+            src_manifest = _fp.source_tensor_bytes_manifest(
+                probe_model_path,
+                name_map=getattr(model_profile, "checkpoint_to_live_name", None),
+                expert_parent_for_projection=getattr(
+                    model_profile, "packed_expert_parent_for_projection", None),
+            )
+            priced_total, _part = _partition_source_total(
+                _fp, src_total, src_manifest,
+                where="pareto candidate footprint",
+                assigned_names={**accounting_stats, **fixed_stats, **stats})
             _footprint_ctx.update({
                 "fp": _fp,
-                "source_total_bytes": src_total,
+                "source_total_bytes": priced_total,
                 "regime": _fp.source_regime(src_by_dtype),
-                "source_manifest": _fp.source_tensor_bytes_manifest(
-                    probe_model_path,
-                    name_map=getattr(model_profile, "checkpoint_to_live_name", None),
-                    expert_parent_for_projection=getattr(
-                        model_profile, "packed_expert_parent_for_projection", None),
-                ),
+                "source_manifest": src_manifest,
                 "stats": {**accounting_stats, **fixed_stats, **stats},
             })
         except Exception as exc:  # pricing is additive; never break allocation
@@ -3699,6 +3754,9 @@ def main():
                             args.artifact_overhead_reserve_bytes
                         ),
                         selection_assignment=assignment,
+                        excluded_source_prefixes=(
+                            getattr(args, "exclude_source_prefix", None) or ()
+                        ),
                     )
             payload = {
                 "schema": "prismaquant.allocator.pareto_assignment.v2",
@@ -3884,6 +3942,13 @@ def main():
             expert_parent_for_projection=getattr(
                 model_profile, "packed_expert_parent_for_projection", None),
         )
+        # Must apply the SAME partition the Pareto sweep priced against, or
+        # the narrowing pass and the ratchet would disagree about which rungs
+        # fit the card.
+        src_total_full = int(src_total)
+        src_total, source_partition = _partition_source_total(
+            _fp, src_total, src_manifest, where="byte-budget selection",
+            assigned_names={**accounting_stats, **fixed_stats, **stats})
 
         # Stats view for the footprint accounting: the same three-map
         # precedence `_stats_entry_for_assignment_name` uses (aggregated DP
@@ -4105,6 +4170,25 @@ def main():
             "source_total_bytes": float(src_total),
             "source_regime": regime,
             "source_accounting": "per_tensor_manifest_v2",
+            # Present only when --exclude-source-prefix partitioned the ship.
+            # Without it `source_total_bytes` above would not reconcile with
+            # the checkpoint on disk and a later reader would have no way to
+            # tell a partitioned artifact from a mis-measured one.
+            **({
+                "source_partition": {
+                    "excluded_prefixes": list(
+                        source_partition["excluded_prefixes"]),
+                    "excluded_source_bytes": int(
+                        source_partition["excluded_source_bytes"]),
+                    "n_excluded_source_tensors": int(
+                        source_partition["n_excluded"]),
+                    "source_total_bytes_unpartitioned": src_total_full,
+                    "rationale": (
+                        "tensors under these prefixes ship as a separate "
+                        "artifact and are absent from this one"
+                    ),
+                },
+            } if source_partition else {}),
             "footprint_path": "footprint.assignment_artifact_bytes",
             "source_bytes_per_param": int(
                 _fp.dominant_source_bytes_per_param(src_by_dtype)),
@@ -4409,6 +4493,9 @@ def main():
             ),
             selection_non_tensor_reserve_bytes=overhead_reserve_bytes,
             selection_assignment=chosen_info["assignment"],
+            excluded_source_prefixes=(
+                getattr(args, "exclude_source_prefix", None) or ()
+            ),
         )
         selection.update({
             "has_slack": bool(has_slack),

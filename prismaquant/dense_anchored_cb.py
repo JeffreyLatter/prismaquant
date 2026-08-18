@@ -806,6 +806,7 @@ def _merge_aqua_a_side(
     import numpy as np
     from prismaquant.aqua_activation_cost import (
         activation_dloss_table, merge_act_dloss,
+        resolve_executed_activation_formats,
     )
     from prismaquant.allocator_candidates import ACT_DLOSS_KEY
     from prismaquant.sensitivity_card import SensitivityCard
@@ -821,9 +822,15 @@ def _merge_aqua_a_side(
     card = SensitivityCard.from_npz(args.aqua_card)
     card.validate()
     formats = sorted({fmt for row in costs.values() for fmt in row})
+    # This is the CB export lane. Its runtime decides the A-side, not the
+    # format registry -- see LaneActivationContract. Resolving through the lane
+    # spec is what makes an A-side of exactly zero say so loudly instead of
+    # being priced as if the fused W4A4 kernel were serving.
+    executed = resolve_executed_activation_formats(lane_id="nvfp4_cb")
     table, holes, meta = activation_dloss_table(
         card, args.model, formats, device=args.aqua_device,
         names=list(costs), act_dir=args.act_dir,
+        executed_activation_formats=executed,
     )
     report = merge_act_dloss(costs, table)
     if report["entries_merged"] == 0:

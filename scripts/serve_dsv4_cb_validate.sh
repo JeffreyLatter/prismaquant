@@ -46,10 +46,28 @@ if ! compgen -G "$MODEL/*.safetensors" >/dev/null; then
   exit 2
 fi
 
-# The artifact's build receipt selects the PrismaQuant source commit used for
-# validation.  A live checkout is only a bootstrap: it must be clean at that
-# same commit, then this script re-executes from a complete content-addressed
-# snapshot before sourcing helpers or importing PrismaQuant.
+# The artifact's build receipt selects the PrismaQuant source commit the SERVED
+# STACK runs at; the live checkout selects the commit the GATE runs at.  Those
+# were one commit until 2026-08-16, and holding them equal made a validator bug
+# structurally incurable -- the only remedy the gate admitted for a wrong
+# verdict was rebuilding bytes that were never wrong.  They are now split:
+#
+#   runtime  = artifact build commit.  Mounted at /repo, sources the Gridbook
+#              serving runtime, executes every in-container step.  The stack
+#              that decodes the bytes is still exactly the stack they were made
+#              for; nothing about the serve is relaxed.
+#   judge    = the live checkout's HEAD.  Runs this launcher and every
+#              host-side verdict, so a gate fix reaches artifacts already on
+#              disk.  It must be CLEAN and a DESCENDANT of the build commit --
+#              forward only, never judging with code older than the producer.
+#
+# The split is not taken on trust.  Both snapshots are materialized and
+# verified, and `judge-divergence` proves every closure path that differs
+# between them is judge-only.  A divergence anywhere in the serve path refuses,
+# and re-export is the honest answer there.
+#
+# A live checkout is only a bootstrap: this script re-executes from a complete
+# content-addressed snapshot before sourcing helpers or importing PrismaQuant.
 PQ_SERVE_SNAPSHOT_REEXEC=${PQ_SERVE_SNAPSHOT_REEXEC:-0}
 PQ_SNAPSHOT_CACHE=${PQ_SNAPSHOT_CACHE:-$(dirname -- "$MODEL")/runtime-source-cache}
 if [[ "$PQ_SERVE_SNAPSHOT_REEXEC" != 1 ]]; then
@@ -85,16 +103,24 @@ PY
   fi
   REPO_HEAD=$(git -C "$REPO" rev-parse --verify 'HEAD^{commit}' 2>/dev/null || true)
   REPO_DIRTY=$(git -C "$REPO" status --porcelain --untracked-files=all)
-  if [[ "$REPO_HEAD" != "$ARTIFACT_BUILD_COMMIT" || -n "$REPO_DIRTY" ]]; then
-    echo "REFUSE: serve checkout must be clean at artifact build commit $ARTIFACT_BUILD_COMMIT" >&2
+  if [[ ! "$REPO_HEAD" =~ ^[0-9a-f]{40}$ || -n "$REPO_DIRTY" ]]; then
+    echo "REFUSE: serve checkout must be a clean Git checkout" >&2
     exit 2
   fi
-  PQ_SNAPSHOT_JSON=$(env -u PYTHONPATH PYTHONNOUSERSITE=1 PYTHONSAFEPATH=1 \
-    python3 -P "$REPO/tools/prismaquant_runtime_snapshot.py" \
-    materialize --source-root "$REPO" --cache-root "$PQ_SNAPSHOT_CACHE" \
-    --commit "$ARTIFACT_BUILD_COMMIT")
-  readarray -t snapshot_fields < <(env -u PYTHONPATH PYTHONNOUSERSITE=1 \
-    PYTHONSAFEPATH=1 python3 -P -c '
+  # Forward only.  A descendant contains the producer's own code, so the judge
+  # can never be older than the artifact it is judging.
+  if ! git -C "$REPO" merge-base --is-ancestor \
+       "$ARTIFACT_BUILD_COMMIT" "$REPO_HEAD" 2>/dev/null; then
+    echo "REFUSE: serve checkout $REPO_HEAD is not a descendant of the artifact build commit $ARTIFACT_BUILD_COMMIT" >&2
+    exit 2
+  fi
+  pq_materialize_snapshot() {  # $1=commit; emits snapshot, tree, closure
+    local snapshot_json
+    snapshot_json=$(env -u PYTHONPATH PYTHONNOUSERSITE=1 PYTHONSAFEPATH=1 \
+      python3 -P "$REPO/tools/prismaquant_runtime_snapshot.py" \
+      materialize --source-root "$REPO" --cache-root "$PQ_SNAPSHOT_CACHE" \
+      --commit "$1")
+    env -u PYTHONPATH PYTHONNOUSERSITE=1 PYTHONSAFEPATH=1 python3 -P -c '
 import json, sys
 value = json.load(sys.stdin)
 for key in ("snapshot", "tree", "closure_sha256"):
@@ -102,13 +128,23 @@ for key in ("snapshot", "tree", "closure_sha256"):
     if not isinstance(item, str) or not item:
         raise SystemExit(f"runtime snapshot lacks {key}")
     print(item)
-' <<<"$PQ_SNAPSHOT_JSON")
+' <<<"$snapshot_json"
+  }
+  readarray -t snapshot_fields < <(pq_materialize_snapshot "$ARTIFACT_BUILD_COMMIT")
   PQ_RUNTIME_SNAPSHOT=${snapshot_fields[0]:-}
   PQ_RUNTIME_TREE=${snapshot_fields[1]:-}
   PQ_RUNTIME_CLOSURE_SHA256=${snapshot_fields[2]:-}
+  readarray -t judge_fields < <(pq_materialize_snapshot "$REPO_HEAD")
+  PQ_JUDGE_SNAPSHOT=${judge_fields[0]:-}
+  PQ_JUDGE_TREE=${judge_fields[1]:-}
+  PQ_JUDGE_CLOSURE_SHA256=${judge_fields[2]:-}
+  PQ_JUDGE_COMMIT=$REPO_HEAD
   if [[ ! -d "$PQ_RUNTIME_SNAPSHOT" \
         || ! "$PQ_RUNTIME_TREE" =~ ^[0-9a-f]{40}$ \
-        || ! "$PQ_RUNTIME_CLOSURE_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+        || ! "$PQ_RUNTIME_CLOSURE_SHA256" =~ ^[0-9a-f]{64}$ \
+        || ! -d "$PQ_JUDGE_SNAPSHOT" \
+        || ! "$PQ_JUDGE_TREE" =~ ^[0-9a-f]{40}$ \
+        || ! "$PQ_JUDGE_CLOSURE_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
     echo "REFUSE: reviewed PrismaQuant snapshot identity is malformed" >&2
     exit 2
   fi
@@ -118,8 +154,20 @@ for key in ("snapshot", "tree", "closure_sha256"):
     --expected-commit "$ARTIFACT_BUILD_COMMIT" \
     --expected-tree "$PQ_RUNTIME_TREE" \
     --expected-closure-sha256 "$PQ_RUNTIME_CLOSURE_SHA256" >/dev/null
-  if [[ $(git -C "$REPO" rev-parse --verify 'HEAD^{commit}') \
-        != "$ARTIFACT_BUILD_COMMIT" \
+  env -u PYTHONPATH python3 -P \
+    "$PQ_JUDGE_SNAPSHOT/tools/prismaquant_runtime_snapshot.py" verify \
+    --snapshot "$PQ_JUDGE_SNAPSHOT" \
+    --expected-commit "$PQ_JUDGE_COMMIT" \
+    --expected-tree "$PQ_JUDGE_TREE" \
+    --expected-closure-sha256 "$PQ_JUDGE_CLOSURE_SHA256" >/dev/null
+  # The split's proof obligation, run from the JUDGE snapshot: the newer
+  # revision states which of its own divergences it claims are judge-only, and
+  # anything in the serve path refuses here rather than at the receipt.
+  env -u PYTHONPATH python3 -P \
+    "$PQ_JUDGE_SNAPSHOT/tools/prismaquant_runtime_snapshot.py" judge-divergence \
+    --runtime-snapshot "$PQ_RUNTIME_SNAPSHOT" \
+    --judge-snapshot "$PQ_JUDGE_SNAPSHOT" >/dev/null
+  if [[ $(git -C "$REPO" rev-parse --verify 'HEAD^{commit}') != "$PQ_JUDGE_COMMIT" \
         || -n $(git -C "$REPO" status --porcelain --untracked-files=all) ]]; then
     echo "REFUSE: serve checkout changed while snapshotting" >&2
     exit 2
@@ -127,20 +175,33 @@ for key in ("snapshot", "tree", "closure_sha256"):
   export PQ_SERVE_SNAPSHOT_REEXEC=1
   export PQ_RUNTIME_SNAPSHOT ARTIFACT_BUILD_COMMIT PQ_RUNTIME_TREE
   export PQ_RUNTIME_CLOSURE_SHA256
-  export PQ_RUNTIME_PRISMAQUANT_ROOT=$PQ_RUNTIME_SNAPSHOT
+  export PQ_JUDGE_SNAPSHOT PQ_JUDGE_COMMIT PQ_JUDGE_TREE
+  export PQ_JUDGE_CLOSURE_SHA256
+  # The source-bootstrap contract: this names the root HOST-SIDE Python must
+  # import from, and `activate_prismaquant_source` refuses unless it equals the
+  # directory of the bootstrap tool being run.  Host-side runs are the judge, so
+  # this is the judge root.  The container gets its own explicit `/repo`, which
+  # is the runtime snapshot -- see the `docker create` environment below.
+  export PQ_RUNTIME_PRISMAQUANT_ROOT=$PQ_JUDGE_SNAPSHOT
+  # The artifact's identity is still the artifact's build commit -- the judge
+  # running newer does not restamp what produced these bytes.
   export PRISMAQUANT_IDENTITY_GIT_COMMIT=$ARTIFACT_BUILD_COMMIT
   export PRISMAQUANT_IDENTITY_GIT_DIRTY=0
   export PYTHONSAFEPATH=1
   export PYTHONDONTWRITEBYTECODE=1
   export PYTHONNOUSERSITE=1
   unset PYTHONPATH
-  exec bash "$PQ_RUNTIME_SNAPSHOT/scripts/serve_dsv4_cb_validate.sh" "$ARM"
+  exec bash "$PQ_JUDGE_SNAPSHOT/scripts/serve_dsv4_cb_validate.sh" "$ARM"
 fi
 
 if [[ ! "$ARTIFACT_BUILD_COMMIT" =~ ^[0-9a-f]{40}$ \
       || ! "$PQ_RUNTIME_TREE" =~ ^[0-9a-f]{40}$ \
       || ! "$PQ_RUNTIME_CLOSURE_SHA256" =~ ^[0-9a-f]{64}$ \
-      || "$REPO" != "$PQ_RUNTIME_SNAPSHOT" \
+      || ! "${PQ_JUDGE_COMMIT:-}" =~ ^[0-9a-f]{40}$ \
+      || ! "${PQ_JUDGE_TREE:-}" =~ ^[0-9a-f]{40}$ \
+      || ! "${PQ_JUDGE_CLOSURE_SHA256:-}" =~ ^[0-9a-f]{64}$ \
+      || "$REPO" != "${PQ_JUDGE_SNAPSHOT:-}" \
+      || ! -d "$PQ_RUNTIME_SNAPSHOT" \
       || "${PQ_RUNTIME_PRISMAQUANT_ROOT:-}" != "$REPO" \
       || "${PYTHONSAFEPATH:-}" != 1 \
       || "${PYTHONDONTWRITEBYTECODE:-}" != 1 \
@@ -149,13 +210,29 @@ if [[ ! "$ARTIFACT_BUILD_COMMIT" =~ ^[0-9a-f]{40}$ \
   echo "REFUSE: serve launcher is not executing from its attested snapshot" >&2
   exit 2
 fi
+# Both halves are re-verified at every checkpoint, and so is the claim that
+# lets them differ.  Re-proving the divergence each time is deliberate: the
+# judge-only list is the whole justification for the split, so it may not be
+# checked once at bootstrap and then trusted for the rest of a long serve.
 verify_runtime_snapshot() {
   env -u PYTHONPATH python3 -P \
-    "$REPO/tools/prismaquant_runtime_snapshot.py" verify \
-    --snapshot "$REPO" \
+    "$PQ_RUNTIME_SNAPSHOT/tools/prismaquant_runtime_snapshot.py" verify \
+    --snapshot "$PQ_RUNTIME_SNAPSHOT" \
     --expected-commit "$ARTIFACT_BUILD_COMMIT" \
     --expected-tree "$PQ_RUNTIME_TREE" \
     --expected-closure-sha256 "$PQ_RUNTIME_CLOSURE_SHA256" >/dev/null
+  env -u PYTHONPATH python3 -P \
+    "$REPO/tools/prismaquant_runtime_snapshot.py" verify \
+    --snapshot "$REPO" \
+    --expected-commit "$PQ_JUDGE_COMMIT" \
+    --expected-tree "$PQ_JUDGE_TREE" \
+    --expected-closure-sha256 "$PQ_JUDGE_CLOSURE_SHA256" >/dev/null
+  if [[ "$PQ_JUDGE_SNAPSHOT" != "$PQ_RUNTIME_SNAPSHOT" ]]; then
+    env -u PYTHONPATH python3 -P \
+      "$REPO/tools/prismaquant_runtime_snapshot.py" judge-divergence \
+      --runtime-snapshot "$PQ_RUNTIME_SNAPSHOT" \
+      --judge-snapshot "$REPO" >/dev/null
+  fi
 }
 pq_run_module() {
   env -u PYTHONPATH PYTHONNOUSERSITE=1 python3 -P \
@@ -177,7 +254,9 @@ if [[ "${inner_build_git[0]:-}" != "$ARTIFACT_BUILD_COMMIT" \
   echo "REFUSE: artifact build identity changed across snapshot re-exec" >&2
   exit 2
 fi
-. "$REPO/prismaquant/gridbook_runtime/gridbook_serving_runtime.sh"
+# Serving runtime, so it comes from the artifact's build commit -- this decides
+# the Gridbook wheel the container installs.
+. "$PQ_RUNTIME_SNAPSHOT/prismaquant/gridbook_runtime/gridbook_serving_runtime.sh"
 gridbook_serving_runtime_prepare
 
 # The lane, its image, its tokenizer mode and its served-model brand come from
@@ -276,6 +355,62 @@ if [[ "$LOCK" != "$EXPECTED_GPU_LOCK" ]]; then
   exit 2
 fi
 
+# Which code produced these bytes and which code judged them are now two
+# answers, so the evidence carries both rather than leaving a reader to assume
+# they are one.  Written before the GPU is reserved: a receipt that cannot say
+# who rendered its verdict is not a receipt.
+env -u PYTHONPATH PYTHONNOUSERSITE=1 PYTHONSAFEPATH=1 python3 -P - \
+    "$REPO" "$PQ_RUNTIME_SNAPSHOT" "$EVIDENCE/judge_split.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+judge_root, runtime_root, out = sys.argv[1:]
+sys.path.insert(0, str(Path(judge_root) / "tools"))
+from prismaquant_runtime_snapshot import (
+    MANIFEST,
+    _load_manifest,
+    _validate_manifest_shape,
+    judge_divergence,
+)
+
+# Read the ledgers rather than re-verify. `verify_runtime_snapshot` re-hashes
+# both closures at the top of this pass and again in the preflight just below,
+# so another full pass over every file here buys nothing but wall-clock.
+def _identity(root):
+    return _validate_manifest_shape(_load_manifest(Path(root) / MANIFEST))
+
+runtime = _identity(runtime_root)
+judge = _identity(judge_root)
+payload = {
+    "schema": "prismaquant.serve_gate_judge_split.v1",
+    "runtime": {
+        "commit": runtime["commit"],
+        "tree": runtime["tree"],
+        "closure_sha256": runtime["closure_sha256"],
+        "role": "served stack; mounted at /repo; the artifact's build commit",
+    },
+    "judge": {
+        "commit": judge["commit"],
+        "tree": judge["tree"],
+        "closure_sha256": judge["closure_sha256"],
+        "role": "host-side launcher and verdict",
+    },
+    "split": (
+        judge_divergence(Path(runtime_root), Path(judge_root))
+        if runtime["commit"] != judge["commit"]
+        else {"schema": "prismaquant.judge_split_divergence.v1",
+              "divergent_paths": [], "divergent_count": 0,
+              "judge_only_paths": []}
+    ),
+}
+Path(out).write_text(
+    json.dumps(payload, sort_keys=True, indent=2, allow_nan=False) + "\n",
+    encoding="utf-8",
+)
+PY
+test -s "$EVIDENCE/judge_split.json"
+
 # Header-only and sidecar-only preflight.  Refuse an incomplete decoder map or
 # a missing/mismatched released DSpark overlay before reserving the single GPU.
 verify_runtime_snapshot
@@ -327,6 +462,10 @@ fi
   date --iso-8601=seconds
   echo "ARM=$ARM"
   echo "MODEL=$MODEL"
+  echo "ARTIFACT_BUILD_COMMIT=$ARTIFACT_BUILD_COMMIT"
+  echo "PQ_RUNTIME_CLOSURE_SHA256=$PQ_RUNTIME_CLOSURE_SHA256"
+  echo "PQ_JUDGE_COMMIT=$PQ_JUDGE_COMMIT"
+  echo "PQ_JUDGE_CLOSURE_SHA256=$PQ_JUDGE_CLOSURE_SHA256"
   echo "BASE_IMAGE=$BASE_IMAGE"
   echo "VLLM_VERSION=$VLLM_VERSION"
   echo "VLLM_COMMIT=$VLLM_COMMIT"
@@ -346,7 +485,7 @@ CID=$(docker create --pull=never --name "$NAME" --gpus all --ipc=host \
   --user 0:0 --oom-score-adj=1000 \
   --log-driver local --log-opt max-size=100m --log-opt max-file=3 \
   -p "127.0.0.1:$PORT:8000" \
-  -v "$REPO:/repo:ro" \
+  -v "$PQ_RUNTIME_SNAPSHOT:/repo:ro" \
   -v "$MODEL:/model:ro" \
   -v "$EVIDENCE:/evidence:rw" \
   -v "$EXT_CACHE:/opt/gridbook/ext-cache:rw" \

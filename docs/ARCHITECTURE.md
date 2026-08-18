@@ -1,6 +1,98 @@
 # PrismaQuant Architecture
 
-As of: 2026-08-17 · branch `merge/proven-rescues` · re-stamped for the
+As of: 2026-08-18 · `main` — merge of the `merge/proven-rescues` and
+`fix/aqua-profile-aware-resolver` lines; both lines' stamps follow, newest
+first, each recording its own branch and date. Re-stamped (2026-08-18,
+`fix/aqua-profile-aware-resolver`) for
+the **Gridbook 0.8.9 serving pin — the qualified CB kernels default on**:
+three selectors became tri-state with unset → auto in Gridbook 0.8.9
+(`PRISMAQUANT_CB_MOE_PERSISTENT_B` — both persistent-B payload families
+engage where the load-time predicate and the extension attest, and per-role
+FP8-CB split books keep the expand+grouped bridge, announced per layer — plus
+`PRISMAQUANT_CB_GEMV` and `PRISMAQUANT_CB_FP8_GEMV_V2` in the routed M ≤ 16
+band). Every EXPLICIT spelling keeps its exact 0.8.8 semantics, so the
+canonical gold environment (`PERSISTENT_B=0`, `CB_GEMV=inherited`) replays
+gold routes unchanged; `PRISMAQUANT_CB_FP8_GEMV_V2` stays outside the closed
+Gridbook-0.8.5 measurement registry by design (that profile is release
+evidence and its scan refuses namespace changes), and the 0.8.9 default-state
+served leg on the shipped clean 87 GB body measured kl_mean +0.17 % /
+PPL −0.06 % vs its gold record, inside the ±0.7 % cross-session KL envelope.
+The serving pin moves to 0.8.9/v4 with the wheel digest read from
+`gridbook:0.8.9-clean-23a3955`'s PEP 610 record (the published PyPI archive
+is byte-identical to a rebuild from tag v0.8.9, 60/60 members);
+`fp8_cb_fused_mid_m` gains its omitted 0.8.8 backed-set key plus 0.8.9 — the
+packaged runtime contract is byte-unchanged since 0.8.6 so both mirror the
+attested table — and the fp4-CB lane's detail now records that its
+"MoE T > 16 expands to BF16 + Ampere grouped GEMM" sentence describes
+runtimes BEFORE 0.8.9 and the announced fallbacks after it. Recorded evidence
+is untouched: gold drivers bind their pin from the runtime snapshot that
+carried the artifact, so shipped-era replays stay on 0.8.8 by construction.
+Previously re-stamped, the same day, for
+the **card-figure `model_sha` exclusion** (`CARD_FIGURE_FILENAMES`, §9.3 — the
+README doctrine now also covers `allocation-map.png`/`byte-budget.png`, with a
+legacy fallback) and, previously the same day, for
+the **body-only parity scoping** (§9.3): `perf.matched_budget_parity`'s
+verifier census walks every construction unit of the displaced container, and
+a namespace-excluded (body-only) export moves the excluded units into a
+separate sidecar artifact by construction (DSv4: `mtp.` lives in the 4.597 GB
+DSpark draft) — a gate no correct body-only artifact can pass. `required_slots`
+now scopes the demand out for such artifacts, keyed on `quant_config.json`
+`provenance.excluded_namespaces` (bound by `compute_model_sha`, so not
+flippable without breaking identity); a non-null parity claim on any card is
+still replayed. Previously re-stamped for
+the **served activation contract governing the A-side** (§"AQUA-AURA"): whether
+a format quantizes activations is a property of the RUNTIME, not of the format
+registry. Gridbook's CB lane decodes to BF16 and runs a BF16 GEMM unless a
+process-global selector picks a fused mode, and every CB gate and gold serve
+leaves it unset — so the A-side there is exactly zero. Pricing one anyway drove
+DSv4-Flash at 87.403 GB from 96.8% `nvfp4_cb` (K16 bulk) to 25.4% FP8_CB with
+the bulk rung crushed K16 → K12, paying weight bits to escape a cost the served
+artifact never incurs. Lanes now declare
+`served_activation_quantization.executes`, the pricing requires it, and a lane
+that executes nothing refuses the merge. Previously re-stamped for
+the **streamed rope-axis fix** (§4.1): `_call_layer` bypasses `Model.forward`,
+and where DSv4-Flash's rotary keys (*rope axes* `main`/`compress`) failed to
+match a layer's reported *attention schedule*, the streamed driver silently
+substituted `main` — rotating 41 of 46 layers on base 10000 with YaRN off
+instead of 160000 with YaRN. That is the defect behind the perplexity-262
+teacher, it is a reintroduction of the bug PATCH 06 had already fixed inside
+the vendored forward, and it reached the teacher, the incremental probe and the
+sensitivity probe alike. The mapping now has one definition and the silent
+fallback raises. Re-stamped with it for
+the **teacher forward-fidelity gate** (§7.3): the DSv4 gold lane's first
+execution built a BF16 teacher whose *own* teacher-forced perplexity was 262 —
+far worse than the 2.34-bpp student it was grading — and every existing gate
+passed it, because top-K coverage cannot distinguish a confidently wrong
+distribution from a correct one. The new gate enforces **context-monotonicity**
+on the teacher's own NLL, recovered from the payload alone, and refuses at
+build, `teacher_meta` and `load_teacher_evidence` alike. Re-stamped with it for
+the **DSv4 gold lane's first execution**, which found two further defects that
+made it unrunnable as written (§7.3). Its teacher support widens from top-1024 to
+**top-8192** — measured, not chosen: at 1024 the BF16 teacher misses the 0.90
+per-position coverage floor on 34 of 4,088 positions, so the gate refused every
+teacher the lane could build; 8192 is the smallest swept K that clears it, and
+the floor itself is unchanged. And the lane now installs the **0.8.8/v4 serving
+pin** rather than the 0.8.5/v3 producer pin, because both gold measurement tools
+attest the serving pin against the live runtime and would refuse a producer-pin
+container after the teacher pass had already been paid for.
+Previously re-stamped for
+the **judge/runtime split in the serve gate**, and with it the
+**split-release decode topology and the per-role cover** (§9.3). The gate bound
+the *judge* to the artifact's build commit as well as the served stack, which
+made a validator bug incurable for bytes already on disk; the container still
+runs the artifact's own build commit, but the host-side verdict now runs at
+HEAD, guarded by a descendant check and a `judge-divergence` proof that every
+differing closure path is judge-only. The fixes that exposed it: a DSv4 release
+may now ship as two artifacts, with the body declaring itself by *recording* the
+`mtp.` omission; and a routed packed expert stack is covered per **role** rather
+than per tensor, because the CB ABI binds one codebook per role.
+Previously re-stamped for the
+**published-bpp cross-check** — `shipcard.verify` now refuses a card whose
+`build.achieved_bpp` contradicts the per-unit serialized bytes the recipe it
+names declares (§7). Precedence alone could not catch a right field describing
+the wrong point: DSv4-Flash `artifact-aura-cb-112p69` published 4.3065 bpp from
+a sibling `pareto.knees.json` for a recipe that prices to 2.7385, 57% wide.
+Previously re-stamped (2026-08-17, `merge/proven-rescues`) for the
 **deletion of the signed `NVFP4_CB_S*` family and the per-regime correction to
 native-execution reporting** (§9.2). The signed family is gone from the registry,
 encoder, exporter, footprint and serving profile: every native Gridbook FP4 route
@@ -39,11 +131,22 @@ gates does not escape it (KL is only bit-identical *within* a docker session).
 Legacy cards stamped while the README was hashed still verify, through
 `compute_model_sha(..., legacy_readme_hashed=True)` behind a single
 `accepted_model_shas()` helper that `verify` and `reattest` share so the two
-cannot drift on which identities they accept; §9.3. The **whole CB ship-gate stack turned out to be DSv4-shaped**, not
+cannot drift on which identities they accept; §9.3. **The card figures
+(`CARD_FIGURE_FILENAMES`: `allocation-map.png`, `byte-budget.png`) joined that
+exclusion 2026-08-18** by the same argument — they are rendered *from* the
+attested `quant_config.json` after the gates by construction, decoded by no
+runtime, and hashing them made illustrating an artifact invalidate the records
+that measured it; exact filenames, not a category, with a
+`legacy_figures_hashed=True` fallback in `accepted_model_shas()` and the same
+exclusion honored by the gold inventory replay. The **whole CB ship-gate stack turned out to be DSv4-shaped**, not
 just the gold contract: `validate_cb_endpoint.py` pinned the served-model
 brand, `--tokenizer-mode deepseek_v4`, the eugr image and `model_type ==
 "deepseek_v4"` itself, and `perf.matched_budget_parity` structurally requires a
-displaced container a net-new size class does not have. No CB artifact on this
+displaced container a net-new size class does not have — nor can a *body-only*
+(namespace-excluded) DSv4 artifact satisfy its census, whose walk demands the
+construction units living in the separate DSpark draft; both scopings are keyed
+on identity-bound artifact provenance, and a volunteered parity claim is still
+replayed wherever it appears. No CB artifact on this
 box — DSv4's included — had ever had a single slot filled, so the stack had
 never run end-to-end. The three genuinely lane-varying constants now come from
 one table, `CB_SERVING_LANE_SPECS`, that the launcher *reads* rather than
@@ -163,6 +266,60 @@ W-side to 0.07%, which produced a Pareto byte-identical to the weight-only one.
 (`1dbf146`; the two differ by 3.23% of Linears at 5.0–5.5 bpp). It is **still
 research** — there is no served KL/PPL A/B against the weight-only arm at
 matched bpp, and that A/B is the promotion gate.
+
+**The A-side belongs to the SERVING LANE, not to the format registry, and the
+lane answers per FAMILY (2026-08-17).** Whether choosing a format actually
+quantizes activations is a property of the runtime that will serve the
+artifact. On the `nvfp4_cb` lane gridbook answers **two different ways**:
+`FP8_CB_*` genuinely is W8A8 — `gridbook/linear.py` hands quantized `xq` with
+per-token dynamic scales to `native_cutlass_scaled_mm`, and `moe.py` declares
+`_FP8_GROUPED_CONTRACT = "fp8_per_token_dynamic"` — while `NVFP4_CB_*` is not:
+it decodes to BF16 and runs a BF16 GEMM, gridbook's own "exact native BF16
+bridge", unless a **process-global** env selector picks a fused mode
+(`PRISMAQUANT_CB_FUSED_FP4`, `..._FP4_MOE`), which every gate and gold serve on
+this lane leaves unset. So an `NVFP4_CB` unit's true A-side is exactly zero,
+the artifact's per-scheme `activation_contract` is *permission* for a fused
+mode rather than selection of one, and there is no per-unit A4/A16 choice to
+allocate over. Pricing that half is not a conservative overestimate but a
+**currency error** in the principle-8 sense, and it cost bytes: at 87.403 GB it
+drove DSv4-Flash from 96.8% `nvfp4_cb` (K16 bulk) to 73.7% with **25.4%
+promoted to FP8_CB** and the bulk rung crushed **K16 → K12** — the DP spending
+real weight bits to escape a cost the served artifact never pays, while the
+FP8 promotions it bought were priced against a *phantom* alternative. The
+Qwen3.8-27B CB-A allocation used the same AQUA-merged cost on the same lane.
+Lanes therefore declare `served_activation_quantization.executes` as **glob
+patterns over format names** (`lane_spec.LaneActivationContract`,
+`lane_specs/nvfp4_cb.json` — `["FP8_CB_*"]`), because the answer is per family
+and rungs within a family are open-ended; enumerating rungs would under-declare
+silently the day one is added. `activation_dloss_table` **requires** the
+pattern set and refuses to fall back on the registry's W4A4 claim; a lane that
+declares an empty set refuses the merge outright rather than writing an
+all-zero A-side that is indistinguishable later from a real one. Pass
+`--lane-executes-all-activation-grids` for a lane that genuinely serves every
+activation grid fused.
+Name resolution goes through the **model profile**: the stage inverts
+`checkpoint_to_live_name` over the safetensors index, because a card's unit
+names come from the module tree the probe walked while a checkpoint may rename
+both the path and the leaf (DSv4-Flash stores
+`model.layers.N.mlp.experts.E.down_proj` as `layers.N.ffn.experts.E.w2`, which
+resolved **0 of 33,325** units under the previous path-only aliasing). The
+forward direction is not usable — `source_tensor_name` rewrites the path but
+not the leaf. Two failures that were previously silent now **refuse**: zero
+name resolution, and a merge that writes zero entries (the signature of a
+scalar-only card with no `g_sq_sum`). Both would otherwise emit an artifact
+with the right units and formats and an absent A-side, which
+`cost_entry_act_dloss` reads as 0.0 — i.e. free — making "unmeasured"
+indistinguishable from "costless" to the DP.
+On a **quantized-source** checkpoint the resolved tensor is not a dense weight
+(DSv4-Flash: MXFP4 nibble-packed routed experts, block-FP8 everything else,
+both with E8M0 `.scale` siblings), so `materialize_source_weight` dispatches on
+the streaming loader's own `_build_fp8_scale_inv_map` — declaration-driven,
+never shape-inferred — and reuses the loader's decoders
+(`dequantize_mxfp4_source`, `_dequant_fp8_block_weight`); the materialized W is
+bit-identical to the weights the loader installs for the probe. Dense
+checkpoints hit the map-empty passthrough and behave exactly as before; any
+tensor that cannot be materialized to the card's `(out, in)` **raises** rather
+than pricing a wrong-shaped or code-range W.
 The external runtime record pins Gridbook **0.8.5** at exact commit
 `e992e5980c96333a48149f96392d6cff56ae9e3f`, with
 `gridbook.runtime-contract.v3` and the exact required feature map
@@ -428,7 +585,7 @@ Highest first. A claim is worth exactly the rung it was measured on.
 
 | # | Metric | Contract | Where |
 |---|---|---|---|
-| 1 | Served-artifact vLLM KL-vs-BF16 at matched bpp: exact full vocabulary where feasible; DSv4Flash all-position top-1024 support plus one tail bucket | n=8 × seqlen=512 | `tools/measure_vllm_full_kl.py`; DSv4 source builder `tools/build_streamed_full_kl_teacher.py` with the offline input from `tools/prepare_dsv4_wikitext_inputs.py` — invoked **manually**, never by the pipeline |
+| 1 | Served-artifact vLLM KL-vs-BF16 at matched bpp: exact full vocabulary where feasible; DSv4Flash all-position top-8192 support plus one tail bucket | n=8 × seqlen=512 | `tools/measure_vllm_full_kl.py`; DSv4 source builder `tools/build_streamed_full_kl_teacher.py` with the offline input from `tools/prepare_dsv4_wikitext_inputs.py` — invoked **manually**, never by the pipeline |
 | 2 | Direct WikiText PPL on the served artifact | pinned WikiText test revision; 8,192-token prefix in 16 non-overlapping 512-token windows; 8,176 scored positions | `tools/measure_vllm_wikitext_ppl.py` with that same offline input, contract `prismaquant.wikitext_ppl_calibration/1` — manual |
 | 3 | Mean NLL alongside PPL; KL-vs-BF16 (`/home/rob/dq-runs/kl_tool.py`) for IT/BOS-sensitive models where raw PPL is meaningless | — | §7.5 |
 | 4 | Downstream suite on materialized artifacts: GSM8K, IFEval, MMLU, **ToolEvalBench** (`--no-think --hardmode --parallel 1`) | — | tool-use fidelity is the deep reason KL matters: a small probability shift at a decision point flips a tool call |
@@ -978,6 +1135,38 @@ The probe is streamed shard-by-shard through `layer_streaming` — head resident
 MTP a built-in shard kind (`incremental_probe.py:2-17`); a modality guard aborts on
 probe/`CALIBRATION_MODALITY` mismatch (`:562-599`).
 
+**The streamed driver must reproduce the model's own forward, and where it
+cannot observe a rule it must not guess one.** `_call_layer` drives one decoder
+layer at a time and therefore bypasses `Model.forward` entirely, so everything
+that forward does *between* layers has to be re-supplied: the profile's
+`expand_hidden_for_layers`/`collapse_hidden_after_layers` (DSv4's `hc_mult=4`
+streams), `extra_layer_kwargs` (DSv4 hash-routed layers' `input_ids`),
+`new_forward_pass_state` (Gemma4 shared K/V), the mask, and the rope. Rope is
+the subtle one, because two namespaces collide: a multi-rope model's rotary is
+keyed by *rope axis*, while a layer can only report its *attention schedule*.
+On Gemma3/Gemma4 those coincide. On DSv4-Flash they never do — axes are
+`main`/`compress`, schedules are `sliding_attention` /
+`compressed_sparse_attention` / `heavily_compressed_attention` — so the lookup
+missed every layer, and the code answered the miss by substituting `main`.
+That silently rotated 41 of V4-Flash's 46 layers on base 10000 with YaRN
+disabled where `DeepseekV4Model.forward` uses `compress_rope_theta` 160000 with
+YaRN, an angle error that grows with position. The BF16 teacher built through
+that path scored perplexity **262** — worse than the 2.34-bpp student it
+existed to grade — while the served artifact was healthy, and it was used as a
+gold KL reference. The bug is notable twice over: PATCH 06 had already found
+and fixed exactly it *inside* the vendored forward
+(`modeling_deepseek_v4.py:1514-1521`), and the streamed path reintroduced it.
+The mapping now has a single definition,
+`DeepseekV4RotaryEmbedding.rope_axis_for_layer_type`, which the model's forward
+and `ModelProfile.rope_axis_for_layer_type` both resolve through;
+`_compute_position_embeddings` re-keys the rope dict by attention layer type so
+every `_call_layer` caller is fixed at once; and the `main` fallback is gone —
+an unresolved layer type now raises. Guarded by
+`tests/test_multilayer_rope_forward.py` and
+`tests/test_deepseek_v4_profile.py::test_rope_axis_mapping_matches_the_vendored_definition`.
+See also the teacher forward-fidelity gate (§7.3), which is what makes a
+teacher this broken impossible to ship silently.
+
 `h_trace` is the empirical CE Fisher diagonal trace. Additive model:
 `0.5 · h_trace · weight_mse · gain` (`allocator_solver.py:60-63`, derivation
 `allocator.py:13-52`).
@@ -1115,7 +1304,7 @@ seam defect from a campaign convention into a checked plugin contract.
 and the **112.690 GB exact-byte budget** into that mechanism. It remains a one-shot campaign
 rather than a four-phase `run-pipeline.sh` cost mode: rank the weights, solve once, and export
 the resulting assignment blind. There is no contested set, certificate, or cost-driven
-iteration. The only quality gate is the served artifact: all-position top-1024-plus-tail-bucket
+iteration. The only quality gate is the served artifact: all-position top-8192-plus-tail-bucket
 vLLM KL-vs-BF16 plus direct WikiText PPL against `artifact-112p69-raw` at matched bpp. Qwen3.8-27B can reuse the
 same generic mechanism and CB plugin while supplying its own model profile, source-gated unit
 classes, budget, and acceptance driver.
@@ -2860,7 +3049,30 @@ point, else the allocator's `achieved_bits`, and only then falling back to `pare
 The knee file is a *separate* artifact describing the **surrogate** frontier, so under
 `SELECTION_MODE=validated-surrogate` it does not describe the recipe beside it — reading it
 first put a 1.25 bpp false claim on the Qwen3.8-27B arm-B card, 5.9994 for bytes that were the
-validated 4.7496), exact `artifact_bytes`, format histogram, the render-lever
+validated 4.7496.
+
+**That precedence is now backed by a cross-check, because precedence alone cannot catch a
+right field naming the wrong point.** `shipcard.recipe_priced_bpp` sums
+`cb_serialized_identity.tensor_payload_bytes` and `.params` over the units that declare them,
+so numerator and denominator come from the same recipe entries and the result is scope-matched
+by construction — no probe, no source manifest, no header or sidecar estimate. It is a **lower
+bound**: units carrying no per-unit price (FP8_SOURCE passthrough Linears) leave both sums, and
+they can only add bytes. `allocator_achieved_bpp` attaches the comparison as a `cross_check`
+block on the card (advisory at export, so a gate bug can never strand a finished export), and
+`shipcard.verify` **refuses** on `verdict == "DISAGREE"` — publication is the blocking point,
+per R16. Tolerance is `RECIPE_BPP_CROSS_CHECK_TOLERANCE = 0.10`, far wider than label-scope
+drift and far narrower than what it exists to catch. A card written before the gate existed
+carries no verdict and is left alone. The motivating case is DSv4-Flash
+`artifact-aura-cb-112p69`, which published **4.3065** bpp read from a sibling
+`pareto.knees.json` for a recipe that prices to **2.7385** — 57% wide, and a false public bpp
+silently breaks every matched-bpp comparison built on it. (Post-mortem: that recipe's own
+metadata *did* carry the correct 2.7555, byte-identical to the `layer_config_sha` the card
+recorded, so the precedence fix above already closes that specific instance; the cross-check is
+the independent net that does not depend on getting precedence right.) Tests:
+`tests/test_shipcard.py::test_recipe_priced_bpp_*`,
+`::test_achieved_bpp_cross_check_*`.
+
+Also on the card: exact `artifact_bytes`, format histogram, the render-lever
 echo (`_render_lever_provenance()`, shared with the export cache's fingerprint so the two
 cannot drift), and the `PRISMAQUANT_ALLOW_KV_SHARED_FISHER` / `PRISMAQUANT_KV_COTANGENT` state
 so an allocation that rode an unvalidated Fisher correction is visible on the artifact rather
@@ -3146,8 +3358,32 @@ into `native_export.eager`.
 **Served-artifact vLLM KL-vs-BF16** — `tools/measure_vllm_full_kl.py` retains the
 exact-full-vocabulary path for teachers that fit its ordinary vLLM two-pass
 workflow. DSv4Flash must instead use the digest-bound streamed-teacher path; its
-release statistic is explicitly **all-position top-1024 support plus one tail
+release statistic is explicitly **all-position top-8192 support plus one tail
 bucket**, not full-vocabulary KL.
+
+**Why 8192 and not the 1024 this lane originally specified.** The support width
+is set by measurement, not convention. The contract requires every one of the
+4,088 scored positions to carry ≥ 0.90 probability mass inside the teacher's
+top-K. On the first execution of this lane — it had never been run, on either
+DSv4 artifact — a K=1024 teacher missed that floor on 34 positions (worst
+0.6943), so the gate refused every teacher the lane could build. Sweeping K in
+one pass over the pinned calibration (`topk` returns sorted, so a single K=16384
+reduction yields every smaller K) gives min coverage 0.6943 / 0.7829 / 0.8606 /
+0.9231 / 0.9658 at K = 1024 / 2048 / 4096 / 8192 / 16384. K=8192 is the smallest
+width clearing the floor. **The 0.90 floor is unchanged** — the support was
+widened until it could meet the guarantee, rather than the guarantee lowered to
+fit a support that could not. `PROMPT_TOP_K` in `tools/full_kl_teacher_payload.py`
+is the single source of that number; `shipcard.py`'s three DSv4 gold literals and
+`tests/test_shipcard_gold_replay.py` all track it.
+
+**Gridbook version on this lane.** The gold measurement tools bind the **serving**
+pin: both call `load_gridbook_serving_runtime_pin()` and hand the attestation to
+`self_manifest`, which compares it against the live runtime. A driver that
+installs the 0.8.5/v3 *producer* pin therefore cannot complete the KL step —
+`run_gold_after_export.sh` does exactly that, which is consistent with that lane
+never having produced a gold result. `run_gold_92gb.sh` installs the 0.8.8/v4
+serving pin, matching both the tools and the pair that carried the artifact
+through the serve gate.
 
 The exact DSv4 serving image intentionally does not install Hugging Face
 `datasets`. Before either GPU measurement,
@@ -3164,7 +3400,7 @@ mode is refused rather than silently recovering the corpus at runtime.
 `tools/build_streamed_full_kl_teacher.py` extends the existing
 `cost_streaming.build_streamed_causal_lm` layer streamer: BF16 source weights,
 one source `LayerCache` slot, one prefetch worker, and zero lookahead. It reduces
-logits to FP32 top-1024 log probabilities on GPU before releasing the streamed
+logits to FP32 top-8192 log probabilities on GPU before releasing the streamed
 model. The closed calibration is WikiText-2 raw **train** revision
 `b08601e04326c79dfdd32d625aee71d232d685c3`, verbatim nonempty rows joined by
 two newlines, tokenizer special tokens disabled, Python window seed 42,
@@ -3187,6 +3423,34 @@ probability mass is finite and at most `1 + 1e-6`. Contract
 `prismaquant.topk_tail_coverage_policy/1` additionally requires **at least 0.90 mass at every
 position** (therefore at most 0.10 declared tail mass), and records recomputed mean/minimum
 coverage; a caller-supplied summary is never trusted.
+
+**Coverage is not fidelity, and a second gate says so.** A confidently *wrong*
+distribution is still sharply peaked, so the coverage policy above is silent on
+whether the teacher's forward pass is correct at all. On 2026-08-16 that
+silence shipped a teacher whose own teacher-forced perplexity was 262 — far
+worse than the 2.34-bpp student it was grading — and every existing gate
+passed. `teacher_forward_fidelity_summary` (`tools/full_kl_teacher_payload.py`,
+contract `prismaquant.teacher_forward_fidelity_policy/1`) closes it, and runs
+inside `validate_teacher_payload`, so build, `teacher_meta` and
+`load_teacher_evidence` all refuse: an unfaithful payload cannot be replayed
+into shipcard evidence either. It recovers the teacher's own per-position NLL
+from the payload alone — no extra forward — imputing out-of-support targets by
+the two exact bounds the row already carries (declared tail mass, and the
+smallest probability in a sorted top-K), which is a *lower* bound, so the
+imputation can never manufacture a refusal. Positions are partitioned into
+octaves of available context (the scale-free partition of a power law, and
+fully determined by `SEQLEN`), and every ordered octave pair is compared by a
+one-sided Welch t-test on per-position NLL. The enforced property is
+**context-monotonicity**: a correct autoregressive model on contiguous natural
+text improves with context and never inverts, whatever its absolute quality —
+so the gate is scale-free and needs no absolute NLL threshold. "Materially
+worse" is measured in the payload's own dispersion; the only convention is the
+significance level, fixed at family-wise `1/scored_positions` split Bonferroni
+across the comparisons, and the verdict is insensitive to it across ~60 decades.
+A secondary absolute ceiling of `ln(vocab_size)` refuses a teacher no more
+informative than uniform over its own vocabulary. Both the profile and the
+worst comparison print on every build, refusal or not.
+
 Student measurement must load and replay both files, carry the compact
 `teacher_evidence` into its result, report exactly 4,088 positions, and require
 the teacher source identity to equal the candidate artifact's source identity.
@@ -3283,8 +3547,9 @@ is still fully replayed.
 same survey reached `validate_cb_artifact_decode_contract`, which demanded
 "exactly one of `dspark_source_overlay` or `dspark_cb_sidecar`" — two DSpark
 topologies a plain Gridbook CB export has neither of. It now dispatches on the
-lane: the DSv4 lane still requires exactly one (declaring neither would shed the
-bridge contract its stack depends on), declaring *both* is refused everywhere,
+lane: the DSv4 lane requires a declared topology (declaring neither would shed
+the bridge contract its stack depends on — unless the omission is itself
+declared, see the split release below), declaring *both* is refused everywhere,
 and declaring a DSpark topology off the DSv4 lane is refused too. Off-lane
 artifacts take `CB_PLAIN_MODE` under
 `ARTIFACT_DECODE_CONTRACT_SCHEMA_PLAIN` — a distinct mode, not a version bump,
@@ -3314,12 +3579,97 @@ artifact never uses must not refuse it, and one missing a feature it does use
 must — so a dense CB artifact requires none and a routed-MoE one requires the
 per-role LUT.
 
-*Open, DSv4 lane:* the stricter enumerator reports 8 `…ffn.experts.gate_up_proj`
-stacks on `artifact-aura-cb-112p69` as claimed by nothing, because 8 of its
-layers spell the targets unfused while 35 spell them fused, and
-`DeepseekV4Profile.fused_sibling_leaf_mapping()` is empty in the host venv (the
-vLLM class lives only in the serving container). That is a real inconsistency to
-settle before the DSv4 ship (task #14), not a Qwen3.8 blocker.
+**A fourth topology: the body half of a split release** (2026-08-16). At 92 GB
+the DSv4-Flash body ships with `mtp.` excluded and the draft as a *second*
+artifact, so it declares neither DSpark topology — and the lane guard refused
+it. Both old branches were the wrong reading: it is not an in-band overlay and
+it is not the sidecar. A DSv4 artifact may now decline both **iff** it records
+`mtp.` in `provenance.excluded_namespaces`. The omission is the declaration, so
+a body that merely *lost* its overlay (records nothing) still refuses, and
+overlay-plus-exclusion is refused as a contradiction — the overlay is
+constructed from exactly those source layers. It then takes `CB_PLAIN_MODE`, and
+the disk-free receipt replay accepts exactly the one permitted omission (`[]` or
+`["mtp."]`, a closed set — not "any exclusion").
+
+Running the plain cover against a real FP8-source artifact for the first time
+then broke three assumptions it had never had to hold (all 2026-08-16):
+
+- **A group's target is a tensor.** 22 of 48 groups resolved to zero tensors,
+  because 11 learned layers name the *halves* (`…experts.gate_proj`) of a packed
+  `gate_up_proj` stack. That is the CB ABI, not a defect: a packed target binds
+  exactly one `codebook_ref`, so a per-role learned book must be named per role,
+  while a lattice layer's single shared book legally names the packed stack.
+  Cover is now computed per **role**, decomposed through the profile's
+  `packed_expert_projection_names` — matching gridbook 0.8.5
+  `_resolve_moe_codebook_roles` read *at the pin* rather than widening past it —
+  and a stack whose roles are only partly claimed is refused as unservable, the
+  same rule the fused-sibling bridge already applies.
+- **`source_passthrough` did not exist to the cover.** The third declared
+  claiming mechanism was invisible, so 336 verbatim-FP8 units read as claimed by
+  nothing. It is now read exactly as `artifact_completeness` reads it: by exact
+  variant, not by ancestry. A unit legitimately carries **both** a passthrough
+  declaration and a scheme-less config group — the group states LAYOUT, the
+  declaration states ROUTING (`cb_export_config.py`) — and 272 of the 336 carry
+  the pair, so refusing it would refuse every FP8-source release.
+- **Groups partition units.** `covered == cb_unit_count` cannot hold once two
+  per-role groups share one packed stack (398 vs 115). The assembly site, which
+  holds both sets, now asserts set equality against the classified CB units
+  after subtracting passthrough; the disk-free replay, which does not hold them,
+  keeps only the bound it can honestly assert — the cover may not fall *short*.
+
+With those, `artifact-aura-cb-92gb` validates `cb_plain` complete: 115 CB + 336
+passthrough over 1736 tensors. `artifact-aura-cb-112p69`'s `evidence_sha256` is
+byte-identical across the change, and the ordinary plain fixture's
+`cover_sha256`/`evidence_sha256` are pinned in
+`tests/test_validate_cb_endpoint_plain.py` from the pre-change code, so a future
+cover change cannot silently move every artifact's receipt.
+
+*Closed with them:* the 8 `…ffn.experts.gate_up_proj` stacks previously reported
+on `artifact-aura-cb-112p69` as claimed by nothing were the same per-role blind
+spot mirrored in `artifact_completeness`, not a `fused_sibling_leaf_mapping`
+gap.
+
+**The gate could not run its own fix** (2026-08-16). Both fixes above landed
+after the 92 GB body was built, and `scripts/serve_dsv4_cb_validate.sh` refused
+unless `REPO_HEAD == ARTIFACT_BUILD_COMMIT`, then materialized and re-exec'd the
+snapshot **at that commit**. So the gate would have executed the *pre-fix*
+validator against the artifact, and the only remedy it admitted for a wrong
+verdict was rebuilding bytes that were never wrong — five to six GPU-hours to
+reproduce the same tensors under a newer stamp. That is a defect in the gate,
+not a property of the artifact: the binding covered the **judge** as well as the
+**runtime**, and `validate_cb_endpoint.py` decodes nothing.
+
+The two roles are now separate identities, and the launcher materializes and
+verifies **both**:
+
+| | commit | role |
+|---|---|---|
+| **runtime** | artifact `build.git.commit` | mounted at `/repo`, sources the Gridbook serving runtime, executes every in-container step |
+| **judge** | the live checkout's `HEAD` | runs the launcher and every host-side verdict |
+
+Nothing about the serve is relaxed — the container still runs exactly the stack
+the bytes were made for, and its in-container closure verify still expects the
+build commit. What changed is that a gate fix now reaches artifacts already on
+disk. Two guards keep it from becoming a way to judge with unrelated code. The
+judge must be a **descendant** of the build commit (`git merge-base
+--is-ancestor`) — forward only, never older than the producer. And
+`prismaquant_runtime_snapshot.py judge-divergence` proves every closure path
+that differs between the two snapshots is in `JUDGE_ONLY_PATHS`: `docs/`,
+`tests/`, and three named host-side modules. A divergence anywhere in the serve
+path refuses, because a judge that also moved the serve path may be expecting
+something the build-commit runtime does not produce — and *there* re-export is
+the honest answer. The claim is re-proved at every `verify_runtime_snapshot`
+checkpoint rather than trusted once at bootstrap, and `evidence/judge_split.json`
+records both identities with the divergence list, so a receipt can always say
+which code rendered its verdict. On the 92 GB body the divergent set is exactly
+the eight paths of `1467c90` + `2027c60` + this entry.
+
+Two subtleties the split had to respect. `PQ_RUNTIME_PRISMAQUANT_ROOT` is the
+*source-bootstrap* contract — `activate_prismaquant_source` refuses unless it
+equals the directory of the tool being run — so on the host it names the judge
+root, while the container keeps its own explicit `/repo`. And
+`PRISMAQUANT_IDENTITY_GIT_COMMIT` stays the **artifact build commit**: a judge
+running newer does not restamp what produced the bytes.
 
 `serve_manifest.json` is excluded from `compute_model_sha` for the same reason
 it is written at all: it is the R15 fingerprint of a *serve*, not artifact
@@ -4860,6 +5210,7 @@ New with the 2026-07-30 merge:
 | D28 | **Serve-time fast-kernel enforcement has no caller.** `require_fast_kernels(model)` — which reads the model profile's kernel requirements and hard-fails at startup when a required fast kernel (`causal-conv1d`, `flash-linear-attention`, …) is not importable — lost its only caller when `polish_from_assignment` was archived on **2026-05-15**, and was itself walled 2026-07-30 (R19) as an orphan. It is the only mechanized piece of **core principle 9's** "routed to a *performant* kernel (not a slow fallback)" gate, so that gate is **manual today**: nothing in the build or serve path refuses a checkpoint whose arch would silently fall back to the slow PyTorch implementation. The mechanism is written and tested — only the call site is missing. | `archive/orphans_2026-07-30/prismaquant/_fast_kernel_guard.py` + `tests/test_fast_kernel_guard.py`; sole historical caller `archive/polish_2026-05-15/prismaquant/polish_from_assignment.py:202` | LOW | Move the guard back and call it from `validate_native_export` / the serve launcher, keyed on the resolved profile — or, if serve-time enforcement belongs to the lane scripts, say so in §7 and delete the row. |
 | D29 | **The FP8-CB row scale is not bit-reproducible across CPU architectures.** It is the scalar argmin of a scale sweep whose objective reduces over every column of the row, and that reduction reorders differently on x86 than on aarch64: on the fixed `test_cbl_scope_identity` fixture the packed index bytes -- the payload that actually ships -- are **identical** on both, while the single float32 scale differs in the low bits. Found 2026-08-11 when a byte-identity test recorded on the aarch64 build box failed on x86 CI. Consequence for the provenance gate (§5): artifact byte-reproducibility is a **within-platform** guarantee, not a cross-platform one; a rebuild on a different architecture may differ in scale bytes without differing in indices. Artifacts are built on the Spark, so nothing shipped is affected. The test now pins the packed plane by exact digest everywhere and the scale by value within float32's own worst-case reordering bound (n·2^-23), keeping the exact digest assertion on the recording platform. | `tests/test_cbl_scope_identity.py::test_unset_scopes_pin_76666bd_stamp_and_rendered_bytes`; `nvfp4_cb_formats._sweep_encode_moment` | LOW | Decide whether cross-architecture byte reproducibility is a goal at all. If it is, the sweep objective needs a fixed reduction order; if it is not (the likely answer -- artifacts are Spark-built), say so in §5 so a future reader does not read a cross-platform promise into the provenance gate. |
 | D30 | **The Sensitivity Card's non-scalar tiers are screening surrogates, and its probe wiring has two soft spots** (added 2026-08-14, §4.8). Four honest gaps, none of them closed: (1) **No served A/B.** The `MARGINAL` tier and AQUA-AURA have never been measured on exact full-vocab vLLM KL-vs-BF16 or direct WikiText PPL. `SCALAR` is a byte-identical reproduction of today's model and carries no such debt; the other two must not be cited as results (§2.5). (2) **The rank-1 reconstruction's error is unquantified on real layers.** `H = Σ_t outer(g_t², x_t²)` is exactly rank-1 only when one token dominates; `outer(row, col)/h_trace_raw` is provably exact in that case (`rtol=1e-10`) and an approximation of unknown magnitude everywhere else. Nothing has compared it against a materialized `H` on a real Linear. (3) **The marginal identity is exact only at the two streaming sites.** `sum(fisher_row) == sum(fisher_col) == h_trace_raw` holds by construction where `h_trace_raw` is literally `chunk_h.sum()` in fp32 (`incremental_probe.py:2520`, `:2751`). On the **resident** path `h_trace_raw` comes from the bf16 outer-product-norm identity `(gy2_sq.sum(1) · x2_sq.sum(1)).sum()` (`:1667-1668`) while the marginals reduce the fp32 `chunk_h`, so the two agree mathematically but not bitwise; `SensitivityUnit.validate`'s `rtol=1e-3` is what absorbs that, and nothing measures the actual spread. (4) **One accumulation site is dead on the shipping path and therefore untested.** The batched MoE block-flush hook (`:2276-2362`) fires only for blocks whose immediate children are per-expert containers exposing the profile's projection names as `nn.Linear` — the *unpacked*-expert layout. The shipping recipe's MoE models do not take it, and `tests/test_probe_marginals.py` covers the helpers and the two streaming sites but not that branch, so its marginal emission has never executed. A transposed axis or a wrong merge rule there would surface first on a new unpacked-expert architecture, which is exactly the class of silent-garbage failure §8.5 L3 is about. | §4.8; `prismaquant/sensitivity_card.py`, `format_cost_protocol.py`, `sensitivity_card_allocate.py`; `incremental_probe.py:97-199,1667-1672,2276-2360,2501-2520,2735-2751`; `tests/test_sensitivity_card.py`, `tests/test_probe_marginals.py`; `docs/design/sensitivity_card_contract.md` §8 | MED | (1)-(2) run the rank-agreement check against measured `output_mse` on Qwen3-0.6B and an allocation-churn check against a shipped `cost.pkl` before any tier but `SCALAR` is proposed for a default; (3) record the resident-vs-streaming identity spread on one real probe, or tighten the resident path to reduce `chunk_h` for both; (4) cover the MoE block flush with a synthetic unpacked-expert fixture, or state that the branch is retired. |
+| D31 | **Shipcard replay binds recorded evidence to the serving pin at HEAD** (added 2026-08-18). Every gate slot records the runtime that actually gated it (serve-manifest `gridbook_distribution`, endpoint-contract stack), but the replay compares those records against `load_gridbook_serving_runtime_pin()` at HEAD — so the 0.8.9 pin bump made the already-published DSv4 flagship unpublishable for a docs-only README update: six slot refusals, all "is not the tracked pin", on evidence that exactly matches the pin that was tracked when it was measured. Worked around honestly for the 0.8.9 card update by running the publisher from a worktree at `0266662` (the pre-bump commit; publisher and verifier code there are byte-identical to HEAD — the bump commit `6a883bc` touched pin data and docs only — so this verifies the card against the pin that gated it, with zero tool divergence). Recurs on every serving-pin bump for every historical artifact. | `prismaquant/shipcard.py:1225,2374,2521`; `tools/publish_artifact.py` dry-run refusal 2026-08-18 | MED | Decision for Robert: accept a declarative superseded-pins record in `gridbook_serving_runtime_pin.py` (version/commit/wheel of prior released pins; replay accepts recorded == current OR recorded ∈ superseded, and the verdict names which) — keeps fail-closed against unreviewed runtimes without rotting history — or rule that docs updates to historical artifacts always re-run the publisher at the artifact's pin era. |
 
 **Open items carried from session handovers.** Of the 41 items the handover census could not
 map to a verified closure, the prior FP4-CB fast-expander/Triton item is now closed by the

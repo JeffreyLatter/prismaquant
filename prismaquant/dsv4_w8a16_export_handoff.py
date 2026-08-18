@@ -26,7 +26,7 @@ from prismaquant.cb_anchored_cost import (
 )
 from prismaquant.cost_stage_checkpoint import canonical_json_sha256
 from prismaquant.dsv4_aura_cb_reprice import (
-    DSV4_BUDGET_BYTES,
+    DSV4_W8A16_APPROVED_BUDGET_BYTES,
     DSV4_TOTAL_UNITS,
     DSV4_W8A16_APPROVED_ASSIGNMENT_SHA256,
     DSV4_W8A16_APPROVED_CB_COL_WEIGHTS_SHA256,
@@ -115,7 +115,137 @@ _PUBLISHED_FILES = frozenset({
 #     declaration is two otherwise-unread attributes. Verified directly:
 #     `lm_head`/`model.embed_tokens`/expert names derive exactly as before on
 #     both the vLLM-internal and checkpoint sides.
-# RE-FROZEN 2026-08-18 (third time, the merge/proven-rescues line), reviewed
+#
+# RE-FROZEN 2026-08-16 (third time). Whole closure enumerated per the note
+# above; THREE files drifted, reviewed against THIS handoff rather than
+# re-hashed:
+#   artifact_completeness.py -- two changes. (1) 1ccdf58 widened the
+#     enumerator from "`.weight` in an FP8 dtype" to also read
+#     `.cb_qweight`/`.weight_packed` planes, added `quantized_embedding` as a
+#     claiming mechanism, and bridged a fused checkpoint unit claimed by its
+#     unfused halves. The widening can only ADD units to classify, i.e. it can
+#     only turn a pass into a failure, and on this lane it adds none: a DSv4
+#     W8A16 artifact ships `FP8_BLOCK_UE8M0_SOURCE` blocks as `.weight` +
+#     `.scale` and carries no coded or packed plane. The embedding branch needs
+#     a `quantized_embedding` key this lane never writes (same argument as the
+#     first re-freeze's `embedding_stock`). The fused bridge is the only
+#     pass-ward change, and it is unreachable here: this lane's units resolve
+#     through their `source_passthrough` declaration several branches earlier,
+#     and it fires only when EVERY member is separately claimed. (2) The DSpark
+#     construction bridge below, which is gated on a non-null
+#     `provenance.dspark_cb_sidecar`; a W8A16 or target artifact declares none,
+#     so the resolver is None and `_unit_variants` is byte-identical. Pinned by
+#     tests/test_artifact_completeness_namespaces.py::
+#     test_without_a_sidecar_declaration_the_construction_bridge_is_inert, and
+#     confirmed on real bytes: artifact-aura-cb-112p69 reports the same 100
+#     declared passthrough / 25 verbatim / COMPLETE before and after.
+#     (3) `per_expert_format_groups` is now recognized as a claiming mechanism
+#     in the classifier, closing the same omission 1ccdf58 left for split
+#     expert banks: those tensors were already owned in both directions by
+#     `_validate_per_expert_format_groups`, so the classifier was reporting
+#     them a second time as claimed by nothing. Undeclared split tensors still
+#     fail through that validator, pinned by a negative control. This lane
+#     ships no split bank -- it writes no `per_expert_format_groups` key at
+#     all, so the claimed set is empty and the branch is unreachable.
+#   nvfp4_cb_footprint.py -- `whole_artifact_budget_stamp` gained an optional
+#     `excluded_source_prefixes` that emits its field only when non-empty, its
+#     reader validates that field, and two exclusion helpers were added. This
+#     handoff imports `assignment_serialization_sha256` and
+#     `cb_serialization_metadata_from_assignment_payload` and neither was
+#     touched; a caller that passes no exclusions gets a byte-identical stamp,
+#     pinned by tests/test_cb_serialization_contract.py::
+#     test_budget_stamp_is_byte_identical_without_exclusions.
+#   export_nvfp4_cb_streaming.py -- `_validate_namespace_exclusions` now
+#     cross-checks the exclusion set against the budget stamp that priced the
+#     allocation. It returns early when there is no stamp, and on a lane that
+#     excludes nothing the check compares two empty sets, so it can refuse only
+#     an export whose exclusions contradict its own price.
+#
+# RE-FROZEN 2026-08-16 (fourth time). Whole closure enumerated per the note
+# above; exactly ONE file drifted, and unlike the previous three re-freezes the
+# honest review is NOT "inert on this lane" -- it changes this lane's verdict,
+# so it is written out in full rather than waved through:
+#   artifact_completeness.py -- `_fused_member_units` gained a second fusion
+#     source for ROUTED expert units only. Its first source is
+#     `profile.fused_sibling_leaf_mapping()`, i.e. vLLM's
+#     `packed_modules_mapping`, which describes DENSE fusions; DeepseekV4
+#     exposes no vLLM architecture class, so that mapping is `{}` and
+#     `specs/deepseek_v4.json` declares no `fused_groups`. The bridge the third
+#     re-freeze called "unreachable here" was in fact unreachable EVERYWHERE on
+#     this architecture, which is why the 8 expert stacks 1ccdf58 recorded as
+#     task #14 were still failing. The fallback consults
+#     `profile.packed_expert_projection_names`, the declarative
+#     `packed_experts.projection_splits` the exporter itself used to emit the
+#     halves, and the same table Gridbook keeps as `_FUSED_FALLBACK` for the
+#     identical reason.
+#
+#     WHAT THIS CHANGES HERE, stated plainly: on `artifact-aura-cb-112p69` the
+#     verdict moves from 8 undeclared / NOT complete to 0 undeclared / COMPLETE
+#     (259->267 cb_units; passthrough 184, verbatim 25, fp8_in_ignore 0,
+#     missing_scale 0 all unchanged). That is task #14 closing, not a gate being
+#     widened to admit a defect: a per-role LEARNED codebook fits one book per
+#     `(layer, projection)` and a packed `gate_up_proj` target binds exactly one
+#     `codebook_ref`, so a per-role layer CANNOT name the packed stack -- the
+#     halves are the only spelling the ABI permits. Pinned Gridbook 0.8.5
+#     resolves it (`config.py:1487-1503` `_moe_target_keys` accepts the half
+#     leaves, `:1401-1454` builds `codebook_ref_by_role`, `moe.py:512-527`
+#     consumes it) and covers it with its own tests
+#     (`test_routed_per_role_codebooks.py`). Correspondingly, 1ccdf58's message
+#     calls the dual spelling a "real inconsistency" -- that framing is wrong
+#     and is retracted here; lattice layers share one book and legally name the
+#     packed stack, so both spellings coexist in one correct artifact.
+#
+#     The pass-ward reach is bounded on three sides: the parent must be a
+#     routed-expert container (dotted-boundary anchored, so `experts2` never
+#     matches `experts`), the leaf must decompose to MORE than itself, and the
+#     call site's EVERY-member rule is untouched, so a half-claimed stack still
+#     fails -- Gridbook refuses that same partial. A W8A16 `.weight` + `.scale`
+#     block still resolves through its `source_passthrough` declaration several
+#     branches earlier and never reaches this code. Pinned by
+#     tests/test_artifact_completeness_routed_per_role.py (6 tests: both-halves
+#     claims, one-half still fails, packed spelling still works, the dense
+#     fusion does NOT get the routed fallback, the vLLM mapping still covers
+#     dense, and the `experts2` boundary).
+#
+# RE-FROZEN 2026-08-16 (fifth time). Whole closure enumerated per the note
+# above; THREE files drifted, all for one fix, and the honest review is that
+# this lane's verdict is UNCHANGED -- the drift is confined to the streamed
+# FORWARD path, which no exporter calls:
+#   layer_streaming.py -- `_compute_position_embeddings` gained an optional
+#     `profile` argument and now re-keys a multi-rope dict from ROPE AXIS to
+#     ATTENTION LAYER TYPE, and `_call_layer` lost its silent
+#     `position_embeddings["main"]` fallback (an unresolved layer type raises).
+#     DSv4-Flash's rotary is keyed `("main","compress")` while its layers
+#     report `sliding_attention`/`compressed_sparse_attention`/
+#     `heavily_compressed_attention`, so the lookup missed EVERY layer and the
+#     fallback rotated 41 of 46 layers on base 10000 with YaRN off instead of
+#     160000 with YaRN. That is the defect behind the perplexity-262 BF16
+#     teacher, and it is a reintroduction of the bug PATCH 06 had already
+#     fixed inside the vendored forward (modeling_deepseek_v4.py:1514-1521).
+#   model_profiles/base.py -- new `rope_axis_for_layer_type` hook, default
+#     None, which is exactly the pre-change behaviour for every other arch.
+#   model_profiles/deepseek_v4.py -- overrides it by DELEGATING to
+#     `DeepseekV4RotaryEmbedding.rope_axis_for_layer_type`, so the mapping has
+#     one definition that `DeepseekV4Model.forward` resolves through too.
+#
+#     WHAT THIS CHANGES HERE, stated plainly: nothing. The two touched
+#     functions have exactly five callers -- `cost_streaming.py:137`,
+#     `incremental_probe.py:1542`/`:2706`, `sensitivity_probe.py:3219`/`:3274`
+#     -- which are the teacher, the Fisher probe and the sensitivity probe.
+#     No export path reaches them, the `LayerCache`/residency machinery this
+#     handoff does depend on is untouched, and no already-written byte moves.
+#     What DOES change is every FUTURE probe/cost pass on DSv4-Flash, whose
+#     forward was previously wrong on 41 of 46 layers; the allocation behind
+#     the current artifacts was produced through the defective path, and
+#     whether to re-probe is being decided on gold KL against a valid teacher
+#     rather than assumed here. Pinned by tests/test_multilayer_rope_forward.py
+#     (6 new tests: the re-key, compressed layers receiving `compress` rope,
+#     Gemma-style passthrough, a profile returning None, the removed fallback
+#     now raising, and a profile naming an axis the rotary lacks) and
+#     test_deepseek_v4_profile.py::test_rope_axis_mapping_matches_the_vendored_definition,
+#     which asserts the model forward still resolves through the shared
+#     definition so the two cannot drift apart again.
+# RE-FROZEN 2026-08-18 (fourth time, the merge/proven-rescues line), reviewed
 # against THIS handoff rather than re-hashed:
 #   nvfp4_cb_formats.py + nvfp4_cb_footprint.py -- the signed CB family
 #     (S13..S16, mode="signed") is deleted (c2c72a9). Lane-inert twice over:
@@ -134,9 +264,20 @@ _PUBLISHED_FILES = frozenset({
 #     bytes and renders nothing; every change widens what a correctly
 #     declared artifact can prove, and undeclared tensors still fail through
 #     the same refusal paths.
+#
+# MERGE-FROZEN 2026-08-18: the proven-rescues and DSv4-release lines merged.
+# Both lines above label themselves "third time" -- they were written in
+# parallel on sibling branches that shared the completeness commits; both
+# records are kept verbatim. The digests below are recomputed from the MERGED
+# tree: footprint carries both lines' changes (signed-branch removal +
+# excluded_source_prefixes), completeness carries both fifth-namespace
+# mechanisms (the sidecar alias map AND the dspark-threaded _unit_variants
+# bridge -- redundant claim paths, both fail-closed; unification is a
+# candidate follow-up, not a correctness need). Per-file lane-inertness
+# arguments are exactly the union of the two records above.
 _FROZEN_EXPORT_SOURCE_SHA256 = {
     "prismaquant/export_nvfp4_cb_streaming.py": (
-        "05ea8ece98086feccc487b036e3a746d131629f0dc7049ae38abc19f0187ba7e"
+        "33ab70dd2b234095b58351f81a3708b076c12a6469c3f1c6cc47478a12b47c48"
     ),
     "prismaquant/cb_export_config.py": (
         "a690dafe120c4a6fc077d34aad1b142ee4201ec4dedda9ccd35a7583dfb22770"
@@ -151,13 +292,13 @@ _FROZEN_EXPORT_SOURCE_SHA256 = {
         "fb20303ed1b017a5a7f3a035d5ef43880822d775e252c28a08f32a67f8104c95"
     ),
     "prismaquant/model_profiles/base.py": (
-        "7355fe24fb81acd2086cc677df9cf9d81a4c98e7d16a95541c83640f9d361f66"
+        "2ed0bd76c6adf4bee550d55a56a59c148ee8bf50f3616631228cd7028d9b1fbb"
     ),
     "prismaquant/model_profiles/registry.py": (
         "2fb8bcc01fbfd3b89870d387d335f804b05378f9853f223469c619e7ab766b90"
     ),
     "prismaquant/model_profiles/deepseek_v4.py": (
-        "f280937e826c2262a7a3646c90aa883915daa516e78f7a2b83b586890e05cbf7"
+        "b288c184c938b09498591430725c6cc52b35926efee51441c8df9b9a1c989c65"
     ),
     "prismaquant/model_profiles/specs/deepseek_v4.json": (
         "b8f3b22c16484a6859494d96ff052e5c5229c9a7c3afb7ae829e9cf5e26ecbf4"
@@ -166,16 +307,16 @@ _FROZEN_EXPORT_SOURCE_SHA256 = {
         "d9a06483d008bf2361b0522bc258ab291db870d1c2432f9d4cd8d7a8cbacefbe"
     ),
     "prismaquant/layer_streaming.py": (
-        "5fa349dd47b024274d64f2ae17613138e35cea93a28b1ff6f016204980df471e"
+        "5344f30043be08baf0c1509d77be511f6d2fbe963ce4d7b32afd8072a48a9da4"
     ),
     "prismaquant/production_weight_cache.py": (
         "1cc27e3b64043f9873da528ae2aa128e37c15be303109509f713b8d738c59f36"
     ),
     "prismaquant/nvfp4_cb_footprint.py": (
-        "e8adaaeea27ee67a038c67932338616d3d5e87aeabffb1fceb85baf536ebb253"
+        "fcefc1fd68c668ba06165454e0edf6f98c353f6d5a52321ba3f26fb24b71bae8"
     ),
     "prismaquant/artifact_completeness.py": (
-        "c14a8237d4670677471c3b9dc32ababfca1c5f7314d4cf8f4b9d21f8a907c1ee"
+        "22f72feb6d341ae7316ade617939cfb76cbcd1430d0ab87624b5d52bdac6c853"
     ),
     "prismaquant/export_output_safety.py": (
         "4af0a9d891313f1d9d031955e431e1e84c1ba0e11a9ce2605ea92de3bc3703b5"
@@ -500,7 +641,7 @@ def verify_dsv4_w8a16_export_handoff(
         not isinstance(stamp, Mapping)
         or stamp.get("schema") != CB_ANCHORED_COST_SCHEMA
         or stamp.get("cost_currency") != AURA_CURRENCY
-        or stamp.get("budget_bytes") != DSV4_BUDGET_BYTES
+        or stamp.get("budget_bytes") != DSV4_W8A16_APPROVED_BUDGET_BYTES
         or selection.get("aura_cb_reprice") != stamp
         or selection.get("cost_currency") != AURA_CURRENCY
         or selection.get("feasible") is not True

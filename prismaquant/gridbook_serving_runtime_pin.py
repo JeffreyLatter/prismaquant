@@ -25,45 +25,54 @@ GRIDBOOK_SERVING_RUNTIME_PIN_SCHEMA = (
 GRIDBOOK_SERVING_RUNTIME_REPOSITORY = (
     "https://github.com/RobTand/gridbook.git"
 )
-GRIDBOOK_SERVING_RUNTIME_RELEASE_VERSION = "0.8.8"
+GRIDBOOK_SERVING_RUNTIME_RELEASE_VERSION = "0.8.9"
 GRIDBOOK_SERVING_RUNTIME_COMMIT_PENDING = (
-    "PENDING_GRIDBOOK_V0_8_8_RELEASE_COMMIT"
+    "PENDING_GRIDBOOK_V0_8_9_RELEASE_COMMIT"
 )
 GRIDBOOK_SERVING_RUNTIME_WHEEL_SHA256_PENDING = (
-    "PENDING_GRIDBOOK_V0_8_8_WHEEL_SHA256"
+    "PENDING_GRIDBOOK_V0_8_9_WHEEL_SHA256"
 )
-# Resolved 2026-08-15 against the v0.8.8 release.  Neither value is guessed,
+# Resolved 2026-08-18 against the v0.8.9 release.  Neither value is guessed,
 # and neither is transcribed from the other's source:
-#   commit  -- annotated tag v0.8.8, which the release workflow refuses to
+#   commit  -- annotated tag v0.8.9, which the release workflow refuses to
 #              build unless the commit is reachable from origin/master.  It is
 #              also the build recorded in the image tag
-#              `gridbook:0.8.8-clean-064a4cb`.
+#              `gridbook:0.8.9-clean-23a3955`.
 #   wheel   -- read out of that image's installed distribution, from the PEP
 #              610 `direct_url.json` `archive_info.hashes.sha256` of
-#              gridbook-0.8.8-py3-none-any.whl.  This is the digest of the
+#              gridbook-0.8.9-py3-none-any.whl.  This is the digest of the
 #              wheel that is actually importable at serve time, which is the
 #              only digest a serving pin may assert; a locally rebuilt wheel is
 #              a DIFFERENT archive and must not be substituted here without
 #              re-reading it from the served image.
 #
-# As with 0.8.7, this digest IS the PyPI wheel's: the image was built by
-# installing the published `gridbook==0.8.8` archive from a local file rather
-# than rebuilding it, so `pip download gridbook==0.8.8` satisfies the pin
+# As with 0.8.7/0.8.8, this digest IS the PyPI wheel's: the image was built by
+# installing the published `gridbook==0.8.9` archive from a local file rather
+# than rebuilding it, so `pip download gridbook==0.8.9` satisfies the pin
 # instead of tripping the wheel-cache trap documented in
-# docs/audits/serving_wheel_cache_poisoning_2026-08-14.md.  Verified before
-# use: all 60 members of the PyPI wheel are byte-identical to a local rebuild
-# from the tag, so the published archive is this commit's content.
+# docs/audits/serving_wheel_cache_poisoning_2026-08-14.md.
 #
-# WHY 0.8.8 AND NOT 0.8.7 for the Qwen3.8-27B CB lane: 0.8.7 shipped the
-# quantized-embedding method and its dispatch branch, but vLLM dispatches from
-# inside the layer constructor and `qwen3_5.py` builds its embedding with
-# neither a quant_config nor a prefix -- so neither was ever reached and the
-# artifact did not load at all.  0.8.8 supplies those arguments.
+# WHY 0.8.9 AND NOT 0.8.8 for the CB lanes: 0.8.9 defaults the qualified CB
+# kernels on.  Three selectors became tri-state with unset -> auto
+# (PRISMAQUANT_CB_MOE_PERSISTENT_B, PRISMAQUANT_CB_GEMV,
+# PRISMAQUANT_CB_FP8_GEMV_V2); every EXPLICIT spelling keeps its exact prior
+# semantics, so the canonical gold environment -- which pins
+# PRISMAQUANT_CB_MOE_PERSISTENT_B=0 and PRISMAQUANT_CB_GEMV=inherited --
+# reproduces the recorded gold routes unchanged under this wheel.
+# PRISMAQUANT_CB_FP8_GEMV_V2 is deliberately NOT added to the closed
+# Gridbook-0.8.5 measurement registry (gridbook_environment.py -- that profile
+# is release evidence and its scan refuses namespace changes); a gold replay
+# under this wheel therefore serves the qualified K28 GEMV cell in the routed
+# decode band by default, which the 0.8.9 default-state served leg measured
+# end-to-end on the shipped clean 87 GB body: kl_mean +0.17 %, PPL -0.06 % vs
+# the gold record, inside the +/-0.7 % cross-session KL envelope.  0.8.9 also
+# repairs docker/Dockerfile.gridbook-pinned's GRIDBOOK_REF, which 0.8.8
+# shipped still pointing at v0.8.6.
 GRIDBOOK_SERVING_RUNTIME_RELEASE_COMMIT = (
-    "064a4cb093da10d7c35be03435bb6a525280a45f"
+    "23a395518a3d6aa3ee9f27836163fca927744c42"
 )
 GRIDBOOK_SERVING_RUNTIME_RELEASE_WHEEL_SHA256 = (
-    "a982e8842d0ce183eaad8978941a375dc984fa0697be7c4519dd741efd1153a3"
+    "5fe0fd9439023b937a30de4005fd287cf13f4b803814c2e1ec36beeb92c9b5ff"
 )
 GRIDBOOK_SERVING_RUNTIME_CONTRACT_SCHEMA = "gridbook.runtime-contract.v4"
 GRIDBOOK_SERVING_REQUIRED_ABI_FEATURES = {

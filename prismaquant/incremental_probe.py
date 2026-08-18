@@ -1481,7 +1481,7 @@ def _compute_global_precompute(
     with torch.no_grad():
         hidden = base_model.embed_tokens(ids).to(dtype)
     position_embeddings = _compute_position_embeddings(
-        base_model, hidden, position_ids)
+        base_model, hidden, position_ids, _profile)
     causal_mask = _compute_attention_mask(base_model, hidden, position_ids)
 
     hidden = _profile.expand_hidden_for_layers(hidden, base_model)
@@ -2041,7 +2041,7 @@ def _run_body_streaming_shard(
         # produced activations_cpu[0]; call on an on-device copy once.
         embed0 = activations_cpu[0].to(device).to(dtype)
         position_embeddings = _compute_position_embeddings(
-            base_model, embed0, position_ids)
+            base_model, embed0, position_ids, _shard_profile)
         causal_mask = _compute_attention_mask(base_model, embed0, position_ids)
         del embed0
     print(f"[incremental] shard reuses global precompute "

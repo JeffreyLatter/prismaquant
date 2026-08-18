@@ -73,11 +73,13 @@ def _write_safetensors(path, tensors):
         fh.write(b"\x00" * off)
 
 
-def _fixture(tmp_path, *, nvfp4_dloss, fp8_dloss, drop_tensor=None):
+def _fixture(tmp_path, *, nvfp4_dloss, fp8_dloss, drop_tensor=None,
+             extra_tensors=None):
     """Synthetic bf16 checkpoint + probe/cost pickles. Returns paths."""
     model_dir = tmp_path / "model"
     model_dir.mkdir()
     tensors = dict(_FLOOR_TENSORS)
+    tensors.update(extra_tensors or {})
     for n in _NAMES:
         if n == drop_tensor:
             continue
@@ -148,7 +150,8 @@ def _artifact_bytes(model_dir, fmt, stats):
 
 
 def _run(monkeypatch, tmp_path, probe_p, cost_p, *, disk_gb, fmt_for_target,
-         pareto="4.6,8.2", overhead_reserve=_OVERHEAD_RESERVE):
+         pareto="4.6,8.2", overhead_reserve=_OVERHEAD_RESERVE,
+         exclude_prefixes=()):
     monkeypatch.setattr(alloc, "solve_with_promotion",
                         _stub_solver(fmt_for_target))
     lc = tmp_path / "layer_config.json"
@@ -168,6 +171,8 @@ def _run(monkeypatch, tmp_path, probe_p, cost_p, *, disk_gb, fmt_for_target,
         argv.extend([
             "--artifact-overhead-reserve-bytes", str(overhead_reserve)
         ])
+    for prefix in exclude_prefixes:
+        argv.extend(["--exclude-source-prefix", prefix])
     monkeypatch.setattr(sys, "argv", argv)
     alloc.main()
     selection = json.loads((tmp_path / "selection.json").read_text())
@@ -599,3 +604,83 @@ def test_genuine_below_floor_reports_the_menu_floor_not_the_swept_minimum(
         float(nvfp4_bytes + _OVERHEAD_RESERVE), abs=1.0)
     assert cheapest < fp8_bytes
     assert selection["pareto_grid_extension"]["added_targets"]
+
+
+# ---------------------------------------------------------------------------
+# 9. --exclude-source-prefix: an artifact that ships only PART of the source
+# ---------------------------------------------------------------------------
+
+# A draft head that ships as its own directory, so the target artifact holds
+# none of it. Sized to dominate the reserve so its effect is unmistakable.
+_DRAFT_TENSORS = {"mtp.0.attn.wo_a.weight": ("BF16", (512, 64))}   # 65536 B
+_DRAFT_BYTES = 65536
+
+
+def test_excluded_source_prefix_leaves_the_floor(monkeypatch, tmp_path):
+    """The whole point: a tensor that is not in this artifact must not be
+    priced into it."""
+    _, probe_p, cost_p = _fixture(
+        tmp_path, nvfp4_dloss=1.0, fp8_dloss=0.5,
+        extra_tensors=_DRAFT_TENSORS)[:3]
+
+    kw = dict(disk_gb=1.0, fmt_for_target=lambda t: "FP8_E4M3")
+    full, _ = _run(monkeypatch, tmp_path, probe_p, cost_p, **kw)
+    part, _ = _run(monkeypatch, tmp_path, probe_p, cost_p,
+                   exclude_prefixes=("mtp.",), **kw)
+
+    assert (full["source_total_bytes"] - part["source_total_bytes"]
+            == _DRAFT_BYTES)
+    assert "source_partition" not in full
+    sp = part["source_partition"]
+    assert sp["excluded_prefixes"] == ["mtp."]
+    assert sp["excluded_source_bytes"] == _DRAFT_BYTES
+    assert sp["n_excluded_source_tensors"] == 1
+    assert sp["source_total_bytes_unpartitioned"] == full["source_total_bytes"]
+
+
+def test_excluded_mass_is_returned_to_the_body(monkeypatch, tmp_path):
+    """The failure this prevents is an UNDERSHOOT, so assert the budget buys
+    MORE: at a budget that fits only the cheap rung while the draft is priced
+    in, excluding the draft must let the expensive rung fit instead."""
+    _, probe_p, cost_p, stats = _fixture(
+        tmp_path, nvfp4_dloss=1.0, fp8_dloss=0.5,
+        extra_tensors=_DRAFT_TENSORS)
+
+    model_dir = tmp_path / "model"
+    fp8_bytes, _ = _artifact_bytes(model_dir, "FP8_E4M3", stats)
+    # A card that the FP8 rung overshoots by less than the draft's mass: it
+    # cannot fit while the draft is priced in, and must fit once it is not.
+    budget = fp8_bytes + _OVERHEAD_RESERVE - _DRAFT_BYTES // 2
+
+    def fmt_for_target(t):
+        return "FP8_E4M3" if t > 6.0 else "NVFP4"
+
+    kw = dict(disk_gb=budget / 1e9, fmt_for_target=fmt_for_target)
+    full, _ = _run(monkeypatch, tmp_path, probe_p, cost_p, **kw)
+    part, _ = _run(monkeypatch, tmp_path, probe_p, cost_p,
+                   exclude_prefixes=("mtp.",), **kw)
+
+    # Same card, and the draft's mass comes back as shipped body: the cheap
+    # rung was all that fit while the draft was priced in.
+    assert part["budget_bytes"] == full["budget_bytes"]
+    assert full["chosen_achieved_bits"] < part["chosen_achieved_bits"]
+    assert (part["predicted_body_tensor_payload_gb"]
+            > full["predicted_body_tensor_payload_gb"])
+    # ...and the floor shed exactly the draft, nothing else.
+    assert round((full["predicted_floor_gb"] - part["predicted_floor_gb"])
+                 * 1e9) == _DRAFT_BYTES
+
+
+def test_exclude_prefix_matching_nothing_exits(monkeypatch, tmp_path):
+    """A typo'd prefix excludes zero bytes and reproduces the undershoot with
+    every downstream number self-consistent. It must not be a silent no-op —
+    and it must not be swallowed by the `except Exception` that degrades
+    footprint pricing to a warning."""
+    _, probe_p, cost_p = _fixture(
+        tmp_path, nvfp4_dloss=1.0, fp8_dloss=0.5,
+        extra_tensors=_DRAFT_TENSORS)[:3]
+    with pytest.raises(SystemExit) as exc:
+        _run(monkeypatch, tmp_path, probe_p, cost_p, disk_gb=1.0,
+             fmt_for_target=lambda t: "FP8_E4M3",
+             exclude_prefixes=("mtp_",))
+    assert "matched no tensor" in str(exc.value)

@@ -1148,6 +1148,31 @@ class ModelProfile(ABC):
         Default: False (single-rope path)."""
         return False
 
+    def rope_axis_for_layer_type(self, layer_type: str) -> str | None:
+        """Map an attention-schedule layer type to a rope-table key.
+
+        A multi-rope model exposes `rotary.layer_types`, and the streamed
+        per-layer driver selects one table per layer. On Gemma3/Gemma4 those
+        keys ARE attention layer types (`sliding_attention` /
+        `full_attention`), so the lookup is direct and this hook returns None.
+
+        On DSv4-Flash they are not: the rotary's keys are rope AXES
+        (`main` / `compress`) while `config.layer_types` names an attention
+        schedule (`sliding_attention` / `compressed_sparse_attention` /
+        `heavily_compressed_attention`). Two namespaces that never intersect,
+        so a direct lookup misses every layer — and the streamed driver used to
+        answer that miss by silently substituting `main`, which handed 41 of
+        V4-Flash's 46 layers a rope on base 10000 with YaRN disabled where the
+        model's own forward uses 160000 with YaRN. The resulting BF16 teacher
+        scored perplexity 262 and was used to grade a 9.05-PPL student.
+
+        A profile that overrides this MUST resolve the answer from the model's
+        own definition rather than restating the rule, so the streamed pass
+        cannot drift from the forward it reproduces.
+
+        Default: None (rope keys are already attention layer types)."""
+        return None
+
     def expand_hidden_for_layers(self, hidden, base_model):
         """Optionally reshape the post-embedding hidden state before
         the per-layer forward loop. DSv4 expands single-stream

@@ -1856,13 +1856,18 @@ def _call_layer(layer: nn.Module, hidden: torch.Tensor, *,
         lt = _layer_attention_type(layer)
         pe = pe.get(lt)
         if pe is None:
-            if "main" in position_embeddings:
-                # DSv4: rotary.layer_types are rope AXES ("main"/"compress"),
-                # not attention-schedule types — the vendored probe forward
-                # feeds layer_type="main" rope to every decoder layer (the
-                # compress branch is stubbed out in probe mode).
-                pe = position_embeddings["main"]
-            elif len(position_embeddings) == 1:
+            # There used to be a `position_embeddings["main"]` default here,
+            # justified by "the compress branch is stubbed out in probe mode".
+            # `probe_mode` defaults False and is never set True in this tree,
+            # so the compress branch always ran — and every DSv4-Flash layer
+            # whose type was not literally a rope-axis name silently got the
+            # WRONG rope. Substituting a plausible table for the right one is
+            # precisely the band-aid that hid a perplexity-262 teacher behind
+            # a passing pipeline; the namespace mismatch it was papering over
+            # is now bridged in `_compute_position_embeddings` via the
+            # profile, and anything still unresolved here is a real defect
+            # that must be loud.
+            if len(position_embeddings) == 1:
                 pe = next(iter(position_embeddings.values()))
             else:
                 raise RuntimeError(
@@ -1895,7 +1900,8 @@ def _call_layer(layer: nn.Module, hidden: torch.Tensor, *,
 
 def _compute_position_embeddings(base_model: nn.Module,
                                  hidden: torch.Tensor,
-                                 position_ids: torch.Tensor):
+                                 position_ids: torch.Tensor,
+                                 profile=None):
     """Call the rotary module to get position embeddings.
 
     Single-rope models return a `(cos, sin)` tuple. Multi-layer-type-rope
@@ -1903,7 +1909,19 @@ def _compute_position_embeddings(base_model: nn.Module,
     sliding vs full with different `rope_theta`) expose `rotary.layer_types`
     and a `forward(x, position_ids, layer_type=...)`; for those we return a
     `{layer_type: (cos, sin)}` dict and `_call_layer` selects the right entry
-    per layer. Returns None if the model exposes no standalone rotary."""
+    per layer. Returns None if the model exposes no standalone rotary.
+
+    The returned dict is always keyed by **attention layer type**, because
+    that is what `_call_layer` can observe on a layer. On Gemma3/Gemma4 the
+    rotary's own keys already are attention layer types, so the two coincide.
+    On DSv4-Flash they do not: the rotary is keyed by rope AXIS
+    (`main`/`compress`) while a layer reports an attention schedule
+    (`sliding_attention`/`compressed_sparse_attention`/
+    `heavily_compressed_attention`). `ModelProfile.rope_axis_for_layer_type`
+    bridges the two namespaces, and re-keying here rather than at the lookup
+    keeps every `_call_layer` caller correct without any of them having to
+    know a rope exists. Getting this wrong is not hypothetical — see that
+    hook's docstring for the perplexity-262 teacher it produced."""
     rotary = _get_rotary(base_model)
     if rotary is None:
         return None
@@ -1916,12 +1934,41 @@ def _compute_position_embeddings(base_model: nn.Module,
                     per_type[lt] = tuple(rotary(hidden, position_ids,
                                                 layer_type=lt))
                 except TypeError:
-                    # Rotary forward doesn't take layer_type (e.g. DSv4 uses
-                    # one rope for all layers) — same embeddings for each.
+                    # Rotary forward doesn't take layer_type — one rope for
+                    # every layer, so the entries are deliberately identical.
                     per_type[lt] = tuple(rotary(hidden, position_ids))
-            return per_type
+            return _rekey_rope_by_attention_type(per_type, base_model, profile)
         cos, sin = rotary(hidden, position_ids)
     return (cos, sin)
+
+
+def _rekey_rope_by_attention_type(per_axis: dict, base_model: nn.Module,
+                                  profile) -> dict:
+    """Re-key a rope-axis dict by attention layer type, via the profile.
+
+    A no-op unless the profile implements `rope_axis_for_layer_type` AND the
+    config lists per-layer attention types — so Gemma3/Gemma4, whose rotary
+    keys already are attention types, pass through untouched."""
+    axis_of = getattr(profile, "rope_axis_for_layer_type", None)
+    if axis_of is None:
+        return per_axis
+    attention_types = getattr(getattr(base_model, "config", None),
+                              "layer_types", None)
+    if not attention_types:
+        return per_axis
+    by_attention_type: dict = {}
+    for attention_type in dict.fromkeys(attention_types):
+        axis = axis_of(attention_type)
+        if axis is None:
+            return per_axis
+        if axis not in per_axis:
+            raise RuntimeError(
+                f"profile mapped attention layer type {attention_type!r} to "
+                f"rope axis {axis!r}, which the rotary does not expose "
+                f"(has {sorted(per_axis)})"
+            )
+        by_attention_type[attention_type] = per_axis[axis]
+    return by_attention_type or per_axis
 
 
 def _make_causal_mask(seqlen: int, device: torch.device, dtype: torch.dtype):

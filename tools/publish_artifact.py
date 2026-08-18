@@ -497,8 +497,12 @@ def _freeze_artifact(
 
     Large files are represented inside the verifier's private tree by
     ``/proc/self/fd`` links, which do not change source inode ctime (hardlinks
-    would invalidate the shipcard's stat attestation). Upload never reopens
-    those links: it reads the held descriptor through ``_VerifiedBlockReader``.
+    would invalidate the shipcard's stat attestation). Upload consumes those
+    links as paths -- each resolves through this process's held descriptor,
+    which cannot be retargeted -- because the Hub's Xet transport (the only
+    one without a 50 GB per-file cap) cannot read a Python file object; the
+    declared digests are replayed across the same descriptors after the
+    commit. ``_VerifiedBlockReader`` remains the accessor for local replay.
     """
     root = artifact_dir.absolute()
     if root.is_symlink():
@@ -719,6 +723,32 @@ def _verify_declared_weight_hashes(snapshot: _FrozenSnapshot) -> None:
             )
 
 
+def _replay_frozen_digests(snapshot: _FrozenSnapshot) -> None:
+    """Re-read every held descriptor and compare against the frozen digests.
+
+    The Xet transport consumes the frozen link paths rather than the
+    streaming verified reader, so nothing re-checks bytes DURING upload;
+    replaying the digests across the same descriptors after the commit
+    detects any same-inode mutation across the upload window.  (An unlink
+    or path swap cannot reach these descriptors at all.)
+    """
+    for entry in snapshot.entries:
+        if entry.fd is None:
+            continue
+        digest = hashlib.sha256()
+        size = 0
+        while True:
+            block = os.pread(entry.fd, SNAPSHOT_BLOCK_BYTES, size)
+            if not block:
+                break
+            digest.update(block)
+            size += len(block)
+        if size != entry.size or digest.hexdigest() != entry.sha256:
+            raise FrozenSnapshotError(
+                f"held bytes diverged during upload: {entry.relative_path}"
+            )
+
+
 def _repo_prefix(path_in_repo: str) -> str:
     raw = str(path_in_repo).strip()
     if raw in {"", "."}:
@@ -764,7 +794,20 @@ def _make_additions(
                 size=entry.size,
                 sample=entry.sample,
             )
-            operation.path_or_fileobj = snapshot.reader_for(entry)
+            # A BufferedIOBase operation suppresses the Hub's Xet transport
+            # (huggingface_hub offers "xet" only for path/bytes operations),
+            # forcing basic LFS and its 50 GB per-file cap -- which no
+            # single-file CB body above 50 GB can pass.  Hand the frozen
+            # view's link path over instead: it resolves through this
+            # process's held descriptor (`/proc/self/fd/N`), so it cannot be
+            # retargeted to other content, and the declared UploadInfo stays
+            # the frozen scan's digest.  The reader's per-block streaming
+            # re-check is traded for a full post-commit re-verification of
+            # the held descriptors (see `_publish_snapshot`), which detects
+            # any local mutation across the upload window.
+            operation.path_or_fileobj = str(
+                snapshot.root / entry.relative_path
+            )
         additions.append(operation)
     return additions
 
@@ -940,6 +983,23 @@ def _publish_snapshot(
                 "before retrying this publisher.",
                 file=sys.stderr,
             )
+        return 1
+
+    # The upload read the held descriptors through the frozen link paths (the
+    # Xet transport cannot consume the verifying reader), so replay the
+    # frozen digests once more across the same descriptors: a divergence
+    # here means bytes mutated during the upload window and the commit above
+    # must not be announced as verified.
+    try:
+        _replay_frozen_digests(snapshot)
+    except FrozenSnapshotError as exc:
+        print(
+            "[publish] ERROR: post-commit re-verification of the held "
+            f"descriptors failed: {exc}. The Hub commit above may carry "
+            "bytes that diverged from the verified snapshot during upload — "
+            "inspect the repository and re-publish before announcing.",
+            file=sys.stderr,
+        )
         return 1
 
     commit_oid = str(getattr(result, "oid", "") or "").lower()

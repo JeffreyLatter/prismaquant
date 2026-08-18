@@ -147,6 +147,7 @@ from prismaquant.nvfp4_cb_footprint import (
     resolve_cb_encode_tier,
     assignment_serialization_sha256,
     whole_artifact_budget_from_assignment_payload,
+    assert_exclusions_match_budget_stamp,
     validate_cb_sidecar_tensors,
     validate_cb_assignment_serialization_stamps,
     validate_cb_serialization_context_stamp,
@@ -2243,6 +2244,7 @@ def _validate_namespace_exclusions(
     *,
     assignment,
     profile,
+    budget_stamp=None,
 ) -> tuple[str, ...]:
     """Normalize the exclusion list, refusing anything the recipe allocated.
 
@@ -2261,12 +2263,25 @@ def _validate_namespace_exclusions(
     spelling the operator has in hand (``mtp.`` is a checkpoint spelling; the
     recipe would say ``model.mtp.``), and a prefix that misses only because it
     was written in the other vintage would be a silent no-op.
+
+    When the recipe carries a whole-artifact budget stamp, the exclusion set
+    must additionally equal the set the price was computed without. Those are
+    two halves of one statement -- the allocator hands the excluded bytes to
+    the body only if the exporter really omits them -- and until they were
+    checked against each other, making just one of them was silent in the
+    direction that costs quality.
     """
 
     prefixes = tuple(
         str(prefix).strip() for prefix in (exclude_namespaces or ())
         if str(prefix).strip()
     )
+    # Before the empty-list shortcut, because the dangerous direction is the
+    # one with NO exclusions here: a price computed without a namespace, spent
+    # on the body, and then an export that writes the namespace anyway.
+    assert_exclusions_match_budget_stamp(
+        budget_stamp, prefixes,
+        where="export_nvfp4_cb_streaming namespace exclusions")
     if not prefixes:
         return ()
 
@@ -2739,6 +2754,7 @@ def export_nvfp4_cb_streaming(
     excluded_namespaces = _validate_namespace_exclusions(
         exclude_namespaces if exclude_namespaces is not None
         else _exclude_namespaces_from_env(),
+        budget_stamp=_whole_artifact_budget,
         assignment=assignment,
         profile=profile,
     )

@@ -31,6 +31,7 @@ Run standalone::
 from __future__ import annotations
 
 import json
+import re
 import struct
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -592,6 +593,7 @@ def check_artifact_completeness(
     header = read_artifact_header(root)
 
     profile = _detect_profile_quietly(root)
+    dspark = _dspark_construction_resolver(root, quant_config)
     raw_declared = dict(
         (quant_config.get("source_passthrough") or {}).get("units") or {})
     # Resolve every declaration/ignore/CB key into the checkpoint namespace the
@@ -618,6 +620,27 @@ def check_artifact_completeness(
         for spelling in _checkpoint_spellings(str(entry), profile)
     }
     sidecar_alias = _dspark_sidecar_aliases(artifact_dir, quant_config)
+    # A SPLIT expert bank is claimed by the `per_expert_format_groups`
+    # declaration, not by a config group: one mixed-rung stack ships as
+    # `…gate_up_proj.format_group_<wire>` per rung, and each is named by a
+    # declared `tensor_prefix`. `_validate_per_expert_format_groups` owns those
+    # tensors completely — it requires every declared prefix to have its planes
+    # AND every split tensor in the header to be declared — so the classifier
+    # must recognize the mechanism rather than report them a second time as
+    # claimed by nothing. Undeclared split tensors still fail, through that
+    # validator's `undeclared_group_tensors`.
+    group_split_claimed = {
+        str(entry["tensor_prefix"])
+        for families in (
+            (quant_config.get(_PER_EXPERT_FORMAT_GROUPS_KEY) or {})
+            .get("layers") or {}
+        ).values()
+        if isinstance(families, dict)
+        for entries in families.values()
+        if isinstance(entries, list)
+        for entry in entries
+        if isinstance(entry, dict) and entry.get("tensor_prefix")
+    }
     acknowledged = list(
         (quant_config.get("provenance") or {}).get(
             "route_pending_passthrough_acknowledged") or ())
@@ -693,29 +716,37 @@ def check_artifact_completeness(
                 report.missing_scale.append(unit)
             continue
 
-        if _unit_variants(unit, profile) & declared.keys():
+        if _unit_variants(unit, profile, dspark) & declared.keys():
             report.passthrough_units.append(unit)
             if unit_scales:
                 claimed_scales |= unit_scales
             else:
                 report.missing_scale.append(unit)
-            if _unit_variants(unit, profile) & ignored:
+            if _unit_variants(unit, profile, dspark) & ignored:
                 # Both statements cannot be true, and `ignore` is the one that
                 # loses the scale.
                 report.fp8_in_ignore.append(unit)
             continue
 
-        if _unit_variants(unit, profile) & ignored:
+        if _unit_variants(unit, profile, dspark) & ignored:
             # THE ORIGINAL BUG. `ignore` means "plain unquantized floats", and
             # this tensor is not that. Checked before the config-group test so
             # a unit that is somehow both still reports the contradiction.
             report.fp8_in_ignore.append(unit)
             continue
-        if _claimed_by_self_or_ancestor(unit, group_claimed, profile):
+        if _claimed_by_self_or_ancestor(unit, group_claimed, profile, dspark):
             report.cb_units.append(unit)
             claimed_scales |= unit_scales
             continue
-        if _claimed_by_self_or_ancestor(unit, embedding_claimed, profile):
+        if unit in group_split_claimed:
+            # Exact name, no variant walk: `tensor_prefix` is written in the
+            # same namespace as the tensor it names, and an ancestor match here
+            # would let the UNSPLIT parent's claim cover a split tensor whose
+            # own rung was never declared.
+            report.cb_units.append(unit)
+            claimed_scales |= unit_scales
+            continue
+        if _claimed_by_self_or_ancestor(unit, embedding_claimed, profile, dspark):
             report.embedding_units.append(unit)
             claimed_scales |= unit_scales
             continue
@@ -726,9 +757,9 @@ def check_artifact_completeness(
             report.cb_units.append(unit)
             claimed_scales |= unit_scales
             continue
-        members = _fused_member_units(unit, fused_leaves)
+        members = _fused_member_units(unit, fused_leaves, profile)
         if members and all(
-            _claimed_by_self_or_ancestor(member, group_claimed, profile)
+            _claimed_by_self_or_ancestor(member, group_claimed, profile, dspark)
             for member in members
         ):
             # EVERY member, never any: a fused stack half of whose members are
@@ -743,9 +774,9 @@ def check_artifact_completeness(
         unit = _scale_unit(scale_key)
         if any(unit.startswith(prefix) for prefix in verbatim_prefixes):
             continue
-        if _claimed_by_self_or_ancestor(unit, declared, profile):
+        if _claimed_by_self_or_ancestor(unit, declared, profile, dspark):
             continue
-        if _claimed_by_self_or_ancestor(unit, group_claimed, profile):
+        if _claimed_by_self_or_ancestor(unit, group_claimed, profile, dspark):
             # An expert stack keeps its per-expert source scale planes only
             # when the stack was NOT collapsed; either way a group claims
             # them, so they are not orphans.
@@ -770,7 +801,60 @@ def check_artifact_completeness(
 _COLLAPSIBLE_COMPONENTS = ("shared_mlp", "shared_experts")
 
 
-def _unit_variants(unit: str, profile=None) -> set[str]:
+def _dspark_construction_resolver(root: Path, quant_config: dict):
+    """Resolve a physical DSpark unit to the construction name its target uses.
+
+    THE FIFTH NAMESPACE, and the one a sidecar artifact cannot avoid. A DSpark
+    draft ships its tensors under the PHYSICAL ``mtp.{stage}.<tail>`` names, but
+    vLLM builds those blocks as ordinary body layers past the end of the body,
+    so the exporter writes their config-group targets under
+    ``model.layers.{num_hidden_layers+stage}.<tail>``
+    (``export_nvfp4_cb_streaming._cb_target_name`` ->
+    ``dspark_cb_construction_target_for_physical_output``). A target artifact
+    never shows this because ``mtp.`` is a verbatim prefix there; a SIDECAR
+    passes ``verbatim_prefixes=()`` on purpose — proving those units is the
+    whole point of the artifact — so all 27 CB units reported as claimed by no
+    mechanism at all.
+
+    Recomputed with the producer's own function rather than read back from the
+    sidecar's recorded ``physical_cb_targets``/``construction_cb_targets``
+    pairing: a completeness gate that accepted the artifact's own statement of
+    which name claims which tensor could be satisfied by writing the pairing
+    down. Only the ACTIVATION is taken from provenance; the layer arithmetic
+    comes from the model config, so a claim naming the wrong construction slot
+    still fails.
+
+    Returns ``None`` when the artifact declares no sidecar, which leaves every
+    other lane's spellings byte-identical.
+    """
+
+    provenance = quant_config.get("provenance")
+    if not isinstance(provenance, dict):
+        return None
+    if provenance.get("dspark_cb_sidecar") is None:
+        return None
+    try:
+        from prismaquant.dspark_source_metadata import (
+            dspark_cb_construction_target_for_physical_output,
+        )
+        config = json.loads((root / "config.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ImportError):
+        return None
+
+    def resolve(unit: str) -> str | None:
+        # `main_proj`, the `wo_a` BMM and anything else off the CB surface
+        # raise rather than return a name; those units are claimed by the
+        # W8A16 route under their physical spelling and need no bridge.
+        try:
+            return dspark_cb_construction_target_for_physical_output(
+                unit, config)
+        except (ValueError, KeyError):
+            return None
+
+    return resolve
+
+
+def _unit_variants(unit: str, profile=None, dspark=None) -> set[str]:
     """Every spelling of *unit* a target may legitimately be written as.
 
     THE THIRD NAMESPACE. ``_checkpoint_spellings`` normalizes a claim written
@@ -802,6 +886,11 @@ def _unit_variants(unit: str, profile=None) -> set[str]:
                 variants.add(profile.to_vllm_internal_name(spelling))
             except Exception:              # pragma: no cover - defensive
                 pass
+    if dspark is not None:
+        for spelling in tuple(variants):
+            construction = dspark(spelling)
+            if construction:
+                variants.add(construction)
     return variants
 
 
@@ -857,23 +946,46 @@ def _dspark_sidecar_aliases(artifact_dir: Path, quant_config: dict) -> dict[str,
     return aliases
 
 
-def _fused_member_units(unit: str, fused_leaves) -> tuple[str, ...]:
+def _fused_member_units(unit: str, fused_leaves, profile=None) -> tuple[str, ...]:
     """The unfused sibling units a FUSED checkpoint unit is built from.
 
     THE FOURTH NAMESPACE. A checkpoint may store the fused stack
     (``…experts.gate_up_proj``) while the config groups name the halves
-    (``…experts.gate_proj``, ``…experts.up_proj``) — which is what the
-    allocator's union-find promotion guarantees is legal, since fused siblings
-    must share one format. A claim written against the halves therefore covers
-    the fused tensor, and reading only the fused spelling reports a CORRECT
-    artifact as unclaimed (8 DSv4-Flash expert stacks, 2026-08-15).
+    (``…experts.gate_proj``, ``…experts.up_proj``). A claim written against the
+    halves therefore covers the fused tensor, and reading only the fused
+    spelling reports a CORRECT artifact as unclaimed (8 DSv4-Flash expert
+    stacks, 2026-08-15).
 
     The mapping is the vLLM class's own ``packed_modules_mapping`` by way of the
     profile, so this recognizes the fusion the serving stack performs rather
     than inventing a naming rule.
+
+    ROUTED EXPERTS NEED A SECOND SOURCE. On a routed-MoE stack the halves are
+    not merely a legal alternative spelling, they are the only one the ABI
+    permits: per-role learned codebooks fit one book per ``(layer, projection)``,
+    and a packed ``gate_up_proj`` target can bind exactly one ``codebook_ref``,
+    so a per-role layer *must* name gate and up separately. (Lattice layers
+    share one book and legally name the packed stack; both spellings coexisting
+    across layers is the designed ABI, not an inconsistency.) But
+    ``packed_modules_mapping`` describes the *dense* fusions vLLM performs and
+    DeepseekV4 exposes none at all — ``fused_sibling_leaf_mapping()`` is ``{}``
+    there — so the vLLM source can never cover routed experts on that
+    architecture, and every correct per-role artifact reports as unclaimed.
+
+    For routed units we therefore fall back to the profile's declarative
+    packed-expert decomposition, which is the *same* mapping the exporter used
+    to emit the halves (``deepseek_v4.json`` ``packed_experts.projection_splits``).
+    The consumer keeps its own copy for the identical reason — Gridbook carries
+    a ``_FUSED_FALLBACK`` table precisely because DeepseekV4 has no
+    ``packed_modules_mapping`` — so this teaches the checker the table the
+    serving stack already uses rather than inventing a rule.
+
+    The EVERY-member requirement at the call site is untouched, and Gridbook
+    refuses a partially-declared stack the same way, so checker and consumer
+    still refuse in lockstep.
     """
 
-    if not fused_leaves or "." not in unit:
+    if "." not in unit:
         return ()
 
     # A per-expert split-format unit spells its group token AFTER the
@@ -890,13 +1002,34 @@ def _fused_member_units(unit: str, fused_leaves) -> tuple[str, ...]:
         return ()
 
     parent, leaf = stem.rsplit(".", 1)
-    members = fused_leaves.get(leaf)
+    members = (fused_leaves or {}).get(leaf)
+    if not members and profile is not None and _is_routed_expert_unit(parent):
+        try:
+            candidate = profile.packed_expert_projection_names(leaf)
+        except Exception:                      # pragma: no cover - defensive
+            candidate = ()
+        # A leaf that decomposes to itself is not a fusion; only a genuine
+        # split (gate_up_proj -> gate_proj, up_proj) may claim by members.
+        if len(candidate) > 1:
+            members = candidate
     if not members:
         return ()
     return tuple(f"{parent}.{member}{token}" for member in members)
 
 
-def _claimed_by_self_or_ancestor(unit: str, claimed, profile=None) -> bool:
+def _is_routed_expert_unit(parent: str) -> bool:
+    """Whether *parent* is a routed-expert container, on dotted boundaries.
+
+    Anchored so ``experts2`` never matches ``experts``, the same discipline
+    :func:`_claimed_by_self_or_ancestor` applies to ancestry.
+    """
+
+    return re.search(r"(?:^|[.])experts(?:[.]|$)", str(parent)) is not None
+
+
+def _claimed_by_self_or_ancestor(
+    unit: str, claimed, profile=None, dspark=None
+) -> bool:
     """Whether *unit* or any dotted ancestor of it appears in *claimed*.
 
     Routed-expert groups are declared ONCE for the whole stack
@@ -908,7 +1041,7 @@ def _claimed_by_self_or_ancestor(unit: str, claimed, profile=None) -> bool:
     ``experts``.
     """
 
-    for variant in _unit_variants(unit, profile):
+    for variant in _unit_variants(unit, profile, dspark):
         if variant in claimed:
             return True
         parts = variant.split(".")

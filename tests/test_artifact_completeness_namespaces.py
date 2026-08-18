@@ -210,3 +210,172 @@ def test_a_sidecar_alias_map_is_empty_without_a_published_sidecar(tmp_path):
             "physical_cb_targets": ["mtp.0.attn.wkv"],
         }}},
     ) == {"mtp.0.attn.wo_a": "model.layers.3.attn.wo_a"}
+
+# --- THE FIFTH NAMESPACE: DSpark physical vs construction ------------------
+#
+# A DSpark draft ships its tensors as `mtp.{stage}.<tail>` but vLLM builds those
+# blocks as body layers past the end of the body, so the exporter writes their
+# config-group targets as `model.layers.{num_hidden_layers+stage}.<tail>`
+# (`_cb_target_name` -> `dspark_cb_construction_target_for_physical_output`).
+# A TARGET artifact never shows this because `mtp.` is a verbatim prefix there.
+# A SIDECAR passes `verbatim_prefixes=()` on purpose — proving those units is
+# the entire point of the artifact — so all 27 CB units reported as claimed by
+# no mechanism at all.
+
+_SIDECAR_BODY_LAYERS = 3
+_SIDECAR_STAGES = 3
+
+#: One CB unit, in the physical namespace its tensors actually ship under.
+_DSPARK_UNIT = (
+    ("mtp.0.attn.wkv.cb_qweight", "U8", (32, 8), 32 * 8),
+)
+
+
+def _write_dspark_sidecar_artifact(
+    root: Path, *, targets, declare_sidecar: bool = True,
+) -> None:
+    """A minimal sidecar: the physical tensor, plus the config/provenance the
+    bridge keys off. `declare_sidecar=False` writes the same bytes with no
+    sidecar declaration, which is how the inertness control is expressed."""
+
+    _write_artifact(root, targets=targets, tensors=_DSPARK_UNIT)
+    (root / "config.json").write_text(json.dumps({
+        "model_type": "deepseek_v4",
+        "num_hidden_layers": _SIDECAR_BODY_LAYERS,
+        "n_mtp_layers": _SIDECAR_STAGES,
+    }), encoding="utf-8")
+    quant = json.loads((root / "quant_config.json").read_text())
+    if declare_sidecar:
+        quant["provenance"] = {"dspark_cb_sidecar": {
+            "schema": "prismaquant.dspark_cb_sidecar.v1",
+            "num_hidden_layers": _SIDECAR_BODY_LAYERS,
+            "n_mtp_layers": _SIDECAR_STAGES,
+        }}
+    (root / "quant_config.json").write_text(
+        json.dumps(quant), encoding="utf-8")
+
+
+@pytest.fixture()
+def no_profile(monkeypatch):
+    """The bridge is architecture arithmetic, not a profile map: it must work
+    with no profile at all, which is also what a synthetic artifact detects."""
+
+    monkeypatch.setattr(
+        completeness, "_detect_profile_quietly", lambda _root: None)
+
+
+def test_construction_spelled_target_claims_its_physical_dspark_unit(
+        tmp_path, no_profile):
+    """The exact shape of the sidecar failure: stage 0 of a 3-layer body is
+    built at `model.layers.3`, and that is what the correct artifact claims."""
+
+    root = tmp_path / "artifact"
+    _write_dspark_sidecar_artifact(
+        root, targets=["re:^model[.]layers[.]3[.]attn[.]wkv$"])
+    report = check_artifact_completeness(root, verbatim_prefixes=())
+    assert report.undeclared == []
+    assert report.cb_units == ["mtp.0.attn.wkv"]
+    assert report.ok
+    assert_artifact_complete(root, verbatim_prefixes=())
+
+
+def test_a_construction_target_for_the_wrong_stage_still_fails(
+        tmp_path, no_profile):
+    """The negative control, and the reason the layer arithmetic is recomputed
+    from the model config rather than read back from the sidecar's own recorded
+    physical->construction pairing. `model.layers.4` is stage 1; claiming it
+    does not claim stage 0's tensor, and an off-by-one the gate forgave would
+    ship a draft whose blocks load into the wrong slots."""
+
+    root = tmp_path / "artifact"
+    _write_dspark_sidecar_artifact(
+        root, targets=["re:^model[.]layers[.]4[.]attn[.]wkv$"])
+    with pytest.raises(ArtifactIncomplete, match="claimed by no mechanism"):
+        assert_artifact_complete(root, verbatim_prefixes=())
+
+
+def test_without_a_sidecar_declaration_the_construction_bridge_is_inert(
+        tmp_path, no_profile):
+    """Additive, like every other bridge here. The construction spelling is
+    only a legitimate claim on an artifact that declares itself a DSpark
+    sidecar; on anything else — every target artifact ever shipped — the same
+    target must still leave the unit unclaimed."""
+
+    root = tmp_path / "artifact"
+    _write_dspark_sidecar_artifact(
+        root,
+        targets=["re:^model[.]layers[.]3[.]attn[.]wkv$"],
+        declare_sidecar=False,
+    )
+    with pytest.raises(ArtifactIncomplete, match="claimed by no mechanism"):
+        assert_artifact_complete(root, verbatim_prefixes=())
+
+
+# --- A SPLIT expert bank is claimed by its own declaration -----------------
+#
+# A mixed-rung expert stack ships one tensor per rung,
+# `…gate_up_proj.format_group_<wire>`, claimed by `per_expert_format_groups`
+# rather than by a config group. `_validate_per_expert_format_groups` owns
+# those tensors in both directions, so the classifier must recognize the
+# mechanism instead of reporting them a second time as claimed by nothing.
+
+_SPLIT_PARENT = "model.layers.0.mlp.experts.gate_up_proj"
+_SPLIT_UNITS = (
+    (f"{_SPLIT_PARENT}.format_group_fp8_cb_k28.cb_qweight", "U8", (4, 8), 32),
+    (f"{_SPLIT_PARENT}.format_group_fp8_cb_k29.cb_qweight", "U8", (4, 8), 32),
+)
+
+
+def _write_split_group_artifact(root: Path, *, declare: bool) -> None:
+    _write_artifact(root, targets=[], tensors=_SPLIT_UNITS)
+    if not declare:
+        return
+    quant = json.loads((root / "quant_config.json").read_text())
+    quant["per_expert_format_groups"] = {
+        "version": 1,
+        "layers": {"0": {
+            family: [
+                {
+                    "format_wire_id": wire,
+                    "expert_ids": [0, 1],
+                    "tensor_prefix": f"{_SPLIT_PARENT}.format_group_{wire}",
+                }
+                for wire in ("fp8_cb_k28", "fp8_cb_k29")
+            ]
+            for family in ("w13", "w2")
+        }},
+    }
+    (root / "quant_config.json").write_text(
+        json.dumps(quant), encoding="utf-8")
+
+
+def test_a_declared_split_format_group_claims_its_tensor(
+        tmp_path, no_profile):
+    """The regression `1ccdf58` introduced: once the enumerator could see
+    `.cb_qweight` planes it saw these too, and no branch knew the mechanism."""
+
+    root = tmp_path / "artifact"
+    _write_split_group_artifact(root, declare=True)
+    report = check_artifact_completeness(root)
+    assert report.undeclared == []
+    assert sorted(report.cb_units) == [
+        f"{_SPLIT_PARENT}.format_group_fp8_cb_k28",
+        f"{_SPLIT_PARENT}.format_group_fp8_cb_k29",
+    ]
+
+
+def test_an_undeclared_split_format_group_still_fails(tmp_path, no_profile):
+    """The negative control. Recognizing the declaration must not make a split
+    tensor that NOTHING declares acceptable -- it stays a failure, reported by
+    the per-expert validator rather than by the classifier."""
+
+    root = tmp_path / "artifact"
+    _write_split_group_artifact(root, declare=False)
+    report = check_artifact_completeness(root)
+    assert not report.ok
+    assert sorted(report.undeclared_group_tensors) == [
+        f"{_SPLIT_PARENT}.format_group_fp8_cb_k28.cb_qweight",
+        f"{_SPLIT_PARENT}.format_group_fp8_cb_k29.cb_qweight",
+    ]
+    with pytest.raises(ArtifactIncomplete):
+        assert_artifact_complete(root)

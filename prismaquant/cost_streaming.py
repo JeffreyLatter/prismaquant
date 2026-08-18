@@ -123,7 +123,7 @@ class StreamedCausalLM:
         ).unsqueeze(0)
         hidden = self.base_model.embed_tokens(ids).to(self.dtype)
         position_embeddings = _compute_position_embeddings(
-            self.base_model, hidden, position_ids
+            self.base_model, hidden, position_ids, self.profile
         )
         attention_mask = _compute_attention_mask(
             self.base_model, hidden, position_ids

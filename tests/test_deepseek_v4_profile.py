@@ -196,3 +196,43 @@ def test_gridbook_cb_export_lane_is_declared(profile):
         "compressed-tensors", "nvfp4_cb"
     )
     assert profile.preferred_export_lane() == "compressed-tensors"
+
+
+def test_rope_axis_mapping_matches_the_vendored_definition(profile):
+    """The profile must ANSWER from the model, not restate its rule.
+
+    `DeepseekV4Model.forward` picks a layer's rotary table by attention
+    schedule; PrismaQuant's streamed driver bypasses that forward and must
+    reach the same answer. When the streamed path had its own copy of the rule
+    it silently fed `main` rope to all 41 compressed V4-Flash layers -- base
+    10000 with YaRN off instead of 160000 with YaRN -- and the BF16 teacher
+    built that way scored perplexity 262. So this pins that there is exactly
+    one definition and both callers reach it.
+    """
+    import importlib
+    import inspect
+
+    # Import through the REGISTERED name -- the vendored package's `__init__`
+    # is Transformers-relative and only resolves after registration.
+    profile.register_vendored_modeling()
+    modeling = importlib.import_module(
+        "transformers.models.deepseek_v4.modeling_deepseek_v4")
+    DeepseekV4Model = modeling.DeepseekV4Model
+    DeepseekV4RotaryEmbedding = modeling.DeepseekV4RotaryEmbedding
+
+    axis_of = DeepseekV4RotaryEmbedding.rope_axis_for_layer_type
+    assert axis_of("sliding_attention") == "main"
+    assert axis_of("compressed_sparse_attention") == "compress"
+    assert axis_of("heavily_compressed_attention") == "compress"
+    # Every axis it can name must be a table the rotary actually builds.
+    for layer_type in ("sliding_attention", "compressed_sparse_attention",
+                       "heavily_compressed_attention"):
+        assert axis_of(layer_type) in DeepseekV4RotaryEmbedding.layer_types
+        assert profile.rope_axis_for_layer_type(layer_type) == axis_of(layer_type)
+
+    # The model's own forward resolves through the same staticmethod rather
+    # than an inline conditional, so the two cannot drift apart.
+    source = inspect.getsource(DeepseekV4Model.forward)
+    assert "rope_axis_for_layer_type" in source, (
+        "DeepseekV4Model.forward no longer resolves the rope axis through the "
+        "shared definition; the streamed driver can now silently disagree")

@@ -356,8 +356,10 @@ def _measure_prompt_topk(
     Returns (ids, lps) shaped [n_prompts, P-1, K] (position 0 has no
     prediction). Full-vocab dicts at every position are infeasible (~620M
     Python objects per pass), so K bounds the support; the tail is handled
-    as a single bucket by the caller. K=1024 covers ~all teacher mass at
-    nearly every position and the truncation floor is shared across arms.
+    as a single bucket by the caller. K is set by the teacher's measured
+    coverage, not by convention -- see PROMPT_TOP_K in full_kl_teacher_payload
+    for the sweep that fixes it -- and the truncation floor is shared across
+    arms.
     Positions with fewer than K entries are padded with ``(-1, -inf)``;
     ``_position_kl`` masks the pads back out.
     """

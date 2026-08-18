@@ -165,3 +165,120 @@ def test_call_layer_rejects_unknown_attention_mask_type():
         assert "per-layer attention mask" in str(exc)
     else:  # pragma: no cover - assert path keeps compatibility without pytest.raises
         raise AssertionError("unknown layer_type accepted for attention mask")
+
+
+# --- rope-axis vs attention-schedule namespaces (DSv4-Flash) ---------------
+# DSv4-Flash's rotary is keyed by rope AXIS ("main"/"compress") while its
+# layers report an attention SCHEDULE ("sliding_attention" /
+# "compressed_sparse_attention" / "heavily_compressed_attention"). The two
+# namespaces never intersect, so a direct lookup misses every layer. The
+# streamed driver used to answer that miss by silently substituting "main",
+# which rotated 41 of V4-Flash's 46 layers on base 10000 with YaRN disabled
+# where the model's own forward uses 160000 with YaRN. The BF16 teacher built
+# that way scored perplexity 262 -- worse than the 2.34-bpp student it was
+# built to grade -- and its error grew with position, because a rope-frequency
+# error does. `ModelProfile.rope_axis_for_layer_type` bridges the namespaces;
+# these tests pin the bridge and the absence of the silent fallback.
+_DSV4_LAYER_TYPES = (
+    "sliding_attention",
+    "compressed_sparse_attention",
+    "heavily_compressed_attention",
+)
+
+
+class _AxisRotary(nn.Module):
+    """DSv4-style: keyed by rope axis, NOT by attention layer type."""
+    layer_types = ("main", "compress")
+
+    def forward(self, hidden, position_ids, layer_type=None):
+        assert layer_type in self.layer_types, layer_type
+        return (f"cos-{layer_type}", f"sin-{layer_type}")
+
+
+class _AxisProfile:
+    """Stand-in for DeepseekV4Profile's mapping, without transformers."""
+    def rope_axis_for_layer_type(self, layer_type):
+        return "main" if layer_type == "sliding_attention" else "compress"
+
+
+class _AxisConfig(PreTrainedConfig):
+    def __init__(self):
+        super().__init__()
+        self.layer_types = list(_DSV4_LAYER_TYPES)
+
+
+def test_rope_dict_is_rekeyed_by_attention_type_via_profile():
+    pe = _compute_position_embeddings(
+        _Base(_AxisRotary(), config=_AxisConfig()),
+        torch.zeros(1), torch.zeros(1), _AxisProfile())
+    assert set(pe) == set(_DSV4_LAYER_TYPES), pe
+    assert pe["sliding_attention"] == ("cos-main", "sin-main")
+    assert pe["compressed_sparse_attention"] == ("cos-compress", "sin-compress")
+    assert pe["heavily_compressed_attention"] == ("cos-compress", "sin-compress")
+
+
+def test_compressed_layers_receive_compress_rope_not_main():
+    """The regression itself: a compressed layer must not get `main` rope."""
+    pe = _compute_position_embeddings(
+        _Base(_AxisRotary(), config=_AxisConfig()),
+        torch.zeros(1), torch.zeros(1), _AxisProfile())
+    for layer_type, expected_axis in (
+        ("sliding_attention", "main"),
+        ("compressed_sparse_attention", "compress"),
+        ("heavily_compressed_attention", "compress"),
+    ):
+        layer = _Layer(layer_type=layer_type)
+        _call_layer(layer, torch.zeros(1), position_embeddings=pe,
+                    attention_mask=None, position_ids=None)
+        assert layer.received == (f"cos-{expected_axis}",
+                                  f"sin-{expected_axis}"), layer_type
+
+
+def test_no_profile_leaves_rope_axis_keys_untouched():
+    """Gemma3/Gemma4 keep the old behaviour: their rotary keys already ARE
+    attention layer types, so nothing is re-keyed."""
+    pe = _compute_position_embeddings(
+        _Base(_MultiRotary()), torch.zeros(1), torch.zeros(1))
+    assert set(pe) == {"sliding_attention", "full_attention"}
+
+
+def test_profile_returning_none_leaves_keys_untouched():
+    class _NoMapping:
+        def rope_axis_for_layer_type(self, layer_type):
+            return None
+    pe = _compute_position_embeddings(
+        _Base(_AxisRotary(), config=_AxisConfig()),
+        torch.zeros(1), torch.zeros(1), _NoMapping())
+    assert set(pe) == {"main", "compress"}
+
+
+def test_unknown_layer_type_no_longer_falls_back_to_main():
+    """The silent `main` default is gone: an unresolved layer type raises.
+
+    Substituting a plausible rope for the right one is what let a broken
+    teacher pass every gate, so this must be loud even though `main` exists.
+    """
+    pe = {"main": ("cos-main", "sin-main"),
+          "compress": ("cos-compress", "sin-compress")}
+    layer = _Layer(layer_type="compressed_sparse_attention")
+    try:
+        _call_layer(layer, torch.zeros(1), position_embeddings=pe,
+                    attention_mask=None, position_ids=None)
+    except RuntimeError as exc:
+        assert "per-layer position_embeddings" in str(exc)
+    else:  # pragma: no cover - keeps compatibility without pytest.raises
+        raise AssertionError("unresolved layer_type silently got `main` rope")
+
+
+def test_profile_axis_outside_rotary_keys_is_rejected():
+    class _BadMapping:
+        def rope_axis_for_layer_type(self, layer_type):
+            return "nonexistent"
+    try:
+        _compute_position_embeddings(
+            _Base(_AxisRotary(), config=_AxisConfig()),
+            torch.zeros(1), torch.zeros(1), _BadMapping())
+    except RuntimeError as exc:
+        assert "rope axis" in str(exc)
+    else:  # pragma: no cover - keeps compatibility without pytest.raises
+        raise AssertionError("profile named a rope axis the rotary lacks")

@@ -344,6 +344,105 @@ def materialize_snapshot(
     )
 
 
+#: Paths whose HEAD revision is used ONLY by the host-side gate, never by the
+#: served stack. The container is mounted the *runtime* snapshot, so it always
+#: executes the artifact's own build-commit copy of every file; this list is not
+#: about what the container runs. It is the answer to a narrower question: when
+#: the judge runs newer than the runtime it is judging, which divergences can be
+#: known harmless? Only those in code that renders a verdict. A judge that also
+#: expects something NEW from the serve would be a divergence in the serve path,
+#: and every such path is deliberately absent from this list, so it refuses.
+#:
+#: Trailing "/" means the whole subtree. Keep this list short and justified;
+#: growing it is a contract decision, not a convenience.
+JUDGE_ONLY_PATHS: tuple[str, ...] = (
+    # Documentation and tests are not executable stack under any entry point.
+    "docs/",
+    "tests/",
+    # The gate itself: reads the artifact and the endpoint, renders the verdict,
+    # and owns CB_SERVING_LANE_SPECS. The launcher reads that table from the
+    # same (judge) revision it replays against, so the two cannot drift.
+    "prismaquant/validate_cb_endpoint.py",
+    # Classifies a checkpoint's units for the cover proof. Host-side only in the
+    # gate's path; the exporter imports it too, but export already happened.
+    "prismaquant/artifact_completeness.py",
+    # The W8A16 export handoff's frozen-closure declaration. Consulted by
+    # tools/verify_dsv4_w8a16_export_handoff.py at export time, never at serve.
+    "prismaquant/dsv4_w8a16_export_handoff.py",
+    # The launcher itself. The judge snapshot's copy is the one that executes;
+    # the runtime snapshot's copy is never run by anything, in or out of the
+    # container.
+    "scripts/serve_dsv4_cb_validate.sh",
+    # This file. It is the one entry here that the CONTAINER also executes -- as
+    # `/repo/tools/prismaquant_runtime_snapshot.py verify`, from the runtime
+    # snapshot, so at the build commit. That is safe for a specific reason
+    # rather than by assertion: the launcher runs the runtime snapshot's copy
+    # host-side, with the identical `verify --snapshot --expected-commit
+    # --expected-tree --expected-closure-sha256` surface, at every checkpoint
+    # and before any container starts. A newer judge that broke that CLI would
+    # therefore fail on the host first, loudly, with no GPU reserved.
+    "tools/prismaquant_runtime_snapshot.py",
+)
+
+
+def _manifest_paths(snapshot: Path) -> dict[str, tuple[Any, ...]]:
+    payload = _validate_manifest_shape(_load_manifest(snapshot / MANIFEST))
+    return {
+        str(entry["path"]): (
+            entry.get("type"),
+            entry.get("sha256"),
+            entry.get("target"),
+            entry.get("executable"),
+        )
+        for entry in payload["entries"]
+    }
+
+
+def _is_judge_only(path: str) -> bool:
+    for allowed in JUDGE_ONLY_PATHS:
+        if allowed.endswith("/"):
+            if path.startswith(allowed):
+                return True
+        elif path == allowed:
+            return True
+    return False
+
+
+def judge_divergence(runtime: Path, judge: Path) -> dict[str, Any]:
+    """Prove a judge snapshot may validate an artifact built at *runtime*.
+
+    The serve gate binds the container to the artifact's build commit so the
+    stack that decodes the bytes is the stack they were made for. Binding the
+    *judge* to it as well made a validator bug structurally incurable: the only
+    remedy the gate admitted was rebuilding bytes that were never wrong. The two
+    roles are now split, and this is the proof obligation that keeps the split
+    honest -- every closure path that differs between the two revisions must be
+    judge-only, or the gate refuses and re-export is the answer.
+    """
+
+    runtime_paths = _manifest_paths(runtime)
+    judge_paths = _manifest_paths(judge)
+    divergent = sorted(
+        path
+        for path in runtime_paths.keys() | judge_paths.keys()
+        if runtime_paths.get(path) != judge_paths.get(path)
+    )
+    blocking = [path for path in divergent if not _is_judge_only(path)]
+    if blocking:
+        raise SnapshotError(
+            "judge snapshot diverges from the artifact's runtime outside the "
+            "judge-only set, so it may not validate this artifact: "
+            + ", ".join(blocking[:8])
+            + (f" (+{len(blocking) - 8} more)" if len(blocking) > 8 else "")
+        )
+    return {
+        "schema": "prismaquant.judge_split_divergence.v1",
+        "divergent_paths": divergent,
+        "divergent_count": len(divergent),
+        "judge_only_paths": list(JUDGE_ONLY_PATHS),
+    }
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -356,6 +455,9 @@ def _parser() -> argparse.ArgumentParser:
     verify.add_argument("--expected-commit", required=True)
     verify.add_argument("--expected-tree")
     verify.add_argument("--expected-closure-sha256")
+    divergence = subparsers.add_parser("judge-divergence")
+    divergence.add_argument("--runtime-snapshot", type=Path, required=True)
+    divergence.add_argument("--judge-snapshot", type=Path, required=True)
     return parser
 
 
@@ -366,6 +468,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             payload = materialize_snapshot(
                 args.source_root, args.cache_root, commit=args.commit
             )
+        elif args.command == "judge-divergence":
+            payload = judge_divergence(args.runtime_snapshot, args.judge_snapshot)
         else:
             payload = verify_snapshot(
                 args.snapshot,

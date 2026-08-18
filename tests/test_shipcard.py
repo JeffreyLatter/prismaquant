@@ -396,6 +396,67 @@ def test_a_parity_claim_that_is_made_off_lane_is_still_verified(tmp_path):
     ), "an off-lane parity claim must still be replayed, not waved through"
 
 
+def test_a_body_only_dsv4_artifact_is_not_held_to_parity(tmp_path):
+    """A namespace-excluded DSv4 export cannot pass the parity census.
+
+    The parity verifier walks every construction unit of the displaced
+    container; a body-only export moves the excluded units (`mtp.`, the
+    DSpark draft) into a separate sidecar artifact by construction, so the
+    census fires on every correct body-only rebuild -- the same
+    gate-no-correct-artifact-can-pass defect as the off-lane case above.
+    The scoping key is `quant_config.json` provenance, which
+    `compute_model_sha` binds, so it cannot be flipped without breaking
+    artifact identity.
+    """
+    model_dir = _artifact(tmp_path, model_type="deepseek_v4")
+    (model_dir / "quant_config.json").write_text(json.dumps({
+        "quant_method": "gridbook",
+        "format": "nvfp4_cb",
+        "provenance": {"excluded_namespaces": ["mtp."]},
+    }))
+    card = build_shipcard(model_dir, build={"quant_method": "gridbook"})
+
+    assert CB_REQUIRED_SLOTS[0] not in required_slots(
+        card, model_dir=model_dir
+    )
+    assert not any(
+        problem.startswith(CB_REQUIRED_SLOTS[0])
+        for problem in verify(card, model_dir=model_dir)
+    )
+    # An exporter that OPENED the slot before this scoping existed left an
+    # opened-but-null record; that is an honest "scoped out", not a demand.
+    card_with_open_slot = dict(card)
+    card_with_open_slot["slots"] = dict(card["slots"])
+    card_with_open_slot["slots"][CB_REQUIRED_SLOTS[0]] = None
+    assert CB_REQUIRED_SLOTS[0] not in required_slots(
+        card_with_open_slot, model_dir=model_dir
+    )
+    assert not any(
+        problem.startswith(CB_REQUIRED_SLOTS[0])
+        for problem in verify(card_with_open_slot, model_dir=model_dir)
+    )
+
+
+def test_a_body_only_dsv4_parity_claim_is_still_verified(tmp_path):
+    """Scoping the DEMAND must not create a hole in the CHECK (body-only)."""
+    model_dir = _artifact(tmp_path, model_type="deepseek_v4")
+    (model_dir / "quant_config.json").write_text(json.dumps({
+        "quant_method": "gridbook",
+        "format": "nvfp4_cb",
+        "provenance": {"excluded_namespaces": ["mtp."]},
+    }))
+    card = build_shipcard(model_dir, build={"quant_method": "gridbook"})
+    card["slots"][CB_REQUIRED_SLOTS[0]] = {
+        "slot": CB_REQUIRED_SLOTS[0], "passed": True, "tool": "handmade",
+    }
+
+    assert CB_REQUIRED_SLOTS[0] in required_slots(card, model_dir=model_dir)
+    assert any(
+        problem.startswith(CB_REQUIRED_SLOTS[0])
+        for problem in verify(card, model_dir=model_dir)
+    ), "a body-only parity claim must still be replayed, not waved through"
+
+
 def _cb_card(tmp_path, *, model_type, architectures, name="exported"):
     """A Gridbook CB artifact whose architecture is the one thing that varies."""
     model_dir = _artifact(tmp_path, name=name)
@@ -662,6 +723,30 @@ def test_shipcard_reservation_overflow_preserves_previous_record(tmp_path):
         write_shipcard(path, card)
 
     assert path.read_bytes() == before
+
+
+def test_shipcard_write_falls_back_to_compact_before_refusing(tmp_path):
+    """indent=2 inflates the card ~1.5x; a card that only overflows the
+    reservation pretty-printed must be written compact, not dropped.  The
+    six-slot DSv4 card crossed this line on its LAST slot fill (the graph
+    endpoint record, 2026-08-18) after every gate had already passed."""
+    model_dir = _artifact(tmp_path)
+    path = _open_card(tmp_path, model_dir)
+    card = load_shipcard(path)
+    reserved = card["reserved_file_bytes"]
+    # Grow the card until pretty-printed exceeds the reservation but compact
+    # still fits: many small fields inflate most under indentation.
+    filler = {f"k{i}": i for i in range(reserved // 18)}
+    card["build"]["filler"] = filler
+    pretty = len(json.dumps(card, indent=2, default=str)) + 1
+    compact = len(json.dumps(card, separators=(",", ":"), default=str)) + 1
+    assert pretty > reserved > compact, (pretty, reserved, compact)
+
+    write_shipcard(path, card)
+
+    raw = path.read_bytes()
+    assert len(raw) == reserved, "the byte contract must hold exactly"
+    assert load_shipcard(path)["build"]["filler"] == filler
 
 
 def test_record_from_another_build_is_refused(tmp_path):
@@ -1119,13 +1204,42 @@ def test_documenting_an_artifact_does_not_invalidate_its_own_card(tmp_path):
     assert compute_model_sha(model_dir) == before
     assert verify(load_shipcard(path), model_dir=model_dir) == []
 
-    # One exact filename, not a category: a figure the card references, or a
-    # doc under any other name, stays attested.
+    # Exact filenames, not a category: the card figures share the exclusion
+    # (2026-08-18 -- they are rendered FROM the attested quant_config after
+    # the gates by construction), and a doc under any other name stays
+    # attested.
     (model_dir / "allocation-map.png").write_bytes(b"\x89PNG\r\n")
-    assert compute_model_sha(model_dir) != before
-    after_png = compute_model_sha(model_dir)
+    assert compute_model_sha(model_dir) == before
+    (model_dir / "byte-budget.png").write_bytes(b"\x89PNG\r\n")
+    assert compute_model_sha(model_dir) == before
+    assert verify(load_shipcard(path), model_dir=model_dir) == []
     (model_dir / "NOTES.md").write_text("notes")
-    assert compute_model_sha(model_dir) != after_png
+    assert compute_model_sha(model_dir) != before
+
+
+def test_a_card_stamped_while_the_figures_were_hashed_still_verifies(tmp_path):
+    """Same tolerance as the README scope change, for the card figures.
+
+    An artifact published with a hashed allocation-map.png keeps verifying via
+    the `legacy_figures_hashed` fallback -- and keeps its figure attestation:
+    tampering with the figure still moves the legacy identity.
+    """
+    model_dir = _artifact(tmp_path)
+    (model_dir / "allocation-map.png").write_bytes(b"\x89PNG\r\nv1")
+
+    legacy_sha = compute_model_sha(model_dir, legacy_figures_hashed=True)
+    assert legacy_sha != compute_model_sha(model_dir)
+
+    path = _open_card(tmp_path, model_dir)
+    card = load_shipcard(path)
+    card["model_sha"] = legacy_sha
+    write_shipcard(path, card)
+    _fill_all(path, legacy_sha)
+    assert verify(load_shipcard(path), model_dir=model_dir) == []
+
+    (model_dir / "allocation-map.png").write_bytes(b"\x89PNG\r\ntampered")
+    assert any("artifact changed" in p
+               for p in verify(load_shipcard(path), model_dir=model_dir))
 
 
 def test_a_card_stamped_while_the_readme_was_hashed_still_verifies(tmp_path):
@@ -1189,3 +1303,245 @@ def test_a_card_written_under_the_legacy_native_scope_still_verifies(tmp_path):
         "artifact changed since the shipcard was opened" in problem
         for problem in verify(load_shipcard(path), model_dir=model_dir)
     )
+
+
+def _cb_recipe(tmp_path, *, units, bytes_per_unit, params_per_unit, meta):
+    """A CB recipe whose units carry the per-unit serialized price."""
+    payload = {}
+    for i in range(units):
+        payload[f"model.layers.{i}.mlp.up_proj"] = {
+            "bits": 4,
+            "cb_serialized_identity": json.dumps({
+                "format": "NVFP4_CB_K18",
+                "params": params_per_unit,
+                "tensor_payload_bytes": bytes_per_unit,
+            }),
+        }
+    payload["__prismaquant__"] = meta
+    recipe = tmp_path / "layer_config.json"
+    recipe.write_text(json.dumps(payload))
+    return recipe
+
+
+def test_recipe_priced_bpp_is_scope_matched_and_a_lower_bound(tmp_path):
+    """Numerator and denominator come from the SAME entries, so no sidecar noise.
+
+    K18 on (4096, 2048) is 2,654,212 payload bytes over 8,388,608 params --
+    2,654,208 packed (2.53125 bpp exactly: 2.25 index + 0.28125 fp4 group
+    scale) plus the 4-byte input global scale, so 2.5312538. These are the
+    literal numbers the shipped DSv4 recipe's own identities declare.
+    Units without a per-unit price are excluded from BOTH sums, which is what
+    makes the result a lower bound rather than an estimate.
+    """
+    from prismaquant.shipcard import recipe_priced_bpp
+
+    recipe = _cb_recipe(
+        tmp_path, units=4, bytes_per_unit=2654212, params_per_unit=8388608,
+        meta={"achieved_bits": 2.53125},
+    )
+    # One FP8_SOURCE passthrough Linear, priced by nobody.
+    payload = json.loads(recipe.read_text())
+    payload["model.layers.9.self_attn.wkv"] = {"bits": 8, "data_type": "fp8_e4m3"}
+    recipe.write_text(json.dumps(payload))
+
+    got = recipe_priced_bpp(recipe)
+    assert got["value"] == pytest.approx(2.53125, rel=1e-5)
+    assert got["priced_units"] == 4
+    assert got["total_units"] == 5
+    assert got["coverage_units"] == pytest.approx(0.8)
+
+
+def test_recipe_priced_bpp_is_not_applicable_without_per_unit_prices(tmp_path):
+    """A non-CB recipe declares no per-unit bytes; that is not a failure."""
+    from prismaquant.shipcard import recipe_priced_bpp
+
+    recipe = tmp_path / "layer_config.json"
+    recipe.write_text(json.dumps({
+        "model.layers.0.mlp.up_proj": {"bits": 4},
+        "__prismaquant__": {"achieved_bits": 4.75},
+    }))
+    got = recipe_priced_bpp(recipe)
+    assert got["value"] is None
+    assert "no unit carries a per-unit serialized price" in got["reason"]
+
+
+def test_achieved_bpp_cross_check_catches_a_label_describing_another_point(tmp_path):
+    """The DSv4 `artifact-aura-cb-112p69` failure, reproduced.
+
+    That card published 4.3065 bpp read from a sibling `pareto.knees.json`
+    while the recipe it named priced to 2.7385 -- a 57% false public claim that
+    would silently break every matched-bpp comparison built on it. No
+    precedence rule catches it on its own, because the stale number is not the
+    wrong FIELD, it is the right field describing the wrong POINT.
+    """
+    from prismaquant.shipcard import allocator_achieved_bpp, verify
+
+    recipe = _cb_recipe(
+        tmp_path, units=4, bytes_per_unit=2654212, params_per_unit=8388608,
+        meta={"schema": "prismaquant.layer_config_meta.v1"},   # declares no bpp
+    )
+    (tmp_path / "pareto.knees.json").write_text(json.dumps({
+        "primary": "log_error",
+        "log_error": {"achieved_bits": 4.306515854190045, "target_bits": 4.5},
+    }))
+
+    got = allocator_achieved_bpp(recipe)
+    assert got["value"] == pytest.approx(4.306515854190045)
+    assert got["source"] == "pareto.knees.json:log_error"
+
+    cross = got["cross_check"]
+    assert cross["verdict"] == "DISAGREE"
+    assert cross["recipe_priced_bpp"] == pytest.approx(2.53125, rel=1e-5)
+    assert cross["relative_difference"] > 0.5
+
+    problems = verify({"build": {"achieved_bpp": got}}, model_dir=None, required=[])
+    assert any("contradicts the recipe's own serialized bytes" in p for p in problems)
+
+
+def test_achieved_bpp_cross_check_passes_a_truthful_claim(tmp_path):
+    """A claim slightly ABOVE the floor is expected, not a defect.
+
+    The floor omits unpriced passthrough units, which only add bytes -- so the
+    real DSv4 recipe claims 2.7555 against a 2.7385 floor (0.6% apart) and must
+    pass. This pins the gate as a floor test, not an equality test.
+    """
+    from prismaquant.shipcard import allocator_achieved_bpp, verify
+
+    recipe = _cb_recipe(
+        tmp_path, units=4, bytes_per_unit=2654212, params_per_unit=8388608,
+        meta={"achieved_bits": 2.53125 * 1.006},
+    )
+    got = allocator_achieved_bpp(recipe)
+    assert got["cross_check"]["verdict"] == "agree"
+    assert verify({"build": {"achieved_bpp": got}}, model_dir=None, required=[]) == []
+
+
+def test_achieved_bpp_cross_check_is_silent_on_a_preexisting_card():
+    """A card written before this gate carries no verdict and is left alone."""
+    from prismaquant.shipcard import verify
+
+    legacy = {"build": {"achieved_bpp": {"value": 4.3065, "source": "whatever"}}}
+    assert verify(legacy, model_dir=None, required=[]) == []
+
+
+def _add_passthrough(recipe, count):
+    """Append FP8_SOURCE passthrough Linears, which carry no per-unit price."""
+    payload = json.loads(recipe.read_text())
+    for i in range(count):
+        payload[f"model.layers.{i}.self_attn.kv_a_proj"] = {
+            "bits": 8, "data_type": "fp8_e4m3",
+        }
+    recipe.write_text(json.dumps(payload))
+    return recipe
+
+
+def test_cross_check_does_not_refuse_a_passthrough_heavy_recipe(tmp_path):
+    """A loose floor must not false-refuse a legal artifact at publication.
+
+    Hy3 shipped 226 FP8_SOURCE Linears. Those carry no per-unit price, so they
+    leave both sums -- and because passthrough is ~8.002 bpp against CB's ~2.5,
+    the true rate sits legitimately far above the covered floor. Refusing that
+    would be a gate bug that teaches the operator to reach for
+    --force-unverified, which is a worse failure than not refusing.
+    """
+    from prismaquant.shipcard import allocator_achieved_bpp, verify
+
+    recipe = _cb_recipe(
+        tmp_path, units=4, bytes_per_unit=2654212, params_per_unit=8388608,
+        meta={"achieved_bits": 5.2},        # honest for a half-passthrough mix
+    )
+    _add_passthrough(recipe, 4)             # coverage 4/8 = 50%
+
+    cross = allocator_achieved_bpp(recipe)["cross_check"]
+    assert cross["verdict"] == "inconclusive_low_coverage"
+    assert cross["coverage_units"] == pytest.approx(0.5)
+    assert cross["relative_difference"] > 1.0       # >100% apart, still not refused
+    assert "too loose to indict" in cross["detail"]
+    assert verify(
+        {"build": {"achieved_bpp": allocator_achieved_bpp(recipe)}},
+        model_dir=None, required=[],
+    ) == []
+
+
+def test_cross_check_refuses_a_claim_below_the_blend_at_high_coverage(tmp_path):
+    """Undershoot is caught too, not just the stale-Pareto overshoot.
+
+    At near-complete coverage the unpriced remainder cannot explain a gap in
+    either direction, so a claim under the blend is as much a false public
+    number as one over it.
+    """
+    from prismaquant.shipcard import allocator_achieved_bpp, verify
+
+    recipe = _cb_recipe(
+        tmp_path, units=100, bytes_per_unit=2654212, params_per_unit=8388608,
+        meta={"achieved_bits": 1.5},        # well under the 2.53 blend
+    )
+    _add_passthrough(recipe, 2)             # coverage 100/102 = 98%
+
+    got = allocator_achieved_bpp(recipe)
+    cross = got["cross_check"]
+    assert cross["verdict"] == "DISAGREE"
+    assert cross["claim_is_below_floor"] is True
+    assert cross["coverage_units"] > 0.95
+
+    problems = verify({"build": {"achieved_bpp": got}}, model_dir=None, required=[])
+    assert any("contradicts the recipe's own serialized bytes" in p for p in problems)
+
+
+def test_cross_check_undershoot_is_also_coverage_gated(tmp_path):
+    """The tempting shortcut -- "below the blend is impossible" -- is unsound.
+
+    It holds only when every unpriced unit is HIGHER-rate than the priced
+    blend. A recipe whose priced subset is FP8_CB-heavy (~8 bpp) with plain
+    NVFP4 (4.25 bpp) unpriced has a true rate legitimately BELOW its own priced
+    blend. The sound bound is blend x PARAMETER coverage, and parameter
+    coverage is not computable from a recipe: non-CB units record no shape.
+    So undershoot is gated on coverage exactly like overshoot.
+    """
+    from prismaquant.shipcard import allocator_achieved_bpp, verify
+
+    recipe = _cb_recipe(
+        tmp_path, units=4, bytes_per_unit=2654212, params_per_unit=8388608,
+        meta={"achieved_bits": 1.5},
+    )
+    _add_passthrough(recipe, 4)             # coverage 50%
+
+    got = allocator_achieved_bpp(recipe)
+    cross = got["cross_check"]
+    assert cross["verdict"] == "inconclusive_low_coverage"
+    assert cross["claim_is_below_floor"] is True
+    assert "below" in cross["detail"]
+    assert verify({"build": {"achieved_bpp": got}}, model_dir=None, required=[]) == []
+
+
+def test_recipe_priced_bpp_reads_the_sidecar_flat_layout(tmp_path):
+    """Two production layouts carry per-unit prices; both must be priceable.
+
+    The body allocator writes `name -> {..., "cb_serialized_identity": ...}`.
+    The DSpark CB sidecar builder writes a flat `name -> "FORMAT"` map with the
+    identities collected under `__prismaquant__.cb_serialized_identities`.
+    Reading only the first shape reported "not applicable" for the entire
+    sidecar lane, silently disabling the gate on a shippable artifact -- the
+    real MTP draft recipe prices 2,325 of 2,328 units at exactly 1.78125 bpp
+    (K12 two_tier), the 3 exclusions being the grouped-BMM `wo_a` passthroughs.
+    """
+    from prismaquant.shipcard import recipe_priced_bpp
+
+    identity = json.dumps({
+        "format": "NVFP4_CB_K12", "params": 8388608,
+        "tensor_payload_bytes": 1867776,       # 8388608 * 57/256
+    })
+    payload = {f"mtp.0.ffn.experts.{i}.up_proj": "NVFP4_CB_K12" for i in range(4)}
+    payload["mtp.0.attn.wo_a"] = "FP8_BLOCK_UE8M0_SOURCE"   # passthrough, unpriced
+    payload["__prismaquant__"] = {
+        "cb_serialized_identities": {
+            f"mtp.0.ffn.experts.{i}.up_proj": identity for i in range(4)
+        },
+    }
+    recipe = tmp_path / "dspark_layer_config.json"
+    recipe.write_text(json.dumps(payload))
+
+    got = recipe_priced_bpp(recipe)
+    assert got["value"] == pytest.approx(1.78125)
+    assert got["priced_units"] == 4
+    assert got["total_units"] == 5

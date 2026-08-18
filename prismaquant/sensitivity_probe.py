@@ -3205,7 +3205,7 @@ def run_streaming_multimodal_visual_probe_pass(
             causal_mask = _compute_attention_mask(
                 base_model, inputs_embeds, position_ids)
             position_embeddings = _compute_position_embeddings(
-                base_model, inputs_embeds, position_ids)
+                base_model, inputs_embeds, position_ids, model_profile)
             pass_state = model_profile.new_forward_pass_state()
 
             activations_cpu: list[torch.Tensor] = [inputs_embeds.detach().cpu()]

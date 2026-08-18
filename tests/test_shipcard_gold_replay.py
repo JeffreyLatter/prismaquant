@@ -15,6 +15,7 @@ from prismaquant.gridbook_environment import (
     CANONICAL_GOLD_SET_ENVIRONMENT,
 )
 from prismaquant.gridbook_runtime_pin import load_gridbook_runtime_pin
+from tools.full_kl_teacher_payload import PROMPT_TOP_K
 from prismaquant.shipcard import (
     DSV4_TOKENIZER_IDENTITY_SHA256,
     DSV4_WIKITEXT_CORPUS_SHA256,
@@ -213,7 +214,7 @@ def _teacher_evidence() -> dict:
         "calib_ids_sha256": "3" * 64,
         "scoring": {
             "positions": "all",
-            "prompt_top_k": 1024,
+            "prompt_top_k": PROMPT_TOP_K,
             "logprob_dtype": "float32",
             "tail_bucket": True,
         },
@@ -232,7 +233,7 @@ def _teacher_evidence() -> dict:
         "topk_coverage_min": 0.91,
         "topk_coverage_policy": {
             "schema": "prismaquant.topk_tail_coverage_policy/1",
-            "top_k": 1024,
+            "top_k": PROMPT_TOP_K,
             "minimum_probability_mass_per_position": 0.90,
             "maximum_probability_mass": 1.0,
             "probability_mass_absolute_tolerance": 1e-6,
@@ -454,7 +455,7 @@ def _gold_record(root: Path, *, slot: str = "gold.kl") -> tuple[dict, dict]:
     metrics = {
         "mode": "student",
         "score_positions": "all",
-        "prompt_top_k": 1024,
+        "prompt_top_k": PROMPT_TOP_K,
         "model": str(root),
         "quantization": "gridbook",
         "n_samples": 8,
@@ -677,6 +678,136 @@ def test_ppl_value_identity_and_sampling_contract_are_exact(
         "gold.ppl", record, metrics, model_dir=None
     )
     assert any(fragment in problem for problem in problems), problems
+
+
+def test_gold_receipt_survives_a_model_card_but_no_other_file(tmp_path):
+    """Documenting an artifact must not invalidate its gold records.
+
+    `compute_model_sha` excludes exactly `README.md` so a card can quote the
+    gold numbers measured before it existed; the inventory replay must honor
+    the same one-filename doctrine (the exporter's finalized inventory
+    predates any card by construction).  Every OTHER added file remains a
+    binding violation.
+    """
+    root, _card = _artifact(tmp_path)
+    record, _metrics = _gold_record(root)
+    kwargs = dict(model_dir=root, require_current_artifact_path=True)
+    assert _verify_dsv4_gridbook_gold_contract(
+        "gold.kl", record, record["metrics"], **kwargs
+    ) == []
+
+    (root / "README.md").write_text("# model card, added after the gates\n")
+    assert _verify_dsv4_gridbook_gold_contract(
+        "gold.kl", record, record["metrics"], **kwargs
+    ) == []
+
+    # The card figures share the doctrine (rendered from the attested
+    # quant_config after the gates); any other name stays a violation.
+    (root / "allocation-map.png").write_bytes(b"\x89PNG\r\n")
+    (root / "byte-budget.png").write_bytes(b"\x89PNG\r\n")
+    assert _verify_dsv4_gridbook_gold_contract(
+        "gold.kl", record, record["metrics"], **kwargs
+    ) == []
+
+    (root / "extra.bin").write_bytes(b"\0")
+    problems = _verify_dsv4_gridbook_gold_contract(
+        "gold.kl", record, record["metrics"], **kwargs
+    )
+    assert any("differ from inventory" in p for p in problems)
+
+
+def test_artifact_binding_tolerates_documentation_but_no_other_file(tmp_path):
+    """`serve_fingerprint.artifact_binding` walks the SERVED dir against the
+    finalized inventory at measurement-provenance time; a published artifact
+    legitimately carries its README, card figures, and shipcard — all written
+    after the exporter finalized the inventory. The walk honors the same
+    exact-filename doctrine (and `shipcard.json`, the gate record itself),
+    but only for names the inventory does NOT list: an inventoried file can
+    never dodge its byte check by wearing a documentation name."""
+    import pytest
+
+    root, _card = _artifact(tmp_path)
+    assert artifact_binding(root, launch_model=root)["model_sha"]
+
+    (root / "README.md").write_text("# model card, added after the gates\n")
+    (root / "allocation-map.png").write_bytes(b"\x89PNG\r\n")
+    assert artifact_binding(root, launch_model=root)["model_sha"]
+
+    (root / "extra.bin").write_bytes(b"\0")
+    with pytest.raises(ValueError, match="differ from finalized inventory"):
+        artifact_binding(root, launch_model=root)
+    (root / "extra.bin").unlink()
+
+    # This fixture inventories shipcard.json (the real exporter does too —
+    # the card occupies a fixed-size reservation, so filling slots never
+    # moves its byte count). The byte check therefore still applies to it:
+    ship = root / "shipcard.json"
+    original_card = ship.read_bytes()
+    ship.write_bytes(original_card + b" ")
+    with pytest.raises(ValueError, match="differ from finalized inventory"):
+        artifact_binding(root, launch_model=root)
+    ship.write_bytes(original_card)
+    assert artifact_binding(root, launch_model=root)["model_sha"]
+
+    # A NON-inventoried shipcard.json (an artifact class whose card arrives
+    # wholly after export) is documentation and is tolerated by name.
+    (tmp_path / "post-export-card").mkdir()
+    root3, _card3 = _artifact(tmp_path / "post-export-card")
+    (root3 / "shipcard.json").unlink()
+    quant3 = __import__("json").loads(
+        (root3 / "quant_config.json").read_text())
+    _finalize_inventory(root3, quant3)
+    (root3 / "shipcard.json").write_text("{}\n")
+    assert artifact_binding(root3, launch_model=root3)["model_sha"]
+
+    # An INVENTORIED file keeps its byte check even under a documentation
+    # name: rebuild the artifact with README.md inside the finalized ledger,
+    # then let it drift.
+    (tmp_path / "inventoried-readme").mkdir()
+    root2, _card2 = _artifact(tmp_path / "inventoried-readme")
+    (root2 / "README.md").write_text("shipped at export\n")
+    quant = __import__("json").loads(
+        (root2 / "quant_config.json").read_text())
+    _finalize_inventory(root2, quant)
+    assert artifact_binding(root2, launch_model=root2)["model_sha"]
+    (root2 / "README.md").write_text("drifted after export\n" * 4)
+    with pytest.raises(ValueError, match="differ from finalized inventory"):
+        artifact_binding(root2, launch_model=root2)
+
+
+def test_gold_receipt_accepts_the_publishers_frozen_fd_links_only(tmp_path):
+    """The publisher replays this contract on its frozen view, where large
+    files are `/proc/self/fd/N` links to its own held descriptors; the freeze
+    opens sources O_NOFOLLOW so a real symlink can never reach that view.
+    The walk follows exactly that form and refuses every other symlink."""
+    import os
+
+    root, _card = _artifact(tmp_path)
+    record, _metrics = _gold_record(root)
+    kwargs = dict(model_dir=root, require_current_artifact_path=True)
+    assert _verify_dsv4_gridbook_gold_contract(
+        "gold.kl", record, record["metrics"], **kwargs
+    ) == []
+
+    weights = root / "model.safetensors"
+    backing = tmp_path / "held-backing.bin"
+    backing.write_bytes(weights.read_bytes())
+    fd = os.open(backing, os.O_RDONLY)
+    try:
+        weights.unlink()
+        weights.symlink_to(f"/proc/self/fd/{fd}")
+        assert _verify_dsv4_gridbook_gold_contract(
+            "gold.kl", record, record["metrics"], **kwargs
+        ) == []
+
+        weights.unlink()
+        weights.symlink_to(backing)  # an ordinary symlink still refuses
+        problems = _verify_dsv4_gridbook_gold_contract(
+            "gold.kl", record, record["metrics"], **kwargs
+        )
+        assert any("contains a symlink" in p for p in problems)
+    finally:
+        os.close(fd)
 
 
 def test_gold_receipt_survives_move_and_weight_reattest(tmp_path, monkeypatch):
