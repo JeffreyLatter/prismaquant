@@ -680,6 +680,34 @@ def test_ppl_value_identity_and_sampling_contract_are_exact(
     assert any(fragment in problem for problem in problems), problems
 
 
+def test_gold_receipt_survives_a_model_card_but_no_other_file(tmp_path):
+    """Documenting an artifact must not invalidate its gold records.
+
+    `compute_model_sha` excludes exactly `README.md` so a card can quote the
+    gold numbers measured before it existed; the inventory replay must honor
+    the same one-filename doctrine (the exporter's finalized inventory
+    predates any card by construction).  Every OTHER added file remains a
+    binding violation.
+    """
+    root, _card = _artifact(tmp_path)
+    record, _metrics = _gold_record(root)
+    kwargs = dict(model_dir=root, require_current_artifact_path=True)
+    assert _verify_dsv4_gridbook_gold_contract(
+        "gold.kl", record, record["metrics"], **kwargs
+    ) == []
+
+    (root / "README.md").write_text("# model card, added after the gates\n")
+    assert _verify_dsv4_gridbook_gold_contract(
+        "gold.kl", record, record["metrics"], **kwargs
+    ) == []
+
+    (root / "extra.bin").write_bytes(b"\0")
+    problems = _verify_dsv4_gridbook_gold_contract(
+        "gold.kl", record, record["metrics"], **kwargs
+    )
+    assert any("differ from inventory" in p for p in problems)
+
+
 def test_gold_receipt_survives_move_and_weight_reattest(tmp_path, monkeypatch):
     root, card = _artifact(tmp_path)
     record, _metrics = _gold_record(root)

@@ -2072,9 +2072,18 @@ def _verify_dsv4_gridbook_gold_contract(
                 if path.is_symlink():
                     raise ValueError("artifact inventory contains a symlink")
                 if path.is_file():
-                    observed_files[path.relative_to(root).as_posix()] = int(
-                        path.stat().st_size
-                    )
+                    rel = path.relative_to(root).as_posix()
+                    if rel == "README.md":
+                        # `compute_model_sha` deliberately excludes the model
+                        # card -- one exact filename -- so that DOCUMENTING an
+                        # artifact cannot invalidate the records that measured
+                        # it (an artifact must be able to quote its own gold
+                        # numbers; see the exclusion doctrine there).  The
+                        # exporter's finalized inventory predates any card by
+                        # construction, so this replay honors the same
+                        # exclusion or no documented artifact can ever pass.
+                        continue
+                    observed_files[rel] = int(path.stat().st_size)
             if dict(declared_files) != observed_files or sum(
                 observed_files.values()
             ) != binding.get("artifact_bytes"):
