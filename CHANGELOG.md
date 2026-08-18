@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.15.3 — 2026-08-18
+
+### Fixed
+
+- **`lane_specs/nvfp4_cb.json`: the CB lane executes BOTH families'
+  activation grids.** The 2026-08-17 entry scoped
+  `served_activation_quantization.executes` to `["FP8_CB_*"]` by reading
+  gridbook's "exact native BF16 bridge" as activations-left-exact; the
+  runtime QDQs NVFP4_CB activations to E2M1 group-16 on every served route
+  (`linear.py` `fp4_act_qdq_or_codec`, moe.py's three routed sites,
+  `codec.py` `fp4_group16_act_qdq`), so the bridge names a GEMM schedule,
+  not an activation precision. The premise was retracted the same day; the
+  spec now says `["NVFP4_CB_*", "FP8_CB_*"]`, drops the dead
+  `selectors_must_be_unset` guard, and cites the runtime call sites.
+  Measured on the shipped Qwen3.8-27B 13 GB card: the corrected entry
+  re-allocates to the shipped `layer_config.json` byte-for-byte, while the
+  stale entry silently moves 337/496 body units (272 FP8_CB → NVFP4_CB
+  family flips). Both shipped artifacts were priced with both A-sides and
+  are correct as shipped; the fix protects every FUTURE fresh-card CB
+  campaign, which consumes this list with no flag and no refusal.
+
 ## 0.15.2 — 2026-08-18
 
 ### Fixed
