@@ -716,6 +716,65 @@ def test_gold_receipt_survives_a_model_card_but_no_other_file(tmp_path):
     assert any("differ from inventory" in p for p in problems)
 
 
+def test_artifact_binding_tolerates_documentation_but_no_other_file(tmp_path):
+    """`serve_fingerprint.artifact_binding` walks the SERVED dir against the
+    finalized inventory at measurement-provenance time; a published artifact
+    legitimately carries its README, card figures, and shipcard — all written
+    after the exporter finalized the inventory. The walk honors the same
+    exact-filename doctrine (and `shipcard.json`, the gate record itself),
+    but only for names the inventory does NOT list: an inventoried file can
+    never dodge its byte check by wearing a documentation name."""
+    import pytest
+
+    root, _card = _artifact(tmp_path)
+    assert artifact_binding(root, launch_model=root)["model_sha"]
+
+    (root / "README.md").write_text("# model card, added after the gates\n")
+    (root / "allocation-map.png").write_bytes(b"\x89PNG\r\n")
+    assert artifact_binding(root, launch_model=root)["model_sha"]
+
+    (root / "extra.bin").write_bytes(b"\0")
+    with pytest.raises(ValueError, match="differ from finalized inventory"):
+        artifact_binding(root, launch_model=root)
+    (root / "extra.bin").unlink()
+
+    # This fixture inventories shipcard.json (the real exporter does too —
+    # the card occupies a fixed-size reservation, so filling slots never
+    # moves its byte count). The byte check therefore still applies to it:
+    ship = root / "shipcard.json"
+    original_card = ship.read_bytes()
+    ship.write_bytes(original_card + b" ")
+    with pytest.raises(ValueError, match="differ from finalized inventory"):
+        artifact_binding(root, launch_model=root)
+    ship.write_bytes(original_card)
+    assert artifact_binding(root, launch_model=root)["model_sha"]
+
+    # A NON-inventoried shipcard.json (an artifact class whose card arrives
+    # wholly after export) is documentation and is tolerated by name.
+    (tmp_path / "post-export-card").mkdir()
+    root3, _card3 = _artifact(tmp_path / "post-export-card")
+    (root3 / "shipcard.json").unlink()
+    quant3 = __import__("json").loads(
+        (root3 / "quant_config.json").read_text())
+    _finalize_inventory(root3, quant3)
+    (root3 / "shipcard.json").write_text("{}\n")
+    assert artifact_binding(root3, launch_model=root3)["model_sha"]
+
+    # An INVENTORIED file keeps its byte check even under a documentation
+    # name: rebuild the artifact with README.md inside the finalized ledger,
+    # then let it drift.
+    (tmp_path / "inventoried-readme").mkdir()
+    root2, _card2 = _artifact(tmp_path / "inventoried-readme")
+    (root2 / "README.md").write_text("shipped at export\n")
+    quant = __import__("json").loads(
+        (root2 / "quant_config.json").read_text())
+    _finalize_inventory(root2, quant)
+    assert artifact_binding(root2, launch_model=root2)["model_sha"]
+    (root2 / "README.md").write_text("drifted after export\n" * 4)
+    with pytest.raises(ValueError, match="differ from finalized inventory"):
+        artifact_binding(root2, launch_model=root2)
+
+
 def test_gold_receipt_accepts_the_publishers_frozen_fd_links_only(tmp_path):
     """The publisher replays this contract on its frozen view, where large
     files are `/proc/self/fd/N` links to its own held descriptors; the freeze

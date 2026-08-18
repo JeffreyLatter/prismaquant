@@ -1368,7 +1368,7 @@ def artifact_binding(
             raise ValueError(
                 "--artifact-dir does not resolve to the artifact in the serve argv"
             )
-    from prismaquant.shipcard import compute_model_sha
+    from prismaquant.shipcard import CARD_FIGURE_FILENAMES, compute_model_sha
 
     quant_path = resolved_root / "quant_config.json"
     payload = json.loads(quant_path.read_text(encoding="utf-8"))
@@ -1386,6 +1386,14 @@ def artifact_binding(
     file_bytes = inventory.get("file_bytes")
     if not isinstance(file_bytes, dict) or not file_bytes:
         raise ValueError("served artifact inventory has no file ledger")
+    # Post-export DOCUMENTATION shares the model_sha exclusion doctrine
+    # (prismaquant.shipcard): the README, the card figures, and the shipcard
+    # itself are written after the exporter finalizes the inventory, and
+    # documenting an artifact must not make it unservable-for-measurement.
+    # Exact filenames, not a category — and each is tolerated only when the
+    # finalized inventory does NOT list it, so an inventoried file can never
+    # dodge its byte check by wearing a documentation name.
+    documentation_names = {"README.md", "shipcard.json", *CARD_FIGURE_FILENAMES}
     observed: dict[str, int] = {}
     for path in sorted(resolved_root.rglob("*")):
         if path.is_symlink():
@@ -1393,7 +1401,10 @@ def artifact_binding(
                 f"served artifact contains symlink {path.relative_to(resolved_root)}"
             )
         if path.is_file():
-            observed[path.relative_to(resolved_root).as_posix()] = int(path.stat().st_size)
+            rel = path.relative_to(resolved_root).as_posix()
+            if rel in documentation_names and rel not in file_bytes:
+                continue
+            observed[rel] = int(path.stat().st_size)
     if observed != file_bytes or sum(observed.values()) != inventory.get(
         "export_directory_bytes"
     ):
