@@ -25,38 +25,38 @@ GRIDBOOK_SERVING_RUNTIME_PIN_SCHEMA = (
 GRIDBOOK_SERVING_RUNTIME_REPOSITORY = (
     "https://github.com/RobTand/gridbook.git"
 )
-GRIDBOOK_SERVING_RUNTIME_RELEASE_VERSION = "0.8.9"
+GRIDBOOK_SERVING_RUNTIME_RELEASE_VERSION = "0.8.10"
 GRIDBOOK_SERVING_RUNTIME_COMMIT_PENDING = (
-    "PENDING_GRIDBOOK_V0_8_9_RELEASE_COMMIT"
+    "PENDING_GRIDBOOK_V0_8_10_RELEASE_COMMIT"
 )
 GRIDBOOK_SERVING_RUNTIME_WHEEL_SHA256_PENDING = (
-    "PENDING_GRIDBOOK_V0_8_9_WHEEL_SHA256"
+    "PENDING_GRIDBOOK_V0_8_10_WHEEL_SHA256"
 )
-# Resolved 2026-08-18 against the v0.8.9 release.  Neither value is guessed,
+# Resolved 2026-08-18 against the v0.8.10 release.  Neither value is guessed,
 # and neither is transcribed from the other's source:
-#   commit  -- annotated tag v0.8.9, which the release workflow refuses to
+#   commit  -- annotated tag v0.8.10, which the release workflow refuses to
 #              build unless the commit is reachable from origin/master.  It is
 #              also the build recorded in the image tag
-#              `gridbook:0.8.9-clean-23a3955`.
+#              `gridbook:0.8.10-clean-f4b3274`.
 #   wheel   -- read out of that image's installed distribution, from the PEP
 #              610 `direct_url.json` `archive_info.hashes.sha256` of
-#              gridbook-0.8.9-py3-none-any.whl.  This is the digest of the
+#              gridbook-0.8.10-py3-none-any.whl.  This is the digest of the
 #              wheel that is actually importable at serve time, which is the
 #              only digest a serving pin may assert; a locally rebuilt wheel is
 #              a DIFFERENT archive and must not be substituted here without
 #              re-reading it from the served image.
 #
-# As with 0.8.7/0.8.8, this digest IS the PyPI wheel's: the image was built by
-# installing the published `gridbook==0.8.9` archive from a local file rather
-# than rebuilding it, so `pip download gridbook==0.8.9` satisfies the pin
-# instead of tripping the wheel-cache trap documented in
-# docs/audits/serving_wheel_cache_poisoning_2026-08-14.md.
+# As with 0.8.7/0.8.8/0.8.9, this digest IS the PyPI wheel's: the image was
+# built by installing the published `gridbook==0.8.10` archive from a local
+# file rather than rebuilding it, so `pip download gridbook==0.8.10` satisfies
+# the pin instead of tripping the wheel-cache trap documented in
+# docs/audits/serving_wheel_cache_poisoning_2026-08-14.md.  (The PyPI archive
+# was additionally verified member-byte-identical to a rebuild from the tag,
+# 60/60 members.)
 #
-# WHY 0.8.9 AND NOT 0.8.8 for the CB lanes: 0.8.9 defaults the qualified CB
-# kernels on.  Three selectors became tri-state with unset -> auto
-# (PRISMAQUANT_CB_MOE_PERSISTENT_B, PRISMAQUANT_CB_GEMV,
-# PRISMAQUANT_CB_FP8_GEMV_V2); every EXPLICIT spelling keeps its exact prior
-# semantics, so the canonical gold environment -- which pins
+# WHY 0.8.10: 0.8.9 is the release that defaults the qualified CB kernels on
+# (three selectors tri-state with unset -> auto; every EXPLICIT spelling keeps
+# its exact prior semantics, so the canonical gold environment -- which pins
 # PRISMAQUANT_CB_MOE_PERSISTENT_B=0 and PRISMAQUANT_CB_GEMV=inherited --
 # reproduces the recorded gold routes unchanged under this wheel.
 # PRISMAQUANT_CB_FP8_GEMV_V2 is deliberately NOT added to the closed
@@ -65,14 +65,20 @@ GRIDBOOK_SERVING_RUNTIME_WHEEL_SHA256_PENDING = (
 # under this wheel therefore serves the qualified K28 GEMV cell in the routed
 # decode band by default, which the 0.8.9 default-state served leg measured
 # end-to-end on the shipped clean 87 GB body: kl_mean +0.17 %, PPL -0.06 % vs
-# the gold record, inside the +/-0.7 % cross-session KL envelope.  0.8.9 also
-# repairs docker/Dockerfile.gridbook-pinned's GRIDBOOK_REF, which 0.8.8
-# shipped still pointing at v0.8.6.
+# the gold record, inside the +/-0.7 % cross-session KL envelope).  But 0.8.9
+# also shipped a load regression its own suite could not see: the tri-state
+# refactor renamed a moe_gemv_select symbol that gridbook/moe_mixed.py still
+# imported, so any artifact declaring per_expert_format_groups (a split-bank
+# mixed expert stack) died with an ImportError at config.py's dispatch.
+# Uniform stacks -- every published artifact -- were unaffected.  0.8.10 is
+# 0.8.9 plus that fix and its guards; it changes no route, no kernel, and no
+# default for uniform-stack artifacts, so this pin supersedes 0.8.9 with zero
+# serving-behaviour delta on everything we ship today.
 GRIDBOOK_SERVING_RUNTIME_RELEASE_COMMIT = (
-    "23a395518a3d6aa3ee9f27836163fca927744c42"
+    "f4b3274722cc0addac60d25c49f9f5306b933937"
 )
 GRIDBOOK_SERVING_RUNTIME_RELEASE_WHEEL_SHA256 = (
-    "5fe0fd9439023b937a30de4005fd287cf13f4b803814c2e1ec36beeb92c9b5ff"
+    "7a7c98e10bbda3f74b9317de8c396d024f4e0134f43e64d34458d9bbc018d89b"
 )
 GRIDBOOK_SERVING_RUNTIME_CONTRACT_SCHEMA = "gridbook.runtime-contract.v4"
 GRIDBOOK_SERVING_REQUIRED_ABI_FEATURES = {

@@ -3,6 +3,23 @@
 As of: 2026-08-18 · `main` — merge of the `merge/proven-rescues` and
 `fix/aqua-profile-aware-resolver` lines; both lines' stamps follow, newest
 first, each recording its own branch and date. Re-stamped (2026-08-18,
+`main`) for the **Gridbook 0.8.10 serving pin**: 0.8.10 is 0.8.9 plus a fix
+for a load regression 0.8.9's own suite could not see — the tri-state
+refactor renamed a `moe_gemv_select` symbol that `gridbook/moe_mixed.py`
+still imported, so any artifact declaring `per_expert_format_groups` (a
+split-bank mixed expert stack) died with an ImportError at `config.py`'s
+dispatch, while uniform stacks — every published artifact — were unaffected.
+The break shipped green because `tests/test_moe_mixed.py` importorskip'd
+gridbook's own module (the importorskip all-skip trap, second occurrence);
+0.8.10 skips only on missing vLLM, adds a static import-name guard, and the
+serving image build hard-gates `import gridbook.moe_mixed`. No route, codec,
+or default changes for uniform stacks, so the pin supersedes 0.8.9 with zero
+serving-behaviour delta on everything shipped today: pin 0.8.10/v4, commit
+`f4b3274`, wheel digest read from `gridbook:0.8.10-clean-f4b3274`'s PEP 610
+record (PyPI archive byte-identical to a tag rebuild, 60/60 members);
+`fp8_cb_fused_mid_m` gains the 0.8.10 backed-set key carried forward
+unchanged (packaged runtime contract byte-unchanged since 0.8.6).
+Previously re-stamped (2026-08-18,
 `fix/aqua-profile-aware-resolver`) for
 the **Gridbook 0.8.9 serving pin — the qualified CB kernels default on**:
 three selectors became tri-state with unset → auto in Gridbook 0.8.9
