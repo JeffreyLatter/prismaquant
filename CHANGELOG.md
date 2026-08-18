@@ -1,5 +1,68 @@
 # Changelog
 
+## 0.15.0 — 2026-08-18
+
+Merge of two parallel lines: the DSv4-Flash release campaign
+(`fix/aqua-profile-aware-resolver`, 74 commits) and the rescued-work
+integration line (`merge/proven-rescues`, 43 commits).
+
+### Added
+
+- **Gridbook 0.8.9 serving pin — the qualified CB kernels default on.** The
+  serving runtime moves to gridbook 0.8.9 (wheel digest read from the
+  `gridbook:0.8.9-clean-23a3955` image's PEP 610 record), whose three lane
+  selectors are tri-state with unset → auto: persistent-B decode-in-mainloop
+  for routed CB MoE prefill (both payload families), the CB GEMV v2
+  dictionary kernel, and the FP8 whole-row GEMV sibling on its qualified
+  cell. Every explicit spelling keeps its 0.8.8 semantics, so the canonical
+  gold environment replays recorded routes unchanged. Default-state served
+  evidence on the shipped clean 87 GB body: kl_mean +0.17 %, PPL −0.06 % vs
+  its gold record. The `fp8_cb_fused_mid_m` backed set gains its omitted
+  0.8.8 key plus 0.8.9, and the r1–r7 served-validation instruments are
+  tracked under `scripts/pb_validation/`.
+- **The CB ship-gate stack generalized off the DSv4 shape** — the gold
+  contract is a lane read fail-closed from the artifact's own `config.json`;
+  every lane's measurement scripts are tracked; a two-artifact (body +
+  DSpark draft) release is a declared topology with per-role coverage.
+- **AQUA on CB lanes**: the activation answer is priced per format FAMILY
+  under the pinned runtime's executed contract, with anchored dense drivers;
+  a lane that executes nothing refuses the merge instead of pricing a
+  phantom A-side.
+- **Byte-budget partition hardening**: namespace exclusions price exactly
+  once, the partition is pinned through the real `allocator.main()`, and a
+  frozen approval constant can no longer double as a run target.
+- **Artifact-completeness fifth namespace**: the checker reads delegated
+  targets, per-expert split-format group tokens, routed per-role claims, and
+  the DSpark sidecar's published physical→construction bijection — via both
+  the sidecar alias map and the dspark-threaded unit-variant bridge
+  (redundant fail-closed paths; unification is a recorded follow-up).
+- **Publication chain**: publisher rides Xet for large files with digest
+  replay after commit; card figures (`allocation-map.png`, `byte-budget.png`)
+  share the README exclusion from `model_sha`, so documenting an artifact no
+  longer invalidates its own gate records.
+
+### Removed
+
+- **The signed `NVFP4_CB_S*` family is deleted** (registry, encoder,
+  exporter, footprint, serving profile). No native route ever admitted an
+  `n_sub = 1` rung and no allocation on disk referenced one; a recipe
+  carrying `cb_mode: "signed"` now refuses instead of silently resolving to
+  the product rung of the same `k`.
+
+### Fixed
+
+- The streamed DSv4 driver fed the `main` rope table to all compressed
+  layers (the perplexity-262 teacher); the mapping now has one definition
+  and the silent fallback raises. The teacher forward-fidelity gate enforces
+  context-monotonicity on the teacher's own NLL.
+- The public-repo `DATASET` default pointed into a home directory; the dense
+  CB driver read the sensitivity card as a raw npz; `ALLOW_PINNED` was
+  unreachable from the pipeline; a validation rung that doubled as the
+  anchor validated nothing.
+- Native-execution truth is reported per batch regime (decode vs batch), not
+  per unit — the "73.7 % unbacked" DSv4 reading was a regime share.
+
+
 ## 0.14.0 — 2026-08-14
 
 ### Added
