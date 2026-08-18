@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.15.2 — 2026-08-18
+
+### Fixed
+
+- **`tools/measure_served_gold.py` `_tail_logprob`: libm-dependent phantom
+  residual.** A fully-tabulated row can re-exponentiate to `1.0 − 1 ulp` on
+  some libms, and `log()` of that phantom residual returned ≈ −36.7 instead
+  of the documented no-residual answer. Two exact guards: `vocab_size <=
+  len(row)` means there is no untabulated set to estimate, and a residual at
+  or below `len(row)` ulps of 1.0 is summation rounding, not mass. Real
+  residuals still spread max-entropy, clamped at the K-th value. (Numeric
+  effect on any real KL was bounded by ~1e-14 nats; the fix is about the
+  contract, not a measured delta.)
+- **CI: the pinned-contract conformance fixture asked the producer for the
+  deleted signed fp4 family** (removed 2026-08-17). The tiny-export leaf
+  becomes a second product rung at k13; the reference decoder drops the dead
+  signed branch. The test only runs in the pinned-Gridbook CI job, which is
+  why local suites never saw it.
+
 ## 0.15.1 — 2026-08-18
 
 ### Changed
