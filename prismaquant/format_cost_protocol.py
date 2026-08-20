@@ -246,6 +246,57 @@ def weight_dloss_marginal(unit: SensitivityUnit, dw_sq: np.ndarray,
     return 0.5 * (quad / max(1, unit.n_tokens)) * float(gain)
 
 
+def _cuda_reduce_device():
+    """The CUDA device to reduce on, or None.
+
+    The A-side's only heavy arithmetic is ``sum_o g[o] * sum_j W[o,j]^2 var[j]``
+    -- a square and a weighted row-sum over EVERY parameter, once per candidate
+    format. On a 35B-A3B that is ~70 G multiply-adds per format. Running it in
+    numpy float64 on the host is a hot path on the CPU (principle 7), and it
+    pays twice: the float64 promotion of a [256, 1024, 2048] expert tensor
+    allocates 4 GiB before the multiply even starts.
+    """
+    try:
+        import torch
+    except Exception:
+        return None, None
+    if not torch.cuda.is_available():
+        return None, None
+    return torch, torch.device("cuda")
+
+
+def _weighted_row_sum(w, var, g) -> float:
+    """``sum_o g[o] * sum_j w[o, j]^2 * var[j]`` for one row block.
+
+    GPU when there is one, host numpy otherwise, with the SAME accumulation
+    semantics either way: the elementwise square and product are float32 on
+    device but the reduction accumulates in float64
+    (``sum(dtype=torch.float64)``). Every term here is non-negative -- squares
+    times variances -- so there is no cancellation and the float32 products
+    carry ~1e-7 relative error into a float64 sum. `tests/
+    test_packed_expert_aqua_marginals.py` pins the two paths against each other.
+
+    TF32 is not a risk on this path: no ``matmul`` is used. The row-sum is an
+    elementwise multiply plus a reduction, which is memory-bound at these
+    shapes anyway, so the safe formulation is also the fast one.
+    """
+    torch, device = _cuda_reduce_device()
+    if torch is None:
+        w_sq = np.asarray(w, dtype=np.float64) ** 2
+        return float(np.asarray(g, dtype=np.float64) @ (w_sq @ np.asarray(var, dtype=np.float64)))
+    w_t = w if torch.is_tensor(w) else torch.from_numpy(np.ascontiguousarray(w))
+    w_t = w_t.to(device=device, dtype=torch.float32, non_blocking=True)
+    var_t = torch.as_tensor(np.asarray(var, dtype=np.float32), device=device)
+    g_t = torch.as_tensor(np.asarray(g, dtype=np.float64), device=device)
+    rows = (w_t * w_t * var_t).sum(dim=1, dtype=torch.float64)
+    return float((g_t * rows).sum())
+
+
+def _row_chunk(in_features: int, itemsize: int = 4) -> int:
+    """Rows per block, bounding the reduction temporary to 256 MiB."""
+    return max(1, int((256 << 20) // max(1, in_features * itemsize)))
+
+
 def activation_dloss(unit: SensitivityUnit, weight: np.ndarray,
                      act_var: np.ndarray, gain: float = 1.0) -> float | None:
     """AQUA-AURA: loss delta from quantizing the layer's INPUT activations.
@@ -262,30 +313,105 @@ def activation_dloss(unit: SensitivityUnit, weight: np.ndarray,
     NOTE the sensitivity used here is ``g_sq_sum`` (output space), NOT
     ``h_trace`` (weight space). That distinction is the whole point.
     """
+    if unit.has_expert_activation_stats:
+        return _activation_dloss_packed(unit, weight, act_var, gain)
     if unit.g_sq_sum is None:
         return None
     g_sq = np.asarray(unit.g_sq_sum, dtype=np.float64)
-    w = np.asarray(weight)
+    # NOT np.asarray: `weight` may be a device tensor the caller uploaded once
+    # and reuses across formats, and np.asarray would drag it back to the host.
+    w = weight
     var = np.asarray(act_var, dtype=np.float64)
-    if w.shape != (unit.out_features, unit.in_features):
+    if tuple(w.shape) != (unit.out_features, unit.in_features):
         raise ValueError(f"{unit.topology.name}: weight shape mismatch")
     if var.shape != (unit.in_features,):
         raise ValueError(f"{unit.topology.name}: act_var shape mismatch")
 
-    # Chunked over output rows. Promoting the whole weight to float64 and
-    # squaring it costs 8 bytes per parameter -- 10.2 GiB for a 248320 x 5120
-    # lm_head, before the matvec's own temporary -- which is enough on its own
-    # to exhaust a shared 121 GiB pool once a few formats are priced back to
-    # back. The result is a sum over rows, so a row-blocked accumulation is
-    # arithmetically the same quantity at a bounded peak. float64 accumulation
-    # is kept exactly as before.
-    rows_per_chunk = max(1, int((64 << 20) // max(1, unit.in_features * 8)))
+    # Chunked over output rows: squaring the whole weight at once costs a full
+    # extra copy -- 5.1 GiB for a 248320 x 5120 lm_head -- which is enough on
+    # its own to exhaust a shared 121 GiB pool once a few formats are priced
+    # back to back. The result is a sum over rows, so a row-blocked
+    # accumulation is arithmetically the same quantity at a bounded peak.
+    rows_per_chunk = _row_chunk(unit.in_features)
     total = 0.0
     for lo in range(0, unit.out_features, rows_per_chunk):
         hi = min(lo + rows_per_chunk, unit.out_features)
-        w_sq = np.asarray(w[lo:hi], dtype=np.float64) ** 2
-        total += float(g_sq[lo:hi] @ (w_sq @ var))
+        total += _weighted_row_sum(w[lo:hi], var, g_sq[lo:hi])
     return 0.5 * (total / max(1, unit.n_tokens)) * float(gain)
+
+
+def _activation_dloss_packed(unit: SensitivityUnit, weight: np.ndarray,
+                             act_var: np.ndarray,
+                             gain: float = 1.0) -> float | None:
+    """``activation_dloss`` for a packed [E, M, N] routed-expert unit.
+
+    The same quantity, summed over experts BEFORE the global normalization::
+
+        dLoss ~= 0.5 / T_global
+                 * sum_e sum_o g_sq[e, o] * sum_j W[e, o, j]^2 * var[e, j]
+
+    Why this cannot be collapsed to the dense form: routing makes ``g_sq`` and
+    ``var`` functions of e, and ``W`` is a different matrix per e, so the sum of
+    the products is not the product of the sums. Two experts with identical
+    aggregate statistics can differ by orders of magnitude in A-side once you
+    account for WHICH tokens each one saw.
+
+    The normalization asymmetry is deliberate and is the easiest thing to get
+    wrong here. ``g_sq[e]`` is a RAW sum over expert e's routed tokens and is
+    divided by the GLOBAL count, so a rarely-routed expert contributes little --
+    correct, that is its share of the mean-delta-loss objective. ``var[e]`` is
+    already a per-token mean (the caller fits it against ``expert_tokens[e]``),
+    so it carries no frequency information at all. Fitting the variance
+    globally too would discount a rare expert twice.
+    """
+    w = weight
+    g_all = np.asarray(unit.expert_g_sq_sum, dtype=np.float64)
+    var = np.asarray(act_var, dtype=np.float64)
+    n_e = int(g_all.shape[0])
+    if w.ndim != 3 or tuple(w.shape) != (
+            n_e, unit.out_features, unit.in_features):
+        raise ValueError(
+            f"{unit.topology.name}: packed weight shape {w.shape}, expected "
+            f"{(n_e, unit.out_features, unit.in_features)}")
+    if var.shape == (unit.in_features,):
+        # One population variance shared by every expert. Legal (the block
+        # scale is a function of the token, not of the routing decision) and
+        # explicitly broadcast rather than silently indexed.
+        var = np.broadcast_to(var, (n_e, unit.in_features))
+    elif var.shape != (n_e, unit.in_features):
+        raise ValueError(
+            f"{unit.topology.name}: packed act_var shape {var.shape}, expected "
+            f"{(n_e, unit.in_features)} or {(unit.in_features,)}")
+
+    # Chunked over output rows within each expert, same bound as the dense
+    # path: a [256, 2048, 512] gate_up promoted to float64 whole is 2 GiB
+    # before the temporary, and several formats are priced back to back.
+    rows_per_chunk = _row_chunk(unit.in_features)
+    total = 0.0
+    for e in range(n_e):
+        g_e = g_all[e]
+        v_e = var[e]
+        w_e = w[e]
+        for lo in range(0, unit.out_features, rows_per_chunk):
+            hi = min(lo + rows_per_chunk, unit.out_features)
+            total += _weighted_row_sum(w_e[lo:hi], v_e, g_e[lo:hi])
+    return 0.5 * (total / max(1, unit.n_tokens)) * float(gain)
+
+
+def expert_act_sigma(unit: SensitivityUnit) -> np.ndarray | None:
+    """Per-expert per-channel activation sigma, [E, N].
+
+    ``expert_act_sq_sum[e]`` divided by expert e's OWN routed token count.
+    An expert that saw zero calibration tokens yields a zero row: it has no
+    measured activation distribution, and inventing one would put a fabricated
+    A-side on the least-evidenced part of the model.
+    """
+    if unit.expert_act_sq_sum is None or unit.expert_tokens is None:
+        return None
+    sq = np.asarray(unit.expert_act_sq_sum, dtype=np.float64)
+    tok = np.asarray(unit.expert_tokens, dtype=np.float64)
+    denom = np.maximum(tok, 1.0)[:, None]
+    return np.sqrt(sq / denom)
 
 
 def price_activation_only(unit: SensitivityUnit, weight: np.ndarray,
@@ -334,6 +460,13 @@ def price_activation_only(unit: SensitivityUnit, weight: np.ndarray,
     # NVFP4, and 0.45 on L0 down_proj), which is why (1) exists as an option
     # rather than a claim that (2) is good enough everywhere.
     var = act_var
+    if var is None and unit.has_expert_activation_stats:
+        # A packed unit needs a variance PER EXPERT; the dense measure would
+        # read `act_sq_sum`, which a packed entry does not have, and return
+        # None -- reading as a hole rather than as the wrong shape.
+        measure = getattr(plugin, "expert_activation_error_variance", None)
+        if callable(measure):
+            var = measure(unit)
     if var is None:
         measure = getattr(plugin, "activation_error_variance", None)
         if callable(measure):

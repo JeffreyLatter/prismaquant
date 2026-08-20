@@ -75,6 +75,8 @@ from collections import defaultdict
 from pathlib import Path
 import tempfile
 
+import numpy as np
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -558,6 +560,7 @@ def _accumulate_packed_per_token_fisher(
     scalar_acc: dict,
     channel_acc: dict | None,
     full_acc: dict | None,
+    marginal_acc: dict | None = None,
 ) -> None:
     """Per-token-summed empirical Fisher moments for one expert's Linear
     application inside a packed [E, M, N] MoE parameter.
@@ -613,6 +616,61 @@ def _accumulate_packed_per_token_fisher(
         cur[expert_idx].add_(chunk_h.to("cpu", torch.float32))
         del chunk_h
 
+    if marginal_acc is not None:
+        # AQUA A-side marginals for THIS expert slice. Both are pure
+        # reductions of tensors the Fisher path already materialized, so
+        # they add no matmul and no extra device→host sync (the flush is
+        # batched by the caller, exactly like `h_trace_per_expert_raw`).
+        #
+        #   g_sq_sum [E, M] : Σ_{t routed to e} gy_{t,m}²   -- RAW sum.
+        #   act_sq_sum [E, N]: Σ_{t routed to e} x_{t,n}²   -- RAW sum.
+        #   act_absmax [E, N]: max_t |x_{t,n}|              -- a BOUND.
+        #   tokens [E]      : |{t routed to e}|             -- see below.
+        #
+        # `tokens` is the piece with no dense analogue and it is not
+        # optional. The two raw sums feed two DIFFERENT normalizations
+        # downstream and only one of them is global:
+        #
+        #   * g_sq_sum is divided by the GLOBAL token count, because that
+        #     is what carries an expert's share of the mean-Δloss
+        #     objective (a rarely-routed expert SHOULD price low). This is
+        #     the PR #14 convention `finalize_fisher_stats` already
+        #     enforces for h_trace.
+        #   * act_sq_sum is divided by this expert's ROUTED count, because
+        #     it is fitting the per-token noise magnitude of the rows that
+        #     actually flow through the expert. Dividing it globally too
+        #     would discount a rare expert TWICE -- once correctly in g,
+        #     once wrongly in the variance -- which is PR #14's inverted
+        #     importance weighting in mirror image.
+        #
+        # The packed stat entry's `n_tokens_seen` is the layer's global
+        # count, so the routed denominator has to be recorded here.
+        slot = marginal_acc.get(name)
+        if slot is None:
+            slot = {
+                "expert_g_sq_sum": torch.zeros(
+                    num_experts, gy2.size(1), dtype=torch.float32,
+                    device=gy2.device),
+                "expert_act_sq_sum": torch.zeros(
+                    num_experts, x2.size(1), dtype=torch.float32,
+                    device=x2.device),
+                "expert_act_absmax": torch.zeros(
+                    num_experts, x2.size(1), dtype=torch.float32,
+                    device=x2.device),
+                "expert_tokens": torch.zeros(
+                    num_experts, dtype=torch.float64, device=x2.device),
+            }
+            marginal_acc[name] = slot
+        slot["expert_g_sq_sum"][expert_idx].add_(
+            gy_sq.sum(dim=0, dtype=torch.float32))
+        slot["expert_act_sq_sum"][expert_idx].add_(
+            x_sq.sum(dim=0, dtype=torch.float32))
+        torch.maximum(
+            slot["expert_act_absmax"][expert_idx],
+            x2.abs().amax(dim=0).to(torch.float32),
+            out=slot["expert_act_absmax"][expert_idx])
+        slot["expert_tokens"][expert_idx].add_(float(x2.size(0)))
+
 
 def _packed_expert_slice_index(weight: torch.Tensor,
                                param: torch.Tensor) -> int | None:
@@ -659,13 +717,15 @@ class _PackedLinearPerTokenFisher(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x, weight, bias, orig_linear, name, expert_idx,
-                num_experts, scalar_acc, channel_acc, full_acc):
+                num_experts, scalar_acc, channel_acc, full_acc,
+                marginal_acc=None):
         ctx.name = name
         ctx.expert_idx = expert_idx
         ctx.num_experts = num_experts
         ctx.scalar_acc = scalar_acc
         ctx.channel_acc = channel_acc
         ctx.full_acc = full_acc
+        ctx.marginal_acc = marginal_acc
         ctx.has_bias = bias is not None
         ctx.set_materialize_grads(False)
         ctx.save_for_backward(x, weight)
@@ -674,16 +734,17 @@ class _PackedLinearPerTokenFisher(torch.autograd.Function):
     @staticmethod
     def backward(ctx, gy):
         if gy is None:
-            return (None,) * 11
+            return (None,) * 12
         x, w = ctx.saved_tensors
         _accumulate_packed_per_token_fisher(
             ctx.name, ctx.expert_idx, ctx.num_experts, x, gy,
-            ctx.scalar_acc, ctx.channel_acc, ctx.full_acc)
+            ctx.scalar_acc, ctx.channel_acc, ctx.full_acc,
+            ctx.marginal_acc)
         grad_x = gy.matmul(w) if ctx.needs_input_grad[0] else None
         grad_b = None
         if ctx.has_bias and ctx.needs_input_grad[2]:
             grad_b = gy.reshape(-1, gy.size(-1)).sum(dim=0)
-        return (grad_x, None, grad_b) + (None,) * 8
+        return (grad_x, None, grad_b) + (None,) * 9
 
 
 class _PackedWeightGradFallback(torch.autograd.Function):
@@ -853,6 +914,7 @@ def _packed_expert_projection_candidate_names(profile=None) -> tuple[str, ...]:
 _PRISMAQUANT_PATCH_SENTINEL = "_prismaquant_packed_expert_patch"
 _PRISMAQUANT_CHANNEL_SENTINEL = "_prismaquant_packed_expert_channel_patch"
 _PRISMAQUANT_FULL_SENTINEL = "_prismaquant_packed_expert_full_patch"
+_PRISMAQUANT_MARGINAL_SENTINEL = "_prismaquant_packed_expert_marginal_patch"
 
 
 def install_packed_expert_hooks(
@@ -860,6 +922,7 @@ def install_packed_expert_hooks(
     accumulator: dict,
     channel_accumulator: dict | None = None,
     full_accumulator: dict | None = None,
+    marginal_accumulator: dict | None = None,
     profile=None,
 ) -> dict[str, dict]:
     """Patch every packed-experts module's forward so each expert-slice
@@ -933,6 +996,7 @@ def install_packed_expert_hooks(
             setattr(module, _PRISMAQUANT_PATCH_SENTINEL, accumulator)
             setattr(module, _PRISMAQUANT_CHANNEL_SENTINEL, channel_accumulator)
             setattr(module, _PRISMAQUANT_FULL_SENTINEL, full_accumulator)
+            setattr(module, _PRISMAQUANT_MARGINAL_SENTINEL, marginal_accumulator)
             # Still report metadata so callers can refresh their stats dict.
             for pn in param_names:
                 p_existing = module._parameters.get(pn)
@@ -1031,12 +1095,14 @@ def install_packed_expert_hooks(
         setattr(mod_ref, _PRISMAQUANT_PATCH_SENTINEL, accumulator)
         setattr(mod_ref, _PRISMAQUANT_CHANNEL_SENTINEL, channel_accumulator)
         setattr(mod_ref, _PRISMAQUANT_FULL_SENTINEL, full_accumulator)
+        setattr(mod_ref, _PRISMAQUANT_MARGINAL_SENTINEL, marginal_accumulator)
 
         def patched_forward(*args, _ns=ns, _full=full_names, _orig=original_forward,
                             _mod=mod_ref, **kwargs):
             acc = getattr(_mod, _PRISMAQUANT_PATCH_SENTINEL, None)
             ch_acc = getattr(_mod, _PRISMAQUANT_CHANNEL_SENTINEL, None)
             fu_acc = getattr(_mod, _PRISMAQUANT_FULL_SENTINEL, None)
+            mg_acc = getattr(_mod, _PRISMAQUANT_MARGINAL_SENTINEL, None)
             if acc is None:
                 # Should not happen, but degrade gracefully.
                 return _orig(*args, **kwargs)
@@ -1066,7 +1132,8 @@ def install_packed_expert_hooks(
                     if e is not None:
                         return _PackedLinearPerTokenFisher.apply(
                             input, weight, bias, orig_linear, fn, e,
-                            int(param.shape[0]), acc, ch_acc, fu_acc)
+                            int(param.shape[0]), acc, ch_acc, fu_acc,
+                            mg_acc)
                 return orig_linear(input, weight, bias)
 
             F.linear = _intercepting_linear
@@ -1718,6 +1785,10 @@ class FisherAccumulator:
         # values may be device-resident 0-dim fp32 tensors), read in
         # finalize().
         self._packed_grad_acc: dict[str, float | torch.Tensor] = {}
+        # AQUA per-expert A-side marginals, same estimator and same merge
+        # rules as the incremental backend (the two backends agree on the
+        # packed path or a card built by one mis-prices under the other).
+        self._packed_marginal_acc: dict[str, dict[str, torch.Tensor]] = {}
         # Per-(experts module qname) sample count (one per backward),
         # populated by the experts forward hook below.
         self._packed_sample_count: dict[str, int] = defaultdict(int)
@@ -1915,6 +1986,7 @@ class FisherAccumulator:
                 model,
                 accumulator=self._packed_grad_acc,
                 channel_accumulator=self._h_packed_channel,
+                marginal_accumulator=self._packed_marginal_acc,
                 profile=self.model_profile,
             )
             for full_name, meta in packed_meta.items():
@@ -2195,6 +2267,13 @@ class FisherAccumulator:
                 self.stats[full_name]["h_trace_raw"] += float(raw)
                 self.stats[full_name]["n_tokens_seen"] = int(
                     self._packed_sample_count.get(full_name, 0))
+        for full_name, slot in self._packed_marginal_acc.items():
+            entry = self.stats.get(full_name)
+            if entry is None:
+                continue
+            for key, tensor in slot.items():
+                entry[key] = tensor.detach().to("cpu").numpy().astype(
+                    np.float64 if key == "expert_tokens" else np.float32)
 
         if tracker is not None:
             for name, s in self.stats.items():

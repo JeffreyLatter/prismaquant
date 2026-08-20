@@ -41,6 +41,12 @@ from .sensitivity_card import (
 
 VECTOR_KEYS = ("fisher_row", "fisher_col", "g_sq_sum", "act_sq_sum", "act_absmax")
 
+# The packed-expert A-side arrays. Kept apart from VECTOR_KEYS because they are
+# [E, *] matrices, and `_as_vector` deliberately rejects anything that is not a
+# 1-D per-Linear vector.
+EXPERT_KEYS = ("expert_g_sq_sum", "expert_act_sq_sum", "expert_act_absmax",
+               "expert_tokens")
+
 # Role is read off the module name. This is descriptive metadata for consumers
 # that price per-role; it never gates a format, so an unrecognised name simply
 # yields None rather than an error.
@@ -103,6 +109,14 @@ def _as_vector(value: Any) -> np.ndarray | None:
         return None
     arr = np.asarray(value, dtype=np.float32)
     return arr if arr.ndim == 1 and arr.size else None
+
+
+def _as_expert_array(value: Any, ndim: int) -> np.ndarray | None:
+    """A packed-expert marginal: [E, C] for the sums, [E] for the counts."""
+    if value is None:
+        return None
+    arr = np.asarray(value, dtype=np.float32)
+    return arr if arr.ndim == ndim and arr.size else None
 
 
 def _git_commit(repo: str | None = None) -> str:
@@ -180,6 +194,28 @@ def card_from_probe(
             expert_id = int(s["expert_id"])
 
         vectors = {k: _as_vector(s.get(k)) for k in VECTOR_KEYS}
+        vectors.update({
+            k: _as_expert_array(s.get(k), 1 if k == "expert_tokens" else 2)
+            for k in EXPERT_KEYS
+        })
+        # Shape agreement is the wiring check: these arrays index by expert on
+        # dim 0 and by the SAME channel axis the unit declares on dim 1. A
+        # transposed or stale array would price a real A-side against the wrong
+        # channels and still look plausible, so refuse instead of pricing it.
+        n_e = int(s.get("num_experts", 0) or 0)
+        expected = {
+            "expert_g_sq_sum": (n_e, out_features),
+            "expert_act_sq_sum": (n_e, in_features),
+            "expert_act_absmax": (n_e, in_features),
+            "expert_tokens": (n_e,),
+        }
+        for k, want in expected.items():
+            got = vectors.get(k)
+            if got is not None and tuple(got.shape) != want:
+                raise ValueError(
+                    f"{name}: {k} has shape {tuple(got.shape)}, expected "
+                    f"{want} from the probe's num_experts/out_features/"
+                    f"in_features -- refusing to build a card on it")
 
         units.append(SensitivityUnit(
             topology=UnitTopology(
@@ -223,6 +259,16 @@ def summarize(card: SensitivityCard) -> dict[str, Any]:
     units = card.units()
     with_vec = sum(1 for u in units if u.has_vectors)
     with_gsq = sum(1 for u in units if u.g_sq_sum is not None)
+    with_expert_act = sum(1 for u in units if u.has_expert_activation_stats)
+    expert_floats = sum(
+        sum(np.asarray(getattr(u, k)).size
+            for k in EXPERT_KEYS if getattr(u, k) is not None)
+        for u in units)
+    # Params, not units, is the honest denominator for "is this card
+    # activation-aware": on an MoE the expert tensors ARE the model.
+    aqua_params = sum(
+        u.n_params for u in units
+        if u.g_sq_sum is not None or u.has_expert_activation_stats)
     vec_floats = sum(
         sum(np.asarray(getattr(u, k)).size
             for k in VECTOR_KEYS if getattr(u, k) is not None)
@@ -236,11 +282,15 @@ def summarize(card: SensitivityCard) -> dict[str, Any]:
         "n_units": len(units),
         "n_units_with_vectors": with_vec,
         "n_units_aqua_ready": with_gsq,
+        "n_units_with_expert_act_stats": with_expert_act,
+        "expert_vector_floats": expert_floats,
+        "expert_vector_mb_float32": round(expert_floats * 4 / 1e6, 2),
         "n_fused_groups": len(card.fused_groups()),
         "n_packed_groups": len(card.packed_groups()),
         "vector_floats": vec_floats,
         "vector_mb_float32": round(vec_floats * 4 / 1e6, 2),
         "quantizable_params": sum(u.n_params for u in units),
+        "aqua_priceable_params": aqua_params,
     }
 
 

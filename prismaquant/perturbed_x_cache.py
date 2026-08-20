@@ -488,6 +488,7 @@ class PerturbedActivationCache:
         for plan in self.plans:
             if self._try_install_nvfp4_fused_forward(plan):
                 continue
+            self._install_packed_expert_activation_quant(plan)
             self._handles.append(
                 plan.module.register_forward_pre_hook(
                     self._make_pre_hook(plan),
@@ -1122,6 +1123,89 @@ class PerturbedActivationCache:
             param.data.copy_(original.to(device=param.device, dtype=param.dtype))
         plan.active_originals.clear()
 
+    def _packed_act_plan(self, plan: _ModulePlan) -> list[_ParamPlan] | None:
+        """The per-projection params of a packed-experts plan, or None.
+
+        A packed-experts module owns several 3-D projection parameters and is
+        not an ``nn.Linear``, so the module-level pre-hook can only ever see
+        ONE of their inputs -- the module input, which is gate_up's. down_proj
+        consumes the post-SwiGLU intermediate produced INSIDE the forward, and
+        no hook on the module boundary can reach it.
+
+        That is not a cosmetic gap. vLLM's ``CompressedTensorsW4A4Nvfp4MoEMethod``
+        registers BOTH ``w13_input_global_scale`` and ``w2_input_global_scale``:
+        the served runtime quantizes both activations. A gate that emulates only
+        one of them measures a cheaper model than the one that ships, on the
+        half of the MoE FLOPs it left alone -- and it is the selecting gate, so
+        the error goes straight into which assignment is chosen.
+        """
+        if not self.include_activation_quant or len(plan.params) < 2:
+            return None
+        if isinstance(plan.module, nn.Linear):
+            return None
+        members = [
+            p for p in plan.params
+            if getattr(p.spec, "act_quant_changes_input", False)
+            and getattr(getattr(plan.module, p.attr, None), "ndim", 0) == 3
+        ]
+        return members or None
+
+    def _install_packed_expert_activation_quant(self, plan: _ModulePlan) -> None:
+        """Quantize each expert-slice ``F.linear`` input with ITS OWN spec.
+
+        Same interception the probe uses to capture packed-expert Fisher
+        (``sensitivity_probe.install_packed_expert_hooks``): swap ``F.linear``
+        for the duration of the experts-module forward and dispatch on whether
+        the weight is a dim-0 slice of one of this plan's packed parameters.
+        Eval-time only -- no autograd Function, no gradient path.
+
+        Each projection uses its own calibrated activation scale, keyed by its
+        own param name. The module-level pre-hook's act-qdq is suppressed for
+        these plans (see ``_make_pre_hook``) so gate_up's input is quantized
+        exactly once, here, rather than once there and once again inside.
+        """
+        members = self._packed_act_plan(plan)
+        if members is None:
+            return
+        from prismaquant.sensitivity_probe import _packed_expert_slice_index
+
+        module = plan.module
+        original_forward = module.forward
+        owner = self
+
+        def _forward(*args, **kwargs):
+            targets: dict[int, _ParamPlan] = {}
+            params: dict[int, torch.Tensor] = {}
+            for member in members:
+                param = getattr(module, member.attr, None)
+                if not isinstance(param, torch.Tensor) or param.ndim != 3:
+                    continue
+                targets[id(param)] = member
+                params[id(param)] = param
+            if not targets:
+                return original_forward(*args, **kwargs)
+            orig_linear = F.linear
+
+            def _intercepting_linear(input, weight, bias=None):
+                base = weight._base if weight._is_view() else weight
+                member = targets.get(id(base))
+                if member is not None and isinstance(input, torch.Tensor):
+                    if _packed_expert_slice_index(
+                            weight, params[id(base)]) is not None:
+                        input = _activation_qdq(
+                            input, member.spec, owner._activation_scales,
+                            member.name)
+                return orig_linear(input, weight, bias)
+
+            F.linear = _intercepting_linear
+            try:
+                return original_forward(*args, **kwargs)
+            finally:
+                F.linear = orig_linear
+
+        module.forward = _forward
+        self._fused_forward_originals.append((module, original_forward))
+
     def _make_pre_hook(self, plan: _ModulePlan):
         def _pre_hook(_module, args, kwargs):
             where, key, x = _first_tensor_location(args, kwargs)
@@ -1130,6 +1214,12 @@ class PerturbedActivationCache:
                 member_name = _module_input_member_name(plan, x)
                 x_runtime = x
                 act_spec = self._active_activation_spec(plan)
+                if self._packed_act_plan(plan) is not None:
+                    # Handled per projection inside the forward, where
+                    # down_proj's input is reachable and each projection gets
+                    # its own calibrated scale. Quantizing here too would put
+                    # gate_up's input through the quantizer twice.
+                    act_spec = None
                 if act_spec is not None:
                     # MED-3: act-clip to the calibrated max_abs before the
                     # quantizer, so outliers don't dominate per-group

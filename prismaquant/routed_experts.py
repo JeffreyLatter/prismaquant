@@ -203,10 +203,30 @@ class ProfileRoutedExpertClassifier:
 
         group_keys = {group for _candidate, group in grouped}
         if len(group_keys) != 1:
-            raise RuntimeError(
-                f"profile {type(self.profile).__name__} assigns conflicting "
-                f"routed-expert groups to {qname!r}: {sorted(group_keys)!r}"
-            )
+            # `grouped` holds groups derived from the THREE spellings of ONE
+            # Linear (live / recipe / vLLM-internal), and
+            # `packed_expert_format_group` builds its key as
+            # f"{parent}::__packed_format__:{projections}" from whichever
+            # spelling it was handed. So on any model whose namespaces differ
+            # by a prefix -- a multimodal wrapper contributes
+            # `model.language_model.` on the checkpoint side and
+            # `language_model.model.` on the vLLM side, against a bare
+            # `model.` recipe name -- the raw keys ALWAYS differ and this gate
+            # fires on a naming artifact rather than a declaration conflict.
+            # Compare what actually carries meaning instead: the projection
+            # grouping, and the structural position from `layers.` onward.
+            # Those still catch a profile that groups one Linear two different
+            # ways, or that points two spellings at different layers.
+            def _meaning(key: str) -> tuple[str, str]:
+                parent, _, grouping = key.partition("::")
+                idx = parent.find("layers.")
+                return (parent[idx:] if idx != -1 else parent), grouping
+
+            if len({_meaning(group) for _candidate, group in grouped}) != 1:
+                raise RuntimeError(
+                    f"profile {type(self.profile).__name__} assigns conflicting "
+                    f"routed-expert groups to {qname!r}: {sorted(group_keys)!r}"
+                )
         profile_qname = grouped[0][0]
         projection = profile_qname.rsplit(".", 1)[-1]
         if projection not in self.projection_names:
@@ -218,7 +238,11 @@ class ProfileRoutedExpertClassifier:
         return RoutedExpertMatch(
             qname=str(qname),
             profile_qname=profile_qname,
-            group_key=next(iter(group_keys)),
+            # Deterministic: the first spelling that produced a group, not an
+            # arbitrary element of a set. Every member of one experts module
+            # walks the same candidate order, so siblings agree and union-find
+            # still fuses them.
+            group_key=grouped[0][1],
             projection_name=projection,
             regex_declared=regex_declared,
         )

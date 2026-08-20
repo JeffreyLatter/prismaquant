@@ -30,7 +30,7 @@ import numpy as np
 import torch
 
 from .format_registry import FormatSpec, get_format
-from .format_cost_protocol import FormatDescriptor
+from .format_cost_protocol import FormatDescriptor, expert_act_sigma
 from .sensitivity_card import SensitivityUnit
 
 # Formats that copy an already-matching source tensor verbatim. The allocator
@@ -308,6 +308,72 @@ class RegistryFormatPlugin:
         out = per_channel.cpu().numpy().astype(np.float64)
         if not np.all(np.isfinite(out)):
             return None
+        return out
+
+    def expert_activation_error_variance(self, unit: SensitivityUnit,
+                                         ) -> np.ndarray | None:
+        """Per-expert per-channel activation-quant error variance, [E, N].
+
+        Same estimator as :meth:`activation_error_variance` -- synthetic rows
+        scaled to the measured second moment, clipped to the measured absmax,
+        pushed through the format's own quantizer -- but fitted per expert,
+        because on a routed MoE the activation distribution IS a function of
+        the expert: the router sends systematically different tokens to
+        different experts, which is the entire premise of routing.
+
+        Batched: activation quantization is per-token (NVFP4's block scale is
+        set within one row), so stacking every expert's synthetic rows into
+        one tensor and reducing per expert is arithmetically identical to E
+        separate calls, at a fraction of the launch overhead. Chunked over
+        experts so the temporary stays bounded regardless of E.
+        """
+        if not self.descriptor.quantizes_activations:
+            return None
+        sigma = expert_act_sigma(unit)
+        if sigma is None:
+            return None
+        n_e, n_in = sigma.shape
+        dev = torch.device(self.device)
+        # ONE standard-normal draw, shared by every expert (common random
+        # numbers), generated on the CPU with the same seed the dense path
+        # uses so the estimate stays deterministic and machine-independent.
+        #
+        # Drawing independently per expert instead costs ~65 s of CPU randn on
+        # a 40-layer 256-expert model -- more than half this stage's wall clock
+        # -- to buy nothing: the experts differ by sigma and by the clip bound,
+        # not by the underlying sample. Sharing the draw is also the LOWER
+        # variance estimator for what this feeds, which is a comparison BETWEEN
+        # experts: the common component cancels out of the difference.
+        gen = torch.Generator(device="cpu").manual_seed(self.seed)
+        base = torch.randn(self.act_samples, n_in,
+                           generator=gen, dtype=torch.float32).to(dev)
+        sig_t = torch.as_tensor(sigma, dtype=torch.float32, device=dev)
+        cap = (torch.as_tensor(np.asarray(unit.expert_act_absmax),
+                               dtype=torch.float32, device=dev)
+               if unit.expert_act_absmax is not None else None)
+        out = np.zeros((n_e, n_in), dtype=np.float64)
+        # ~64 MiB of bf16 per chunk before the quantizer's own temporaries.
+        per_chunk = max(1, int((32 << 20) // max(1, self.act_samples * n_in)))
+        for lo in range(0, n_e, per_chunk):
+            hi = min(lo + per_chunk, n_e)
+            k = hi - lo
+            x = base.unsqueeze(0) * sig_t[lo:hi].unsqueeze(1)   # [k, S, N]
+            if cap is not None:
+                c = cap[lo:hi].unsqueeze(1)
+                x = torch.clamp(x, -c, c)
+            x = x.reshape(k * self.act_samples, n_in).to(torch.bfloat16)
+            with torch.no_grad():
+                xq = self.spec.activation_quantize_dequantize(x)
+                err = (x.float() - xq.float()) ** 2
+                per = err.view(k, self.act_samples, n_in).mean(dim=1)
+            out[lo:hi] = per.double().cpu().numpy()
+            del x, xq, err, per
+        if not np.all(np.isfinite(out)):
+            return None
+        # An expert that saw no calibration tokens has sigma == 0, so the
+        # quantizer returns exact zeros and its A-side is 0.0. That is the
+        # honest answer for "no evidence", and it is visible in the census
+        # rather than hidden: `expert_tokens` records the zero.
         return out
 
 

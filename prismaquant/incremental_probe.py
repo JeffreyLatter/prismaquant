@@ -20,10 +20,19 @@ output format matches `sensitivity_probe.run_probe_pass` / `streaming_probe`
 unchanged — the allocator consumes either. The two backends also agree on
 the estimator and normalization conventions: per-token-summed empirical
 Fisher (Σ_t ‖∇_t‖², including packed experts via the F.linear
-interception in `install_packed_expert_hooks`), divided by the tokens
-each entry actually saw (routed tokens for MoE experts — the single
-implicit ÷token-fraction; `run_probe_pass` used to apply a second
-÷route_prob, removed per audit M4).
+interception in `install_packed_expert_hooks`), divided by the GLOBAL
+calibration token count for every row -- dense and MoE expert alike.
+(This paragraph used to say "the tokens each entry actually saw (routed
+tokens for MoE experts)". That was audit M4's convention and PR #14
+reversed it: a per-routed-token denominator inflates a rarely-routed
+expert by global/routed, which is inverted importance weighting for the
+mean-Δloss objective. `finalize_fisher_stats` carries the derivation.)
+
+The one quantity that is still per-routed-token is the AQUA A-side's
+activation VARIANCE fit, and deliberately so: `expert_act_sq_sum` is
+divided by `expert_tokens[e]` because it models the per-token noise
+magnitude of the rows that flow through expert e, not that expert's
+share of the objective. See `_accumulate_packed_per_token_fisher`.
 """
 from __future__ import annotations
 
@@ -88,6 +97,14 @@ _MARGINAL_KEYS = (
 # act_absmax is a BOUND, not a total: it merges by elementwise maximum
 # across chunks/shards. Summing it would inflate it without bound.
 _MARGINAL_MAX_KEYS = frozenset({"act_absmax"})
+
+# The packed-expert (AQUA) counterparts. Separate from `_MARGINAL_KEYS`
+# because these are [E, *] per-expert arrays produced by the F.linear
+# interception, not the 1-D per-Linear vectors the dense backward hook
+# flushes through `_marginal_flush`.
+_PACKED_MARGINAL_KEYS = (
+    "expert_g_sq_sum", "expert_act_sq_sum", "expert_act_absmax",
+    "expert_tokens")
 
 
 def _marginals_enabled() -> bool:
@@ -2637,6 +2654,15 @@ def _run_body_streaming_shard(
             packed_channel_acc: dict[str, torch.Tensor] = {}
             packed_full_acc: dict[str, torch.Tensor] | None = (
                 {} if h_detail_dir is not None else None)
+            # AQUA A-side marginals per expert. Dense Linears get theirs
+            # from `_marginal_accumulate` on the nn.Linear backward hook;
+            # a packed [E, M, N] expert parameter is not an nn.Linear and
+            # has no such hook, which is why an AQUA card built before
+            # this carried an A-side for the dense trunk only -- 5.5% of
+            # this model's parameters. The F.linear interception is the
+            # equivalent site: it already holds (x, gy) for the slice.
+            packed_marginal_acc: dict[str, dict[str, torch.Tensor]] = (
+                {} if _marginals_enabled() else None)
             # Reverse-sweep visits every layer (gradient chain-rule needs
             # all of them), but Fisher stats should only be recorded for
             # layers in this shard's scope. Skip the packed-expert install
@@ -2663,6 +2689,7 @@ def _run_body_streaming_shard(
                 layers[L], accumulator=packed_grad_acc,
                 channel_accumulator=packed_channel_acc,
                 full_accumulator=packed_full_acc,
+                marginal_accumulator=packed_marginal_acc,
                 profile=_shard_profile,
             ) if layer_in_scope else {}
             layer_prefix = f"{layers_prefix}{L}."
@@ -2861,6 +2888,29 @@ def _run_body_streaming_shard(
                     acc_stats[full_key]["h_trace_per_expert_raw"] = summed
             packed_channel_acc.clear()
 
+            # Per-expert AQUA marginals. One .cpu() per array (four per
+            # packed param per layer -- the arrays are [E, M] / [E, N] /
+            # [E], so ~8 MB per MoE layer at E=256; the dense marginals'
+            # single-concat discipline buys nothing at that count).
+            for local_key, slot in (packed_marginal_acc or {}).items():
+                full_key = f"{layer_prefix}{local_key}"
+                entry = acc_stats.get(full_key)
+                if entry is None:
+                    continue
+                for key, tensor in slot.items():
+                    host = tensor.detach().to("cpu").numpy()
+                    host = host.astype(
+                        np.float64 if key == "expert_tokens" else np.float32)
+                    prev = entry.get(key)
+                    if prev is None:
+                        entry[key] = host.copy()
+                    elif key == "expert_act_absmax":
+                        entry[key] = np.maximum(prev, host)
+                    else:
+                        entry[key] = prev + host
+            if packed_marginal_acc:
+                packed_marginal_acc.clear()
+
             grad_out = x_in.grad.detach().clone().cpu()
 
             for h in handles:
@@ -2890,6 +2940,22 @@ def _run_body_streaming_shard(
                             prev["h_trace_per_expert_raw"] = [
                                 a + b for a, b in zip(per_prev, per_new)
                             ]
+                    # Per-expert AQUA marginals follow the SAME merge
+                    # rules as the dense ones: sums add, an absmax bound
+                    # maxes. Kept beside `h_trace_per_expert_raw` rather
+                    # than inside `merge_marginals` because those arrays
+                    # are 1-D per-Linear and these are [E, *] per-expert.
+                    for key in _PACKED_MARGINAL_KEYS:
+                        new = s.get(key)
+                        if new is None:
+                            continue
+                        old_v = prev.get(key)
+                        if old_v is None:
+                            prev[key] = np.asarray(new).copy()
+                        elif key == "expert_act_absmax":
+                            prev[key] = np.maximum(old_v, np.asarray(new))
+                        else:
+                            prev[key] = np.asarray(old_v) + np.asarray(new)
             if collect_h_full:
                 for fqn, h in acc_h_full.items():
                     if fqn in merged_h_full:

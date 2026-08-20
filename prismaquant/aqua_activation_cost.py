@@ -114,16 +114,26 @@ def build_weight_resolver(weight_map: dict, profile=None) -> dict:
     ``source_tensor_name`` rewrites the path but not the leaf, so it yields
     ``layers.0.ffn.experts.0.down_proj``, which is not a key.
     """
+    # A packed routed-expert parameter is a bare 3-D tensor with NO ``.weight``
+    # suffix -- ``...mlp.experts.gate_up_proj``, not ``....gate_up_proj.weight``
+    # -- because it is an ``nn.Parameter`` on the experts module rather than an
+    # ``nn.Linear``. Indexing only ``.weight`` keys therefore drops every expert
+    # tensor, which on an A3B is 94% of the parameters. They resolved to nothing
+    # and were reported as "units without an act price" -- an accurate count of
+    # a silent hole.
+    def _bases(key: str):
+        base = key[: -len(".weight")] if key.endswith(".weight") else key
+        yield base
+        if ".language_model." in base:
+            yield base.replace("model.language_model.", "model.")
+
     idx: dict[str, str] = {}
     for key in weight_map:
-        if key.endswith(".weight"):
-            idx[key[: -len(".weight")]] = key
+        own = next(iter(_bases(key)))
+        idx[own] = key
     for key in weight_map:
-        if not key.endswith(".weight"):
-            continue
-        base = key[: -len(".weight")]
-        if ".language_model." in base:
-            idx.setdefault(base.replace("model.language_model.", "model."), key)
+        for alias in list(_bases(key))[1:]:
+            idx.setdefault(alias, key)
     if profile is not None:
         mapped = 0
         for key in weight_map:
@@ -441,21 +451,44 @@ def activation_dloss_table(card, model_path: str, formats: list[str], *,
                                        device="cpu") as sh:
                             scale_t = sh.get_tensor(scale_key)
                 w_t = materialize_source_weight(name, raw, scale_t, fp8_map)
-                if tuple(w_t.shape) != (unit.out_features, unit.in_features):
+                # A packed routed-expert unit is [E, out, in]: ONE decision
+                # unit, E matrices. `out_features`/`in_features` describe one
+                # expert's slice (that is what the probe recorded), so the
+                # expected rank depends on whether the card carries per-expert
+                # statistics for it.
+                n_experts = unit.n_experts
+                want = ((unit.out_features, unit.in_features)
+                        if n_experts is None else
+                        (n_experts, unit.out_features, unit.in_features))
+                if tuple(w_t.shape) != want:
                     raise RuntimeError(
                         f"{name}: materialized weight has shape "
-                        f"{tuple(w_t.shape)}, expected "
-                        f"({unit.out_features}, {unit.in_features}) from the "
+                        f"{tuple(w_t.shape)}, expected {want} from the "
                         f"probe stats (source dtype {raw.dtype}, "
                         f"{'scale-mapped' if entry else 'dense'}); refusing "
                         f"to price a wrong-shaped W")
-                w_np = w_t.to(torch.float32).numpy()
+                # Uploaded ONCE per unit and reused by every candidate format:
+                # the A-side reduction is GPU work (principle 7), and pricing a
+                # 3-format menu off a host array would either copy the tensor
+                # three times or do 70 G float64 multiply-adds on the CPU. On a
+                # packed expert tensor that is 2 GiB of copy per format.
+                w_np = w_t.to(device=device, dtype=torch.float32) \
+                    if torch.cuda.is_available() and device != "cpu" \
+                    else w_t.to(torch.float32).numpy()
                 del raw, scale_t, w_t
                 # Real input rows if the probe cached them for this Linear.
                 # Loaded once per unit and reused across formats -- the tensor
                 # is the same batch, only the quantizer differs.
                 x_cpu = None
-                if act_dir:
+                # Packed units deliberately do NOT take the measured path.
+                # The probe caches the experts MODULE's input -- every token
+                # before routing -- so a measured variance from it is one
+                # population figure shared by all E experts, which is exactly
+                # the routing structure this unit needs to keep. The per-expert
+                # synthetic fit (source 2) is used instead: it loses the
+                # cross-channel joint but keeps the per-expert distribution,
+                # and routing is the larger effect on a 256-expert layer.
+                if act_dir and n_experts is None:
                     p = cached_act_path(act_dir, name)
                     if os.path.exists(p):
                         blob_ = torch.load(p, map_location="cpu",
@@ -472,7 +505,8 @@ def activation_dloss_table(card, model_path: str, formats: list[str], *,
                 for fmt in formats:
                     try:
                         plugin = RegistryFormatPlugin.build(
-                            fmt, shape=tuple(w_np.shape), device=device)
+                            fmt, shape=(unit.out_features, unit.in_features),
+                            device=device)
                     except Exception as exc:
                         holes[fmt].append(f"{name}: unbuildable ({exc})")
                         continue
@@ -492,7 +526,12 @@ def activation_dloss_table(card, model_path: str, formats: list[str], *,
                     v = None
                     if x_cpu is not None:
                         v = measured_act_var(plugin.spec, x_cpu, device)
-                    var_source["measured" if v is not None else "modelled"] += 1
+                    if v is not None:
+                        var_source["measured"] += 1
+                    elif n_experts is None:
+                        var_source["modelled"] += 1
+                    else:
+                        var_source["modelled_per_expert"] += 1
                     a = price_activation_only(unit, w_np, plugin, act_var=v)
                     if a is None:
                         holes[fmt].append(name)
@@ -511,9 +550,10 @@ def activation_dloss_table(card, model_path: str, formats: list[str], *,
                     log(f"  priced {done}/{len(resolvable)} "
                         f"({time.time() - t0:.0f}s)")
     log(f"A-side priced for {len(table)} units in {time.time() - t0:.0f}s")
-    if act_dir:
+    if var_source:
         log(f"act_var source: {dict(var_source)} (measured = real cached "
-            f"activations, modelled = per-channel Gaussian fit)")
+            f"activations; modelled = per-channel Gaussian fit; "
+            f"modelled_per_expert = the same fit, one per routed expert)")
     if non_act:
         log(f"formats that leave activations alone (correctly unpriced): "
             f"{sorted(non_act)}")

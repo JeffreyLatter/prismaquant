@@ -1,8 +1,34 @@
 # PrismaQuant Architecture
 
-As of: 2026-08-20 · `main` — stamps follow, newest first, each recording its own
-branch and date. Re-stamped (2026-08-20, `main`) for **the default lane's own
-activation contract, and ~1 GiB output shards**. (a) `compressed_tensors` had
+As of: 2026-08-20 · `merge/proven-rescues` — stamps follow, newest first, each
+recording its own branch and date. Re-stamped (2026-08-20,
+`merge/proven-rescues`) for **the A-side reaching routed MoE experts, on both
+the surrogate and the gate** (§"AQUA-AURA"). AQUA priced only `nn.Linear`
+units, because per-channel marginals come from a backward hook and a packed
+`[E, M, N]` expert is an `nn.Parameter` on a fused module: on Ornith-1.5-35B-A3B
+that left **94.5% of the quantizable parameters** weight-only. The site already
+existed — `install_packed_expert_hooks` swaps `F.linear` for the experts
+module's whole forward and therefore sees every expert slice, **`down_proj`
+included, whose input is the post-SwiGLU intermediate** — and nothing was
+reading its `(x, gy)` for the activation side. Card **schema 1.1** carries
+`expert_g_sq_sum`/`expert_act_sq_sum`/`expert_act_absmax`/`expert_tokens` per
+expert, because routing makes `g` and the activation distribution functions of
+`e` and the aggregate does not factor. Two normalizations on purpose: `g` by the
+**global** token count (PR #14 — a rare expert should price low), the variance
+fit by that expert's **routed** count (it is a per-token magnitude, not a
+frequency); one denominator for both would discount a rare expert twice.
+`PerturbedActivationCache` installs the same interception at eval, so the
+selecting gate measures what the surrogate prices — vLLM registers both
+`w13_input_global_scale` and `w2_input_global_scale`, so this closes a
+principle-8 execution-identity gap and **frontier KL is not comparable to
+earlier runs**. Coverage 5.5% → 99.89% of quantizable mass; NVFP4 A/W median
+**0.67 on packed experts vs 5.77 on dense**. Corollary: `expert_empirical_cost`
+must stay activation-blind or the two paths double-count. Principle 7 with it —
+the A-side reduction moved to the GPU (host float64 matvec; agrees to 7.4e-9)
+and the per-expert synthetic draw became one shared common-random-numbers
+sample instead of ~65 s of CPU `randn`. Previously re-stamped (2026-08-20,
+`main`) for **the default lane's own activation contract, and ~1 GiB output
+shards**. (a) `compressed_tensors` had
 never declared `served_activation_quantization`, so AQUA-AURA *refused* on the
 one lane every flagship ships through — the term had only ever been priced on
 CB. It is declared now, and **derived rather than asserted**: vanilla vLLM
@@ -320,6 +346,44 @@ W-side to 0.07%, which produced a Pareto byte-identical to the weight-only one.
 (`1dbf146`; the two differ by 3.23% of Linears at 5.0–5.5 bpp). It is **still
 research** — there is no served KL/PPL A/B against the weight-only arm at
 matched bpp, and that A/B is the promotion gate.
+
+**It covers routed MoE experts as of 2026-08-20, not just the dense trunk.**
+Until then the A-side reached only `nn.Linear` units, because per-channel
+marginals come from a `register_full_backward_hook` and a packed `[E, M, N]`
+expert is an `nn.Parameter` on a fused module — on an A3B that is 94.5% of the
+quantizable parameters priced weight-only. `sensitivity_probe`'s existing
+`F.linear` interception (`install_packed_expert_hooks`) is the equivalent site
+and already holds `(x, gy)` per expert slice, **including `down_proj`'s, whose
+input is the post-SwiGLU intermediate**; it now also accumulates
+`expert_g_sq_sum [E, M]`, `expert_act_sq_sum [E, N]`, `expert_act_absmax
+[E, N]` and `expert_tokens [E]` into card **schema 1.1**. Per expert, not
+aggregated: routing makes both `g` and the activation distribution functions of
+`e`, and `Σ_e W²·g·var ≠ (Σ_e W²)(Σ_e g)(Σ_e var)`.
+
+Two normalizations, and they differ on purpose. `expert_g_sq_sum` divides by
+the **global** calib token count (the PR #14 convention — a rarely-routed
+expert *should* price low, that is its share of the objective);
+`expert_act_sq_sum` divides by **`expert_tokens[e]`**, because it fits a
+per-token noise magnitude rather than a frequency. Using the global count for
+both discounts a rare expert twice — PR #14's inverted importance weighting in
+mirror image. Corollary for the empirical branch: `expert_empirical_cost.py`
+must stay **activation-blind**, or the two paths double-count the expert
+A-side.
+
+**The selecting gate measures the same term (2026-08-20).**
+`PerturbedActivationCache` emulated activation quantization with a module
+`forward_pre_hook`, which on a packed-experts module sees only the module input
+— gate_up's. It now installs the same `F.linear` interception at eval, so each
+projection is quantized with its own calibrated scale, and the pre-hook stands
+down for packed plans so gate_up is not quantized twice. vLLM's
+`CompressedTensorsW4A4Nvfp4MoEMethod` registers **both**
+`w13_input_global_scale` and `w2_input_global_scale`, so the served runtime
+quantizes both: this closes a principle-8 execution-identity gap, and frontier
+KL values are **not comparable to pre-2026-08-20 runs**. Measured on
+Ornith-1.5-35B-A3B: card AQUA coverage 5.5% → 99.89% of quantizable mass, merge
+310→390 units (the 11 remaining are BF16 MTP sidecar), and the NVFP4 A/W ratio
+is median **0.67 on packed experts vs 5.77 on dense** — experts do not behave
+like the trunk.
 
 **The A-side belongs to the SERVING LANE, not to the format registry — and on
 this lane BOTH CB families execute their activation grids (corrected

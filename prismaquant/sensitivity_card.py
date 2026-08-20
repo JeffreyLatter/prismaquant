@@ -90,7 +90,10 @@ from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
 
-SCHEMA_VERSION = "1.0"
+# 1.1 adds the packed-expert A-side vectors (``expert_*``). Additive: a 1.0
+# reader sees array keys it never asks for, and a 1.1 card whose probe predates
+# the F.linear interception simply omits them.
+SCHEMA_VERSION = "1.1"
 
 # Vectors are stored in float32 on disk. They are sums of squares -- strictly
 # non-negative and spanning a wide dynamic range across channels -- so float16
@@ -213,12 +216,60 @@ class SensitivityUnit:
     #: (see ``n_tokens``).
     route_prob: float | None = None
 
+    # ------------------------------------------------- packed-expert A-side
+    # A packed [E, M, N] MoE parameter is ONE decision unit (the serving
+    # runtime cannot give two experts in a tensor different formats), but its
+    # A-side is not one number's worth of structure: routing means expert e
+    # sees a different token subset, so g and the activation distribution
+    # both vary per expert. Collapsing them into the 1-D vectors above would
+    # destroy the W-vs-routing correlation --
+    #   sum_e W_e^2 g_e var_e  !=  (sum_e W_e^2)(sum_e g_e)(sum_e var_e)
+    # -- and routing concentration makes that gap large, not marginal.
+    #
+    # Present only for packed units, and only from a probe that ran the
+    # F.linear interception (schema 1.1+). ``out_features``/``in_features``
+    # describe ONE expert's slice; ``n_params`` counts all E.
+
+    #: [E, out_features] -- sum over tokens ROUTED TO e of g[t, o]^2.
+    expert_g_sq_sum: np.ndarray | None = None
+    #: [E, in_features] -- sum over tokens ROUTED TO e of x[t, i]^2.
+    expert_act_sq_sum: np.ndarray | None = None
+    #: [E, in_features] -- max |x[t, i]| over tokens routed to e.
+    expert_act_absmax: np.ndarray | None = None
+    #: [E] -- how many calibration tokens were routed to each expert. The
+    #: denominator for ``expert_act_sq_sum`` ONLY: it fits a per-token noise
+    #: magnitude, so it must divide by the tokens that actually flowed.
+    #: ``expert_g_sq_sum`` is normalized by the global ``n_tokens`` like every
+    #: other row, because that is what carries the expert's share of the
+    #: objective. Using one denominator for both discounts a rare expert
+    #: twice -- PR #14's inverted importance weighting, in mirror image.
+    expert_tokens: np.ndarray | None = None
+
     # ---------------------------------------------------------------- helpers
 
     @property
     def h_trace(self) -> float:
         """Token-normalized weight-Fisher trace -- today's scalar sensitivity."""
         return self.h_trace_raw / max(1, self.n_tokens)
+
+    @property
+    def n_experts(self) -> int | None:
+        """Experts packed into this unit, or None when it is dense."""
+        if self.expert_g_sq_sum is None:
+            return None
+        return int(np.asarray(self.expert_g_sq_sum).shape[0])
+
+    @property
+    def has_expert_activation_stats(self) -> bool:
+        """True when the A-side can be priced PER EXPERT for this unit.
+
+        All three arrays or none: ``expert_tokens`` is what makes the two sums
+        interpretable, so a unit carrying sums without their routed denominator
+        is not usable and must not be quietly half-priced.
+        """
+        return (self.expert_g_sq_sum is not None
+                and self.expert_act_sq_sum is not None
+                and self.expert_tokens is not None)
 
     @property
     def has_vectors(self) -> bool:
@@ -438,7 +489,9 @@ class SensitivityCard:
                 "vectors": [],
             }
             for field in ("fisher_row", "fisher_col", "act_sq_sum",
-                          "g_sq_sum", "act_absmax"):
+                          "g_sq_sum", "act_absmax",
+                          "expert_g_sq_sum", "expert_act_sq_sum",
+                          "expert_act_absmax", "expert_tokens"):
                 vec = getattr(unit, field)
                 if vec is None:
                     continue
