@@ -403,7 +403,7 @@ allocating on the other estimator), **`SELECTION_MODE=surrogate`** (set
 `validated-surrogate` to opt into the real-KL frontier selection that produced
 the shipped 27B), `TARGET_PROFILE=vllm_packed_moe`, `PRODUCTION_CACHE=1`,
 `PRODUCTION_RECACHE=1`, `VALIDATED_SOURCE_PREFETCH=require`,
-`AURA_ADDITIVITY_GATE=auto`, `CB_EXPERT_EMPIRICAL=0`, `CB_SCALE_CODING=two_tier`
+`AURA_ADDITIVITY_GATE=measure`, `CB_EXPERT_EMPIRICAL=0`, `CB_SCALE_CODING=two_tier`
 (the last two are D15: the default is now the value every shipped driver sets).
 The archived cost modes / levers (`grouped-kl`, fisher, hdq, multi-shot,
 production-render-staged) **fail fast with `exit 2`** pointing at their archive.
