@@ -8175,8 +8175,15 @@ def _main_impl(argv: Sequence[str] | None = None):
     )
     ap.add_argument("--output", required=True,
                     help="Output directory for the compressed checkpoint")
-    ap.add_argument("--shard-bytes", type=int, default=5 * 1024**3,
-                    help="Approx per-shard size in bytes (default 5 GiB)")
+    ap.add_argument("--shard-bytes", type=int, default=1024**3,
+                    help="Approx per-shard size in bytes (default 1 GiB). "
+                         "Robert's standing packaging preference for every "
+                         "published artifact since 2026-08-20; it was 5 GiB "
+                         "before. Smaller shards resume better on a flaky "
+                         "download and let a client fetch a subset, at the "
+                         "cost of more files in the index. A single tensor "
+                         "larger than this still gets its own shard -- the "
+                         "writer flushes it whole rather than splitting it.")
     ap.add_argument("--device", default="cuda",
                     help="CUDA device for quantization arithmetic. Layer "
                          "weights are read into this device; "

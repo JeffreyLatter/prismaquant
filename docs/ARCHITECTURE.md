@@ -1,8 +1,32 @@
 # PrismaQuant Architecture
 
-As of: 2026-08-18 · `main` — merge of the `merge/proven-rescues` and
-`fix/aqua-profile-aware-resolver` lines; both lines' stamps follow, newest
-first, each recording its own branch and date. Re-stamped (2026-08-18, `main`) for
+As of: 2026-08-20 · `main` — stamps follow, newest first, each recording its own
+branch and date. Re-stamped (2026-08-20, `main`) for **the default lane's own
+activation contract, and ~1 GiB output shards**. (a) `compressed_tensors` had
+never declared `served_activation_quantization`, so AQUA-AURA *refused* on the
+one lane every flagship ships through — the term had only ever been priced on
+CB. It is declared now, and **derived rather than asserted**: vanilla vLLM
+packages no runtime contract, but on this lane what the runtime executes is a
+function of the artifact we write, since vLLM's compressed-tensors dispatcher
+selects the scheme from the checkpoint's own
+`config_groups[*].input_activations` that `export_native_compressed` emits. Both
+ends are readable, so the list is their intersection. `executes` =
+`["NVFP4", "FP8_E4M3", "MXFP8_E4M3", "MXFP8_E5M2", "FP8_SOURCE"]`, verified
+against the image the lane's `serve` block names and the current serving pin
+alike (byte-identical vLLM `0.26.1rc1.dev693+g7f7a32cfe`), dense scheme **and**
+fused-MoE method checked separately per family. **`MXFP4` is excluded on
+purpose**: its scheme declares no `input_activations` key at all, so vLLM serves
+it W4A16 while the format registry's descriptor calls it W4A4 — pricing it off
+the registry would charge a phantom A4, the exact shape of the DSv4
+mispricing. One recorded hole: `FP8_SOURCE` is executed by the runtime but
+priced at zero, because its descriptor says otherwise and AQUA skips
+non-activation formats before consulting the lane; no shipped artifact has
+combined an FP8_SOURCE rung with AQUA, and the first that does must close it.
+(b) Published artifacts are packaged in **~1 GiB safetensors shards**
+(`EXPORT_SHARD_BYTES`, and `export_native_compressed`'s own `--shard-bytes`
+default, both down from 5 GiB) on Robert's standing instruction; the CB lane's
+single-file streaming exporter is out of scope. Previously re-stamped
+(2026-08-18, `main`) for
 the **CB-lane A-side correction — both families execute** (§"AQUA-AURA"):
 `lane_specs/nvfp4_cb.json` `served_activation_quantization.executes` is now
 `["NVFP4_CB_*", "FP8_CB_*"]`. The 2026-08-17 entry (`["FP8_CB_*"]`) rested on
@@ -840,7 +864,18 @@ which is what the rows touched since are keyed on.
 | **3c** | AURA additivity report — `residual = measured_end_KL − Σ predicted_dloss`, stamped into `cost.pkl` `provenance["additivity"]` (§4.3) | `prismaquant.aura_additivity_gate` (+ optional `validate_assignments_kl` under `AURA_ADDITIVITY_GATE=measure`) | `artifacts/aura_additivity.json`, `aura_additivity_kl.json` (measure only); `logs/aura_additivity*.log` | none — non-blocking report, skip-if-exists on the KL half | `COST_MODE=aura`, `AURA_ADDITIVITY_GATE≠0` |
 | **4/4 E-gguf** | GGUF skeleton + export + llama.cpp smoke | `convert_hf_to_gguf.py` (`1461-1464`), `prismaquant.export_gguf` (`1469-1493`), `llama-completion` (`1500-1516`) | `artifacts/skeleton.gguf`, `exported.gguf` | settings-hash `gguf-skeleton` (`1488`); export always runs | GGUF lane; **exits 0** |
 | **4/4 E-cb** | CB col-weights + codebook export | `harvest_cb_col_weights "[4/4]"`, `export_nvfp4_cb[_streaming]` | `exported_nvfp4_cb/` | settings-hash `cb-col-weights`; export always runs | CB lane; no in-lane serving smoke; **exits 0** |
-| **4/4 E** | compressed-tensors export (§6) | `prismaquant.export_native_compressed` (`1665-1699`) | `exported/`; `logs/export.log` | **none — always runs** | default lane |
+| **4/4 E** | compressed-tensors export (§6) | `prismaquant.export_native_compressed` (`1665-1699`) | `exported/` in **~1 GiB safetensors shards** (`EXPORT_SHARD_BYTES`, default `1073741824`); `logs/export.log` | **none — always runs** | default lane |
+
+**Output packaging — ~1 GiB shards (2026-08-20).** Published artifacts are packaged in ~1 GiB
+safetensors shards, down from 5 GiB, on Robert's standing instruction ("package all models using
+1gb file sizes"). The value lives in two places kept deliberately in agreement:
+`export_native_compressed`'s own `--shard-bytes` default (so a hand-run export gets it too) and
+`run-pipeline.sh`'s `EXPORT_SHARD_BYTES`, which is passed through and echoed in the settings
+banner. `IncrementalSafetensorsWriter` flushes a single oversized tensor whole rather than
+splitting it, so a wide `lm_head`/`embed_tokens` row may still exceed the target — that is the
+writer's contract, not a violation of it. **Scope: the compressed-tensors lane only.** The CB
+lane's streaming exporter writes one `model.safetensors` (`export_nvfp4_cb_streaming.py:5127`)
+and has no shard-size concept, so CB artifacts are not covered by this default.
 
 **Nothing in the pipeline validates the artifact** — that is a physical lane boundary (`vllm`
 is not importable in the build venv), not laziness. What the script now does instead of

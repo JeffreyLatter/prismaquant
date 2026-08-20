@@ -234,6 +234,14 @@ PIPELINE_SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 : "${EXPERT_GATE_DATASET:=${PRISMAQUANT_CALIBRATION_DIR%/}/xdom-gate-v1.jsonl}"
 : "${DEVICE:=cuda}"
 : "${EXPORT_DEVICE:=cuda}"   # CUDA ~10× faster than CPU on NVFP4 packing
+# Published artifacts are packaged in ~1 GiB safetensors shards (Robert,
+# 2026-08-20: "package all models using 1gb file sizes"; it was 5 GiB before).
+# This mirrors export_native_compressed's own --shard-bytes default so the
+# pipeline and a hand-run export agree. NOTE the scope: only the
+# compressed-tensors lane shards its output. The CB lane's streaming exporter
+# writes a single model.safetensors and has no shard-size concept, so it is
+# NOT covered by this default.
+: "${EXPORT_SHARD_BYTES:=1073741824}"
 # TARGET_PROFILE is deliberately UNSET by default (re-vet R11 / debt D4). A
 # hardcoded `:=vllm_packed_moe` here won `resolve_target_profile`'s explicit-
 # request precedence over the architecture's own `spec.default_serving_profile`
@@ -865,6 +873,7 @@ echo "  PREFETCH_LOOKAHEAD=$PREFETCH_LOOKAHEAD PREFETCH_WORKERS=$PREFETCH_WORKER
 echo "  ACTIVATION_ROWS_LIMIT=$ACTIVATION_ROWS_LIMIT"
 echo "  VISUAL_FORMAT=$VISUAL_FORMAT"
 echo "  MTP_FORMAT=$MTP_FORMAT"
+echo "  EXPORT_SHARD_BYTES=$EXPORT_SHARD_BYTES ($((EXPORT_SHARD_BYTES / 1024 / 1024)) MiB per output shard)"
 echo "  CALIBRATION_MODALITY=$CALIBRATION_MODALITY  MM_DATASET=$MM_DATASET"
 echo "  PRODUCTION_CACHE=$PRODUCTION_CACHE PRODUCTION_RECACHE=$PRODUCTION_RECACHE"
 echo "  PRODUCTION_CACHE_FORMATS=$PRODUCTION_CACHE_FORMATS"
@@ -2383,6 +2392,7 @@ EXPORT_ARGS=(
   --layer-config "${WORK_DIR}/artifacts/layer_config.json"
   --output "${WORK_DIR}/exported"
   --device "$EXPORT_DEVICE"
+  --shard-bytes "$EXPORT_SHARD_BYTES"
   --activation-cache-dir "${WORK_DIR}/act"
 )
 case "$EXPORT_GPTQ" in
