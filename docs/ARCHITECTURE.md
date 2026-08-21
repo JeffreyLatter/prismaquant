@@ -2,6 +2,19 @@
 
 As of: 2026-08-21 · `merge/proven-rescues` — stamps follow, newest first, each recording
 its own branch and date. Re-stamped (2026-08-21, `merge/proven-rescues`) for the
+**producer half of campaign rule R1** (§"The learned-codebook selector"): the
+routed book burn and selector (`tools/dsv4_onlaw_book_burn.py`,
+`tools/dsv4_onlaw_book_select.py`) take `--keying stack|role`, defaulting to
+`stack` like the bundle builder, and a stack cell is the bundle's own fused
+population — every expert's gate rows then its up rows in the profile's
+declared order, weighted by the packed target's imatrix entry through the
+builder's `_stack_col_weights`. A per-expert-Linear checkpoint's harvest has
+no packed entry, so `tools/dsv4_packed_col_weights.py` writes one with the
+export's own `_packed_expert_col_weights` derivation (the per-expert mean of
+the gate and up vectors) into a sibling pickle, never in place. Verified on
+DSv4 layer 0: the production builder under stack keying binds the new
+`gate_up_proj` shards and the unchanged `down_proj` role shards with its own
+digests. Previously re-stamped (2026-08-21, `merge/proven-rescues`) for the
 **Gridbook 0.8.11 serving pin**: 0.8.11 is 0.8.10 plus two CUDA-graph capture
 fixes, both reported by smb209 and neither changing a route, a codec, or a
 default. gridbook#46 pre-warms the MXFP8 dense lane's swizzled-plane A-side
@@ -1194,7 +1207,19 @@ selection and bank shard name the population in their `projection` member
 pooled request), the pooled book is trained against the fused rank-3 stack and
 the packed target's own imatrix entry, and every routed learned cell records
 `routed_book_keying` in the bundle manifest. An absent field reads as `role`:
-pre-R1 books are per role by construction.
+pre-R1 books are per role by construction. The producer side speaks the same
+keying: `tools/dsv4_onlaw_book_burn.py --keying stack` burns one `gate_up_proj`
+cell per `(layer, rung)` over the fused population (`load_population`, the
+builder's `provide_weight` row order and `_stack_col_weights` reshape), and
+`tools/dsv4_onlaw_book_select.py --keying stack` authors the selection over
+`(layer, gate_up_proj | down_proj)`. The packed imatrix entry a stack cell is
+burned against is the export's own derivation, materialized by
+`tools/dsv4_packed_col_weights.py` for checkpoints whose experts are per-expert
+Linears (DSv4) — the burn refuses a pickle without it, or one whose entry is a
+different spelling of the per-expert vectors, so burn, bundle and export weight
+the fused rows by one tensor. `down_proj` is a one-projection stack: its role
+cell and its stack cell are the same tensors under the same name, so a role
+bank's `down_proj` shards satisfy the stack request unchanged.
 
 Both CB exporters branch on the bundle's own record, never on a flag. A
 stack-keyed cell emits ONE codebook target for the fused weight, under the

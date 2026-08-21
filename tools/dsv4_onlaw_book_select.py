@@ -9,7 +9,8 @@ file -- not the contents of the bank -- is what makes a rung renderable.
 Digests deliberately do NOT live in the selection: the loader compares the
 selected shard's `content_guard` against the producer's tensors at the moment
 the bundle is built.  This tool therefore verifies the same way the exporter
-will, by re-deriving `tensor_value_identity` from `load_projection`.
+will, by re-deriving `tensor_value_identity` from the burn's own population
+loader (`dsv4_onlaw_book_burn.load_population`).
 
 Verification modes:
   none    structural only -- every cell has an acceptable shard
@@ -26,6 +27,15 @@ generation the burn used (see the CALIBRATION REBASE section of
 dsv4_onlaw_book_burn).  Verification is exactly the check that fails when they
 do not: `col_weights_digest` is derived from the imatrix passed here and
 compared against the one the book was learned under.
+
+`--keying` must name the keying the burn used (see KEYING in
+dsv4_onlaw_book_burn): the census enumerates `(layer, gate_up_proj | down_proj)`
+under stack keying and `(layer, gate_proj | up_proj | down_proj)` under role
+keying, and the bundle builder binds a selection only under the keying it was
+burned with.  The two forms write differently named selections in the same
+shard root (`CB_ROUTED_MOE_BOOK_SELECTION.json` for role, the historical name;
+`CB_ROUTED_MOE_BOOK_SELECTION.stack.json` for stack) so neither can be handed
+to a build expecting the other by accident.
 """
 from __future__ import annotations
 
@@ -45,9 +55,21 @@ from prismaquant.cb_banked_books import (
 from tools import dsv4_afast_burn as burn
 from tools import dsv4_ldlq_cost_campaign as ldlq_campaign
 from tools import dsv4_onlaw_book_burn as ob
-from tools.dsv4_afast_campaign import load_projection
+from prismaquant.routed_moe_codebooks import (
+    DEFAULT_ROUTED_BOOK_KEYING,
+    ROUTED_BOOK_KEYINGS,
+    ROUTED_BOOK_KEYING_STACK,
+    normalize_routed_book_keying,
+)
 
 BOOK_ROOT = burn.RUN_ROOT / "bucket-books"
+
+
+def selection_filename(keying: str) -> str:
+    keying = normalize_routed_book_keying(keying)
+    if keying == ROUTED_BOOK_KEYING_STACK:
+        return "CB_ROUTED_MOE_BOOK_SELECTION.stack.json"
+    return "CB_ROUTED_MOE_BOOK_SELECTION.json"
 
 
 def _guard(path: Path) -> dict:
@@ -75,7 +97,14 @@ def main() -> int:
         "--layers", default=None,
         help="comma-separated layer subset; default every layer",
     )
+    parser.add_argument(
+        "--keying", choices=ROUTED_BOOK_KEYINGS,
+        default=DEFAULT_ROUTED_BOOK_KEYING,
+        help="the keying the burn used; see dsv4_onlaw_book_burn KEYING",
+    )
     args = parser.parse_args()
+    keying = normalize_routed_book_keying(args.keying)
+    keys = ob.populations(keying)
 
     if bool(args.col_weights) != bool(args.act_root):
         raise SystemExit(
@@ -90,9 +119,9 @@ def main() -> int:
     # after the by-layer stores have validated against their own cache.
     # Keep a rebased selection out of the previous generation's filename.
     out = Path(args.out) if args.out else (
-        burn.BURN_CELL_ROOT / "CB_ROUTED_MOE_BOOK_SELECTION.json"
+        burn.BURN_CELL_ROOT / selection_filename(keying)
         if args.shard_root
-        else burn.RUN_ROOT / "onlaw-books" / "CB_ROUTED_MOE_BOOK_SELECTION.json"
+        else burn.RUN_ROOT / "onlaw-books" / selection_filename(keying)
     )
 
     layers = (
@@ -109,7 +138,7 @@ def main() -> int:
     cells: list[dict] = []
     missing: list[str] = []
     for layer in layers:
-        for projection in ob.PROJECTIONS:
+        for projection in keys:
             for rung in rungs:
                 shard = ob.accepted_shard(layer, projection, rung)
                 if shard is None:
@@ -119,18 +148,21 @@ def main() -> int:
                     "layer": layer, "projection": projection,
                     "rung": rung, "burn_shard": str(shard),
                 })
-    expected = len(layers) * len(ob.PROJECTIONS) * len(rungs)
+    expected = len(layers) * len(keys) * len(rungs)
+    print(f"[select] keying={keying} populations={list(keys)}")
     print(f"[select] {len(cells)}/{expected} cells have an acceptable shard")
     if missing:
         print(f"[select] REFUSE: {len(missing)} cells unbanked, e.g. "
-              f"{missing[:5]}")
+              f"{missing[:5]}"
+              + (" (burn them with dsv4_onlaw_book_burn --keying stack)"
+                 if keying == ROUTED_BOOK_KEYING_STACK else ""))
         return 1
 
     # Cross-rung digest consistency (no GPU): same tensors, same digests.
     by_cell = {(c["layer"], c["projection"], c["rung"]): c for c in cells}
     inconsistent = []
     for layer in layers:
-        for projection in ob.PROJECTIONS:
+        for projection in keys:
             guards = [
                 _guard(Path(by_cell[(layer, projection, r)]["burn_shard"]))
                 for r in rungs
@@ -142,16 +174,29 @@ def main() -> int:
             if len(digests) > 1:
                 inconsistent.append(f"L{layer:02d} {projection}")
     if inconsistent:
-        print(f"[select] REFUSE: {len(inconsistent)} (layer, projection) pairs "
+        print(f"[select] REFUSE: {len(inconsistent)} (layer, population) pairs "
               f"disagree on source digest across rungs: {inconsistent[:5]}")
         return 1
     print(f"[select] cross-rung digest consistency OK "
-          f"({len(layers) * len(ob.PROJECTIONS)} pairs)")
+          f"({len(layers) * len(keys)} pairs)")
 
     # A partial census must never be written: a selection file is read as the
     # complete accepted set, and one covering 3 of 129 pairs would render the
     # rest by silently missing rather than by refusing.
     if len(layers) == burn.LAYER_COUNT:
+        if out.is_file():
+            previous = json.loads(out.read_text())
+            previous_keys = sorted({
+                str(cell.get("projection"))
+                for cell in (previous.get("cells") or [])
+            })
+            if previous_keys != sorted(keys):
+                raise SystemExit(
+                    f"REFUSE: {out} holds a selection over {previous_keys}, "
+                    f"not the {keying} populations {sorted(keys)}; pass "
+                    "--out rather than overwriting the other keying's "
+                    "selection"
+                )
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps({
             "schema": ROUTED_MOE_CBL_SELECTION_SCHEMA,
@@ -172,7 +217,7 @@ def main() -> int:
     if args.verify == "sample":
         step = max(1, len(targets) // args.sample_size)
         targets = targets[::step][:args.sample_size]
-    print(f"[select] verifying {len(targets)} (layer, projection) loads "
+    print(f"[select] verifying {len(targets)} (layer, population) loads "
           f"x {len(rungs)} rungs against freshly loaded source")
 
     if not torch.cuda.is_available():
@@ -190,11 +235,16 @@ def main() -> int:
         all_col_weights,
         act_root=args.act_root,
     )
+    profile = None
+    if keying == ROUTED_BOOK_KEYING_STACK:
+        from prismaquant.model_profiles import detect_profile
+        profile = detect_profile(str(burn.SOURCE))
 
     verified = 0
     for layer, projection in targets:
-        data = load_projection(
-            layer, projection, device=torch.device("cuda:0"),
+        data = ob.load_population(
+            layer, projection, keying=keying, profile=profile,
+            device=torch.device("cuda:0"),
             identity=identities[layer], all_col_weights=all_col_weights,
             model_to_shard=model_to_shard, model_to_ckpt=model_to_ckpt,
             scale_map=scale_map,

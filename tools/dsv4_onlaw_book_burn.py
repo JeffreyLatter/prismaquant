@@ -84,6 +84,30 @@ full 256-expert stack (`expert_ids=all_experts`, `full_encode_rungs=rung`),
 which is exactly the digest the exporter computes.  Books are content-addressed
 under `bucket-books/` by a key that includes the imatrix digest, so a rebased
 burn writes new addresses and can never overwrite the 0p6 generation.
+
+KEYING (--keying stack | role)
+------------------------------
+Campaign rule R1: routed learned books are burned per `(layer, STACK, rung)`,
+so the fused `gate_up_proj` population gets ONE book covering gate and up, and
+the exported fused weight names a single codebook.  That is the default here,
+as it is for `build_cb_learned_bundle`.  `--keying role` reproduces the
+pre-R1 per-`(layer, projection, rung)` form for the A/B arm.
+
+A stack cell is the exact population the bundle builder's `provide_weight`
+materializes: every expert's gate rows followed by its up rows, in the
+profile's declared fused order, weighted by the packed target's OWN imatrix
+entry reshaped `(E, 1, in)` -- read through the builder's `_stack_col_weights`
+so burn and bundle cannot disagree about the reshape.  The per-expert-Linear
+harvest carries no packed entry, so `tools/dsv4_packed_col_weights.py` writes
+one with the export's own derivation first; a pickle without it refuses here,
+exactly as the bundle build would.  `down_proj` is a one-projection stack:
+its stack cell and its role cell are the same tensors under the same name, so
+a role-keyed bank already satisfies the stack request for it.
+
+The shard root is per CALIBRATION generation, not per keying: a stack cell is
+named by its population (`layer_NNN_gate_up_proj_...`) and cannot collide
+with a role cell, and the `down_proj` cells are shared between the two forms
+by construction.
 """
 from __future__ import annotations
 
@@ -99,9 +123,25 @@ import torch
 # The single source of truth for the canonical imatrix identity triple.  It is
 # private, and imported anyway on purpose: re-deriving the byte framing here is
 # how a producer and a consumer drift into disagreeing about the same tensors.
+# The same reasoning imports the bundle builder's stack-imatrix reshape and the
+# export's fused-projection order: the burn must hash exactly the tensors the
+# consumers will hold.
+from prismaquant.build_cb_learned_bundle import _stack_col_weights
+from prismaquant.export_nvfp4_cb_streaming import (
+    _packed_expert_col_weights,
+    _packed_expert_projection_names,
+)
 from prismaquant.production_weight_cache import (
     _canonical_cb_col_weights_identity,
     validate_cb_render_identity_metadata,
+)
+from prismaquant.routed_moe_codebooks import (
+    DEFAULT_ROUTED_BOOK_KEYING,
+    ROUTED_BOOK_KEYINGS,
+    ROUTED_BOOK_KEYING_STACK,
+    ROUTED_ROLE_PROJECTIONS,
+    ROUTED_STACK_KEYS,
+    normalize_routed_book_keying,
 )
 from tools import dsv4_afast_burn as burn
 from tools import dsv4_ldlq_cost_campaign as ldlq_campaign
@@ -112,7 +152,140 @@ from tools.dsv4_afast_campaign import load_layer_identity, load_projection
 # ROUTED_MOE_CBL_BANK_RUNGS (unbankable).  --rungs exists to burn them one at a
 # time, never to introduce a third.
 ONLAW_ROUTED_RUNGS = (28, 32)
-PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
+# The role-keyed population list; `populations()` is the keying-aware form.
+PROJECTIONS = ROUTED_ROLE_PROJECTIONS
+# The fused order the export's routed-expert ABI requires; the profile must
+# declare exactly this (export_nvfp4_cb_streaming asserts the same thing).
+_ABI_STACK_PROJECTIONS = {
+    "gate_up_proj": ("gate_proj", "up_proj"),
+    "down_proj": ("down_proj",),
+}
+
+
+def populations(keying: str) -> tuple[str, ...]:
+    """The burn cells' ``projection`` spellings under *keying*."""
+
+    keying = normalize_routed_book_keying(keying)
+    if keying == ROUTED_BOOK_KEYING_STACK:
+        return tuple(ROUTED_STACK_KEYS)
+    return tuple(ROUTED_ROLE_PROJECTIONS)
+
+
+def population_members(key: str, keying: str, profile) -> tuple[str, ...]:
+    """The role projections one burn cell pools, in fused row order."""
+
+    keying = normalize_routed_book_keying(keying)
+    if keying != ROUTED_BOOK_KEYING_STACK:
+        if key not in ROUTED_ROLE_PROJECTIONS:
+            raise ValueError(f"{key!r} is not a routed role projection")
+        return (key,)
+    if key not in ROUTED_STACK_KEYS:
+        raise ValueError(f"{key!r} is not a routed stack key")
+    declared = tuple(_packed_expert_projection_names(profile, key))
+    expected = _ABI_STACK_PROJECTIONS[key]
+    if declared != expected:
+        raise ValueError(
+            f"{key}: Gridbook routed expert ABI expects {expected}, profile "
+            f"declared {declared}"
+        )
+    return declared
+
+
+def packed_qname(layer: int, key: str) -> str:
+    return f"model.layers.{layer}.mlp.experts.{key}"
+
+
+def load_population(
+    layer: int,
+    key: str,
+    *,
+    keying: str,
+    profile,
+    device: torch.device,
+    identity,
+    all_col_weights,
+    model_to_shard,
+    model_to_ckpt,
+    scale_map,
+) -> dict:
+    """`load_projection` for one burn population under *keying*.
+
+    A one-projection population is `load_projection` unchanged.  A fused stack
+    is every member loaded (and validated) through the same function, its
+    weights concatenated along the output rows per expert in the declared
+    fused order, and its imatrix the packed target's own entry through the
+    bundle builder's reshape.  The entry must equal the export's per-expert
+    mean derivation of the member vectors it sits beside: the pooled arm must
+    weight the fused rows by the same per-expert statistics the per-role
+    arm's export applies, or the A/B is confounded by its imatrix.
+    """
+
+    members = population_members(key, keying, profile)
+    parts = [
+        load_projection(
+            layer, projection, device=device, identity=identity,
+            all_col_weights=all_col_weights, model_to_shard=model_to_shard,
+            model_to_ckpt=model_to_ckpt, scale_map=scale_map,
+        )
+        for projection in members
+    ]
+    if len(parts) == 1:
+        return parts[0]
+
+    qname = packed_qname(layer, key)
+    experts = int(parts[0]["weight"].shape[0])
+    in_features = int(parts[0]["weight"].shape[2])
+    for projection, part in zip(members, parts):
+        shape = tuple(int(dim) for dim in part["weight"].shape)
+        if shape[0] != experts or shape[2] != in_features:
+            raise ValueError(
+                f"{qname}: {projection} stack {shape} does not fuse with "
+                f"E={experts}, in={in_features}"
+            )
+    if qname not in all_col_weights:
+        raise SystemExit(
+            f"REFUSE: {qname} has no packed col_weights entry; a stack-keyed "
+            "book is burned against the packed target's own imatrix (the "
+            "bundle builder refuses the same pickle). Write it with "
+            "tools/dsv4_packed_col_weights.py and pass that pickle as "
+            "--col-weights."
+        )
+    col = _stack_col_weights(
+        qname, experts=experts, in_features=in_features,
+        col_weights=all_col_weights,
+    ).to(torch.float32).contiguous()
+    member_map = {
+        (projection, expert): part["qnames"][expert]
+        for projection, part in zip(members, parts)
+        for expert in range(experts)
+    }
+    derived = _packed_expert_col_weights(
+        {member: all_col_weights[member] for member in member_map.values()},
+        {qname: member_map},
+        profile,
+    )[qname].to(torch.float32).contiguous()
+    if tuple(derived.shape) != tuple(col.shape) or not torch.equal(derived, col):
+        raise SystemExit(
+            f"REFUSE: {qname}: packed col_weights entry (shape "
+            f"{tuple(col.shape)}) is not the export's per-expert mean of its "
+            f"{members} member vectors; the pooled book would be learned "
+            "under a different imatrix spelling than the fused render"
+        )
+    weight = torch.cat([part["weight"] for part in parts], dim=1).contiguous()
+    for part in parts:
+        del part["weight"]
+    observed = sum(int(part["observed_activation_files"]) for part in parts)
+    cold = sorted({expert for part in parts for expert in part["cold_experts"]})
+    return {
+        "qnames": [name for part in parts for name in part["qnames"]],
+        "weight": weight,
+        "col_weights": col.to(device).contiguous(),
+        # Books are learned from weights and the imatrix only (replay=False);
+        # the per-member activation rows stay with their roles.
+        "activation_rows": None,
+        "observed_activation_files": observed,
+        "cold_experts": cold,
+    }
 
 # Exactly the fields `_canonical_cb_col_weights_identity` produces.  A
 # calibration rebase may restate these three and nothing else.
@@ -289,8 +462,17 @@ def main() -> int:
         "--shard-root", default=None,
         help="burn-cell directory; defaults to the campaign's burn-shards",
     )
+    # See KEYING above.  The default is campaign rule R1, the same default
+    # build_cb_learned_bundle applies; the per-role form is the A/B arm.
+    parser.add_argument(
+        "--keying", choices=ROUTED_BOOK_KEYINGS,
+        default=DEFAULT_ROUTED_BOOK_KEYING,
+        help="burn one book per (layer, stack, rung) [stack, R1] or per "
+             "(layer, projection, rung) [role, the A/B arm]",
+    )
     args = parser.parse_args()
 
+    keying = normalize_routed_book_keying(args.keying)
     if bool(args.col_weights) != bool(args.act_root):
         raise SystemExit(
             "REFUSE: --col-weights and --act-root are one calibration and must "
@@ -318,17 +500,28 @@ def main() -> int:
             f"legal set is {list(ONLAW_ROUTED_RUNGS)} (k%4==0 AND <=K33)"
         )
 
+    from tools import dsv4_cbl_kernels as cblk
+    not_cbl = [r for r in rungs if not cblk.cbl_eligible(r)]
+    if not_cbl:
+        raise SystemExit(
+            f"REFUSE: K{not_cbl} would dispatch the incumbent encoder, whose "
+            "cells are not bankable (load_banked_cbl_book accepts cbl_poolb "
+            "only)"
+        )
+
     layers = range(args.start_layer, min(args.end_layer, burn.LAYER_COUNT))
+    keys = populations(keying)
     worklist = [
-        (layer, projection, missing)
+        (layer, key, missing)
         for layer in layers
-        for projection in PROJECTIONS
-        if (missing := _missing_rungs(layer, projection, rungs))
+        for key in keys
+        if (missing := _missing_rungs(layer, key, rungs))
     ]
     total_cells = sum(len(m) for _, _, m in worklist)
     print(
+        f"[onlaw-books] keying={keying} populations={list(keys)}\n"
         f"[onlaw-books] {total_cells} cells to burn across "
-        f"{len(worklist)} (layer, projection) loads; rungs={list(rungs)}",
+        f"{len(worklist)} (layer, population) loads; rungs={list(rungs)}",
         flush=True,
     )
     if args.dry_run:
@@ -373,13 +566,24 @@ def main() -> int:
 
     model_to_shard, model_to_ckpt = burn._build_weight_map(str(burn.SOURCE))
     scale_map = burn._build_fp8_scale_inv_map(str(burn.SOURCE))
+    profile = None
+    if keying == ROUTED_BOOK_KEYING_STACK:
+        from prismaquant.model_profiles import detect_profile
+        profile = detect_profile(str(burn.SOURCE))
+        for key in keys:
+            print(
+                f"[onlaw-books] stack {key} pools "
+                f"{list(population_members(key, keying, profile))}",
+                flush=True,
+            )
 
     started = time.time()
     done = 0
     with manifest_path.open("a") as manifest:
         for layer, projection, missing in worklist:
-            data = load_projection(
-                layer, projection, device=torch.device("cuda:0"),
+            data = load_population(
+                layer, projection, keying=keying, profile=profile,
+                device=torch.device("cuda:0"),
                 identity=identities[layer], all_col_weights=all_col_weights,
                 model_to_shard=model_to_shard, model_to_ckpt=model_to_ckpt,
                 scale_map=scale_map,
@@ -396,6 +600,7 @@ def main() -> int:
                         "measurement_semantics"
                     ) or {}
                     row = {
+                        "keying": keying,
                         "layer": layer, "projection": projection, "rung": rung,
                         "shard": str(burn._burn_cell_path(
                             layer, projection,
