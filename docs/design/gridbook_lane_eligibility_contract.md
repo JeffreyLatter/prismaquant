@@ -31,10 +31,11 @@ publishes no lane-eligibility table. The measured consequence:
   kernel predicates into local constants, which principle 14 treats as an
   assertion and therefore refuses.
 
-## What Gridbook 0.8.10 publishes today
+## What Gridbook 0.8.11 publishes today
 
 `gridbook/runtime_contract.json`, schema `gridbook.runtime-contract.v4`, carries
-exactly these top-level fields:
+exactly these top-level fields (measured on 0.8.10; the 0.8.11 file is
+byte-identical, sha256 `0e2c32f3…`):
 
 | Field | Contents |
 |---|---|

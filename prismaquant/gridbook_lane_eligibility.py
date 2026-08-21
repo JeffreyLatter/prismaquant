@@ -435,7 +435,7 @@ def load_eligibility_table(
 
     The SERVING pin resolves this, deliberately and explicitly. PrismaQuant
     carries two Gridbook pins -- a producer pin (0.8.5) and a serving pin
-    (0.8.10) -- and ``serving_profiles.gridbook_runtime_version()`` reads the
+    (0.8.11) -- and ``serving_profiles.gridbook_runtime_version()`` reads the
     PRODUCER one. Route status is a statement about what the *serve* executes,
     so resolving it through the producer pin would attest the wrong release.
     That exact confusion already produced one defect (the feasibility
@@ -525,7 +525,7 @@ def load_published_formats(
 ) -> dict[str, dict[str, Any]]:
     """The pinned release's PUBLISHED format table, keyed by family prefix.
 
-    Unlike the eligibility table, this one Gridbook 0.8.10 really does package:
+    Unlike the eligibility table, this one Gridbook 0.8.11 really does package:
     ``formats[]`` carries ``family``, ``name_pattern``, ``grid``, ``mode``,
     ``n_sub``, ``rungs``, ``layout_versions`` and ``moe_layout_versions``. So a
     unit's payload family, sub-table split and rung legality are genuinely

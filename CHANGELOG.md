@@ -1,5 +1,44 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **Gridbook serving pin 0.8.11** (commit `187c721`, wheel sha `3fbd257e…`
+  read from `gridbook:0.8.11-clean-187c721`'s PEP 610 record; PyPI archive
+  verified member-byte-identical to a tag rebuild, 60/60). 0.8.11 is 0.8.10
+  plus two CUDA-graph capture fixes and nothing else. gridbook#46 (smb209):
+  the MXFP8 dense lane's swizzled-plane A-side offsets were computed on the
+  host and moved with an unpinned copy on first use, which aborted
+  `FULL_DECODE_ONLY` capture at load; they are pre-warmed at load now.
+  gridbook#47 (smb209): the routed grouped lanes' `_padded_route` read a
+  routing-**dependent** trim count on the host — and, for the BF16 grouped
+  bridge, the per-expert block offsets — so vLLM 0.27's default
+  `FULL_AND_PIECEWISE` capture of prefill sizes above the 16-token GEMV band
+  died at engine start ("operation not permitted when stream is capturing").
+  That abort was protective: a captured graph would have replayed one
+  capture-time routing's tile count on every later routing. Under capture the
+  fused FP4/FP8 lanes now launch the static-capacity tile layout
+  (`P // tile_m + E`, provable from shapes alone — the
+  `PRISMAQUANT_CB_GROUPED_TRIM=0` arm); the one lane that chunks by
+  host-read per-expert offsets — the opt-in sm12x bridge,
+  `PRISMAQUANT_CB_BF16_SM120=1` — refuses capture naming the flag, while the
+  default expand + grouped bridge and the persistent-B lane never host-read
+  and capture as-is. Eager and decode-band (≤ 16 tokens) dispatch are
+  byte-identical to 0.8.10, so no route, codec, or default changes for any
+  published artifact and the backed set is carried forward unchanged; the
+  packaged runtime contract is byte-identical to 0.8.10's (materialized as
+  `gridbook_runtime_contract.0.8.11.json`, still `lane_eligibility: absent`).
+  The fp4-CB lane ADDENDUM, the CB endpoint image digest, the Qwen3.8 smoke
+  `BASE_IMAGE`, and the real-pin route-status tests follow. Measured on the
+  shipped DSv4 87 GB body under the new image (`perf-b1-0811`): the card
+  command (`FULL_DECODE_ONLY [1,2]`) decodes 20.53–20.61 tok/s vs
+  20.54–20.63 on 0.8.10 — unchanged, as designed — and vLLM's default
+  `FULL_AND_PIECEWISE` with capture sizes up to 64 now starts (11 piecewise
+  + 7 full graphs) and decodes 20.56–20.64 single-stream, so the default
+  command no longer needs `--compilation-config` to come up. Batch-32 decode
+  throughput under graphs vs outside them is the separate B1d record.
+
 ## 0.16.0 — 2026-08-21
 
 ### Added

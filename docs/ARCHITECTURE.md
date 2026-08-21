@@ -1,7 +1,29 @@
 # PrismaQuant Architecture
 
-As of: 2026-08-21 · `main` — stamps follow, newest first, each recording
-its own branch and date. Re-stamped (2026-08-21, `feat/cb-route-status`)
+As of: 2026-08-21 · `merge/proven-rescues` — stamps follow, newest first, each recording
+its own branch and date. Re-stamped (2026-08-21, `merge/proven-rescues`) for the
+**Gridbook 0.8.11 serving pin**: 0.8.11 is 0.8.10 plus two CUDA-graph capture
+fixes, both reported by smb209 and neither changing a route, a codec, or a
+default. gridbook#46 pre-warms the MXFP8 dense lane's swizzled-plane A-side
+offsets at load (an unpinned first-use copy had aborted `FULL_DECODE_ONLY`
+capture). gridbook#47: `_padded_route` read a routing-**dependent** trim count
+on the host — and, for the BF16 grouped bridge, the per-expert block offsets —
+so vLLM 0.27's default `FULL_AND_PIECEWISE` capture of prefill sizes above the
+16-token GEMV band died at engine start; that abort was protective, because a
+captured graph would have replayed one routing's tile count on every later
+routing. Under capture the fused lanes launch the static-capacity layout
+(`P // tile_m + E`, the `PRISMAQUANT_CB_GROUPED_TRIM=0` arm); only the opt-in
+sm12x bridge (`PRISMAQUANT_CB_BF16_SM120=1`) refuses capture — the default
+bridge and persistent-B never host-read. Eager and decode-band dispatch are
+byte-identical to 0.8.10; measured on the shipped DSv4 body, the card command
+decodes 20.53–20.61 tok/s (0.8.10: 20.54–20.63) and vLLM's default
+`FULL_AND_PIECEWISE` with capture sizes up to 64 now starts and serves. Pin 0.8.11/v4, commit `187c721`, wheel digest read
+from `gridbook:0.8.11-clean-187c721`'s PEP 610 record (PyPI archive
+byte-identical to a tag rebuild, 60/60 members); the packaged runtime contract
+is byte-identical to 0.8.10's, materialized as
+`gridbook_runtime_contract.0.8.11.json` and still `lane_eligibility: absent`;
+`fp8_cb_fused_mid_m` carries its backed set forward unchanged. Previously
+re-stamped (2026-08-21, `feat/cb-route-status`)
 for **structured route status on the CB lane** (§9.2.1,
 `prismaquant/gridbook_lane_eligibility.py` +
 `prismaquant/cb_route_status_gate.py`): serving-lane eligibility becomes a
@@ -11,7 +33,7 @@ runtime's eligibility table it consults, and `ResolvedServingLane` carries
 `route_status` / `requires_serve_flags` / `route_status_source` resolved from
 the **serving** pin — never declared in a spec file. Measured and recorded
 here rather than worked around: Gridbook 0.8.10's packaged
-`runtime_contract.json` publishes `formats`, `packing`, `layout`,
+`runtime_contract.json` (unchanged in 0.8.11) publishes `formats`, `packing`, `layout`,
 `abi_features`, `quant_method` and `producer_profiles`, and **no
 lane-eligibility table at all** — its own validator enforces that exact key
 set — so the honest verdict for this pin is `unattested`, derived from a
@@ -5434,7 +5456,7 @@ and a user found it at serve time. Its twin lives on the vanilla-vLLM lane, wher
 `units_on_fallback_route = 0` was reachable only by never having looked: no serving-profile spec
 declared route status, so every unit `continue`d before it could be counted.
 
-**What the pinned contract publishes.** Gridbook 0.8.10's packaged
+**What the pinned contract publishes.** Gridbook 0.8.11's packaged (byte-identical to 0.8.10's)
 `gridbook/runtime_contract.json` (schema `gridbook.runtime-contract.v4`) carries `schema`,
 `contract_version`, `abi_features`, `quant_method`, `packing`, `layout`, `formats`, and
 `producer_profiles` — and its own validator enforces that exact key set, so a lane-eligibility
@@ -5448,7 +5470,7 @@ attests fused-mainloop LUT support, a different question.
 **What PrismaQuant does instead of transcribing.** The producer implements the consumption half
 and reports the gap:
 
-- `prismaquant/gridbook_runtime/gridbook_runtime_contract.0.8.10.json` is a byte-verbatim copy of
+- `prismaquant/gridbook_runtime/gridbook_runtime_contract.0.8.11.json` (and the `0.8.10` copy it is byte-identical to) is a byte-verbatim copy of
   the packaged contract, bound to the **serving** pin by
   `gridbook_runtime_contract_index.json` (version, commit, sha256). The contract JSON is the
   sanctioned boundary crossing (`AGENTS.md:38`); the runtime is never imported. The
@@ -5457,14 +5479,14 @@ and reports the gap:
 - `prismaquant/gridbook_lane_eligibility.py` reads `lane_eligibility` from that file, finds it
   absent, and returns a typed `EligibilityTable(present=False)`. Absence is therefore **derived
   from the pinned contract**, not assumed. The same module derives payload family, `n_sub`, and
-  rung legality from the `formats` table that 0.8.10 really does publish.
+  rung legality from the `formats` table that 0.8.11 really does publish.
 - `serving_profile_specs/nvfp4_cb.json` gives every serving lane a `route_status_source` block
   naming which structural classes it consults. The spec declares the **key**; the verdict comes
   from the contract. A verdict written into that file would be an assertion, so
   `tests/test_cb_route_status_gate.py` refuses one.
 - `ResolvedServingLane` carries `route_status`, `requires_serve_flags`, and
   `route_status_source`. Under the current pin every CB lane resolves
-  `unattested` / `gridbook_runtime_contract:0.8.10:absent`. Two values sit outside principle 9's
+  `unattested` / `gridbook_runtime_contract:0.8.11:absent`. Two values sit outside principle 9's
   three-value enum and both say "this is not a verdict": `unattested` (the release publishes no
   table) and `unit_dependent` (the table's rules predicate on facts that exist only per unit).
 

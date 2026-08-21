@@ -17,7 +17,7 @@ THE DEFECT THIS PINS, measured twice.
 The property under test is therefore about SHAPE as much as values: an absent
 attestation must be *unrepresentable* as a clean bill. The synthetic tables here
 exercise the gate's four dispositions; the ABSENT test runs against the REAL
-materialized Gridbook 0.8.10 contract, because that is the state the repository
+materialized Gridbook 0.8.11 contract, because that is the state the repository
 actually ships in and the one a vacuous zero would hide.
 """
 from __future__ import annotations
@@ -330,9 +330,13 @@ def test_a_mixed_selection_counts_every_disposition(attested_table):
 # 3. The ABSENT path — the exact defect of units_on_fallback_route = 0
 # ---------------------------------------------------------------------------
 def test_the_real_pinned_release_publishes_no_eligibility_table():
-    """Measured, not assumed: Gridbook 0.8.10 packages no lane_eligibility."""
+    """Measured, not assumed: Gridbook 0.8.11 packages no lane_eligibility.
+
+    (0.8.11's packaged contract is byte-identical to 0.8.10's; the serving
+    pin, not this file, says which release the claim is made of.)
+    """
     contract = json.loads(
-        (ASSET_DIR / "gridbook_runtime_contract.0.8.10.json").read_text())
+        (ASSET_DIR / "gridbook_runtime_contract.0.8.11.json").read_text())
     assert "lane_eligibility" not in contract
     # What it DOES publish, so a future reader can see the gap precisely.
     assert set(contract) == {
@@ -341,7 +345,7 @@ def test_the_real_pinned_release_publishes_no_eligibility_table():
     }
     table = load_eligibility_table()
     assert table.present is False
-    assert table.runtime_version == "0.8.10"
+    assert table.runtime_version == "0.8.11"
 
 
 def test_absent_attestation_reports_unattested_and_never_a_zero():
@@ -356,7 +360,7 @@ def test_absent_attestation_reports_unattested_and_never_a_zero():
     assert p["route_attestation"] == ROUTE_STATUS_UNATTESTED
     assert p["units_unattested"] == 2
     assert p["attestation"]["status"] == "absent"
-    assert p["attestation"]["gridbook_serving_commit"].startswith("f4b3274")
+    assert p["attestation"]["gridbook_serving_commit"].startswith("187c721")
 
     # THE POINT: none of the counters that could be misread as a clean bill
     # exist in this payload at all.
@@ -494,7 +498,7 @@ def test_the_resolved_lane_exposes_structured_route_status():
     assert payload["route_status"] == ROUTE_STATUS_UNATTESTED
     assert payload["requires_serve_flags"] == []
     assert payload["route_status_source"].endswith(":absent")
-    assert "0.8.10" in payload["route_status_source"]
+    assert "0.8.11" in payload["route_status_source"]
 
 
 def test_selection_provenance_distinguishes_unattested_from_zero():

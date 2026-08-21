@@ -11,13 +11,14 @@
 # embedding mechanism does not exist before Gridbook 0.8.7 -- on 0.8.5 the load
 # dies on an unrecognised `embed_tokens.cb_*`/NVFP4 embedding parameter. So
 # this lane must cross the *serving* pin (gridbook_serving_runtime.sh, contract
-# v4, 0.8.10) instead.  0.8.8+ is required, not merely current: 0.8.7 shipped
+# v4, 0.8.11) instead.  0.8.8+ is required, not merely current: 0.8.7 shipped
 # the quantized-embedding METHOD but Qwen3.5/3.6 never calls get_quant_method
-# for its lookup table, so on 0.8.7 this artifact does not load at all; 0.8.10
-# is the pinned release (0.8.9 defaults the qualified CB kernels on and 0.8.10
-# fixes a split-bank MoE load regression -- dense-only artifacts like this one
-# see no route change from either, and every explicit spelling keeps its 0.8.8
-# semantics). The two pins are independent and nothing cross-checks
+# for its lookup table, so on 0.8.7 this artifact does not load at all; 0.8.11
+# is the pinned release (0.8.9 defaults the qualified CB kernels on, 0.8.10
+# fixes a split-bank MoE load regression, 0.8.11 makes the routed grouped
+# lanes and the MXFP8 A-side capture-safe -- dense-only artifacts like this one
+# see no route change from any of them, and every explicit spelling keeps its
+# 0.8.8 semantics). The two pins are independent and nothing cross-checks
 # them; picking the wrong one is a load-time failure, not a warning.
 #
 # The base image already carries the pinned wheel, so `install-container` is a
@@ -41,7 +42,7 @@ gridbook_serving_runtime_prepare || exit $?
 
 # The image built from the published gridbook archive the serving pin names;
 # its installed distribution is the archive whose sha256 the pin asserts.
-BASE_IMAGE="${BASE_IMAGE:-gridbook:0.8.10-clean-f4b3274}"
+BASE_IMAGE="${BASE_IMAGE:-gridbook:0.8.11-clean-187c721}"
 NAME=pq_qwen38_cb_a
 WORK=/home/rob/dq-runs/qwen38-27b-cb-a
 MODEL="${MODEL:-/dqruns/qwen38-27b-cb-a/exported_nvfp4_cb}"

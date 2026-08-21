@@ -4,6 +4,15 @@
   "packaged_path": "gridbook/runtime_contract.json",
   "contracts": [
     {
+      "version": "0.8.11",
+      "commit": "187c7216b9d4882321c1923de0b4c49dc139743c",
+      "runtime_contract_schema": "gridbook.runtime-contract.v4",
+      "path": "gridbook_runtime_contract.0.8.11.json",
+      "sha256": "0e2c32f3a41385d940dde09dac799338266829f01eb70fd5f41448b538371382",
+      "lane_eligibility": "absent",
+      "lane_eligibility_detail": "Gridbook 0.8.11 packages NO lane-eligibility table; its runtime_contract.json is byte-identical to 0.8.10's (sha256 0e2c32f3...), so everything said of 0.8.10 below holds unchanged. 0.8.11 is 0.8.10 plus two CUDA-graph capture fixes (gridbook#46 MXFP8 A-side offset pre-warm; gridbook#47 capture-safe padded grouped routing) -- neither changes what the contract publishes, and neither can be read from it. For 0.8.10 as for 0.8.11: Its contract publishes schema, contract_version, abi_features, quant_method, packing, layout, formats and producer_profiles, and gridbook/runtime_contract.py::validate_runtime_contract enforces that exact top-level key set -- so a 'lane_eligibility' block is not merely missing, it is currently REJECTED by the runtime's own validator. Nothing in the published fields determines which serving lane a unit's bytes ride: the persistent-B role-split refusal, the fused mid-M k%4 TMA law, the token-count regime thresholds and the operator serve flags all live in Gridbook source that the contract does not summarize. PrismaQuant therefore reports route status as UNATTESTED for this pin rather than transcribing those behaviours into local constants (principle 14: derived, or refused). docs/design/gridbook_lane_eligibility_contract.md is the exact table Gridbook must package to close this."
+    },
+    {
       "version": "0.8.10",
       "commit": "f4b3274722cc0addac60d25c49f9f5306b933937",
       "runtime_contract_schema": "gridbook.runtime-contract.v4",
