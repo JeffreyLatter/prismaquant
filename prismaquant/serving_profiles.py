@@ -25,6 +25,33 @@ from .gridbook_runtime_pin import (
 SCHEMA = "prismaquant.serving_profile.v1"
 SERVING_LANE_SCHEMA = "prismaquant.serving_lane_route.v1"
 
+#: Preference order when several unpredicated eligibility rules cover one lane.
+#: ``backed`` wins over a flag-gated route, which wins over an announced
+#: fallback, which wins over nothing -- and "nothing" is where an undeclared
+#: rule lands, never a default pass.
+_LANE_STATUS_RANK = {
+    "unbacked": 0,
+    "fallback": 1,
+    "backed_with_serve_flag": 2,
+    "backed": 3,
+}
+
+_ELIGIBILITY_TABLE: Any = None
+
+
+def _cached_eligibility_table(loader):
+    """One read of the pinned contract per process (it is immutable)."""
+    global _ELIGIBILITY_TABLE
+    if _ELIGIBILITY_TABLE is None:
+        _ELIGIBILITY_TABLE = loader()
+    return _ELIGIBILITY_TABLE
+
+
+def _reset_eligibility_table_cache() -> None:
+    """Test seam: the pinned contract is immutable, monkeypatched ones are not."""
+    global _ELIGIBILITY_TABLE
+    _ELIGIBILITY_TABLE = None
+
 
 @dataclass(frozen=True)
 class ServingFormatDecision:
@@ -390,6 +417,24 @@ class ResolvedServingLane:
     rungs_source: str
     rung: int | None = None
     detail: str = ""
+    # --- Structured route status (campaign rule R3, principle 9). ----------
+    # Principle 9 requires route status in a STRUCTURED field a gate can read,
+    # never in prose. These three carry it. Their values are RESOLVED from the
+    # pinned Gridbook serving release's packaged contract, never written into
+    # a spec file: a hand-typed verdict is an assertion, and principle 14 takes
+    # assertions about another runtime as refusals.
+    #
+    # ``route_status`` adds two values to principle 9's lane enum, both of
+    # which say "this is not a verdict":
+    #   ``unattested``     the pinned release publishes no eligibility table,
+    #                      so no claim is made. NOT a zero and NOT a pass.
+    #   ``unit_dependent`` the table's rules for this lane predicate on facts
+    #                      that only exist per unit at export (role split,
+    #                      out_features), so the verdict is the export gate's
+    #                      (``cb_route_status_gate``), not this lane's.
+    route_status: str = "unattested"
+    requires_serve_flags: tuple[str, ...] = ()
+    route_status_source: str = ""
 
     def as_dict(self) -> dict:
         return {
@@ -397,6 +442,9 @@ class ResolvedServingLane:
             "format": self.format,
             "rung": self.rung,
             "activation_contract": self.activation_contract,
+            "route_status": self.route_status,
+            "requires_serve_flags": list(self.requires_serve_flags),
+            "route_status_source": self.route_status_source,
             "fused_mid_m_backed": bool(self.fused_mid_m_backed),
             "fused_mid_m_rungs": list(self.fused_mid_m_rungs),
             "fused_mid_m_range": (
@@ -417,6 +465,7 @@ class ResolvedServingLane:
                 "act": self.activation_contract,
                 "fused_mid_m": bool(self.fused_mid_m_backed),
                 "runtime": self.runtime_version,
+                "route_status": self.route_status,
             },
             separators=(",", ":"),
             sort_keys=True,
@@ -461,13 +510,22 @@ class ServingLaneSpec:
         tuple[str, tuple[int, ...]], ...
     ] = ()
     detail: str = ""
+    #: Which structural class of the pinned runtime's eligibility table this
+    #: lane's route status is resolved from (campaign rule R3). The spec
+    #: declares the MAPPING -- which key to consult -- and never the verdict.
+    #: A lane with no ``route_status_source`` resolves ``unattested``, which is
+    #: the fail-closed direction: a lane that names no attestation has none.
+    route_status_structures: tuple[str, ...] = ()
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "ServingLaneSpec":
         fused = dict(payload.get("fused_mid_m") or {})
         m_range = fused.get("m_range")
         by_version = fused.get("rungs_by_runtime_version") or {}
+        source = dict(payload.get("route_status_source") or {})
         return cls(
+            route_status_structures=tuple(
+                str(v) for v in source.get("structures", ())),
             id=str(payload["id"]),
             formats=_declared_formats(
                 payload.get("formats", ()),
@@ -500,9 +558,69 @@ class ServingLaneSpec:
             return (), "lane_declares_no_fused_mid_m_lane"
         return (), "pinned_runtime_version_not_declared"
 
+    def route_status_for(self, fmt: str) -> tuple[str, tuple[str, ...], str]:
+        """``(route_status, requires_serve_flags, source)`` from the pin (R3).
+
+        Resolved, never declared. The spec names which structural classes of
+        the runtime's eligibility table this lane consults; the verdict comes
+        from the table the PINNED SERVING release packages.
+        """
+        from .gridbook_lane_eligibility import (
+            ROUTE_STATUS_UNATTESTED,
+            load_eligibility_table,
+        )
+
+        table = _cached_eligibility_table(load_eligibility_table)
+        if not table.present:
+            return (
+                ROUTE_STATUS_UNATTESTED,
+                (),
+                f"gridbook_runtime_contract:{table.runtime_version}:absent",
+            )
+        if not self.route_status_structures:
+            # A lane that names no attestation has none. Fail-closed.
+            return (
+                ROUTE_STATUS_UNATTESTED,
+                (),
+                "lane_declares_no_route_status_source",
+            )
+        canonical = fr.canonical_format_name(fmt)
+        rules = [
+            rule for rule in table.rules
+            if rule.structure in self.route_status_structures
+        ]
+        if not rules:
+            return (
+                ROUTE_STATUS_UNATTESTED,
+                (),
+                f"gridbook_runtime_contract:{table.runtime_version}:no_rule",
+            )
+        # Any rule carrying a predicate needs per-unit facts the lane does not
+        # have (role split, out_features). The export gate settles those; this
+        # lane says so rather than guessing a lane-wide verdict.
+        if any(rule.predicates for rule in rules):
+            return (
+                "unit_dependent",
+                tuple(sorted({
+                    flag for rule in rules
+                    for flag in rule.requires_serve_flags
+                })),
+                f"gridbook_runtime_contract:{table.runtime_version}"
+                ":unit_dependent(cb_route_status_gate)",
+            )
+        best = max(rules, key=lambda rule: _LANE_STATUS_RANK.get(
+            rule.route_status, 0))
+        _ = canonical
+        return (
+            best.route_status,
+            best.requires_serve_flags,
+            f"gridbook_runtime_contract:{table.runtime_version}:{best.id}",
+        )
+
     def resolve(self, fmt: str, *, runtime_version: str,
                 rung: int | None) -> ResolvedServingLane:
         rungs, source = self.backed_rungs(runtime_version)
+        status, flags, status_source = self.route_status_for(fmt)
         return ResolvedServingLane(
             lane_id=self.id,
             format=fr.canonical_format_name(fmt),
@@ -515,6 +633,9 @@ class ServingLaneSpec:
             rungs_source=source,
             rung=rung,
             detail=self.detail,
+            route_status=status,
+            requires_serve_flags=flags,
+            route_status_source=status_source,
         )
 
 

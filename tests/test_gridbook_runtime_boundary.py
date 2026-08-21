@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import shutil
 from pathlib import Path
@@ -180,6 +181,75 @@ def test_no_gridbook_runtime_or_tests_are_vendored():
     assert not (REPO / "plugins" / "gridbook").exists()
     assert not (REPO / "scripts" / "sync_gridbook.py").exists()
     assert not (REPO / "tests" / "test_gridbook_sync.py").exists()
+
+
+def test_the_materialized_runtime_contract_is_data_not_runtime_code():
+    """The CONTRACT crosses the boundary; the RUNTIME never does (R3).
+
+    AGENTS.md:38 sanctions exactly one crossing -- "the immutable pin and
+    contract" -- and principle 14 says the attestation travels in the contract
+    file. So a byte-verbatim copy of Gridbook's packaged ``runtime_contract.json``
+    belongs here, and a ``.py``/``.cu``/``.so`` from that repository never does.
+    This test is the line between the two.
+    """
+    stray = sorted(
+        path.relative_to(REPO).as_posix()
+        for path in ASSET_DIR.iterdir()
+        if path.suffix not in {".json", ".sh"}
+    )
+    assert not stray, (
+        f"only pin/contract JSON and the resolver helper belong in {ASSET_DIR}: "
+        f"{stray}")
+
+    index = json.loads(
+        (ASSET_DIR / "gridbook_runtime_contract_index.json").read_text(
+            encoding="utf-8"))
+    assert index["packaged_path"] == "gridbook/runtime_contract.json"
+    for entry in index["contracts"]:
+        contract = json.loads(
+            (ASSET_DIR / entry["path"]).read_text(encoding="utf-8"))
+        assert contract["schema"] == entry["runtime_contract_schema"]
+        assert hashlib.sha256(
+            (ASSET_DIR / entry["path"]).read_bytes()).hexdigest() == (
+                entry["sha256"]), (
+            f"{entry['path']} has drifted from the release it claims to be; "
+            "re-materialize it from the pinned commit rather than editing it")
+        # `lane_eligibility` is either absent (and the index says so, loudly)
+        # or present -- never quietly invented here.
+        declared = entry["lane_eligibility"]
+        assert declared in {"absent", "present"}
+        assert (declared == "present") == ("lane_eligibility" in contract), (
+            f"{entry['path']}: the index and the contract disagree about "
+            "whether a lane-eligibility table is published")
+
+
+def test_tests_do_not_import_gridbook_outside_the_pinned_compat_job():
+    """AGENTS.md:38 -- the attestation travels in the contract file."""
+    # The sanctioned importers are the pinned-compatibility CI job's modules,
+    # which run only under PRISMAQUANT_REQUIRE_GRIDBOOK_CONTRACT=1 with the
+    # pinned wheel installed. Membership is derived from that GUARD rather
+    # than from a filename list, so a new compat test inherits the rule and a
+    # test that drops its guard loses the exemption in the same commit.
+    guard = "PRISMAQUANT_REQUIRE_GRIDBOOK_CONTRACT"
+    violations: list[str] = []
+    for path in (REPO / "tests").rglob("*.py"):
+        text = path.read_text(encoding="utf-8")
+        if guard in text and "pytestmark" in text:
+            continue
+        tree = ast.parse(text, filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                names = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                names = [node.module or ""]
+            else:
+                continue
+            if any(name == "gridbook" or name.startswith("gridbook.")
+                   for name in names):
+                violations.append(f"{path.relative_to(REPO)}:{node.lineno}")
+    assert not violations, (
+        "a test may not import the Gridbook runtime; read the materialized "
+        f"contract in {ASSET_DIR.relative_to(REPO)} instead: {violations}")
 
 
 def test_producer_does_not_import_external_gridbook_runtime():

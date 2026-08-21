@@ -1,7 +1,33 @@
 # PrismaQuant Architecture
 
 As of: 2026-08-21 · `main` — stamps follow, newest first, each recording
-its own branch and date. Re-stamped (2026-08-21, `feat/discovery-walker`)
+its own branch and date. Re-stamped (2026-08-21, `feat/cb-route-status`)
+for **structured route status on the CB lane** (§9.2.1,
+`prismaquant/gridbook_lane_eligibility.py` +
+`prismaquant/cb_route_status_gate.py`): serving-lane eligibility becomes a
+fail-closed export gate instead of a serve-time discovery. Every CB serving
+lane gains a `route_status_source` naming which structural class of the
+runtime's eligibility table it consults, and `ResolvedServingLane` carries
+`route_status` / `requires_serve_flags` / `route_status_source` resolved from
+the **serving** pin — never declared in a spec file. Measured and recorded
+here rather than worked around: Gridbook 0.8.10's packaged
+`runtime_contract.json` publishes `formats`, `packing`, `layout`,
+`abi_features`, `quant_method` and `producer_profiles`, and **no
+lane-eligibility table at all** — its own validator enforces that exact key
+set — so the honest verdict for this pin is `unattested`, derived from a
+byte-verbatim copy of the packaged contract now materialized in
+`prismaquant/gridbook_runtime/`. Transcribing the runtime's persistent-B
+role-split refusal into local constants would have been an assertion, which
+principle 14 refuses. The export gate runs in both CB exporters before any
+byte is written, because `role_split` — the fact that made 11 shipped DSv4
+layers take an announced fallback with nothing consuming it — exists only
+once the per-`(qname, format)` codebook cells resolve. Its payload shape is
+load-bearing: under an absent attestation it carries `units_unattested` and
+**no** backed/fallback counters at all, so the
+`units_on_fallback_route = 0` defect is unrepresentable rather than merely
+discouraged. `docs/design/gridbook_lane_eligibility_contract.md` specifies
+what Gridbook must package to flip this to attested. Re-stamped
+(2026-08-21, `feat/discovery-walker`)
 for **the discovery walker** (§8.8, `prismaquant/model_walk.py`): every
 weight-bearing computation is discovered by traversal — module tree plus one
 matmul-intercepted forward traced under `FakeTensorMode` on a meta load —
@@ -5345,6 +5371,93 @@ artifact was not release-eligible at its then-current runtime pin. Gridbook 0.8.
 the DSv4 body/MTP/DSpark loader and routed per-role ABI consumed by this producer, but that does
 not retroactively promote the 92 GB study: the current 112.690 GB AURA artifact must still close
 the exact eager/graph, quality, and paired whole-model served native-parity shipcard gates.
+
+#### 9.2.1 Structured route status, and why it reads "unattested" (R3)
+
+Principle 9 requires route status in a **structured** field a gate can read, and principle 14
+requires that field to be derived from a table the pinned runtime publishes, or refused. Both
+apply to this lane, and the honest current answer is a refusal to claim.
+
+**The two measured defects.** The shipped DSv4 87 GB artifact carries 11 routed FP8-CB layers
+whose `gate_proj` and `up_proj` bind distinct learned codebooks. Gridbook's persistent-B prefill
+lane refuses per-role split books, so above the token threshold those layers take the announced
+expand-and-bridge route. The exporter priced and shipped them with no gate consuming that fact,
+and a user found it at serve time. Its twin lives on the vanilla-vLLM lane, where
+`units_on_fallback_route = 0` was reachable only by never having looked: no serving-profile spec
+declared route status, so every unit `continue`d before it could be counted.
+
+**What the pinned contract publishes.** Gridbook 0.8.10's packaged
+`gridbook/runtime_contract.json` (schema `gridbook.runtime-contract.v4`) carries `schema`,
+`contract_version`, `abi_features`, `quant_method`, `packing`, `layout`, `formats`, and
+`producer_profiles` — and its own validator enforces that exact key set, so a lane-eligibility
+block is currently rejected rather than merely missing. None of the published fields determines
+which lane a unit rides: the persistent-B role-split refusal, the fused mid-M `k % 4` law, the
+token-count regime thresholds, and the operator serve flags all live in Gridbook source the
+contract does not summarize. Do not read
+`abi_features.routed_moe_per_role_codebook_lut = 1` as a persistent-B eligibility claim; it
+attests fused-mainloop LUT support, a different question.
+
+**What PrismaQuant does instead of transcribing.** The producer implements the consumption half
+and reports the gap:
+
+- `prismaquant/gridbook_runtime/gridbook_runtime_contract.0.8.10.json` is a byte-verbatim copy of
+  the packaged contract, bound to the **serving** pin by
+  `gridbook_runtime_contract_index.json` (version, commit, sha256). The contract JSON is the
+  sanctioned boundary crossing (`AGENTS.md:38`); the runtime is never imported. The
+  pinned-compatibility CI job asserts the copy equals the installed wheel's file
+  (`tests/test_gridbook_runtime_contract.py`), so the two cannot drift.
+- `prismaquant/gridbook_lane_eligibility.py` reads `lane_eligibility` from that file, finds it
+  absent, and returns a typed `EligibilityTable(present=False)`. Absence is therefore **derived
+  from the pinned contract**, not assumed. The same module derives payload family, `n_sub`, and
+  rung legality from the `formats` table that 0.8.10 really does publish.
+- `serving_profile_specs/nvfp4_cb.json` gives every serving lane a `route_status_source` block
+  naming which structural classes it consults. The spec declares the **key**; the verdict comes
+  from the contract. A verdict written into that file would be an assertion, so
+  `tests/test_cb_route_status_gate.py` refuses one.
+- `ResolvedServingLane` carries `route_status`, `requires_serve_flags`, and
+  `route_status_source`. Under the current pin every CB lane resolves
+  `unattested` / `gridbook_runtime_contract:0.8.10:absent`. Two values sit outside principle 9's
+  three-value enum and both say "this is not a verdict": `unattested` (the release publishes no
+  table) and `unit_dependent` (the table's rules predicate on facts that exist only per unit).
+
+**The export gate.** `prismaquant/cb_route_status_gate.py` runs in both CB exporters before any
+byte is written — `export_nvfp4_cb_streaming.py` after the serialization-context stamp, and
+`export_nvfp4_cb.py` at the matching point — because `role_split` is knowable only once the
+per-`(qname, format)` codebook cells resolve. Per unit it resolves the route in every declared
+regime and then:
+
+| Outcome | Disposition |
+|---|---|
+| Backed in every regime | Passes. |
+| Backed in some regime, announced fallback in another | **Recorded**, per unit and in the shipcard census. This is the measured DSv4 state, and it serves. |
+| Backed only behind an operator flag | Passes as `backed_with_serve_flag`; the flag travels with the artifact. |
+| No backed route in any regime | **Refuses**, unless `--non-native-target PLATFORM` or `--allow-unbacked-route REASON` is given. Both are strings, both are stamped. |
+| No table published | Reports `unattested`. |
+
+Both dispositions are stamped into `quant_config["provenance"]["cb_route_status"]`, which is
+inventory-bound, so the census is part of the artifact's identity rather than a log line. From
+there `shipcard.build_shipcard` lifts the compact census onto `shipcard.json` as
+`cb_route_status` (`cb_route_status_gate.shipcard_route_summary`), because principle 9 stamps
+the disposition **on the card** and principle 12 makes the route histogram travel with the bpp
+claim. Both exporters stamp before opening the card, so one seam covers the streaming and
+non-streaming paths, and a non-CB artifact — which never runs the gate — gets no field at all
+rather than an empty census. The environment spellings are `PQ_CB_ROUTE_STATUS_OVERRIDE` and
+`PQ_CB_NON_NATIVE_TARGET`. They take the reason and the platform, not a bare `1`: a stamped
+override whose rationale is `1` documents nothing.
+
+**The payload shape is the point.** Under an absent attestation the provenance carries
+`units_unattested` and **no** backed, fallback, or unbacked counters at all. A vacuous zero is
+unrepresentable rather than merely discouraged, which is the 2026-08-17 lesson applied to its
+own twin. `selection_serving_lane_provenance` gains the same discipline: alongside the older
+`units_on_fallback_route` (which is about the fused mid-M lane only) it now reports
+`route_status_counts` and `route_status_attested`, so a lane that has never been looked at is
+distinguishable from one that came back clean. Principle 12 requires whichever is true to travel
+next to any bpp or KL claim: report "route status not attested for this lane", never "0 units on
+a fallback route".
+
+**To make it attested,** Gridbook must package the table specified in
+`docs/design/gridbook_lane_eligibility_contract.md`. Then advance the serving pin, add the new
+release's packaged contract, and flip the index entry to `present`; no PrismaQuant code changes.
 
 ### 9.3 GGUF
 
