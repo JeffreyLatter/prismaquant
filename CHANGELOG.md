@@ -1,5 +1,76 @@
 # Changelog
 
+## 0.16.0 — 2026-08-21
+
+### Added
+
+- **AQUA prices packed routed experts — 94.5% of an MoE's quantizable
+  parameters that the activation term had never reached.** On
+  Ornith-1.5-35B-A3B the AQUA merge covered 310 of 402 units; the 91 misses
+  were the packed routed-expert tensors. Two causes, the second decisive:
+  packed expert params carry no `.weight` suffix so `build_weight_resolver`
+  never indexed them, and even once resolved they had no `g_sq_sum`, because
+  marginals come from `nn.Linear` backward hooks while a packed `[E, M, N]`
+  expert is an `nn.Parameter` on a fused module.
+  `install_packed_expert_hooks` already intercepted every expert-slice matmul
+  — including `down_proj`, whose input is the post-SwiGLU intermediate — and
+  already held `(x, gy)` per slice; nothing read them for the activation side.
+  Marginals are carried **per expert, not aggregated**, because routing makes
+  both `g` and the activation distribution functions of `e` and
+  `sum_e W^2 g var != (sum W^2)(sum g)(sum var)`. Sensitivity card schema 1.1
+  adds `expert_g_sq_sum [E, M]`, `expert_act_sq_sum [E, N]`,
+  `expert_act_absmax [E, N]` and `expert_tokens [E]`, with the two
+  normalizations deliberately different: `g` by global tokens, activation
+  variance by routed tokens.
+
+- **`lane_specs/compressed_tensors.json` declares
+  `served_activation_quantization`.** AQUA-AURA previously refused on the lane
+  every flagship ships through: the key existed only on `nvfp4_cb`, so the
+  activation term had never been priced on a vanilla-vLLM artifact and asking
+  for it returned a REFUSE rather than a number. The list is **derived, not
+  asserted** (principle 14): vLLM packages no runtime contract, but on this
+  lane the executed contract is a function of the artifact we write — vLLM's
+  compressed-tensors dispatcher picks the scheme from the checkpoint's own
+  `config_groups[*].input_activations`, which `export_native_compressed`
+  emits from its per-format scheme table. Both ends are readable, so the list
+  is their intersection, and each entry cites the producer field and the
+  consumer predicate. Dense scheme and fused-MoE method were verified
+  **separately per family**. MXFP4 is excluded on purpose: its scheme declares
+  no `input_activations` key, so vLLM serves it W4A16 while the registry
+  descriptor calls it W4A4 — pricing it off the registry would charge a
+  phantom A4, the exact shape of the DSv4 mispricing. The registry is not the
+  authority here; the lane is.
+
+### Fixed
+
+- **The A-side test tolerance pinned the pre-GPU host-float64 path.**
+  `test_activation_dloss_uses_g_sq_sum_not_fisher_row` asserted `rel=1e-9`,
+  exact only while `activation_dloss` reduced in numpy float64 on the host.
+  Moving that reduction to the device (principle 7) makes the square and the
+  product float32 with a float64 accumulation — a deliberate trade, since
+  every term is a square times a variance and nothing cancels. Measured
+  aggregate error 3.4e-9 relative; the tolerance is now 8 float32 eps, derived
+  from the dtype rather than picked. The discrimination the test exists for is
+  untouched.
+
+### Documentation
+
+- **D32: the Fisher probe is not bit-reproducible.** A probe-side change was
+  gated on `h_trace` being bit-identical to the previous probe and refused
+  twice. Two runs of the *same* code at the *same* pin settled it: 379/402
+  units differ, median 2.5e-4, max 1.1e-2 — larger than the old-vs-new
+  difference of 1.56e-4. `n_tokens_seen` and the per-expert Fisher support are
+  bit-identical on every unit, so the forward and the routing are exactly
+  deterministic; only the backward moves, and 30 of 40 layers are Gated
+  DeltaNet whose fla Triton kernels reduce over chunks in non-deterministic
+  order. Consequence recorded: probe-derived artifacts must be rebuilt
+  together from one probe run, or `cost.pkl`'s stamped provenance names a
+  probe that produced only some of its numbers.
+
+- `CLAUDE.md` named the wrong `AURA_ADDITIVITY_GATE` default (`auto`);
+  `run-pipeline.sh` defaults it to `measure`, which is why a run's `cost.pkl`
+  carries a measured additivity residual rather than a predicted sum alone.
+
 ## 0.15.3 — 2026-08-18
 
 ### Fixed
