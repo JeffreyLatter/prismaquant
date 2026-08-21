@@ -42,6 +42,14 @@ from prismaquant.gridbook_runtime_pin import (
     load_gridbook_runtime_pin,
     supports_routed_moe_per_role_codebook_lut,
 )
+from prismaquant.routed_moe_codebooks import (
+    DEFAULT_ROUTED_BOOK_KEYING,
+    ROUTED_BOOK_KEYINGS,
+    ROUTED_BOOK_KEYING_ROLE,
+    ROUTED_BOOK_KEYING_STACK,
+    ROUTED_STACK_KEYS,
+    normalize_routed_book_keying,
+)
 
 
 CB_LEARNED_BUNDLE_SCHEMA = "prismaquant.cb_learned_codebook_bundle.v1"
@@ -224,6 +232,50 @@ def refuse_routed_moe_learned(
         f">={GRIDBOOK_ROUTED_MOE_PER_ROLE_CODEBOOK_LUT_MIN_VERSION}. Dense "
         "Linear CBL remains supported."
     )
+
+
+def _keying_implied_by_cell_qname(qname: str) -> str | None:
+    """Keying a routed cell name proves on its own, or ``None`` if ambiguous.
+
+    A cell named after the packed parent (``...experts.gate_up_proj``) pools
+    both projections; one named after a half (``...experts.gate_proj``) does
+    not.  ``down_proj`` is a one-projection stack, so its book is the same
+    object under either keying and the name proves nothing.
+    """
+
+    leaf = str(qname).rsplit(".", 1)[-1]
+    if leaf == "down_proj":
+        return None
+    if leaf in ROUTED_STACK_KEYS:
+        return ROUTED_BOOK_KEYING_STACK
+    if leaf in {"gate_proj", "up_proj"}:
+        return ROUTED_BOOK_KEYING_ROLE
+    return None
+
+
+def resolve_routed_book_keying(
+    qname: str,
+    declared: object | None,
+    *,
+    fallback: str = DEFAULT_ROUTED_BOOK_KEYING,
+) -> str:
+    """Return the keying to record for one routed learned cell.
+
+    A declared value must agree with whatever the cell name already proves;
+    with nothing declared the name decides, and an ambiguous name (a
+    one-projection ``down_proj`` stack) takes *fallback*.
+    """
+
+    implied = _keying_implied_by_cell_qname(qname)
+    if declared is None:
+        return implied or normalize_routed_book_keying(fallback)
+    keying = normalize_routed_book_keying(declared)
+    if implied is not None and keying != implied:
+        raise ValueError(
+            f"{qname}: cell name implies {implied} keying but the build "
+            f"declared {keying}"
+        )
+    return keying
 
 
 def _wq_pattern(col_weight: torch.Tensor) -> torch.Tensor:
@@ -581,6 +633,27 @@ class CBLearnedBundle:
                 f"{canonical} cell; refusing lattice fallback"
             ) from exc
 
+    def has_cell(self, qname: str, format_name: str) -> bool:
+        """Whether this bundle carries one exact ``(qname, format)`` cell."""
+
+        try:
+            self.cell(qname, format_name)
+        except ValueError:
+            return False
+        return True
+
+    def routed_book_keying(self, qname: str, format_name: str) -> str:
+        """Which rule burned one routed learned book.
+
+        A cell written before campaign rule R1 records nothing, and those books
+        are per role by construction, so an absent field reads as ``"role"``.
+        """
+
+        cell = self.cell(qname, format_name)
+        return str(
+            cell.get("routed_book_keying", ROUTED_BOOK_KEYING_ROLE)
+        )
+
     def validate_inputs(
         self,
         qname: str,
@@ -658,6 +731,7 @@ def train_and_save_bundle(
     formats: Sequence[str] | Mapping[str, Sequence[str]],
     learned_formats: Iterable[str] | None = None,
     routed_moe_qnames: Iterable[str] = (),
+    routed_book_keying: str | Mapping[str, str] | None = None,
     pretrained_codebooks: Mapping[tuple[str, str], object] | None = None,
     pretrained_codebook_provider: Callable[
         [str, str, torch.Tensor, torch.Tensor], object | None
@@ -686,6 +760,14 @@ def train_and_save_bundle(
     supplied cell (static or provider-backed) is the only production route for
     a rank-3 routed-expert population: expert books measured during a burn must
     be copied byte-for-byte into the bundle, never retrained at export time.
+
+    ``routed_book_keying`` records which rule burned each routed learned book —
+    ``"stack"`` (one book per ``(layer, stack, rung)``, gate and up pooled) or
+    ``"role"`` (one book per ``(layer, projection, rung)``).  A book's
+    calibration is its identity, and so is the population it was pooled over,
+    so the keying is written onto every routed learned cell.  Pass one value
+    for the whole build or a per-qname mapping; omit it and each cell's name
+    decides.
     """
 
     path = Path(path)
@@ -721,6 +803,41 @@ def train_and_save_bundle(
     if missing_col:
         raise ValueError(f"bundle cells are missing col_weights: {missing_col[:8]}")
     routed = {str(name) for name in routed_moe_qnames}
+    if routed_book_keying is None or isinstance(routed_book_keying, str):
+        declared_keying: dict[str, object] = {
+            qname: routed_book_keying for qname in routed
+        }
+    else:
+        declared_keying = {
+            str(name): value for name, value in routed_book_keying.items()
+        }
+        unknown_keying = sorted(set(declared_keying) - routed)
+        if unknown_keying:
+            raise ValueError(
+                "routed_book_keying names non-routed qname(s): "
+                f"{unknown_keying[:8]}"
+            )
+    # A ``down_proj`` cell is one projection either way, so its name proves no
+    # keying.  Let the build's own unambiguous cells answer for it before
+    # falling back to the campaign default: a bundle whose w13 books are per
+    # role is a per-role bundle throughout.
+    build_implied = {
+        implied
+        for qname in routed
+        if (implied := _keying_implied_by_cell_qname(qname)) is not None
+    }
+    fallback_keying = (
+        next(iter(build_implied)) if len(build_implied) == 1
+        else DEFAULT_ROUTED_BOOK_KEYING
+    )
+    keying_by_qname = {
+        qname: resolve_routed_book_keying(
+            qname,
+            declared_keying.get(qname),
+            fallback=fallback_keying,
+        )
+        for qname in sorted(routed)
+    }
     supplied_books: dict[tuple[str, str], object] = {}
     for raw_key, value in (pretrained_codebooks or {}).items():
         if (
@@ -909,6 +1026,9 @@ def train_and_save_bundle(
                     "rung_policy": dict(CBL_RUNG_POLICY[rung]),
                 } if source == "learned" else {}),
                 **({
+                    "routed_book_keying": keying_by_qname[qname],
+                } if source == "learned" and qname in keying_by_qname else {}),
+                **({
                     "pretrained_origin": pretrained_origin,
                 } if pretrained_origin is not None else {}),
             }
@@ -974,6 +1094,7 @@ def train_and_save_bundle_streaming(
     formats: Sequence[str] | Mapping[str, Sequence[str]],
     learned_formats: Iterable[str] | None = None,
     routed_moe_qnames: Iterable[str] = (),
+    routed_book_keying: str | Mapping[str, str] | None = None,
     pretrained_codebooks: Mapping[tuple[str, str], object] | None = None,
     pretrained_codebook_provider: Callable[
         [str, str, torch.Tensor, torch.Tensor], object | None
@@ -993,6 +1114,7 @@ def train_and_save_bundle_streaming(
         formats=formats,
         learned_formats=learned_formats,
         routed_moe_qnames=routed_moe_qnames,
+        routed_book_keying=routed_book_keying,
         pretrained_codebooks=pretrained_codebooks,
         pretrained_codebook_provider=pretrained_codebook_provider,
         input_alias_provider=input_alias_provider,
@@ -1166,6 +1288,21 @@ def load_bundle(path: str | Path) -> CBLearnedBundle:
             expected_cell_members = {
                 "source", "codebook_ref", "content_sha256"
             } | ({"rung_policy"} if source == "learned" else set())
+            if "routed_book_keying" in cell:
+                # Absent means a pre-R1 bundle, whose routed books ARE per
+                # role; present, it must name a keying this producer knows.
+                if source != "learned":
+                    raise ValueError(
+                        f"{path}: lattice cell records a routed book keying "
+                        f"for {qname}/{canonical}"
+                    )
+                if cell.get("routed_book_keying") not in ROUTED_BOOK_KEYINGS:
+                    raise ValueError(
+                        f"{path}: invalid routed book keying "
+                        f"{cell.get('routed_book_keying')!r} for "
+                        f"{qname}/{canonical}"
+                    )
+                expected_cell_members.add("routed_book_keying")
             if "pretrained_origin" in cell:
                 if source != "learned":
                     raise ValueError(

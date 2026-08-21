@@ -1,7 +1,24 @@
 # PrismaQuant Architecture
 
 As of: 2026-08-21 · `main` — stamps follow, newest first, each recording
-its own branch and date. Re-stamped (2026-08-21, `feat/discovery-walker`)
+its own branch and date. Re-stamped (2026-08-21, `feat/pooled-stack-books`)
+for **pooled routed codebooks and the split-book ship gate** (campaign rule
+R1, §"The learned-codebook selector"). Routed learned books are now burned per
+`(layer, STACK, rung)` — gate and up pooled into one book — and the exporters
+emit one codebook target for a fused weight whose bundle cell says `stack`.
+The pre-R1 per-`(layer, projection, rung)` form survives behind
+`build_cb_learned_bundle --routed-book-keying role` for the campaign's A/B
+arm, and its artifact now needs `--allow-per-role-books` at export, stamped on
+the shipcard. The defect this closes: the shipped 87 GB DSv4 body's 11 routed
+FP8-CB layers agree on format — gate = up = down = `FP8_CB_K28`, union-find
+promotion ran and bound — yet ship distinct `codebook_sha256` per role,
+because codebook identity was in no promotion's domain and the exporter
+emitted per-role unconditionally. Nothing refused it. The allocator is
+untouched: no post-allocator rewrite, no format ban, and the new refusal is a
+structural producer-side count of the codebooks one fused weight names, not a
+claim about a runtime. Not covered here: the GPU burn that produces pooled
+books, and any quality comparison between the two arms — that is the
+campaign's B3 real-KL A/B. Re-stamped (2026-08-21, `feat/discovery-walker`)
 for **the discovery walker** (§8.8, `prismaquant/model_walk.py`): every
 weight-bearing computation is discovered by traversal — module tree plus one
 matmul-intercepted forward traced under `FakeTensorMode` on a meta load —
@@ -1118,6 +1135,38 @@ production map is learned K28–K46 plus lattice K47/K48 in one menu; changing
 the process-global policy after context creation cannot reinterpret that
 artifact (`cb_learned_bundle.py`, `nvfp4_cb_footprint.py`). `all` still warns
 because learned NVFP4-CB is measured NO-GO.
+
+**Routed learned books are keyed per (layer, stack, rung) — campaign rule R1.**
+A routed book covers the fused `w13` stack, gate and up pooled, and `down_proj`
+is a one-projection stack that keeps its own book. `build_cb_learned_bundle
+--routed-book-keying` selects the rule: `stack` (the default) or `role`, the
+pre-R1 book per `(layer, projection, rung)` that the campaign's A/B arm still
+burns. The keying reaches everything that identifies a book — the burn
+selection and bank shard name the population in their `projection` member
+(`gate_up_proj` under stack keying, so a per-role bank can never satisfy a
+pooled request), the pooled book is trained against the fused rank-3 stack and
+the packed target's own imatrix entry, and every routed learned cell records
+`routed_book_keying` in the bundle manifest. An absent field reads as `role`:
+pre-R1 books are per role by construction.
+
+Both CB exporters branch on the bundle's own record, never on a flag. A
+stack-keyed cell emits ONE codebook target for the fused weight, under the
+packed spelling a lattice layer already uses; a role-keyed cell keeps the
+per-half declaration Gridbook 0.8.4+ resolves independently. **A fused routed
+weight whose scheme would name more than one codebook refuses at export**
+(`routed_moe_codebooks.fused_targets_with_split_books`,
+`export_nvfp4_cb_streaming.py`, `export_nvfp4_cb.py`), unless
+`--allow-per-role-books` is passed, which stamps
+`build.routed_codebook_books.per_role_books_override` onto the shipcard beside
+the fused targets it covers. The gate's predicate is structural and
+producer-side — it counts distinct codebook references the artifact is about to
+write — so it asserts nothing about a runtime; the runtime consequence (split
+books cannot attest the persistent-B FP8 fast lane) appears only in the
+human-facing message. What made this a rule: the shipped 87 GB DSv4 body's 11
+routed FP8-CB layers all agree on format, gate = up = down = `FP8_CB_K28`, and
+still split because book identity was in no promotion's domain
+(`tests/test_cb_banked_bundle_builder.py`,
+`tests/test_resident_routed_moe_cbl.py`).
 
 **Scale search remains family-scoped producer identity.**
 `CB_SCALE_SWEEP_SCOPE=none|nvfp4|fp8|all` resolves the scale-search arm through

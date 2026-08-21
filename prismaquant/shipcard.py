@@ -653,8 +653,13 @@ def open_cb_export_shipcard(
     layer_config_path: str | os.PathLike,
     exporter: str,
     weight_content_manifest: Mapping[str, Any] | None = None,
+    build_extra: Mapping[str, Any] | None = None,
 ) -> tuple[Path, dict[str, Any]]:
     """Write the preliminary CB config and open its refusal record.
+
+    ``build_extra`` carries exporter-measured build-lane facts that belong on
+    the card itself — a per-run override an operator passed, for instance — and
+    may not overwrite a field this helper computes.
 
     CB inventory finalization must run *after* this helper.  The preliminary
     config lets :func:`compute_model_sha` bind all value-bearing CB metadata;
@@ -718,6 +723,12 @@ def open_cb_export_shipcard(
         # written above, so it cannot describe a different assignment.
         "read_gb_per_token": read_traffic.read_traffic_claim(root),
     }
+    collisions = sorted(set(build_extra or {}) & set(build))
+    if collisions:
+        raise ValueError(
+            f"build_extra may not overwrite computed build fields: {collisions}"
+        )
+    build.update(json.loads(json.dumps(dict(build_extra or {}))))
     card = build_shipcard(root, build=build)
     path = write_shipcard(root / SHIPCARD_FILENAME, card)
     return path, card

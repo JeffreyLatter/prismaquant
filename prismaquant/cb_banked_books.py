@@ -26,7 +26,10 @@ import torch
 from safetensors import safe_open
 
 from .cb_layout import codebook_subtable_shapes, parse_format_name
-from .routed_moe_codebooks import ROUTED_MOE_CBL_BANK_RUNGS
+from .routed_moe_codebooks import (
+    ROUTED_BOOK_KEY_NAMES,
+    ROUTED_MOE_CBL_BANK_RUNGS,
+)
 
 
 BURN_CELL_SCHEMA = "prismaquant.dsv4_afast_burn_cell.v4"
@@ -51,7 +54,12 @@ BANKED_CBL_TRAIN_STAMP: dict[str, object] = {
     "normalization": "cand0_v1",
 }
 
-_PROJECTIONS = frozenset({"gate_proj", "up_proj", "down_proj"})
+# A burn cell's ``projection`` names the population its book was pooled over:
+# one projection under role keying, or the packed parent (``gate_up_proj``)
+# under the stack keying campaign rule R1 makes the default.  A shard records
+# the same spelling its request asks for, so the two keyings cannot be
+# confused for one another.
+_PROJECTIONS = ROUTED_BOOK_KEY_NAMES
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _BANKED_ORIGIN_MEMBERS = {
     "schema",

@@ -961,12 +961,14 @@ def _fused_member_units(unit: str, fused_leaves, profile=None) -> tuple[str, ...
     than inventing a naming rule.
 
     ROUTED EXPERTS NEED A SECOND SOURCE. On a routed-MoE stack the halves are
-    not merely a legal alternative spelling, they are the only one the ABI
-    permits: per-role learned codebooks fit one book per ``(layer, projection)``,
-    and a packed ``gate_up_proj`` target can bind exactly one ``codebook_ref``,
-    so a per-role layer *must* name gate and up separately. (Lattice layers
-    share one book and legally name the packed stack; both spellings coexisting
-    across layers is the designed ABI, not an inconsistency.) But
+    the only spelling the ABI permits for a PER-ROLE layer: those learned
+    codebooks fit one book per ``(layer, projection)``, and a packed
+    ``gate_up_proj`` target can bind exactly one ``codebook_ref``, so such a
+    layer *must* name gate and up separately. (A lattice layer, and since
+    campaign rule R1 a layer whose learned books were pooled per
+    ``(layer, stack, rung)``, share one book and legally name the packed stack;
+    both spellings coexisting across layers is the designed ABI, not an
+    inconsistency.) But
     ``packed_modules_mapping`` describes the *dense* fusions vLLM performs and
     DeepseekV4 exposes none at all — ``fused_sibling_leaf_mapping()`` is ``{}``
     there — so the vLLM source can never cover routed experts on that

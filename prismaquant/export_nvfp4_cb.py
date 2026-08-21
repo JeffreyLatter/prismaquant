@@ -95,6 +95,8 @@ from prismaquant.nvfp4_activation_contract import (
 from prismaquant.routed_moe_codebooks import (
     ROUTED_MOE_CBL_BANK_RUNGS,
     RoutedMoECodebookRole,
+    describe_split_book_refusal,
+    fused_targets_with_split_books,
     learned_role_qnames_for_packed,
     logical_role_qname,
     split_role_rows,
@@ -627,6 +629,7 @@ def export_nvfp4_cb(
     scale_coding: str = cb.SCALE_CODING_TWO_TIER,
     allow_unstamped_research: bool = False,
     allow_research_cost_selection: bool = False,
+    allow_per_role_books: bool = False,
     activation_cache_dir: str | Path | None = None,
     activation_scale_policy: str | None = None,
     shard_bytes: int = DEFAULT_SHARD_BYTES,
@@ -643,6 +646,13 @@ def export_nvfp4_cb(
         a shared per-(role) learned codebook trained here on pooled vectors;
       * ``{"source": "learned", "codebooks": {role: cb_obj}}`` — use provided
         per-role codebooks (a missing role for a target hard-fails).
+
+    ``allow_per_role_books`` overrides the split-book ship gate (campaign rule
+    R1): a fused routed weight whose scheme would name more than one codebook
+    refuses unless this is passed, and passing it stamps the fact onto the
+    shipcard. This exporter reads role-keyed bundles only; a bundle whose
+    routed books were pooled per ``(layer, stack, rung)`` belongs to the
+    streaming exporter and fails closed here on its missing per-role cell.
 
     ``scale_coding``: ``"two_tier"`` (production layout v2; fp4 targets write
     4k+9 bytes per superblock) or explicit legacy ``"v1"`` (4k+16). Readers
@@ -1136,6 +1146,20 @@ def export_nvfp4_cb(
             else (_role_of(qname) if kind == "learned" else "lattice")
         )
         by_group.setdefault((ref, fmt), []).append(qname)
+
+    # --- SPLIT-BOOK SHIP GATE (campaign rule R1), the streaming exporter's
+    # twin. Structural and producer-side: count the distinct codebooks one
+    # fused routed weight's scheme would name. The runtime consequence lives
+    # only in the human-facing message.
+    split_book_targets = fused_targets_with_split_books({
+        _resident_export_target(routed_qname): {
+            role.projection: role.ref for role in routed_roles
+        }
+        for routed_qname, routed_roles in routed_role_plans.items()
+        if len(routed_roles) > 1
+    })
+    if split_book_targets and not allow_per_role_books:
+        raise ValueError(describe_split_book_refusal(split_book_targets))
 
     for (ref, fmt), qnames in by_group.items():
         if qnames[0] in routed_role_plans:
@@ -1875,6 +1899,17 @@ def export_nvfp4_cb(
         source_model=model_dir,
         layer_config_path=layer_config_path,
         exporter="export_nvfp4_cb",
+        build_extra={
+            "routed_codebook_books": {
+                "keying": ["role"] if routed_role_plans else [],
+                "pooled_stack_units": 0,
+                "per_role_units": len(routed_role_plans),
+                "fused_targets_with_split_books": sorted(split_book_targets),
+                "per_role_books_override": bool(
+                    split_book_targets and allow_per_role_books
+                ),
+            },
+        },
     )
     # Final measured bytes are a separate scope from CB tensor-data pricing:
     # include safetensors headers, JSON, tokenizer files, and every other
@@ -1960,6 +1995,14 @@ def main(argv: list[str] | None = None) -> None:
              "the sanctioned study-grade assembled cost table; recorded in "
              "artifact provenance",
     )
+    ap.add_argument(
+        "--allow-per-role-books",
+        action="store_true",
+        help="ship fused routed weights whose scheme names more than one "
+        "codebook (books burned per (layer, projection, rung) rather than "
+        "pooled per (layer, stack, rung), campaign rule R1). Refused by "
+        "default; passing it stamps the acknowledgement onto the shipcard.",
+    )
     ap.add_argument("--scale-coding", default=cb.SCALE_CODING_TWO_TIER,
                     choices=[cb.SCALE_CODING_V1, cb.SCALE_CODING_TWO_TIER],
                     help="fp4 scale coding: production layout-v2 two-tier "
@@ -1984,6 +2027,7 @@ def main(argv: list[str] | None = None) -> None:
         scale_coding=args.scale_coding,
         allow_unstamped_research=args.allow_unstamped_research,
         allow_research_cost_selection=args.allow_research_cost_selection,
+        allow_per_role_books=args.allow_per_role_books,
         activation_cache_dir=args.activation_cache_dir,
         activation_scale_policy=args.activation_scale_policy,
         shard_bytes=args.shard_bytes,
