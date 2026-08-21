@@ -48,10 +48,23 @@ def _pretend_gridbook_supports_routed_lut(monkeypatch):
 _LAYER = 7
 _RUNG = 28
 _PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
+# Campaign rule R1 burns one book per (layer, STACK, rung); the pre-R1 form
+# burned one per (layer, projection, rung) and is kept for the A/B arm.
+_STACK_KEYS = ("gate_up_proj", "down_proj")
+_BOOK_KEY_INDEX = {
+    "gate_proj": 0,
+    "up_proj": 1,
+    "down_proj": 2,
+    "gate_up_proj": 3,
+}
 _SOURCE_LEAF = {
     "gate_proj": "w1",
     "up_proj": "w3",
     "down_proj": "w2",
+}
+_STACK_PROJECTIONS = {
+    "gate_up_proj": ("gate_proj", "up_proj"),
+    "down_proj": ("down_proj",),
 }
 
 
@@ -67,7 +80,7 @@ def _pool_sha(tables: tuple[torch.Tensor, ...]) -> str:
 def _role_book(projection: str) -> tuple[torch.Tensor, ...]:
     family = family_for("fp8", "product")
     shapes = codebook_subtable_shapes(_RUNG, family.mode, family.n_sub)
-    role_index = _PROJECTIONS.index(projection)
+    role_index = _BOOK_KEY_INDEX[projection]
     tables = []
     for subtable_index, shape in enumerate(shapes):
         raw = torch.linspace(
@@ -129,6 +142,12 @@ def _col_weights() -> dict[str, torch.Tensor]:
         ].reshape(1, -1)
         for expert in range(2)
     ])
+    # The fused stack has ONE input, so production carries a single broadcast
+    # vector for it (moe_imatrix writes ``(1, 1, in)``). A pooled book is
+    # trained against that exact tensor.
+    result[
+        f"model.layers.{_LAYER}.mlp.experts.gate_up_proj"
+    ] = torch.linspace(0.75, 1.75, 256, dtype=torch.float32).reshape(1, 1, -1)
     return result
 
 
@@ -285,6 +304,203 @@ def _fixture(tmp_path: Path):
     return model_dir, col, selection_path, expected, shards
 
 
+def _pooled_fixture(tmp_path: Path):
+    """The same model and bank, burned per (layer, STACK, rung)."""
+
+    model_dir = tmp_path / "model"
+    _write_model(model_dir)
+    col = _col_weights()
+    source = _LazySkeleton(model_dir)
+    root = tmp_path / "bucket-books"
+    root.mkdir()
+    expected = {}
+    shards = {}
+    weights = {}
+    for key in _STACK_KEYS:
+        projections = _STACK_PROJECTIONS[key]
+        weight = torch.stack([
+            torch.cat([
+                source.dequant_weight(
+                    f"layers.{_LAYER}.ffn.experts.{expert}."
+                    f"{_SOURCE_LEAF[projection]}.weight"
+                )
+                for projection in projections
+            ], dim=0)
+            for expert in range(2)
+        ])
+        weights[key] = weight
+        packed_entry = col[f"model.layers.{_LAYER}.mlp.experts.{key}"]
+        stack_col = (
+            packed_entry.reshape(1, 1, -1).expand(2, 1, 256).contiguous()
+            if packed_entry.numel() == 256
+            else packed_entry.reshape(2, 1, -1).contiguous()
+        )
+        shards[key], expected[key] = _write_bank_cell(
+            root=root,
+            projection=key,
+            weight=weight,
+            col_weights=stack_col,
+        )
+    selection_path = tmp_path / "selection.json"
+    selection_path.write_text(json.dumps({
+        "schema": bank.ROUTED_MOE_CBL_SELECTION_SCHEMA,
+        "book_root": str(root),
+        "cells": [
+            {
+                "layer": _LAYER,
+                "projection": key,
+                "rung": _RUNG,
+                "burn_shard": str(shards[key]),
+            }
+            for key in _STACK_KEYS
+        ],
+    }))
+    return model_dir, col, selection_path, expected, shards, weights
+
+
+def test_pooled_stack_keying_is_the_default_and_pools_gate_with_up(
+    tmp_path, monkeypatch
+):
+    """Campaign rule R1: one book per (layer, stack, rung), gate+up pooled."""
+
+    model_dir, col, selection, expected, shards, weights = _pooled_fixture(
+        tmp_path
+    )
+
+    def forbidden_train(*_args, **_kwargs):
+        raise AssertionError("routed bundle must not retrain pooled-Lloyd books")
+
+    monkeypatch.setattr(learned, "learn_pool", forbidden_train)
+    bundle = build_bundle_from_model(
+        model_dir=model_dir,
+        col_weights=col,
+        formats=["FP8_CB_K28"],
+        output=tmp_path / "bundle.pqcb",
+        device="cpu",
+        routed_moe_book_selection=selection,
+    )
+
+    stack_qname = f"model.layers.{_LAYER}.mlp.experts.gate_up_proj"
+    down_qname = f"model.layers.{_LAYER}.mlp.experts.down_proj"
+    assert set(bundle.manifest["cells"]) == {stack_qname, down_qname}
+    # No half of the fused stack owns a book of its own any more.
+    for projection in ("gate_proj", "up_proj"):
+        assert (
+            f"model.layers.{_LAYER}.mlp.experts.{projection}"
+            not in bundle.manifest["cells"]
+        )
+
+    cell = bundle.cell(stack_qname, "FP8_CB_K28")
+    assert all(
+        torch.equal(bundle.sidecar_tensors[ref], want)
+        for ref, want in zip(
+            cell["codebook_ref"], expected["gate_up_proj"], strict=True
+        )
+    )
+    # The pooled book's identity is the UNION of both projections' data: the
+    # fused rank-3 stack the export renders, gate rows then up rows.
+    assert bundle.manifest["inputs"][stack_qname]["source_weight"]["shape"] == [
+        2, 512, 256
+    ]
+    assert bundle.manifest["inputs"][stack_qname]["source_weight"][
+        "sha256"
+    ] == tensor_value_identity(weights["gate_up_proj"])[1]
+    origin = bank.validate_banked_cbl_origin(
+        cell["pretrained_origin"], where="pooled origin"
+    )
+    assert origin["projection"] == "gate_up_proj"
+    assert origin["burn_shard"] == str(shards["gate_up_proj"])
+
+    # Every per-expert member of BOTH projections resolves to the one cell.
+    for projection in ("gate_proj", "up_proj"):
+        for expert in range(2):
+            alias = f"model.layers.{_LAYER}.mlp.experts.{expert}.{projection}"
+            assert bundle.manifest["aliases"][alias]["cell_qname"] == stack_qname
+
+
+def test_bundle_records_which_keying_burned_each_routed_book(
+    tmp_path, monkeypatch
+):
+    """A book's calibration is its identity, and so is its keying."""
+
+    def forbidden_train(*_args, **_kwargs):
+        raise AssertionError("routed bundle must not retrain pooled-Lloyd books")
+
+    monkeypatch.setattr(learned, "learn_pool", forbidden_train)
+
+    pooled_dir = tmp_path / "pooled"
+    pooled_dir.mkdir()
+    model_dir, col, selection, _expected, _shards, _weights = _pooled_fixture(
+        pooled_dir
+    )
+    pooled = build_bundle_from_model(
+        model_dir=model_dir,
+        col_weights=col,
+        formats=["FP8_CB_K28"],
+        output=pooled_dir / "bundle.pqcb",
+        device="cpu",
+        routed_moe_book_selection=selection,
+    )
+    for leaf in _STACK_KEYS:
+        qname = f"model.layers.{_LAYER}.mlp.experts.{leaf}"
+        assert pooled.cell(qname, "FP8_CB_K28")["routed_book_keying"] == "stack"
+        assert pooled.routed_book_keying(qname, "FP8_CB_K28") == "stack"
+
+    role_dir = tmp_path / "role"
+    role_dir.mkdir()
+    model_dir, col, selection, _expected, _shards = _fixture(role_dir)
+    per_role = build_bundle_from_model(
+        model_dir=model_dir,
+        col_weights=col,
+        formats=["FP8_CB_K28"],
+        output=role_dir / "bundle.pqcb",
+        device="cpu",
+        routed_moe_book_selection=selection,
+        routed_book_keying="role",
+    )
+    for projection in _PROJECTIONS:
+        qname = f"model.layers.{_LAYER}.mlp.experts.{projection}"
+        assert per_role.cell(qname, "FP8_CB_K28")["routed_book_keying"] == "role"
+        assert per_role.routed_book_keying(qname, "FP8_CB_K28") == "role"
+
+    # A pre-R1 bundle records nothing, and those books ARE per role.
+    legacy = learned.CBLearnedBundle(
+        path=per_role.path,
+        manifest={
+            **per_role.manifest,
+            "cells": {
+                qname: {
+                    fmt: {
+                        member: value for member, value in cell.items()
+                        if member != "routed_book_keying"
+                    }
+                    for fmt, cell in formats.items()
+                }
+                for qname, formats in per_role.manifest["cells"].items()
+            },
+        },
+        sidecar_tensors=per_role.sidecar_tensors,
+    )
+    assert legacy.routed_book_keying(
+        f"model.layers.{_LAYER}.mlp.experts.gate_proj", "FP8_CB_K28"
+    ) == "role"
+
+
+def test_a_selection_burned_under_the_other_keying_fails_closed(tmp_path):
+    """A per-role bank cannot be silently bound as a pooled one."""
+
+    model_dir, col, selection, _expected, _shards = _fixture(tmp_path)
+    with pytest.raises(ValueError, match="under stack keying"):
+        build_bundle_from_model(
+            model_dir=model_dir,
+            col_weights=col,
+            formats=["FP8_CB_K28"],
+            output=tmp_path / "mismatched.pqcb",
+            device="cpu",
+            routed_moe_book_selection=selection,
+        )
+
+
 def test_builder_copies_distinct_gate_up_down_books_and_never_trains(
     tmp_path, monkeypatch
 ):
@@ -301,6 +517,7 @@ def test_builder_copies_distinct_gate_up_down_books_and_never_trains(
         output=tmp_path / "bundle.pqcb",
         device="cpu",
         routed_moe_book_selection=selection,
+        routed_book_keying="role",
     )
 
     observed_digests = []
@@ -372,6 +589,7 @@ def test_routed_roles_declare_supplied_lattice_cells(tmp_path, monkeypatch):
         output=tmp_path / "bundle.pqcb",
         device="cpu",
         routed_moe_book_selection=selection,
+        routed_book_keying="role",
     )
 
     for projection in _PROJECTIONS:
@@ -422,6 +640,7 @@ def test_routed_roles_do_not_pick_up_off_menu_fp8_lattice_rungs(
         output=tmp_path / "bundle.pqcb",
         device="cpu",
         routed_moe_book_selection=selection,
+        routed_book_keying="role",
     )
     for projection in _PROJECTIONS:
         role = f"model.layers.{_LAYER}.mlp.experts.{projection}"
@@ -443,6 +662,7 @@ def test_routed_lattice_cell_absent_when_the_rung_is_not_supplied(tmp_path):
         output=tmp_path / "bundle.pqcb",
         device="cpu",
         routed_moe_book_selection=selection,
+        routed_book_keying="role",
     )
     member = f"model.layers.{_LAYER}.mlp.experts.0.down_proj"
     with pytest.raises(ValueError, match="no NVFP4_CB_K15 cell"):
@@ -464,6 +684,7 @@ def test_builder_refuses_stale_current_imatrix_identity(tmp_path):
             output=tmp_path / "stale.pqcb",
             device="cpu",
             routed_moe_book_selection=selection,
+            routed_book_keying="role",
         )
 
 
@@ -482,6 +703,7 @@ def test_builder_refuses_conflicting_redundant_packed_down_imatrix(tmp_path):
             output=tmp_path / "conflicting.pqcb",
             device="cpu",
             routed_moe_book_selection=selection,
+            routed_book_keying="role",
         )
 
 

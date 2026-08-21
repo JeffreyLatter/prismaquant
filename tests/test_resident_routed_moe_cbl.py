@@ -157,7 +157,7 @@ def _layer_config(
     return path
 
 
-def _fixture(tmp_path, monkeypatch):
+def _fixture(tmp_path, monkeypatch, *, keying="role"):
     generator = torch.Generator().manual_seed(1204)
     gate_members = []
     up_members = []
@@ -236,6 +236,73 @@ def _fixture(tmp_path, monkeypatch):
                 ],
             )
             for expert_id in range(EXPERTS)
+        }
+
+    def stack_aliases(qname, weight, _cw):
+        projections = (
+            ("gate_proj", "up_proj") if qname == PACKED else ("down_proj",)
+        )
+        aliases = {}
+        offset = 0
+        for projection in projections:
+            for expert_id in range(EXPERTS):
+                member = (
+                    f"model.layers.0.mlp.experts.{expert_id}.{projection}"
+                )
+                aliases[member] = (
+                    weight[expert_id, offset:offset + ROWS],
+                    col_weights[member],
+                )
+            offset += ROWS
+        return aliases
+
+    if keying == "stack":
+        # Campaign rule R1: one book per (layer, stack, rung). The fused w13
+        # stack is one cell covering gate and up; down is a one-projection
+        # stack and keeps its own book either way.
+        bundle = train_and_save_bundle(
+            bundle_path,
+            weights={PACKED: physical, PACKED_DOWN: down_stack},
+            col_weights={PACKED: physical_cw, PACKED_DOWN: down_cw_stack},
+            formats={
+                PACKED: (FORMAT, FORMAT_29),
+                PACKED_DOWN: (FORMAT, FORMAT_29),
+            },
+            learned_formats=(FORMAT, FORMAT_29),
+            routed_moe_qnames=(PACKED, PACKED_DOWN),
+            routed_book_keying="stack",
+            pretrained_codebooks={
+                (PACKED, FORMAT): gate_book,
+                (PACKED, FORMAT_29): gate_book_29,
+                (PACKED_DOWN, FORMAT): down_book,
+                (PACKED_DOWN, FORMAT_29): down_book_29,
+            },
+            input_alias_provider=stack_aliases,
+        )
+        _set_learned_env(monkeypatch, bundle_path)
+        context = cb_serialization_context_from_env()
+        return {
+            "model_dir": model_dir,
+            "bundle": bundle,
+            "config_path": _layer_config(
+                tmp_path / "layer_config.json",
+                physical,
+                physical_cw,
+                down_stack,
+                down_cw_stack,
+                context,
+            ),
+            "col_weights": col_weights,
+            "gate_stack": gate_stack,
+            "up_stack": up_stack,
+            "down_stack": down_stack,
+            "gate_cw": gate_cw_stack,
+            "up_cw": up_cw_stack,
+            "down_cw": down_cw_stack,
+            "physical": physical,
+            "physical_cw": physical_cw,
+            "physical_down": down_stack,
+            "physical_down_cw": down_cw_stack,
         }
 
     bundle = train_and_save_bundle(
@@ -366,6 +433,10 @@ def test_resident_export_encodes_fused_rows_with_distinct_role_books(
         fixture["col_weights"],
         shared_codebook_spec={"source": "learned"},
         device="cpu",
+        # This fixture's books are burned per (layer, projection, rung), the
+        # pre-R1 form, so the fused stack names two codebooks and the R1 ship
+        # gate refuses without an explicit acknowledgement.
+        allow_per_role_books=True,
     )
 
     bundle = fixture["bundle"]
@@ -488,6 +559,7 @@ def test_resident_learned_direct_stack_without_member_map_fails_closed(
             fixture["col_weights"],
             shared_codebook_spec={"source": "learned"},
             device="cpu",
+            allow_per_role_books=True,
         )
 
 
@@ -515,6 +587,10 @@ def test_streaming_export_collapses_members_but_keeps_distinct_role_books(
         fixture["col_weights"],
         shared_codebook_spec={"source": "learned"},
         device="cpu",
+        # This fixture's books are burned per (layer, projection, rung), the
+        # pre-R1 form, so the fused stack names two codebooks and the R1 ship
+        # gate refuses without an explicit acknowledgement.
+        allow_per_role_books=True,
     )
 
     bundle = fixture["bundle"]
@@ -626,6 +702,7 @@ def test_streaming_split_format_groups_reuse_exact_role_rung_books(
         shared_codebook_spec={"source": "learned"},
         device="cpu",
         per_expert_config_path=per_expert_path,
+        allow_per_role_books=True,
     )
 
     emitted = load_file(str(out / "model.safetensors"))
@@ -747,4 +824,149 @@ def test_streaming_routed_books_refuse_an_fp8_ldlq_scope(
             fixture["col_weights"],
             shared_codebook_spec={"source": "learned"},
             device="cpu",
+            allow_per_role_books=True,
         )
+
+
+def test_streaming_pooled_stack_names_one_codebook_for_the_fused_weight(
+    tmp_path, monkeypatch
+):
+    """Campaign rule R1's export half: one stack, one book, one target."""
+
+    import importlib
+
+    stream = importlib.import_module("prismaquant.export_nvfp4_cb_streaming")
+    fixture = _fixture(tmp_path, monkeypatch, keying="stack")
+    monkeypatch.setattr(
+        stream, "detect_profile", lambda *_args, **_kwargs: _PerExpertProfile()
+    )
+    context = cb_serialization_context_from_env()
+    config_path = _streaming_layer_config(
+        tmp_path / "pooled-layer-config.json", fixture, context
+    )
+    out = tmp_path / "pooled-out"
+    # No override: a pooled bundle passes the R1 gate on its own.
+    stream.export_nvfp4_cb_streaming(
+        fixture["model_dir"],
+        config_path,
+        out,
+        fixture["col_weights"],
+        shared_codebook_spec={"source": "learned"},
+        device="cpu",
+    )
+
+    bundle = fixture["bundle"]
+    packed, fields = cb.nvfp4_cb_pack(
+        fixture["physical"],
+        28,
+        grid="fp8",
+        mode="product",
+        col_weights=fixture["physical_cw"],
+        codebook=bundle.codebook_for(PACKED, FORMAT),
+        scale_sweep=True,
+        scale_coding=cb.SCALE_CODING_V1,
+        encode_tier="balanced",
+    )
+    emitted = load_file(str(out / "model.safetensors"))
+    assert torch.equal(
+        emitted[PACKED + ".cb_qweight"],
+        packed.reshape(EXPERTS, 2 * ROWS, -1).to(torch.uint8),
+    )
+    assert torch.equal(
+        emitted[PACKED + ".weight_scale"],
+        fields["scales"].reshape(EXPERTS, 2 * ROWS).to(torch.float32),
+    )
+
+    config = json.loads((out / "quant_config.json").read_text())
+    learned_groups = [
+        group for group in config["config_groups"].values()
+        if group.get("format") == FORMAT
+    ]
+    # The fused weight is declared once, under the packed spelling, and the
+    # halves own nothing: gate and up resolve to the same book.
+    assert {tuple(group["targets"]) for group in learned_groups} == {
+        (PACKED,), (PACKED_DOWN,)
+    }
+    assert len({
+        tuple(group["scheme"]["codebook_ref"]) for group in learned_groups
+    }) == 2
+    packed_group = next(
+        group for group in learned_groups if group["targets"] == [PACKED]
+    )
+    assert all(
+        ref.startswith(f"cb_codebook.{PACKED}.")
+        for ref in packed_group["scheme"]["codebook_ref"]
+    )
+
+    card = json.loads((out / "shipcard.json").read_text())
+    books = card["build"]["routed_codebook_books"]
+    assert books["keying"] == ["stack"]
+    assert books["pooled_stack_units"] == 2
+    assert books["per_role_units"] == 0
+    assert books["fused_targets_with_split_books"] == []
+    assert books["per_role_books_override"] is False
+
+
+def test_streaming_refuses_per_role_books_without_the_override(
+    tmp_path, monkeypatch
+):
+    """A fused weight naming two books fails closed at the ship step."""
+
+    import importlib
+
+    stream = importlib.import_module("prismaquant.export_nvfp4_cb_streaming")
+    fixture = _fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        stream, "detect_profile", lambda *_args, **_kwargs: _PerExpertProfile()
+    )
+    context = cb_serialization_context_from_env()
+    config_path = _streaming_layer_config(
+        tmp_path / "per-role-layer-config.json", fixture, context
+    )
+    with pytest.raises(ValueError) as excinfo:
+        stream.export_nvfp4_cb_streaming(
+            fixture["model_dir"],
+            config_path,
+            tmp_path / "per-role-out",
+            fixture["col_weights"],
+            shared_codebook_spec={"source": "learned"},
+            device="cpu",
+        )
+    message = str(excinfo.value)
+    assert PACKED in message
+    assert GATE in message and UP in message
+    assert "persistent-B" in message
+    assert "--allow-per-role-books" in message
+
+
+def test_per_role_override_is_stamped_on_the_shipcard(tmp_path, monkeypatch):
+    """Shipping split books knowingly leaves the fact on the card."""
+
+    import importlib
+
+    stream = importlib.import_module("prismaquant.export_nvfp4_cb_streaming")
+    fixture = _fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        stream, "detect_profile", lambda *_args, **_kwargs: _PerExpertProfile()
+    )
+    context = cb_serialization_context_from_env()
+    config_path = _streaming_layer_config(
+        tmp_path / "override-layer-config.json", fixture, context
+    )
+    out = tmp_path / "override-out"
+    stream.export_nvfp4_cb_streaming(
+        fixture["model_dir"],
+        config_path,
+        out,
+        fixture["col_weights"],
+        shared_codebook_spec={"source": "learned"},
+        device="cpu",
+        allow_per_role_books=True,
+    )
+
+    card = json.loads((out / "shipcard.json").read_text())
+    books = card["build"]["routed_codebook_books"]
+    assert books["per_role_books_override"] is True
+    assert books["fused_targets_with_split_books"] == [PACKED]
+    assert books["keying"] == ["role"]
+    assert books["per_role_units"] == 2

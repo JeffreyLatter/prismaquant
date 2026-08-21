@@ -322,9 +322,21 @@ _PUBLISHED_FILES = frozenset({
 #     five prepended DSv4 pins (routers, mHC mixers, hyper head,
 #     compressor/indexer). Pure additions consumed only by `model_walk`; no
 #     existing export or naming path is touched.
+# RE-FROZEN 2026-08-21 (third this date: campaign rule R1 merged), reviewed
+# against THIS handoff rather than re-hashed:
+#   export_nvfp4_cb_streaming.py -- routed learned books are keyed per
+#     (layer, stack, rung) when the bundle records that keying, emitting ONE
+#     codebook per fused weight, and a fused weight whose scheme would name
+#     more than one book fails closed unless --allow-per-role-books stamps the
+#     shipcard. The W8A16 lane exports FP8 block-source passthrough and
+#     assigns no CB rung, so neither branch is reachable on this lane; the
+#     gate's predicate is structural (distinct refs a producer writes).
+#   artifact_completeness.py -- learns to claim the pooled single-book routed
+#     spelling alongside the per-role one; claim-widening only, and no CB
+#     claims exist on this lane.
 _FROZEN_EXPORT_SOURCE_SHA256 = {
     "prismaquant/export_nvfp4_cb_streaming.py": (
-        "f39ffec9ea48ae1a6d06c0d0fc076dfc8317e01e355b3db7f188b31258710ccd"
+        "5f29114adbd0302760ffbeaf2140014e764ea059de75143aba699f071a9fb656"
     ),
     "prismaquant/cb_export_config.py": (
         "2bca669278cc1f3195c27747c05facea497e7b6ff2912bad7f917a184d1d6f94"
@@ -363,7 +375,7 @@ _FROZEN_EXPORT_SOURCE_SHA256 = {
         "68fa72cfb7274ceb8152db31940b2401e3d25485ea4b5a589ee8366b52997b93"
     ),
     "prismaquant/artifact_completeness.py": (
-        "22f72feb6d341ae7316ade617939cfb76cbcd1430d0ab87624b5d52bdac6c853"
+        "7f0c6c74733c2503b1e9607383264479007f49ae04e41700327bf0e97ab59767"
     ),
     "prismaquant/export_output_safety.py": (
         "4af0a9d891313f1d9d031955e431e1e84c1ba0e11a9ce2605ea92de3bc3703b5"

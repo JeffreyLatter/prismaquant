@@ -132,6 +132,19 @@ if [[ "$EXPORT_CONTAINER" == "nvfp4_cb" ]]; then
     fi
     CB_ROUTED_MOE_BOOK_SELECTION_SHA256="$(sha256sum "$CB_ROUTED_MOE_BOOK_SELECTION" | cut -d' ' -f1)"
   fi
+  # Campaign rule R1: routed learned books are burned per (layer, STACK, rung),
+  # so a fused gate/up stack names ONE codebook. `role` reproduces the pre-R1
+  # book per (layer, projection, rung) for the A/B arm; its export then needs
+  # CB_ALLOW_PER_ROLE_BOOKS=1, which is stamped on the shipcard.
+  : "${CB_ROUTED_BOOK_KEYING:=stack}"
+  case "$CB_ROUTED_BOOK_KEYING" in
+    stack|role) ;;
+    *)
+      echo "[pipeline] ERROR: CB_ROUTED_BOOK_KEYING must be stack or role" >&2
+      exit 2
+      ;;
+  esac
+  : "${CB_ALLOW_PER_ROLE_BOOKS:=0}"
   : "${CB_SCALE_CODING:=two_tier}"
   # Static fused-W4A4 activation metadata is calibrated from the same probe
   # cache as the weighted CB render.  MSE-grid is a deterministic producer
@@ -993,6 +1006,8 @@ STAGE_SETTINGS_ENV=(
   "CB_CODEBOOK_BUNDLE=${CB_CODEBOOK_BUNDLE:-}"
   "CB_ROUTED_MOE_BOOK_SELECTION=${CB_ROUTED_MOE_BOOK_SELECTION:-}"
   "CB_ROUTED_MOE_BOOK_SELECTION_SHA256=${CB_ROUTED_MOE_BOOK_SELECTION_SHA256:-}"
+  "CB_ROUTED_BOOK_KEYING=${CB_ROUTED_BOOK_KEYING:-}"
+  "CB_ALLOW_PER_ROLE_BOOKS=${CB_ALLOW_PER_ROLE_BOOKS:-}"
   "CB_SCALE_SWEEP=${CB_SCALE_SWEEP:-}"
   "CB_SCALE_SWEEP_SCOPE=${CB_SCALE_SWEEP_SCOPE:-}"
   "PRISMAQUANT_CB_LDLQ=${PRISMAQUANT_CB_LDLQ:-}"
@@ -1127,8 +1142,11 @@ ensure_cb_learned_bundle() {
   harvest_cb_col_weights "$1"
   local col_sha
   col_sha="$(sha256sum "$CB_COL_WEIGHTS" | cut -d' ' -f1)"
+  # The keying is part of a book's identity, so a bundle built under the other
+  # rule must rebuild loudly rather than be reused.
   require_stage_settings "$CB_CODEBOOK_BUNDLE" cb-learned-bundle \
-    "CB_COL_WEIGHTS_SHA256=$col_sha"
+    "CB_COL_WEIGHTS_SHA256=$col_sha" \
+    "CB_ROUTED_BOOK_KEYING=${CB_ROUTED_BOOK_KEYING:-stack}"
   if [[ -f "$CB_CODEBOOK_BUNDLE" ]]; then
     # Full name/shape/digest/cell validation; a same-path replacement never
     # counts as an immutable bundle merely because the file exists.
@@ -1154,6 +1172,7 @@ PY
     --formats "$FORMATS" \
     --output "$CB_CODEBOOK_BUNDLE" \
     --device "$DEVICE" \
+    --routed-book-keying "${CB_ROUTED_BOOK_KEYING:-stack}" \
     "${routed_book_args[@]}"
 }
 
@@ -2349,6 +2368,17 @@ if [[ "$EXPORT_CONTAINER" == "nvfp4_cb" ]]; then
     1|true|True|TRUE|yes|Yes|YES|auto|"") ;;
     *)
       echo "[pipeline] ERROR: CB_SCALE_SWEEP must be 0 or 1" >&2
+      exit 2
+      ;;
+  esac
+  # Campaign rule R1's escape hatch, for the A/B's per-role arm only. The
+  # export refuses split books by default and stamps this acknowledgement on
+  # the shipcard when it is passed.
+  case "${CB_ALLOW_PER_ROLE_BOOKS:-0}" in
+    1|true|True|TRUE|yes|Yes|YES) CB_EXPORT_ARGS+=(--allow-per-role-books) ;;
+    0|false|False|FALSE|no|No|NO|"") ;;
+    *)
+      echo "[pipeline] ERROR: CB_ALLOW_PER_ROLE_BOOKS must be 0 or 1" >&2
       exit 2
       ;;
   esac

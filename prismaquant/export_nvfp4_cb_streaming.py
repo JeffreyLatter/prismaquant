@@ -119,9 +119,14 @@ from prismaquant.export_nvfp4_cb import (
 from prismaquant.layer_config import canonicalize_assignment, load_assignment
 from prismaquant.model_profiles import detect_profile
 from prismaquant.routed_moe_codebooks import (
+    ROUTED_BOOK_KEYING_ROLE,
+    ROUTED_BOOK_KEYING_STACK,
     ROUTED_MOE_CBL_BANK_RUNGS,
     RoutedMoECodebookRole,
     bundle_role_qname,
+    bundle_stack_qname,
+    describe_split_book_refusal,
+    fused_targets_with_split_books,
     logical_role_qname,
     split_role_rows,
     stacked_role_col_weights,
@@ -2686,6 +2691,7 @@ def export_nvfp4_cb_streaming(
     allow_unstamped_research: bool = False,
     allow_research_cost_selection: bool = False,
     allow_route_pending_passthrough: bool = False,
+    allow_per_role_books: bool = False,
     exclude_namespaces: list[str] | tuple[str, ...] | None = None,
     activation_cache_dir: str | Path | None = None,
     activation_scale_policy: str | None = None,
@@ -2714,6 +2720,12 @@ def export_nvfp4_cb_streaming(
     reporting a serving gap worth seeing — so the refusal lives here, at the
     ship step, and the override is recorded in the artifact's provenance rather
     than only in the operator's shell history.
+
+    ``allow_per_role_books`` overrides the split-book ship gate (campaign rule
+    R1): a fused routed weight whose scheme would name more than one codebook
+    refuses unless this is passed, and passing it stamps the fact onto the
+    shipcard. The keying comes from the bundle's own record of how each routed
+    book was burned, never from a flag here.
 
     ``reuse_prior`` is reserved but currently fails closed. The prior gate did
     not bind exact source content, treated an imatrix mismatch as a warning,
@@ -3481,6 +3493,9 @@ def export_nvfp4_cb_streaming(
     ] = {}
     cb_group_target_names: dict[tuple[str, str], tuple[str, ...]] = {}
     role_group_keys: set[tuple[str, str]] = set()
+    # Recipe qname -> pooled stack cell, for routed stacks whose books were
+    # burned per (layer, stack, rung).
+    pooled_stack_cells: dict[str, str] = {}
     for qname in cb_targets:
         fmt = assignment[qname]
         grid, mode, k = cb_targets[qname]
@@ -3517,7 +3532,7 @@ def export_nvfp4_cb_streaming(
             members = expert_stack_members.get(qname)
             if target_kind != "experts" or members is None:
                 raise ValueError(
-                    f"{qname}: learned per-role expert export requires the "
+                    f"{qname}: learned expert export requires the "
                     "per-expert source/member map so gate, up, and down input "
                     "identities can be verified independently"
                 )
@@ -3530,10 +3545,40 @@ def export_nvfp4_cb_streaming(
             )
             if tuple(projections) != expected:
                 raise ValueError(
-                    f"{qname}: Gridbook per-role LUT ABI expects {expected}, "
+                    f"{qname}: Gridbook routed expert ABI expects {expected}, "
                     f"profile declared {tuple(projections)}"
                 )
             physical_target = _base_name(qname)
+            # Campaign rule R1: how the BOOKS were burned decides the spelling,
+            # so read the bundle's own record rather than guessing here. A
+            # stack-keyed cell pools gate and up, so the fused weight names ONE
+            # codebook on the packed target -- the same spelling a lattice
+            # layer uses. Role-keyed cells keep the per-half declaration below.
+            stack_qname = bundle_stack_qname(qname)
+            if (
+                learned_bundle.has_cell(stack_qname, fmt)
+                and learned_bundle.routed_book_keying(stack_qname, fmt)
+                == ROUTED_BOOK_KEYING_STACK
+            ):
+                codebook = learned_bundle.codebook_for(stack_qname, fmt)
+                group_key = (stack_qname, fmt)
+                if group_key in codebooks:
+                    raise ValueError(
+                        f"duplicate routed learned stack group {group_key}"
+                    )
+                codebooks[group_key] = codebook
+                by_group[group_key] = [qname]
+                role_group_keys.add(group_key)
+                pooled_stack_cells[qname] = stack_qname
+                target_cb[qname] = (stack_qname, fmt, codebook, "learned")
+                # No per-member `validate_inputs` here, unlike the role branch
+                # below: the pooled cell's recorded imatrix identity is the
+                # packed entry materialized per expert, and the exporter holds
+                # the raw entry. What binds this target instead is the recipe's
+                # own render identity on the fused source weight
+                # (`validate_cb_render_source_weight`) plus the codebook digest
+                # cross-check against the immutable bundle.
+                continue
             roles: list[RoutedMoECodebookRole] = []
             for projection in projections:
                 # The immutable cell is shared by every expert subgroup at
@@ -3606,6 +3651,33 @@ def export_nvfp4_cb_streaming(
                 else (_role_of(qname) if source_kind == "learned" else "lattice")
             )
         by_group.setdefault((ref, fmt), []).append(qname)
+
+    # --- SPLIT-BOOK SHIP GATE (campaign rule R1). The predicate is structural
+    # and producer-side: count the distinct codebooks one fused routed weight's
+    # scheme would name. Nothing here asserts what a runtime does; the runtime
+    # consequence appears only in the human-facing message.
+    books_by_fused_target: dict[str, dict[str, tuple[str, ...]]] = {}
+    for routed_qname, routed_roles in expert_role_plans.items():
+        if len(routed_roles) < 2:
+            continue
+        books_by_fused_target[_base_name(routed_qname)] = {
+            # One ref names one immutable bundle cell, and the digest
+            # cross-check below binds one value to each ref, so counting refs
+            # counts codebooks.
+            role.projection: role.ref
+            for role in routed_roles
+        }
+    split_book_targets = fused_targets_with_split_books(books_by_fused_target)
+    if split_book_targets and not allow_per_role_books:
+        raise ValueError(describe_split_book_refusal(split_book_targets))
+    if split_book_targets:
+        print(
+            "[export-cb-stream] --allow-per-role-books: shipping "
+            f"{len(split_book_targets)} fused routed weight(s) with per-role "
+            "books; the acknowledgement is stamped on the shipcard",
+            flush=True,
+        )
+
     for (ref, fmt), qnames in by_group.items():
         if (ref, fmt) in role_group_keys:
             continue
@@ -3680,7 +3752,10 @@ def export_nvfp4_cb_streaming(
     for qname, (ref, fmt, codebook, _kind) in target_cb.items():
         roles = expert_role_plans.get(qname)
         if roles is None:
-            selected_refs_by_format[qname] = {
+            # A pooled routed stack reports under its bundle cell name, which
+            # is the packed parent without any format-subgroup discriminator --
+            # the same name the bundle's own ref map uses.
+            selected_refs_by_format[pooled_stack_cells.get(qname, qname)] = {
                 fmt: _codebook_tensor_names(ref, fmt, codebook)
             }
             continue
@@ -3758,12 +3833,12 @@ def export_nvfp4_cb_streaming(
 
     routed_ldlq = sorted(
         qname
-        for qname in expert_role_plans
+        for qname in (set(expert_role_plans) | set(pooled_stack_cells))
         if _ldlq_for_format(assignment[qname], serialization_context)
     )
     if routed_ldlq:
         raise ValueError(
-            "routed learned per-role CBL reuses the immutable no-LDLQ burn "
+            "routed learned CBL reuses the immutable no-LDLQ burn "
             "identity; PRISMAQUANT_CB_LDLQ_SCOPE must exclude FP8 for "
             f"{routed_ldlq[:5]}"
         )
@@ -3774,7 +3849,8 @@ def export_nvfp4_cb_streaming(
         if _ldlq_for_format(assignment[qname], serialization_context)
         for telemetry_qname in (
             tuple(role.qname for role in expert_role_plans[qname])
-            if qname in expert_role_plans else (qname,)
+            if qname in expert_role_plans
+            else (pooled_stack_cells.get(qname, qname),)
         )
     }
     ldlq_telemetry = None
@@ -5414,12 +5490,30 @@ def export_nvfp4_cb_streaming(
         open_cb_export_shipcard,
     )
 
+    routed_book_keyings = sorted(
+        ({ROUTED_BOOK_KEYING_STACK} if pooled_stack_cells else set())
+        | ({ROUTED_BOOK_KEYING_ROLE} if expert_role_plans else set())
+    )
     open_cb_export_shipcard(
         out_dir,
         quant_config,
         source_model=model_dir,
         layer_config_path=layer_config_path,
         exporter="export_nvfp4_cb_streaming",
+        build_extra={
+            # Campaign rule R1, on the card next to bpp: how many fused routed
+            # weights name one book, how many name several, and whether an
+            # operator knowingly shipped the split ones.
+            "routed_codebook_books": {
+                "keying": routed_book_keyings,
+                "pooled_stack_units": len(pooled_stack_cells),
+                "per_role_units": len(expert_role_plans),
+                "fused_targets_with_split_books": sorted(split_book_targets),
+                "per_role_books_override": bool(
+                    split_book_targets and allow_per_role_books
+                ),
+            },
+        },
         weight_content_manifest={
             "schema": WEIGHT_CONTENT_MANIFEST_SCHEMA,
             "algorithm": "sha256",
@@ -5964,6 +6058,14 @@ def main(argv=None) -> None:
         "on stderr and is OFF unless set to exactly '1'.",
     )
     ap.add_argument(
+        "--allow-per-role-books",
+        action="store_true",
+        help="ship fused routed weights whose scheme names more than one "
+        "codebook (books burned per (layer, projection, rung) rather than "
+        "pooled per (layer, stack, rung), campaign rule R1). Refused by "
+        "default; passing it stamps the acknowledgement onto the shipcard.",
+    )
+    ap.add_argument(
         "--exclude-namespace",
         action="append",
         default=None,
@@ -6047,6 +6149,7 @@ def main(argv=None) -> None:
         allow_unstamped_research=args.allow_unstamped_research,
         allow_research_cost_selection=args.allow_research_cost_selection,
         allow_route_pending_passthrough=args.allow_route_pending_passthrough,
+        allow_per_role_books=args.allow_per_role_books,
         exclude_namespaces=args.exclude_namespaces,
         activation_cache_dir=args.activation_cache_dir,
         activation_scale_policy=args.activation_scale_policy,
