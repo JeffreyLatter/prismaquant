@@ -2,8 +2,10 @@
 # Resolve and install the exact published Gridbook serving wheel.
 #
 # This is deliberately separate from gridbook_runtime.sh.  The latter is the
-# immutable 0.8.5/v3 producer/handoff environment; current serving uses the
-# independently pinned 0.8.11/v4 release wheel and its published SHA-256.
+# producer/handoff environment pin (0.8.11/v4 since 2026-08-21, held in
+# lockstep with this one by tests/test_gridbook_runtime_boundary.py); serving
+# additionally binds the independently reviewed release wheel and its
+# published SHA-256, which the producer pin does not carry.
 
 _GRIDBOOK_SERVING_ASSET_DIR="$({
     cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P

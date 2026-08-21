@@ -6,7 +6,8 @@
 # WHY THIS IS NOT serve_qwen27b_smoke.sh
 # --------------------------------------
 # That script sources gridbook_runtime.sh, which is the *build* pin: contract
-# v3, Gridbook 0.8.5, installed into vllm-node:latest from a source checkout.
+# v4, Gridbook 0.8.11 since 2026-08-21 (0.8.5/v3 when this note was written),
+# installed into vllm-node:latest from a source checkout.
 # Artifact A's recipe assigns `model.embed_tokens` to NVFP4, and the quantized
 # embedding mechanism does not exist before Gridbook 0.8.7 -- on 0.8.5 the load
 # dies on an unrecognised `embed_tokens.cb_*`/NVFP4 embedding parameter. So
@@ -18,8 +19,10 @@
 # fixes a split-bank MoE load regression, 0.8.11 makes the routed grouped
 # lanes and the MXFP8 A-side capture-safe -- dense-only artifacts like this one
 # see no route change from any of them, and every explicit spelling keeps its
-# 0.8.8 semantics). The two pins are independent and nothing cross-checks
-# them; picking the wrong one is a load-time failure, not a warning.
+# 0.8.8 semantics). The two pins are held in lockstep by
+# tests/test_gridbook_runtime_boundary.py since 2026-08-21, but they remain
+# distinct boundaries (only the serving pin binds a reviewed wheel digest);
+# picking the wrong one is a load-time failure, not a warning.
 #
 # The base image already carries the pinned wheel, so `install-container` is a
 # reinstall-and-verify no-op here rather than a first install -- kept anyway
