@@ -225,13 +225,22 @@ def test_classification_table(profile):
         "model.layers.0.mlp.gate": "held_fixed",
         "model.layers.0.input_layernorm": "held_fixed",
         "lm_head": "held_fixed",
-        "model.embed_tokens": "excluded_embedding",
         "mtp.fc": "excluded_mtp",
         "mtp.layers.0.self_attn.q_proj": "excluded_mtp",
         "cb_codebook.ref0.NVFP4_CB_K12": "resident_codebooks",
     }
     for name, expected in cases.items():
         assert rt.classify_read_class(name, profile=profile) == expected, name
+    # The embedding is the one class a single name cannot decide: untied it is
+    # gathered (p=0), tied it IS the output projection (p=1).
+    assert rt.classify_read_class(
+        "model.embed_tokens", profile=profile,
+        embedding_streamed=False) == "excluded_embedding"
+    assert rt.classify_read_class(
+        "model.embed_tokens", profile=profile,
+        embedding_streamed=True) == "held_fixed"
+    with pytest.raises(rt.ReadTrafficError, match="did not resolve"):
+        rt.classify_read_class("model.embed_tokens", profile=profile)
     # A shared expert is read on EVERY token; the segment test is what keeps
     # it out of the routed class.
     assert rt.classify_read_class(
@@ -289,3 +298,112 @@ def test_exporter_shipcard_stamps_read_gb_per_token(model_dir: Path):
     assert claim["breakdown"]["routed"] == 128
     assert claim["routing"]["read_probability"] == TOPK / N_EXPERTS
     assert claim["scope"] == rt.READ_SCOPE
+
+
+# ---------------------------------------------------------------------------
+# Tied embeddings: the table IS the output projection and IS streamed.
+# ---------------------------------------------------------------------------
+
+def _tied_model_dir(tmp_path: Path, *, tie_flag: bool | None) -> Path:
+    """The same model with no ``lm_head.weight`` -- i.e. tied.
+
+    Source total drops by the 256 lm_head bytes to 848.
+    """
+    root = tmp_path / f"tied-{tie_flag}"
+    root.mkdir()
+    tensors = {k: v for k, v in _TENSORS.items() if k != "lm_head.weight"}
+    _write_safetensors(root / "model.safetensors", tensors)
+    config = {
+        "model_type": "qwen3_moe",
+        "architectures": ["Qwen3MoeForCausalLM"],
+        "hidden_size": HIDDEN,
+        "num_hidden_layers": 1,
+        "num_experts": N_EXPERTS,
+        "num_experts_per_tok": TOPK,
+    }
+    if tie_flag is not None:
+        config["tie_word_embeddings"] = tie_flag
+    (root / "config.json").write_text(json.dumps(config))
+    return root
+
+
+@pytest.mark.parametrize("tie_flag", [True, None])
+def test_tied_embedding_is_streamed_every_token(tmp_path: Path, tie_flag):
+    """A tied table is the logits projection: p=1, not excluded.
+
+    Excluding it would drop one of the largest always-active tensors in the
+    model (Qwen3-0.6B and LFM2.5 both tie), so this is a wrong published
+    number rather than a conservative one.  ``tie_flag=None`` pins that the
+    decision is made by OBSERVING that no output projection exists, not by
+    reading a flag the config may omit.
+    """
+    root = _tied_model_dir(tmp_path, tie_flag=tie_flag)
+    profile = detect_profile_with_warning(str(root), entrypoint="test")
+    report = rt.assignment_read_traffic(
+        ASSIGNMENT, STATS, model_path=str(root), profile=profile)
+
+    assert report["embedding"]["streamed_per_token"] is True
+    assert report["embedding"]["read_class"] == "held_fixed"
+    assert report["embedding"]["lm_head_tensor_present"] is False
+    assert report["embedding"]["config_tie_word_embeddings"] is tie_flag
+    assert report["excluded"]["embedding_bytes"] == 0
+    # router 64 + layernorm 16 + the tied embedding/lm_head 256 = 336
+    assert report["classes"]["held_fixed"]["stored_bytes"] == 336
+    assert report["classes"]["excluded_embedding"]["stored_bytes"] == 0
+    # 848 source - 384 re-encoded source + 96 q_proj + 144 experts = 704
+    assert report["reconciliation"]["ledger_stored_bytes"] == 704
+    assert report["read_bytes_per_token"] == 96 + 72 + 336
+
+    # Post-export there is no allocator/floor split, so every always-active
+    # tensor is held_fixed: q_proj 128 + router 64 + ln 16 + embed 256 = 464.
+    exported = rt.exported_checkpoint_read_traffic(str(root), profile=profile)
+    assert exported["embedding"]["streamed_per_token"] is True
+    assert exported["classes"]["held_fixed"]["stored_bytes"] == 464
+    assert exported["read_bytes_per_token"] == 464 + 256 * TOPK // N_EXPERTS
+
+
+def test_untied_embedding_is_excluded(model_dir: Path, profile):
+    """The twin: with a real lm_head, the table is gathered, not streamed."""
+    report = _report(model_dir, profile)
+    assert report["embedding"]["streamed_per_token"] is False
+    assert report["embedding"]["lm_head_tensor_present"] is True
+    assert report["excluded"]["embedding_bytes"] == 256
+
+
+def test_cb_codebook_sidecar_is_resident_not_traffic(model_dir: Path, profile):
+    """A CB artifact ships its codebooks OUTSIDE the shard set.
+
+    The sidecar is invisible to the safetensors ledger, so reporting zero
+    resident codebook bytes for an artifact that ships them would be the same
+    silent zero this module refuses everywhere else.  It is read from the
+    artifact's own ``codebook_file`` declaration, counted as resident, and
+    kept out of per-token traffic.
+    """
+    _write_safetensors(
+        model_dir / "cb_codebooks.pqcb", {"cb_codebook.ref0.NVFP4_CB_K12": (4, 8)})
+    (model_dir / "quant_config.json").write_text(
+        json.dumps({"codebook_file": "cb_codebooks.pqcb"}))
+
+    report = rt.exported_checkpoint_read_traffic(
+        str(model_dir), profile=profile)
+    assert report["breakdown"]["resident_codebooks"] == 64
+    # Resident bytes are never per-token traffic, and never enter the shard
+    # reconciliation either.
+    assert report["read_bytes_per_token"] == 464 + 256 * TOPK // N_EXPERTS
+    assert report["reconciliation"]["ledger_stored_bytes"] == SOURCE_TOTAL_BYTES
+    assert report["reconciliation"][
+        "codebook_sidecar_bytes_outside_shards"] == 64
+
+    # A declaration with nothing behind it is a refusal, not a zero.
+    (model_dir / "cb_codebooks.pqcb").unlink()
+    with pytest.raises(rt.ReadTrafficError, match="codebook_file"):
+        rt.exported_checkpoint_read_traffic(str(model_dir), profile=profile)
+
+
+def test_untied_declaration_without_an_lm_head_refuses(tmp_path: Path):
+    """Nothing would carry the logits traffic; that is a contradiction."""
+    root = _tied_model_dir(tmp_path, tie_flag=False)
+    profile = detect_profile_with_warning(str(root), entrypoint="test")
+    with pytest.raises(rt.ReadTrafficError, match="tie_word_embeddings=false"):
+        rt.assignment_read_traffic(
+            ASSIGNMENT, STATS, model_path=str(root), profile=profile)

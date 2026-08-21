@@ -3259,15 +3259,38 @@ declarations and **cross-checked against the tensors' measured stack depth**; an
 model that declares neither is refused rather than defaulted (principle 2 — the
 `moe_imatrix` "assume 8" fallback would mis-price the largest term in the ledger).
 
-Three classes are **excluded but itemized**, never silently dropped: the input embedding
-(one row is gathered per token, not the table), the MTP/draft sidecar (read every token
-under spec-decode and never without it — the honest default is excluded, and
+Three classes are **excluded but itemized**, never silently dropped: an **untied** input
+embedding (one row is gathered per token, not the table), the MTP/draft sidecar (read
+every token under spec-decode and never without it — the honest default is excluded, and
 `excluded.mtp_bytes` lets a spec-decode serve add it back exactly), and anything the
 model profile's own `checkpoint_to_live_name` declines to map into the live text graph
-(vision/audio towers). CB codebook tables are reported as `resident_bytes`, not stream
-traffic. `ModelProfile.embedding_name()` (`model_profiles/base.py`, spec key
+(vision/audio towers). `ModelProfile.embedding_name()` (`model_profiles/base.py`, spec key
 `shard_regexes.embedding_name`) is the twin of `lm_head_name()` and exists so "which
 tensor is the embedding" is a declaration rather than a substring test.
+
+**Tied embeddings are streamed, and that is decided by observation.** Under
+`tie_word_embeddings` the embedding table *is* the output projection and the logits matmul
+reads all of it every token, so excluding it would drop one of the largest always-active
+tensors in the model (Qwen3-0.6B and LFM2.5 both tie). The invariant
+`read_traffic.resolve_embedding_disposition` rests on is that **the logits projection is
+streamed exactly once per token**: the embedding is `excluded_embedding` when the
+checkpoint carries a separate output-projection tensor and `held_fixed` when it does not.
+The config's `tie_word_embeddings` is a cross-check, not the decision — a config declaring
+*untied* over a checkpoint with no output projection raises rather than picking a story,
+and a config that merely omits the key is answered by the tensors (transformers defaults
+that key to `True`, exactly the implicit default principle 2 forbids leaning on). The
+resolution is reported per artifact under `embedding` (`streamed_per_token`, `read_class`,
+`lm_head_tensor_present`, `config_tie_word_embeddings`, `reason`). It reads both namespaces
+because the two declarations live in different ones: `lm_head_name()` is the checkpoint
+spelling (DSv4 says `head`), `embedding_name()` the live one.
+
+CB codebook tables are reported as `resident_bytes`, not stream traffic — and the CB lane
+ships them in a globbed sidecar *outside* the shard set, invisible to the safetensors
+ledger, so the post-export form reads the artifact's own `quant_config.json`
+`codebook_file` declaration, counts it as resident after the shard reconciliation has
+passed, and **refuses** when the declared file is absent (687 KB on the shipped DSv4 CB
+artifact; a reported `0` there would have been the same silent zero this module refuses
+everywhere else).
 
 Stored bytes are **not** a second copy of the byte math. Assigned units are priced by
 `footprint.format_tensor_payload_breakdown` / the CB payload breakdown; every other
@@ -3290,7 +3313,15 @@ and activations excluded — so the figure is a lower bound on real decode traff
 four-key `breakdown` (`dense` / `routed` / `held_fixed` / `resident_codebooks`), the
 itemized `excluded` bytes, and the `routing` factor with the config keys it came from.
 Tests: `tests/test_read_traffic.py` (exact hand-computed ledger on a synthetic 4-expert
-model, the `p = topk/E` and `p = 1` property, the classification table, and both refusals).
+model, the `p = topk/E` and `p = 1` property, the classification table, tied/untied
+embedding disposition, the CB codebook sidecar, and every refusal). Measured against real
+artifacts on both lanes: the shipped DSv4-Flash CB 87.08 GB body reconciles exactly and
+reproduces the campaign's independently measured **8.058 GB/token** at **8.076**, with
+`resident_codebooks` 687 KB and `excluded_non_text_graph` 0; Ornith-1.5-35B-A3B's
+compressed-tensors export reconciles at 24,623,875,824 B for 3.127 GB/token. The
+post-export form cannot split `dense` from `held_fixed` — a shipped checkpoint carries no
+allocator/floor distinction on disk, so `breakdown.dense` is `0` there by construction and
+the split is only meaningful in the pre-export `assignment_read_traffic` form.
 
 Also on the card: exact `artifact_bytes`, format histogram, the render-lever
 echo (`_render_lever_provenance()`, shared with the export cache's fingerprint so the two

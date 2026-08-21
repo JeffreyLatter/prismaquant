@@ -37,9 +37,13 @@ class                        read probability       what lands here
                                                     a pinned ``lm_head``,
                                                     grouped operands the probe
                                                     skips (DSv4 ``attn.wo_a``)
-``excluded_embedding``       ``0.0`` (excluded)     the input embedding table:
-                                                    one row is gathered per
-                                                    token, not the table
+``excluded_embedding``       ``0.0`` (excluded)     the input embedding table
+                                                    of an UNTIED model: one row
+                                                    is gathered per token, not
+                                                    the table.  A *tied* table
+                                                    is the output projection
+                                                    and lands in ``held_fixed``
+                                                    — see below
 ``excluded_mtp``             ``0.0`` (excluded)     MTP / draft sidecar — read
                                                     only when spec-decode is
                                                     on; see the honest-default
@@ -60,6 +64,20 @@ routing skew redistributes which experts are read without changing the
 expected bytes read.  Where a lane breaks that invariant — a CB split-stack
 whose sub-stacks carry different bytes per expert — the number becomes an
 expectation under *uniform* routing and says so in ``routing.exactness``.
+
+The embedding is excluded because it is *gathered*, not streamed — but that
+is only true while it is nothing else.  Under ``tie_word_embeddings`` the same
+table **is** the output projection, and the logits matmul streams all of it on
+every token.  Which case an artifact is in is decided by observation, not by
+name: the logits projection is streamed exactly once per token, so the
+embedding is excluded when the checkpoint carries a separate ``lm_head``
+tensor and is ``held_fixed`` when it does not; ``resolve_embedding_disposition``
+is where that is decided.  The config's ``tie_word_embeddings`` is the
+cross-check, and a
+config that declares *untied* on a checkpoint with no output projection raises
+rather than picking one of the two stories.  Excluding a tied table would drop
+one of the largest always-active tensors in the model (Qwen3-0.6B ties; so
+does LFM2.5).
 
 Honest defaults for the genuinely ambiguous classes
 ---------------------------------------------------
@@ -308,12 +326,140 @@ def _mtp_prefixes(profile) -> tuple[str, ...]:
     return tuple(dict.fromkeys(out))
 
 
+_TIE_KEYS = ("tie_word_embeddings", "tie_embeddings", "tie_embedding")
+
+
+@dataclass(frozen=True)
+class EmbeddingDisposition:
+    """Whether this checkpoint's embedding table is streamed per token."""
+
+    streamed: bool
+    lm_head_present: bool
+    tie_declared: bool | None
+    reason: str
+
+    @property
+    def read_class(self) -> str:
+        return "held_fixed" if self.streamed else "excluded_embedding"
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "streamed_per_token": self.streamed,
+            "read_class": self.read_class,
+            "lm_head_tensor_present": self.lm_head_present,
+            "config_tie_word_embeddings": self.tie_declared,
+            "reason": self.reason,
+        }
+
+
+def _matches_declared(base: str, declared: str) -> bool:
+    """``base`` is the tensor the profile means by ``declared``."""
+    declared = _strip_weight(str(declared))
+    return base == declared or base.endswith("." + declared)
+
+
+def _declared_tie(config: Mapping[str, Any]) -> bool | None:
+    for scope in _config_scopes(config or {}):
+        for key in _TIE_KEYS:
+            value = scope.get(key)
+            if isinstance(value, bool):
+                return value
+    return None
+
+
+def resolve_embedding_disposition(
+    names: Iterable[str],
+    *,
+    profile,
+    config: Mapping[str, Any] | None = None,
+    context: str = "read_traffic",
+) -> EmbeddingDisposition:
+    """Decide whether the embedding table is per-token read traffic.
+
+    The invariant this rests on is that the **logits projection is streamed
+    exactly once per generated token**.  So the question is not "is this
+    model tied?" as a config fact but "does this checkpoint carry a separate
+    output projection?" as an observed one:
+
+    * a separate ``lm_head`` tensor exists -> it carries the p=1 logits
+      traffic and the embedding table is gathered only, ``p = 0``;
+    * no output projection tensor exists -> the embedding table *is* the
+      output projection and is streamed in full, ``p = 1``.
+
+    ``config['tie_word_embeddings']`` is a cross-check rather than the
+    decision: a config declaring the model untied while the checkpoint ships
+    no output projection is a contradiction, and one of the two descriptions
+    is of a different model.  Deciding by observation is also what keeps this
+    correct for a config that simply omits the key (transformers defaults it
+    to ``True``, which is exactly the kind of implicit default principle 2
+    forbids relying on).
+
+    ``names`` must carry **both** spellings of every tensor -- the checkpoint
+    key and the live name -- because the two declarations this reads are in
+    different namespaces: ``lm_head_name()`` is the checkpoint spelling (DSv4
+    says ``head``) while ``embedding_name()`` is the live one (``model.
+    embed_tokens``, where the checkpoint says ``embed``).
+    """
+    lm_head = _strip_weight(str(profile.lm_head_name()))
+    embedding = _strip_weight(str(profile.embedding_name()))
+    lm_head_present = False
+    embedding_present = False
+    for raw in names:
+        base = _strip_weight(str(raw))
+        if _matches_declared(base, lm_head):
+            lm_head_present = True
+        elif _matches_declared(base, embedding):
+            embedding_present = True
+    tie = _declared_tie(config or {})
+
+    if lm_head_present:
+        reason = (
+            f"a separate output projection ({lm_head!r}) carries the "
+            "per-token logits traffic, so the embedding table is gathered "
+            "one row at a time"
+        )
+        if tie is True:
+            reason += (
+                "; config declares tie_word_embeddings=true and the "
+                "checkpoint materializes lm_head anyway -- the projection is "
+                "still streamed exactly once, counted there"
+            )
+        return EmbeddingDisposition(False, True, tie, reason)
+
+    if not embedding_present:
+        # Neither tensor is here (a body-only shard set, a sub-model). There
+        # is no embedding byte to classify either way.
+        return EmbeddingDisposition(
+            False, False, tie,
+            "this checkpoint carries neither an embedding table nor an "
+            "output projection",
+        )
+
+    if tie is False:
+        raise ReadTrafficError(
+            f"[read_traffic] {context}: the config declares "
+            f"tie_word_embeddings=false but no {lm_head!r} tensor exists in "
+            "this checkpoint, so nothing carries the per-token logits "
+            "traffic. Either the profile names the output projection wrongly "
+            "or the config describes a different model; refusing to guess "
+            "whether the embedding table is streamed."
+        )
+    return EmbeddingDisposition(
+        True, False, tie,
+        "no separate output projection exists, so the embedding table IS the "
+        "logits projection and the decode streams all of it every token"
+        + ("" if tie else " (config omits tie_word_embeddings; decided by "
+                          "the absence of an output projection tensor)"),
+    )
+
+
 def classify_read_class(
     name: str,
     *,
     profile,
     checkpoint_key: str | None = None,
     in_assignment: bool = False,
+    embedding_streamed: bool | None = None,
     context: str = "read_traffic",
 ) -> str:
     """The read class of one tensor.  See :data:`READ_CLASS_TABLE`.
@@ -324,6 +470,12 @@ def classify_read_class(
     back to the raw key).  Both spellings are tested against every rule, so a
     class is never missed on naming alone (project memory: a Linear has three
     names).
+
+    ``embedding_streamed`` answers the one question a single tensor's name
+    cannot: a tied embedding IS the output projection and is read in full
+    every token.  It is only consulted for the embedding tensor itself, and
+    only :func:`resolve_embedding_disposition` may answer it — passing
+    nothing raises there rather than assuming untied.
 
     Raises rather than falling through when a name is structurally a routed
     expert but the profile cannot name its role: that is an undeclared
@@ -362,9 +514,19 @@ def classify_read_class(
         return "routed_experts"
 
     embedding = _strip_weight(str(profile.embedding_name()))
-    if any(base == embedding or base.endswith("." + embedding)
-           for base in bases):
-        return "excluded_embedding"
+    if any(_matches_declared(base, embedding) for base in bases):
+        if embedding_streamed is None:
+            raise ReadTrafficError(
+                f"[read_traffic] {context}: {name!r} is this profile's "
+                "embedding table, whose read probability depends on whether "
+                "it is also the output projection (tie_word_embeddings). The "
+                "caller did not resolve that; call "
+                "resolve_embedding_disposition() over the checkpoint's tensor "
+                "names and pass embedding_streamed=. Assuming untied would "
+                "silently drop the whole logits projection from the ledger "
+                "on every tied model."
+            )
+        return "held_fixed" if embedding_streamed else "excluded_embedding"
 
     # The profile declining to map a checkpoint key into the live graph is
     # the architecture's OWN declaration that the tensor is not part of the
@@ -397,6 +559,7 @@ def _finalize(
     routing: RoutingFactor | None,
     *,
     reconciliation: Mapping[str, Any],
+    embedding: EmbeddingDisposition,
     unpriced_assignment_names: tuple[str, ...] = (),
     measured_from: str,
 ) -> dict:
@@ -428,6 +591,7 @@ def _finalize(
                 "be added back from this figure exactly"
             ),
         },
+        "embedding": embedding.as_dict(),
         "routing": (
             {
                 "num_experts_per_tok": routing.num_experts_per_tok,
@@ -552,6 +716,25 @@ def assignment_read_traffic(
         if passthrough_names else {}
     )
 
+    # The embedding's read probability is a whole-checkpoint fact (is there a
+    # separate output projection?), so it is resolved once, over every name in
+    # the artifact, before any tensor is classified.
+    span_bytes = fp.source_tensor_span_bytes(model_path)
+    live_names: list[str] = list(merged)
+
+    def _live(ckpt_key: str) -> str:
+        try:
+            mapped = profile.checkpoint_to_live_name(ckpt_key)
+        except Exception:
+            mapped = ckpt_key
+        return _strip_weight(mapped or ckpt_key)
+
+    for key in span_bytes:
+        live_names.append(key)        # the checkpoint spelling (`head`)
+        live_names.append(_live(key))  # and the live one (`lm_head`)
+    embedding = resolve_embedding_disposition(
+        live_names, profile=profile, config=config, context=context)
+
     class_totals = _new_class_totals()
     observed_expert_counts: dict[str, int] = {}
     priced_names: list[str] = []
@@ -601,7 +784,8 @@ def assignment_read_traffic(
                     entry.get(fp.NVFP4_WEIGHT_ONLY_STATS_KEY, False)),
             ))
         klass = classify_read_class(
-            qname, profile=profile, in_assignment=True, context=context)
+            qname, profile=profile, in_assignment=True,
+            embedding_streamed=embedding.streamed, context=context)
         if klass == "routed_experts":
             saw_routed = True
             if len(shape) == 3:
@@ -617,7 +801,8 @@ def assignment_read_traffic(
                 f"[read_traffic] {context}: per-expert group {key!r} declares "
                 "no member tensors, so it cannot be classified.")
         klass = classify_read_class(
-            members[0], profile=profile, in_assignment=True, context=context)
+            members[0], profile=profile, in_assignment=True,
+            embedding_streamed=embedding.streamed, context=context)
         saw_routed |= klass == "routed_experts"
         _charge(int(group["tensor_payload_bytes"]), klass)
         if int(group["codebook_sidecar_bytes"]):
@@ -634,19 +819,13 @@ def assignment_read_traffic(
         key = qname if qname in source_manifest else _strip_weight(qname)
         covered_spans.update(span_map.get(key, ()))
 
-    for ckpt_key, nbytes in sorted(
-        fp.source_tensor_span_bytes(model_path).items()
-    ):
+    for ckpt_key, nbytes in sorted(span_bytes.items()):
         if fp.source_span_identity(ckpt_key) in covered_spans:
             continue
-        try:
-            live = profile.checkpoint_to_live_name(ckpt_key)
-        except Exception:
-            live = ckpt_key
-        live_name = _strip_weight(live or ckpt_key)
         klass = classify_read_class(
-            live_name, profile=profile, checkpoint_key=ckpt_key,
-            in_assignment=False, context=context)
+            _live(ckpt_key), profile=profile, checkpoint_key=ckpt_key,
+            in_assignment=False, embedding_streamed=embedding.streamed,
+            context=context)
         saw_routed |= klass == "routed_experts"
         _charge(int(nbytes), klass)
 
@@ -682,6 +861,7 @@ def assignment_read_traffic(
             "source_total_bytes": int(source_total_bytes),
             "n_priced_units": len(priced_names),
         },
+        embedding=embedding,
         unpriced_assignment_names=unpriced,
         measured_from="allocator assignment + source checkpoint spans",
     )
@@ -707,6 +887,49 @@ def _source_passthrough_formats() -> frozenset[str]:
 # ---------------------------------------------------------------------------
 # Post-export: measure the artifact that was actually written
 # ---------------------------------------------------------------------------
+
+def _exported_codebook_sidecar_bytes(
+    export_dir: str, *, context: str,
+) -> tuple[int, str | None]:
+    """Resident bytes of a CB artifact's codebook sidecar, if it declares one.
+
+    The CB lane ships its codebooks in a globbed sidecar file rather than in
+    the shard set (so vLLM's weight loader never sees them), which means the
+    safetensors ledger above cannot see them either.  Reporting ``0`` resident
+    codebook bytes for an artifact that ships 748 KB of them would be exactly
+    the silent zero this module refuses everywhere else, so the file is read
+    from the artifact's OWN ``quant_config.json`` declaration
+    (``codebook_file``) -- not from a glob, and not from a guess about naming.
+    """
+    config_path = Path(export_dir) / "quant_config.json"
+    if not config_path.is_file():
+        return 0, None
+    try:
+        declared = json.loads(config_path.read_text()).get("codebook_file")
+    except Exception:
+        return 0, None
+    if not declared:
+        return 0, None
+    path = Path(export_dir) / str(declared)
+    if not path.is_file():
+        raise ReadTrafficError(
+            f"[read_traffic] {context}: quant_config.json declares "
+            f"codebook_file={declared!r} but no such file exists under "
+            f"{export_dir!r}. Its resident bytes cannot be reported as zero: "
+            "the artifact is either incomplete or mis-declared."
+        )
+    try:
+        header = fp._read_safetensors_header(str(path))
+        nbytes = sum(
+            int(meta["data_offsets"][1]) - int(meta["data_offsets"][0])
+            for name, meta in header.items() if name != "__metadata__"
+        )
+        return nbytes, f"{declared} (tensor data)"
+    except ReadTrafficError:
+        raise
+    except Exception:
+        return path.stat().st_size, f"{declared} (file bytes)"
+
 
 def exported_checkpoint_read_traffic(
     export_dir: str | os.PathLike,
@@ -736,21 +959,31 @@ def exported_checkpoint_read_traffic(
         config = read_model_config(export_dir)
 
     spans = fp.source_tensor_span_bytes(export_dir)
+
+    # Classify on the LIVE spelling with the on-disk one alongside: a
+    # multimodal checkpoint stores the embedding as
+    # `model.language_model.embed_tokens.weight`, and only the profile's own
+    # mapping turns that into the name the profile declares.
+    def _live(ckpt_key: str) -> str:
+        try:
+            mapped = profile.checkpoint_to_live_name(ckpt_key)
+        except Exception:
+            mapped = ckpt_key
+        return _strip_weight(mapped or ckpt_key)
+
+    embedding = resolve_embedding_disposition(
+        [name for key in spans for name in (key, _live(key))],
+        profile=profile, config=config, context=context,
+    )
+
     class_totals = _new_class_totals()
     observed_expert_counts: dict[str, int] = {}
     saw_routed = False
     for key, nbytes in sorted(spans.items()):
-        # Classify on the LIVE spelling with the on-disk one alongside: a
-        # multimodal checkpoint stores the embedding as
-        # `model.language_model.embed_tokens.weight`, and only the profile's
-        # own mapping turns that into the name the profile declares.
-        try:
-            live = profile.checkpoint_to_live_name(key)
-        except Exception:
-            live = key
         klass = classify_read_class(
-            _strip_weight(live or key), profile=profile, checkpoint_key=key,
-            in_assignment=False, context=context)
+            _live(key), profile=profile, checkpoint_key=key,
+            in_assignment=False, embedding_streamed=embedding.streamed,
+            context=context)
         # An exported artifact has no allocator/floor distinction on disk, so
         # every always-active tensor lands in `held_fixed`; the recipe-side
         # dense/held_fixed split is only available pre-export.
@@ -778,6 +1011,14 @@ def exported_checkpoint_read_traffic(
             "silently omitted term in the bandwidth figure."
         )
 
+    # Resident, never per-token traffic -- and outside the shard ledger, so it
+    # is added only after the reconciliation above has passed.
+    codebook_bytes, codebook_source = _exported_codebook_sidecar_bytes(
+        export_dir, context=context)
+    if codebook_bytes:
+        class_totals["resident_codebooks"]["stored_bytes"] += int(codebook_bytes)
+        class_totals["resident_codebooks"]["n_tensors"] += 1
+
     routing = resolve_routing_factor(
         config, observed_expert_counts=observed_expert_counts, context=context,
     ) if saw_routed else None
@@ -788,7 +1029,10 @@ def exported_checkpoint_read_traffic(
             "ledger_stored_bytes": ledger_total,
             "checkpoint_tensor_data_bytes": measured_total,
             "agrees": True,
+            "codebook_sidecar_bytes_outside_shards": int(codebook_bytes),
+            "codebook_sidecar_source": codebook_source,
         },
+        embedding=embedding,
         measured_from=f"exported safetensors headers under {export_dir}",
     )
 
@@ -806,6 +1050,7 @@ def _claim_from_report(report: Mapping[str, Any]) -> dict[str, Any]:
         "breakdown": report["breakdown"],
         "excluded": report["excluded"],
         "routing": report["routing"],
+        "embedding": report["embedding"],
         "note": (
             "expected weight bytes streamed per decode token at batch 1 -- "
             "the quantity that sets decode throughput, which a disk-byte "
