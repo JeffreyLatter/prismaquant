@@ -336,6 +336,7 @@ class ModelStructureSpec:
     visual_layer_prefix: str | None = None
     visual_config_key: str | None = None
     lm_head_name: str | None = None
+    embedding_name: str | None = None
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "ModelStructureSpec":
@@ -419,6 +420,7 @@ class ModelStructureSpec:
             visual_layer_prefix=_optional_str(shard_regexes.get("visual_layer_prefix")),
             visual_config_key=_optional_str(shard_regexes.get("visual_config_key")),
             lm_head_name=_optional_str(shard_regexes.get("lm_head_name")),
+            embedding_name=_optional_str(shard_regexes.get("embedding_name")),
         )
 
     def for_config(

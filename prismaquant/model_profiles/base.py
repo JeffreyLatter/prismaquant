@@ -1049,6 +1049,28 @@ class ModelProfile(ABC):
             return spec.lm_head_name
         return "lm_head"
 
+    def embedding_name(self) -> str:
+        """Qualified LIVE name of the input embedding table.
+
+        The twin of :meth:`lm_head_name`, and it exists for the same reason:
+        a consumer that has to single out one structural tensor must ask the
+        profile rather than pattern-match a name. The read-traffic ledger
+        (:mod:`prismaquant.read_traffic`) is the caller — the embedding is the
+        one weight a decode step does NOT stream (it gathers one row per
+        token), so it is the one tensor excluded from per-token read bytes,
+        and "which tensor is the embedding" must be a declaration rather than
+        a substring test.
+
+        Override in ``shard_regexes.embedding_name`` for an architecture that
+        names it otherwise; the value is the live/allocator spelling, not the
+        on-disk one (DSv4 stores ``embed.weight`` but
+        ``checkpoint_to_live_name`` maps it to ``model.embed_tokens.weight``).
+        """
+        spec = self.structure_spec()
+        if spec is not None and spec.embedding_name is not None:
+            return spec.embedding_name
+        return "model.embed_tokens"
+
     def mtp_layer_count(self, cfg: dict) -> int:
         """Count of MTP layers from the HF config. Fall back to
         scanning the safetensors index via `_count_mtp_layers_from_safetensors`

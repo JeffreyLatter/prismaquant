@@ -738,12 +738,19 @@ def _validated_codebook_sequence(
     return tuple(validated)
 
 
+#: Name prefix of every serialized codebook sidecar tensor.  Exported so a
+#: consumer that has to recognise one on disk (the read-traffic ledger, which
+#: reports codebooks as resident bytes rather than per-token stream traffic)
+#: reads the producer's own spelling instead of repeating a literal.
+CODEBOOK_TENSOR_PREFIX = "cb_codebook."
+
+
 def _codebook_names_for_count(
     ref: str,
     fmt: str,
     count: int,
 ) -> tuple[str, ...]:
-    base = f"cb_codebook.{ref}.{fmt}"
+    base = f"{CODEBOOK_TENSOR_PREFIX}{ref}.{fmt}"
     if count > 1:
         return tuple(f"{base}.sub{i}" for i in range(count))
     return (base,)
@@ -1249,6 +1256,7 @@ __all__ = [
     "build_source_passthrough_declaration",
     "parse_quantized_embedding_declaration",
     "cb_scheme_reuse_signature",
+    "CODEBOOK_TENSOR_PREFIX",
     "codebook_tensor_names",
     "codebook_tensors",
     "parse_source_passthrough_declaration",
