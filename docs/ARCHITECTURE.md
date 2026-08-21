@@ -1,7 +1,26 @@
 # PrismaQuant Architecture
 
-As of: 2026-08-20 · `merge/proven-rescues` — stamps follow, newest first, each
-recording its own branch and date. Re-stamped (2026-08-20,
+As of: 2026-08-21 · `feat/decode-read-bytes-stat` — stamps follow, newest first,
+each recording its own branch and date. Re-stamped (2026-08-21,
+`feat/decode-read-bytes-stat`) for **per-token decode read bytes as a
+first-class exported stat** (§7, `read_gb_per_token`). An artifact has two
+rates, and we only ever reported one: bpp prices the disk, while decode
+throughput is set by the bytes streamed per generated token — and on a sparse
+MoE those diverge by ~40x on the dense-vs-expert margin, because a dense weight
+is read every token while an expert stack is read `topk/E` of the time. On the
+shipped DSv4-Flash 87 GB artifact the dense path is **8.3% of the checkpoint and
+76.8% of the read**; on Ornith-1.5-35B-A3B's export, **10.4% and 81.5%**. The
+allocator's byte budget cannot see this, so it overspends decode bandwidth on
+the dense path. Principle 1 says that is a measurement gap: `read_traffic.py`
+measures it exactly (no estimates — assigned units priced by the footprint
+primitives, everything else by the checkpoint's own spans, the whole ledger
+reconciled against `assignment_artifact_bytes` to the byte before any
+probability is applied), and it is stamped beside `achieved_bpp` on the
+exporter card, the CB card, and every `validate_assignments_kl` result.
+Embedding, MTP sidecar, and non-text-graph tensors are **excluded but
+itemized**, never silently dropped; CB codebooks are reported as resident
+bytes. **No allocator change** — pricing the axis inside the DP is a separate
+decision. Previously re-stamped (2026-08-20,
 `merge/proven-rescues`) for **the A-side reaching routed MoE experts, on both
 the surrogate and the gate** (§"AQUA-AURA"). AQUA priced only `nn.Linear`
 units, because per-channel marginals come from a backward hook and a packed
@@ -3213,6 +3232,65 @@ recorded, so the precedence fix above already closes that specific instance; the
 the independent net that does not depend on getting precedence right.) Tests:
 `tests/test_shipcard.py::test_recipe_priced_bpp_*`,
 `::test_achieved_bpp_cross_check_*`.
+
+**`read_gb_per_token` — the second rate, stamped wherever `achieved_bpp` is**
+(`prismaquant/read_traffic.py`, campaign rule R2, 2026-08-21). bpp measures what an
+artifact costs on disk; it does **not** measure what decode costs, because decode
+throughput is governed by the bytes streamed per generated token and a sparse MoE reads
+only `topk/E` of its expert mass on any one token. Measured on the shipped DSv4-Flash
+87 GB artifact: the dense path is **8.3% of the checkpoint but 76.8% of decode read
+traffic** (8.058 GB/token at batch 1); re-measured on Ornith-1.5-35B-A3B's 24.62 GB
+export it is **10.4% of the checkpoint and 81.5% of the read** (3.127 GB/token). The
+allocator's byte budget is blind to that ~40x divergence in dense-vs-expert marginal
+pricing, so it systematically overspends decode bandwidth on the dense path. Per
+principle 1 that is a **measurement gap**, and this is the measurement; nothing in
+`allocator_solver.py` changed, and pricing the axis inside the DP is a separate decision.
+
+The definition is exact, not an estimate:
+`read_bytes_per_token = Σ_tensor stored_bytes(tensor) × read_probability(tensor)`.
+`READ_CLASS_TABLE` (`read_traffic.py`) is the single authority for the second factor:
+routed-expert stacks get `num_experts_per_tok / n_routed_experts` (exact as an
+expectation under the per-layer-uniform expert invariant §6.4 — routing skew changes
+*which* experts are read, not how many bytes); allocator-assigned always-active units
+(`dense`) and always-active tensors the allocator never decided (`held_fixed` — norms,
+biases, routers, a pinned `lm_head`, and grouped operands the probe skips such as DSv4's
+`attn.wo_a`) get `1.0`. Both `topk` and `E` are read from the architecture's own config
+declarations and **cross-checked against the tensors' measured stack depth**; an MoE
+model that declares neither is refused rather than defaulted (principle 2 — the
+`moe_imatrix` "assume 8" fallback would mis-price the largest term in the ledger).
+
+Three classes are **excluded but itemized**, never silently dropped: the input embedding
+(one row is gathered per token, not the table), the MTP/draft sidecar (read every token
+under spec-decode and never without it — the honest default is excluded, and
+`excluded.mtp_bytes` lets a spec-decode serve add it back exactly), and anything the
+model profile's own `checkpoint_to_live_name` declines to map into the live text graph
+(vision/audio towers). CB codebook tables are reported as `resident_bytes`, not stream
+traffic. `ModelProfile.embedding_name()` (`model_profiles/base.py`, spec key
+`shard_regexes.embedding_name`) is the twin of `lm_head_name()` and exists so "which
+tensor is the embedding" is a declaration rather than a substring test.
+
+Stored bytes are **not** a second copy of the byte math. Assigned units are priced by
+`footprint.format_tensor_payload_breakdown` / the CB payload breakdown; every other
+tensor is priced from the checkpoint's own safetensors spans via the new
+`footprint.source_tensor_span_bytes`, which asserts it partitions the checkpoint exactly.
+The two halves are then **reconciled against `footprint.assignment_artifact_bytes`
+before any probability is applied**, and a one-byte disagreement raises — a ledger that
+cannot drift without failing is what makes this reuse rather than duplication (project
+memory: a silent zero in a per-tensor score ranks the broken arm first).
+
+Where it is stamped, always beside the bpp: `export_native_compressed._write_shipcard`
+and `shipcard.open_cb_export_shipcard` stamp `build.read_gb_per_token` measured from the
+shards just written (`read_traffic.read_traffic_claim`), which cannot describe a
+different assignment than the one on disk; `validate_assignments_kl` stamps a per-result
+`read_gb_per_token` computed from the candidate assignment
+(`assignment_read_traffic_claim`). All three are **advisory** in the same sense
+`allocator_achieved_bpp`'s cross-check is: a failure reports a named `reason` rather than
+stranding a finished export. Every claim carries `scope` (weights only, batch 1, KV cache
+and activations excluded — so the figure is a lower bound on real decode traffic), the
+four-key `breakdown` (`dense` / `routed` / `held_fixed` / `resident_codebooks`), the
+itemized `excluded` bytes, and the `routing` factor with the config keys it came from.
+Tests: `tests/test_read_traffic.py` (exact hand-computed ledger on a synthetic 4-expert
+model, the `p = topk/E` and `p = 1` property, the classification table, and both refusals).
 
 Also on the card: exact `artifact_bytes`, format histogram, the render-lever
 echo (`_render_lever_provenance()`, shared with the export cache's fingerprint so the two

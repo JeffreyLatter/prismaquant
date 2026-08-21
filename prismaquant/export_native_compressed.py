@@ -7995,6 +7995,7 @@ def _write_shipcard(
     """
     import hashlib
 
+    from . import read_traffic as _read_traffic
     from . import shipcard as _shipcard
 
     def _hash(payload) -> str | None:
@@ -8016,6 +8017,12 @@ def _write_shipcard(
         "config_assignment_hash": _hash(config_assignment),
         "n_assignment_entries": len(config_assignment),
         "achieved_bpp": _shipcard.allocator_achieved_bpp(layer_config_path),
+        # Disk bytes are not what decode throughput is made of: a dense
+        # weight is streamed every token while a routed expert stack is
+        # streamed topk/E of the time, so bpp and per-token read bytes rank
+        # artifacts differently on a sparse MoE. Stamped beside the bpp,
+        # measured from the shards this export just wrote.
+        "read_gb_per_token": _read_traffic.read_traffic_claim(out_dir),
         "format_histogram": {f"{k[0]}/{k[1]}": v for k, v in hist.items()},
         "render_levers": _render_lever_provenance(),
         "kv_shared_fisher": _shipcard.kv_shared_fisher_echo(),

@@ -32,6 +32,7 @@ from pathlib import Path
 import torch
 
 from prismaquant import format_registry as fr
+from prismaquant import read_traffic
 from prismaquant.build_rtn_cache import (
     cache_reference_log_probs,
     kl_divergence,
@@ -1973,6 +1974,21 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "bpp_quantizable_entries": int(bpp_details["quantizable_entries"]),
                 "bpp_excluded_entries": int(bpp_details["excluded_entries"]),
                 "bpp_quantizable_params": int(bpp_details["quantizable_params"]),
+                # Beside the bpp, the other rate this candidate is spending:
+                # expected weight bytes streamed per decode token. bpp ranks
+                # candidates by disk cost; this ranks them by the memory-bus
+                # cost that actually sets decode throughput, and on a sparse
+                # MoE the two orderings differ (see `read_traffic`).
+                "read_gb_per_token": read_traffic.assignment_read_traffic_claim(
+                    assignment,
+                    stats,
+                    model_path=args.model,
+                    profile=profile,
+                    cb_serialization_context=assignment_cb_metadata[
+                        (label, path)
+                    ][0],
+                    context=f"assignment {label!r} ({path})",
+                ),
                 "format_counts": counts,
                 "changed_vs_base": int(changed),
                 "assignment_entries": len(assignment),
