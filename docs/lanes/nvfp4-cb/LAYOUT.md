@@ -208,6 +208,17 @@ coords)]`; multiply coords by their group-16 E4M3 scale.
 
 ## 3. safetensors tensor names
 
+**Containers (2026-08-21).** CB weights are published in the standard HF shard
+layout, at the repo-wide ~1 GiB budget (`--shard-bytes`, default
+`prismaquant.shard_layout.DEFAULT_SHARD_BYTES`; `EXPORT_SHARD_BYTES` on the
+pipeline). One resulting shard is `model.safetensors` with no index; more than
+one is `model-XXXXX-of-YYYYY.safetensors` plus `model.safetensors.index.json`.
+A budget at least as large as the artifact reproduces the pre-2026-08-21
+single-container layout — there is no zero sentinel, in this lane or the
+compressed-tensors one. The `.pqcb` codebook sidecar is **never** sharded and
+never carries an index: it sits outside the `*.safetensors` glob on purpose
+(§codebook contract), and its size is bounded by the codebook tables.
+
 For each **CB target Linear** `<q>` (e.g. `model.layers.0.mlp.gate_proj`):
 
 | tensor | dtype / shape | families | meaning |

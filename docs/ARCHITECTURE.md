@@ -1,7 +1,29 @@
 # PrismaQuant Architecture
 
-As of: 2026-08-20 · `merge/proven-rescues` — stamps follow, newest first, each
-recording its own branch and date. Re-stamped (2026-08-20,
+As of: 2026-08-21 · `feat/cb-lane-sharding` — stamps follow, newest first, each
+recording its own branch and date. Re-stamped (2026-08-21,
+`feat/cb-lane-sharding`) for **the CB lane joining the ~1 GiB shard standard**
+(§"Output packaging"). Both CB exporters take `--shard-bytes` with the native
+lane's 1 GiB default, `run-pipeline.sh` passes `EXPORT_SHARD_BYTES` on the CB
+branch, and the partition rule is now one shared implementation
+(`prismaquant/shard_layout.py`) rather than two writers that agreed by
+inspection. One resulting shard still publishes `model.safetensors` with no
+index, so a budget at least as large as the artifact reproduces every
+pre-2026-08-21 CB layout; more than one publishes
+`model-XXXXX-of-YYYYY.safetensors` plus `model.safetensors.index.json`, which
+is what a stock HF/vLLM loader already reads. Motivation is a real user: the
+shipped 87 GB single-container DSv4 CB artifact stalled the default HF loader
+on a 128 GB unified-memory GB10 and the reporter resharded it by hand
+(RobTand/gridbook#47). **`model_sha` is unchanged and deliberately so** — it
+binds weight-container filenames and sizes (`shipcard.py:270-279`), so a
+different shard budget is a different artifact identity, which is correct for
+a freshly exported artifact and is not a reshard-in-place story. What the
+change adds instead is a layout-INVARIANT payload digest,
+`provenance.tensor_payload_identity` (`shard_layout.tensor_payload_identity`,
+stamped by **both** CB exporters), hashed in the pass that already touches the
+bytes: two exports of identical tensors at different budgets agree there and
+differ in `model_sha`, so a resharded export stays recognisable as the same
+model without changing what identity means. Previously re-stamped (2026-08-20,
 `merge/proven-rescues`) for **the A-side reaching routed MoE experts, on both
 the surrogate and the gate** (§"AQUA-AURA"). AQUA priced only `nn.Linear`
 units, because per-channel marginals come from a backward hook and a packed
@@ -50,8 +72,9 @@ non-activation formats before consulting the lane; no shipped artifact has
 combined an FP8_SOURCE rung with AQUA, and the first that does must close it.
 (b) Published artifacts are packaged in **~1 GiB safetensors shards**
 (`EXPORT_SHARD_BYTES`, and `export_native_compressed`'s own `--shard-bytes`
-default, both down from 5 GiB) on Robert's standing instruction; the CB lane's
-single-file streaming exporter is out of scope. Previously re-stamped
+default, both down from 5 GiB) on Robert's standing instruction; the CB lane
+was out of scope then and is covered as of 2026-08-21 (stamp above).
+Previously re-stamped
 (2026-08-18, `main`) for
 the **CB-lane A-side correction — both families execute** (§"AQUA-AURA"):
 `lane_specs/nvfp4_cb.json` `served_activation_quantization.executes` is now
@@ -927,19 +950,41 @@ which is what the rows touched since are keyed on.
 | **4/4 D** | Production cache build / recache for the selected assignment | `production_recache` (`1331-1346`, `1399-1414`) or `build_production_cache --recache-layer-config` (`1379-1396`, `1423-1438`) | `production_weight_cache_frontier_<digest>_recached.pkl` (`1328`), `production_weight_cache_recached.pkl` / `…_raw.pkl` (`1102-1103`) | settings-hash `production-cache-recached` (`1404`), `frontier-recache` (`1360`), `production-cache-raw` (`1452`) | `PRODUCTION_CACHE=1` |
 | **3c** | AURA additivity report — `residual = measured_end_KL − Σ predicted_dloss`, stamped into `cost.pkl` `provenance["additivity"]` (§4.3) | `prismaquant.aura_additivity_gate` (+ optional `validate_assignments_kl` under `AURA_ADDITIVITY_GATE=measure`) | `artifacts/aura_additivity.json`, `aura_additivity_kl.json` (measure only); `logs/aura_additivity*.log` | none — non-blocking report, skip-if-exists on the KL half | `COST_MODE=aura`, `AURA_ADDITIVITY_GATE≠0` |
 | **4/4 E-gguf** | GGUF skeleton + export + llama.cpp smoke | `convert_hf_to_gguf.py` (`1461-1464`), `prismaquant.export_gguf` (`1469-1493`), `llama-completion` (`1500-1516`) | `artifacts/skeleton.gguf`, `exported.gguf` | settings-hash `gguf-skeleton` (`1488`); export always runs | GGUF lane; **exits 0** |
-| **4/4 E-cb** | CB col-weights + codebook export | `harvest_cb_col_weights "[4/4]"`, `export_nvfp4_cb[_streaming]` | `exported_nvfp4_cb/` | settings-hash `cb-col-weights`; export always runs | CB lane; no in-lane serving smoke; **exits 0** |
+| **4/4 E-cb** | CB col-weights + codebook export | `harvest_cb_col_weights "[4/4]"`, `export_nvfp4_cb[_streaming]` | `exported_nvfp4_cb/` in **~1 GiB safetensors shards** (`EXPORT_SHARD_BYTES`, default `1073741824`) + `.pqcb` codebook sidecar | settings-hash `cb-col-weights`; export always runs | CB lane; no in-lane serving smoke; **exits 0** |
 | **4/4 E** | compressed-tensors export (§6) | `prismaquant.export_native_compressed` (`1665-1699`) | `exported/` in **~1 GiB safetensors shards** (`EXPORT_SHARD_BYTES`, default `1073741824`); `logs/export.log` | **none — always runs** | default lane |
 
-**Output packaging — ~1 GiB shards (2026-08-20).** Published artifacts are packaged in ~1 GiB
-safetensors shards, down from 5 GiB, on Robert's standing instruction ("package all models using
-1gb file sizes"). The value lives in two places kept deliberately in agreement:
-`export_native_compressed`'s own `--shard-bytes` default (so a hand-run export gets it too) and
-`run-pipeline.sh`'s `EXPORT_SHARD_BYTES`, which is passed through and echoed in the settings
-banner. `IncrementalSafetensorsWriter` flushes a single oversized tensor whole rather than
-splitting it, so a wide `lm_head`/`embed_tokens` row may still exceed the target — that is the
-writer's contract, not a violation of it. **Scope: the compressed-tensors lane only.** The CB
-lane's streaming exporter writes one `model.safetensors` (`export_nvfp4_cb_streaming.py:5127`)
-and has no shard-size concept, so CB artifacts are not covered by this default.
+**Output packaging — ~1 GiB shards (2026-08-20; CB lane 2026-08-21).** Published artifacts are
+packaged in ~1 GiB safetensors shards, down from 5 GiB, on Robert's standing instruction
+("package all models using 1gb file sizes"). The value lives in
+`prismaquant/shard_layout.py` (`DEFAULT_SHARD_BYTES`), which every lane's `--shard-bytes`
+default reads (so a hand-run export gets it too), and in `run-pipeline.sh`'s
+`EXPORT_SHARD_BYTES`, passed through on **both** the compressed-tensors branch and the CB
+branch and echoed in the settings banner. The partition rule is one implementation
+(`shard_layout.plan_shards`): accumulate in emit order, close the current shard when the next
+tensor would push it past the budget, and give a single oversized tensor its own shard whole
+rather than splitting it — so a wide `lm_head`/`embed_tokens` row may still exceed the target.
+That is the writer's contract, not a violation of it. **There is no zero sentinel** in either
+lane: the legacy single-container layout is what a budget at least as large as the finished
+artifact already produces, and the writers publish `model.safetensors` with no index whenever
+exactly one shard results.
+
+**Scope now covers the CB lane.** `export_nvfp4_cb` (resident) and
+`export_nvfp4_cb_streaming` (the 200-300B-class path) both take `--shard-bytes`; the streaming
+writer partitions its recorded entry sequence up front, so every shard's name and header are
+known before a byte is written, streams each container to a temporary file, runs the
+source-coverage `before_publish` assertion once after the last producer, and only then renames
+every container and writes the index — an abort at any point still leaves no partial artifact.
+The CB refusal contract follows the layout rather than being told it: a single container must
+carry no index and a `model-XXXXX-of-YYYYY` run must carry one naming exactly the planned
+containers (`nvfp4_cb_footprint.cb_export_artifact_inventory`), and the shipcard's
+`weight_content_manifest` lists every published shard with the digest the writer accumulated
+in-stream (no second read of a 100 GB container). Motivation: the shipped 87 GB single-container
+DSv4 CB artifact stalled the default HF loader on a 128 GB unified-memory GB10 and the reporter
+resharded it by hand (RobTand/gridbook#47); `scripts/reshard_safetensors.py` is that repair
+after the fact. **Serving evidence has that scope and no more** — the CB lane serves only in the
+pinned Gridbook runtime, which this repo may not import (`AGENTS.md`), so what is attested here
+is that the layout is the standard HF one and that the reporter's own reshard served; no CB
+serve of a PrismaQuant-sharded artifact has been run.
 
 **Nothing in the pipeline validates the artifact** — that is a physical lane boundary (`vllm`
 is not importable in the build venv), not laziness. What the script now does instead of

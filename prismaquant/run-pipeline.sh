@@ -2341,6 +2341,7 @@ if [[ "$EXPORT_CONTAINER" == "nvfp4_cb" ]]; then
     --codebook-iters "$CB_CODEBOOK_ITERS"
     --codebook-seed "$CB_CODEBOOK_SEED"
     --scale-coding "$CB_SCALE_CODING"
+    --shard-bytes "$EXPORT_SHARD_BYTES"
     --device "$EXPORT_DEVICE"
   )
   case "$CB_SCALE_SWEEP" in

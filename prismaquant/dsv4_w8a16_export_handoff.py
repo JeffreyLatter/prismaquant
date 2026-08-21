@@ -275,9 +275,45 @@ _PUBLISHED_FILES = frozenset({
 # bridge -- redundant claim paths, both fail-closed; unification is a
 # candidate follow-up, not a correctness need). Per-file lane-inertness
 # arguments are exactly the union of the two records above.
+#
+# RE-FROZEN 2026-08-21 (the CB lane joins the shard standard), reviewed
+# against THIS handoff rather than re-hashed:
+#   export_nvfp4_cb_streaming.py + nvfp4_cb_footprint.py -- the CB lane now
+#     publishes ~1 GiB safetensors shards by default (`shard_bytes`,
+#     `EXPORT_SHARD_BYTES`), which is the standing packaging default every
+#     other lane already ships. The single-container layout it replaces is a
+#     MEASURED user-hit defect, not a preference: the published 87 GB
+#     `model.safetensors` stalls the default HF loader on a 128 GB
+#     unified-memory GB10 and the reporter resharded it by hand
+#     (RobTand/gridbook#47 setup notes). The footprint change is the matching
+#     inventory rule -- it used to refuse any `model.safetensors.index.json`
+#     and now derives from the published container set whether an index is
+#     required, forbidden, or unrecognisable, failing closed on all three.
+#
+#     WHAT THIS CHANGES HERE, stated plainly, because this one is NOT inert:
+#     a W8A16 export from this tree publishes ~90 shards plus an index rather
+#     than one ~92 GB container, so its `model_sha` (a filename->size map,
+#     shipcard.py:270-279) differs from what a pre-change run would have
+#     produced, and the added index/per-shard-header bytes count against
+#     `whole_artifact_budget_bytes` (kilobytes against 92 GB, but real and
+#     measured by the same inventory). That is accepted deliberately: this
+#     release is UNSHIPPED -- the handoff is a pre-export gate -- so no
+#     published artifact's identity moves, and reproduction of the artifacts
+#     that ARE published happens in era worktrees at their pinned commits,
+#     where the pre-sharding exporter still lives, so replay identity there
+#     is untouched. `--shard-bytes` at or above the finished artifact
+#     reproduces the single-container layout if a specific release wants it;
+#     there is deliberately no zero sentinel, because the native lane has
+#     none. Recognition across a reshard is carried by the new layout-
+#     INVARIANT `provenance.tensor_payload_identity`
+#     (`shard_layout.tensor_payload_identity`), stamped by both CB exporters
+#     from digests taken in the pass that already hashes the bytes. Pinned by
+#     tests/test_shard_layout.py (12) and tests/test_cb_lane_sharding.py (21),
+#     which include a cross-exporter test showing the two exporters agree on
+#     the payload identity while their shard COUNTS differ.
 _FROZEN_EXPORT_SOURCE_SHA256 = {
     "prismaquant/export_nvfp4_cb_streaming.py": (
-        "33ab70dd2b234095b58351f81a3708b076c12a6469c3f1c6cc47478a12b47c48"
+        "f39ffec9ea48ae1a6d06c0d0fc076dfc8317e01e355b3db7f188b31258710ccd"
     ),
     "prismaquant/cb_export_config.py": (
         "a690dafe120c4a6fc077d34aad1b142ee4201ec4dedda9ccd35a7583dfb22770"
@@ -313,7 +349,7 @@ _FROZEN_EXPORT_SOURCE_SHA256 = {
         "1cc27e3b64043f9873da528ae2aa128e37c15be303109509f713b8d738c59f36"
     ),
     "prismaquant/nvfp4_cb_footprint.py": (
-        "fcefc1fd68c668ba06165454e0edf6f98c353f6d5a52321ba3f26fb24b71bae8"
+        "68fa72cfb7274ceb8152db31940b2401e3d25485ea4b5a589ee8366b52997b93"
     ),
     "prismaquant/artifact_completeness.py": (
         "22f72feb6d341ae7316ade617939cfb76cbcd1430d0ab87624b5d52bdac6c853"
