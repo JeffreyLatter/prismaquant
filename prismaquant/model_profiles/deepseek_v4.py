@@ -435,3 +435,50 @@ class DeepseekV4Profile(ModelProfile):
         sqrtsoftplus ACT2FN, per-expert experts swap)."""
         from ..vendored import register_deepseek_v4
         register_deepseek_v4()
+
+    def walk_claim_rules(self):
+        """DSv4 has four matmul-fed families the base rules cannot claim —
+        every one a bare Parameter (or an out-of-inventory Linear) on a
+        module class the probe's enumeration skips, which is the exact
+        `wo_a` failure class the walker exists to surface. Each is pinned
+        with the reason it ships at source precision; the GroupedLinear
+        (`wo_a`) pin itself comes from the base rules via the spec's
+        `probe_skip_module_class_names`."""
+        from prismaquant.model_walk import ClaimRule
+
+        rules = [
+            ClaimRule(
+                "pin",
+                "MoE router gate: matmul-fed but never priced — a route "
+                "flip is not a smooth cost; held at source precision",
+                module_class="DeepseekV4TopKRouter",
+            ),
+            ClaimRule(
+                "pin",
+                "MoE router gate (hash-routed layer): matmul-fed but never "
+                "priced; held at source precision",
+                module_class="DeepseekV4HashRouter",
+            ),
+            ClaimRule(
+                "pin",
+                "mHC hyper-connection mixer: bare Parameter fed to "
+                "F.linear on a class the probe skips; unpriced, held at "
+                "source precision as a named debt",
+                module_class="DeepseekV4HyperConnection",
+            ),
+            ClaimRule(
+                "pin",
+                "mHC hyper head mixer: bare Parameter fed to F.linear on a "
+                "class the probe skips; unpriced, held at source precision "
+                "as a named debt",
+                module_class="DeepseekV4HyperHead",
+            ),
+            ClaimRule(
+                "pin",
+                "compressor/indexer Linear: the gridbook D0.1 serve "
+                "contract keeps these leaves source-format; charged to the "
+                "immutable floor (see probe_linear_exclude_extra)",
+                name_regex=self.probe_linear_exclude_extra(),
+            ),
+        ]
+        return rules + super().walk_claim_rules()

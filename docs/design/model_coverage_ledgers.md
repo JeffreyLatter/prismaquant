@@ -6,6 +6,11 @@ reframed the same day from closure ledgers to a discovery traversal (Rob: "I
 don't believe in checklists. I believe in processes that discover requirements
 like a tree traversal.").**
 
+**The walker landed 2026-08-21: `prismaquant/model_walk.py` +
+`ModelProfile.walk_claim_rules()` (see `docs/ARCHITECTURE.md` §8.8). Intake
+walks are usable now; wiring the walk as an export gate and migrating
+probe/cost/footprint/read-traffic onto its edge list is still open.**
+
 ## The failure class this exists to kill
 
 On DeepSeek-V4, `attn.wo_a` — 17.9% of all decode read traffic — was never an
