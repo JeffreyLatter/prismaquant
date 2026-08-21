@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.16.1 — 2026-08-21
 
 ### Changed
 
@@ -37,7 +37,18 @@
   `FULL_AND_PIECEWISE` with capture sizes up to 64 now starts (11 piecewise
   + 7 full graphs) and decodes 20.56–20.64 single-stream, so the default
   command no longer needs `--compilation-config` to come up. Batch-32 decode
-  throughput under graphs vs outside them is the separate B1d record.
+  (32 streams) is the one regime where the capture-safe layout costs
+  something: captured static-capacity TPOT 789 ms vs 608 ms with capture
+  sizes kept ≤ 16 (batch-32 steps eager, trimmed), because
+  `cb_fused_moe_grouped` runs its mainloop on pad tiles and at T=32/E=256
+  the static capacity is about twice the trimmed tile count. Only the 11
+  per-role FP8-CB layers ride that lane above 16 tokens; the pooled-book
+  reburn moves them to persistent-B, and a kernel early-exit for
+  `expert_id < 0` tiles is the general fix. Until then, multi-stream
+  deployments of the shipped body keep capture sizes ≤ 16 — the card
+  command already does. Negative control: the same default-mode command
+  on the 0.8.10 image dies at the first capture above 16 tokens
+  (`moe.py:207`), so the start is measured on this stack.
 
 ## 0.16.0 — 2026-08-21
 
