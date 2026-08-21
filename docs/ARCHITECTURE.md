@@ -1,7 +1,20 @@
 # PrismaQuant Architecture
 
 As of: 2026-08-21 · `main` — stamps follow, newest first, each recording
-its own branch and date. Re-stamped (2026-08-21,
+its own branch and date. Re-stamped (2026-08-21, `feat/discovery-walker`)
+for **the discovery walker** (§8.8, `prismaquant/model_walk.py`): every
+weight-bearing computation is discovered by traversal — module tree plus one
+matmul-intercepted forward traced under `FakeTensorMode` on a meta load —
+and every discovered node must carry a claim (`decide` / `pin(reason)` /
+`exclude(reason)`) from `ModelProfile.walk_claim_rules()`, or the walk fails
+with the parameter named and the op cited. This is the `wo_a` enablement
+generalized: the pipeline's decision universe stops being defined by the
+pipeline's own enumeration. Walking the real DSv4 modeling code immediately
+surfaced three further unclaimed matmul-fed families (router gates, mHC
+mixers, hyper head), now pinned with reasons in
+`DeepseekV4Profile.walk_claim_rules()`. API only — no consumer is wired yet;
+migration of probe/cost/footprint/read-traffic onto the walker's edge list
+is separate work. Re-stamped (2026-08-21,
 `feat/decode-read-bytes-stat`) for **per-token decode read bytes as a
 first-class exported stat** (§7, `read_gb_per_token`). An artifact has two
 rates, and we only ever reported one: bpp prices the disk, while decode
@@ -4435,7 +4448,9 @@ effect.
 hy_v3 route — `has_mtp → False` plus `passthrough_prefixes` and out-of-band CB encoding
 scripts); streaming overrides (`checkpoint_to_live_name` for flat naming, `init_rotaries` for
 multi-layer-type rope, `head_resident_extra_prefixes`); cross-layer forward state; vendored
-modeling. Then run the conformance validator (§8.6), which nothing else does.
+modeling. Then run the conformance validator (§8.6), which nothing else does, and the
+discovery walker (§8.8) on a meta load — an unclaimed matmul-fed parameter at intake is a
+`wo_a` waiting to ship.
 
 **Tier D — the gridbook CB lane (§9.2) adds per-arch work.** (6) `default_serving_profile:
 "nvfp4_cb"` in the spec **and** `TARGET_PROFILE=nvfp4_cb` (gated `run-pipeline.sh:124-125`),
@@ -4597,6 +4612,77 @@ Two properties keep it honest rather than merely convenient:
   entire difference between `NVFP4` (W4A4) and `NVFP4A16` — two registry entries
   with identical weight bits — which is what makes them a clean A-side isolation
   menu.
+
+### 8.8 The discovery walker: requirement discovery by traversal
+
+`prismaquant/model_walk.py` (2026-08-21, campaign R5; normative frame
+`docs/design/model_coverage_ledgers.md`) discovers every weight-bearing
+computation in a model by traversal instead of by the pipeline's own
+enumeration. The failure class it kills is structural: when the probe
+enumerates the units, then cost, allocation, bpp, and coverage are all computed
+over that same enumeration, an omission is invisible by construction. DSv4's
+`attn.wo_a` — a parameter consumed by a grouped bmm on a module class the probe
+skips, 17.9% of decode read traffic — shipped as passthrough by omission while
+every coverage statistic read complete.
+
+The walk has one root pair and one output (`WalkResult`, JSON-serializable):
+
+- **Root A — the module tree.** Every named parameter and buffer becomes a
+  `WalkNode` (`remove_duplicate=False`, so tied weights keep all names).
+- **Root B — one traced forward.** A `TorchFunctionMode` interceptor
+  (`WeightUseInterceptor`) records every matmul-family call (`F.linear`,
+  `matmul`, `bmm`, `mm`, `mv`, `addmm`/`addbmm`/`addmv`/`baddbmm`, `einsum`,
+  `tensordot`, `@`) with the parameters that feed it, resolved by **storage
+  identity** so a view or per-expert slice maps to its parent parameter. The
+  trace runs under `FakeTensorMode` on a meta-loaded model — intake costs no
+  GPU and no weight I/O — and the interceptor is host-mode agnostic:
+  `execution="real"` runs the same capture over a real CPU forward, the
+  fallback for forwards fake tensors cannot execute (measured: DSv4's
+  `int(position_ids[0, 0])` raises `DataDependentOutputException`; the ratchet
+  is `tests/test_model_walk.py::test_dsv4_fake_trace_block_is_still_real`).
+  `F.scaled_dot_product_attention` carries no weights and is excluded;
+  `F.embedding` produces no edge but its weight still requires a claim.
+
+Every discovered node must be **claimed** by exactly one disposition —
+`decide` (the allocator's domain), `pin(reason)` (held at source precision on
+purpose), or `exclude(reason)` (outside the artifact's scope). Claims come
+from ordered `ClaimRule` lists supplied by the profile:
+`ModelProfile.walk_claim_rules()` (`model_profiles/base.py`) derives the base
+set from the profile's own declarations — spec
+`probe_skip_module_class_names` → pin (this is the `wo_a` rule: the spec
+already said the probe skips `DeepseekV4GroupedLinear`, so the walker turns
+that declaration into a named debt), `pinned_names` → pin, MTP/visual
+prefixes and `nn.Embedding` weights and non-persistent buffers and
+non-floating or ≤1-D tensors → exclude with reasons, remaining `nn.Linear`
+weights → decide. **A matmul-fed node no rule matches fails the walk** with
+the node named and the op cited (einsum equations included). Reasons are
+first-class output for the shipcard, not log prose.
+
+Two implementation facts are load-bearing and measured (torch 2.11):
+`data_ptr()` is 0 for every meta storage, so identity keys on the
+`StorageImpl` address; and under fake mode a view of a non-fake parameter gets
+fresh fake storage, so the interceptor propagates identity through a fixed
+alias/cast allowlist at `__torch_function__` level (recorded per edge as
+`via`). Every tensor whose storage key enters the resolution maps is kept
+alive for the trace, so a freed address can never be reused and
+misattributed. An unresolved floating multiplicand — a weight the walk cannot
+name — is itself a failure, never a guess.
+
+First real yield: walking the actual DSv4 modeling code surfaced **three more
+unclaimed matmul-fed families beyond `wo_a`** — the MoE router gates
+(`DeepseekV4TopKRouter`/`DeepseekV4HashRouter.weight`), the mHC
+hyper-connection mixers (`attn_hc.fn`/`ffn_hc.fn`), and the hyper head
+(`hc_head.hc_fn`) — all bare Parameters fed to `F.linear` on classes outside
+the probe's enumeration. `DeepseekV4Profile.walk_claim_rules()` now pins each
+with its reason (plus the compressor/indexer Linears the serve contract keeps
+source-format).
+
+This build ships the API and the conformance surface only
+(`tests/test_model_walk.py`) — **no consumer is wired**. The intended end
+state per the design doc: the walker's edge list becomes the single
+enumeration the probe, cost, footprint, and read-traffic stages derive from,
+and the walk runs at new-architecture intake and again at export as a gate.
+Consumer migration is separate, deliberate work.
 
 ## 9. Serving lanes
 

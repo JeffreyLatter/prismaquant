@@ -1279,6 +1279,115 @@ class ModelProfile(ABC):
                 return False
         return True
 
+    def walk_claim_rules(self):
+        """Claim rules for the discovery walker (`prismaquant.model_walk`).
+
+        The walker discovers every named tensor and every matmul-fed
+        parameter by traversal; these rules assign each discovered node one
+        disposition — ``decide``, ``pin(reason)``, or ``exclude(reason)``.
+        A matmul-fed node no rule matches fails the walk with the node named
+        and the op cited, which is the mechanism that keeps the next
+        architecture's ``wo_a`` from shipping silently. Reasons are
+        first-class output: they land on the shipcard, so write them for the
+        reader of a model card, not for grep.
+
+        The base rules, in match order:
+
+        1. **pin** — weights of module classes the profile's spec declares in
+           ``probe_skip_module_class_names``. The probe cannot price them, so
+           they are held at source precision as a *named* debt (this is
+           exactly the ``wo_a`` case: matmul-fed, discovered, unpriced).
+        2. **pin** — ``pinned_names()`` (``lm_head`` and friends).
+        3. **exclude** — the MTP sidecar (``mtp_source_prefix()``), read only
+           under spec decode; dispositioned by the MTP lane.
+        4. **exclude** — the visual/audio tower (``visual_layer_prefix()``),
+           outside the text graph this artifact serves.
+        5. **exclude** — ``nn.Embedding`` weights: consumed by row gather,
+           not by a GEMM; the exporter ships source bytes.
+        6. **exclude** — non-persistent buffers (rotary caches, derived
+           tables): never serialized, so not artifact bytes.
+        7. **exclude** — non-floating tensors (position ids, masks, integer
+           lookup tables): not weights.
+        8. **exclude** — 0-D/1-D floating tensors (norm scales, biases,
+           rotary frequency tables): never a GEMM multiplicand; immutable
+           floor bytes.
+        9. **decide** — every remaining ``nn.Linear`` weight (subclasses
+           included, matched through the MRO): the allocator's domain.
+
+        Override to extend, not to weaken: profiles append architecture
+        rules (or prepend more specific ones) and return the base list for
+        everything the architecture does not special-case. A profile that
+        removes rule 8 turns every Linear into a walk failure, which is loud
+        by design.
+        """
+        from prismaquant.model_walk import ClaimRule
+
+        rules = []
+        spec = self.structure_spec()
+        skip_classes = ()
+        if spec is not None:
+            skip_classes = tuple(spec.probe_skip_module_class_names)
+        for class_name in skip_classes:
+            rules.append(ClaimRule(
+                "pin",
+                f"weight of {class_name}, which the probe skips "
+                "(probe_skip_module_class_names): matmul-fed but unpriced, "
+                "held at source precision as a named debt",
+                module_class=class_name,
+            ))
+        rules.append(ClaimRule(
+            "pin",
+            "profile-pinned (pinned_names): held at source precision by "
+            "this architecture's serving contract",
+            predicate=lambda node: self.is_pinned_name(node.name),
+        ))
+        mtp_prefix = self.mtp_source_prefix()
+        if mtp_prefix:
+            rules.append(ClaimRule(
+                "exclude",
+                "MTP sidecar: read only under spec decode; dispositioned by "
+                "the MTP lane, outside this artifact's quantizable body",
+                name_regex=rf"^{re.escape(mtp_prefix)}",
+            ))
+        visual_prefix = self.visual_layer_prefix()
+        if visual_prefix:
+            rules.append(ClaimRule(
+                "exclude",
+                "visual tower: outside the text graph this artifact serves",
+                name_regex=rf"^{re.escape(visual_prefix)}",
+            ))
+        rules.append(ClaimRule(
+            "exclude",
+            "input embedding: consumed by per-token row gather "
+            "(F.embedding), not by a GEMM; source bytes ship verbatim",
+            module_class="Embedding",
+        ))
+        rules.append(ClaimRule(
+            "exclude",
+            "non-persistent buffer (rotary cache, derived table): never "
+            "serialized, so it is not artifact bytes",
+            kind="buffer",
+            persistent=False,
+        ))
+        rules.append(ClaimRule(
+            "exclude",
+            "non-floating tensor (ids, masks, lookup tables): not a weight",
+            floating=False,
+        ))
+        rules.append(ClaimRule(
+            "exclude",
+            "0-D/1-D tensor (norm scale, bias, rotary table): never a GEMM "
+            "multiplicand; immutable floor bytes",
+            max_ndim=1,
+        ))
+        rules.append(ClaimRule(
+            "decide",
+            "nn.Linear weight in the quantizable graph: allocator decision",
+            module_class="Linear",
+            leaf="weight",
+        ))
+        return rules
+
     def register_vendored_modeling(self) -> None:
         """Called once when this profile is instantiated by
         `detect_profile()`. Profiles that vendor transformers modeling
