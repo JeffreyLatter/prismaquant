@@ -311,12 +311,23 @@ _PUBLISHED_FILES = frozenset({
 #     tests/test_shard_layout.py (12) and tests/test_cb_lane_sharding.py (21),
 #     which include a cross-exporter test showing the two exporters agree on
 #     the payload identity while their shard COUNTS differ.
+# RE-FROZEN 2026-08-21 (second this date: the read-bytes ledger + discovery
+# walker merges), reviewed against THIS handoff rather than re-hashed:
+#   cb_export_config.py -- extracts the codebook sidecar name literal into
+#     `CODEBOOK_TENSOR_PREFIX` and uses it in the same f-string (5b03e3e), so
+#     a consumer (the read-traffic ledger) reads the producer's own spelling.
+#     Serialized names are byte-identical; plus one `__all__` entry.
+#   model_profiles/base.py + model_profiles/deepseek_v4.py -- the discovery
+#     walker's claim rules (f5ce761): `walk_claim_rules()` on the profile and
+#     five prepended DSv4 pins (routers, mHC mixers, hyper head,
+#     compressor/indexer). Pure additions consumed only by `model_walk`; no
+#     existing export or naming path is touched.
 _FROZEN_EXPORT_SOURCE_SHA256 = {
     "prismaquant/export_nvfp4_cb_streaming.py": (
         "f39ffec9ea48ae1a6d06c0d0fc076dfc8317e01e355b3db7f188b31258710ccd"
     ),
     "prismaquant/cb_export_config.py": (
-        "a690dafe120c4a6fc077d34aad1b142ee4201ec4dedda9ccd35a7583dfb22770"
+        "2bca669278cc1f3195c27747c05facea497e7b6ff2912bad7f917a184d1d6f94"
     ),
     "prismaquant/nvfp4_cb_formats.py": (
         "1f29d3c08af0272f8a709a1b820da9caeafa4e27865fa552e1d99432d4cb74f9"
@@ -328,13 +339,13 @@ _FROZEN_EXPORT_SOURCE_SHA256 = {
         "fb20303ed1b017a5a7f3a035d5ef43880822d775e252c28a08f32a67f8104c95"
     ),
     "prismaquant/model_profiles/base.py": (
-        "2ed0bd76c6adf4bee550d55a56a59c148ee8bf50f3616631228cd7028d9b1fbb"
+        "69fcddeb8c5de48756bc47b053782f2ddd9e2773c68176248f679e8f5fbd0e5c"
     ),
     "prismaquant/model_profiles/registry.py": (
         "2fb8bcc01fbfd3b89870d387d335f804b05378f9853f223469c619e7ab766b90"
     ),
     "prismaquant/model_profiles/deepseek_v4.py": (
-        "b288c184c938b09498591430725c6cc52b35926efee51441c8df9b9a1c989c65"
+        "6368f5657fbfb3b77a886e9bc0c589885d9240c49fdb77635d4bf2a74164b6f6"
     ),
     "prismaquant/model_profiles/specs/deepseek_v4.json": (
         "b8f3b22c16484a6859494d96ff052e5c5229c9a7c3afb7ae829e9cf5e26ecbf4"
