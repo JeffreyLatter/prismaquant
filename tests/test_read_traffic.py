@@ -63,17 +63,25 @@ PACKED_EXPERTS = "model.layers.0.mlp.experts.gate_up_proj"
 Q_PROJ = "model.layers.0.self_attn.q_proj"
 
 
-def _write_safetensors(path: Path, tensors: dict[str, tuple[int, ...]]) -> None:
-    """Write a valid BF16 safetensors shard; only the header is ever read."""
+_ITEMSIZE = {"BF16": 2, "F32": 4, "F8_E4M3": 1, "U8": 1, "I8": 1, "I64": 8}
+
+
+def _write_safetensors(
+    path: Path,
+    tensors: dict[str, tuple[int, ...]],
+    dtypes: dict[str, str] | None = None,
+) -> None:
+    """Write a valid safetensors shard; only the header is ever read."""
     header: dict[str, object] = {}
     offset = 0
     for name, shape in tensors.items():
         n = 1
         for dim in shape:
             n *= dim
-        nbytes = n * 2
+        dtype = (dtypes or {}).get(name, "BF16")
+        nbytes = n * _ITEMSIZE[dtype]
         header[name] = {
-            "dtype": "BF16",
+            "dtype": dtype,
             "shape": list(shape),
             "data_offsets": [offset, offset + nbytes],
         }
@@ -398,6 +406,88 @@ def test_cb_codebook_sidecar_is_resident_not_traffic(model_dir: Path, profile):
     (model_dir / "cb_codebooks.pqcb").unlink()
     with pytest.raises(rt.ReadTrafficError, match="codebook_file"):
         rt.exported_checkpoint_read_traffic(str(model_dir), profile=profile)
+
+
+# ---------------------------------------------------------------------------
+# Indexed lookups: three facts, because each weaker rule was falsified on a
+# real artifact (see the module docstring).
+# ---------------------------------------------------------------------------
+
+def test_indexed_lookup_needs_all_three_facts(tmp_path: Path):
+    """Integer dtype alone is a weight payload on both quantized lanes.
+
+    The foils are the two real misclassifications this rule was hardened
+    against: a scale-bearing packed weight, and a CB payload whose scales live
+    in the codebook sidecar so only the artifact's declared ``targets`` names
+    it.  Both are vocabulary-keyed integers, and both are read in full.
+    """
+    root = tmp_path / "lookups"
+    root.mkdir()
+    tensors = dict(_TENSORS)
+    dtypes: dict[str, str] = {}
+
+    # (1) the real lookup: integer, vocab-keyed, no scale, no target.
+    tensors["model.layers.0.mlp.gate.tid2eid"] = (VOCAB, 2)      # 16*2*8 = 256
+    dtypes["model.layers.0.mlp.gate.tid2eid"] = "I64"
+    # (2) foil: a packed weight with a float scale sidecar.
+    tensors["model.scaled_proj.weight_packed"] = (VOCAB, 4)      # 16*4*1 =  64
+    dtypes["model.scaled_proj.weight_packed"] = "U8"
+    tensors["model.scaled_proj.weight_scale"] = (VOCAB,)         # 16*4    =  64
+    dtypes["model.scaled_proj.weight_scale"] = "F32"
+    # (3) foil: a CB payload -- no scale in the shard set, declared instead.
+    tensors["model.declared_proj.cb_qweight"] = (VOCAB, 4)       #          64
+    dtypes["model.declared_proj.cb_qweight"] = "U8"
+    # (4) an integer buffer keyed by something else: over-counted on purpose.
+    tensors["model.layers.0.tiny_index"] = (4, 2)                #           8
+    dtypes["model.layers.0.tiny_index"] = "I8"
+
+    _write_safetensors(root / "model.safetensors", tensors, dtypes)
+    (root / "config.json").write_text(json.dumps({
+        "model_type": "qwen3_moe",
+        "architectures": ["Qwen3MoeForCausalLM"],
+        "hidden_size": HIDDEN,
+        "num_hidden_layers": 1,
+        "num_experts": N_EXPERTS,
+        "num_experts_per_tok": TOPK,
+        "vocab_size": VOCAB,
+    }))
+    (root / "quant_config.json").write_text(json.dumps({
+        "config_groups": {
+            "group_0": {"targets": ["model.declared_proj"]},
+        },
+    }))
+    profile = detect_profile_with_warning(str(root), entrypoint="test")
+    report = rt.exported_checkpoint_read_traffic(str(root), profile=profile)
+
+    lookups = report["indexed_lookups"]
+    assert lookups["vocab_size"] == VOCAB
+    assert report["classes"]["excluded_indexed_lookup"]["n_tensors"] == 1
+    assert report["excluded"]["indexed_lookup_bytes"] == 256
+    # The three foils stay operands: 64 + 64 (its F32 scale is not integer)
+    # + 64 + 8 -> only the integer ones are tallied.
+    assert lookups["integer_bytes_read_in_full"] == 64 + 64 + 8
+    # ... and they are streamed, not excluded.
+    assert report["classes"]["held_fixed"]["stored_bytes"] == 464 + 64 + 64 + 64 + 8
+
+    # The rule itself, stated directly.
+    stems = rt.scaled_module_stems(rt._header_meta(str(root)))
+    targets = rt.quantization_targets(str(root))
+    def lookup(name, dtype, shape):
+        return rt.is_indexed_lookup(
+            dtype, shape, VOCAB, name=name, scaled_stems=stems,
+            quant_targets=targets)
+    assert lookup("model.layers.0.mlp.gate.tid2eid", "I64", (VOCAB, 2))
+    assert not lookup("model.scaled_proj.weight_packed", "U8", (VOCAB, 4))
+    assert not lookup("model.declared_proj.cb_qweight", "U8", (VOCAB, 4))
+    assert not lookup("model.layers.0.tiny_index", "I8", (4, 2))
+    # A float tensor is an operand whatever its shape (a BF16 lm_head is
+    # vocabulary-keyed and streamed in full).
+    assert not lookup("lm_head.weight", "BF16", (VOCAB, HIDDEN))
+    # Facts that cannot be established never exclude: no vocab declaration,
+    # or no way to check fact 3, means p=1 -- an over-count, never the reverse.
+    assert not rt.is_indexed_lookup(
+        "I64", (VOCAB, 2), None, name="x.tid2eid", scaled_stems=stems)
+    assert not rt.is_indexed_lookup("I64", (VOCAB, 2), VOCAB, name="x.tid2eid")
 
 
 def test_untied_declaration_without_an_lm_head_refuses(tmp_path: Path):

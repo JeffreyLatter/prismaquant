@@ -3239,7 +3239,7 @@ artifact costs on disk; it does **not** measure what decode costs, because decod
 throughput is governed by the bytes streamed per generated token and a sparse MoE reads
 only `topk/E` of its expert mass on any one token. Measured on the shipped DSv4-Flash
 87 GB artifact: the dense path is **8.3% of the checkpoint but 76.8% of decode read
-traffic** (8.058 GB/token at batch 1); re-measured on Ornith-1.5-35B-A3B's 24.62 GB
+traffic** (8.0576 GB/token at batch 1); re-measured on Ornith-1.5-35B-A3B's 24.62 GB
 export it is **10.4% of the checkpoint and 81.5% of the read** (3.127 GB/token). The
 allocator's byte budget is blind to that ~40x divergence in dense-vs-expert marginal
 pricing, so it systematically overspends decode bandwidth on the dense path. Per
@@ -3259,12 +3259,12 @@ declarations and **cross-checked against the tensors' measured stack depth**; an
 model that declares neither is refused rather than defaulted (principle 2 — the
 `moe_imatrix` "assume 8" fallback would mis-price the largest term in the ledger).
 
-Three classes are **excluded but itemized**, never silently dropped: an **untied** input
-embedding (one row is gathered per token, not the table), the MTP/draft sidecar (read
-every token under spec-decode and never without it — the honest default is excluded, and
-`excluded.mtp_bytes` lets a spec-decode serve add it back exactly), and anything the
-model profile's own `checkpoint_to_live_name` declines to map into the live text graph
-(vision/audio towers). `ModelProfile.embedding_name()` (`model_profiles/base.py`, spec key
+Four classes are **excluded but itemized**, never silently dropped: an **untied** input
+embedding (one row is gathered per token, not the table), **indexed lookup tables** (below),
+the MTP/draft sidecar (read every token under spec-decode and never without it — the honest
+default is excluded, and `excluded.mtp_bytes` lets a spec-decode serve add it back exactly),
+and anything the model profile's own `checkpoint_to_live_name` declines to map into the live
+text graph (vision/audio towers). `ModelProfile.embedding_name()` (`model_profiles/base.py`, spec key
 `shard_regexes.embedding_name`) is the twin of `lm_head_name()` and exists so "which
 tensor is the embedding" is a declaration rather than a substring test.
 
@@ -3283,6 +3283,24 @@ resolution is reported per artifact under `embedding` (`streamed_per_token`, `re
 `lm_head_tensor_present`, `config_tie_word_embeddings`, `reason`). It reads both namespaces
 because the two declarations live in different ones: `lm_head_name()` is the checkpoint
 spelling (DSv4 says `head`), `embedding_name()` the live one.
+
+**An indexed lookup takes three facts, because each weaker rule was falsified on a real
+artifact.** DSv4 ships `ffn.gate.tid2eid` — I64 `[129280, 6]`, token id to its six expert
+ids — 18.6 MB read one row at a time, not streamed. But integer dtype alone does not mean
+lookup: the packed weight payload of **both** quantized lanes is `U8` (81.65 GB of
+`cb_qweight` on the DSv4 body, 15.7 GB of NVFP4 `weight_packed` on Ornith), so a dtype-only
+rule excludes 94% of that artifact. Adding "leading axis is the vocabulary" is still not
+enough — a **quantized `lm_head`** is both, and on the `embed-smoke` CB-head export that
+two-fact rule dropped 857,736 B of real logits traffic, an *under*-count. So
+`read_traffic.is_indexed_lookup` requires all three: integer dtype **and**
+`shape[0] == vocab_size` **and** the module is not declared a quantized weight — neither by
+a float scale sidecar (suffixes from `footprint._SIDECAR_SUFFIXES`) nor by the artifact's own
+`config_groups[*].targets` (`quantization_targets()`; the CB lane needs this half, since a
+CB payload keeps its scales in the codebook sidecar and has no scale tensor in the shard set).
+The residual is one-directional by construction: anything the three facts cannot establish
+stays at `p=1` and **over**-counts. Every report carries an `indexed_lookups` block naming
+the rule, the vocab size, and how many integer bytes were read in full, so the over-count is
+visible rather than silent.
 
 CB codebook tables are reported as `resident_bytes`, not stream traffic — and the CB lane
 ships them in a globbed sidecar *outside* the shard set, invisible to the safetensors
@@ -3314,10 +3332,11 @@ four-key `breakdown` (`dense` / `routed` / `held_fixed` / `resident_codebooks`),
 itemized `excluded` bytes, and the `routing` factor with the config keys it came from.
 Tests: `tests/test_read_traffic.py` (exact hand-computed ledger on a synthetic 4-expert
 model, the `p = topk/E` and `p = 1` property, the classification table, tied/untied
-embedding disposition, the CB codebook sidecar, and every refusal). Measured against real
-artifacts on both lanes: the shipped DSv4-Flash CB 87.08 GB body reconciles exactly and
-reproduces the campaign's independently measured **8.058 GB/token** at **8.076**, with
-`resident_codebooks` 687 KB and `excluded_non_text_graph` 0; Ornith-1.5-35B-A3B's
+embedding disposition, the three-fact lookup rule with both foils, the CB codebook sidecar,
+and every refusal). Measured against real artifacts on both lanes: the shipped DSv4-Flash CB
+87.08 GB body reconciles exactly and lands at **8.0576 GB/token**, matching the campaign's
+independently measured 8.0576 to seven significant figures, with `excluded_indexed_lookup`
+18.6 MB, `resident_codebooks` 687 KB and `excluded_non_text_graph` 0; Ornith-1.5-35B-A3B's
 compressed-tensors export reconciles at 24,623,875,824 B for 3.127 GB/token. The
 post-export form cannot split `dense` from `held_fixed` — a shipped checkpoint carries no
 allocator/floor distinction on disk, so `breakdown.dense` is `0` there by construction and

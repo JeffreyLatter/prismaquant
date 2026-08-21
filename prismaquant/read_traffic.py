@@ -10,7 +10,7 @@ token while a routed expert stack is read only when the router selects it.
 
 Measured 2026-08-21 on the shipped DSv4-Flash 87 GB artifact: the dense path
 is **8.3% of the checkpoint but 76.8% of decode read traffic**, and the whole
-artifact costs **8.058 GB read per token** at batch 1.  A byte budget cannot
+artifact costs **8.0576 GB read per token** at batch 1.  A byte budget cannot
 see that, so it systematically overspends decode bandwidth on the dense path.
 This module is the *measurement* half of closing that gap (principle 1: it is
 a measurement gap, not an optimizer gap).  It deliberately changes no
@@ -44,6 +44,11 @@ class                        read probability       what lands here
                                                     is the output projection
                                                     and lands in ``held_fixed``
                                                     — see below
+``excluded_indexed_lookup``  ``0.0`` (excluded)     integer tables addressed by
+                                                    token id (DSv4's
+                                                    ``ffn.gate.tid2eid``): one
+                                                    row per token, like the
+                                                    embedding
 ``excluded_mtp``             ``0.0`` (excluded)     MTP / draft sidecar — read
                                                     only when spec-decode is
                                                     on; see the honest-default
@@ -79,6 +84,40 @@ rather than picking one of the two stories.  Excluding a tied table would drop
 one of the largest always-active tensors in the model (Qwen3-0.6B ties; so
 does LFM2.5).
 
+Indexed lookup tables take **three** facts, not one
+---------------------------------------------------
+An integer tensor is not automatically an index table, and each weaker rule was
+falsified on a real artifact before this one was settled:
+
+* *dtype only* — the packed weight payload of both quantized lanes is an
+  integer dtype and is streamed in full (``U8`` is 81.65 GB of ``cb_qweight``
+  on the shipped DSv4 CB body and 15.7 GB of NVFP4 ``weight_packed`` on
+  Ornith-1.5-35B).  Classifying by dtype alone excludes 94% of that artifact.
+* *dtype + vocabulary-keyed leading axis* — a **quantized ``lm_head``** is
+  both, and it is streamed in full.  On the `embed-smoke` CB-head export that
+  rule dropped 857,736 B of real logits traffic: an **under**-count, the
+  dangerous direction.
+
+So ``excluded_indexed_lookup`` requires all three: *integer dtype* (it cannot
+be a float matmul operand on its own) **AND** ``shape[0] == vocab_size`` (a
+decode step addresses one row by token id) **AND** *the module is not declared
+a quantized weight* — neither by a float scale sidecar (nothing turns those
+integers into numbers) nor by the artifact's own
+``config_groups[*].targets``.  Both halves of the third fact are needed: a CB
+payload keeps its scales in the codebook sidecar, so ``lm_head.cb_qweight`` has
+no scale tensor in the shard set at all, and only the declared ``targets:
+["lm_head"]`` covers it.  Everything is read from the safetensors headers and
+the artifact's own config; the scale suffixes come from
+``footprint._SIDECAR_SUFFIXES``, the constant the byte partition already folds
+on.  DSv4's ``ffn.gate.tid2eid`` — I64 ``[129280, 6]``, token id to its six
+expert ids, no scale on ``ffn.gate`` and no target naming it — is the case that
+survives all three.
+
+The residual direction is deliberate: anything the three facts cannot establish
+stays in ``held_fixed`` at ``p=1``, which **over**-counts read traffic.  For a
+bandwidth figure that is the safe direction, and it is the opposite of the
+failure this module exists to prevent.
+
 Honest defaults for the genuinely ambiguous classes
 ---------------------------------------------------
 The MTP sidecar is read every token when the artifact is served with
@@ -100,6 +139,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -129,6 +169,7 @@ READ_CLASS_TABLE: dict[str, float | None] = {
     "dense": 1.0,
     "held_fixed": 1.0,
     "excluded_embedding": 0.0,
+    "excluded_indexed_lookup": 0.0,
     "excluded_mtp": 0.0,
     "excluded_non_text_graph": 0.0,
     "resident_codebooks": None,  # resident, never streamed per token
@@ -138,7 +179,17 @@ READ_CLASS_TABLE: dict[str, float | None] = {
 STREAMED_CLASSES = ("dense", "routed_experts", "held_fixed")
 #: Classes reported under ``excluded`` — real bytes, zero per-token traffic.
 EXCLUDED_CLASSES = (
-    "excluded_embedding", "excluded_mtp", "excluded_non_text_graph")
+    "excluded_embedding", "excluded_indexed_lookup", "excluded_mtp",
+    "excluded_non_text_graph")
+
+#: safetensors dtype names that cannot be a float matmul operand *on their
+#: own*.  Necessary but NOT sufficient for the lookup class -- both quantized
+#: lanes store the packed weight payload as ``U8``, and it is read in full.
+INTEGER_SAFETENSORS_DTYPES = frozenset({
+    "BOOL", "U8", "I8", "U16", "I16", "U32", "I32", "U64", "I64"})
+
+#: HF config keys that declare the vocabulary size, most specific first.
+_VOCAB_SIZE_KEYS = ("vocab_size", "padded_vocab_size", "n_vocab")
 
 #: HF config keys that declare the routed-expert count, most specific first.
 _EXPERT_COUNT_KEYS = (
@@ -326,6 +377,155 @@ def _mtp_prefixes(profile) -> tuple[str, ...]:
     return tuple(dict.fromkeys(out))
 
 
+def resolve_vocab_size(config: Mapping[str, Any] | None) -> int | None:
+    """The declared vocabulary size, or ``None`` if the config states none."""
+    found = _first_positive_int(_config_scopes(config or {}), _VOCAB_SIZE_KEYS)
+    return None if found is None else found[0]
+
+
+def _module_stem(name: str) -> str:
+    """The module a tensor hangs off: its name minus the final leaf."""
+    base = _strip_weight(str(name))
+    for suffix in fp._SIDECAR_SUFFIXES:
+        if base.endswith(suffix):
+            base = base[: -len(suffix)]
+            return base
+    head, _, _leaf = base.rpartition(".")
+    return head or base
+
+
+def scaled_module_stems(
+    header_meta: Mapping[str, tuple[str, tuple[int, ...]]],
+) -> frozenset[str]:
+    """Module stems that ship a float **scale** sidecar in this checkpoint.
+
+    A scale is what turns packed integers into numbers, so a stem carrying one
+    holds a quantized *operand*, not an index table.  The suffixes come from
+    ``footprint._SIDECAR_SUFFIXES`` -- the same producer-side constant the byte
+    partition already folds on -- rather than from a name guess invented here.
+    """
+    out: set[str] = set()
+    for name, (dtype, _shape) in header_meta.items():
+        if str(dtype).upper() in INTEGER_SAFETENSORS_DTYPES:
+            continue  # a scale is float; an integer sidecar is not one
+        if any(str(name).endswith(s) for s in fp._SIDECAR_SUFFIXES):
+            out.add(_module_stem(name))
+    return frozenset(out)
+
+
+def quantization_targets(model_path: str) -> tuple[str, ...]:
+    """The module patterns this artifact declares as quantized, if any.
+
+    ``config_groups[*].targets`` in ``quant_config.json`` (CB lane) or in
+    ``config.json``'s ``quantization_config`` (compressed-tensors) is the
+    artifact's own statement of which modules hold packed weights.  It is
+    needed because the scale-sidecar test cannot see the CB lane: a CB payload
+    keeps its scales in the codebook sidecar, so ``lm_head.cb_qweight`` has no
+    scale tensor in the shard set at all -- but the artifact does declare
+    ``targets: ["lm_head"]``.
+    """
+    payloads: list[Mapping[str, Any]] = []
+    for filename, key in (("quant_config.json", None),
+                          ("config.json", "quantization_config")):
+        path = Path(model_path) / filename
+        if not path.is_file():
+            continue
+        try:
+            loaded = json.loads(path.read_text())
+        except Exception:
+            continue
+        section = loaded if key is None else loaded.get(key)
+        if isinstance(section, Mapping):
+            payloads.append(section)
+    out: list[str] = []
+    for section in payloads:
+        groups = section.get("config_groups")
+        if not isinstance(groups, Mapping):
+            continue
+        for group in groups.values():
+            if not isinstance(group, Mapping):
+                continue
+            for target in group.get("targets") or ():
+                out.append(str(target))
+    return tuple(dict.fromkeys(out))
+
+
+def _matches_quant_target(stem: str, targets: Iterable[str]) -> bool:
+    """compressed-tensors target semantics: a literal name or an ``re:``."""
+    for target in targets:
+        if target.startswith("re:"):
+            try:
+                if re.fullmatch(target[3:], stem):
+                    return True
+            except re.error:
+                continue
+        elif target == stem or stem.endswith("." + target):
+            return True
+    return False
+
+
+def is_indexed_lookup(
+    dtype: str | None,
+    shape: tuple[int, ...] | None,
+    vocab_size: int | None,
+    *,
+    name: str | None = None,
+    scaled_stems: frozenset[str] | None = None,
+    quant_targets: tuple[str, ...] = (),
+) -> bool:
+    """Is this tensor a per-token *indexed lookup* rather than an operand?
+
+    Three facts, all read off the safetensors headers and the model config,
+    and **all required**:
+
+    1. the dtype is an integer type, so the tensor cannot be a float matmul
+       operand *on its own*;
+    2. its leading axis is the vocabulary, so a decode step addresses one row
+       of it by token id -- exactly the reason the embedding is excluded; and
+    3. its module is **not declared a quantized weight** -- neither by a float
+       scale sidecar (nothing turns those integers into numbers) nor by the
+       artifact's own ``config_groups[*].targets``.
+
+    Each of the first two was measured to be insufficient alone, on real
+    artifacts:
+
+    * dtype only -- the packed weight payload of both quantized lanes is
+      ``U8`` (81.65 GB of ``cb_qweight`` on the shipped DSv4 CB body, 15.7 GB
+      of NVFP4 ``weight_packed`` on Ornith-1.5-35B), streamed in full.  A
+      dtype-only rule excludes 94% of that artifact.
+    * dtype + vocabulary axis -- a **quantized ``lm_head``** is integer-dtyped
+      *and* vocabulary-keyed, and it is streamed in full.  On the
+      `embed-smoke` CB-head export that two-fact rule dropped 857,736 B of
+      real logits traffic, an **under**-count: the dangerous direction.
+    * the scale-sidecar half of fact 3 alone -- a CB payload keeps its scales
+      in the codebook sidecar, so ``lm_head.cb_qweight`` has no scale tensor
+      in the shard set; the artifact's declared ``targets`` is what covers it.
+
+    What survives all three is DSv4's ``ffn.gate.tid2eid`` -- I64
+    ``[129280, 6]``, token id -> its six expert ids, no scale anywhere on
+    ``ffn.gate`` and no quantization target naming it -- which is the case the
+    rule was derived from.
+
+    The residual is deliberate and one-directional: an integer table keyed by
+    anything other than the vocabulary, or one that happens to sit under a
+    quantized module, stays in ``held_fixed`` at ``p=1`` and **over**-counts.
+    """
+    if not dtype or str(dtype).upper() not in INTEGER_SAFETENSORS_DTYPES:
+        return False
+    if not shape or vocab_size is None:
+        return False
+    if int(shape[0]) != int(vocab_size):
+        return False
+    if scaled_stems is None or name is None:
+        # Fact 3 cannot be established, so the tensor is not classified as a
+        # lookup: it stays at p=1 and over-counts, never the reverse.
+        return False
+    stem = _module_stem(name)
+    if stem in scaled_stems:
+        return False
+    return not _matches_quant_target(stem, quant_targets)
+
+
 _TIE_KEYS = ("tie_word_embeddings", "tie_embeddings", "tie_embedding")
 
 
@@ -460,6 +660,11 @@ def classify_read_class(
     checkpoint_key: str | None = None,
     in_assignment: bool = False,
     embedding_streamed: bool | None = None,
+    dtype: str | None = None,
+    shape: tuple[int, ...] | None = None,
+    vocab_size: int | None = None,
+    scaled_stems: frozenset[str] | None = None,
+    quant_targets: tuple[str, ...] = (),
     context: str = "read_traffic",
 ) -> str:
     """The read class of one tensor.  See :data:`READ_CLASS_TABLE`.
@@ -493,6 +698,18 @@ def classify_read_class(
     mtp_prefixes = _mtp_prefixes(profile)
     if any(base.startswith(p) for base in bases for p in mtp_prefixes):
         return "excluded_mtp"
+
+    # Only the floor half passes a dtype: a unit the allocator assigned is a
+    # matmul operand by construction, and its stored bytes are a rendered
+    # weight format rather than the source dtype.  (An NVFP4-quantized SOURCE
+    # would present `lm_head.weight_packed` as U8 with a vocabulary-length
+    # leading axis, and it is a weight, not a lookup.)
+    if not in_assignment and is_indexed_lookup(
+        dtype, shape, vocab_size,
+        name=checkpoint_key or name, scaled_stems=scaled_stems,
+        quant_targets=quant_targets,
+    ):
+        return "excluded_indexed_lookup"
 
     if any(_has_experts_segment(base) for base in bases):
         # The `experts` path SEGMENT is the structural fact, and it is the
@@ -547,6 +764,73 @@ def classify_read_class(
 # Ledger
 # ---------------------------------------------------------------------------
 
+def _header_meta(model_path: str) -> dict[str, tuple[str, tuple[int, ...]]]:
+    """``{checkpoint key: (dtype, shape)}`` from the shards' own headers."""
+    out: dict[str, tuple[str, tuple[int, ...]]] = {}
+    for shard in sorted(Path(model_path).glob("*.safetensors")):
+        for name, meta in fp._read_safetensors_header(str(shard)).items():
+            if name == "__metadata__":
+                continue
+            out[name] = (
+                str(meta.get("dtype") or ""),
+                tuple(int(d) for d in (meta.get("shape") or ())),
+            )
+    return out
+
+
+class _IntegerTensorTally:
+    """How the integer-dtype tensors in a checkpoint were resolved.
+
+    Published with the figure because the rule's residual is an over-count:
+    an integer tensor that is *not* vocabulary-keyed is read at ``p=1``, and
+    a reviewer must be able to see how many bytes that is (on a quantized
+    artifact it is the whole packed weight payload, by design).
+    """
+
+    def __init__(self, vocab_size: int | None) -> None:
+        self.vocab_size = vocab_size
+        self.excluded_bytes = 0
+        self.excluded_tensors = 0
+        self.read_in_full_bytes = 0
+        self.read_in_full_tensors = 0
+
+    def note(self, dtype: str | None, shape, nbytes: int, klass: str) -> None:
+        if not dtype or str(dtype).upper() not in INTEGER_SAFETENSORS_DTYPES:
+            return
+        if klass == "excluded_indexed_lookup":
+            self.excluded_bytes += int(nbytes)
+            self.excluded_tensors += 1
+        elif klass in STREAMED_CLASSES:
+            self.read_in_full_bytes += int(nbytes)
+            self.read_in_full_tensors += 1
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "rule": (
+                "integer dtype AND shape[0] == vocab_size AND the module is "
+                "not declared a quantized weight (no float scale sidecar and "
+                "no config_groups[*].targets match)"
+            ),
+            "vocab_size": self.vocab_size,
+            "excluded_bytes": self.excluded_bytes,
+            "excluded_tensors": self.excluded_tensors,
+            "integer_bytes_read_in_full": self.read_in_full_bytes,
+            "integer_tensors_read_in_full": self.read_in_full_tensors,
+            "note": (
+                "integer dtype alone does not mean lookup -- the packed "
+                "weight payload of both quantized lanes is U8 and is streamed "
+                "in full, and a quantized lm_head is vocabulary-keyed too, so "
+                "what separates an index from a number is that no module "
+                "declares the tensor a quantized weight -- neither a float "
+                "scale sidecar next to it nor a config_groups[*].targets entry "
+                "naming it (a CB lm_head ships no scale sidecar at all, so "
+                "both halves of that fact are load-bearing); anything the "
+                "three facts cannot establish stays at p=1, which over-counts "
+                "rather than under-counts"
+            ),
+        }
+
+
 def _new_class_totals() -> dict[str, dict[str, Any]]:
     return {
         name: {"stored_bytes": 0, "read_bytes": 0.0, "n_tensors": 0}
@@ -560,6 +844,7 @@ def _finalize(
     *,
     reconciliation: Mapping[str, Any],
     embedding: EmbeddingDisposition,
+    integer_tally: _IntegerTensorTally,
     unpriced_assignment_names: tuple[str, ...] = (),
     measured_from: str,
 ) -> dict:
@@ -582,16 +867,20 @@ def _finalize(
         "excluded": {
             "embedding_bytes": int(
                 class_totals["excluded_embedding"]["stored_bytes"]),
+            "indexed_lookup_bytes": int(
+                class_totals["excluded_indexed_lookup"]["stored_bytes"]),
             "mtp_bytes": int(class_totals["excluded_mtp"]["stored_bytes"]),
             "non_text_graph_bytes": int(
                 class_totals["excluded_non_text_graph"]["stored_bytes"]),
             "note": (
-                "real bytes with zero batch-1 text-decode traffic; the MTP "
-                "sidecar becomes per-token traffic under spec-decode and can "
-                "be added back from this figure exactly"
+                "real bytes with zero batch-1 text-decode traffic; indexed "
+                "lookups are addressed one row at a time, and the MTP sidecar "
+                "becomes per-token traffic under spec-decode and can be added "
+                "back from this figure exactly"
             ),
         },
         "embedding": embedding.as_dict(),
+        "indexed_lookups": integer_tally.as_dict(),
         "routing": (
             {
                 "num_experts_per_tok": routing.num_experts_per_tok,
@@ -734,6 +1023,11 @@ def assignment_read_traffic(
         live_names.append(_live(key))  # and the live one (`lm_head`)
     embedding = resolve_embedding_disposition(
         live_names, profile=profile, config=config, context=context)
+    vocab_size = resolve_vocab_size(config)
+    header_meta = _header_meta(model_path)
+    scaled_stems = scaled_module_stems(header_meta)
+    quant_targets = quantization_targets(model_path)
+    integer_tally = _IntegerTensorTally(vocab_size)
 
     class_totals = _new_class_totals()
     observed_expert_counts: dict[str, int] = {}
@@ -822,11 +1116,15 @@ def assignment_read_traffic(
     for ckpt_key, nbytes in sorted(span_bytes.items()):
         if fp.source_span_identity(ckpt_key) in covered_spans:
             continue
+        dtype, shape = header_meta.get(ckpt_key, (None, None))
         klass = classify_read_class(
             _live(ckpt_key), profile=profile, checkpoint_key=ckpt_key,
             in_assignment=False, embedding_streamed=embedding.streamed,
+            dtype=dtype, shape=shape, vocab_size=vocab_size,
+            scaled_stems=scaled_stems, quant_targets=quant_targets,
             context=context)
         saw_routed |= klass == "routed_experts"
+        integer_tally.note(dtype, shape, nbytes, klass)
         _charge(int(nbytes), klass)
 
     # --- reconcile before weighting -----------------------------------------
@@ -862,6 +1160,7 @@ def assignment_read_traffic(
             "n_priced_units": len(priced_names),
         },
         embedding=embedding,
+        integer_tally=integer_tally,
         unpriced_assignment_names=unpriced,
         measured_from="allocator assignment + source checkpoint spans",
     )
@@ -976,14 +1275,24 @@ def exported_checkpoint_read_traffic(
         profile=profile, config=config, context=context,
     )
 
+    vocab_size = resolve_vocab_size(config)
+    header_meta = _header_meta(export_dir)
+    scaled_stems = scaled_module_stems(header_meta)
+    quant_targets = quantization_targets(export_dir)
+    integer_tally = _IntegerTensorTally(vocab_size)
+
     class_totals = _new_class_totals()
     observed_expert_counts: dict[str, int] = {}
     saw_routed = False
     for key, nbytes in sorted(spans.items()):
+        dtype, shape = header_meta.get(key, (None, None))
         klass = classify_read_class(
             _live(key), profile=profile, checkpoint_key=key,
             in_assignment=False, embedding_streamed=embedding.streamed,
+            dtype=dtype, shape=shape, vocab_size=vocab_size,
+            scaled_stems=scaled_stems, quant_targets=quant_targets,
             context=context)
+        integer_tally.note(dtype, shape, nbytes, klass)
         # An exported artifact has no allocator/floor distinction on disk, so
         # every always-active tensor lands in `held_fixed`; the recipe-side
         # dense/held_fixed split is only available pre-export.
@@ -991,14 +1300,9 @@ def exported_checkpoint_read_traffic(
         class_totals[klass]["stored_bytes"] += int(nbytes)
         class_totals[klass]["n_tensors"] += 1
 
-    for shard in sorted(Path(export_dir).glob("*.safetensors")):
-        header = fp._read_safetensors_header(str(shard))
-        for name, meta in header.items():
-            if name == "__metadata__":
-                continue
-            shape = tuple(int(d) for d in (meta.get("shape") or ()))
-            if len(shape) == 3 and _has_experts_segment(_strip_weight(name)):
-                observed_expert_counts[name] = shape[0]
+    for name, (_dtype, shape) in header_meta.items():
+        if len(shape) == 3 and _has_experts_segment(_strip_weight(name)):
+            observed_expert_counts[name] = shape[0]
 
     ledger_total = sum(
         int(entry["stored_bytes"]) for entry in class_totals.values())
@@ -1033,6 +1337,7 @@ def exported_checkpoint_read_traffic(
             "codebook_sidecar_source": codebook_source,
         },
         embedding=embedding,
+        integer_tally=integer_tally,
         measured_from=f"exported safetensors headers under {export_dir}",
     )
 
@@ -1051,6 +1356,7 @@ def _claim_from_report(report: Mapping[str, Any]) -> dict[str, Any]:
         "excluded": report["excluded"],
         "routing": report["routing"],
         "embedding": report["embedding"],
+        "indexed_lookups": report["indexed_lookups"],
         "note": (
             "expected weight bytes streamed per decode token at batch 1 -- "
             "the quantity that sets decode throughput, which a disk-byte "
