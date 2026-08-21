@@ -15,10 +15,12 @@ from prismaquant.shard_layout import (
     DEFAULT_SHARD_BYTES,
     SHARD_INDEX_NAME,
     SINGLE_CONTAINER_NAME,
+    TENSOR_PAYLOAD_IDENTITY_SCHEMA,
     container_names,
     describe_container_layout,
     plan_shards,
     shard_name,
+    tensor_payload_identity,
     write_shard_index,
 )
 
@@ -115,6 +117,21 @@ def test_describe_container_layout_reads_the_layout_off_the_names():
         SINGLE_CONTAINER_NAME, "model-00001-of-00001.safetensors",
     ])[0] == "other"
     assert describe_container_layout([])[0] == "other"
+
+
+def test_the_payload_identity_depends_on_tensors_and_nothing_else():
+    """One digest over `name -> sha256(raw bytes)`; no file, no order, no size."""
+    rows = {"b.weight": "b" * 64, "a.weight": "a" * 64}
+    identity = tensor_payload_identity(rows)
+    assert identity["schema"] == TENSOR_PAYLOAD_IDENTITY_SCHEMA
+    assert identity["algorithm"] == "sha256"
+    assert identity["tensors"] == 2
+    # Insertion order is not part of the identity; the tensor set is.
+    assert tensor_payload_identity(dict(sorted(rows.items()))) == identity
+    assert tensor_payload_identity(
+        {**rows, "c.weight": "c" * 64}) != identity
+    with pytest.raises(ValueError, match="empty tensor payload"):
+        tensor_payload_identity({})
 
 
 def test_write_shard_index_is_the_layout_hf_and_vllm_read(tmp_path):

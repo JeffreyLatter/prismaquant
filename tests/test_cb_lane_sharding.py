@@ -33,6 +33,7 @@ from prismaquant.export_nvfp4_cb_streaming import (  # noqa: E402
 from prismaquant.shard_layout import (  # noqa: E402
     SHARD_INDEX_NAME,
     SINGLE_CONTAINER_NAME,
+    TENSOR_PAYLOAD_IDENTITY_SCHEMA,
     container_names,
 )
 from prismaquant.shipcard import (  # noqa: E402
@@ -363,6 +364,51 @@ def test_a_sharded_cb_artifact_carries_a_valid_card_and_inventory(
         path = out / name
         assert row["bytes"] == path.stat().st_size
         assert row["sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+@pytest.mark.parametrize(
+    "exporter",
+    [export_nvfp4_cb, export_nvfp4_cb_streaming],
+    ids=["batch", "streaming"],
+)
+def test_both_exporters_stamp_a_budget_invariant_payload_identity(
+    tmp_path, exporter,
+):
+    """The property `model_sha` cannot carry across a reshard."""
+    mdl, assignment, col_weights = _cb_fixture(tmp_path)
+    one, many = tmp_path / "one", tmp_path / "many"
+    exporter(mdl, assignment, one, col_weights, device="cpu",
+             shard_bytes=10 ** 9)
+    exporter(mdl, assignment, many, col_weights, device="cpu",
+             shard_bytes=32 * 1024)
+
+    def identity(out: Path) -> dict:
+        config = json.loads((out / "quant_config.json").read_text())
+        return config["provenance"]["tensor_payload_identity"]
+
+    single, sharded = identity(one), identity(many)
+    assert single["schema"] == TENSOR_PAYLOAD_IDENTITY_SCHEMA
+    assert single["tensors"] == len(
+        load_file(str(one / SINGLE_CONTAINER_NAME)))
+    assert single == sharded
+    # ...while the file-scoped identity necessarily moved with the layout.
+    assert compute_model_sha(one) != compute_model_sha(many)
+
+
+def test_the_two_exporters_agree_on_the_payload_identity(tmp_path):
+    """One identity for one tensor payload, whichever exporter wrote it."""
+    mdl, assignment, col_weights = _cb_fixture(tmp_path)
+    batch, streamed = tmp_path / "batch", tmp_path / "streamed"
+    export_nvfp4_cb(mdl, assignment, batch, col_weights, device="cpu",
+                    shard_bytes=32 * 1024)
+    export_nvfp4_cb_streaming(mdl, assignment, streamed, col_weights,
+                              device="cpu", shard_bytes=32 * 1024)
+
+    def identity(out: Path) -> dict:
+        config = json.loads((out / "quant_config.json").read_text())
+        return config["provenance"]["tensor_payload_identity"]
+
+    assert identity(batch) == identity(streamed)
 
 
 def test_a_sharded_cb_artifact_passes_the_publish_freeze(tmp_path):

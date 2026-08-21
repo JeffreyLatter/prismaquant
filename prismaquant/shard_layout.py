@@ -29,6 +29,7 @@ after-the-fact repair this module makes unnecessary at the export boundary.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from collections.abc import Iterable, Mapping, Sequence
@@ -39,10 +40,12 @@ __all__ = [
     "SHARD_INDEX_NAME",
     "SHARD_NAME_RE",
     "SINGLE_CONTAINER_NAME",
+    "TENSOR_PAYLOAD_IDENTITY_SCHEMA",
     "container_names",
     "describe_container_layout",
     "plan_shards",
     "shard_name",
+    "tensor_payload_identity",
     "write_shard_index",
 ]
 
@@ -54,6 +57,39 @@ DEFAULT_SHARD_BYTES = 1024 ** 3
 SINGLE_CONTAINER_NAME = "model.safetensors"
 SHARD_INDEX_NAME = "model.safetensors.index.json"
 SHARD_NAME_RE = re.compile(r"^model-([0-9]{5})-of-([0-9]{5})\.safetensors$")
+
+TENSOR_PAYLOAD_IDENTITY_SCHEMA = "prismaquant.tensor_payload_identity/1"
+
+
+def tensor_payload_identity(
+    tensor_sha256: Mapping[str, str],
+) -> dict[str, object]:
+    """Reduce per-tensor content digests to one layout-invariant identity.
+
+    ``shipcard.compute_model_sha`` binds the *container filenames and sizes*
+    (``shipcard.py:270-279``), so a model_sha necessarily moves when the shard
+    budget changes -- it is a statement about the published files. This digest
+    is over the tensor payload alone (name -> sha256 of the tensor's raw
+    bytes), so it does **not** move, which is what makes a reshard of identical
+    tensors recognisable as the same model.
+
+    Both CB exporters stamp it at ``provenance.tensor_payload_identity``, from
+    digests taken in the pass that already touches the bytes.
+    """
+    if not tensor_sha256:
+        raise ValueError("cannot identify an empty tensor payload")
+    rows = {str(name): str(digest) for name, digest in tensor_sha256.items()}
+    return {
+        "schema": TENSOR_PAYLOAD_IDENTITY_SCHEMA,
+        "algorithm": "sha256",
+        "tensors": len(rows),
+        "payload_sha256": hashlib.sha256(json.dumps(
+            dict(sorted(rows.items())),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")).hexdigest(),
+    }
 
 
 def shard_name(index: int, count: int) -> str:

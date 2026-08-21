@@ -60,6 +60,7 @@ from prismaquant.shard_layout import (
     DEFAULT_SHARD_BYTES,
     container_names,
     plan_shards,
+    tensor_payload_identity,
     write_shard_index,
 )
 from prismaquant.export_output_safety import (
@@ -568,14 +569,16 @@ def _write_cb_containers(
     out_tensors: dict[str, torch.Tensor],
     out_dir: Path,
     shard_bytes: int,
-) -> list[str]:
+) -> tuple[list[str], dict[str, str]]:
     """Publish the CB weight containers in the HF-standard shard layout.
 
     The resident exporter already holds the whole tensor dict, so this is the
     same partition rule the streaming writer applies to its entry sequence --
     emit order, one budget, an oversized tensor gets its own container -- with
     the dict's insertion order as the emit order. Returns the published
-    container names in index order.
+    container names in index order and the per-tensor content digests that
+    ``shard_layout.tensor_payload_identity`` reduces to the layout-invariant
+    identity (the streaming writer takes the same digests in its write pass).
     """
     sizes = [
         (name, int(tensor.numel() * tensor.element_size()))
@@ -583,9 +586,16 @@ def _write_cb_containers(
     ]
     groups = plan_shards(sizes, shard_bytes)
     names = container_names(len(groups))
+    tensor_sha256: dict[str, str] = {}
     for name, group in zip(names, groups):
+        payload = {key: out_tensors[key].contiguous() for key in group}
+        for key, tensor in payload.items():
+            tensor_sha256[key] = hashlib.sha256(
+                tensor.detach().cpu().contiguous()
+                .flatten().view(torch.uint8).numpy().tobytes()
+            ).hexdigest()
         save_file(
-            {key: out_tensors[key].contiguous() for key in group},
+            payload,
             str(out_dir / name),
             metadata={"format": "pt", "quant_method": "gridbook"},
         )
@@ -597,7 +607,7 @@ def _write_cb_containers(
         )
         print(f"[export-cb] published {len(names)} safetensors shard(s) + "
               "model.safetensors.index.json", flush=True)
-    return names
+    return names, tensor_sha256
 
 
 @transactional_directory_output(
@@ -1814,8 +1824,13 @@ def export_nvfp4_cb(
     )
 
     # --- Write safetensors (params only) + the codebook sidecar + configs. ---
-    published_containers = _write_cb_containers(
+    published_containers, _tensor_sha256 = _write_cb_containers(
         out_tensors, out_dir, int(shard_bytes))
+    # Layout-invariant payload identity: `model_sha` binds container filenames
+    # and sizes, so it moves with the shard budget; this digest does not.
+    quant_config["provenance"]["tensor_payload_identity"] = (
+        tensor_payload_identity(_tensor_sha256)
+    )
     if codebook_file:
         # The .pqcb is a plain safetensors blob under a non-globbed extension:
         # the plugin reads it with safetensors.load_file, vLLM's *.safetensors

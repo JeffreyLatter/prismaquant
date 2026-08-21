@@ -80,6 +80,7 @@ from prismaquant.shard_layout import (
     SINGLE_CONTAINER_NAME,
     container_names,
     plan_shards,
+    tensor_payload_identity,
     write_shard_index,
 )
 from prismaquant.allocator_candidates import (
@@ -411,7 +412,6 @@ _EXPORT_WRITE_QUEUE_BYTES_ENV = "PRISMAQUANT_EXPORT_WRITE_QUEUE_BYTES"
 _SOURCE_MODEL_IDENTITY_CACHE_ENV = (
     "PRISMAQUANT_STREAMED_MODEL_IDENTITY_CACHE"
 )
-TENSOR_PAYLOAD_IDENTITY_SCHEMA = "prismaquant.tensor_payload_identity/1"
 _DSPARK_RENDER_RECIPE_SCHEMA = "prismaquant.dspark_cb_render_recipe.v1"
 _DSPARK_RENDER_SOURCE_BINDING = "streamed_decoded_cb_source.v1"
 _DEFAULT_EXPORT_PREFETCH_DEPTH = 1
@@ -5361,18 +5361,11 @@ def export_nvfp4_cb_streaming(
             "streaming writer published without an exact content digest"
         )
     # Layout-invariant payload identity, hashed in the same pass that hashed
-    # the containers.  `model_sha` binds container filenames and sizes
-    # (`shipcard.compute_model_sha`), so it necessarily moves when the shard
-    # budget changes; this digest does not, which is what makes a reshard of
-    # identical tensors recognisable as the same model.
-    quant_config["provenance"]["tensor_payload_identity"] = {
-        "schema": TENSOR_PAYLOAD_IDENTITY_SCHEMA,
-        "algorithm": "sha256",
-        "tensors": len(writer.last_tensor_content_sha256),
-        "payload_sha256": _canonical_json_digest(
-            dict(sorted(writer.last_tensor_content_sha256.items()))
-        ),
-    }
+    # the containers.  See `shard_layout.tensor_payload_identity` for why the
+    # artifact needs an identity `model_sha` cannot provide.
+    quant_config["provenance"]["tensor_payload_identity"] = (
+        tensor_payload_identity(writer.last_tensor_content_sha256)
+    )
     if warm_session is not None:
         warm_provenance = warm_session.provenance()
         quant_config["provenance"]["encoder_warm_start"] = warm_provenance

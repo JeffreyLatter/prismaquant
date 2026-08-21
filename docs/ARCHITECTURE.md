@@ -19,11 +19,11 @@ binds weight-container filenames and sizes (`shipcard.py:270-279`), so a
 different shard budget is a different artifact identity, which is correct for
 a freshly exported artifact and is not a reshard-in-place story. What the
 change adds instead is a layout-INVARIANT payload digest,
-`provenance.tensor_payload_identity` (`export_nvfp4_cb_streaming.py`), hashed
-in the same single pass that hashes the containers: two exports of identical
-tensors at different budgets agree there and differ in `model_sha`, so a
-resharded export stays recognisable as the same model without changing what
-identity means. Previously re-stamped (2026-08-20,
+`provenance.tensor_payload_identity` (`shard_layout.tensor_payload_identity`,
+stamped by **both** CB exporters), hashed in the pass that already touches the
+bytes: two exports of identical tensors at different budgets agree there and
+differ in `model_sha`, so a resharded export stays recognisable as the same
+model without changing what identity means. Previously re-stamped (2026-08-20,
 `merge/proven-rescues`) for **the A-side reaching routed MoE experts, on both
 the surrogate and the gate** (§"AQUA-AURA"). AQUA priced only `nn.Linear`
 units, because per-channel marginals come from a backward hook and a packed
