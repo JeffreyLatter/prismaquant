@@ -56,6 +56,12 @@ from prismaquant.cb_export_config import (
     codebook_tensors as _codebook_tensors,
 )
 from prismaquant.layer_config import load_assignment
+from prismaquant.shard_layout import (
+    DEFAULT_SHARD_BYTES,
+    container_names,
+    plan_shards,
+    write_shard_index,
+)
 from prismaquant.export_output_safety import (
     prepare_fresh_export_directory,
     transactional_directory_output,
@@ -558,6 +564,42 @@ def _train_shared_codebook(weights, cws, *, grid, mode, k, seed, iters,
                              seed=seed).cpu()
 
 
+def _write_cb_containers(
+    out_tensors: dict[str, torch.Tensor],
+    out_dir: Path,
+    shard_bytes: int,
+) -> list[str]:
+    """Publish the CB weight containers in the HF-standard shard layout.
+
+    The resident exporter already holds the whole tensor dict, so this is the
+    same partition rule the streaming writer applies to its entry sequence --
+    emit order, one budget, an oversized tensor gets its own container -- with
+    the dict's insertion order as the emit order. Returns the published
+    container names in index order.
+    """
+    sizes = [
+        (name, int(tensor.numel() * tensor.element_size()))
+        for name, tensor in out_tensors.items()
+    ]
+    groups = plan_shards(sizes, shard_bytes)
+    names = container_names(len(groups))
+    for name, group in zip(names, groups):
+        save_file(
+            {key: out_tensors[key].contiguous() for key in group},
+            str(out_dir / name),
+            metadata={"format": "pt", "quant_method": "gridbook"},
+        )
+    if len(names) > 1:
+        write_shard_index(
+            out_dir,
+            {key: name for name, group in zip(names, groups) for key in group},
+            sum(nbytes for _name, nbytes in sizes),
+        )
+        print(f"[export-cb] published {len(names)} safetensors shard(s) + "
+              "model.safetensors.index.json", flush=True)
+    return names
+
+
 @transactional_directory_output(
     source_parameter="model_dir",
     output_parameter="out_dir",
@@ -577,6 +619,7 @@ def export_nvfp4_cb(
     allow_research_cost_selection: bool = False,
     activation_cache_dir: str | Path | None = None,
     activation_scale_policy: str | None = None,
+    shard_bytes: int = DEFAULT_SHARD_BYTES,
 ) -> dict[str, int]:
     """Export a CB checkpoint. See module docstring / LAYOUT.md for the layout.
 
@@ -594,6 +637,12 @@ def export_nvfp4_cb(
     ``scale_coding``: ``"two_tier"`` (production layout v2; fp4 targets write
     4k+9 bytes per superblock) or explicit legacy ``"v1"`` (4k+16). Readers
     remain backward compatible with v1; new artifacts default to v2.
+
+    ``shard_bytes`` is the per-container byte budget, 1 GiB by default, the
+    same flag and partition rule as the compressed-tensors lane. One resulting
+    shard keeps ``model.safetensors``; more than one publishes
+    ``model-XXXXX-of-YYYYY.safetensors`` plus ``model.safetensors.index.json``.
+    Pass a budget at least as large as the artifact for the legacy layout.
     """
     model_dir = Path(model_dir)
     out_dir = Path(out_dir)
@@ -1765,8 +1814,8 @@ def export_nvfp4_cb(
     )
 
     # --- Write safetensors (params only) + the codebook sidecar + configs. ---
-    save_file(out_tensors, str(out_dir / "model.safetensors"),
-              metadata={"format": "pt", "quant_method": "gridbook"})
+    published_containers = _write_cb_containers(
+        out_tensors, out_dir, int(shard_bytes))
     if codebook_file:
         # The .pqcb is a plain safetensors blob under a non-globbed extension:
         # the plugin reads it with safetensors.load_file, vLLM's *.safetensors
@@ -1822,7 +1871,7 @@ def export_nvfp4_cb(
         serialized_payload=serialized_payload_summary,
         cb_tensor_names=sorted(cb_output_tensor_names),
         codebook_file=codebook_file,
-        expected_model_files=["model.safetensors"],
+        expected_model_files=published_containers,
         whole_artifact_budget_bytes=(
             int(_whole_artifact_budget["budget_bytes"])
             if _whole_artifact_budget is not None
@@ -1845,6 +1894,15 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--layer-config", required=True,
                     help="assignment JSON (qname -> CB format)")
     ap.add_argument("--out", required=True, help="output checkpoint dir")
+    ap.add_argument("--shard-bytes", type=int, default=DEFAULT_SHARD_BYTES,
+                    help="Approx per-shard size in bytes (default 1 GiB), the "
+                         "same flag, default, and partition rule as "
+                         "export_native_compressed. A single tensor larger "
+                         "than this still gets its own shard. One resulting "
+                         "shard is published as model.safetensors with no "
+                         "index; pass a value at least as large as the "
+                         "artifact to reproduce the legacy single-container "
+                         "layout.")
     ap.add_argument("--col-weights", required=True,
                     help="pickle: {qname: per-column importance tensor}")
     ap.add_argument(
@@ -1913,6 +1971,7 @@ def main(argv: list[str] | None = None) -> None:
         allow_research_cost_selection=args.allow_research_cost_selection,
         activation_cache_dir=args.activation_cache_dir,
         activation_scale_policy=args.activation_scale_policy,
+        shard_bytes=args.shard_bytes,
     )
     size = sum(p.stat().st_size for p in Path(args.out).glob("*")) / 1e9
     print(f"wrote {args.out} ({size:.3f} GB)")

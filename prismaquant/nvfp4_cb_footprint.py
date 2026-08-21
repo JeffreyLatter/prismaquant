@@ -53,6 +53,7 @@ from .cb_layout import (
     type_size as cb_type_size,
 )
 from .routed_moe_codebooks import bundle_role_qname
+from .shard_layout import SHARD_INDEX_NAME, describe_container_layout
 
 CB_SERIALIZED_PAYLOAD_SCHEMA = "prismaquant.cb_serialized_payload.v3"
 MINCHAIN_CB_SERIALIZED_PAYLOAD_SCHEMA = "prismaquant.cb_serialized_payload.v4"
@@ -3097,14 +3098,37 @@ def cb_export_artifact_inventory(
     if not files:
         raise AssertionError(f"{root}: CB export produced no files")
 
-    if (
-        expected_model_files is not None
-        and "model.safetensors.index.json" in files
-    ):
-        raise AssertionError(
-            f"{root}: unexpected/stale model.safetensors.index.json is "
-            "present beside the fresh CB export plan"
-        )
+    if expected_model_files is not None:
+        # The layout says whether an index belongs here, so nothing has to be
+        # told: a single `model.safetensors` must NOT carry one (a leftover
+        # index from an earlier sharded run would route a loader at containers
+        # this export never wrote), and a `model-XXXXX-of-YYYYY` run MUST, and
+        # that index must name exactly the planned containers.
+        kind, _count = describe_container_layout(expected_model_files)
+        index_present = SHARD_INDEX_NAME in files
+        if kind == "single" and index_present:
+            raise AssertionError(
+                f"{root}: unexpected/stale {SHARD_INDEX_NAME} is "
+                "present beside the fresh CB export plan"
+            )
+        if kind == "sharded":
+            if not index_present:
+                raise AssertionError(
+                    f"{root}: sharded CB export is missing {SHARD_INDEX_NAME}"
+                )
+            index = json.loads((root / SHARD_INDEX_NAME).read_text())
+            mapped = set((index.get("weight_map") or {}).values())
+            if mapped != {str(name) for name in expected_model_files}:
+                raise AssertionError(
+                    f"{root}: {SHARD_INDEX_NAME} names containers outside the "
+                    f"fresh export plan: index={sorted(mapped)}, "
+                    f"expected={sorted(expected_model_files)}"
+                )
+        if kind == "other":
+            raise AssertionError(
+                f"{root}: CB export plan is neither a single container nor a "
+                f"complete shard run: {sorted(expected_model_files)}"
+            )
 
     stale_codebook_files = sorted(
         name

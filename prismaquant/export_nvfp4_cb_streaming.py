@@ -63,7 +63,7 @@ import struct
 import sys
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from collections import Counter
 from dataclasses import dataclass
 from functools import wraps
@@ -73,6 +73,15 @@ import torch
 from safetensors import safe_open
 
 from prismaquant import nvfp4_cb_formats as cb
+from prismaquant.shard_layout import (
+    DEFAULT_SHARD_BYTES,
+    SHARD_INDEX_NAME,
+    SHARD_NAME_RE,
+    SINGLE_CONTAINER_NAME,
+    container_names,
+    plan_shards,
+    write_shard_index,
+)
 from prismaquant.allocator_candidates import (
     ROUTE_PENDING_PASSTHROUGH_FORMATS,
     SOURCE_PASSTHROUGH_CONTRACTS,
@@ -402,6 +411,7 @@ _EXPORT_WRITE_QUEUE_BYTES_ENV = "PRISMAQUANT_EXPORT_WRITE_QUEUE_BYTES"
 _SOURCE_MODEL_IDENTITY_CACHE_ENV = (
     "PRISMAQUANT_STREAMED_MODEL_IDENTITY_CACHE"
 )
+TENSOR_PAYLOAD_IDENTITY_SCHEMA = "prismaquant.tensor_payload_identity/1"
 _DSPARK_RENDER_RECIPE_SCHEMA = "prismaquant.dspark_cb_render_recipe.v1"
 _DSPARK_RENDER_SOURCE_BINDING = "streamed_decoded_cb_source.v1"
 _DEFAULT_EXPORT_PREFETCH_DEPTH = 1
@@ -871,20 +881,48 @@ def _requant_pack(fmt: str, w: torch.Tensor) -> dict[str, torch.Tensor]:
     raise ValueError(f"no re-quant streaming packer for {fmt!r}")
 
 
+def _merge_pipeline_timings(
+    total: dict[str, float] | None, shard: dict[str, float],
+) -> dict[str, float]:
+    """Sum the per-shard pipeline timings into one report for the whole write."""
+    if total is None:
+        return dict(shard)
+    for key, value in shard.items():
+        total[key] = total.get(key, 0.0) + value
+    return total
+
+
 class _StreamWriter:
     """Two-pass safetensors writer. ``add`` records (name, dtype, shape) and a
     zero-arg ``producer`` that yields the tensor at write time; ``write`` lays
     out contiguous offsets, writes the header, then streams every producer's
-    bytes in order — one output tensor resident at a time."""
+    bytes in order — one output tensor resident at a time.
+
+    With ``shard_bytes`` the same stream is published as the HF-standard shard
+    layout (:mod:`prismaquant.shard_layout`) instead of one container: the
+    entry sequence is partitioned up front, so every shard's name and header
+    are known before a byte is written and the layout is a pure function of
+    the emit order and the budget."""
 
     def __init__(self):
         self._entries: list[_StreamEntry] = []
         # Set only after an atomic publication succeeds.  The production
         # exporter feeds this digest into the shipcard's immutable weight
         # manifest, avoiding a second sequential read of the finished
-        # 100GB-class DSv4 container.
+        # 100GB-class DSv4 container.  The scalar pair describes the single
+        # published container and stays ``None`` on a sharded publication;
+        # ``last_weight_manifest_files`` is the general answer and is always
+        # populated on success.
         self.last_content_sha256: str | None = None
         self.last_content_bytes: int | None = None
+        self.last_weight_manifest_files: dict[str, dict[str, object]] = {}
+        # Layout-INVARIANT payload identity: sha256 of each tensor's raw bytes,
+        # hashed in the same single pass that hashes the containers.  Two
+        # exports of the same tensors at different shard budgets agree here and
+        # differ in `model_sha` (which binds container filenames and sizes,
+        # `shipcard.compute_model_sha`), so a reshard remains recognisable as
+        # the same model without changing what identity means.
+        self.last_tensor_content_sha256: dict[str, str] = {}
 
     def add(self, name, dtype, shape, producer, copy_src=None, *, reader=None,
             encoder=None):
@@ -910,30 +948,88 @@ class _StreamWriter:
     def names(self) -> list[str]:
         return [entry.name for entry in self._entries]
 
-    def write(self, path: Path, *, before_publish=None,
-              _pipeline_encode_workers: int = 1) -> dict[str, float] | None:
-        self.last_content_sha256 = None
-        self.last_content_bytes = None
+    def _plan_containers(
+        self, path: Path, shard_bytes: int | None,
+    ) -> list[tuple[str, list[_StreamEntry]]]:
+        """``[(filename, entries)]`` in emit order, before any byte is written.
+
+        The duplicate-name refusal runs here so it precedes every filesystem
+        effect: a name planned twice keeps one header span while both blobs are
+        still streamed, silently corrupting every offset after it.
+        """
+        seen: set[str] = set()
+        for entry in self._entries:
+            if entry.name in seen:
+                raise AssertionError(
+                    f"{entry.name}: planned twice; two emit paths claim the "
+                    "same output tensor")
+            seen.add(entry.name)
+        if not self._entries:
+            raise AssertionError("streaming export planned no output tensors")
+
+        if shard_bytes is None:
+            return [(path.name, list(self._entries))]
+
+        groups = plan_shards(
+            [(entry.name, entry.nbytes) for entry in self._entries],
+            shard_bytes,
+        )
+        if len(groups) == 1:
+            return [(path.name, list(self._entries))]
+        if path.name != SINGLE_CONTAINER_NAME:
+            # The shard filenames are derived from the standard layout, not
+            # from `path`, so a caller sharding under some other basename would
+            # publish files no loader associates with the name it asked for.
+            raise ValueError(
+                f"{path}: a sharded publication is named by "
+                f"{SINGLE_CONTAINER_NAME!r}; pass that path or raise "
+                "shard_bytes above the artifact size"
+            )
+        names = container_names(len(groups))
+        planned: list[tuple[str, list[_StreamEntry]]] = []
+        cursor = 0
+        for name, group in zip(names, groups):
+            planned.append((name, self._entries[cursor:cursor + len(group)]))
+            cursor += len(group)
+        assert cursor == len(self._entries)
+        return planned
+
+    @staticmethod
+    def _shard_header(entries: Sequence[_StreamEntry]) -> tuple[bytes, int]:
+        """``(header bytes, payload bytes)`` for one container's entries."""
         header: dict[str, dict] = {}
         off = 0
-        for entry in self._entries:
-            name, dtype, shape = entry.name, entry.dtype, entry.shape
+        for entry in entries:
             nb = entry.nbytes
-            if name in header:
-                # The header is a dict but the data stream is not: a duplicate
-                # name keeps only the LAST span while both blobs are still
-                # written, producing a file whose offsets are silently wrong
-                # from that point on. Cheap to check, and the passthrough lane
-                # adds tens of thousands of names from a second namespace.
-                raise AssertionError(
-                    f"{name}: planned twice; two emit paths claim the same "
-                    "output tensor")
-            header[name] = {"dtype": _ST_DTYPE[dtype], "shape": list(shape),
-                            "data_offsets": [off, off + nb]}
+            header[entry.name] = {
+                "dtype": _ST_DTYPE[entry.dtype],
+                "shape": list(entry.shape),
+                "data_offsets": [off, off + nb],
+            }
             off += nb
         header["__metadata__"] = {"format": "pt", "quant_method": "gridbook"}
-        hjson = json.dumps(header, separators=(",", ":")).encode("utf-8")
-        data0 = 8 + len(hjson)
+        return json.dumps(header, separators=(",", ":")).encode("utf-8"), off
+
+    def write(self, path: Path, *, shard_bytes: int | None = None,
+              before_publish=None,
+              _pipeline_encode_workers: int = 1) -> dict[str, float] | None:
+        """Publish the recorded stream atomically.
+
+        ``shard_bytes=None`` writes exactly one container at ``path``.  An
+        integer budget publishes the HF-standard layout: one shard keeps
+        ``path``; N > 1 becomes ``model-XXXXX-of-YYYYY.safetensors`` plus
+        ``model.safetensors.index.json``.  Every container is streamed to a
+        temporary file first and ``before_publish`` runs once, after the last
+        producer, so an abort at any point leaves no partial artifact.
+        """
+        self.last_content_sha256 = None
+        self.last_content_bytes = None
+        self.last_weight_manifest_files = {}
+        self.last_tensor_content_sha256 = {}
+        path = Path(path)
+        out_dir = path.parent
+        planned = self._plan_containers(path, shard_bytes)
+        sharded = len(planned) > 1
 
         # A safetensors header binds names/dtypes/shapes, not the source
         # weights, imatrix, codebooks, or exporter implementation.  Reusing a
@@ -941,91 +1037,172 @@ class _StreamWriter:
         # different render while every final span/size assertion still passes.
         # Resume stays disabled until the header carries one immutable digest
         # covering all of those producer inputs.
-        if os.path.lexists(path):
-            raise RuntimeError(
-                f"{path}: refusing an unbound streaming resume. The existing "
-                "file header does not prove source/imatrix/codebook/exporter "
-                "identity; use a fresh output directory."
+        reserved = [out_dir / name for name, _ in planned]
+        if sharded:
+            reserved.append(out_dir / SHARD_INDEX_NAME)
+            # A stale run at a different shard COUNT leaves containers this
+            # plan never names; they would be indistinguishable from this
+            # export's own output to any consumer that globs *.safetensors.
+            reserved.extend(
+                sibling for sibling in sorted(out_dir.glob("*.safetensors"))
+                if SHARD_NAME_RE.fullmatch(sibling.name) is not None
             )
-        temp_path = path.with_name(f".{path.name}.tmp")
-        if os.path.lexists(temp_path):
-            raise RuntimeError(
-                f"{temp_path}: refusing to overwrite a stale or aliased "
-                "streaming-export temporary file"
-            )
+        for candidate in reserved:
+            if os.path.lexists(candidate):
+                raise RuntimeError(
+                    f"{candidate}: refusing an unbound streaming resume. The "
+                    "existing file header does not prove source/imatrix/"
+                    "codebook/exporter identity; use a fresh output directory."
+                )
+        temps = [out_dir / f".{name}.tmp" for name, _ in planned]
+        for temp_path in temps:
+            if os.path.lexists(temp_path):
+                raise RuntimeError(
+                    f"{temp_path}: refusing to overwrite a stale or aliased "
+                    "streaming-export temporary file"
+                )
 
         cuda = torch.cuda.is_available()
-        owns_temp = False
+        owned_temps: list[Path] = []
         try:
-            digest = hashlib.sha256()
-            bytes_written = 0
+            tensor_digests: dict[str, str] = {}
+            manifest: dict[str, dict[str, object]] = {}
+            timings: dict[str, float] | None = None
+            index_offset = 0
+            for (name, entries), temp_path in zip(planned, temps):
+                hjson, payload_bytes = self._shard_header(entries)
+                data0 = 8 + len(hjson)
+                digest = hashlib.sha256()
+                bytes_written = 0
 
-            class _HashingWriter:
-                """Binary writer that hashes exactly the bytes it publishes."""
+                class _HashingWriter:
+                    """Writer that hashes exactly the bytes it publishes.
 
-                def write(self, payload) -> int:
-                    nonlocal bytes_written
-                    view = memoryview(payload)
-                    written = raw_file.write(view)
-                    if written != len(view):
-                        raise OSError(
-                            "short write while streaming safetensors: "
-                            f"{written} of {len(view)} bytes"
+                    ``begin_tensor``/``end_tensor`` bracket one tensor's span so
+                    the layout-invariant payload digest costs no extra read --
+                    the same bytes feed both the container digest and the
+                    per-tensor one.
+                    """
+
+                    def __init__(self) -> None:
+                        self._tensor: str | None = None
+                        self._tensor_digest = None
+
+                    def begin_tensor(self, tensor_name: str) -> None:
+                        self._tensor = tensor_name
+                        self._tensor_digest = hashlib.sha256()
+
+                    def end_tensor(self) -> None:
+                        if self._tensor is not None:
+                            tensor_digests[self._tensor] = (
+                                self._tensor_digest.hexdigest()
+                            )
+                        self._tensor = None
+                        self._tensor_digest = None
+
+                    def write(self, payload) -> int:
+                        nonlocal bytes_written
+                        view = memoryview(payload)
+                        written = raw_file.write(view)
+                        if written != len(view):
+                            raise OSError(
+                                "short write while streaming safetensors: "
+                                f"{written} of {len(view)} bytes"
+                            )
+                        digest.update(view)
+                        if self._tensor_digest is not None:
+                            self._tensor_digest.update(view)
+                        bytes_written += written
+                        return written
+
+                with open(temp_path, "xb") as raw_file:
+                    owned_temps.append(temp_path)
+                    f = _HashingWriter()
+                    f.write(struct.pack("<Q", len(hjson)))
+                    f.write(hjson)
+                    if _export_pipeline_enabled():
+                        shard_timings = self._write_pipeline(
+                            f,
+                            entries,
+                            cuda=cuda,
+                            encode_workers=int(_pipeline_encode_workers),
+                            index_offset=index_offset,
                         )
-                    digest.update(view)
-                    bytes_written += written
-                    return written
-
-            with open(temp_path, "xb") as raw_file:
-                owns_temp = True
-                f = _HashingWriter()
-                f.write(struct.pack("<Q", len(hjson)))
-                f.write(hjson)
-                if _export_pipeline_enabled():
-                    timings = self._write_pipeline(
-                        f,
-                        cuda=cuda,
-                        encode_workers=int(_pipeline_encode_workers),
+                        timings = _merge_pipeline_timings(
+                            timings, shard_timings)
+                    else:
+                        self._write_serial(
+                            f, entries, cuda=cuda, index_offset=index_offset)
+                expected_bytes = data0 + payload_bytes
+                if bytes_written != expected_bytes:
+                    raise AssertionError(
+                        "streamed safetensors byte count differs from its "
+                        f"header: {bytes_written} != {expected_bytes}"
                     )
-                else:
-                    timings = None
-                    self._write_serial(f, cuda=cuda)
-            expected_bytes = data0 + off
-            if bytes_written != expected_bytes:
+                manifest[name] = {
+                    "bytes": bytes_written,
+                    "sha256": digest.hexdigest(),
+                }
+                index_offset += len(entries)
+
+            if set(tensor_digests) != {e.name for e in self._entries}:
                 raise AssertionError(
-                    "streamed safetensors byte count differs from its header: "
-                    f"{bytes_written} != {expected_bytes}"
+                    "streaming writer did not attest every published tensor: "
+                    f"{len(tensor_digests)} of {len(self._entries)}"
                 )
             if before_publish is not None:
                 before_publish()
-            os.replace(temp_path, path)
-            owns_temp = False
-            self.last_content_sha256 = digest.hexdigest()
-            self.last_content_bytes = bytes_written
+            for (name, _entries), temp_path in zip(planned, temps):
+                os.replace(temp_path, out_dir / name)
+                owned_temps.remove(temp_path)
+            if sharded:
+                weight_map = {
+                    entry.name: name
+                    for name, entries in planned for entry in entries
+                }
+                write_shard_index(
+                    out_dir, weight_map,
+                    sum(entry.nbytes for entry in self._entries),
+                )
+                print(
+                    f"[export-cb-stream] published {len(planned)} safetensors "
+                    f"shard(s) + {SHARD_INDEX_NAME}", flush=True)
+            else:
+                only = planned[0][0]
+                self.last_content_sha256 = str(manifest[only]["sha256"])
+                self.last_content_bytes = int(manifest[only]["bytes"])
+            self.last_weight_manifest_files = manifest
+            self.last_tensor_content_sha256 = tensor_digests
             return timings
         except BaseException:
-            if owns_temp and os.path.lexists(temp_path):
-                temp_path.unlink()
+            for temp_path in owned_temps:
+                if os.path.lexists(temp_path):
+                    temp_path.unlink()
             raise
 
-    def _write_serial(self, f, *, cuda: bool) -> None:
+    def _write_serial(self, f, entries: Sequence[_StreamEntry], *, cuda: bool,
+                      index_offset: int = 0) -> None:
         """The pre-pipeline loop, kept as the exact flag-off implementation."""
 
-        for i, entry in enumerate(self._entries):
+        for i, entry in enumerate(entries, start=index_offset):
             name, dtype, shape = entry.name, entry.dtype, entry.shape
-            if entry.copy_src is not None:
-                self._write_copy(f, i, entry)
-                continue
-            t = entry.producer()
-            if t.dtype != dtype or tuple(t.shape) != shape:
-                raise AssertionError(
-                    f"{name}: produced {t.dtype}{tuple(t.shape)} != "
-                    f"declared {dtype}{shape}")
-            b = _raw_bytes(t)
-            if len(b) != entry.nbytes:
-                raise AssertionError(f"{name}: byte count mismatch")
-            f.write(b)
-            del t, b
+            f.begin_tensor(name)
+            try:
+                if entry.copy_src is not None:
+                    self._write_copy(f, i, entry)
+                    continue
+                t = entry.producer()
+                if t.dtype != dtype or tuple(t.shape) != shape:
+                    raise AssertionError(
+                        f"{name}: produced {t.dtype}{tuple(t.shape)} != "
+                        f"declared {dtype}{shape}")
+                b = _raw_bytes(t)
+                if len(b) != entry.nbytes:
+                    raise AssertionError(f"{name}: byte count mismatch")
+                f.write(b)
+                del t, b
+            finally:
+                f.end_tensor()
             self._cuda_hygiene(i, entry, cuda=cuda)
 
     def _write_copy(self, f, index: int, entry: _StreamEntry) -> None:
@@ -1063,8 +1240,9 @@ class _StreamWriter:
                   f"{torch.cuda.memory_allocated() / 2**30:.1f}G reserved "
                   f"{torch.cuda.memory_reserved() / 2**30:.1f}G", flush=True)
 
-    def _write_pipeline(self, f, *, cuda: bool,
-                        encode_workers: int = 1) -> dict[str, float]:
+    def _write_pipeline(self, f, entries: Sequence[_StreamEntry], *,
+                        cuda: bool, encode_workers: int = 1,
+                        index_offset: int = 0) -> dict[str, float]:
         """Read -> encode -> bounded ordered-write execution strategy.
 
         Production uses one encode worker, preserving the existing ordered
@@ -1117,7 +1295,7 @@ class _StreamWriter:
 
         def read_stage() -> None:
             try:
-                for index, entry in enumerate(self._entries):
+                for index, entry in enumerate(entries):
                     if failure.stop.is_set():
                         break
                     owns_prefetch_slot = False
@@ -1173,17 +1351,23 @@ class _StreamWriter:
 
         def write_stage() -> None:
             try:
-                for index, entry in enumerate(self._entries):
+                for index, entry in enumerate(entries):
                     payload, stalled = results.get(index)
                     add_timing("write_stall", stalled)
                     started = time.perf_counter()
-                    if isinstance(payload, _CopyPayload):
-                        self._write_copy(f, index, entry)
-                    else:
-                        f.write(payload)
+                    f.begin_tensor(entry.name)
+                    try:
+                        if isinstance(payload, _CopyPayload):
+                            self._write_copy(
+                                f, index + index_offset, entry)
+                        else:
+                            f.write(payload)
+                    finally:
+                        f.end_tensor()
                     add_timing("write_busy", time.perf_counter() - started)
                     budget.release(entry.nbytes)
-                    self._cuda_hygiene(index, entry, cuda=cuda)
+                    self._cuda_hygiene(
+                        index + index_offset, entry, cuda=cuda)
             except BaseException as exc:
                 failure.fail(exc)
                 budget.wake()
@@ -2509,6 +2693,7 @@ def export_nvfp4_cb_streaming(
     warm_state_dir: str | Path | None = None,
     warm_verify_sample: int = 32,
     dspark_cb_sidecar: bool = False,
+    shard_bytes: int = DEFAULT_SHARD_BYTES,
 ) -> dict[str, int]:
     """Streaming counterpart of :func:`export_nvfp4_cb.export_nvfp4_cb`. Same
     signature + container; peak residency ~= one source tensor + codebooks.
@@ -2550,6 +2735,15 @@ def export_nvfp4_cb_streaming(
     passthrough overlay and this quantized sidecar mode are mutually exclusive.
     A separate ``/draft`` artifact is emitted; the target artifact is never
     rewritten or linked into the draft.
+
+    ``shard_bytes`` is the per-container byte budget, 1 GiB by default, the
+    same value and the same partition rule the compressed-tensors lane ships
+    (``run-pipeline.sh``'s ``EXPORT_SHARD_BYTES``).  One resulting shard keeps
+    the legacy ``model.safetensors``; more than one publishes
+    ``model-XXXXX-of-YYYYY.safetensors`` plus ``model.safetensors.index.json``,
+    which is the layout a stock HF/vLLM loader already reads.  There is no zero
+    sentinel: pass a budget at least as large as the artifact to reproduce a
+    pre-2026-08-21 single-container CB export.
     """
     model_dir = Path(model_dir)
     out_dir = Path(out_dir)
@@ -5124,9 +5318,11 @@ def export_nvfp4_cb_streaming(
             ldlq_telemetry.payload()
 
     writer.write(
-        out_dir / "model.safetensors",
+        out_dir / SINGLE_CONTAINER_NAME,
+        shard_bytes=int(shard_bytes),
         before_publish=_assert_source_coverage_before_publish,
     )
+    published_containers = sorted(writer.last_weight_manifest_files)
     if cb_render_source_collector is not None:
         completed_render_identity = cb_render_source_collector.finalize()
         if not isinstance(_recipe_cb_render_identity, dict):
@@ -5160,10 +5356,23 @@ def export_nvfp4_cb_streaming(
                 _recipe_cb_render_identity["source_weights_content_sha256"]
             ),
         }
-    if writer.last_content_sha256 is None or writer.last_content_bytes is None:
+    if not writer.last_weight_manifest_files:
         raise AssertionError(
             "streaming writer published without an exact content digest"
         )
+    # Layout-invariant payload identity, hashed in the same pass that hashed
+    # the containers.  `model_sha` binds container filenames and sizes
+    # (`shipcard.compute_model_sha`), so it necessarily moves when the shard
+    # budget changes; this digest does not, which is what makes a reshard of
+    # identical tensors recognisable as the same model.
+    quant_config["provenance"]["tensor_payload_identity"] = {
+        "schema": TENSOR_PAYLOAD_IDENTITY_SCHEMA,
+        "algorithm": "sha256",
+        "tensors": len(writer.last_tensor_content_sha256),
+        "payload_sha256": _canonical_json_digest(
+            dict(sorted(writer.last_tensor_content_sha256.items()))
+        ),
+    }
     if warm_session is not None:
         warm_provenance = warm_session.provenance()
         quant_config["provenance"]["encoder_warm_start"] = warm_provenance
@@ -5221,12 +5430,7 @@ def export_nvfp4_cb_streaming(
         weight_content_manifest={
             "schema": WEIGHT_CONTENT_MANIFEST_SCHEMA,
             "algorithm": "sha256",
-            "files": {
-                "model.safetensors": {
-                    "bytes": writer.last_content_bytes,
-                    "sha256": writer.last_content_sha256,
-                },
-            },
+            "files": dict(sorted(writer.last_weight_manifest_files.items())),
         },
     )
     # Persist and assert a final filesystem inventory distinct from the CB
@@ -5238,7 +5442,7 @@ def export_nvfp4_cb_streaming(
         serialized_payload=serialized_payload_summary,
         cb_tensor_names=sorted(cb_output_tensor_names),
         codebook_file=codebook_file,
-        expected_model_files=["model.safetensors"],
+        expected_model_files=published_containers,
         whole_artifact_budget_bytes=(
             int(_whole_artifact_budget["budget_bytes"])
             if _whole_artifact_budget is not None
@@ -5710,6 +5914,15 @@ def main(argv=None) -> None:
         "per (layer, w13/w2 family, format)",
     )
     ap.add_argument("--out", required=True)
+    ap.add_argument("--shard-bytes", type=int, default=DEFAULT_SHARD_BYTES,
+                    help="Approx per-shard size in bytes (default 1 GiB), the "
+                         "same flag, default, and partition rule as "
+                         "export_native_compressed. A single tensor larger "
+                         "than this still gets its own shard. One resulting "
+                         "shard is published as model.safetensors with no "
+                         "index; pass a value at least as large as the "
+                         "artifact to reproduce the legacy single-container "
+                         "layout.")
     ap.add_argument("--col-weights", required=True,
                     help="pickle {qname: per-column importance}")
     ap.add_argument(
@@ -5847,7 +6060,8 @@ def main(argv=None) -> None:
         per_expert_config_path=args.per_expert_config,
         warm_state_dir=args.warm_state_dir,
         warm_verify_sample=args.warm_verify_sample,
-        dspark_cb_sidecar=args.dspark_cb_sidecar)
+        dspark_cb_sidecar=args.dspark_cb_sidecar,
+        shard_bytes=args.shard_bytes)
     size = sum(p.stat().st_size for p in Path(args.out).glob("*")) / 1e9
     print(f"wrote {args.out} ({size:.3f} GB)")
     for fmt, n in sorted(counts.items()):
