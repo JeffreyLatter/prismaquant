@@ -630,6 +630,8 @@ def export_nvfp4_cb(
     allow_unstamped_research: bool = False,
     allow_research_cost_selection: bool = False,
     allow_per_role_books: bool = False,
+    allow_unbacked_route: str | None = None,
+    non_native_target: str | None = None,
     activation_cache_dir: str | Path | None = None,
     activation_scale_policy: str | None = None,
     shard_bytes: int = DEFAULT_SHARD_BYTES,
@@ -1315,6 +1317,34 @@ def export_nvfp4_cb(
             if _scoped_bundle_export else None
         ),
     )
+    # --- ROUTE-STATUS GATE (campaign rule R3, principle 9). ----------------
+    # The in-memory twin of the streaming gate, at the matching pre-write
+    # point. Both call one helper so the verdict cannot drift between the two
+    # export paths; only the spelling of the facts differs (this exporter
+    # holds real tensors, so shapes come from the skeleton rather than from a
+    # safetensors header).
+    from .cb_route_status_gate import gate_cb_export_units
+
+    def _route_gate_shape(qname: str) -> tuple[int, ...]:
+        wname = _try_resolve_skeleton(qname, skeleton, _profile)
+        if wname is None:
+            raise ValueError(
+                f"{qname}: route-status gate cannot resolve a weight tensor")
+        return tuple(int(v) for v in skeleton[wname].shape)
+
+    cb_route_status_provenance = gate_cb_export_units(
+        assignment=assignment,
+        quantized_targets=(*cb_targets, *stock_targets),
+        routed_units=_expert_stack_members,
+        role_split_units=(
+            qname for qname, roles in routed_role_plans.items() if roles
+        ),
+        shape_of=_route_gate_shape,
+        allow_unbacked_route=allow_unbacked_route,
+        non_native_target=non_native_target,
+        exporter="export_nvfp4_cb",
+    )
+
     validate_cb_serialization_context_stamp(
         _recipe_cb_context_stamp,
         serialization_context,
@@ -1855,6 +1885,10 @@ def export_nvfp4_cb(
     quant_config["provenance"]["tensor_payload_identity"] = (
         tensor_payload_identity(_tensor_sha256)
     )
+    # The route census principle 12 requires next to any bpp or KL claim; the
+    # streaming exporter stamps the identical key. Its shape makes an
+    # unattested lane impossible to read as a clean one.
+    quant_config["provenance"]["cb_route_status"] = cb_route_status_provenance
     if codebook_file:
         # The .pqcb is a plain safetensors blob under a non-globbed extension:
         # the plugin reads it with safetensors.load_file, vLLM's *.safetensors

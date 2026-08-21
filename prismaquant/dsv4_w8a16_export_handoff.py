@@ -334,9 +334,19 @@ _PUBLISHED_FILES = frozenset({
 #   artifact_completeness.py -- learns to claim the pooled single-book routed
 #     spelling alongside the per-role one; claim-widening only, and no CB
 #     claims exist on this lane.
+# RE-FROZEN 2026-08-21 (fourth this date: the R3 route-status merge), reviewed
+# against THIS handoff rather than re-hashed:
+#   export_nvfp4_cb_streaming.py -- the CB route-status gate (48618a6) runs
+#     before any byte is written, resolving each unit's structural facts
+#     against the pinned runtime's eligibility attestation; with the 0.8.10
+#     attestation ABSENT every unit reports `unattested` and nothing refuses
+#     without `--allow-unbacked-route`/`--non-native-target` being needed. The
+#     W8A16 lane assigns no CB rung, so the gate's per-unit loop sees no CB
+#     units on this lane; merge union with the R1 split-book gate reviewed
+#     line-by-line (both are additive parameters + calls at the same anchors).
 _FROZEN_EXPORT_SOURCE_SHA256 = {
     "prismaquant/export_nvfp4_cb_streaming.py": (
-        "5f29114adbd0302760ffbeaf2140014e764ea059de75143aba699f071a9fb656"
+        "3380385f601623fc5d5b31147a226da15928b77b99dc15d2719e0ccb54232d1b"
     ),
     "prismaquant/cb_export_config.py": (
         "2bca669278cc1f3195c27747c05facea497e7b6ff2912bad7f917a184d1d6f94"

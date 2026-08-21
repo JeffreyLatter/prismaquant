@@ -642,6 +642,24 @@ def build_shipcard(
             "weight_content_manifest"
         ) is not None:
             card["weight_stat_attestation"] = weight_stat_attestation(root)
+        # Principle 9 requires the artifact's route disposition -- a declared
+        # non-native target or an explicit override -- to be stamped on the
+        # card, and principle 12 requires the route census to travel with the
+        # bpp claim rather than only inside quant_config. Both CB exporters
+        # stamp the gate's verdict into quant_config provenance before opening
+        # this card, so lifting it here covers the streaming and non-streaming
+        # paths with one seam. The summary keeps the gate's own shape rule: an
+        # unattested lane publishes no backed/unbacked counters to misread.
+        if isinstance(provenance, Mapping) and isinstance(
+            provenance.get("cb_route_status"), Mapping
+        ):
+            # local: the gate reaches the serving-lane resolution stack, and
+            # shipcard is imported very early.
+            from .cb_route_status_gate import shipcard_route_summary
+
+            card["cb_route_status"] = shipcard_route_summary(
+                provenance["cb_route_status"]
+            )
     return card
 
 

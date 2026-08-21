@@ -2039,6 +2039,7 @@ def selection_serving_lane_provenance(
     by_format: dict[str, dict] = {}
     branch_counts: Counter[str] = Counter()
     contract_counts: Counter[str] = Counter()
+    route_status_counts: Counter[str] = Counter()
     backed_rungs: set[int] = set()
     fallback_rungs: set[int] = set()
     n_backed = n_fallback = n_no_lane = 0
@@ -2059,6 +2060,12 @@ def selection_serving_lane_provenance(
         branch_counts[str(branch) if branch else "unrecorded"] += 1
         if lane is None:
             n_no_lane += 1
+            # A unit whose profile declares no lane has no route status either.
+            # "no_declared_lane" is NOT "backed" and NOT a zero: it is the
+            # vanilla-vLLM state, where absence of evidence was being rendered
+            # as evidence of absence (units_on_fallback_route = 0 was reachable
+            # only by never having looked).
+            route_status_counts["no_declared_lane"] += 1
             by_format.setdefault(fmt, {
                 "format": fmt, "units": 0, "route": None})["units"] += 1
             continue
@@ -2066,6 +2073,8 @@ def selection_serving_lane_provenance(
             "format": fmt, "units": 0, "route": lane.as_dict()})
         row["units"] += 1
         contract_counts[lane.activation_contract or "unspecified"] += 1
+        route_status_counts[
+            getattr(lane, "route_status", None) or "no_declared_lane"] += 1
         if lane.fused_mid_m_backed:
             n_backed += 1
             if lane.rung is not None:
@@ -2083,6 +2092,21 @@ def selection_serving_lane_provenance(
         "units_on_backed_fused_mid_m_lane": n_backed,
         "units_on_fallback_route": n_fallback,
         "units_without_declared_lane": n_no_lane,
+        # --- Structured route status (campaign rule R3, principle 9). -------
+        # READ THIS BEFORE QUOTING units_on_fallback_route. That counter is
+        # about the FUSED MID-M lane only, and a zero there means "no unit
+        # selected an off-law rung", not "every route is native". The route
+        # status census below is the field that answers the route question,
+        # and its ``unattested`` / ``no_declared_lane`` buckets are how a
+        # lane that has never been looked at is told apart from one that was
+        # looked at and came back clean. Principle 12 requires whichever of
+        # the two is true to travel next to any bpp or KL claim.
+        "route_status_counts": dict(sorted(route_status_counts.items())),
+        "route_status_attested": bool(
+            route_status_counts
+            and not (route_status_counts.keys() & {
+                "unattested", "no_declared_lane"})
+        ),
         "selected_rungs_fused_mid_m_backed": sorted(backed_rungs),
         "selected_rungs_on_fallback_route": sorted(fallback_rungs),
         "activation_contracts": dict(sorted(contract_counts.items())),

@@ -46,6 +46,50 @@ def _runtime_contract() -> dict:
     return load_runtime_contract()
 
 
+def test_materialized_contract_equals_the_installed_wheels_file():
+    """The local copy IS the packaged contract, byte for byte (R3).
+
+    PrismaQuant resolves serving-lane route status from a materialized copy of
+    Gridbook's packaged ``runtime_contract.json`` so the producer never imports
+    the runtime. That indirection is only honest while the copy is identical to
+    what the pinned wheel actually ships -- a drifted copy would attest a
+    release that does not exist. This job is the only place both files are
+    present, so it is the only place the equality can be checked.
+    """
+    import hashlib
+    from importlib.resources import files
+
+    asset_dir = REPO / "prismaquant" / "gridbook_runtime"
+    index = json.loads(
+        (asset_dir / "gridbook_runtime_contract_index.json").read_text(
+            encoding="utf-8"))
+    installed_version = importlib.metadata.version("gridbook")
+    entry = next(
+        (e for e in index["contracts"]
+         if e["version"] == installed_version),
+        None,
+    )
+    assert entry is not None, (
+        f"no materialized contract for the installed Gridbook "
+        f"{installed_version}; add its packaged runtime_contract.json to "
+        f"{asset_dir} and index it, or route status attests nothing")
+
+    packaged = files("gridbook").joinpath("runtime_contract.json").read_bytes()
+    local = (asset_dir / entry["path"]).read_bytes()
+    assert local == packaged, (
+        f"{entry['path']} differs from the installed wheel's packaged "
+        "contract; re-materialize it from the pinned commit")
+    assert hashlib.sha256(packaged).hexdigest() == entry["sha256"]
+
+    # And the ABSENT claim in the index must still be true of the real wheel.
+    contract = json.loads(packaged.decode("utf-8"))
+    has_table = "lane_eligibility" in contract
+    assert (entry["lane_eligibility"] == "present") == has_table, (
+        "the index's lane_eligibility claim disagrees with the installed "
+        "runtime; if Gridbook now packages the table, flip the index entry to "
+        "'present' and the CB lanes become attested with no code change")
+
+
 def test_installed_gridbook_is_the_exact_external_vcs_pin():
     pin = _pin()
     spec = importlib.util.find_spec("gridbook")

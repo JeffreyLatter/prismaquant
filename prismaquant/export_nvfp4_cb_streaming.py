@@ -106,6 +106,10 @@ from prismaquant.format_registry import (
     canonical_format_name,
     get_format as _fr_get_format,
 )
+from prismaquant.cb_route_status_gate import (
+    NON_NATIVE_TARGET_ENV,
+    ROUTE_OVERRIDE_ENV,
+)
 from prismaquant.export_nvfp4_cb import (
     _canonical_qname,
     _export_base_name,
@@ -2692,6 +2696,8 @@ def export_nvfp4_cb_streaming(
     allow_research_cost_selection: bool = False,
     allow_route_pending_passthrough: bool = False,
     allow_per_role_books: bool = False,
+    allow_unbacked_route: str | None = None,
+    non_native_target: str | None = None,
     exclude_namespaces: list[str] | tuple[str, ...] | None = None,
     activation_cache_dir: str | Path | None = None,
     activation_scale_policy: str | None = None,
@@ -2726,6 +2732,15 @@ def export_nvfp4_cb_streaming(
     refuses unless this is passed, and passing it stamps the fact onto the
     shipcard. The keying comes from the bundle's own record of how each routed
     book was burned, never from a flag here.
+    ``allow_unbacked_route`` and ``non_native_target`` are the two dispositions
+    principle 9 allows for a selected unit with no backed serving route under
+    the pinned Gridbook release (campaign rule R3). Both are STRINGS, not
+    booleans, and both are stamped: the first is the REASON this artifact ships
+    over an unbacked route, the second names the target platform whose native
+    lane the artifact is not claiming. A bare ``1`` documents nothing, and this
+    record is what a reviewer reads when the artifact turns out to serve badly.
+    They are a separate gate from ``allow_route_pending_passthrough`` above,
+    which governs source-passthrough rungs rather than lane routes.
 
     ``reuse_prior`` is reserved but currently fails closed. The prior gate did
     not bind exact source content, treated an imatrix mismatch as a warning,
@@ -3828,6 +3843,30 @@ def export_nvfp4_cb_streaming(
         _recipe_cb_context_stamp,
         serialization_context,
         where="export_nvfp4_cb_streaming",
+    )
+
+    # --- ROUTE-STATUS GATE (campaign rule R3, principle 9). ----------------
+    # Serving eligibility is judged per artifact, at export. This is the first
+    # point where every input the verdict needs exists -- crucially
+    # `expert_role_plans`, which is what makes a stack's per-role codebook
+    # split visible -- and it is still before any byte is written, so a refusal
+    # costs nothing. The defect it closes: the shipped DSv4 body's 11 routed
+    # FP8-CB layers bind per-role learned books, Gridbook's persistent-B lane
+    # refuses those, and nothing on the producer side consumed that fact; a
+    # user found it at serve time.
+    from .cb_route_status_gate import gate_cb_export_units
+
+    cb_route_status_provenance = gate_cb_export_units(
+        assignment=assignment,
+        quantized_targets=(*cb_targets, *stock_targets),
+        routed_units=expert_stack_members,
+        role_split_units=(
+            qname for qname, roles in expert_role_plans.items() if roles
+        ),
+        shape_of=_target_shape,
+        allow_unbacked_route=allow_unbacked_route,
+        non_native_target=non_native_target,
+        exporter="export_nvfp4_cb_streaming",
     )
     from prismaquant.nvfp4_cb_footprint import _ldlq_for_format
 
@@ -5284,6 +5323,15 @@ def export_nvfp4_cb_streaming(
     quant_config = apply_dspark_overlay_to_quant_config(
         quant_config, dspark_source_overlay
     )
+    # The route census principle 12 requires next to any bpp or KL claim. It
+    # rides the inventory-bound quant_config so it is part of the artifact's
+    # identity rather than a log line, and its shape makes an unattested lane
+    # impossible to read as a clean one: when the pinned release publishes no
+    # eligibility table this payload carries units_unattested and NO
+    # backed/fallback counters at all.
+    quant_config.setdefault("provenance", {})["cb_route_status"] = (
+        cb_route_status_provenance
+    )
     if dspark_cb_sidecar:
         physical_cb_targets = sorted({_base_name(q) for q in cb_targets})
         expected_physical_cb_targets = list(
@@ -6047,6 +6095,25 @@ def main(argv=None) -> None:
              "artifact provenance",
     )
     ap.add_argument(
+        "--allow-unbacked-route",
+        default=None,
+        metavar="REASON",
+        help="ship even though a selected unit has NO backed serving route "
+        "under the pinned Gridbook release (campaign rule R3, principle 9). "
+        "Takes the REASON, not a flag: it is stamped into the artifact's "
+        "provenance and read by whoever inherits the serving problem. May also "
+        f"be set with {ROUTE_OVERRIDE_ENV}=<reason>.",
+    )
+    ap.add_argument(
+        "--non-native-target",
+        default=None,
+        metavar="PLATFORM",
+        help="declare that this artifact targets a platform whose native lane "
+        "does not exist, so unbacked routes are expected rather than a defect. "
+        "Stamped on the artifact; a win on a non-native kernel is not a win on "
+        f"the named hardware (principle 12). Env: {NON_NATIVE_TARGET_ENV}.",
+    )
+    ap.add_argument(
         "--allow-route-pending-passthrough",
         action="store_true",
         default=_route_pending_ack_from_env(),
@@ -6150,6 +6217,8 @@ def main(argv=None) -> None:
         allow_research_cost_selection=args.allow_research_cost_selection,
         allow_route_pending_passthrough=args.allow_route_pending_passthrough,
         allow_per_role_books=args.allow_per_role_books,
+        allow_unbacked_route=args.allow_unbacked_route,
+        non_native_target=args.non_native_target,
         exclude_namespaces=args.exclude_namespaces,
         activation_cache_dir=args.activation_cache_dir,
         activation_scale_policy=args.activation_scale_policy,
