@@ -242,7 +242,15 @@ def test_activation_dloss_uses_g_sq_sum_not_fisher_row():
         "fixture failed to separate the two sensitivities; the discrimination "
         f"below would be vacuous (row={want_row:.3e} vs g={want_g:.3e})")
 
-    assert got == pytest.approx(want_g, rel=1e-9)
+    # Tolerance is float32 eps, not an arbitrary epsilon. `_weighted_row_sum`
+    # forms the square and the product in float32 on device and accumulates the
+    # reduction in float64, so each product carries ~1 float32 ulp. Every term
+    # is a square times a variance -- non-negative, so nothing cancels
+    # catastrophically -- and the observed aggregate error on this fixture is
+    # 3.4e-9 relative. Do NOT tighten this back to 1e-9: that pins the pre-GPU
+    # host-float64 path and fails wherever CUDA is present. The discrimination
+    # is untouched -- want_row sits 10x away, five orders outside this band.
+    assert got == pytest.approx(want_g, rel=8 * float(np.finfo(np.float32).eps))
     assert got != pytest.approx(want_row, rel=1e-3)
 
 
