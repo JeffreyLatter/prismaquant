@@ -698,6 +698,7 @@ def open_cb_export_shipcard(
             flush=True,
         )
     provenance["weight_content_manifest"] = manifest
+    from . import read_traffic  # local: shipcard is imported very early
     config_path = root / "quant_config.json"
     config_path.write_text(json.dumps(
         dict(quant_config), indent=2, sort_keys=True
@@ -710,6 +711,12 @@ def open_cb_export_shipcard(
         "layer_config": str(layer_config_path),
         "layer_config_sha": file_sha256(layer_config_path),
         "achieved_bpp": allocator_achieved_bpp(layer_config_path),
+        # See `read_traffic`: bpp measures what the artifact costs on disk,
+        # this measures what it costs the memory bus per generated token --
+        # the quantity that actually sets decode throughput, and the one a
+        # byte budget is blind to on a sparse MoE. Measured from the shards
+        # written above, so it cannot describe a different assignment.
+        "read_gb_per_token": read_traffic.read_traffic_claim(root),
     }
     card = build_shipcard(root, build=build)
     path = write_shipcard(root / SHIPCARD_FILENAME, card)

@@ -341,6 +341,78 @@ class SourceByteManifest(dict):
         self.spans: dict[str, frozenset[str]] = dict(spans or {})
 
 
+def source_span_identity(checkpoint_key: str) -> str:
+    """The SOURCE identity of a checkpoint key: the key without ``.weight``.
+
+    Unique per checkpoint tensor and shared by every live name that covers it
+    (the per-expert entry and the packed aggregate both resolve to it), which
+    is what makes a double charge structurally detectable in
+    :class:`SourceByteManifest.spans`.
+    """
+    return (
+        checkpoint_key[: -len(".weight")]
+        if checkpoint_key.endswith(".weight") else checkpoint_key
+    )
+
+
+def source_tensor_span_bytes(model_path: str) -> dict[str, int]:
+    """``{checkpoint key: on-disk bytes}`` — the EXACT per-tensor partition.
+
+    Every quantization sidecar span (``.scale`` / ``.weight_scale_inv`` /
+    ``.weight_scale``) is summed into its base tensor's entry — exactly the
+    bytes the export removes from the checkpoint when it re-encodes that
+    Linear — so a sidecar does not get an entry of its own.  A *standalone*
+    sidecar (no base tensor in the checkpoint) keeps its own entry, because
+    the point of this function is that nothing is lost:
+
+        ``sum(source_tensor_span_bytes(p).values())
+          == source_checkpoint_bytes(p)[0]``
+
+    holds by construction and is asserted here.  That partition property is
+    what :func:`source_tensor_bytes_manifest` renames into live qnames, and
+    what :mod:`prismaquant.read_traffic` itemizes the non-allocated floor
+    from — an itemization is only honest if it provably covers the whole
+    checkpoint.
+
+    Keys are the raw checkpoint names (``.weight`` intact) so a caller can
+    still run them through a profile's ``checkpoint_to_live_name``; use
+    :func:`source_span_identity` for the base form.
+    """
+    raw: dict[str, int] = {}
+    shards = sorted(glob.glob(os.path.join(model_path, "*.safetensors")))
+    if not shards:
+        raise FileNotFoundError(
+            f"no *.safetensors shards under {model_path!r}; cannot build the "
+            "per-tensor source-byte partition")
+    for shard in shards:
+        header = _read_safetensors_header(shard)
+        for name, meta in header.items():
+            if name == "__metadata__":
+                continue
+            a, b = meta["data_offsets"]
+            raw[name] = raw.get(name, 0) + (int(b) - int(a))
+    out: dict[str, int] = {}
+    for name, nb in raw.items():
+        suffix = next(
+            (s for s in _SIDECAR_SUFFIXES if name.endswith(s)), None)
+        if suffix is not None:
+            stem = name[: -len(suffix)]
+            if stem in raw or (stem + ".weight") in raw:
+                continue  # folded into its base tensor's entry below
+            out[name] = nb  # standalone sidecar: its own floor tensor
+            continue
+        base = source_span_identity(name)
+        out[name] = nb + sum(raw.get(base + s, 0) for s in _SIDECAR_SUFFIXES)
+    total_in, total_out = sum(raw.values()), sum(out.values())
+    if total_in != total_out:
+        raise AssertionError(
+            f"[footprint] source_tensor_span_bytes lost bytes on "
+            f"{model_path!r}: partitioned {total_out} of {total_in} checkpoint "
+            "bytes. Every span must be counted exactly once, as its own entry "
+            "or folded into a base tensor's.")
+    return out
+
+
 def source_tensor_bytes_manifest(
     model_path: str,
     name_map=None,
@@ -391,19 +463,6 @@ def source_tensor_bytes_manifest(
     manifest is >= 0 by construction (a negative floor is always an
     accounting bug — rejected at the consumers).
     """
-    spans: dict[str, int] = {}
-    shards = sorted(glob.glob(os.path.join(model_path, "*.safetensors")))
-    if not shards:
-        raise FileNotFoundError(
-            f"no *.safetensors shards under {model_path!r}; cannot build the "
-            "per-tensor source-byte manifest")
-    for shard in shards:
-        header = _read_safetensors_header(shard)
-        for name, meta in header.items():
-            if name == "__metadata__":
-                continue
-            a, b = meta["data_offsets"]
-            spans[name] = spans.get(name, 0) + (int(b) - int(a))
     out = SourceByteManifest()
     provenance: dict[str, set[str]] = {}
 
@@ -411,13 +470,14 @@ def source_tensor_bytes_manifest(
         out[live] = out.get(live, 0) + nb
         provenance.setdefault(live, set()).add(span_key)
 
-    for name, nb in spans.items():
+    for name, total in source_tensor_span_bytes(model_path).items():
         if any(name.endswith(s) for s in _SIDECAR_SUFFIXES):
-            continue  # folded into its base tensor's entry below
+            # A standalone sidecar with no base tensor is never re-encoded and
+            # stays priced in the floor, so it needs no manifest entry.
+            continue
         # Packed 3-D expert params have no ".weight" suffix; the key IS the
         # base (and its sidecars still hang off `<base>.scale` etc.).
-        base = name[: -len(".weight")] if name.endswith(".weight") else name
-        total = nb + sum(spans.get(base + s, 0) for s in _SIDECAR_SUFFIXES)
+        base = source_span_identity(name)
         # A live-graph mapper declining a key does NOT mean the tensor has no
         # source bytes, so it must not drop out of the manifest: MTP sidecars
         # are the live case (transformers v5 removed the module, so

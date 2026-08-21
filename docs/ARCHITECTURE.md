@@ -1,7 +1,26 @@
 # PrismaQuant Architecture
 
-As of: 2026-08-21 · `feat/cb-lane-sharding` — stamps follow, newest first, each
-recording its own branch and date. Re-stamped (2026-08-21,
+As of: 2026-08-21 · `main` — stamps follow, newest first, each recording
+its own branch and date. Re-stamped (2026-08-21,
+`feat/decode-read-bytes-stat`) for **per-token decode read bytes as a
+first-class exported stat** (§7, `read_gb_per_token`). An artifact has two
+rates, and we only ever reported one: bpp prices the disk, while decode
+throughput is set by the bytes streamed per generated token — and on a sparse
+MoE those diverge by ~40x on the dense-vs-expert margin, because a dense weight
+is read every token while an expert stack is read `topk/E` of the time. On the
+shipped DSv4-Flash 87 GB artifact the dense path is **8.3% of the checkpoint and
+76.8% of the read**; on Ornith-1.5-35B-A3B's export, **10.4% and 81.5%**. The
+allocator's byte budget cannot see this, so it overspends decode bandwidth on
+the dense path. Principle 1 says that is a measurement gap: `read_traffic.py`
+measures it exactly (no estimates — assigned units priced by the footprint
+primitives, everything else by the checkpoint's own spans, the whole ledger
+reconciled against `assignment_artifact_bytes` to the byte before any
+probability is applied), and it is stamped beside `achieved_bpp` on the
+exporter card, the CB card, and every `validate_assignments_kl` result.
+Embedding, MTP sidecar, and non-text-graph tensors are **excluded but
+itemized**, never silently dropped; CB codebooks are reported as resident
+bytes. **No allocator change** — pricing the axis inside the DP is a separate
+decision. Re-stamped (2026-08-21,
 `feat/cb-lane-sharding`) for **the CB lane joining the ~1 GiB shard standard**
 (§"Output packaging"). Both CB exporters take `--shard-bytes` with the native
 lane's 1 GiB default, `run-pipeline.sh` passes `EXPORT_SHARD_BYTES` on the CB
@@ -3258,6 +3277,115 @@ recorded, so the precedence fix above already closes that specific instance; the
 the independent net that does not depend on getting precedence right.) Tests:
 `tests/test_shipcard.py::test_recipe_priced_bpp_*`,
 `::test_achieved_bpp_cross_check_*`.
+
+**`read_gb_per_token` — the second rate, stamped wherever `achieved_bpp` is**
+(`prismaquant/read_traffic.py`, campaign rule R2, 2026-08-21). bpp measures what an
+artifact costs on disk; it does **not** measure what decode costs, because decode
+throughput is governed by the bytes streamed per generated token and a sparse MoE reads
+only `topk/E` of its expert mass on any one token. Measured on the shipped DSv4-Flash
+87 GB artifact: the dense path is **8.3% of the checkpoint but 76.8% of decode read
+traffic** (8.0576 GB/token at batch 1); re-measured on Ornith-1.5-35B-A3B's 24.62 GB
+export it is **10.4% of the checkpoint and 81.5% of the read** (3.127 GB/token). The
+allocator's byte budget is blind to that ~40x divergence in dense-vs-expert marginal
+pricing, so it systematically overspends decode bandwidth on the dense path. Per
+principle 1 that is a **measurement gap**, and this is the measurement; nothing in
+`allocator_solver.py` changed, and pricing the axis inside the DP is a separate decision.
+
+The definition is exact, not an estimate:
+`read_bytes_per_token = Σ_tensor stored_bytes(tensor) × read_probability(tensor)`.
+`READ_CLASS_TABLE` (`read_traffic.py`) is the single authority for the second factor:
+routed-expert stacks get `num_experts_per_tok / n_routed_experts` (exact as an
+expectation under the per-layer-uniform expert invariant §6.4 — routing skew changes
+*which* experts are read, not how many bytes); allocator-assigned always-active units
+(`dense`) and always-active tensors the allocator never decided (`held_fixed` — norms,
+biases, routers, a pinned `lm_head`, and grouped operands the probe skips such as DSv4's
+`attn.wo_a`) get `1.0`. Both `topk` and `E` are read from the architecture's own config
+declarations and **cross-checked against the tensors' measured stack depth**; an MoE
+model that declares neither is refused rather than defaulted (principle 2 — the
+`moe_imatrix` "assume 8" fallback would mis-price the largest term in the ledger).
+
+Four classes are **excluded but itemized**, never silently dropped: an **untied** input
+embedding (one row is gathered per token, not the table), **indexed lookup tables** (below),
+the MTP/draft sidecar (read every token under spec-decode and never without it — the honest
+default is excluded, and `excluded.mtp_bytes` lets a spec-decode serve add it back exactly),
+and anything the model profile's own `checkpoint_to_live_name` declines to map into the live
+text graph (vision/audio towers). `ModelProfile.embedding_name()` (`model_profiles/base.py`, spec key
+`shard_regexes.embedding_name`) is the twin of `lm_head_name()` and exists so "which
+tensor is the embedding" is a declaration rather than a substring test.
+
+**Tied embeddings are streamed, and that is decided by observation.** Under
+`tie_word_embeddings` the embedding table *is* the output projection and the logits matmul
+reads all of it every token, so excluding it would drop one of the largest always-active
+tensors in the model (Qwen3-0.6B and LFM2.5 both tie). The invariant
+`read_traffic.resolve_embedding_disposition` rests on is that **the logits projection is
+streamed exactly once per token**: the embedding is `excluded_embedding` when the
+checkpoint carries a separate output-projection tensor and `held_fixed` when it does not.
+The config's `tie_word_embeddings` is a cross-check, not the decision — a config declaring
+*untied* over a checkpoint with no output projection raises rather than picking a story,
+and a config that merely omits the key is answered by the tensors (transformers defaults
+that key to `True`, exactly the implicit default principle 2 forbids leaning on). The
+resolution is reported per artifact under `embedding` (`streamed_per_token`, `read_class`,
+`lm_head_tensor_present`, `config_tie_word_embeddings`, `reason`). It reads both namespaces
+because the two declarations live in different ones: `lm_head_name()` is the checkpoint
+spelling (DSv4 says `head`), `embedding_name()` the live one.
+
+**An indexed lookup takes three facts, because each weaker rule was falsified on a real
+artifact.** DSv4 ships `ffn.gate.tid2eid` — I64 `[129280, 6]`, token id to its six expert
+ids — 18.6 MB read one row at a time, not streamed. But integer dtype alone does not mean
+lookup: the packed weight payload of **both** quantized lanes is `U8` (81.65 GB of
+`cb_qweight` on the DSv4 body, 15.7 GB of NVFP4 `weight_packed` on Ornith), so a dtype-only
+rule excludes 94% of that artifact. Adding "leading axis is the vocabulary" is still not
+enough — a **quantized `lm_head`** is both, and on the `embed-smoke` CB-head export that
+two-fact rule dropped 857,736 B of real logits traffic, an *under*-count. So
+`read_traffic.is_indexed_lookup` requires all three: integer dtype **and**
+`shape[0] == vocab_size` **and** the module is not declared a quantized weight — neither by
+a float scale sidecar (suffixes from `footprint._SIDECAR_SUFFIXES`) nor by the artifact's own
+`config_groups[*].targets` (`quantization_targets()`; the CB lane needs this half, since a
+CB payload keeps its scales in the codebook sidecar and has no scale tensor in the shard set).
+The residual is one-directional by construction: anything the three facts cannot establish
+stays at `p=1` and **over**-counts. Every report carries an `indexed_lookups` block naming
+the rule, the vocab size, and how many integer bytes were read in full, so the over-count is
+visible rather than silent.
+
+CB codebook tables are reported as `resident_bytes`, not stream traffic — and the CB lane
+ships them in a globbed sidecar *outside* the shard set, invisible to the safetensors
+ledger, so the post-export form reads the artifact's own `quant_config.json`
+`codebook_file` declaration, counts it as resident after the shard reconciliation has
+passed, and **refuses** when the declared file is absent (687 KB on the shipped DSv4 CB
+artifact; a reported `0` there would have been the same silent zero this module refuses
+everywhere else).
+
+Stored bytes are **not** a second copy of the byte math. Assigned units are priced by
+`footprint.format_tensor_payload_breakdown` / the CB payload breakdown; every other
+tensor is priced from the checkpoint's own safetensors spans via the new
+`footprint.source_tensor_span_bytes`, which asserts it partitions the checkpoint exactly.
+The two halves are then **reconciled against `footprint.assignment_artifact_bytes`
+before any probability is applied**, and a one-byte disagreement raises — a ledger that
+cannot drift without failing is what makes this reuse rather than duplication (project
+memory: a silent zero in a per-tensor score ranks the broken arm first).
+
+Where it is stamped, always beside the bpp: `export_native_compressed._write_shipcard`
+and `shipcard.open_cb_export_shipcard` stamp `build.read_gb_per_token` measured from the
+shards just written (`read_traffic.read_traffic_claim`), which cannot describe a
+different assignment than the one on disk; `validate_assignments_kl` stamps a per-result
+`read_gb_per_token` computed from the candidate assignment
+(`assignment_read_traffic_claim`). All three are **advisory** in the same sense
+`allocator_achieved_bpp`'s cross-check is: a failure reports a named `reason` rather than
+stranding a finished export. Every claim carries `scope` (weights only, batch 1, KV cache
+and activations excluded — so the figure is a lower bound on real decode traffic), the
+four-key `breakdown` (`dense` / `routed` / `held_fixed` / `resident_codebooks`), the
+itemized `excluded` bytes, and the `routing` factor with the config keys it came from.
+Tests: `tests/test_read_traffic.py` (exact hand-computed ledger on a synthetic 4-expert
+model, the `p = topk/E` and `p = 1` property, the classification table, tied/untied
+embedding disposition, the three-fact lookup rule with both foils, the CB codebook sidecar,
+and every refusal). Measured against real artifacts on both lanes: the shipped DSv4-Flash CB
+87.08 GB body reconciles exactly and lands at **8.0576 GB/token**, matching the campaign's
+independently measured 8.0576 to seven significant figures, with `excluded_indexed_lookup`
+18.6 MB, `resident_codebooks` 687 KB and `excluded_non_text_graph` 0; Ornith-1.5-35B-A3B's
+compressed-tensors export reconciles at 24,623,875,824 B for 3.127 GB/token. The
+post-export form cannot split `dense` from `held_fixed` — a shipped checkpoint carries no
+allocator/floor distinction on disk, so `breakdown.dense` is `0` there by construction and
+the split is only meaningful in the pre-export `assignment_read_traffic` form.
 
 Also on the card: exact `artifact_bytes`, format histogram, the render-lever
 echo (`_render_lever_provenance()`, shared with the export cache's fingerprint so the two
