@@ -195,10 +195,12 @@ SOURCE_PASSTHROUGH_CONTRACTS: dict[str, SourcePassthroughContract] = {
             serving_route=ROUTE_GRIDBOOK_FP8_SOURCE_W8A16,
             route_status=ROUTE_STATUS_BACKED,
             route_requirement=(
-                "Gridbook 0.8.5 commit "
-                "e992e5980c96333a48149f96392d6cff56ae9e3f with "
-                "runtime-contract v3 feature "
-                "abi_features.source_fp8_block128_w8a16=1"
+                "a Gridbook release attesting "
+                "abi_features.source_fp8_block128_w8a16=1; first released in "
+                "0.8.5 commit e992e5980c96333a48149f96392d6cff56ae9e3f under "
+                "runtime-contract v3, and carried unchanged by the currently "
+                "pinned 0.8.11 commit "
+                "187c7216b9d4882321c1923de0b4c49dc139743c under v4"
             ),
             detail=(
                 "block-FP8 with UE8M0 block exponents, consumed by "
@@ -209,12 +211,16 @@ SOURCE_PASSTHROUGH_CONTRACTS: dict[str, SourcePassthroughContract] = {
                 "separate ship gate, not an exporter route override."
             ),
             route_evidence=(
-                "Gridbook 0.8.5 commit e992e5980c96333a48149f96392d6cff56ae9e3f; "
+                "measured on Gridbook 0.8.5 commit "
+                "e992e5980c96333a48149f96392d6cff56ae9e3f; "
                 "installed-wheel GPU gate on GB10/sm121: 91 passed, 0 skipped. "
                 "Fp8SourceW8A16LinearMethod keeps raw E4M3/UE8M0 planes "
                 "resident, dispatches decode to native GEMV and prefill to "
                 "the owned grouped BF16 CUTLASS bridge, and attests the exact "
-                "JIT extension identity/capability."
+                "JIT extension identity/capability. Carried forward to the "
+                "pinned 0.8.11 on the packaged contract's unchanged "
+                "source_fp8_block128_w8a16 attestation; the GPU gate has not "
+                "been re-run on 0.8.11."
             ),
         ),
         # DeepSeek-V4 routed experts: nibble-packed E2M1 + E8M0 group scales.

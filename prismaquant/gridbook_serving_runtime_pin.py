@@ -1,8 +1,10 @@
 """Strict reader for the current Gridbook serving-runtime release pin.
 
-The historical ``gridbook_runtime_pin.v3`` remains immutable producer and
-handoff evidence for the 0.8.5 render.  Serving is a distinct consumer
-boundary: it requires the v4 ABI and an exact reviewed wheel digest.
+``gridbook_runtime_pin.v3`` is the PRODUCER pin, which since 2026-08-21 names
+the same release as this one (0.8.11) and is held in lockstep with it by
+``tests/test_gridbook_runtime_boundary.py``.  Serving remains a distinct
+consumer boundary: it additionally requires an exact reviewed wheel digest,
+which the producer pin does not carry.
 This module deliberately accepts conspicuous pending sentinels structurally
 so a release patch can be reviewed before Gridbook is cut, while every live
 serve/ship gate rejects those sentinels.
@@ -83,13 +85,22 @@ GRIDBOOK_SERVING_RUNTIME_WHEEL_SHA256_PENDING = (
 # its exact prior semantics, so the canonical gold environment -- which pins
 # PRISMAQUANT_CB_MOE_PERSISTENT_B=0 and PRISMAQUANT_CB_GEMV=inherited --
 # reproduces the recorded gold routes unchanged under this wheel.
-# PRISMAQUANT_CB_FP8_GEMV_V2 is deliberately NOT added to the closed
-# Gridbook-0.8.5 measurement registry (gridbook_environment.py -- that profile
-# is release evidence and its scan refuses namespace changes); a gold replay
-# under this wheel therefore serves the qualified K28 GEMV cell in the routed
-# decode band by default, which the 0.8.9 default-state served leg measured
-# end-to-end on the shipped clean 87 GB body: kl_mean +0.17 %, PPL -0.06 % vs
-# the gold record, inside the +/-0.7 % cross-session KL envelope).  But 0.8.9
+# PRISMAQUANT_CB_FP8_GEMV_V2 was originally left OUT of that closed registry
+# on the reasoning that the registry was 0.8.5 release evidence whose scan
+# refuses namespace changes, so a gold replay served the qualified K28 GEMV
+# cell in the routed decode band BY DEFAULT -- which the 0.8.9 default-state
+# served leg measured end-to-end on the shipped clean 87 GB body: kl_mean
+# +0.17 %, PPL -0.06 % vs the gold record, inside the +/-0.7 % cross-session
+# KL envelope.  SUPERSEDED 2026-08-21: the PRODUCER pin advanced to 0.8.11, so
+# gridbook_environment.py now describes the 0.8.11 namespace and the name is
+# registered there with canonical gold value "0", like every other dispatch
+# kill switch in that table.  A gold replay therefore now pins the sibling OFF
+# and takes the inherited kernel on every routed FP8-CB stack.  That is a
+# deliberate determinism choice, not a quality one -- the leg above says the
+# two dispatches agree inside the cross-session envelope -- and it stops a
+# future runtime default from silently moving the gold lane's kernels.
+# Re-baselining gold ONTO the auto dispatch remains available, but it is a
+# reviewed re-measurement, not a side effect of a pin bump.)  But 0.8.9
 # also shipped a load regression its own suite could not see: the tri-state
 # refactor renamed a moe_gemv_select symbol that gridbook/moe_mixed.py still
 # imported, so any artifact declaring per_expert_format_groups (a split-bank

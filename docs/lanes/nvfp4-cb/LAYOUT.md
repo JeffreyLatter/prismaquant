@@ -234,7 +234,7 @@ laid out exactly as the 2-D case; expert `e` = `cb_qweight[e]`), and the fp8
 `(E, 1, in)` when provided (a single `(in,)` vector is broadcast to all
 experts). A uniform stack shares one format; the existing per-expert-format
 declaration may instead partition its experts into physical rung sub-stacks.
-With released Gridbook 0.8.5, learned FP8-CB stacks may
+From released Gridbook 0.8.5 on (the pin is 0.8.11), learned FP8-CB stacks may
 carry one pooled book per logical gate/up/down role: `gate_up_proj` stays one physical
 tensor, while ordinary logical `gate_proj` and `up_proj` config targets carry
 distinct refs and select row-offset blocks. Split logical targets retain their

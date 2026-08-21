@@ -434,10 +434,13 @@ def load_eligibility_table(
     """Load the eligibility table attested by the pinned SERVING release.
 
     The SERVING pin resolves this, deliberately and explicitly. PrismaQuant
-    carries two Gridbook pins -- a producer pin (0.8.5) and a serving pin
-    (0.8.11) -- and ``serving_profiles.gridbook_runtime_version()`` reads the
-    PRODUCER one. Route status is a statement about what the *serve* executes,
-    so resolving it through the producer pin would attest the wrong release.
+    carries two Gridbook pins -- a producer pin and a serving pin, both naming
+    0.8.11 since 2026-08-21 -- and
+    ``serving_profiles.gridbook_runtime_version()`` reads the PRODUCER one.
+    Route status is a statement about what the *serve* executes, so resolving
+    it through the producer pin would attest the wrong release whenever the
+    two diverge again; the lockstep test makes divergence loud, not
+    impossible, and this module stays bound to the serving pin regardless.
     That exact confusion already produced one defect (the feasibility
     certifier stamped the producer pin into a serving-scoped claim).
     """

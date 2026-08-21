@@ -2195,7 +2195,8 @@ def _unit_claim_names(unit: str, profile, is_routed_expert_unit) -> tuple[str, .
     role it names and the stack is covered when both roles are.
 
     This is the pinned runtime's own resolution rule rather than a widening.
-    Gridbook 0.8.5 ``_resolve_moe_codebook_roles`` gathers ``codebook_ref`` per
+    The pinned Gridbook's ``_resolve_moe_codebook_roles`` (read at 0.8.5,
+    unchanged in the pinned 0.8.11) gathers ``codebook_ref`` per
     role across the targets matching a stack, refuses two targets claiming one
     role with different books, and refuses a stack naming no book for some
     role.  Checker and consumer thus still refuse together.  The decomposition

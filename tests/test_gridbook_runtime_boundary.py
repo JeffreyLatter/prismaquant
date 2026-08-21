@@ -9,6 +9,13 @@ from pathlib import Path
 import re
 import subprocess
 
+from prismaquant.gridbook_runtime_pin import (
+    GRIDBOOK_REQUIRED_ABI_FEATURES,
+    GRIDBOOK_RUNTIME_CONTRACT_SCHEMA,
+    GRIDBOOK_RUNTIME_PIN_SCHEMA,
+    GRIDBOOK_RUNTIME_RELEASE_COMMIT,
+    GRIDBOOK_RUNTIME_RELEASE_VERSION,
+)
 from prismaquant.gridbook_serving_runtime_pin import (
     GRIDBOOK_SERVING_RUNTIME_RELEASE_COMMIT,
     GRIDBOOK_SERVING_RUNTIME_RELEASE_WHEEL_SHA256,
@@ -68,18 +75,22 @@ def test_gridbook_pins_separate_immutable_producer_from_current_serving():
         "schema", "repository", "commit", "version", "version_is_release",
         "runtime_contract_schema", "required_abi_features",
     }
-    assert payload["schema"] == "prismaquant.gridbook_runtime_pin.v3"
+    # Bound to the module constants for the same reason the serving block
+    # below is (see its comment): the invariant is that the packaged JSON and
+    # the module agree, not that the pin may never move.  Re-typed literals
+    # here are what made the 0.8.5 -> 0.8.11 advance a multi-file edit.
+    assert payload["schema"] == GRIDBOOK_RUNTIME_PIN_SCHEMA
     assert payload["repository"] == "https://github.com/RobTand/gridbook.git"
-    assert payload["commit"] == "e992e5980c96333a48149f96392d6cff56ae9e3f"
+    assert payload["commit"] == GRIDBOOK_RUNTIME_RELEASE_COMMIT
     assert re.fullmatch(r"[0-9]+(?:[.][0-9]+)+(?:[A-Za-z0-9.+-]*)?",
                         payload["version"])
+    assert payload["version"] == GRIDBOOK_RUNTIME_RELEASE_VERSION
     assert isinstance(payload["version_is_release"], bool)
     assert payload["version_is_release"] is True
-    assert payload["runtime_contract_schema"] == "gridbook.runtime-contract.v3"
-    assert payload["required_abi_features"] == {
-        "routed_moe_per_role_codebook_lut": 1,
-        "source_fp8_block128_w8a16": 1,
-    }
+    assert payload["runtime_contract_schema"] == GRIDBOOK_RUNTIME_CONTRACT_SCHEMA
+    assert payload["required_abi_features"] == dict(
+        GRIDBOOK_REQUIRED_ABI_FEATURES
+    )
     serving = json.loads(SERVING_PIN.read_text(encoding="utf-8"))
     assert serving == {
         "schema": "prismaquant.gridbook_serving_runtime_pin.v1",
@@ -108,6 +119,56 @@ def test_gridbook_pins_separate_immutable_producer_from_current_serving():
     assert serving["commit"] != GRIDBOOK_SERVING_RUNTIME_COMMIT_PENDING
     assert serving["wheel_sha256"] != GRIDBOOK_SERVING_RUNTIME_WHEEL_SHA256_PENDING
     assert serving["version_is_release"] is True
+
+
+def test_producer_and_serving_pins_name_the_same_gridbook_release():
+    """The two pins move in lockstep; drift between them is a defect.
+
+    2026-08-21.  PrismaQuant carries two pins for two different jobs -- the
+    producer pin authorizes builds/exports and the gold measurement
+    environment, the serving pin authorizes route status and the serve wheel
+    -- and nothing required them to agree.  They drifted three releases: the
+    producer pin sat at 0.8.5 while every gate, certificate and shipped
+    artifact resolved through the serving pin's 0.8.11.  CI went red the way
+    that kind of drift always surfaces sideways: the "pinned Gridbook
+    contract" job installs the PRODUCER pin's commit, and the materialized
+    contract test could only find an indexed contract for a version nothing
+    still pinned.
+
+    Two pins remain the right shape -- the serving pin additionally binds a
+    wheel digest, and a future release may legitimately land on one side
+    first.  But divergence must be a deliberate, visible act.  This test is
+    what makes it visible: advancing one pin without the other fails here,
+    naming both, rather than surfacing three files away as a missing
+    contract.
+    """
+    producer = json.loads(PIN.read_text(encoding="utf-8"))
+    serving = json.loads(SERVING_PIN.read_text(encoding="utf-8"))
+    assert producer["repository"] == serving["repository"]
+    assert producer["commit"] == serving["commit"], (
+        "producer/serving Gridbook pins name different commits: "
+        f"{producer['commit']} vs {serving['commit']}"
+    )
+    assert producer["version"] == serving["version"], (
+        "producer/serving Gridbook pins name different versions: "
+        f"{producer['version']} vs {serving['version']}"
+    )
+    # Same release => same runtime contract and the same ABI closure.  The
+    # pin-file schemas differ on purpose (only the serving pin carries a wheel
+    # digest); the RUNTIME contract they describe cannot.
+    assert producer["runtime_contract_schema"] == (
+        serving["runtime_contract_schema"]
+    )
+    assert producer["required_abi_features"] == (
+        serving["required_abi_features"]
+    )
+    # And the module constants track the files they read.
+    assert GRIDBOOK_RUNTIME_RELEASE_COMMIT == (
+        GRIDBOOK_SERVING_RUNTIME_RELEASE_COMMIT
+    )
+    assert GRIDBOOK_RUNTIME_RELEASE_VERSION == (
+        GRIDBOOK_SERVING_RUNTIME_RELEASE_VERSION
+    )
 
 
 def _version_tuple(text: str) -> tuple[int, ...]:
@@ -346,9 +407,11 @@ def test_helper_and_live_scripts_are_valid_bash():
 def _make_gridbook_checkout(root: Path) -> str:
     (root / "gridbook").mkdir(parents=True)
     (root / "gridbook" / "__init__.py").write_text(
-        '__version__ = "0.8.5"\n', encoding="utf-8")
+        f'__version__ = "{GRIDBOOK_RUNTIME_RELEASE_VERSION}"\n',
+        encoding="utf-8")
     (root / "pyproject.toml").write_text(
-        '[project]\nname = "gridbook"\nversion = "0.8.5"\n',
+        '[project]\nname = "gridbook"\n'
+        f'version = "{GRIDBOOK_RUNTIME_RELEASE_VERSION}"\n',
         encoding="utf-8")
     subprocess.run(["git", "init", "-q"], cwd=root, check=True)
     subprocess.run(["git", "config", "user.email", "test@example.invalid"],
@@ -368,7 +431,8 @@ def test_checkout_override_requires_exact_clean_commit(tmp_path):
     commit = _make_gridbook_checkout(checkout)
     command = (
         f'. "{HELPER}"; '
-        'gridbook_runtime_verify_checkout "$1" "$2" 0.8.5')
+        'gridbook_runtime_verify_checkout "$1" "$2" '
+        f'{GRIDBOOK_RUNTIME_RELEASE_VERSION}')
     clean = _bash(command, str(checkout), commit)
     assert clean.returncode == 0, clean.stderr
     assert clean.stdout.strip() == str(checkout)
@@ -398,7 +462,8 @@ def test_checkout_override_requires_exact_clean_commit(tmp_path):
     safe_command = (
         f'. "{HELPER}"; '
         'PATH="$1:$PATH" GRIDBOOK_TEST_SAFE_DIRECTORY="$2" '
-        'gridbook_runtime_verify_checkout "$2" "$3" 0.8.5')
+        'gridbook_runtime_verify_checkout "$2" "$3" '
+        f'{GRIDBOOK_RUNTIME_RELEASE_VERSION}')
     safe = _bash(safe_command, str(wrapper_dir), str(checkout), commit)
     assert safe.returncode == 0, safe.stderr
     assert safe.stdout.strip() == str(checkout)
@@ -425,7 +490,8 @@ def test_standalone_checkout_rejects_linked_git_metadata(tmp_path):
     )
     command = (
         f'. "{HELPER}"; '
-        'gridbook_runtime_verify_standalone_checkout "$1" "$2" 0.8.5'
+        'gridbook_runtime_verify_standalone_checkout "$1" "$2" '
+        f'{GRIDBOOK_RUNTIME_RELEASE_VERSION}'
     )
     refused = _bash(command, str(linked), commit)
     assert refused.returncode == 2
@@ -446,16 +512,13 @@ def test_prepare_mounts_runtime_source_and_contract_read_only(tmp_path):
     copied_helper = assets / HELPER.name
     shutil.copy2(HELPER, copied_helper)
     (assets / PIN.name).write_text(json.dumps({
-        "schema": "prismaquant.gridbook_runtime_pin.v3",
+        "schema": GRIDBOOK_RUNTIME_PIN_SCHEMA,
         "repository": "https://github.com/RobTand/gridbook.git",
         "commit": commit,
-        "version": "0.8.5",
+        "version": GRIDBOOK_RUNTIME_RELEASE_VERSION,
         "version_is_release": True,
-        "runtime_contract_schema": "gridbook.runtime-contract.v3",
-        "required_abi_features": {
-            "routed_moe_per_role_codebook_lut": 1,
-            "source_fp8_block128_w8a16": 1,
-        },
+        "runtime_contract_schema": GRIDBOOK_RUNTIME_CONTRACT_SCHEMA,
+        "required_abi_features": dict(GRIDBOOK_REQUIRED_ABI_FEATURES),
     }), encoding="utf-8")
 
     prepared = _bash(
@@ -535,16 +598,13 @@ def test_prepare_materializes_linked_worktree_as_standalone_checkout(tmp_path):
     copied_helper = assets / HELPER.name
     shutil.copy2(HELPER, copied_helper)
     (assets / PIN.name).write_text(json.dumps({
-        "schema": "prismaquant.gridbook_runtime_pin.v3",
+        "schema": GRIDBOOK_RUNTIME_PIN_SCHEMA,
         "repository": "https://github.com/RobTand/gridbook.git",
         "commit": commit,
-        "version": "0.8.5",
+        "version": GRIDBOOK_RUNTIME_RELEASE_VERSION,
         "version_is_release": True,
-        "runtime_contract_schema": "gridbook.runtime-contract.v3",
-        "required_abi_features": {
-            "routed_moe_per_role_codebook_lut": 1,
-            "source_fp8_block128_w8a16": 1,
-        },
+        "runtime_contract_schema": GRIDBOOK_RUNTIME_CONTRACT_SCHEMA,
+        "required_abi_features": dict(GRIDBOOK_REQUIRED_ABI_FEATURES),
     }), encoding="utf-8")
     cache = tmp_path / "cache"
     prepared = _bash(
@@ -600,16 +660,13 @@ def test_runtime_helper_rejects_resolved_but_unreleased_pin(tmp_path):
     copied_helper = assets / HELPER.name
     shutil.copy2(HELPER, copied_helper)
     (assets / PIN.name).write_text(json.dumps({
-        "schema": "prismaquant.gridbook_runtime_pin.v3",
+        "schema": GRIDBOOK_RUNTIME_PIN_SCHEMA,
         "repository": "https://github.com/RobTand/gridbook.git",
         "commit": "a" * 40,
-        "version": "0.8.5",
+        "version": GRIDBOOK_RUNTIME_RELEASE_VERSION,
         "version_is_release": False,
-        "runtime_contract_schema": "gridbook.runtime-contract.v3",
-        "required_abi_features": {
-            "routed_moe_per_role_codebook_lut": 1,
-            "source_fp8_block128_w8a16": 1,
-        },
+        "runtime_contract_schema": GRIDBOOK_RUNTIME_CONTRACT_SCHEMA,
+        "required_abi_features": dict(GRIDBOOK_REQUIRED_ABI_FEATURES),
     }), encoding="utf-8")
     refused = _bash(f'bash "{copied_helper}" print-pin')
     assert refused.returncode == 2

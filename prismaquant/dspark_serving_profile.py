@@ -1,9 +1,10 @@
 """Closed Gridbook-0.8.7 serving profile for the paired DSpark release gate.
 
 This is deliberately separate from :mod:`prismaquant.gridbook_environment`.
-That module is the immutable Gridbook-0.8.5 producer/gold authority; changing
-it to describe a later serving experiment would retroactively change the
-meaning of historical evidence.  The profile here is a consumer-side contract
+That module is the producer/gold authority and tracks the producer pin (0.8.5
+when this profile was written, 0.8.11 since 2026-08-21); changing it to
+describe a later serving experiment would retroactively change the meaning of
+historical evidence.  The profile here is a consumer-side contract
 used only when the released target and the separately rendered DSpark draft
 are served together.
 
@@ -222,9 +223,11 @@ class DSparkServingProfileError(ValueError):
     """The current paired DSpark serving contract is not exact."""
 
 
-# A full literal registry is intentional.  Importing the historical 0.8.5
+# A full literal registry is intentional.  Importing the producer/gold
 # registry here as authority would make that producer contract control a later
 # consumer lane and would prevent either side from detecting namespace drift.
+# (Concretely: that registry has since advanced with its pin to 0.8.11, while
+# this literal set stays the 0.8.7 audit it was written from.)
 DSPARK_GRIDBOOK_ENVIRONMENT_ALLOWLIST = tuple(sorted((
     "CUDACXX",
     "CXX",
@@ -311,7 +314,8 @@ DSPARK_PROFILE_CLEARED_ENVIRONMENT = tuple(sorted(
 
 # The process snapshot gets its own allowlist rather than widening the old
 # endpoint/gold allowlist.  Thus old manifests and fingerprints retain their
-# exact 0.8.5 meaning while paired DSpark manifests also bind allocator policy.
+# exact original meaning while paired DSpark manifests also bind allocator
+# policy.
 DSPARK_SERVER_ENV_ALLOWLIST = tuple(sorted({
     "PQ_GRIDBOOK_RUNTIME_COMMIT",
     "PQ_GRIDBOOK_RUNTIME_VERSION",

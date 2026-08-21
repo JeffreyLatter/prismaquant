@@ -19,7 +19,7 @@ PIN_PATH = (
 
 
 def _payload(
-    version="0.8.5",
+    version=pinmod.GRIDBOOK_RUNTIME_RELEASE_VERSION,
     *,
     version_is_release=True,
     features=None,
@@ -84,9 +84,13 @@ def test_capabilities_are_feature_gated_not_version_inferred():
         ("runtime_contract_schema", "gridbook.runtime-contract.v2", "schema"),
         ("required_abi_features", {}, "contain exactly"),
         (
+            # Right key SET, wrong value TYPE: the parser must reject a JSON
+            # boolean even though ``True == 1`` in Python.  Keyed off the
+            # required map so it keeps testing the type check, not the
+            # membership check, when the ABI closure grows.
             "required_abi_features",
             {
-                "routed_moe_per_role_codebook_lut": 1,
+                **dict(pinmod.GRIDBOOK_REQUIRED_ABI_FEATURES),
                 "source_fp8_block128_w8a16": True,
             },
             "integer 1",

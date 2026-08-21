@@ -1,4 +1,4 @@
-"""Pinned Gridbook-0.8.5 serving-environment contract.
+"""Pinned Gridbook-0.8.11 serving-environment contract.
 
 Gridbook resolves some dispatch choices at import/model-load time and reads a
 few CUDA schedule selectors at launch time.  A gold measurement therefore
@@ -30,7 +30,7 @@ from .gridbook_runtime_pin import (
 
 
 GRIDBOOK_ENVIRONMENT_SCHEMA = "prismaquant.gridbook_environment/1"
-PINNED_GRIDBOOK_VERSION = "0.8.5"
+PINNED_GRIDBOOK_VERSION = "0.8.11"
 # A projection of the single packaged pin, not a second independently edited
 # commit constant. Future unresolved pins still surface their fail-closed
 # placeholder here; the current released pin is a full immutable commit.
@@ -49,7 +49,7 @@ class GridbookEnvironmentError(ValueError):
 
 @dataclass(frozen=True)
 class GridbookEnvironmentVariable:
-    """One Gridbook-0.8.5 environment input and its gold-lane disposition."""
+    """One Gridbook-0.8.11 environment input and its gold-lane disposition."""
 
     name: str
     category: str
@@ -75,19 +75,43 @@ def _var(
 
 
 # The values and domains below carry forward the audited Gridbook 0.8.4 set
-# into the released 0.8.5 contract. ``None`` is a contract value: the
+# through the 0.8.5 contract into the released 0.8.11 contract. ``None`` is a
+# contract value: the
 # variable must be
 # absent.  This matters for FUSED_FP4/FUSED_FP4_MOE ("0" is invalid), for the
 # expert-chunk override ("0" is invalid), and for CUDA switches whose source
 # recognizes only a non-default sentinel rather than a canonical default word.
+#
+# 2026-08-21, pin advance 0.8.5 -> 0.8.11: two identifiers were added
+# (PRISMAQUANT_CB_FP8_GEMV_V2, PRISMAQUANT_CB_MOE_PERSISTENT_B_D2R) and no
+# existing ``canonical_gold_value`` changed.  ``gridbook_default`` is
+# documentation of what the PINNED runtime does when the name is unset, so the
+# three selectors whose unset default moved to "auto" in 0.8.9 now say so.
+# The canonical gold values deliberately do NOT follow those defaults: every
+# dispatch selector in this table is pinned to the explicit kernel the gold
+# evidence was measured on, precisely so a runtime-default change cannot move
+# the gold lane's executed kernels without a reviewed decision.  Re-baselining
+# gold onto the 0.8.9+ auto dispatch is such a decision; a pin bump is not.
 GRIDBOOK_ENVIRONMENT_REGISTRY = (
     _var(
         "GRIDBOOK_MXFP8_DENSE", CATEGORY_EXECUTION, None, "disabled",
         "strict boolean: unset, 0, or 1",
     ),
     _var(
-        "PRISMAQUANT_CB_GEMV", CATEGORY_EXECUTION, "inherited", "inherited",
+        "PRISMAQUANT_CB_GEMV", CATEGORY_EXECUTION, "inherited",
+        "auto (since 0.8.9; 'inherited' is the kill switch)",
         "enum: inherited, auto, or v2",
+    ),
+    # The routed FP8-CB whole-row GEMV sibling, independent of the FP4
+    # selector above (different bytes, kernels and evidence).  Gold pins the
+    # kill switch: "0"/off reproduces the pre-0.8.9 inherited dispatch on
+    # every routed FP8-CB stack.  "1"/require is never legal for a DSv4 gold
+    # serve -- it fails the load on any stack outside the qualified
+    # k=28/n_sub=4/type_size=112, K in {2048,4096} cell.
+    _var(
+        "PRISMAQUANT_CB_FP8_GEMV_V2", CATEGORY_EXECUTION, "0",
+        "auto (since 0.8.9; unset means auto)",
+        "enum: unset/auto, 1/require, or 0/off",
     ),
     _var(
         "PRISMAQUANT_CB_FUSED_FP4", CATEGORY_EXECUTION, None, "disabled",
@@ -108,12 +132,20 @@ GRIDBOOK_ENVIRONMENT_REGISTRY = (
         "strict boolean: unset, 0, or 1",
     ),
     _var(
-        "PRISMAQUANT_CB_MOE_PERSISTENT_B", CATEGORY_EXECUTION, "0", "disabled",
-        "strict boolean: unset, 0, or 1",
+        "PRISMAQUANT_CB_MOE_PERSISTENT_B", CATEGORY_EXECUTION, "0",
+        "auto (since 0.8.9; 0 is the kill switch)",
+        "enum: unset/auto, 1/require, or 0/off",
     ),
     _var(
         "PRISMAQUANT_CB_MOE_PERSISTENT_B_CFG", CATEGORY_EXECUTION, "0", "auto",
         "integer 0..number of compiled persistent-B tile configurations",
+    ),
+    # A second switch nested UNDER persistent-B: Gridbook's model-load wiring
+    # rejects it unless PRISMAQUANT_CB_MOE_PERSISTENT_B=1, so with the lane
+    # pinned off above, "0" is the only self-consistent gold value.
+    _var(
+        "PRISMAQUANT_CB_MOE_PERSISTENT_B_D2R", CATEGORY_EXECUTION, "0",
+        "disabled", "strict boolean: unset, 0, or 1",
     ),
     _var(
         "PRISMAQUANT_CB_FUSED_MIDM", CATEGORY_EXECUTION, "1", "enabled",
@@ -326,11 +358,22 @@ def attest_canonical_gold_environment(
 # introduced flag even when the read is indirect.  The following identifiers
 # are present in the audited source but are explicitly not runtime environment
 # inputs.
+#
+# ``VLLM_MOE_SKIP_PADDING`` is a vLLM capability Gridbook NAMES but never
+# reads: in 0.8.11 it occurs only in the ``_neutralize_moe_padding_sentinel``
+# docstring (gridbook/ops.py), and that -1 sentinel normalization is
+# unconditional.  It is therefore not an execution input of this gold lane --
+# gold serves neither set it nor branch on it.  Where it IS an input (the
+# paired DSpark serving profile) it is resolved and attested through
+# ``vllm.envs``, not through this registry; see
+# ``dspark_serving_profile.GRIDBOOK_087_SOURCE_NON_ENVIRONMENT_IDENTIFIERS``.
 GRIDBOOK_SOURCE_NON_ENVIRONMENT_IDENTIFIERS = MappingProxyType({
     "PRISMAQUANT_ARTIFACT_INVENTORY_SCHEMA": "Python schema constant",
+    "PRISMAQUANT_CB_W2_": "documentation wildcard for registered W2 knobs",
     "PRISMAQUANT_OPS_CUDAGRAPH_UNSAFE": "retired no-op mentioned in a comment",
     "VLLM_COMPILE": "external vLLM setting mentioned in documentation",
     "VLLM_CUTLASS": "vLLM backend enum member, not an environment variable",
+    "VLLM_MOE_SKIP_PADDING": "resolved vLLM capability, not a Gridbook env read",
     "VLLM_TEST_FORCE_FP8_MARLIN": "external vLLM test flag mentioned in prose",
 })
 
@@ -344,6 +387,7 @@ _GRIDBOOK_EXPECTED_SOURCE_IDENTIFIERS = frozenset({
     "PRISMAQUANT_CB_EXT_DIR",
     "PRISMAQUANT_CB_FP4V2_SCHED",
     "PRISMAQUANT_CB_FP4_FUSED_MIDM",
+    "PRISMAQUANT_CB_FP8_GEMV_V2",
     "PRISMAQUANT_CB_FP8_SCHED",
     "PRISMAQUANT_CB_FUSED_FP4",
     "PRISMAQUANT_CB_FUSED_FP4_MOE",
@@ -352,9 +396,11 @@ _GRIDBOOK_EXPECTED_SOURCE_IDENTIFIERS = frozenset({
     "PRISMAQUANT_CB_GROUPED_TRIM",
     "PRISMAQUANT_CB_MOE_PERSISTENT_B",
     "PRISMAQUANT_CB_MOE_PERSISTENT_B_CFG",
+    "PRISMAQUANT_CB_MOE_PERSISTENT_B_D2R",
     "PRISMAQUANT_CB_PREFILL",
     "PRISMAQUANT_CB_PREFILL_CHUNK_BYTES",
     "PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK",
+    "PRISMAQUANT_CB_W2_",
     "PRISMAQUANT_CB_W2_ROWS",
     "PRISMAQUANT_CB_W2_SCHED",
     "PRISMAQUANT_CB_W2_WARPS",
@@ -365,6 +411,7 @@ _GRIDBOOK_EXPECTED_SOURCE_IDENTIFIERS = frozenset({
     "PRISMAQUANT_SKIP_CB_CAST_CHECK",
     "VLLM_COMPILE",
     "VLLM_CUTLASS",
+    "VLLM_MOE_SKIP_PADDING",
     "VLLM_TEST_FORCE_FP8_MARLIN",
     "VLLM_USE_DEEP_GEMM",
 })

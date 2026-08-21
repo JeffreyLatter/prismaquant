@@ -13,12 +13,14 @@ from prismaquant import gridbook_environment as envmod
 EXECUTION = (
     "GRIDBOOK_MXFP8_DENSE",
     "PRISMAQUANT_CB_GEMV",
+    "PRISMAQUANT_CB_FP8_GEMV_V2",
     "PRISMAQUANT_CB_FUSED_FP4",
     "PRISMAQUANT_CB_FUSED_FP4_MOE",
     "PRISMAQUANT_CB_BF16_SM120",
     "PRISMAQUANT_CB_FP4_FUSED_MIDM",
     "PRISMAQUANT_CB_MOE_PERSISTENT_B",
     "PRISMAQUANT_CB_MOE_PERSISTENT_B_CFG",
+    "PRISMAQUANT_CB_MOE_PERSISTENT_B_D2R",
     "PRISMAQUANT_CB_FUSED_MIDM",
     "PRISMAQUANT_CB_GROUPED_TRIM",
     "PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK",
@@ -57,6 +59,7 @@ CANONICAL = {
     "PRISMAQUANT_CB_EXT_DIR": None,
     "PRISMAQUANT_CB_FP4V2_SCHED": None,
     "PRISMAQUANT_CB_FP4_FUSED_MIDM": "0",
+    "PRISMAQUANT_CB_FP8_GEMV_V2": "0",
     "PRISMAQUANT_CB_FP8_SCHED": None,
     "PRISMAQUANT_CB_FUSED_FP4": None,
     "PRISMAQUANT_CB_FUSED_FP4_MOE": None,
@@ -65,6 +68,7 @@ CANONICAL = {
     "PRISMAQUANT_CB_GROUPED_TRIM": "1",
     "PRISMAQUANT_CB_MOE_PERSISTENT_B": "0",
     "PRISMAQUANT_CB_MOE_PERSISTENT_B_CFG": "0",
+    "PRISMAQUANT_CB_MOE_PERSISTENT_B_D2R": "0",
     "PRISMAQUANT_CB_PREFILL": None,
     "PRISMAQUANT_CB_PREFILL_CHUNK_BYTES": "1073741824",
     "PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK": None,
@@ -145,7 +149,7 @@ def test_attestation_receipt_is_full_and_fails_closed_on_set_and_unset_drift():
     )
     assert receipt == {
         "schema": envmod.GRIDBOOK_ENVIRONMENT_SCHEMA,
-        "gridbook_version": "0.8.5",
+        "gridbook_version": "0.8.11",
         "gridbook_commit": envmod.PINNED_GRIDBOOK_COMMIT,
         "environment": CANONICAL,
     }
@@ -168,8 +172,10 @@ def test_attestation_receipt_is_full_and_fails_closed_on_set_and_unset_drift():
 
 def test_registry_matches_the_packaged_runtime_contract():
     envmod.require_pinned_gridbook_runtime()
+    # Deliberately a literal, not the module constant: this test is the second
+    # independent witness that the packaged pin is the reviewed release.
     assert envmod.PINNED_GRIDBOOK_COMMIT == (
-        "e992e5980c96333a48149f96392d6cff56ae9e3f"
+        "187c7216b9d4882321c1923de0b4c49dc139743c"
     )
 
 
@@ -252,6 +258,17 @@ def test_released_source_domains_explain_every_required_unset_default():
     ).read_text(encoding="utf-8")
     assert '_TRUE = ("1",)' in lane_select
     assert '_FALSE = ("", "0")' in lane_select
+    # The two identifiers registered when the producer pin advanced to 0.8.11.
+    # The FP8 sibling is a tri-state whose "0" spelling means off; D2R is a
+    # plain latched_bool, so "0" is in its domain via _FALSE above.
+    assert '_CB_FP8_GEMV_V2_ENV = "PRISMAQUANT_CB_FP8_GEMV_V2"' in (
+        root / "gridbook" / "moe_gemv_select.py"
+    ).read_text(encoding="utf-8")
+    persistent_b = (root / "gridbook" / "moe_persistent_b_lane.py").read_text(
+        encoding="utf-8"
+    )
+    assert '_D2R_FLAG = "PRISMAQUANT_CB_MOE_PERSISTENT_B_D2R"' in persistent_b
+    assert "lane_select.latched_bool(\n        _D2R_FLAG," in persistent_b
     assert '!pq_env_is("PRISMAQUANT_CB_FP8_SCHED", "legacy")' in gemv
     assert 'pq_env_is("PRISMAQUANT_CB_FP4V2_SCHED", "db")' in gemv
     assert 'pq_env_is("PRISMAQUANT_CB_W2_SCHED", "legacy")' in gemv

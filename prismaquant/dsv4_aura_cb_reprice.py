@@ -28,6 +28,7 @@ import shutil
 import sys
 
 from prismaquant import format_registry as fr
+from prismaquant.gridbook_runtime_pin import GRIDBOOK_RUNTIME_RELEASE_VERSION
 from prismaquant.anchored_cost import (
     AURA_CURRENCY,
     RenderRequest,
@@ -156,7 +157,7 @@ DSV4_W8A16_APPROVED_SELECTION = {
 # and the fused mainloop's single CbSubW = k/4 sub-table width is the format's
 # real layout only on those rungs -- a uniform decode at, say, k37 would be
 # *wrong*, not merely unaligned.  serving_profile_specs/nvfp4_cb.json backs
-# [28, 32, 36, 40, 44, 48] for every runtime 0.5.0..0.8.5 (the pin is 0.8.5,
+# [28, 32, 36, 40, 44, 48] for every runtime 0.5.0..0.8.11 (the pin is 0.8.11,
 # version_is_release, and its packaged contract explicitly attests the routed
 # per-role LUT ABI), so this is the served set, not an aspiration. NVFP4-CB
 # is outside that law -- its lane backs no fused mid-M rungs at any version --
@@ -834,7 +835,14 @@ def _w8a16_format_plan_delta(
     historical_plan: object,
     current_plan: object,
 ) -> dict[str, object]:
-    """Prove the 0.8.4 -> 0.8.5 plan change is version metadata only."""
+    """Prove the 0.8.4 -> pinned-release plan change is version metadata only.
+
+    The historical side is a recorded artifact fact and stays the 0.8.4
+    literal.  The current side is whatever the producer pin names today, so it
+    binds to the pin constant: the gate's claim is that only the version
+    metadata moved, not that the runtime never advances.  Every non-version
+    field is still compared exactly below, so a real plan change still fails.
+    """
 
     historical = historical_plan.to_dict()
     current = current_plan.to_dict()
@@ -857,12 +865,15 @@ def _w8a16_format_plan_delta(
         "runtime_version": "0.8.4",
         "rungs_source": "serving_profile_spec:0.8.4",
     } or new_delta != {
-        "runtime_version": "0.8.5",
-        "rungs_source": "serving_profile_spec:0.8.5",
+        "runtime_version": GRIDBOOK_RUNTIME_RELEASE_VERSION,
+        "rungs_source": (
+            f"serving_profile_spec:{GRIDBOOK_RUNTIME_RELEASE_VERSION}"
+        ),
     }:
         raise DSv4CampaignError(
             "W8A16 readmission format-plan version delta is not the approved "
-            f"0.8.4 -> 0.8.5 transition: old={old_delta}, new={new_delta}"
+            f"0.8.4 -> {GRIDBOOK_RUNTIME_RELEASE_VERSION} transition: "
+            f"old={old_delta}, new={new_delta}"
         )
     old_normalized = dict(historical)
     new_normalized = dict(current)
@@ -2686,6 +2697,7 @@ def _assert_w8a16_legacy_receipt(
 def _w8a16_runtime_contract_proof() -> dict[str, object]:
     from prismaquant.gridbook_runtime_pin import (
         GRIDBOOK_RUNTIME_CONTRACT_SCHEMA,
+        GRIDBOOK_RUNTIME_RELEASE_VERSION as PINNED_VERSION,
         load_gridbook_runtime_pin,
         require_exact_gridbook_runtime_release,
         supports_source_fp8_block128_w8a16,
@@ -2699,14 +2711,15 @@ def _w8a16_runtime_contract_proof() -> dict[str, object]:
             f"W8A16 readmission requires a resolved Gridbook release pin: {exc}"
         ) from exc
     if (
-        pin.version != "0.8.5"
+        pin.version != PINNED_VERSION
         or pin.version_is_release is not True
         or pin.runtime_contract_schema != GRIDBOOK_RUNTIME_CONTRACT_SCHEMA
         or not supports_source_fp8_block128_w8a16(pin)
     ):
         raise DSv4CampaignError(
-            "W8A16 readmission requires released Gridbook 0.8.5 with "
-            "runtime-contract v3 source_fp8_block128_w8a16=1"
+            f"W8A16 readmission requires released Gridbook {PINNED_VERSION} "
+            f"with {GRIDBOOK_RUNTIME_CONTRACT_SCHEMA} "
+            "source_fp8_block128_w8a16=1"
         )
     return {
         "schema": pin.schema,

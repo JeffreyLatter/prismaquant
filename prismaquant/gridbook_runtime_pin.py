@@ -18,21 +18,22 @@ from typing import Any
 
 GRIDBOOK_RUNTIME_PIN_SCHEMA = "prismaquant.gridbook_runtime_pin.v3"
 GRIDBOOK_RUNTIME_REPOSITORY = "https://github.com/RobTand/gridbook.git"
-GRIDBOOK_RUNTIME_RELEASE_VERSION = "0.8.5"
+GRIDBOOK_RUNTIME_RELEASE_VERSION = "0.8.11"
 GRIDBOOK_RUNTIME_RELEASE_COMMIT = (
-    "e992e5980c96333a48149f96392d6cff56ae9e3f"
+    "187c7216b9d4882321c1923de0b4c49dc139743c"
 )
 # Historical staging sentinel retained so parsers and third-party tooling can
-# reject an unresolved future pin explicitly. The packaged v0.8.5 pin is now a
+# reject an unresolved future pin explicitly. The packaged v0.8.11 pin is now a
 # full immutable commit and does not use this value.
-GRIDBOOK_RUNTIME_COMMIT_PENDING = "PENDING_GRIDBOOK_V0_8_5_RELEASE_COMMIT"
-GRIDBOOK_RUNTIME_CONTRACT_SCHEMA = "gridbook.runtime-contract.v3"
+GRIDBOOK_RUNTIME_COMMIT_PENDING = "PENDING_GRIDBOOK_V0_8_11_RELEASE_COMMIT"
+GRIDBOOK_RUNTIME_CONTRACT_SCHEMA = "gridbook.runtime-contract.v4"
 # Historical diagnostic floor retained for error prose and third-party callers.
 # Capability decisions no longer use it; they read the closed feature map.
 GRIDBOOK_ROUTED_MOE_PER_ROLE_CODEBOOK_LUT_MIN_VERSION = "0.8.4"
 GRIDBOOK_REQUIRED_ABI_FEATURES = {
     "routed_moe_per_role_codebook_lut": 1,
     "source_fp8_block128_w8a16": 1,
+    "dspark_construction_physical_bridge": 1,
 }
 _REQUIRED_MEMBERS = {
     "schema",
@@ -202,12 +203,23 @@ def supports_source_fp8_block128_w8a16(pin: GridbookRuntimePin) -> bool:
     return pin.required_abi_features.get("source_fp8_block128_w8a16") == 1
 
 
+def supports_dspark_construction_physical_bridge(
+    pin: GridbookRuntimePin,
+) -> bool:
+    """Whether the consumer contract requires the DSpark physical bridge ABI."""
+
+    return pin.required_abi_features.get(
+        "dspark_construction_physical_bridge"
+    ) == 1
+
+
 def require_resolved_gridbook_runtime_pin(pin: GridbookRuntimePin) -> None:
     """Refuse release work while the conspicuous commit placeholder remains."""
 
     if not pin.commit_is_resolved:
         raise GridbookRuntimePinError(
-            "Gridbook v0.8.5 exact release commit is still unresolved"
+            f"Gridbook v{GRIDBOOK_RUNTIME_RELEASE_VERSION} exact release "
+            "commit is still unresolved"
         )
 
 
@@ -221,7 +233,8 @@ def require_exact_gridbook_runtime_release(pin: GridbookRuntimePin) -> None:
         or pin.version_is_release is not True
     ):
         raise GridbookRuntimePinError(
-            "Gridbook runtime must be exact released v0.8.5 commit "
+            "Gridbook runtime must be exact released "
+            f"v{GRIDBOOK_RUNTIME_RELEASE_VERSION} commit "
             f"{GRIDBOOK_RUNTIME_RELEASE_COMMIT}; observed "
             f"version={pin.version!r} commit={pin.commit!r} "
             f"version_is_release={pin.version_is_release!r}"
@@ -243,6 +256,7 @@ __all__ = [
     "parse_gridbook_runtime_pin",
     "require_exact_gridbook_runtime_release",
     "require_resolved_gridbook_runtime_pin",
+    "supports_dspark_construction_physical_bridge",
     "supports_routed_moe_per_role_codebook_lut",
     "supports_source_fp8_block128_w8a16",
 ]

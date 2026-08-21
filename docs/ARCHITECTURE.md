@@ -2,6 +2,23 @@
 
 As of: 2026-08-21 · `merge/proven-rescues` — stamps follow, newest first, each recording
 its own branch and date. Re-stamped (2026-08-21, `merge/proven-rescues`) for the
+**Gridbook 0.8.11 PRODUCER pin**: the producer pin
+(`gridbook_runtime_pin.json`) advanced 0.8.5/v3 → 0.8.11/v4 at commit
+`187c721`, in lockstep with the serving pin, and a new test
+(`test_gridbook_runtime_boundary.py::test_producer_and_serving_pins_name_the_same_gridbook_release`)
+now makes divergence between the two a failure. The two pins had drifted three
+releases: builds, exports and the gold measurement environment resolved through
+0.8.5 while every route-status gate, certificate and shipped artifact resolved
+through 0.8.11. CI surfaced it sideways — the `gridbook-contract` job installs
+the PRODUCER commit, and only 0.8.10/0.8.11 have indexed materialized
+contracts. Consequences carried in this revision: the closed gold measurement
+environment grew 29 → 31 names (`PRISMAQUANT_CB_FP8_GEMV_V2`,
+`PRISMAQUANT_CB_MOE_PERSISTENT_B_D2R`, both canonical `"0"`), execution 19 →
+21; the 29-name historical projection still hashes to its original digest, so
+the 0.8.5-era gold environment is proven unchanged rather than re-frozen; and
+the FP8-CB fused mid-M backed set is untouched (the `rungs_by_runtime_version`
+table already carried `0.8.11`). Previously re-stamped (2026-08-21,
+`merge/proven-rescues`) for the
 **producer half of campaign rule R1** (§"The learned-codebook selector"): the
 routed book burn and selector (`tools/dsv4_onlaw_book_burn.py`,
 `tools/dsv4_onlaw_book_select.py`) take `--keying stack|role`, defaulting to
@@ -226,7 +243,9 @@ band). Every EXPLICIT spelling keeps its exact 0.8.8 semantics, so the
 canonical gold environment (`PERSISTENT_B=0`, `CB_GEMV=inherited`) replays
 gold routes unchanged; `PRISMAQUANT_CB_FP8_GEMV_V2` stays outside the closed
 Gridbook-0.8.5 measurement registry by design (that profile is release
-evidence and its scan refuses namespace changes), and the 0.8.9 default-state
+evidence and its scan refuses namespace changes) **[superseded 2026-08-21 by
+the producer-pin advance: the registry now describes 0.8.11 and pins that
+selector to `0`; see the top stamp]**, and the 0.8.9 default-state
 served leg on the shipped clean 87 GB body measured kl_mean +0.17 % /
 PPL −0.06 % vs its gold record, inside the ±0.7 % cross-session KL envelope.
 The serving pin moves to 0.8.9/v4 with the wheel digest read from
@@ -583,18 +602,23 @@ bit-identical to the weights the loader installs for the probe. Dense
 checkpoints hit the map-empty passthrough and behave exactly as before; any
 tensor that cannot be materialized to the card's `(out, in)` **raises** rather
 than pricing a wrong-shaped or code-range W.
-The external runtime record pins Gridbook **0.8.5** at exact commit
-`e992e5980c96333a48149f96392d6cff56ae9e3f`, with
-`gridbook.runtime-contract.v3` and the exact required feature map
-`routed_moe_per_role_codebook_lut=1` plus
-`source_fp8_block128_w8a16=1`, and `version_is_release=true`. The exact
-installed wheel passed its GB10/sm121 GPU gate (91 passed, 0 skipped), including
+The external runtime record pins Gridbook **0.8.11** at exact commit
+`187c7216b9d4882321c1923de0b4c49dc139743c`, with
+`gridbook.runtime-contract.v4` and the exact required feature map
+`routed_moe_per_role_codebook_lut=1`, `source_fp8_block128_w8a16=1` plus
+`dspark_construction_physical_bridge=1`, and `version_is_release=true`. It
+advanced there from 0.8.5/v3 on 2026-08-21 and is held in lockstep with the
+serving pin by a test. The 0.8.5 wheel — the release that first attested
+`source_fp8_block128_w8a16` — passed its GB10/sm121 GPU gate (91 passed, 0
+skipped), including
 raw-source W8A16 residency, native decode/prefill dispatch, and JIT extension
 identity/capability. That closes the route-existence and export gates; exact
 full-artifact eager/graph generation, performance parity, and served quality
 remain post-export shipcard gates. The measured command, immutable inputs, and
 raw evidence paths are recorded in
-`docs/results/gridbook_0p8p5_w8a16_gate_2026-08-12.md`. Gridbook 0.8.4 introduced the explicit
+`docs/results/gridbook_0p8p5_w8a16_gate_2026-08-12.md`; that gate has not been
+re-run on 0.8.11, which carries the same attestation forward in its packaged
+contract. Gridbook 0.8.4 introduced the explicit
 routed per-role LUT feature; capability
 decisions now read the closed feature map rather than infer from a numeric
 version. The on-law K28/K32/K36/K40/K44/K48 FP8-CB set is unchanged. This
@@ -603,8 +627,10 @@ branch also preserves the dated 2026-08-01 DeepSeek-V4-Flash-0731
 evidence for the current runtime: the release path is the separately gated
 112.690 GB AURA artifact authorized only by the exact W8A16 handoff.
 
-That 0.8.5/v3 record is deliberately immutable producer and handoff evidence;
-it is not silently repointed when the serving plugin changes. Serving has a
+That producer record is not silently repointed when the serving plugin
+changes: it moves only by a reviewed edit, and since 2026-08-21 a test refuses
+a producer/serving pin that name different releases, so drift is loud in
+either direction. Serving has a
 second, current-consumer pin in
 `gridbook_runtime/gridbook_serving_runtime_pin.json`. It names Gridbook **0.8.7**
 (advanced from 0.8.6 on 2026-08-15), runtime-contract v4, the
@@ -688,7 +714,9 @@ the runtime its accepted numbers were measured on.
 **Which pin a launcher crosses is a property of the artifact.** Until
 2026-08-15 `scripts/serve_dsv4_cb_validate.sh` was the only script sourcing
 `gridbook_serving_runtime.sh`; every other launcher sourced the build-pin
-helper and installed Gridbook 0.8.5 from source into `vllm-node:latest`. A CB
+helper and installed the build pin from source into `vllm-node:latest` (0.8.5
+at the time; 0.8.11 since the 2026-08-21 producer-pin advance — those
+launchers' artifacts have not been re-served on it). A CB
 artifact whose recipe assigns `model.embed_tokens` to NVFP4 cannot load that
 way — the quantized embedding mechanism does not exist before 0.8.7 — so the
 Qwen3.8-27B CB "A" build serves through
@@ -699,15 +727,19 @@ load at all. It still runs `install-container`, which here
 is a reinstall-and-verify no-op whose value is the assertion, not the install:
 it proves the running interpreter imports the exact reviewed archive. The
 membership set lives in `tests/test_gridbook_runtime_boundary.py`
-(`SERVING_PIN_SCRIPTS`); the two pins are independent and nothing cross-checks
-them, so choosing the wrong helper is a load-time failure rather than a
-warning.
+(`SERVING_PIN_SCRIPTS`). The two pins remain independent *mechanisms* — only
+the serving pin binds a wheel digest — but since 2026-08-21 they may not name
+different releases: `test_producer_and_serving_pins_name_the_same_gridbook_release`
+fails on drift. Choosing the wrong helper is still a load-time failure rather
+than a warning; what the lockstep test removes is the silent three-release gap
+that made the wrong helper *plausible*.
 
 This revision retains the four 2026-07-30 architecture re-vet waves documented in
 `docs/audits/architecture_re-vet_2026-07-30.md` and closes the runtime-ownership debt: the
 vendored Gridbook tree and sync path are gone, producer ABI/menu/config facts have one owner,
 and required CI checks the independent producer and consumer at one immutable commit. The
-0.8.5 boundary carries forward the closed 29-variable measurement environment with
+Gridbook boundary (0.8.5 then, 0.8.11 now) carries forward the closed
+measurement environment — 29 variables then, 31 since the 0.8.11 advance — with
 `GRIDBOOK_MXFP8_DENSE` now affirmatively absent, exact installed-distribution provenance,
 artifact-derived native-extension requirements, and a dedicated raw-source W8A16 kernel
 family. These harden evidence and admission and back the source W8A16 route for export; they do
@@ -1883,8 +1915,9 @@ projection replaced the two-factor magnitude score (`h_trace × output_mse`, `h_
 that preceded it. It is not an error-model claim.
 
 **Activation-safe terminal admission is gated.** DSv4's routed-expert terminal
-`MXFP4_SOURCE` preserves both the source weight and activation contract. Gridbook 0.8.5's
-dedicated `Fp8SourceW8A16LinearMethod` gives `FP8_BLOCK_UE8M0_SOURCE` the same numerical
+`MXFP4_SOURCE` preserves both the source weight and activation contract. Gridbook's
+dedicated `Fp8SourceW8A16LinearMethod` (added in 0.8.5, carried by the pinned 0.8.11)
+gives `FP8_BLOCK_UE8M0_SOURCE` the same numerical
 property: its block-128 E4M3 weight plane and one-byte UE8M0 scale plane remain resident and
 byte-verbatim while BF16 activations pass unchanged. The registry therefore declares
 `act_bits=None`, identity activation QDQ, and the distinct
@@ -1895,15 +1928,18 @@ constructed-zero candidates; the approved 112.690 GB allocation selects 120. The
 
 The numerical re-admission and the serving promotion are independent gates. The fixed
 `--w8a16-readmission` path is CPU-only, fresh/no-clobber, consumes only the exact allowlisted
-completed producer/receipt/journal, permits only the audited 0.8.4→0.8.5 format-plan semantic
-delta, reconstructs all measured rows from unit receipts, and re-admits only the historical
+completed producer/receipt/journal, permits only the audited 0.8.4→pinned-release format-plan
+semantic delta (0.8.5 when written, 0.8.11 since 2026-08-21 — the current side reads the pin
+constant, the recorded historical side stays 0.8.4),
+reconstructs all measured rows from unit receipts, and re-admits only the historical
 block-source terminal zeros. It reruns the DP and requires full qname→format equality plus the
 canonical assignment digest and exact selection metrics before atomically publishing a new
 AURA-stamped directory. The allocator subprocess re-enters through the same verified source
 bootstrap with `PYTHONPATH` removed, so it cannot fall through to the image's older installed
 PrismaQuant; ordinary installed-wheel runs retain their normal module entrypoint. Generic replay
 remains same-snapshot and activation-safe. The exact
-Gridbook 0.8.5 pin plus its 91-test installed-wheel GPU gate back the source W8A16 route for
+Gridbook pin (0.8.11 since 2026-08-21) plus the 91-test installed-wheel GPU gate measured on
+0.8.5, the release that first attested the feature, back the source W8A16 route for
 export without a route-pending acknowledgement. The tracked pre-export handoff still refuses
 an unresolved/unreleased pin, any pending route, changed source/bundle/publication bytes,
 changed bytes in the reviewed exporter/source semantic closure, or an existing output. The
@@ -2984,8 +3020,10 @@ correctly outside that CB map. It also rejects a missing source digest, immutabl
 stamp, or source-weight closure. Consequently the existing unstamped K12 draft is research
 evidence only; a fresh export from the stamped inputs is a release prerequisite.
 
-This producer does not promote the lane. The immutable Gridbook 0.8.5/v3 record remains the
-producer and source-overlay handoff evidence; it predates the physical→construction→registered
+This producer does not promote the lane. The Gridbook producer record (0.8.5/v3 when this was
+written, 0.8.11/v4 since 2026-08-21) remains the
+producer and source-overlay handoff evidence; the 0.8.5 record predates the
+physical→construction→registered
 DSpark bridge. A candidate consumer implements that bridge under
 `gridbook.runtime-contract.v4` (`contract_version=4`,
 `dspark_construction_physical_bridge=1`, `source_fp8_block128_w8a16=1`). The draft decode
@@ -3014,7 +3052,8 @@ monotone, and position zero must accept at least 0.60. `attest` additionally req
 exact 256K/FP8-KV/Marlin/Gridbook launch contract and server-log proof that FULL_DECODE_ONLY
 graphs for sizes `[5,6]` were captured without downgrade. The manifests are replayed through
 the separate `dspark_serving_profile.v1` receipt and exact Gridbook-0.8.6 runtime evidence,
-not the immutable 0.8.5 producer environment. The same MTP log must provide an exact 92-route
+not the producer environment (0.8.5 at the time of that measurement). The same MTP log must
+provide an exact 92-route
 `dspark_route_census.v1`: 70 target FP4-v2 routes, six uniform-K12 draft FP4-v2 routes, 16
 target source-FP8 inherited routes, and zero fallback/unscoped routes
 (`prismaquant/dspark_serving_profile.py:validate_dspark_serve_manifest`,
@@ -3557,7 +3596,7 @@ cross-filesystem copy must run `shipcard_cli reattest`, which full-hashes the we
 the immutable manifest before refreshing only that stat cache. CB native records must also
 name `validate_cb_endpoint.py` and carry a canonical self-hashed endpoint
 contract. Verification replays its exact closed launch options and switches,
-artifact-conditional Marlin choice, the complete 29-variable Gridbook-0.8.5
+artifact-conditional Marlin choice, the complete 31-variable Gridbook-0.8.11
 environment snapshot (including affirmative absence), the endpoint preload/cache override,
 current Gridbook/vLLM/image/GB10/TP=1 stack, exact imported-package origin,
 affirmative absence of a server-side `PYTHONPATH`, complete
@@ -3654,7 +3693,8 @@ validation cannot mutate the cached snapshot with `__pycache__` or import user p
 container's stdlib-only fingerprint writer runs through the bootstrap's explicit
 `serve-fingerprint` tool allowlist from neutral `/`, with no `PYTHONPATH`, and proves its lazy
 `prismaquant.shipcard` import resolves to `/repo` before inspecting or writing evidence. Each arm starts a separate ephemeral container
-from image digest `sha256:7bf752…`, requires released Gridbook 0.8.5 from the tracked immutable
+from image digest `sha256:7bf752…`, requires the tracked released Gridbook (0.8.5 for the
+recorded arms, the pinned 0.8.11 for a fresh run) from the tracked immutable
 commit through the verified `git+file://<copied-checkout>@<pin.commit>` VCS target (never a
 bare-directory install), and requires one `NVIDIA GB10`, TP=1, `--quantization gridbook`, FP8 KV, no speculative
 decode, a resident reviewed Gridbook-native CUDA extension, and deterministic non-empty repeated
@@ -3828,11 +3868,16 @@ is the single source of that number; `shipcard.py`'s three DSv4 gold literals an
 **Gridbook version on this lane.** The gold measurement tools bind the **serving**
 pin: both call `load_gridbook_serving_runtime_pin()` and hand the attestation to
 `self_manifest`, which compares it against the live runtime. A driver that
-installs the 0.8.5/v3 *producer* pin therefore cannot complete the KL step —
+installed the 0.8.5/v3 *producer* pin therefore could not complete the KL step —
 `run_gold_after_export.sh` does exactly that, which is consistent with that lane
 never having produced a gold result. `run_gold_92gb.sh` installs the 0.8.8/v4
 serving pin, matching both the tools and the pair that carried the artifact
-through the serve gate.
+through the serve gate. Since the 2026-08-21 lockstep the two pins name the same
+release, so a producer-pin container no longer fails on the *version* leg; the
+serving attestation additionally binds a reviewed wheel digest that the
+producer helper's VCS install does not carry, and that leg has not been
+re-tested here. Bind the gold tools to the serving pin regardless — it is the
+pin they attest.
 
 The exact DSv4 serving image intentionally does not install Hugging Face
 `datasets`. Before either GPU measurement,
@@ -3930,9 +3975,9 @@ seed 0, eager execution, and log stats disabled; speculative decoding is off.
 `source_passthrough` or `per_expert_format_groups` assignment declares
 `mxfp4_e2m1_ue8m0_g32`. Menus, provenance strings, and other metadata cannot
 select that backend (`prismaquant.gridbook_assignment`). The closed relevant
-environment is the complete 29-name Gridbook-0.8.5 snapshot in
+environment is the complete 31-name Gridbook-0.8.11 snapshot in
 `prismaquant.gridbook_environment`, not a two-variable subset. Gold clears the namespace first,
-sets its 12 canonical values (including `VLLM_USE_DEEP_GEMM=0` and
+sets its 14 canonical values (including `VLLM_USE_DEEP_GEMM=0` and
 `PRISMAQUANT_PRELOAD_FUSED=0`), and carries all 17 required
 absences as explicit nulls. In particular retired `PRISMAQUANT_CB_DECODE` is absent, never
 inherited and `GRIDBOOK_MXFP8_DENSE` is absent so the direct W8A8 route cannot replace the
@@ -4049,8 +4094,9 @@ then broke three assumptions it had never had to hold (all 2026-08-16):
   exactly one `codebook_ref`, so a per-role learned book must be named per role,
   while a lattice layer's single shared book legally names the packed stack.
   Cover is now computed per **role**, decomposed through the profile's
-  `packed_expert_projection_names` — matching gridbook 0.8.5
-  `_resolve_moe_codebook_roles` read *at the pin* rather than widening past it —
+  `packed_expert_projection_names` — matching gridbook's
+  `_resolve_moe_codebook_roles` read *at the pin* rather than widening past it
+  (read at 0.8.5, re-read unchanged at the pinned 0.8.11) —
   and a stack whose roles are only partly claimed is refused as unservable, the
   same rule the fused-sibling bridge already applies.
 - **`source_passthrough` did not exist to the cover.** The third declared
@@ -4599,7 +4645,7 @@ artifacts exported before the rename.
 | gemma4 | `gemma4.py` | 140 | ✅ | `vllm_packed_moe` | CT | ⚠ none | none |
 | lfm2_moe (LFM2.5) | `lfm2_moe.py` | 150 | ✅ | `vllm_packed_moe` | CT | ⚠ none | `has_mtp → False` |
 | minimax_m2 | `minimax_m2.py` | 160 | ✅ **added R22** — all 8 overrides declared | `vllm_packed_moe` **(added R22)** | CT | ⚠ none | `has_mtp → False` |
-| deepseek_v4 | `deepseek_v4.py` | 170 | ✅ | `vllm_packed_moe` **(added R22)** | CT, **nvfp4_cb** (CT) | declared by exact Gridbook 0.8.5 v3 commit `e992e59`; streaming CB export, W8A16 source passthrough, top-level loader, and routed per-role LUT ABI are wired and the installed-wheel GPU route gate passed; full-artifact served parity remains a post-export gate | `has_mtp → False`; three source-quantized DSpark stages are declared by the header-validated physical→construction overlay (§6.3), with no tensor rewrite. The experimental hybrid sidecar emits 27 physical K12 CB targets plus four physical W8A16 bases (`main_proj` and three grouped-BMM `wo_a`) with exact construction declarations. It remains non-shipping until the separately pinned Gridbook 0.8.6/v4 consumer is immutable and the sidecar clears load, memory, acceptance, and paired endpoint/throughput-evidence gates. |
+| deepseek_v4 | `deepseek_v4.py` | 170 | ✅ | `vllm_packed_moe` **(added R22)** | CT, **nvfp4_cb** (CT) | declared by the exact Gridbook producer pin (0.8.5/v3 commit `e992e59` when this row was written; 0.8.11/v4 commit `187c721` since 2026-08-21); streaming CB export, W8A16 source passthrough, top-level loader, and routed per-role LUT ABI are wired and the installed-wheel GPU route gate passed on 0.8.5; full-artifact served parity remains a post-export gate | `has_mtp → False`; three source-quantized DSpark stages are declared by the header-validated physical→construction overlay (§6.3), with no tensor rewrite. The experimental hybrid sidecar emits 27 physical K12 CB targets plus four physical W8A16 bases (`main_proj` and three grouped-BMM `wo_a`) with exact construction declarations. It remains non-shipping until the separately pinned Gridbook 0.8.6/v4 consumer is immutable and the sidecar clears load, memory, acceptance, and paired endpoint/throughput-evidence gates. |
 | hy_v3 | `hy_v3.py` | 180 | ✅ | `gguf` (overridden, L1) | CT, nvfp4_cb, **gguf** (gguf) | declared by pinned Gridbook contract | `has_mtp → False`; MTP passthrough + out-of-band CB scripts |
 | laguna (poolside S/XS 2.x) | `laguna.py` | 190 | ✅ | `nvfp4_cb` (overridden, L1) | CT, **nvfp4_cb** (nvfp4_cb) | declared by pinned Gridbook contract; drafter still separate | `has_mtp → False` |
 | default | `default.py` | — (terminal) | n/a by design | — | CT (default) | n/a | none |
@@ -4972,15 +5018,17 @@ honoured and the operator is CUTLASS, FlashInfer being only the wrapper. This
 matters for artifact A's recipe: a mixed CB artifact containing any stock NVFP4
 W4A4 Linear would otherwise have failed at load, after the export.
 
-**Closed Gridbook-0.8.5 measurement environment (29 names).** This is a PrismaQuant release-
+**Closed Gridbook-0.8.11 measurement environment (31 names).** This is a PrismaQuant release-
 evidence profile, not a second catalog of Gridbook's general runtime defaults. The authority is
 `prismaquant.gridbook_environment.GRIDBOOK_ENVIRONMENT_REGISTRY`, whose exact pin/source scan
-fails if 0.8.5, its required W8A16 feature, or its environment namespace changes. Every snapshot includes values **and
+fails if the pinned version, its required W8A16 feature, or its environment namespace changes.
+It described 0.8.5 with 29 names until the 2026-08-21 producer-pin advance, which added the two
+0.8.9-era selectors marked below. Every snapshot includes values **and
 nulls** for all names:
 
 | Category | Count | Exact names |
 |---|---:|---|
-| execution | 19 | `GRIDBOOK_MXFP8_DENSE`, `PRISMAQUANT_CB_GEMV`, `PRISMAQUANT_CB_FUSED_FP4`, `PRISMAQUANT_CB_FUSED_FP4_MOE`, `PRISMAQUANT_CB_BF16_SM120`, `PRISMAQUANT_CB_FP4_FUSED_MIDM`, `PRISMAQUANT_CB_MOE_PERSISTENT_B`, `PRISMAQUANT_CB_MOE_PERSISTENT_B_CFG`, `PRISMAQUANT_CB_FUSED_MIDM`, `PRISMAQUANT_CB_GROUPED_TRIM`, `PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK`, `PRISMAQUANT_CB_PREFILL_CHUNK_BYTES`, `PRISMAQUANT_CB_DECODE_CONTRACT`, `PRISMAQUANT_CB_FP8_SCHED`, `PRISMAQUANT_CB_FP4V2_SCHED`, `PRISMAQUANT_CB_W2_SCHED`, `PRISMAQUANT_CB_W2_ROWS`, `PRISMAQUANT_CB_W2_WARPS`, `VLLM_USE_DEEP_GEMM` |
+| execution | 21 | `GRIDBOOK_MXFP8_DENSE`, `PRISMAQUANT_CB_GEMV`, **`PRISMAQUANT_CB_FP8_GEMV_V2`**, `PRISMAQUANT_CB_FUSED_FP4`, `PRISMAQUANT_CB_FUSED_FP4_MOE`, `PRISMAQUANT_CB_BF16_SM120`, `PRISMAQUANT_CB_FP4_FUSED_MIDM`, `PRISMAQUANT_CB_MOE_PERSISTENT_B`, `PRISMAQUANT_CB_MOE_PERSISTENT_B_CFG`, **`PRISMAQUANT_CB_MOE_PERSISTENT_B_D2R`**, `PRISMAQUANT_CB_FUSED_MIDM`, `PRISMAQUANT_CB_GROUPED_TRIM`, `PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK`, `PRISMAQUANT_CB_PREFILL_CHUNK_BYTES`, `PRISMAQUANT_CB_DECODE_CONTRACT`, `PRISMAQUANT_CB_FP8_SCHED`, `PRISMAQUANT_CB_FP4V2_SCHED`, `PRISMAQUANT_CB_W2_SCHED`, `PRISMAQUANT_CB_W2_ROWS`, `PRISMAQUANT_CB_W2_WARPS`, `VLLM_USE_DEEP_GEMM` |
 | correctness bypass | 1 | `PRISMAQUANT_SKIP_CB_CAST_CHECK` |
 | residency/build | 5 | `PRISMAQUANT_PRELOAD_FUSED`, `PRISMAQUANT_CB_EXT_DIR`, `PRISMAQUANT_CUTLASS_INCLUDE`, `CUDACXX`, `CXX` |
 | retired | 3 | `PRISMAQUANT_CB_DECODE`, `PRISMAQUANT_CB_EXPAND`, `PRISMAQUANT_CB_PREFILL` |
@@ -4989,25 +5037,32 @@ nulls** for all names:
 The canonical gold set leaves `GRIDBOOK_MXFP8_DENSE` **absent** and sets exactly
 `PRISMAQUANT_CB_GEMV=inherited`, `PRISMAQUANT_CB_BF16_SM120=0`,
 `PRISMAQUANT_CB_FP4_FUSED_MIDM=0`, `PRISMAQUANT_CB_MOE_PERSISTENT_B=0`,
-`PRISMAQUANT_CB_MOE_PERSISTENT_B_CFG=0`, `PRISMAQUANT_CB_FUSED_MIDM=1`,
+`PRISMAQUANT_CB_MOE_PERSISTENT_B_CFG=0`,
+`PRISMAQUANT_CB_MOE_PERSISTENT_B_D2R=0`, `PRISMAQUANT_CB_FP8_GEMV_V2=0`,
+`PRISMAQUANT_CB_FUSED_MIDM=1`,
 `PRISMAQUANT_CB_GROUPED_TRIM=1`,
 `PRISMAQUANT_CB_PREFILL_CHUNK_BYTES=1073741824`,
 `PRISMAQUANT_CB_DECODE_CONTRACT=v1`, `VLLM_USE_DEEP_GEMM=0`,
-`PRISMAQUANT_SKIP_CB_CAST_CHECK=0`, and `PRISMAQUANT_PRELOAD_FUSED=0`; the other
-17 names must be absent. Absence is semantic: the MXFP8 override would select the distinct
+`PRISMAQUANT_SKIP_CB_CAST_CHECK=0`, and `PRISMAQUANT_PRELOAD_FUSED=0` — 14 set
+values; the other
+17 names must be absent. The two added in 2026-08-21 are pinned `0` for the
+same reason every other dispatch selector here is: 0.8.9 moved their unset
+default to `auto`, and the gold lane pins the kernel its evidence was measured
+on rather than following a runtime default. Absence is semantic: the MXFP8 override would select the distinct
 direct group-32 W8A8 lane; literal `0` is invalid for the two fused-FP4
 selectors and expert-chunk override, and the retired `PRISMAQUANT_CB_DECODE` must never
 reappear. Gold clears and applies that state before the first tokenizer/runtime import.
 Endpoint and matched-performance profiles change preload to `1` so compared arms have the
 same extension residency; the endpoint also sets
 `PRISMAQUANT_CB_EXT_DIR=/opt/gridbook/ext-cache`. Server manifests inspect the complete process
-tree using the same 29-name allowlist plus the two immutable runtime-pin transport variables,
+tree using the same 31-name allowlist plus the two immutable runtime-pin transport variables,
 `PYTHONSAFEPATH`, and `PYTHONPATH`; the last must be affirmatively absent, while the
 short-lived `/repo` fingerprint writer is not part of the inspected server process set.
 Every readable serving process must agree.
 
-**Separate current Gridbook-0.8.6 DSpark serving profile.** The table above remains the
-immutable 0.8.5 producer/gold authority. It is neither imported nor amended for the later
+**Separate current Gridbook-0.8.6 DSpark serving profile.** The table above is the
+producer/gold authority and tracks the producer pin (0.8.5 then, 0.8.11 now). It is neither
+imported nor amended for the later
 consumer. `prismaquant/dspark_serving_profile.py` owns a literal, independently scanned
 `dspark_serving_profile.v1` profile for paired DSpark validation only. Its 29-name Gridbook
 namespace selects `PRISMAQUANT_CB_GEMV=v2`, persistent-B and its cfg both `0`, decode contract
@@ -5017,8 +5072,11 @@ override absent; it additionally binds
 `VLLM_MOE_SKIP_PADDING=true`. A source scan of the installed 0.8.6 package must find exactly
 the profile's closed Gridbook environment namespace: an unknown prefixed knob, a missing known
 knob, a differing value/null, or a process-tree disagreement refuses. This later profile can
-therefore evolve visibly without changing the regression digest or semantics of the 0.8.5
-target-only authority.
+therefore evolve visibly without changing the semantics of the target-only authority. The
+regression digest is now stated on the scope it protects: the 29-name **historical
+projection** of the gold environment must still hash to its original literal, proving no
+pre-existing canonical value moved, and the full 31-name map carries its own digest
+(`test_gold_environment_grew_additively_over_the_historical_0_8_5_set`).
 
 The self-digesting runtime receipt binds image digest `sha256:58862b…869`, vLLM
 `0.26.1rc1.dev693+g7f7a32cfe.d20260812` at full commit
@@ -5059,7 +5117,8 @@ three draft layer identities (92 routes total). `validate_dspark_serve_manifest`
 profile/runtime receipt through only the paired-DSpark endpoint validator while preserving the
 shared artifact, session, listener, launch, and residency checks. Every selected environment,
 package/capability/cache, launch, and route field has a mutation refusal test; a static digest
-test separately proves the old 0.8.5 environment is unchanged.
+test separately proves the old 0.8.5 environment is unchanged — since 2026-08-21 as the
+29-name historical projection of the grown 31-name map.
 
 **One machine-readable contract, not parallel tables.** Gridbook packages
 `gridbook/runtime_contract.json`; it is authoritative for the runtime's quantization aliases,
@@ -5080,8 +5139,8 @@ the artifact ABI; CI
 compares every packing/layout field and every rung so incompatibility fails at the boundary.
 
 At runtime `register()` registers `"gridbook"` plus the legacy artifact alias `"prismaquant"`
-and installs the per-architecture loader hooks. It does not patch vLLM core. Released 0.8.5 at
-`e992e5980c96333a48149f96392d6cff56ae9e3f` resolves and attests every serving-reachable
+and installs the per-architecture loader hooks. It does not patch vLLM core. The pinned release
+(0.8.11 at `187c7216b9d4882321c1923de0b4c49dc139743c`) resolves and attests every serving-reachable
 extension, optional-kernel mode, ABI, device, and
 shape contract during model load. Decode, expansion, activation QDQ, and routing support are
 native CUDA; GEMM and grouped GEMM are native CUTLASS. A missing or ineligible required native
@@ -5090,10 +5149,13 @@ implementation. The container may mix CB groups, ignored BF16 prefixes, and stoc
 groups delegated to vLLM. Gridbook's own FP8 transient paths call vLLM's registered native
 CUDA quantizer and CUTLASS scaled-matmul operators directly after attestation. Fused dense and
 grouped native-NVFP4 paths remain explicit opt-ins: the 2026-08-01 teacher-backed LFM gate
-rejected default enablement even though operator arithmetic passed. The released 0.8.5 v3 contract
-attests both `abi_features.routed_moe_per_role_codebook_lut=1` and
-`abi_features.source_fp8_block128_w8a16=1`; compatibility is feature-gated and bound to that
-exact commit. The installed-wheel GB10/sm121 gate backs the source route, while the materialized
+rejected default enablement even though operator arithmetic passed. The released 0.8.11 v4 contract
+attests `abi_features.routed_moe_per_role_codebook_lut=1`,
+`abi_features.source_fp8_block128_w8a16=1` and
+`abi_features.dspark_construction_physical_bridge=1`; compatibility is feature-gated and bound
+to that
+exact commit. The installed-wheel GB10/sm121 gate, measured on 0.8.5, backs the source route,
+while the materialized
 artifact must still close eager/graph, performance, and quality gates. The canceled gfx1151/ROCm
 prototype was removed rather than maintained as an unqualified second backend.
 
@@ -5259,7 +5321,7 @@ lattice routed-CB and the default `CB_CODEBOOK_SOURCE_SCOPE=none` are unchanged.
 
 **Runtime defaults and kernel provenance live only in Gridbook.** The old table
 here was removed after it drifted from the runtime it described. The runtime pin names Gridbook
-0.8.5 at released commit `e992e5980c96333a48149f96392d6cff56ae9e3f`; resolve it from
+0.8.11 at released commit `187c7216b9d4882321c1923de0b4c49dc139743c`; resolve it from
 `prismaquant/gridbook_runtime/gridbook_runtime_pin.json`, then consult that exact source's
 `docs/PLUGIN.md`, `docs/KERNELS.md`, and dated audits. The cross-project policy
 is only this: a numerics-changing path cannot be promoted by kernel arithmetic
@@ -5271,7 +5333,7 @@ paragraph is ported verbatim from the 0.5.1-era study working tree and is kept u
 measurement date. It was taken against the then-uncommitted native-only Gridbook candidate
 (base `4e7c1bc6` plus a dirty tree), which was later released as Gridbook 0.6.0 at
 `ca0f0f562d3f398e094bfa5356a9ce3fa47472f1`. PrismaQuant's current consumer is the released
-0.8.5 v3 contract at `e992e5980c96333a48149f96392d6cff56ae9e3f`; these numbers remain
+0.8.11 v4 contract at `187c7216b9d4882321c1923de0b4c49dc139743c`; these numbers remain
 candidate-era historical evidence and are not a
 re-measurement or promotion of either runtime.
 

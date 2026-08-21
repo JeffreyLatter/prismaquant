@@ -164,7 +164,7 @@ from prismaquant.serving_profiles import (
 )
 from prismaquant.model_profiles.structure import load_structure_spec
 assert load_serving_profile("nvfp4_cb").id == "nvfp4_cb"
-assert gridbook_runtime_version() == "0.8.5"
+assert gridbook_runtime_version() == "0.8.11"
 assert load_structure_spec("deepseek_v4").id == "deepseek_v4"
 """
     result = subprocess.run(

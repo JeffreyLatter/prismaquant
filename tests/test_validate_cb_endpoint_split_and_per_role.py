@@ -17,7 +17,8 @@ ships one packed ``…experts.gate_up_proj`` and names it with two groups, one p
 half, because a per-role book fits one ``(layer, projection)`` and a packed
 target binds exactly one ``codebook_ref``. Read per tensor, both groups look
 empty and the tensor looks unclaimed. The cover is now computed per ROLE, which
-is the pinned runtime's own rule (gridbook 0.8.5 ``_resolve_moe_codebook_roles``
+is the pinned runtime's own rule (gridbook ``_resolve_moe_codebook_roles``, read
+at 0.8.5 and re-read unchanged at the pinned 0.8.11:
 collects a book per role, refuses two targets claiming one role, and refuses a
 stack missing a role).
 

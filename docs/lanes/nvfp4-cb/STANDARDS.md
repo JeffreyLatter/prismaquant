@@ -2,7 +2,8 @@
 
 Dated 2026-07-21 (Robert: "make a definitive determination about final kernel
 and format standards"); runtime boundary updated 2026-08-02 for Gridbook
-0.7.0 and refreshed 2026-08-12 for released Gridbook 0.8.5. This page is the
+0.7.0, refreshed 2026-08-12 for released Gridbook 0.8.5, and re-pointed
+2026-08-21 to released Gridbook 0.8.11 when the producer pin advanced. This page is the
 contract production runs build against. Changes to it require a served A/B,
 not a preference.
 
@@ -66,9 +67,10 @@ the pinned package. Its machine-readable form is this producer's own
 runtime version into the per-candidate `fused_mid_m_backed` /
 `fused_mid_m_rungs` the P5b router prices on; the prose here restates that data. The mirror exists because Gridbook's **packaged
 `runtime_contract.json` does not carry the fused rung set** — verified against
-the pinned commit `e992e5980c96333a48149f96392d6cff56ae9e3f`, whose contract
-declares `quant_method`, `packing`, `layout`, `formats` and
-`producer_profiles` and nothing about fused dispatch. So the only cross-repo
+the pinned commit `187c7216b9d4882321c1923de0b4c49dc139743c`, whose contract
+declares `schema`, `contract_version`, `quant_method`, `packing`, `layout`,
+`formats`, `producer_profiles` and `abi_features` — and nothing about fused
+dispatch. So the only cross-repo
 check on this mirror is Gridbook's own tests over `gridbook/codec.py`
 (`FP8_FUSED_KBITS`, `cb_fused_kbits()`); PrismaQuant CI cannot catch it drifting,
 because `tests/test_gridbook_runtime_contract.py` compares rungs, layouts and
@@ -78,23 +80,24 @@ commit before editing either the JSON or the paragraph below.
 
 The earlier PrismaQuant 0.8.0 boundary pinned Gridbook 0.8.0 at exact commit
 `9011a19228ddb96b8a49e11a20ac75c99c83998e`. The current boundary pins released
-Gridbook 0.8.5 at exact commit
-`e992e5980c96333a48149f96392d6cff56ae9e3f`. Every serving-reachable Gridbook
+Gridbook 0.8.11 at exact commit
+`187c7216b9d4882321c1923de0b4c49dc139743c`. Every serving-reachable Gridbook
 operation is native CUDA/CUTLASS and is resolved and attested at model load.
 Gridbook has no Triton dependency, dispatch arm, or fallback; if an artifact,
 shape, ABI, or device lacks its required native operation, serving fails closed.
-The 0.8.5 contract declares the DSV4 body/MTP/DSpark loader, routed per-role
-LUT ABI, and raw-source block-FP8 W8A16 feature; that runtime capability does not itself qualify any DSV4 artifact or
+The 0.8.11 contract declares the DSV4 body/MTP/DSpark loader, routed per-role
+LUT ABI, raw-source block-FP8 W8A16 and the DSpark construction physical
+bridge; that runtime capability does not itself qualify any DSV4 artifact or
 change this producer's format/layout ABI, menu, or quality-promotion status.
 
-The FP8-CB fused mid-M rung surface established by 0.7.0 remains unchanged in
-0.8.5 and is not pending completion: Gridbook's K1.2 resolution proved
+The FP8-CB fused mid-M rung surface established by 0.7.0 remains unchanged
+through 0.8.11 and is not pending completion: Gridbook's K1.2 resolution proved
 `k % 4 == 0` is a format+TMA law
 (`gridbook/codec.py` `FP8_FUSED_KBITS`, queryable as `cb_fused_kbits()`), so
 `{28,32,36,40,44,48}` is the whole lane and the off-law rungs this producer may
 still assign are permanently expand+GEMM-served. Gridbook 0.7.0 introduced the
 contract-preserving FP4-CB v2 fused mid-M kernel; it remains **opt-in** in
-0.8.5 behind `PRISMAQUANT_CB_FP4_FUSED_MIDM` pending its served NATIVE-PARITY
+0.8.11 behind `PRISMAQUANT_CB_FP4_FUSED_MIDM` pending its served NATIVE-PARITY
 gate, so the fp4-CB backed set in
 `prismaquant/serving_profile_specs/nvfp4_cb.json` stays empty: available is not
 backed.

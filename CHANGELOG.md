@@ -1,5 +1,69 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **The producer Gridbook pin advances 0.8.5 → 0.8.11** (commit `187c721`,
+  `gridbook.runtime-contract.v4`), in lockstep with the serving pin, and drift
+  between the two pins is now a test failure
+  (`test_gridbook_runtime_boundary.py::test_producer_and_serving_pins_name_the_same_gridbook_release`).
+  The two pins had silently diverged by three releases. Nothing ships on the
+  producer pin's release: route status, serving-lane eligibility, the gold KL
+  tools, the shipped-artifact certificates and every serve script's runtime all
+  resolve through the serving pin. The producer pin's only live jobs — the
+  build/export gates, the format-plan provenance, and the closed gold
+  measurement environment — were therefore describing a runtime nothing runs.
+  CI made it visible from the side: the `gridbook-contract` job installs the
+  *producer* commit, and since the route-status merge that job's contract test
+  needs an indexed materialized contract for the installed version, which only
+  0.8.10 and 0.8.11 have. The fix is the pin, not a back-materialized 0.8.5
+  contract.
+- **The closed gold measurement environment grows 29 → 31 names** (execution
+  19 → 21). Scanning the 0.8.11 source surfaced four identifiers the 0.8.5
+  registry did not know. Two are real environment reads and are now registered
+  with canonical gold value `"0"`: `PRISMAQUANT_CB_FP8_GEMV_V2` (the routed
+  FP8-CB whole-row GEMV sibling) and `PRISMAQUANT_CB_MOE_PERSISTENT_B_D2R`
+  (persistent-B's nested direct-to-register experiment). Two are not
+  environment variables and join
+  `GRIDBOOK_SOURCE_NON_ENVIRONMENT_IDENTIFIERS`: `PRISMAQUANT_CB_W2_` is a
+  documentation wildcard for the three registered W2 knobs, and
+  `VLLM_MOE_SKIP_PADDING` appears only in a Gridbook docstring — Gridbook never
+  reads it and the `-1` sentinel normalization it describes is unconditional,
+  so it is not an execution input of this lane. Both classifications match the
+  independent 0.8.7 audit already recorded in `dspark_serving_profile.py`.
+- **Behaviour note for gold replays.** Both new names default to `auto` in
+  Gridbook 0.8.9+, and both are pinned `"0"` here, matching every other
+  dispatch selector in the table (`CB_GEMV=inherited`, `MOE_PERSISTENT_B=0`,
+  `FP4_FUSED_MIDM=0`, `BF16_SM120=0`). A gold replay therefore now pins the
+  FP8-CB GEMV sibling **off** where it previously ran at the runtime's `auto`
+  default. This is a determinism choice, not a quality one: the 0.8.9
+  default-state served leg measured kl_mean +0.17 % / PPL −0.06 % against the
+  gold record, inside the ±0.7 % cross-session envelope. Re-baselining gold
+  onto the auto dispatch stays available as a reviewed re-measurement.
+- **The frozen gold-environment digest is restated, not moved.** The 29-name
+  historical projection still hashes to its original literal
+  (`41dd44c5…`), proving no pre-existing canonical value changed; the full
+  31-name map carries a new digest. The freeze now proves what it was written
+  to protect.
+- **The FP8-CB fused mid-M backed set is unchanged.** `rungs_by_runtime_version`
+  already carried a `0.8.11` key with the identical `{28,32,36,40,44,48}` rung
+  list, so `gridbook_runtime_version()` moving to 0.8.11 changes no rung, no
+  route and no codec.
+- **Not re-served.** The six launchers that source `gridbook_runtime.sh`
+  (hy3 smoke/TEB, laguna smoke, qwen27b smoke, the canary ladder, the NVFP4-CB
+  delegation smoke) now install 0.8.11 instead of 0.8.5, which is intended;
+  their artifacts have **not** been re-served on 0.8.11 in this change. Neither
+  has the 91-pass installed-wheel GB10/sm121 W8A16 GPU gate, which remains
+  0.8.5 evidence carried forward on 0.8.11's unchanged
+  `source_fp8_block128_w8a16` attestation.
+- **Fail-closed consequence for existing gold cards.** Shipcard verification
+  compares an artifact's recorded environment against the canonical map by
+  exact equality, so re-verifying a card produced before this change now
+  refuses on the grown 31-name contract. Historical cards remain valid evidence
+  for the release they were verified under; re-verification under the advanced
+  pin is expected to refuse.
+
 ## 0.16.1 — 2026-08-21
 
 ### Changed

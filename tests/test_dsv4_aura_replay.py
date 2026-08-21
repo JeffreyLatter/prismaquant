@@ -518,8 +518,10 @@ def test_w8a16_format_plan_migration_allows_only_runtime_provenance():
     historical["identity_sha256"] = (
         campaign.DSV4_W8A16_LEGACY_FORMAT_PLAN_SHA256
     )
+    pinned = campaign.GRIDBOOK_RUNTIME_RELEASE_VERSION
     current = _format_plan_fixture(
-        runtime_version="0.8.5", rungs_source="serving_profile_spec:0.8.5"
+        runtime_version=pinned,
+        rungs_source=f"serving_profile_spec:{pinned}",
     )
     current["identity_sha256"] = "a" * 64
     old = SimpleNamespace(to_dict=lambda: historical)
@@ -541,8 +543,8 @@ def test_w8a16_format_plan_migration_allows_only_runtime_provenance():
 
 def test_w8a16_readmission_release_pin_is_exact_and_released():
     proof = campaign._w8a16_runtime_contract_proof()
-    assert proof["commit"] == "e992e5980c96333a48149f96392d6cff56ae9e3f"
-    assert proof["version"] == "0.8.5"
+    assert proof["commit"] == "187c7216b9d4882321c1923de0b4c49dc139743c"
+    assert proof["version"] == "0.8.11"
     assert proof["version_is_release"] is True
     assert proof["required_abi_features"][
         "source_fp8_block128_w8a16"

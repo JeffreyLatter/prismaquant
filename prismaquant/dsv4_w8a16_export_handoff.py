@@ -38,6 +38,7 @@ from prismaquant.dsv4_aura_cb_reprice import (
 from prismaquant.format_registry import get_format
 from prismaquant.gridbook_runtime_pin import (
     GRIDBOOK_RUNTIME_CONTRACT_SCHEMA,
+    GRIDBOOK_RUNTIME_RELEASE_VERSION,
     load_gridbook_runtime_pin,
     require_exact_gridbook_runtime_release,
     supports_source_fp8_block128_w8a16,
@@ -186,10 +187,12 @@ _PUBLISHED_FILES = frozenset({
 #     widened to admit a defect: a per-role LEARNED codebook fits one book per
 #     `(layer, projection)` and a packed `gate_up_proj` target binds exactly one
 #     `codebook_ref`, so a per-role layer CANNOT name the packed stack -- the
-#     halves are the only spelling the ABI permits. Pinned Gridbook 0.8.5
-#     resolves it (`config.py:1487-1503` `_moe_target_keys` accepts the half
-#     leaves, `:1401-1454` builds `codebook_ref_by_role`, `moe.py:512-527`
-#     consumes it) and covers it with its own tests
+#     halves are the only spelling the ABI permits. Gridbook 0.8.5 resolved it
+#     (as read at that release: `config.py:1487-1503` `_moe_target_keys`
+#     accepts the half leaves, `:1401-1454` builds `codebook_ref_by_role`,
+#     `moe.py:512-527` consumes it); the currently pinned 0.8.11 carries the
+#     same three mechanisms forward at shifted line numbers
+#     (`config.py:1729`, `:1694`, `moe.py:574`), and covers it with its tests
 #     (`test_routed_per_role_codebooks.py`). Correspondingly, 1ccdf58's message
 #     calls the dual spelling a "real inconsistency" -- that framing is wrong
 #     and is retracted here; lattice layers share one book and legally name the
@@ -557,7 +560,7 @@ def _verify_runtime_contract() -> dict[str, object]:
         ) from exc
     contract = SOURCE_PASSTHROUGH_CONTRACTS["FP8_BLOCK_UE8M0_SOURCE"]
     if (
-        pin.version != "0.8.5"
+        pin.version != GRIDBOOK_RUNTIME_RELEASE_VERSION
         or pin.version_is_release is not True
         or pin.runtime_contract_schema != GRIDBOOK_RUNTIME_CONTRACT_SCHEMA
         or not supports_source_fp8_block128_w8a16(pin)
