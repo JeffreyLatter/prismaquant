@@ -471,27 +471,84 @@ the empirical frontier we plot is the non-dominated lower staircase of measured
 $(\bpp,\kl)$ points.
 \end{proposition}
 
-\noindent\emph{Proof sketch.} For the fractional relaxation the greedy
-ascending-$\rho$ fill is exact, so $D(R)$ is the integral of a nondecreasing step
-function --- convex, and affine exactly when $\rho_{\mathrm{sorted}}$ is flat. The
-integer optimum is feasible for the relaxation, hence weakly above the envelope;
-with unequal saved-bit sizes $\Delta b_i$ the two need not coincide except in the
-limit of fine granularity. \hfill$\square$
+\noindent\emph{Proof.} Let $B=B(R)$ be the saved-bit mass the budget demands and
+write the relaxation over fractions $x_i\in[0,1]$: minimize $\sum_i x_ic_i$
+subject to $\sum_i x_i\Delta b_i\ge B$. Order the Linears
+$\sigma(1),\dots,\sigma(N)$ so that $\rho_{\sigma(1)}\le\dots\le\rho_{\sigma(N)}$,
+and let $\rho_{\mathrm{sorted}}$ be the associated step function,
+$\rho_{\sigma(k)}$ on $[\sum_{j<k}\Delta b_{\sigma(j)},\sum_{j\le k}\Delta b_{\sigma(j)})$.
+(i)~\emph{The greedy fill is optimal.} Let $x$ be optimal and suppose there were
+$p,q$ with $\rho_p<\rho_q$, $x_q>0$, $x_p<1$. For $\delta>0$ small replace
+$x_q\leftarrow x_q-\delta/\Delta b_q$ and $x_p\leftarrow x_p+\delta/\Delta b_p$:
+saved bits are conserved, so feasibility is kept, while cost changes by
+$\delta(\rho_p-\rho_q)<0$, contradicting optimality. Hence every optimum takes an
+ascending-$\rho$ prefix with any remainder confined to a single $\rho$-class
+(interchanges within a class leave the cost $\rho\cdot b$ unchanged), of value
+$D(B)=\int_0^B\rho_{\mathrm{sorted}}(b)\,db$.
+(ii)~\emph{Convexity.} For $u<v<w$ the chord slopes are running means of a
+nondecreasing integrand,
+$\tfrac{D(v)-D(u)}{v-u}=\operatorname{avg}_{[u,v]}\rho_{\mathrm{sorted}}\le
+\operatorname{avg}_{[v,w]}\rho_{\mathrm{sorted}}=\tfrac{D(w)-D(v)}{w-v}$,
+the three-chord condition for convexity on $[0,\sum_i\Delta b_i]$; composing with
+the affine map $R\mapsto B(R)$ preserves it.
+(iii)~\emph{Affine iff constant.} If all $\rho_i=\rho$ then $D(B)=\rho B$. Conversely
+$D$ is absolutely continuous with $D'(b)=\rho_{\mathrm{sorted}}(b)$ a.e.; if $D$ is
+affine then $D'$ is a.e.\ a constant $\bar\rho$, and a step function that is a.e.\
+constant is constant on each of its steps (every step has positive width), so every
+$\rho_i=\bar\rho$.
+(iv)~\emph{Integer versus fractional.} Any assignment is a feasible $x$, so the
+integer optimum lies weakly above $D$; with unequal $\Delta b_i$ the gap can be
+strict, since the fractional solution splits one item where integrality must
+overpay. The plotted object is neither of these but the non-dominated lower
+staircase of measured $(\bpp,\kl)$ points: sampled at finitely many budgets, it sits
+weakly above the integer frontier it samples and is convex only through its lower
+convex hull. \hfill$\square$
 
 \begin{proposition}[The knee tracks the cost-per-bit density, not raw sensitivity]\label{prop:knee}
-The curvature of $D(R)$ is governed by the dispersion of $\{\rho_i\}$, not of the
-raw sensitivities $\{c_i\}$. With a single lossy format the saved bits scale with
-size and $\rho_i\propto c_i/n_i$, which on our models gives a \emph{smooth} convex
-curve. A \emph{sharp} knee requires a strong gap in the sorted-$\rho$ density;
-such a gap is \emph{sufficiently} produced by an intermediate-efficiency rung
-(e.g.\ FP8, for which BF16$\to$FP8 buys many bits at near-zero cost while
-FP8$\to$NVFP4 is expensive), which a single-lossy menu cannot supply. A
-sufficiently heavy-tailed $\rho$ alone could also produce one; we do not observe
-that on the two-rung menu here.
+Work in the fractional relaxation of Proposition~\ref{prop:rd} with several lossy
+formats: each Linear contributes the segments of the lower convex hull of its rung
+points $(0,0)$ and $(\beta_{i,f},c_{i,f})$, where $\beta_{i,f}$ is the bits BF16
+loses to format $f$; a segment saves $\beta$ bits at cost $c$, ratio
+$\rho=c/\beta$, and the greedy fill runs over all segments jointly. Then
+(i)~$D$ is piecewise affine --- affine along each maximal run of equal sorted
+ratio --- and every slope break, hence every knee, occurs at a gap between distinct
+sorted ratios, of size equal to that gap; dispersing the raw costs $\{c_i\}$ while
+holding ratios fixed (e.g.\ $c_i=\rho\,\Delta b_i$ with varied $\Delta b_i$) leaves
+the frontier exactly affine. (ii)~A separated rung is sufficient for a sharp knee:
+if some rung $f$ satisfies $\max_i\rho_{i,f}<\min_i\rho_{i,g}$ for another rung
+$g$, the entire $f$-block is consumed before any $g$-segment, and the frontier's
+slope drops by at least $\min_i\rho_{i,g}-\max_i\rho_{i,f}>0$ at the byte count
+where the cheaper rung is exhausted (for FP8: BF16$\to$FP8 buys many bits at
+near-zero cost, FP8$\to$NVFP4 is expensive).
 \end{proposition}
 
+\noindent\emph{Proof.} (i) Proposition~\ref{prop:rd}'s exchange argument applies
+verbatim to the segment list, so $D(B)=\int_0^B\rho_{\mathrm{sorted}}(b)\,db$ over
+sorted segment ratios; $D$ is affine exactly on the fill intervals of maximal
+constant-ratio runs, and crossing a boundary between ratios $\rho'<\rho''$ changes
+the slope by $\rho''-\rho'$. The raw-cost clause is (iii) of
+Proposition~\ref{prop:rd} read backwards. (ii) Separation places the whole
+$f$-block first in sorted order; crossing the block boundary drops the slope by
+$\min_i\rho_{i,g}-\max_i\rho_{i,f}>0$, a single jump of that size. \hfill$\square$
+
+\medskip
+Two empirical clauses sit deliberately outside the proposition. Under a single
+lossy format no separated rung exists; whether the resulting curve bends smoothly
+is a property of the joint distribution of $(c_i,n_i)$ --- on our models
+$\rho_i\propto c_i/n_i$ varies smoothly and the two-rung frontier is visibly convex
+with no interior slope break. And a sufficiently heavy-tailed $\{\rho_i\}$ would
+produce a knee with no help from the menu, since (i) is indifferent to the origin
+of the gap; we observe no such gap on the two-rung menu here.
+
 \paragraph{Consequences, on real data.} On the Qwen3.6-27B
-\textsc{Aura} costs, the cost-per-bit is far from democratic: weighted Gini
+\textsc{Aura} costs, the cost-per-bit is far from democratic:\footnote{Derivation
+status of the summary statistics: the Gini coefficients, the $\rho$ ratio, the
+chord curvatures quoted in this section, and the bf16-vs-fp32 rank/median
+agreements of Section~\ref{sec:aura} were computed once during development and
+carried forward in working notes; unlike the served tables of
+Section~\ref{sec:experiments}, they have not been re-derived from retained raw
+logs, and their scratch run directories are archived. Read them as indicative
+magnitudes, not audited results.} weighted Gini
 $0.45$ (unweighted $0.65$), with $\rho_{\max}/\rho_{\mathrm{median}}\approx 63$.
 By Proposition~\ref{prop:rd} the frontier is therefore convex, and the
 reconstructed envelope (integral of sorted $\rho$) has $33\%$ \emph{chord
@@ -512,7 +569,18 @@ matched bytes in a resident RTN weight-only train-split screen, not a served
 held-out result). Crucially, a better cost model (\textsc{Aura} vs.\ the baseline)
 shifts the frontier \emph{down} at fixed bpp --- a vertical translation
 orthogonal to its curvature --- so ``\textsc{Aura} is the better ranker'' and
-``the two-rung frontier looks linear'' are simultaneously true. We therefore
+``the two-rung frontier looks linear'' are simultaneously true. A wider validation
+corroborates the picture beyond the production window: on Qwen3.8-27B dense,
+eleven held-out points spanning $4.50$--$8.25$~bpp fall on a single log-linear law,
+$\log_{10}\kl=-0.1133-0.2357\,\bpp$ ($R^2=0.9948$), with no saturation in range
+(Repro: \texttt{docs/design/operating\_point\_selection.md}) --- the narrow-window
+linearity of Figure~\ref{fig:aura_rd_geometry}b is the visible part of a globally
+exponential frontier. An exponential buys the same \emph{relative} return at every
+bpp ($10^{0.2357}\!\approx\!1.72\times$ KL per bpp), so no interior operating point
+is distinguished and a knee detector must manufacture one: on that same sweep
+kneedle returns $4.75$~bpp spelled on the log axis and $6.00$~bpp spelled on the
+linear axis. The $\approx6.5$-bpp knee above therefore survives as chord geometry
+of a convex curve, not as an anchor. We therefore
 select ship points by exact byte budget / raw-KL saturation, not by an axis-%
 dependent knee detector \cite{kneedle2011}.
 
