@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.16.2 — 2026-08-22
+
 ### Fixed
 
 - **MTP Lambert-W closed form no longer silently disables itself**
