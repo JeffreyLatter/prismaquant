@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import math
+import sys
 
 import pytest
 
@@ -18,6 +19,7 @@ from prismaquant.mtp_rung_selection import (
     AcceptancePoint,
     RungPoint,
     ServeConstants,
+    _continuous_bstar_lambertw,
     fit_acceptance,
     select_rung,
 )
@@ -126,6 +128,110 @@ def test_lambertw_agrees_with_fixed_point_when_scipy_present():
     fp, lw = prov["continuous_bstar"], prov["continuous_bstar_lambertw"]
     assert lw is not None
     assert abs(fp - lw) < 0.5
+
+
+# --------------------------------------------------------------------------- #
+# Lambert-W must survive the d0-dominated overflow regime ((t+d0)/c >~ 1023)
+# --------------------------------------------------------------------------- #
+# Audit 2026-08-21: the closed form computed M via math.exp(g_over_c) with
+# g_over_c = ln2*(t+d0)/c + 1, which raises OverflowError once (t+d0)/c
+# passes ~1022.6 -- and returned a bare None indistinguishable in provenance
+# from "scipy absent" or "no real W_-1", even though a real W_-1 exists
+# there. Hy3's eager-drafter constants (t=76, d0=50, c=0.1 -> ratio 1260)
+# sit deep inside the dead zone; only the fixed point kept answering.
+
+
+def _lw_residual(b_star, a_inf, beta, const):
+    """|stationarity residual| of 2^-b*beta*(ln2*(t+d0+c*b)+c) == c*(1+a_inf)."""
+    lhs = 2.0 ** (-b_star) * beta * (
+        math.log(2) * (const.t_ms + const.d0_ms + const.c_ms_per_bit * b_star)
+        + const.c_ms_per_bit)
+    return abs(lhs - const.c_ms_per_bit * (1.0 + a_inf))
+
+
+def test_lambertw_survives_d0_dominated_overflow_regime():
+    pytest.importorskip("scipy")
+    const = ServeConstants(t_ms=76.0, d0_ms=50.0, c_ms_per_bit=0.1)
+    # (t+d0)/c = 1260 puts ln M at -874: below even denormal float64 range,
+    # so the answer comes from the exact log-space continuation of W_-1.
+    value, status = _continuous_bstar_lambertw(0.98, 1.5, const)
+    assert status == "log_space_continuation"
+    assert value is not None
+    # The stationarity equation is solved to float precision there.
+    assert _lw_residual(value, 0.98, 1.5, const) < 1e-9 * 0.1 * 1.98
+    # ...and agrees with the fixed point iterated to convergence.
+    b = 3.0
+    for _ in range(60):
+        bracket = math.log(2) * (76.0 + 50.0 + 0.1 * b) + 0.1
+        b = math.log(1.5 * bracket / (0.1 * 1.98)) / math.log(2)
+    assert abs(value - b) < 1e-6
+
+
+def test_lambertw_uses_scipy_while_the_argument_is_representable():
+    pytest.importorskip("scipy")
+    const = ServeConstants(t_ms=90.0, d0_ms=10.0, c_ms_per_bit=0.1)
+    value, status = _continuous_bstar_lambertw(0.98, 1.5, const)
+    assert status == "scipy_lambertw"
+    assert value is not None
+    assert _lw_residual(value, 0.98, 1.5, const) < 1e-9 * 0.1 * 1.98
+
+
+def test_lambertw_overflow_threshold_now_continuous_across_the_boundary():
+    pytest.importorskip("scipy")
+    # Status hands over where ln((1+a_inf)/beta) - ln2*(t+d0)/c - 1 crosses
+    # the -700 representability floor (between ratio 1000 and 1022 here);
+    # the VALUE must stay correct and smooth on both sides.
+    values = []
+    statuses = []
+    for ratio in (1000.0, 1022.0, 1023.0, 1260.0, 5000.0):
+        span = ratio * 0.1
+        const = ServeConstants(t_ms=span * 0.9, d0_ms=span * 0.1,
+                               c_ms_per_bit=0.1)
+        value, status = _continuous_bstar_lambertw(0.98, 1.5, const)
+        assert value is not None, ratio
+        assert _lw_residual(value, 0.98, 1.5, const) < 1e-8 * 0.1 * 1.98
+        values.append(value)
+        statuses.append(status)
+    assert statuses[0] == "scipy_lambertw"
+    assert all(s == "log_space_continuation" for s in statuses[1:])
+    # The optimum drifts smoothly upward with (t+d0)/c; no cliff at ~1023.
+    assert all(b2 > b1 for b1, b2 in zip(values, values[1:]))
+
+
+def test_lambertw_reports_no_real_solution_and_invalid_constants():
+    pytest.importorskip("scipy")
+    # beta -> 0 makes M = (1+a_inf)/(beta*e^g) huge: outside [-1/e, 0).
+    const = ServeConstants(t_ms=1.0, d0_ms=0.0, c_ms_per_bit=1.0)
+    assert _continuous_bstar_lambertw(0.5, 0.001, const) == (
+        None, "no_real_solution")
+    assert _continuous_bstar_lambertw(None, 1.5, const) == (
+        None, "invalid_fit_constants")
+    assert _continuous_bstar_lambertw(0.5, None, const) == (
+        None, "invalid_fit_constants")
+
+
+def test_lambertw_scipy_absent_is_a_distinct_status(monkeypatch):
+    monkeypatch.setitem(sys.modules, "scipy.special", None)
+    const = ServeConstants(t_ms=76.0, d0_ms=50.0, c_ms_per_bit=0.1)
+    assert _continuous_bstar_lambertw(0.98, 1.5, const) == (
+        None, "scipy_absent")
+
+
+def test_provenance_records_which_continuous_solver_answered():
+    pytest.importorskip("scipy")
+    menu = _ideal_menu([2, 3, 4, 5])
+    const = ServeConstants(t_ms=76.0, d0_ms=50.0, c_ms_per_bit=0.1)
+    accepts = [AcceptancePoint(0.98 - 1.5 * 2.0 ** -2, rung_name="b2"),
+               AcceptancePoint(0.98 - 1.5 * 2.0 ** -5, rung_name="b5")]
+    p = select_rung(menu, const, accepts, _BIG, k=1).provenance
+    # In the formerly-dead overflow regime both estimators answer, and
+    # provenance records which solver produced each continuous estimate.
+    assert p["continuous_bstar"] is not None
+    assert p["continuous_method"] == "fixed_point"
+    assert p["continuous_bstar_lambertw"] is not None
+    assert p["continuous_bstar_lambertw_status"] == "log_space_continuation"
+    assert json.loads(json.dumps(p))["continuous_bstar_lambertw_status"] == (
+        "log_space_continuation")
 
 
 # --------------------------------------------------------------------------- #

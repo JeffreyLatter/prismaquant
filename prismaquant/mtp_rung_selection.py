@@ -230,31 +230,68 @@ def _continuous_bstar_fixed_point(a_inf, beta, const: ServeConstants,
 
 
 def _continuous_bstar_lambertw(a_inf, beta, const: ServeConstants):
-    """Closed form via scipy's Lambert-W (the W_{-1} branch), if scipy is present.
+    """Closed form via scipy's Lambert-W (the W_{-1} branch), when computable.
 
-    Independent cross-check on the fixed point. Returns None if scipy is absent
-    or the transform over/underflows (e.g. the d0-dominated degenerate regime,
-    where the continuous optimum sits far outside the menu anyway).
+    Independent cross-check on the fixed point. Returns ``(value, status)``
+    so provenance can record WHICH solver answered instead of collapsing
+    every failure into a bare ``None``:
+
+      * ``("scipy_lambertw", b*)`` — scipy evaluated W_{-1} directly;
+      * ``("log_space_continuation", b*)`` — the argument is smaller than
+        float64 can represent (``ln M < -700``, i.e. the d0-dominated regime
+        ``(t+d0)/c >~ 1023``); the branch is continued exactly by solving
+        ``s - ln(s) = -ln(M)`` (Newton; unique root s > 1, convex, converged
+        to machine precision), which is the same equation W_{-1} solves in
+        the only regime where its argument underflows;
+      * ``(None, "no_real_solution")`` — ``M >= 1/e`` or non-finite: no real
+        point on the -1 branch;
+      * ``(None, "invalid_fit_constants")`` / ``(None, "scipy_absent")``.
+
+    Audit 2026-08-21: the old form computed ``M = (1+a_inf)/(beta*exp(g/c))``
+    directly. For eager-drafter constants (Hy3: t=76 ms, d0=50 ms,
+    c=0.1 ms/bit -> (t+d0)/c = 1260) ``math.exp(g/c)`` raised OverflowError
+    and the helper returned None — silently self-disabling on roughly the
+    top half of the plausible (t+d0)/c range even though a real W_{-1}
+    exists there. Rescaling into ``log_M = ln((1+a_inf)/beta) - g/c``
+    removes the overflow entirely: the argument handed to scipy is
+    ``-exp(log_M)``, representable whenever ``log_M > -700``, and continued
+    analytically below that.
     """
     try:
         from scipy.special import lambertw  # noqa: PLC0415
     except Exception:
-        return None
+        return None, "scipy_absent"
     c = const.c_ms_per_bit
     if beta is None or beta <= 0 or c <= 0 or a_inf is None or (1.0 + a_inf) <= 0:
-        return None
+        return None, "invalid_fit_constants"
+    g_over_c = (_LN2 * (const.t_ms + const.d0_ms) + c) / c
     try:
-        g_over_c = (_LN2 * (const.t_ms + const.d0_ms) + c) / c
-        M = (1.0 + a_inf) / (beta * math.exp(g_over_c))
-    except OverflowError:
-        return None
-    if not math.isfinite(M) or M <= 0 or M >= (1.0 / math.e):
-        return None  # -M outside [-1/e, 0): no real W_{-1} solution
-    w = lambertw(-M, k=-1)
-    if abs(w.imag) > 1e-9:
-        return None
-    s = -w.real
-    return s / _LN2 - (const.t_ms + const.d0_ms) / c - 1.0 / _LN2
+        log_M = math.log((1.0 + a_inf) / beta) - g_over_c
+    except (OverflowError, ValueError):
+        return None, "no_real_solution"
+    if not math.isfinite(log_M) or log_M >= -1.0:
+        return None, "no_real_solution"  # -M outside [-1/e, 0): no real W_{-1}
+    if log_M >= -700.0:
+        w = lambertw(-math.exp(log_M), k=-1)
+        if abs(w.imag) > 1e-9 or not math.isfinite(w.real):
+            return None, "no_real_solution"
+        s = -w.real
+        method = "scipy_lambertw"
+    else:
+        # s := -W_{-1}(-M) >= 1 satisfies s - ln(s) = L with L = -ln(M).
+        L = -log_M
+        s = L + math.log(L)
+        for _ in range(60):
+            step = (s - math.log(s) - L) * s / (s - 1.0)   # Newton
+            s -= step
+            if not (s > 1.0) or not math.isfinite(s):
+                return None, "continuation_did_not_converge"
+            if abs(step) <= 1e-14 * s:
+                break
+        else:
+            return None, "continuation_did_not_converge"
+        method = "log_space_continuation"
+    return s / _LN2 - (const.t_ms + const.d0_ms) / c - 1.0 / _LN2, method
 
 
 # --------------------------------------------------------------------------- #
@@ -350,7 +387,7 @@ def select_rung(menu, constants: ServeConstants, accept_points,
         reason = None
 
     b_star = _continuous_bstar_fixed_point(a_inf, beta, constants, b_mid)
-    b_star_lw = _continuous_bstar_lambertw(a_inf, beta, constants)
+    b_star_lw, lw_status = _continuous_bstar_lambertw(a_inf, beta, constants)
 
     provenance = {
         "schema": "mtp_rung_selection/1",
@@ -405,6 +442,7 @@ def select_rung(menu, constants: ServeConstants, accept_points,
         "continuous_bstar": b_star,
         "continuous_method": "fixed_point" if b_star is not None else None,
         "continuous_bstar_lambertw": b_star_lw,
+        "continuous_bstar_lambertw_status": lw_status,
         "a_clamped": a_clamped,
     }
     # Provenance must be JSON-serialisable (doc §3.7); fail fast if not.

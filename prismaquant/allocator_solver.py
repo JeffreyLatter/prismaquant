@@ -570,7 +570,23 @@ def selected_rung_dual_intervals(
 def solve_allocation(stats: dict, candidates: dict[str, list[Candidate]],
                      target_bits: float, bit_precision: float = 0.001
                      ) -> tuple[dict[str, str], dict[str, Candidate]] | None:
-    """Solve multi-choice knapsack in average-bits-per-parameter units."""
+    """Solve multi-choice knapsack in average-bits-per-parameter units.
+
+    Contract (audit 2026-08-21): this is a PROJECTION, not a budget
+    feasibility certificate. Returns None when ``target_bits`` is below the
+    format floor (``min_bits``); otherwise the returned assignment's charged
+    bins fit ``round((target_bits - min_bits) / bit_precision) + 1``, but its
+    ACHIEVED average bits can exceed ``target_bits`` — each unit's share-
+    scaled bit delta is rounded to the nearest bin (minimum one bin when
+    strictly positive, see ``_charged_bins``), so the overshoot is bounded by
+    ``bit_precision * (n_units + 3) / 2``: n/2 bins of per-unit round-to-
+    nearest slack plus 1.5 bins of DP capacity slack. Budget feasibility
+    (``achieved - target <= tolerance``) is enforced upstream on the promoted,
+    exactly-priced assignment — by :func:`solve_with_promotion`'s overshoot
+    ratchet and the byte-budget exact filter — never here (see
+    docs/design/constrained_pareto_allocation.md and serve_constraints.py
+    for why the filter deliberately lives outside this DP).
+    """
     import numpy as np
 
     names = list(candidates.keys())
