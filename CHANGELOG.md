@@ -2,6 +2,55 @@
 
 ## Unreleased
 
+### Fixed
+
+- **MTP Lambert-W closed form no longer silently disables itself**
+  (`mtp_rung_selection.py`): `exp(g_over_c)` overflowed for
+  `(t+d0)/c ≳ 1022.6` — ~41% of the plausible parameter range, including the
+  recorded Hy3 constants (~1260) — and the bare-`None` fallback was
+  indistinguishable from "no scipy" / "no real solution", so the fixed-point
+  answer shipped without anyone knowing the closed form had died. The closed
+  form is now computed in log space, sub-representable arguments take an
+  exact Newton continuation of `W₋₁` on `s − ln s = L`, and provenance
+  records which solver answered in `continuous_bstar_lambertw_status`
+  (`docs/design/mtp_rung_selection.md` §3 updated). Failing-test-first: six
+  new tests including overflow-regime survival and status handover.
+- **`solve_allocation`'s true contract is now documented with a proven
+  overshoot bound** (`allocator_solver.py` docstring): the DP bounds charged
+  bins, not achieved bits; raw results can exceed target by up to
+  `bit_precision·(n_units+3)/2` (derivation + 400-instance fuzz + near-worst
+  construction at ~97% of bound), feasibility deliberately enforced upstream
+  by `solve_with_promotion`'s ratchet and the byte-budget filter. No caller
+  change — the only live raw caller already frames output as an overshooting
+  projection.
+
+### Added
+
+- **`tests/test_math_reunderwrite_pins.py`** — twelve hard-coded-value pins
+  closing audit gaps: charged-bin conservative table incl. the
+  clamp-over-rounding interaction, `predicted_dloss` gain semantics, KL-Fisher
+  probe covariance law (T²-scaled) and quadratic-form equivalence,
+  ceil-first bit splits, two-tier constants, scale-plane/type_size laws, CB
+  ladder rate factors, dual-interval emptiness on equal-byte domination, and
+  the solve_allocation overshoot bound instance.
+- **`docs/audits/math_reunderwrite_2026-08-21.md`** — the full mathematical
+  re-underwrite: every load-bearing artifact re-derived and numerically
+  verified (cost chain, encoders, selection/accounting), verdicts per
+  artifact, new proofs (two-tier scale-code 2-to-1 structure with provably
+  empty exception set; rearrangement envelope for the ½·H·MSE collapse under
+  correlated error; backtrack sufficiency), and the findings register
+  (F1–F7).
+
+### Documentation
+
+- **Paper consistency pass** (`paper/main.tex`, claims tests green):
+  Proposition 5's proof sketch replaced by a complete proof; Proposition 6
+  restated over its provable segment-LP core with empirical clauses moved to
+  prose; §5 reconciliation splice citing the validated Qwen3.8-27B log-linear
+  fit (R²=0.9948, no saturation over 4.50–8.25 bpp); one provenance footnote
+  covering the dispersion/fidelity constant cluster flagged by the external
+  review.
+
 ### Changed
 
 - **The producer Gridbook pin advances 0.8.5 → 0.8.11** (commit `187c721`,
