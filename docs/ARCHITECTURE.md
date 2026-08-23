@@ -4980,16 +4980,24 @@ inside the claim table — is pinned like every other router; the gate's
 `find_decided_but_unpriced` checker turns that contradiction class into a
 refusal so it cannot recur silently.
 
-Still open per the design doc: migrating cost onto the walker's edge
-list — probe, footprint and read-traffic have landed. The first wave of
-that migration is the shared **name-projection layer** (below): the
-private NAME mappings of the probe (2026-08-22,
-`walker/consumer-probe`), footprint (`walker/consumer-footprint`) and
-read-traffic (`walker/consumer-readtraffic`) all route through it.
-Cost is still on its own enumeration. Separately, every consumer's
-INVENTORY is still its own enumeration — the probe still builds its
-tracked set from `named_modules()` plus shard regexes — so the
-edge-list migration proper remains open for all four.
+Two distinct migrations are in play here, and only one has landed. The
+first wave is the shared **name-projection layer** (below), and as of
+2026-08-22 **all four consumers route their private NAME mappings through
+it**: read-traffic (`walker/consumer-readtraffic`), footprint
+(`walker/consumer-footprint`), probe (`walker/consumer-probe`) and cost
+(`walker/consumer-cost`). No consumer holds its own checkpoint→live→recipe
+string surgery any more. One deliberate exception remains and is not a
+projection: `production_render_cost.canonical_cost_name`'s umbrella-infix half
+stays a **total** normalizer, because render/cost payloads key costed MTP rows
+physically and a projection that may decline must never drop them.
+
+The **edge-list migration proper is still open for all four**, and is the
+larger of the two: every consumer's INVENTORY remains its own enumeration —
+the probe still builds its tracked set from `named_modules()` plus shard
+regexes — so the walker's edge list is not yet the single enumeration the
+stages derive from. Sharing a name projection is not the same as sharing a
+requirement set; the first makes the four agree on what a unit is *called*,
+the second would make them agree on which units *exist*.
 
 #### 8.8.1 The shared name-projection layer
 
