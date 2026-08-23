@@ -596,6 +596,19 @@ def test_sentinel_compare_flags_a_missing_unit():
     assert any("only in the first manifest" in p for p in problems)
 
 
+def test_sentinel_compare_flags_an_incomplete_manifest():
+    # A box that could not render a format at all (2026-08-23: no python3-dev
+    # on sparklina → Triton build failure → every NVFP4 entry absent) must be
+    # named as incomplete, not just "missing units".
+    complete = _manifest({"a|NVFP4": {"sha256": "aa"}, "b|NVFP4": {"sha256": "bb"}})
+    partial = dict(complete, host={"hostname": "boxB"},
+                   entries={"a|NVFP4": {"sha256": "aa"}})
+    assert sentinel_tool.missing_entries(partial) == ["b|NVFP4"]
+    assert sentinel_tool.missing_entries(complete) == []
+    problems = sentinel_tool.compare_manifests([complete, partial])
+    assert any("boxB is incomplete" in p and "b|NVFP4" in p for p in problems)
+
+
 def test_sentinel_compare_refuses_a_nondeterministic_match(tmp_path):
     entries = {"a|NVFP4": {"sha256": "aa"}}
     paths = []

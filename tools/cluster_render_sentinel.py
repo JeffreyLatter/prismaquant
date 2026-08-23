@@ -163,6 +163,22 @@ def _render(args) -> int:
         f"{qname}|{fmt}": _tensor_digest(cache.get(qname, fmt))
         for (qname, fmt) in sorted(cache.weights)
     }
+    # Fail closed on a partial render. The cache fill can drop a (unit,
+    # format) it could not render (2026-08-23: sparklina lacked python3-dev,
+    # Triton could not build, every NVFP4 entry was silently absent while
+    # the FP8 entries matched); a manifest that omits them would certify a
+    # box that cannot render the format at all.
+    missing = missing_entries({"units": picked, "formats": formats,
+                               "entries": entries})
+    if missing:
+        print(
+            "[sentinel] ERROR: incomplete render — refusing to write a "
+            f"manifest. {len(missing)} of {len(picked) * len(formats)} "
+            f"(unit, format) pairs did not render on this box: "
+            f"{missing[:8]}. Look for build/toolchain errors above.",
+            flush=True,
+        )
+        return 2
     records = (cache.metadata or {}).get("render_scores") or {}
     payload = {
         "schema": SCHEMA,
@@ -207,9 +223,27 @@ def _manifest_digest(payload) -> str:
     ).hexdigest()
 
 
+def missing_entries(manifest) -> list[str]:
+    """(unit, format) keys a manifest promises but did not render."""
+    expected = {
+        f"{unit}|{fmt}"
+        for unit in manifest.get("units") or []
+        for fmt in manifest.get("formats") or []
+    }
+    return sorted(expected - set(manifest.get("entries") or {}))
+
+
 def compare_manifests(manifests) -> list[str]:
     """Return the list of problems; empty means the boxes agree."""
     problems: list[str] = []
+    for index, manifest in enumerate(manifests):
+        missing = missing_entries(manifest)
+        if missing:
+            host = (manifest.get("host") or {}).get("hostname", f"#{index}")
+            problems.append(
+                f"manifest {host} is incomplete: {len(missing)} of its "
+                f"promised (unit, format) pairs are absent: {missing[:8]}"
+            )
     first = manifests[0]
     for other in manifests[1:]:
         for field in ("schema", "formats", "levers", "units", "k"):
