@@ -1,7 +1,17 @@
 # PrismaQuant Architecture
 
-As of: 2026-08-22 · `walker/r5-export-gate` — stamps follow, newest first, each recording
-its own branch and date. Re-stamped (2026-08-22, `walker/r5-export-gate`) for
+As of: 2026-08-22 · `walker/name-projection` — stamps follow, newest first, each recording
+its own branch and date. Re-stamped (2026-08-22, `walker/name-projection`) for
+**the shared name-projection layer** (§8.8.1, `prismaquant/name_projection.py`):
+one profile-routed projection between the live/recipe/checkpoint/export/vLLM
+namespaces, fail-closed with structured refusal codes, explicit
+many→one/one→many shapes for fused siblings and packed experts, round-trip
+identity pinned where the profile's rules are total (Qwen3, Qwen3.5
+multimodal, DSv4 — including the surfaced `hc_head` inverse gap), and no
+rank/shard/degree anywhere in the API (the TP seam stays in
+`model_walk.per_device_bytes`). Consumers are not migrated; the module ships
+with its conformance tests only. Previously re-stamped (2026-08-22,
+`walker/r5-export-gate`) for
 **the discovery walker as a fail-closed export gate** (§8.8,
 `prismaquant/model_walk.py`): the R5 design contract's remaining open half —
 wiring the walk as an export gate — is closed; the probe/cost/footprint/
@@ -4906,8 +4916,62 @@ inside the claim table — is pinned like every other router; the gate's
 refusal so it cannot recur silently.
 
 Still open per the design doc: migrating probe/cost/footprint/read-traffic
-onto the walker's edge list — separate, deliberate work (the consumption-API
-design lives in the R5 reports).
+onto the walker's edge list. The first wave of that migration is the shared
+**name-projection layer** (below); the four consumer call-sites themselves are
+still on their own enumerations.
+
+#### 8.8.1 The shared name-projection layer
+
+`prismaquant/name_projection.py` (2026-08-22, `walker/name-projection`)
+lands the ONE projection between the pipeline's parameter-name namespaces
+that the R5 consumer analyses each said they were re-deriving ad hoc: a
+Linear's live name (`WalkNode.name`), its allocator/probe recipe name,
+its source-checkpoint key, its exported-artifact key, and its vLLM
+scheme-dispatch qname (`NameProjection`, five `LIVE/RECIPE/CHECKPOINT/
+EXPORT/VLLM` constants). The contract, pinned by
+`tests/test_name_projection.py`:
+
+- **The profile owns the knowledge; the layer owns the discipline.**
+  Every mapping routes through existing `ModelProfile` accessors
+  (`checkpoint_to_live_name`, `live_to_recipe_name`,
+  `to_vllm_internal_name`, `source_tensor_name`, `export_tensor_name`,
+  `fused_sibling_group`, `packed_expert_format_group`) — no second
+  mapping lives anywhere, and consumers keep no private
+  `_recipe_name`/`_strip_weight` helpers (the leaf rule itself is
+  `strip_weight_leaf` here).
+- **Fail closed and loud.** An unmappable or ambiguous name raises
+  `NameProjectionError` with structured fields — `code`
+  (`unmapped_in_universe`, `ambiguous`, `no_universe_supplied`,
+  `malformed_profile_result`, `profile_accessor_failed`,
+  `unknown_namespace`, `unsupported_pair`, `uncovered_unit`),
+  source/target namespace, and what was tried. Unlike
+  `decision_units.fused_group_key`, nothing swallows a profile failure
+  into an identity fallback. The profile's DECLARED drops (visual/MTP/
+  scale keys) are data instead: `project()` returns a `ProjectedName`
+  whose `outcome == declared_out_of_graph`, so read-traffic can classify
+  `excluded_non_text_graph` by branching on a field.
+- **Non-totality is in the type.** Fused siblings and packed experts
+  surface as `ServingGroup(kind, key, members)` with packed precedence
+  over fused for expert stacks; reverse lookups refuse group KEYS rather
+  than returning an arbitrary member; the coverage index mirrors
+  footprint's dual-entry manifest convention so one logical tensor
+  covered by many split checkpoint spellings answers under either
+  naming (`checkpoint_keys_for` / `require_checkpoint_span`, the
+  coverage assertion footprint.md asked for).
+- **Round-trip property tested where the profile's rules are total**:
+  Qwen3 dense (identity), Qwen3.5 multimodal (umbrella-infix rewrite),
+  DSv4 flat naming — plus the recorded gap the round trip SURFACED:
+  DSv4's spec generates `hc_head.hc_*` source spellings while the real
+  checkpoint stores flat `hc_head_*`, so that family's inverse declines;
+  the layer reports it, it does not guess.
+- **TP seam held**: names are logical, whole-tensor facts; no rank,
+  shard index, or degree exists in any signature (a constructor-kwarg
+  refusal test pins this). Byte accounting stays in
+  `model_walk.per_device_bytes`.
+
+Consumers are NOT migrated yet — this module ships with its conformance
+tests only, so the probe/cost/footprint/read-traffic migrations can land
+as thin call-site changes without colliding.
 
 ## 9. Serving lanes
 
