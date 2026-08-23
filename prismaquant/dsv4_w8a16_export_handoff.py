@@ -347,6 +347,26 @@ _PUBLISHED_FILES = frozenset({
 #     W8A16 lane assigns no CB rung, so the gate's per-unit loop sees no CB
 #     units on this lane; merge union with the R1 split-book gate reviewed
 #     line-by-line (both are additive parameters + calls at the same anchors).
+# RE-FROZEN 2026-08-22 (fifth time; the R5 discovery-walker merge), reviewed
+#     against THIS handoff rather than re-hashed:
+#   model_profiles/base.py -- `walk_claim_rules()` appended two ClaimRules
+#     between the ndim<=1 exclude and the final Linear-decide rule (a
+#     router-class pin and an `*Experts` packed-stack decide; docstring
+#     renumbered 9->11). Nothing else in the file moved. The method's only
+#     consumer is the R5 discovery walker (`prismaquant.model_walk`) and its
+#     tests -- grep over this closure finds no other caller, so exporter,
+#     completeness, decode-source, and namespace behavior cannot observe the
+#     change. On the DSv4 walk itself the rules are strictly shadowed or
+#     equivalent: DeepseekV4Profile prepends its own per-class router pins
+#     ahead of super(), first-match keeps the original disposition+reason for
+#     every node both rules match, and the R5 sweep verified every
+#     router-family node on the vendored topology was already pinned; the
+#     packed-expert decide matches owner classes containing "expert", but this
+#     lane swaps packed classes for per-expert nn.Linears before
+#     instantiation, whose weights the Linear rule already claimed with the
+#     same disposition. Net: byte-identical claims on the shipped DSv4
+#     topology; additional coverage only on architectures that previously had
+#     NO claim at all.
 _FROZEN_EXPORT_SOURCE_SHA256 = {
     "prismaquant/export_nvfp4_cb_streaming.py": (
         "3380385f601623fc5d5b31147a226da15928b77b99dc15d2719e0ccb54232d1b"
@@ -364,7 +384,7 @@ _FROZEN_EXPORT_SOURCE_SHA256 = {
         "fb20303ed1b017a5a7f3a035d5ef43880822d775e252c28a08f32a67f8104c95"
     ),
     "prismaquant/model_profiles/base.py": (
-        "69fcddeb8c5de48756bc47b053782f2ddd9e2773c68176248f679e8f5fbd0e5c"
+        "a69b151eedea8eb11bafd9acfa3923fb2fbcdadf05772573277c493a999e4614"
     ),
     "prismaquant/model_profiles/registry.py": (
         "2fb8bcc01fbfd3b89870d387d335f804b05378f9853f223469c619e7ab766b90"

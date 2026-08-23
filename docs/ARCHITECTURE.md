@@ -1,7 +1,35 @@
 # PrismaQuant Architecture
 
-As of: 2026-08-21 · `merge/proven-rescues` — stamps follow, newest first, each recording
-its own branch and date. Re-stamped (2026-08-21, `merge/proven-rescues`) for the
+As of: 2026-08-22 · `walker/r5-export-gate` — stamps follow, newest first, each recording
+its own branch and date. Re-stamped (2026-08-22, `walker/r5-export-gate`) for
+**the discovery walker as a fail-closed export gate** (§8.8,
+`prismaquant/model_walk.py`): the R5 design contract's remaining open half —
+wiring the walk as an export gate — is closed; the probe/cost/footprint/
+read-traffic migration onto its edge list stays a separate workstream.
+`run-pipeline.sh` stage **[3d]** (`python3 -m prismaquant.model_walk`) runs
+before EVERY export lane (GGUF, CB, compressed-tensors) and refuses (`exit 2`)
+on an unclaimed matmul-fed node, an unresolved floating multiplicand, an
+unknown walk-failure kind, or a decided-but-unpriced contradiction, deciding
+from STRUCTURED fields only (`artifacts/model_walk.json`, gate schema
+`prismaquant.model_walk_gate.v1`). The explicit override
+(`PRISMAQUANT_WALK_GATE_OVERRIDE=<reason>`) excuses trace incompleteness ONLY
+(DSv4's data-dependent scalar aborts the fake trace) and is stamped; claim
+failures have no override — they are fixed by pinning with reasons in
+`ModelProfile.walk_claim_rules()`. Same commit: the walk became a cacheable
+artifact (`SCHEMA prismaquant.model_walk.v1`; envelope `{schema, provenance,
+result}`, atomic write, fail-closed reload on foreign schema / execution
+mismatch / claim-rule digest mismatch), carrying trace-time provenance
+(model+config identity, versions, input contract) and the serialized applied
+rule list; byte semantics are pinned as LOGICAL-TOTAL with the
+`per_device_bytes(total, tp_degree, policy)` seam for Tensor-Parallel
+(decision unit: whole logical tensor; dispositions are TP-invariant; the
+future group/shard misalignment refusal lands as an unknown-until-implemented
+walk-failure kind that already refuses). The R5 profile sweep's findings land
+here too: universal base rules now pin MoE router gates and decide packed
+expert stacks (six/seven profiles were unclaimed; gemma4's router was
+decided-but-never-priced — wrong polarity inside the claim table itself, now
+pinned like every other router), and the gate surfaces that contradiction
+class structurally. Previously re-stamped (2026-08-21, `merge/proven-rescues`) for the
 **Gridbook 0.8.11 PRODUCER pin**: the producer pin
 (`gridbook_runtime_pin.json`) advanced 0.8.5/v3 → 0.8.11/v4 at commit
 `187c721`, in lockstep with the serving pin, and a new test
@@ -1090,6 +1118,7 @@ which is what the rows touched since are keyed on.
 | **4/4 C** | Frontier point selection | `prismaquant.select_validated_frontier` (`1281-1288`) | overwrites `artifacts/layer_config.json`; `layer_config_validated_assignment.json`; `validated_frontier_selection.json` | none | validated-surrogate |
 | **4/4 D** | Production cache build / recache for the selected assignment | `production_recache` (`1331-1346`, `1399-1414`) or `build_production_cache --recache-layer-config` (`1379-1396`, `1423-1438`) | `production_weight_cache_frontier_<digest>_recached.pkl` (`1328`), `production_weight_cache_recached.pkl` / `…_raw.pkl` (`1102-1103`) | settings-hash `production-cache-recached` (`1404`), `frontier-recache` (`1360`), `production-cache-raw` (`1452`) | `PRODUCTION_CACHE=1` |
 | **3c** | AURA additivity report — `residual = measured_end_KL − Σ predicted_dloss`, stamped into `cost.pkl` `provenance["additivity"]` (§4.3) | `prismaquant.aura_additivity_gate` (+ optional `validate_assignments_kl` under `AURA_ADDITIVITY_GATE=measure`) | `artifacts/aura_additivity.json`, `aura_additivity_kl.json` (measure only); `logs/aura_additivity*.log` | none — non-blocking report, skip-if-exists on the KL half | `COST_MODE=aura`, `AURA_ADDITIVITY_GATE≠0` |
+| **3d** | Discovery-walker export gate (§8.8) — meta-load + one fake forward against the profile's claim rules; refuses the run before ANY export lane on an unclaimed matmul-fed node / unresolved floating multiplicand / unknown walk-failure kind / decided-but-unpriced contradiction, decided from structured fields only. Override env excuses trace incompleteness ONLY (stamped); claims have no override | `prismaquant.model_walk` (`python3 -m prismaquant.model_walk`) | `artifacts/model_walk.json`; `logs/model_walk.log` | none — always runs; it is the gate | every lane; knobs `WALK_GATE_SEQLEN=8`, `WALK_GATE_EXECUTION=fake`, `PRISMAQUANT_WALK_GATE_OVERRIDE=<reason>` |
 | **4/4 E-gguf** | GGUF skeleton + export + llama.cpp smoke | `convert_hf_to_gguf.py` (`1461-1464`), `prismaquant.export_gguf` (`1469-1493`), `llama-completion` (`1500-1516`) | `artifacts/skeleton.gguf`, `exported.gguf` | settings-hash `gguf-skeleton` (`1488`); export always runs | GGUF lane; **exits 0** |
 | **4/4 E-cb** | CB col-weights + codebook export | `harvest_cb_col_weights "[4/4]"`, `export_nvfp4_cb[_streaming]` | `exported_nvfp4_cb/` in **~1 GiB safetensors shards** (`EXPORT_SHARD_BYTES`, default `1073741824`) + `.pqcb` codebook sidecar | settings-hash `cb-col-weights`; export always runs | CB lane; no in-lane serving smoke; **exits 0** |
 | **4/4 E** | compressed-tensors export (§6) | `prismaquant.export_native_compressed` (`1665-1699`) | `exported/` in **~1 GiB safetensors shards** (`EXPORT_SHARD_BYTES`, default `1073741824`); `logs/export.log` | **none — always runs** | default lane |
@@ -4844,12 +4873,41 @@ the probe's enumeration. `DeepseekV4Profile.walk_claim_rules()` now pins each
 with its reason (plus the compressor/indexer Linears the serve contract keeps
 source-format).
 
-This build ships the API and the conformance surface only
-(`tests/test_model_walk.py`) — **no consumer is wired**. The intended end
-state per the design doc: the walker's edge list becomes the single
-enumeration the probe, cost, footprint, and read-traffic stages derive from,
-and the walk runs at new-architecture intake and again at export as a gate.
-Consumer migration is separate, deliberate work.
+The gate half of the contract is WIRED (2026-08-22, `walker/r5-export-gate`):
+`run-pipeline.sh` stage **[3d]** runs `python3 -m prismaquant.model_walk
+--model $MODEL_PATH` on a meta load immediately before EVERY export lane and
+refuses the run (`exit 2`, `set -e`) when :func:`evaluate_walk_gate` — the
+gate over :class:`WalkResult` in the same module, schema
+`prismaquant.model_walk_gate.v1` — reports an unclaimed matmul-fed node, an
+unresolved floating multiplicand, an unknown walk-failure kind, or a
+decided-but-unpriced node. The verdict is STRUCTURED: refusal kinds plus
+per-entry `(node, op, equation, module)` lists in
+`artifacts/model_walk.json`; prose (`detail`, `refusal_reason`) explains to
+humans and nothing branches on it. The per-run override
+(`PRISMAQUANT_WALK_GATE_OVERRIDE=<reason>`) excuses trace incompleteness only
+— DSv4's DSA scalar aborts the fake trace today — and is stamped into the
+report; claim failures have no override. Because identity and dispositions
+live on whole logical tensors, Tensor-Parallel degree cannot move the gate's
+universe; byte fields are pinned as logical totals behind the explicit
+`per_device_bytes(total, tp_degree, policy)` seam, and any future walk-failure
+kind (e.g. quantization-group vs shard-boundary misalignment) refuses on
+today's gate via the unknown-kind catch-all. Walks are also cacheable now:
+`save_walk`/`load_walk` wrap the payload in `{schema,
+prismaquant.model_walk.v1, provenance, result}` with fail-closed reload
+(foreign schema, execution mismatch, claim-rule digest mismatch) and
+trace-time provenance (model+config digest, versions, input contract, applied
+rule list). The same commit landed the R5 sweep's claim-table fixes: universal
+base rules pin router gates (hy_v3, qwen3_5, laguna, minimax_m2, qwen3-moe;
+DSv4 keeps its specific pins) and decide packed expert stacks (seven
+`*Experts` families), and gemma4's router — decided by rule 9 while the
+probe's own name exclusion made pricing impossible, i.e. wrong polarity
+inside the claim table — is pinned like every other router; the gate's
+`find_decided_but_unpriced` checker turns that contradiction class into a
+refusal so it cannot recur silently.
+
+Still open per the design doc: migrating probe/cost/footprint/read-traffic
+onto the walker's edge list — separate, deliberate work (the consumption-API
+design lives in the R5 reports).
 
 ## 9. Serving lanes
 
