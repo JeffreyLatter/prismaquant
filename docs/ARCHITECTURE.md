@@ -1,7 +1,28 @@
 # PrismaQuant Architecture
 
-As of: 2026-08-22 · `walker/consumer-probe` — stamps follow, newest first, each recording
-its own branch and date. Re-stamped (2026-08-22, `walker/consumer-probe`) for **the probe
+As of: 2026-08-22 · `walker/consumer-cost` — stamps follow, newest first, each recording
+its own branch and date. Re-stamped (2026-08-22, `walker/consumer-cost`) for
+**the cost consumer migrating onto the shared name-projection layer** (§8.8.1):
+`_scan_source_dtype_manifest` lost its private checkpoint→live→recipe builders
+(`_strip_weight_suffix`, `_to_recipe_name`, `_packed_to_recipe_name`,
+`_per_expert_packed_recipe_name`) and now projects every source-kind row
+through `NameProjection.checkpoint_to_live` / `recipe_unit` /
+`packed_parent_of_expert_param` (`prismaquant/allocator_candidates.py`);
+`decision_units._recipe_name` is retired for
+`name_projection.strip_weight_leaf`, as is the inline leaf surgery in
+`production_render_cost.canonical_cost_name` (whose umbrella-infix half stays
+a total normalizer — render/cost payloads key costed MTP rows physically,
+which a declining projection must never drop) and `measure_quant_cost`'s
+act-cache candidate builder. Emitted values are UNCHANGED for existing
+profiles and artifacts — the manifest's profile=None convention now builds
+over the repo's declared generic baseline (`DefaultProfile`, the substitution
+`resolve_cost_target_name` always made) instead of inlined string surgery.
+One deliberate behavior change, fail-closed only: a profile accessor that
+RAISES now propagates `NameProjectionError` instead of silently skipping the
+row (the wo_a shape); MTP rows stay recipe-native verbatim by an explicit,
+commented short-circuit pending a profile declaration of recipe-native
+checkpoint prefixes. Probe, footprint, and read-traffic remain unmigrated.
+Previously re-stamped (2026-08-22, `walker/consumer-probe`) for **the probe
 consumer migrating onto the shared name-projection layer** (§8.8.1): `FisherAccumulator`
 now builds one `NameProjection`, and the probe holds no private name mapping — the
 packed-expert shard-scope filter reads its block id through `NameProjection.block_id`
@@ -5009,60 +5030,16 @@ EXPORT/VLLM` constants). The contract, pinned by
   refusal test pins this). Byte accounting stays in
   `model_walk.per_device_bytes`.
 
-**Probe migrated (2026-08-22, `walker/consumer-probe`)**: the probe's
-`FisherAccumulator` builds one `NameProjection` from its resolved profile
-(`DefaultProfile` as the explicit fallback when the model's own profile is
-unavailable, mirroring `_packed_expert_param_name_set`) and its two private
-derivations are deleted: the packed-expert shard-scope filter reads block
-identity via `NameProjection.block_id` (the old code sliced the first
-three qname components positionally). Measured: the two agree on every
-shape we ship — `model.layers.N.mlp.experts`,
-`model.layers.N.block_sparse_moe.experts` — and they DIVERGE on a
-multimodal prefix, where the positional slice yields
-`model.language_model.layers` with no layer index at all, so its
-`startswith` scope test matched every layer. The projection yields
-`model.language_model.layers.3`. The change is byte-identical on the
-shipped models and fixes a latent scope bug elsewhere. The Fisher skip
-set compares against the profile-declared `embedding_name()` instead of
-a hardcoded spelling; `DefaultProfile.embedding_name()` is exactly the
-old hardcoded `model.embed_tokens`, so the fallback path is unchanged.
-Footprint and read-traffic have since landed (below); cost is still to
-come, and can land as a thin call-site change without colliding.
-
-**Footprint migrated (2026-08-22, `walker/consumer-footprint`)** — the
-second consumer:
-`prismaquant/footprint.py` keeps no private name derivation — its inline
-`.weight` strips (manifest normalization, the re-encoded resolver, the
-stats lookup) and `source_span_identity` are
-`name_projection.strip_weight_leaf`; its packed-expert parser
-(`packed_expert_alias` + `_default_expert_parent_for_projection`) moved
-INTO `name_projection.py` and is re-exported for the historic import path,
-so the layer no longer depends on a consumer. `source_tensor_bytes_manifest`
-and `floor_bytes_for_model` accept a prebuilt `NameProjection`
-(keyword-only; mutually exclusive with the raw `name_map` /
-`expert_parent_for_projection` accessor kwargs — one manifest must not
-carry two name authorities). Under the projection, keys map through
-`checkpoint_to_live`: a MAPPED outcome uses the projected live unit; a
-`declared_out_of_graph` outcome keeps the raw checkpoint spelling (the MTP
-sidecar case — declined bytes still ride the floor); an accessor that
-raises or returns garbage propagates as a structured
-`NameProjectionError`, never a silent skip or zero. Emitted bytes are
-unchanged by construction: both mapping forms produce identical manifests
-(parity pinned in `tests/test_footprint.py`). Probe and cost remain
-unmigrated; read-traffic migrated in the same wave (below).
-
-The FIRST consumer migrated onto the layer was **read-traffic**
-(`walker/consumer-readtraffic`, 2026-08-22): both `read_traffic` entry
-points build one `NameProjection(profile)`; the classifier's
-decline-to-map rule branches on `ProjectedName.outcome ==
-declared_out_of_graph` instead of calling the profile accessor inline, and
-a profile accessor that fails now raises `NameProjectionError` where the
-old private code swallowed it into a raw-key passthrough (re-pricing every
-unmappable tensor at p=1). The private `_strip_weight` helper is deleted;
-the leaf rule is `strip_weight_leaf` here alone. No emitted number moved:
-`tests/test_read_traffic.py` pins the class table byte-identical. The
-probe/cost/footprint migrations can still land as thin call-site changes
-without colliding.
+Still open per the design doc: migrating the consumers onto the walker's
+EDGE LIST. The first wave of that migration is the shared
+**name-projection layer** (below), and as of 2026-08-22 all four
+consumers route their NAME derivations through it — cost
+(`walker/consumer-cost`), probe (`walker/consumer-probe`), footprint
+(`walker/consumer-footprint`) and read-traffic
+(`walker/consumer-readtraffic`). Their INVENTORIES are still their own
+enumerations — the probe still builds its tracked set from
+`named_modules()` plus shard regexes — so the edge-list migration
+proper remains open for all four.
 
 ## 9. Serving lanes
 
