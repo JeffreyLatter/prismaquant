@@ -367,6 +367,40 @@ _PUBLISHED_FILES = frozenset({
 #     same disposition. Net: byte-identical claims on the shipped DSv4
 #     topology; additional coverage only on architectures that previously had
 #     NO claim at all.
+# RE-FROZEN 2026-08-23 (sixth time; the R5 `wo_a` grouped-operand merge),
+# reviewed against THIS handoff rather than re-hashed. Rob signed off the
+# re-freeze after being shown that the change is deliberately consequential
+# for the ALLOCATOR (it is the point of the branch) and inert for THIS lane:
+#   specs/deepseek_v4.json -- data only: `DeepseekV4GroupedLinear` moves from
+#     `probe.skip_module_class_names` (now `[]`) to the new
+#     `probe.grouped_module_class_names`. No other key moves.
+#   model_profiles/deepseek_v4.py -- DOCSTRING ONLY. `walk_claim_rules()`
+#     re-describes `wo_a` as decided rather than pinned; not one statement
+#     changed. Verified by AST comparison with docstrings elided: identical.
+#   model_profiles/base.py -- two docstrings (`should_probe_linear`,
+#     `walk_claim_rules`) plus ONE new method, `probe_grouped_module_class_names()`,
+#     which returns the spec tuple and nothing else. Verified by per-method AST
+#     comparison with docstrings elided: 72 methods -> 73, ZERO existing
+#     bodies changed, none removed.
+# Why this lane cannot observe it: the changed declarations are read at
+# exactly four sites -- `model_profiles/structure.py` (spec parsing),
+# `base.py` itself (`should_probe_linear`, the new accessor, and
+# `walk_claim_rules`'s skip list), `sensitivity_probe.py`, and
+# `model_walk.py`. A grep over the whole closure finds NO exporter,
+# completeness, decode-source, footprint, output-safety, or namespace
+# consumer. `model_walk.py`, `sensitivity_probe.py`, and the allocator are
+# not members of this closure at all, so the disposition flip (`wo_a`: named
+# pin -> ordinary `decide`) lands entirely outside the frozen surface.
+# Independently, `dspark_source_metadata.dspark_cb_expected_physical_targets`
+# keeps all three `wo_a` bases on their released source-FP8 W8A16 route for a
+# STRUCTURAL reason this branch does not touch -- Gridbook's generic CB Linear
+# method does not implement the grouped-BMM algebra -- so the hybrid sidecar
+# CB surface stays nine physical bases per stage (27 for the released
+# three-stage topology).
+# What IS now true and was not before: a future DSv4 export may let the
+# allocator choose a format for `wo_a` instead of inheriting source precision.
+# That is the reviewed change. It means the 92 GB budget split (87.403 body +
+# 4.597 draft) must be re-checked on the next export rather than inherited.
 _FROZEN_EXPORT_SOURCE_SHA256 = {
     "prismaquant/export_nvfp4_cb_streaming.py": (
         "3380385f601623fc5d5b31147a226da15928b77b99dc15d2719e0ccb54232d1b"
@@ -384,16 +418,16 @@ _FROZEN_EXPORT_SOURCE_SHA256 = {
         "fb20303ed1b017a5a7f3a035d5ef43880822d775e252c28a08f32a67f8104c95"
     ),
     "prismaquant/model_profiles/base.py": (
-        "a69b151eedea8eb11bafd9acfa3923fb2fbcdadf05772573277c493a999e4614"
+        "c380bba84e244c922b19e3e444fcdd29c9c3653641ecdc4b1043234871b734ca"
     ),
     "prismaquant/model_profiles/registry.py": (
         "2fb8bcc01fbfd3b89870d387d335f804b05378f9853f223469c619e7ab766b90"
     ),
     "prismaquant/model_profiles/deepseek_v4.py": (
-        "6368f5657fbfb3b77a886e9bc0c589885d9240c49fdb77635d4bf2a74164b6f6"
+        "06cf8a5ed7bc0a11cca415147110465ffa9030e65fa5cb6fa65cfe28085d562f"
     ),
     "prismaquant/model_profiles/specs/deepseek_v4.json": (
-        "b8f3b22c16484a6859494d96ff052e5c5229c9a7c3afb7ae829e9cf5e26ecbf4"
+        "cbfaeb815f3b51d23a29d943a0bb57deff87ed1ae4f61ce560f74feee5b13a7b"
     ),
     "prismaquant/cb_source_decode.py": (
         "d9a06483d008bf2361b0522bc258ab291db870d1c2432f9d4cd8d7a8cbacefbe"
