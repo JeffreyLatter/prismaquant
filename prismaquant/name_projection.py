@@ -88,6 +88,7 @@ __all__ = [
     "NAMESPACES",
     "NameProjection",
     "NameProjectionError",
+    "packed_expert_alias",
     "PROJECTABLE_PAIRS",
     "ProjectedName",
     "RECIPE",
@@ -142,6 +143,52 @@ def strip_weight_leaf(tensor_name: str) -> str:
     """
     name = str(tensor_name)
     return name[: -len(".weight")] if name.endswith(".weight") else name
+
+
+def _default_expert_parent_for_projection(projection_name: str) -> str | None:
+    """No-profile fallback for the per-expert -> packed projection mapping.
+
+    Mirrors ``ModelProfile.packed_expert_parent_for_projection``'s legacy
+    fallback: per-expert ``gate_proj``/``up_proj`` fuse into the packed
+    ``gate_up_proj`` (output-axis cat, the transformers packed-FusedMoE
+    convention); ``down_proj`` packs 1:1. Anything else (e.g. MiniMax's
+    per-expert ``w1``/``w2``/``w3`` modules, which stay per-expert live)
+    has no packed parent here — callers with a profile should pass its
+    ``packed_expert_parent_for_projection`` instead.
+    """
+    if projection_name in ("gate_proj", "up_proj"):
+        return "gate_up_proj"
+    if projection_name == "down_proj":
+        return "down_proj"
+    return None
+
+
+def packed_expert_alias(qname: str, parent_for_projection=None) -> str | None:
+    """Packed live qname a per-expert Linear aggregates into, or None.
+
+    ``...experts.{i}.{proj}`` -> ``...experts.{parent}`` when
+    ``parent_for_projection(proj)`` names a packed parent
+    (``ModelProfile.packed_expert_parent_for_projection``; the legacy
+    gate/up/down fallback when None). Non-expert names and unrecognized
+    projections return None.
+
+    Lives HERE because it is name derivation, not byte accounting: it is
+    the one structural ``experts.{idx}.{leaf}`` parser, shared by
+    :meth:`NameProjection.packed_parent_of_expert_param` and by
+    ``footprint.source_tensor_bytes_manifest``'s dual-entry convention
+    (a per-expert span is covered under BOTH spellings), and it mirrors
+    the profile layer's own packed-format grouping detection
+    (``packed_expert_format_group``).
+    """
+    parts = str(qname).split(".")
+    if len(parts) < 3 or parts[-3] != "experts" or not parts[-2].isdigit():
+        return None
+    fn = (parent_for_projection if parent_for_projection is not None
+          else _default_expert_parent_for_projection)
+    parent = fn(parts[-1])
+    if not parent:
+        return None
+    return ".".join(parts[:-2] + [str(parent)])
 
 
 @dataclasses.dataclass(frozen=True)
@@ -691,12 +738,10 @@ class NameProjection:
         """Packed aggregate a per-expert parameter folds into, or None.
 
         None means "not a per-expert parameter" — the same declared
-        meaning ``footprint.packed_expert_alias`` gives, reused verbatim
-        (with the profile's own parent mapping) instead of a second
-        structural parser.
+        meaning :func:`packed_expert_alias` gives (defined in this
+        module, shared with footprint's manifest), applied with the
+        profile's own parent mapping.
         """
-        from .footprint import packed_expert_alias
-
         base = strip_weight_leaf(str(qname))
         try:
             return packed_expert_alias(
@@ -705,7 +750,7 @@ class NameProjection:
             raise NameProjectionError(
                 name=base, source_namespace=RECIPE, target_namespace=RECIPE,
                 code="profile_accessor_failed",
-                tried=("footprint.packed_expert_alias("
+                tried=("packed_expert_alias("
                        "ModelProfile.packed_expert_parent_for_projection)",),
                 detail=f"{type(exc).__name__}: {exc}",
             ) from exc
