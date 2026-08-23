@@ -1,7 +1,16 @@
 # PrismaQuant Architecture
 
-As of: 2026-08-22 · `walker/name-projection` — stamps follow, newest first, each recording
-its own branch and date. Re-stamped (2026-08-22, `walker/name-projection`) for
+As of: 2026-08-22 · `walker/consumer-footprint` — stamps follow, newest first, each recording
+its own branch and date. Re-stamped (2026-08-22, `walker/consumer-footprint`) for **the
+first R5 consumer migration**: `footprint.py` holds no private name mapping anymore — its
+private `.weight` strips and its packed-expert parser (`packed_expert_alias` + the legacy
+parent fallback, now defined in `name_projection.py` and re-exported) are the shared
+layer's; `source_tensor_bytes_manifest` / `floor_bytes_for_model` accept a prebuilt
+`NameProjection` (keyword-only, mutually exclusive with the raw accessor kwargs), map
+checkpoint keys through `checkpoint_to_live`, keep the profile's DECLARED drops as raw-key
+floor entries (data, not exceptions), and propagate layer refusals instead of swallowing
+them. Emitted bytes are unchanged — projection/accessor parity is pinned test-side.
+Previously re-stamped (2026-08-22, `walker/name-projection`) for
 **the shared name-projection layer** (§8.8.1, `prismaquant/name_projection.py`):
 one profile-routed projection between the live/recipe/checkpoint/export/vLLM
 namespaces, fail-closed with structured refusal codes, explicit
@@ -4917,8 +4926,9 @@ refusal so it cannot recur silently.
 
 Still open per the design doc: migrating probe/cost/footprint/read-traffic
 onto the walker's edge list. The first wave of that migration is the shared
-**name-projection layer** (below); the four consumer call-sites themselves are
-still on their own enumerations.
+**name-projection layer** (below). Footprint's private name mapping is gone
+(2026-08-22, `walker/consumer-footprint`): it derives nothing on its own
+anymore. Probe/cost/read-traffic are still on their own enumerations.
 
 #### 8.8.1 The shared name-projection layer
 
@@ -4969,9 +4979,26 @@ EXPORT/VLLM` constants). The contract, pinned by
   refusal test pins this). Byte accounting stays in
   `model_walk.per_device_bytes`.
 
-Consumers are NOT migrated yet — this module ships with its conformance
-tests only, so the probe/cost/footprint/read-traffic migrations can land
-as thin call-site changes without colliding.
+**First consumer migrated (2026-08-22, `walker/consumer-footprint`)**:
+`prismaquant/footprint.py` keeps no private name derivation — its inline
+`.weight` strips (manifest normalization, the re-encoded resolver, the
+stats lookup) and `source_span_identity` are
+`name_projection.strip_weight_leaf`; its packed-expert parser
+(`packed_expert_alias` + `_default_expert_parent_for_projection`) moved
+INTO `name_projection.py` and is re-exported for the historic import path,
+so the layer no longer depends on a consumer. `source_tensor_bytes_manifest`
+and `floor_bytes_for_model` accept a prebuilt `NameProjection`
+(keyword-only; mutually exclusive with the raw `name_map` /
+`expert_parent_for_projection` accessor kwargs — one manifest must not
+carry two name authorities). Under the projection, keys map through
+`checkpoint_to_live`: a MAPPED outcome uses the projected live unit; a
+`declared_out_of_graph` outcome keeps the raw checkpoint spelling (the MTP
+sidecar case — declined bytes still ride the floor); an accessor that
+raises or returns garbage propagates as a structured
+`NameProjectionError`, never a silent skip or zero. Emitted bytes are
+unchanged by construction: both mapping forms produce identical manifests
+(parity pinned in `tests/test_footprint.py`). Probe / cost / read-traffic
+remain unmigrated.
 
 ## 9. Serving lanes
 
