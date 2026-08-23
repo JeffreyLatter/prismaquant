@@ -338,6 +338,60 @@ def shard_stamp(
     }
 
 
+def owed_pairs_stamp(pairs) -> dict:
+    """Record the exact ``(qname, format)`` entries this shard set out to render.
+
+    The merge gate needs to know what each shard *owed* before it can call a
+    missing entry missing. Reconstructing that downstream from an
+    operator-supplied layer config would put the operator's file in the trust
+    path: a config that disagrees with the one the shard actually rendered
+    under would under-expect, and a unit dropped by the render would merge
+    clean. So the shard states its own debt, at the moment it is fixed and
+    from the same structure the render loop consumes.
+    """
+    canonical = sorted(
+        {(str(qname), str(fmt).upper()) for qname, fmt in pairs}
+    )
+    payload = json.dumps(canonical, separators=(",", ":")).encode("utf-8")
+    return {
+        "owed_pairs": [[qname, fmt] for qname, fmt in canonical],
+        "owed_pair_count": len(canonical),
+        "owed_pairs_sha256": hashlib.sha256(payload).hexdigest(),
+    }
+
+
+def owed_pairs_from_stamp(stamp: Mapping) -> set[tuple[str, str]] | None:
+    """Read back an ``owed_pairs_stamp``, verifying its own digest.
+
+    Returns ``None`` when the stamp predates the field, so a caller can fall
+    back to reconstruction and say so.
+    """
+    raw = stamp.get("owed_pairs")
+    if raw is None:
+        return None
+    pairs = sorted(
+        {(str(item[0]), str(item[1]).upper()) for item in raw}
+    )
+    payload = json.dumps(
+        [[qname, fmt] for qname, fmt in pairs], separators=(",", ":")
+    ).encode("utf-8")
+    digest = hashlib.sha256(payload).hexdigest()
+    recorded = str(stamp.get("owed_pairs_sha256", ""))
+    if recorded and digest != recorded:
+        raise ValueError(
+            f"unit-shard stamp {stamp.get('shard')!r} owed_pairs do not match "
+            f"owed_pairs_sha256 ({digest} != {recorded}); the stamp was "
+            "edited after the render."
+        )
+    if int(stamp.get("owed_pair_count", len(pairs))) != len(pairs):
+        raise ValueError(
+            f"unit-shard stamp {stamp.get('shard')!r} owed_pair_count "
+            f"{stamp.get('owed_pair_count')!r} disagrees with the "
+            f"{len(pairs)} pairs it lists."
+        )
+    return set(pairs)
+
+
 def host_identity() -> dict:
     """Who rendered this shard. Impure by design; provenance only.
 

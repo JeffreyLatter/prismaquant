@@ -55,6 +55,7 @@ import torch  # noqa: E402
 from prismaquant import format_registry as fr  # noqa: E402
 from prismaquant.unit_sharding import (  # noqa: E402
     SCHEMA as SHARD_SCHEMA,
+    owed_pairs_from_stamp,
     partition_from_stamp,
 )
 
@@ -183,7 +184,17 @@ def _gate_shards(stamps, paths) -> None:
 
 
 def _expected_pairs(cache, stamp, assignment) -> set[tuple[str, str]]:
-    """The (qname, format) entries this shard was supposed to produce."""
+    """The (qname, format) entries this shard was supposed to produce.
+
+    A shard produced by a current build states its own debt in the stamp
+    (``owed_pairs``), recorded from the same format map its render loop
+    consumed. That is authoritative and keeps the operator's layer config out
+    of the trust path. The reconstruction below is the fallback for stamps
+    that predate the field.
+    """
+    stamped = owed_pairs_from_stamp(stamp)
+    if stamped is not None:
+        return stamped
     owned = [str(name) for name in stamp["unit_names"]]
     meta = _metadata(cache)
     scope = str(meta.get("render_scope", ""))
@@ -247,6 +258,7 @@ def _merge(args) -> int:
     missing: list[str] = []
     failed: dict[tuple[str, str], str] = {}
     render_scores: dict[str, dict] = {}
+    gate_records: list[dict] = []
     activation_max_abs: dict[str, float] = {}
     max_abs_conflicts: list[str] = []
 
@@ -301,6 +313,11 @@ def _merge(args) -> int:
                     duplicates.append(f"render score {record_key} in {label}")
                     continue
                 render_scores[str(record_key)] = dict(record)
+        gates = _metadata(cache).get("render_gates")
+        if isinstance(gates, Mapping):
+            for record in gates.get("records") or []:
+                if isinstance(record, Mapping):
+                    gate_records.append(dict(record))
         for qname, value in (cache.activation_max_abs or {}).items():
             previous = activation_max_abs.get(str(qname))
             if previous is not None and float(previous) != float(value):
@@ -341,20 +358,51 @@ def _merge(args) -> int:
             + "\n  ".join(problems)
         )
 
-    # Canonical insertion order: full-enumeration unit order, then format.
-    # A merge that appended shard-by-shard would produce a different pickle
-    # for the same content and defeat any byte comparison downstream.
+    # Canonical insertion order: full-enumeration unit order, then the
+    # requested-format order — which is exactly the order an unsharded run
+    # inserts its keys in. A merge that appended shard-by-shard, or that
+    # sorted formats alphabetically, would produce a different pickle for the
+    # same content and defeat any container-level comparison downstream.
+    format_rank = {
+        fr.canonical_format_name(str(fmt)): i
+        for i, fmt in enumerate(_metadata(caches[0]).get("requested_formats") or [])
+    }
     ordered_weights = {
         key: merged_weights[key]
         for key in sorted(
-            merged_weights, key=lambda k: (order.get(k[0], 1 << 30), k[1])
+            merged_weights,
+            key=lambda k: (
+                order.get(k[0], 1 << 30),
+                format_rank.get(k[1], 1 << 30),
+                k[1],
+            ),
         )
     }
 
-    from prismaquant.production_weight_cache import ProductionWeightCache
+    from prismaquant.production_weight_cache import (
+        ProductionWeightCache,
+        _summarize_render_gate_records,
+        _write_render_score_sidecar,
+    )
 
     reference_meta = dict(_metadata(caches[0]))
     reference_meta.pop("unit_shard", None)
+    # Re-derive the render-gate summary over EVERY shard's records. Inheriting
+    # shard 0's counters would label one shard's tally as the whole run's.
+    gate_records.sort(
+        key=lambda rec: (
+            order.get(str(rec.get("qname", "")), 1 << 30),
+            format_rank.get(str(rec.get("format", "")), 1 << 30),
+            str(rec.get("format", "")),
+        )
+    )
+    gate_summary = _summarize_render_gate_records(gate_records)
+    reference_meta["render_gates"] = {**gate_summary, "records": gate_records}
+    mechanisms = gate_summary.get("mechanisms") or {}
+    reference_meta["four_over_six"] = dict(
+        mechanisms.get("four_over_six")
+        or {"accepted": 0, "rejected": 0, "package_accepted": 0, "reasons": {}}
+    )
     reference_meta["render_scores"] = {
         "schema": "prismaquant.production_render_scores.v1",
         "entries": int(len(render_scores)),
@@ -402,11 +450,23 @@ def _merge(args) -> int:
     with open(output_path, "wb") as fh:
         pickle.dump(merged, fh, protocol=pickle.HIGHEST_PROTOCOL)
     if output_dir is not None:
-        (output_dir / "render_scores.json").write_text(
-            json.dumps(dict(sorted(render_scores.items())), indent=2)
+        # Write the sidecars through the SAME writer the unsharded stage uses.
+        # A merged cache_dir has to be resumable and re-readable exactly like
+        # an unsharded one; a bare records dict here is silently discarded by
+        # `_load_render_score_sidecar`, which reads `payload["records"]`.
+        _write_render_score_sidecar(
+            output_dir / "render_scores.json", render_scores
         )
         (output_dir / "activation_max_abs.json").write_text(
-            json.dumps(dict(sorted(activation_max_abs.items())), indent=2)
+            json.dumps(
+                {
+                    name: activation_max_abs[name]
+                    for name in sorted(
+                        activation_max_abs, key=lambda n: order.get(n, 1 << 30)
+                    )
+                },
+                indent=2,
+            )
         )
     print(
         f"[merge-unit-shards] merged {len(stamps)} shards -> {output_path} "

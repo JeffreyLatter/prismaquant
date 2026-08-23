@@ -5425,6 +5425,18 @@ def fill_production_weight_cache(
     import gc as _gc
     activations_local = dict(activations)  # shallow copy; we'll pop entries
     n = sum(len(render_formats_by_qname.get(q, ())) for q in qname_to_module)
+    if unit_shard_stamp is not None:
+        # Stamp the shard's debt from the same structure the loop below
+        # consumes, so the merge gate never has to infer it.
+        from prismaquant import unit_sharding as _unit_sharding_stamp
+
+        unit_shard_stamp.update(
+            _unit_sharding_stamp.owed_pairs_stamp(
+                (qname, fmt)
+                for qname in qname_to_module
+                for fmt in render_formats_by_qname.get(qname, ())
+            )
+        )
     done = 0
     skipped_resumed = 0
     skipped_prewritten = 0

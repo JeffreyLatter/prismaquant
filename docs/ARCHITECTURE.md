@@ -9,9 +9,13 @@ the same `ProductionWeightCache` under a fail-closed completeness gate. No defau
 `run-pipeline.sh` is untouched; unset is a byte-identical no-op, verified on Qwen3-0.6B. The
 substantive behaviour change is inside `_LinearActivationCollector`: row-priority reservoir
 values are now drawn for every hooked Linear rather than only for the ones a run stores, which
-also fixes resumed and `--include-qnames-file` builds that did not reproduce a fresh build's
-sampled rows. `production_render_cost`, `production_recache`, and packed-expert renders refuse
-the variable rather than pretending to shard. Previously re-stamped (2026-08-22,
+also fixes resumed builds that did not reproduce a fresh build's sampled rows.
+(`--include-qnames-file` shrinks the hooked set itself, upstream of this fix, and still
+changes sampled rows — D33.) Each shard stamps the `(unit, format)` entries it owed, so the
+merge gate reads the shard's own debt instead of an operator-supplied layer config, and the
+merged `cache_dir` is byte-identical to an unsharded one. `production_render_cost`,
+`production_recache`, and packed-expert renders refuse the variable rather than pretending to
+shard. Previously re-stamped (2026-08-22,
 `walker/woa-grouped-fisher`) for
 **pricing the grouped operand `wo_a`** (§8.9): DSv4's grouped-BMM attention
 output projection — 17.9% of decode read traffic — was never an allocator
@@ -2839,6 +2843,17 @@ exact source-tensor bytes with a min-max partition DP. Unset is a byte-identical
 `ProductionWeightCache` with the same layout — not a second store — and refuses unless every
 unit of the recomputed partition appears exactly once, under its owning shard. There is no
 force flag; missing, duplicate, and out-of-shard units all name the units and stop.
+
+The gate reads what each shard says it owed, not what an operator says it should have. Every
+shard stamps `owed_pairs` — the exact `(unit, format)` entries fixed at the moment its render
+map was built, from the same structure the render loop consumes — so a `--render-layer-config`
+that disagreed with the config a shard actually ran under can no longer under-expect a dropped
+unit into a clean merge. That flag survives only for stamps predating the field. The merged
+artifact is the unsharded artifact: `.pt` files, `render_scores.json` (through the stage's own
+`_write_render_score_sidecar`, whose `{"records": …}` envelope the resume loader requires) and
+`activation_max_abs.json` are written in the same order and shape, the render-gate summary is
+re-derived over every shard's records rather than inherited from shard 0, and the merged pickle
+differs from an unsharded one only by its `cache_dir` path and the `unit_shard_merge` block.
 
 Three properties make a shard's rendered bytes the unsharded run's bytes, and each is enforced
 rather than assumed. Layer atomicity keeps every fused-sibling group in one shard, so the joint

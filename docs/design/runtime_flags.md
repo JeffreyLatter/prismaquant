@@ -215,11 +215,27 @@ itself and therefore still changes sampled rows; use the shard variable, not the
 include file, to split a render.
 
 Each shard cache carries `metadata['unit_shard']` — the shard label, the
-`partition_hash`, its own unit names, the complete ordered enumeration, and
-the host that rendered it. `tools/merge_unit_shards.py` recomputes the
-partition from that stamp and refuses to merge unless every unit appears
-exactly once, under the shard the partition assigns it to. There is no force
-flag.
+`partition_hash`, its own unit names, the complete ordered enumeration, the
+host that rendered it, and `owed_pairs`: the exact `(unit, format)` entries
+that shard set out to render, recorded from the same format map its render
+loop consumes. `tools/merge_unit_shards.py` recomputes the partition from that
+stamp and refuses to merge unless every unit appears exactly once, under the
+shard the partition assigns it to, and every owed entry is present. There is
+no force flag.
+
+The shard states its own debt because the alternative puts an operator file in
+the trust path: a `--render-layer-config` that disagrees with the config the
+shard actually rendered under would under-expect, and a dropped unit would
+merge clean. That flag now only serves stamps written before `owed_pairs`
+existed.
+
+A merged cache is the unsharded artifact, not a lookalike. The merge writes
+its `.pt` files, `render_scores.json`, and `activation_max_abs.json` through
+the same writers and in the same order the unsharded stage uses, so a merged
+`cache_dir` resumes and re-reads identically; it re-derives the render-gate
+summary over every shard's records rather than inheriting shard 0's counters;
+and the merged pickle differs from an unsharded one only by its `cache_dir`
+path and the added `unit_shard_merge` provenance block.
 
 Three paths refuse the variable outright, because a unit shard has no meaning
 for them:

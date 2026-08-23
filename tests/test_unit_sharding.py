@@ -232,9 +232,17 @@ def test_partition_from_stamp_refuses_a_tampered_stamp():
 # merge completeness gate (A3)
 # --------------------------------------------------------------------------
 def _shard_cache(tmp_path, partition, index, *, formats=("NVFP4",), drop=(),
-                 extra=(), duplicate_of=None):
+                 extra=(), duplicate_of=None, stamp_owed=True, gates=None):
     spec = us.ShardSpec(index, partition.count)
     stamp = {**us.shard_stamp(partition, spec), "host": {"hostname": "test"}}
+    if stamp_owed:
+        # A real shard stamps the debt it set out to render, before the loop
+        # runs — so `drop` below leaves the stamp intact and the gate sees it.
+        stamp.update(us.owed_pairs_stamp(
+            (name, fmt)
+            for name in partition.shards[index]
+            for fmt in formats
+        ))
     names = list(partition.shards[index])
     if duplicate_of is not None:
         names = names + list(partition.shards[duplicate_of])
@@ -264,6 +272,7 @@ def _shard_cache(tmp_path, partition, index, *, formats=("NVFP4",), drop=(),
                 "entries": len(scores),
                 "records": scores,
             },
+            **({"render_gates": gates} if gates is not None else {}),
         },
     )
     tmp_path.mkdir(parents=True, exist_ok=True)
@@ -375,6 +384,157 @@ def test_merge_refuses_an_unsharded_cache(tmp_path):
     with pytest.raises(SystemExit) as excinfo:
         _merge(tmp_path, [path, path])
     assert "no 'unit_shard' stamp" in str(excinfo.value)
+
+
+# --------------------------------------------------------------------------
+# the shard states its own debt
+# --------------------------------------------------------------------------
+def test_owed_pairs_stamp_round_trips_and_is_order_insensitive():
+    pairs = [("a", "NVFP4"), ("b", "fp8_e4m3"), ("a", "FP8_E4M3")]
+    stamp = us.owed_pairs_stamp(pairs)
+    assert stamp["owed_pair_count"] == 3
+    assert us.owed_pairs_from_stamp(stamp) == {
+        ("a", "NVFP4"), ("a", "FP8_E4M3"), ("b", "FP8_E4M3"),
+    }
+    assert us.owed_pairs_stamp(reversed(pairs)) == stamp
+
+
+def test_owed_pairs_from_stamp_refuses_a_tampered_stamp():
+    stamp = us.owed_pairs_stamp([("a", "NVFP4"), ("b", "NVFP4")])
+    stamp["owed_pairs"] = [["a", "NVFP4"]]
+    with pytest.raises(ValueError, match="owed_pairs_sha256"):
+        us.owed_pairs_from_stamp(stamp)
+
+
+def test_owed_pairs_from_stamp_is_none_when_the_field_is_absent():
+    assert us.owed_pairs_from_stamp({"shard": "0/2"}) is None
+
+
+def test_merge_gate_trusts_the_stamped_debt_over_an_operator_config(tmp_path):
+    """A layer config that under-declares must not excuse a dropped unit.
+
+    The operator supplies `--render-layer-config`; the shard supplies its own
+    owed list. If the config wins, a config that calls the dropped unit BF16
+    makes a silently incomplete merge pass — the exact failure the gate exists
+    to prevent.
+    """
+    partition = us.partition_units(make_units(n_layers=4), 2)
+    victim = partition.shards[1][2]
+    paths = [
+        _shard_cache(tmp_path, partition, 0),
+        _shard_cache(tmp_path, partition, 1, drop=(victim,)),
+    ]
+    config = tmp_path / "layer_config.json"
+    config.write_text(json.dumps(
+        {name: ("BF16" if name == victim else "NVFP4")
+         for name, _ in partition.units}
+    ))
+    with pytest.raises(SystemExit) as excinfo:
+        merge_tool.main([
+            "merge",
+            *[arg for path in paths for arg in ("--shard", str(path))],
+            "--output", str(tmp_path / "merged.pkl"),
+            "--render-layer-config", str(config),
+        ])
+    assert "missing entries" in str(excinfo.value)
+    assert victim in str(excinfo.value)
+
+
+def test_merge_falls_back_to_reconstruction_for_a_legacy_stamp(tmp_path):
+    partition = us.partition_units(make_units(n_layers=4), 2)
+    victim = partition.shards[0][1]
+    paths = [
+        _shard_cache(tmp_path, partition, 0, drop=(victim,), stamp_owed=False),
+        _shard_cache(tmp_path, partition, 1, stamp_owed=False),
+    ]
+    with pytest.raises(SystemExit) as excinfo:
+        _merge(tmp_path, paths)
+    assert "missing entries" in str(excinfo.value)
+    assert victim in str(excinfo.value)
+
+
+def test_merge_orders_keys_like_an_unsharded_run(tmp_path):
+    """Unit order, then REQUESTED-format order — not alphabetical."""
+    partition = us.partition_units(make_units(n_layers=4), 2)
+    formats = ("NVFP4", "FP8_E4M3")
+    paths = [
+        _shard_cache(tmp_path, partition, i, formats=formats)
+        for i in range(2)
+    ]
+    assert _merge(tmp_path, paths) == 0
+    with open(tmp_path / "merged.pkl", "rb") as fh:
+        merged = pickle.load(fh)
+    expected = [
+        (name, fmt) for name, _ in partition.units for fmt in formats
+    ]
+    assert list(merged.weights) == expected
+
+
+def test_merged_sidecars_are_readable_by_the_production_loader(tmp_path):
+    """A merged cache_dir must resume exactly like an unsharded one."""
+    from prismaquant.production_weight_cache import _load_render_score_sidecar
+
+    partition = us.partition_units(make_units(n_layers=4), 2)
+    paths = [_shard_cache(tmp_path, partition, i) for i in range(2)]
+    out_dir = tmp_path / "merged_cache_dir"
+    assert merge_tool.main([
+        "merge",
+        *[arg for path in paths for arg in ("--shard", str(path))],
+        "--output", str(tmp_path / "merged.pkl"),
+        "--output-cache-dir", str(out_dir),
+    ]) == 0
+    records = _load_render_score_sidecar(out_dir / "render_scores.json")
+    assert len(records) == len(partition.units)
+    assert all(
+        f"{name}|NVFP4" in records for name, _ in partition.units
+    )
+    max_abs = json.loads((out_dir / "activation_max_abs.json").read_text())
+    # enumeration order, as the unsharded stage writes it
+    assert list(max_abs) == [name for name, _ in partition.units]
+
+
+def test_merge_unions_the_render_gate_summary(tmp_path):
+    """Merged counters cover every shard, not shard 0's tally relabelled."""
+    def gates_for(index):
+        records = [
+            {
+                "qname": name,
+                "format": "NVFP4",
+                "trace": [{
+                    "mechanism": "gptq",
+                    "accepted": True,
+                    "reason": "improved",
+                    "package": ["gptq"],
+                }],
+            }
+            for name in partition.shards[index]
+        ]
+        return {"enabled": True, "entries": len(records),
+                "mechanisms": {"gptq": {
+                    "accepted": len(records), "rejected": 0,
+                    "reasons": {"improved": len(records)},
+                    "package_accepted": len(records),
+                }},
+                "records": records}
+
+    partition = us.partition_units(make_units(n_layers=4), 2)
+    paths = [
+        _shard_cache(tmp_path, partition, i, gates=gates_for(i))
+        for i in range(2)
+    ]
+    assert _merge(tmp_path, paths) == 0
+    with open(tmp_path / "merged.pkl", "rb") as fh:
+        merged = pickle.load(fh)
+    total = len(partition.units)
+    gates = merged.metadata["render_gates"]
+    assert gates["entries"] == total
+    assert len(gates["records"]) == total
+    assert gates["mechanisms"]["gptq"]["accepted"] == total
+    assert gates["mechanisms"]["gptq"]["reasons"]["improved"] == total
+    # records land in canonical enumeration order, not shard-append order
+    assert [rec["qname"] for rec in gates["records"]] == [
+        name for name, _ in partition.units
+    ]
 
 
 # --------------------------------------------------------------------------

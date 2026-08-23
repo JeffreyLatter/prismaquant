@@ -1513,6 +1513,18 @@ def run_streaming_render(
                 for qname, formats in render_formats_by_qname.items()
                 if formats
             }
+    if unit_shard_stamp is not None:
+        # The shard states its own debt, from the format map the render loop
+        # consumes, so the merge gate never infers it from an operator file.
+        from prismaquant import unit_sharding as _unit_sharding_stamp
+
+        unit_shard_stamp.update(
+            _unit_sharding_stamp.owed_pairs_stamp(
+                (qname, fmt)
+                for qname, formats in render_formats_by_qname.items()
+                for fmt in formats
+            )
+        )
     per_layer_dense: dict[int | None, dict[str, nn.Module]] = defaultdict(dict)
     for qname, mod in dense_modules.items():
         per_layer_dense[_layer_index_of(qname, layers_prefix)][qname] = mod
