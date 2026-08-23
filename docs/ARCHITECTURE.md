@@ -1,7 +1,19 @@
 # PrismaQuant Architecture
 
-As of: 2026-08-22 · `walker/name-projection` — stamps follow, newest first, each recording
-its own branch and date. Re-stamped (2026-08-22, `walker/name-projection`) for
+As of: 2026-08-22 · `walker/consumer-readtraffic` — stamps follow, newest first, each recording
+its own branch and date. Re-stamped (2026-08-22, `walker/consumer-readtraffic`) for
+**the first name-projection consumer migration: read-traffic**
+(`prismaquant/read_traffic.py`). Both entry points build one
+`NameProjection(profile)` and route every checkpoint→live question through
+it: the classifier's decline-to-map rule branches on
+`ProjectedName.outcome == declared_out_of_graph` (`excluded_non_text_graph`),
+the private `_strip_weight` leaf helper is deleted in favor of
+`strip_weight_leaf`, and a profile accessor that fails now refuses as
+`NameProjectionError` instead of silently passing the raw key through
+(previously it would have re-priced unmappable tensors at p=1). No emitted
+number moves; the class table, byte authorities, and refusals are pinned
+byte-identical by `tests/test_read_traffic.py`. Previously re-stamped
+(2026-08-22, `walker/name-projection`) for
 **the shared name-projection layer** (§8.8.1, `prismaquant/name_projection.py`):
 one profile-routed projection between the live/recipe/checkpoint/export/vLLM
 namespaces, fail-closed with structured refusal codes, explicit
@@ -3521,7 +3533,9 @@ embedding (one row is gathered per token, not the table), **indexed lookup table
 the MTP/draft sidecar (read every token under spec-decode and never without it — the honest
 default is excluded, and `excluded.mtp_bytes` lets a spec-decode serve add it back exactly),
 and anything the model profile's own `checkpoint_to_live_name` declines to map into the live
-text graph (vision/audio towers). `ModelProfile.embedding_name()` (`model_profiles/base.py`, spec key
+text graph (vision/audio towers) — read through the shared name-projection
+layer (§8.8.1), whose `declared_out_of_graph` outcome is what that rule
+branches on. `ModelProfile.embedding_name()` (`model_profiles/base.py`, spec key
 `shard_regexes.embedding_name`) is the twin of `lm_head_name()` and exists so "which
 tensor is the embedding" is a declaration rather than a substring test.
 
@@ -4915,9 +4929,10 @@ inside the claim table — is pinned like every other router; the gate's
 `find_decided_but_unpriced` checker turns that contradiction class into a
 refusal so it cannot recur silently.
 
-Still open per the design doc: migrating probe/cost/footprint/read-traffic
-onto the walker's edge list. The first wave of that migration is the shared
-**name-projection layer** (below); the four consumer call-sites themselves are
+Still open per the design doc: migrating probe/cost/footprint onto the
+walker's edge list — read-traffic has landed. The first wave of that
+migration is the shared **name-projection layer** (below); read-traffic is
+the first consumer migrated onto it, and the other three call-sites are
 still on their own enumerations.
 
 #### 8.8.1 The shared name-projection layer
@@ -4969,9 +4984,18 @@ EXPORT/VLLM` constants). The contract, pinned by
   refusal test pins this). Byte accounting stays in
   `model_walk.per_device_bytes`.
 
-Consumers are NOT migrated yet — this module ships with its conformance
-tests only, so the probe/cost/footprint/read-traffic migrations can land
-as thin call-site changes without colliding.
+The first consumer migrated onto the layer is **read-traffic**
+(`walker/consumer-readtraffic`, 2026-08-22): both `read_traffic` entry
+points build one `NameProjection(profile)`; the classifier's
+decline-to-map rule branches on `ProjectedName.outcome ==
+declared_out_of_graph` instead of calling the profile accessor inline, and
+a profile accessor that fails now raises `NameProjectionError` where the
+old private code swallowed it into a raw-key passthrough (re-pricing every
+unmappable tensor at p=1). The private `_strip_weight` helper is deleted;
+the leaf rule is `strip_weight_leaf` here alone. No emitted number moved:
+`tests/test_read_traffic.py` pins the class table byte-identical. The
+probe/cost/footprint migrations can still land as thin call-site changes
+without colliding.
 
 ## 9. Serving lanes
 
