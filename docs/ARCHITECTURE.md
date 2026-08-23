@@ -1,7 +1,28 @@
 # PrismaQuant Architecture
 
-As of: 2026-08-22 · `walker/name-projection` — stamps follow, newest first, each recording
-its own branch and date. Re-stamped (2026-08-22, `walker/name-projection`) for
+As of: 2026-08-22 · `walker/consumer-cost` — stamps follow, newest first, each recording
+its own branch and date. Re-stamped (2026-08-22, `walker/consumer-cost`) for
+**the cost consumer migrating onto the shared name-projection layer** (§8.8.1):
+`_scan_source_dtype_manifest` lost its private checkpoint→live→recipe builders
+(`_strip_weight_suffix`, `_to_recipe_name`, `_packed_to_recipe_name`,
+`_per_expert_packed_recipe_name`) and now projects every source-kind row
+through `NameProjection.checkpoint_to_live` / `recipe_unit` /
+`packed_parent_of_expert_param` (`prismaquant/allocator_candidates.py`);
+`decision_units._recipe_name` is retired for
+`name_projection.strip_weight_leaf`, as is the inline leaf surgery in
+`production_render_cost.canonical_cost_name` (whose umbrella-infix half stays
+a total normalizer — render/cost payloads key costed MTP rows physically,
+which a declining projection must never drop) and `measure_quant_cost`'s
+act-cache candidate builder. Emitted values are UNCHANGED for existing
+profiles and artifacts — the manifest's profile=None convention now builds
+over the repo's declared generic baseline (`DefaultProfile`, the substitution
+`resolve_cost_target_name` always made) instead of inlined string surgery.
+One deliberate behavior change, fail-closed only: a profile accessor that
+RAISES now propagates `NameProjectionError` instead of silently skipping the
+row (the wo_a shape); MTP rows stay recipe-native verbatim by an explicit,
+commented short-circuit pending a profile declaration of recipe-native
+checkpoint prefixes. Probe, footprint, and read-traffic remain unmigrated.
+Previously re-stamped (2026-08-22, `walker/name-projection`) for
 **the shared name-projection layer** (§8.8.1, `prismaquant/name_projection.py`):
 one profile-routed projection between the live/recipe/checkpoint/export/vLLM
 namespaces, fail-closed with structured refusal codes, explicit
@@ -4969,9 +4990,14 @@ EXPORT/VLLM` constants). The contract, pinned by
   refusal test pins this). Byte accounting stays in
   `model_walk.per_device_bytes`.
 
-Consumers are NOT migrated yet — this module ships with its conformance
-tests only, so the probe/cost/footprint/read-traffic migrations can land
-as thin call-site changes without colliding.
+First consumer migrated (2026-08-22, `walker/consumer-cost`): the cost
+consumer — `_scan_source_dtype_manifest` (source-kind census for
+passthrough gating) and `decision_units`' unit naming — now derives every
+name through this layer, keeping no private leaf stripper, recipe-key
+builder, or packed-parent re-parse; accessor failures refuse
+(`NameProjectionError`) instead of silently skipping rows. Probe,
+footprint, and read-traffic are NOT migrated yet, so their migrations can
+land as thin call-site changes without colliding.
 
 ## 9. Serving lanes
 
