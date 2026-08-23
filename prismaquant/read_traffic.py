@@ -1338,7 +1338,14 @@ def exported_checkpoint_read_traffic(
         },
         embedding=embedding,
         integer_tally=integer_tally,
-        measured_from=f"exported safetensors headers under {export_dir}",
+        # Deliberately NOT f"...under {export_dir}": during a staged export
+        # this function runs against the ATOMIC STAGING directory, which the
+        # publishing rename then destroys -- so an embedded absolute path is
+        # provenance naming a directory that no longer exists by the time
+        # anyone reads the card. The card already records the final location
+        # in `model_dir`. Describe WHAT was measured, matching the sibling
+        # claim at :1165 ("allocator assignment + source checkpoint spans").
+        measured_from="exported safetensors headers",
     )
 
 
