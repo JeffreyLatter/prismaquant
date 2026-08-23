@@ -224,9 +224,19 @@ def _manifest_digest(payload) -> str:
 
 
 def missing_entries(manifest) -> list[str]:
-    """(unit, format) keys a manifest promises but did not render."""
+    """(unit, format) keys a manifest promises but did not render.
+
+    Entries are keyed by the cache's canonical format name (the CLI alias
+    FP8_DYNAMIC renders as FP8_E4M3), so requested formats are canonicalized
+    before they are looked up.
+    """
+    try:
+        from prismaquant.format_registry import canonical_format_name
+    except ImportError:  # compare-only hosts without the package
+        def canonical_format_name(name):
+            return name
     expected = {
-        f"{unit}|{fmt}"
+        f"{unit}|{canonical_format_name(fmt)}"
         for unit in manifest.get("units") or []
         for fmt in manifest.get("formats") or []
     }

@@ -605,6 +605,11 @@ def test_sentinel_compare_flags_an_incomplete_manifest():
                    entries={"a|NVFP4": {"sha256": "aa"}})
     assert sentinel_tool.missing_entries(partial) == ["b|NVFP4"]
     assert sentinel_tool.missing_entries(complete) == []
+    # The CLI alias is promised; the cache keys by the canonical name.
+    aliased = dict(complete, formats=["FP8_DYNAMIC"],
+                   entries={"a|FP8_E4M3": {"sha256": "aa"},
+                            "b|FP8_E4M3": {"sha256": "bb"}})
+    assert sentinel_tool.missing_entries(aliased) == []
     problems = sentinel_tool.compare_manifests([complete, partial])
     assert any("boxB is incomplete" in p and "b|NVFP4" in p for p in problems)
 
