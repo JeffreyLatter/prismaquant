@@ -1,7 +1,18 @@
 # PrismaQuant Architecture
 
-As of: 2026-08-22 · `walker/consumer-footprint` — stamps follow, newest first, each recording
-its own branch and date. Re-stamped (2026-08-22, `walker/consumer-footprint`) for **the
+As of: 2026-08-22 · `walker/consumer-probe` — stamps follow, newest first, each recording
+its own branch and date. Re-stamped (2026-08-22, `walker/consumer-probe`) for **the probe
+consumer migrating onto the shared name-projection layer** (§8.8.1): `FisherAccumulator`
+now builds one `NameProjection`, and the probe holds no private name mapping — the
+packed-expert shard-scope filter reads its block id through `NameProjection.block_id`
+(previously a positional `[:3]` qname slice of its own; value-identical on every qname
+shape reachable at that site, pinned by `tests/test_consumer_probe_name_projection.py`),
+and the Fisher skip set keys its embedding clause on the profile's declared
+`ModelProfile.embedding_name()` (previously a hardcoded `"model.embed_tokens"` substring
+test). Probe stats keys, inventories, and shard regexes are untouched, and the regression
+baseline is byte-identical; the walk-edge-list migration itself stays open for all four
+consumers.
+Previously re-stamped (2026-08-22, `walker/consumer-footprint`) for **the
 second R5 consumer migration**: `footprint.py` holds no private name mapping anymore — its
 private `.weight` strips and its packed-expert parser (`packed_expert_alias` + the legacy
 parent fallback, now defined in `name_projection.py` and re-exported) are the shared
@@ -4938,13 +4949,16 @@ inside the claim table — is pinned like every other router; the gate's
 `find_decided_but_unpriced` checker turns that contradiction class into a
 refusal so it cannot recur silently.
 
-Still open per the design doc: migrating probe/cost onto the walker's
-edge list — footprint and read-traffic have landed. The first wave of
-that migration is the shared **name-projection layer** (below).
-Footprint's private name mapping is gone (2026-08-22,
-`walker/consumer-footprint`) and read-traffic's is gone (2026-08-22,
-`walker/consumer-readtraffic`); neither derives names on its own
-anymore. Probe and cost are still on their own enumerations.
+Still open per the design doc: migrating cost onto the walker's edge
+list — probe, footprint and read-traffic have landed. The first wave of
+that migration is the shared **name-projection layer** (below): the
+private NAME mappings of the probe (2026-08-22,
+`walker/consumer-probe`), footprint (`walker/consumer-footprint`) and
+read-traffic (`walker/consumer-readtraffic`) all route through it.
+Cost is still on its own enumeration. Separately, every consumer's
+INVENTORY is still its own enumeration — the probe still builds its
+tracked set from `named_modules()` plus shard regexes — so the
+edge-list migration proper remains open for all four.
 
 #### 8.8.1 The shared name-projection layer
 
@@ -4995,7 +5009,28 @@ EXPORT/VLLM` constants). The contract, pinned by
   refusal test pins this). Byte accounting stays in
   `model_walk.per_device_bytes`.
 
-**First consumer migrated (2026-08-22, `walker/consumer-footprint`)**:
+**Probe migrated (2026-08-22, `walker/consumer-probe`)**: the probe's
+`FisherAccumulator` builds one `NameProjection` from its resolved profile
+(`DefaultProfile` as the explicit fallback when the model's own profile is
+unavailable, mirroring `_packed_expert_param_name_set`) and its two private
+derivations are deleted: the packed-expert shard-scope filter reads block
+identity via `NameProjection.block_id` (the old code sliced the first
+three qname components positionally). Measured: the two agree on every
+shape we ship — `model.layers.N.mlp.experts`,
+`model.layers.N.block_sparse_moe.experts` — and they DIVERGE on a
+multimodal prefix, where the positional slice yields
+`model.language_model.layers` with no layer index at all, so its
+`startswith` scope test matched every layer. The projection yields
+`model.language_model.layers.3`. The change is byte-identical on the
+shipped models and fixes a latent scope bug elsewhere. The Fisher skip
+set compares against the profile-declared `embedding_name()` instead of
+a hardcoded spelling; `DefaultProfile.embedding_name()` is exactly the
+old hardcoded `model.embed_tokens`, so the fallback path is unchanged.
+Footprint and read-traffic have since landed (below); cost is still to
+come, and can land as a thin call-site change without colliding.
+
+**Footprint migrated (2026-08-22, `walker/consumer-footprint`)** — the
+second consumer:
 `prismaquant/footprint.py` keeps no private name derivation — its inline
 `.weight` strips (manifest normalization, the re-encoded resolver, the
 stats lookup) and `source_span_identity` are
@@ -5016,7 +5051,7 @@ unchanged by construction: both mapping forms produce identical manifests
 (parity pinned in `tests/test_footprint.py`). Probe and cost remain
 unmigrated; read-traffic migrated in the same wave (below).
 
-The first consumer migrated onto the layer is **read-traffic**
+The FIRST consumer migrated onto the layer was **read-traffic**
 (`walker/consumer-readtraffic`, 2026-08-22): both `read_traffic` entry
 points build one `NameProjection(profile)`; the classifier's
 decline-to-map rule branches on `ProjectedName.outcome ==
