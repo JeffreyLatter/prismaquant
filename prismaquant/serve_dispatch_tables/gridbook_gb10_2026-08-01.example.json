@@ -1,0 +1,447 @@
+{
+  "schema": "prismaquant.serve_dispatch_table.v1",
+  "table_id": "gridbook_gb10_2026-08-01_example",
+  "status": "proposal_data__example_only__not_release_evidence",
+  "description": "EXAMPLE / PROPOSAL DATA. A worked serve-dispatch table assembled ONLY from measurements already published in the Gridbook repository, each row citing the document it was quoted from. It exists to make the ultraplan P5c constrained-Pareto path runnable and reviewable end to end; it is NOT a qualified serving model and no allocation shipped from it is release evidence. docs/lanes/nvfp4-cb/format-speed-policy.md §1: 'Per-layer or per-operator timing tables may generate candidate assignments. They are not final evidence.' Every number here is a single-box, mostly single-seed measurement on one GB10, transferred across models and shapes; the NATIVE-PARITY served protocol is the only thing that promotes an assignment. Replace this file with your own measured table before using the constraint axis for anything that ships.",
+  "notes": [
+    "THE HEADLINE TRADE (gridbook docs/audits/ultraplan_perf_2026-08-01.md §6, P5c): at ~4.5 bpw, choosing FP8-CB over the native arm buys quality at a measured 1.44x dense-prefill cost. That is the 'prefill/dense_prefill_1400' arena below, and it is the trade the allocator is supposed to see rather than discover at the release gate.",
+    "NVFP4_CB HAS NO WHOLE-MODEL ROW, deliberately. No published measurement gives the default fp4-CB quality path (the BF16 bridge) a whole-artifact TTFT or decode number: audit §2(b) says every dense M > 8 and MoE T > 16 expands to BF16 and feeds an Ampere-schedule grouped GEMM, and the only published timings of that route are the per-expert grouped-GEMM microbenchmarks in the two 'moe_grouped_*' arenas. Those are metric=operator_ms and therefore never SLO-eligible. Consequence: an assignment containing NVFP4_CB CANNOT be certified against a prefill or decode SLO from this table, and the evaluator refuses instead of interpolating. That refusal is the honest state of the record, not a gap to paper over.",
+    "MoE expand is ~35% of MoE layer time at Laguna scale (gridbook docs/KERNELS.md, K1.1 discussion). That is a SHARE of layer time, not a ratio against a named reference route, so it is recorded here as a note and not as a row. A share cannot be divided by a denominator this table declares.",
+    "The 'dense_mid_m_*' and 'dense_large_m_1400_gemm' arenas have NO absolute reference (statistic=ratio_only_no_absolute): the published fused-vs-transient numbers are kernel ratios with no whole-model wall time behind them. They are kept because they are the only evidence for the fused mid-M lane's shape, and because they show its structural ceiling (0.22x at M~1400) in the same units as its wins. They can never satisfy an absolute SLO.",
+    "The native reference arm in the whole-model arenas is a MIXED NVFP4/FP8 compressed-tensors artifact, not pure NVFP4 (format-speed-policy.md §5: 'Published \"native\" reference artifacts are generally mixed NVFP4/FP8'). Both native families are therefore priced at the arena reference, and neither row is evidence that one of them alone would measure the same.",
+    "Statistics are declared per arena and are mostly 'single_seed_point_measurement'. Policy §3 requires streaming TTFT/ITL/TPS percentiles for release evidence. The evaluator stamps the mismatch when a p95 SLO is checked against a point measurement; it does not pretend the point measurement is a percentile."
+  ],
+  "arenas": [
+    {
+      "phase": "prefill",
+      "m_regime": "dense_prefill_1400",
+      "m": 1400,
+      "reference_route": "native compressed-tensors mixed NVFP4/FP8 artifact under vLLM --enforce-eager, TP=1, Qwen3.6-27B",
+      "metric": "ttft_ms",
+      "absolute_value": 746.0,
+      "statistic": "single_seed_point_measurement",
+      "provenance": {
+        "source": "gridbook docs/BENCHMARKS.md, section '27B (Qwen3-class hybrid) — validated quality win at 5.5 bpp', Speed table",
+        "date": "2026-07-18",
+        "gpu": "single NVIDIA GB10 / DGX Spark, Blackwell sm_121, 128 GB unified memory, ~273 GB/s",
+        "measured_quantity": "TTFT at 1400 input tokens (TTFT(1400)) for the native NVFP4/FP8 baseline arm",
+        "units": "s",
+        "derivation": "published absolute 0.746 s, expressed in ms (746.0)",
+        "detail": "Same-artifact, same-harness A/B against the CB arm; --enforce-eager, TP=1. Single seed, single box: directional, not a served p95."
+      },
+      "detail": "The whole-model dense prefill arena. Its denominator is the native arm, which is what the ultraplan's '1.44x' is quoted against."
+    },
+    {
+      "phase": "decode",
+      "m_regime": "decode_batch1",
+      "m": 1,
+      "reference_route": "native compressed-tensors mixed NVFP4/FP8 artifact under vLLM --enforce-eager, TP=1, Qwen3.6-27B, batch-1 decode",
+      "metric": "decode_tok_s",
+      "absolute_value": 10.26,
+      "statistic": "single_seed_point_measurement",
+      "provenance": {
+        "source": "gridbook docs/BENCHMARKS.md, section '27B (Qwen3-class hybrid) — validated quality win at 5.5 bpp', Speed table",
+        "date": "2026-07-18",
+        "gpu": "single NVIDIA GB10 / DGX Spark, Blackwell sm_121, 128 GB unified memory, ~273 GB/s",
+        "measured_quantity": "batch-1 decode throughput for the native NVFP4/FP8 baseline arm",
+        "units": "tok/s",
+        "derivation": "published absolute 10.26 tok/s, kept in its published units; the evaluator converts to ms/token by itl_ms = 1000 / tok_s",
+        "detail": "BENCHMARKS explicitly scopes this: 'This does not establish parity for batched/speculative decode, tail ITL, other prompt distributions, or a formal whole-artifact byte match.'"
+      },
+      "detail": "Batch-1 decode arena. Bandwidth-bound at this M, which is why the CB and native arms sit on top of each other."
+    },
+    {
+      "phase": "prefill",
+      "m_regime": "dense_mid_m_32",
+      "m": 32,
+      "reference_route": "FP8-CB transient expand+GEMM (cb_expand_fp8 -> cutlass_scaled_mm)",
+      "metric": "operator_ms",
+      "absolute_value": null,
+      "statistic": "ratio_only_no_absolute",
+      "provenance": {
+        "source": "gridbook docs/KERNELS.md, section 'FP8-CB fused decode-in-prologue (the 1× fix)'",
+        "date": "2026-08-01",
+        "gpu": "NVIDIA GB10 / DGX Spark, Blackwell sm_121",
+        "measured_quantity": "GEMM-level speed of the fused decode-in-prologue kernel relative to the transient expand+GEMM route, at M=32",
+        "units": "dimensionless speed ratio",
+        "derivation": "the reference route is definitionally 1.0; no absolute wall time is published for it, so this arena carries no absolute",
+        "detail": "Isolated-operator microbenchmark. Policy §5: 'Raw standalone kernel timing is never served evidence.'"
+      }
+    },
+    {
+      "phase": "prefill",
+      "m_regime": "dense_mid_m_64",
+      "m": 64,
+      "reference_route": "FP8-CB transient expand+GEMM (cb_expand_fp8 -> cutlass_scaled_mm)",
+      "metric": "operator_ms",
+      "absolute_value": null,
+      "statistic": "ratio_only_no_absolute",
+      "provenance": {
+        "source": "gridbook docs/KERNELS.md, section 'FP8-CB fused decode-in-prologue (the 1× fix)'",
+        "date": "2026-08-01",
+        "gpu": "NVIDIA GB10 / DGX Spark, Blackwell sm_121",
+        "measured_quantity": "GEMM-level speed of the fused decode-in-prologue kernel relative to the transient expand+GEMM route, at M=64",
+        "units": "dimensionless speed ratio",
+        "derivation": "the reference route is definitionally 1.0; no absolute wall time is published for it, so this arena carries no absolute",
+        "detail": "Isolated-operator microbenchmark. Policy §5: 'Raw standalone kernel timing is never served evidence.'"
+      }
+    },
+    {
+      "phase": "prefill",
+      "m_regime": "dense_mid_m_128",
+      "m": 128,
+      "reference_route": "FP8-CB transient expand+GEMM (cb_expand_fp8 -> cutlass_scaled_mm)",
+      "metric": "operator_ms",
+      "absolute_value": null,
+      "statistic": "ratio_only_no_absolute",
+      "provenance": {
+        "source": "gridbook docs/KERNELS.md, section 'FP8-CB fused decode-in-prologue (the 1× fix)'",
+        "date": "2026-08-01",
+        "gpu": "NVIDIA GB10 / DGX Spark, Blackwell sm_121",
+        "measured_quantity": "GEMM-level speed of the fused decode-in-prologue kernel relative to the transient expand+GEMM route, at M=128",
+        "units": "dimensionless speed ratio",
+        "derivation": "the reference route is definitionally 1.0; no absolute wall time is published for it, so this arena carries no absolute",
+        "detail": "Isolated-operator microbenchmark. Policy §5: 'Raw standalone kernel timing is never served evidence.'"
+      }
+    },
+    {
+      "phase": "prefill",
+      "m_regime": "dense_large_m_1400_gemm",
+      "m": 1400,
+      "reference_route": "FP8-CB transient expand+GEMM (cb_expand_fp8 -> cutlass_scaled_mm)",
+      "metric": "operator_ms",
+      "absolute_value": null,
+      "statistic": "ratio_only_no_absolute",
+      "provenance": {
+        "source": "gridbook docs/KERNELS.md, section 'FP8-CB fused decode-in-prologue (the 1× fix)'",
+        "date": "2026-08-01",
+        "gpu": "NVIDIA GB10 / DGX Spark, Blackwell sm_121",
+        "measured_quantity": "GEMM-level speed of the fused decode-in-prologue kernel relative to the transient expand+GEMM route, at M~1400",
+        "units": "dimensionless speed ratio",
+        "derivation": "the reference route is definitionally 1.0; no absolute wall time is published for it, so this arena carries no absolute",
+        "detail": "The structural ceiling of decode-in-prologue: every M-tile CTA re-decodes the same B tiles, so decode work scales with ceil(M/tile). This arena exists so the ceiling is visible in the same units as the mid-M wins."
+      }
+    },
+    {
+      "phase": "prefill",
+      "m_regime": "moe_grouped_w13_bf16",
+      "m": 1024,
+      "reference_route": "retired segmented BF16 reference: up to 32 per-expert torch F.linear calls writing the same preallocated output segments",
+      "metric": "operator_ms",
+      "absolute_value": 5.346,
+      "statistic": "median_of_repeated_samples",
+      "provenance": {
+        "source": "gridbook docs/BENCHMARKS.md, section '2026-08-01 DSV4-shaped grouped-BF16 bridge microbenchmark', w13 row",
+        "date": "2026-08-01",
+        "gpu": "one GB10 (sm_121), Torch 2.11.0+cu130, CUDA 13.0, vllm-node:latest image ID d0840ff0e0ba",
+        "measured_quantity": "warm segmented-BF16 reference time for the w13 projection, K=4096 N=4096 per expert, DSV4-shaped E=256 top_k=8 T=128 (P=1024 routed pairs), seed-731 uniform synthetic router, measured expert chunk [0,32)",
+        "units": "ms",
+        "derivation": "published absolute 5.346 ms (segmented warm), median of 30 individual CUDA-event samples after 10 alternating warmups",
+        "detail": "Synthetic router and synthetic shapes; an isolated grouped-GEMM operator, not a routed-operator or served measurement."
+      },
+      "detail": "The one arena in which the fp4-CB default quality path has a published number at all - because that path's prefill GEMM IS this owned grouped BF16 bridge (audit §2b)."
+    },
+    {
+      "phase": "prefill",
+      "m_regime": "moe_grouped_w2_bf16",
+      "m": 1024,
+      "reference_route": "retired segmented BF16 reference: up to 32 per-expert torch F.linear calls writing the same preallocated output segments",
+      "metric": "operator_ms",
+      "absolute_value": 2.569,
+      "statistic": "median_of_repeated_samples",
+      "provenance": {
+        "source": "gridbook docs/BENCHMARKS.md, section '2026-08-01 DSV4-shaped grouped-BF16 bridge microbenchmark', w2 row",
+        "date": "2026-08-01",
+        "gpu": "one GB10 (sm_121), Torch 2.11.0+cu130, CUDA 13.0, vllm-node:latest image ID d0840ff0e0ba",
+        "measured_quantity": "warm segmented-BF16 reference time for the w2 projection, K=2048 N=4096 per expert, DSV4-shaped E=256 top_k=8 T=128 (P=1024 routed pairs), seed-731 uniform synthetic router, measured expert chunk [0,32)",
+        "units": "ms",
+        "derivation": "published absolute 2.569 ms (segmented warm), median of 30 individual CUDA-event samples after 10 alternating warmups",
+        "detail": "Synthetic router and synthetic shapes; an isolated grouped-GEMM operator, not a routed-operator or served measurement."
+      }
+    }
+  ],
+  "rows": [
+    {
+      "format_family": "NVFP4",
+      "phase": "prefill",
+      "m_regime": "dense_prefill_1400",
+      "lane": "native",
+      "relative_unit_cost": 1.0,
+      "provenance": {
+        "source": "gridbook docs/BENCHMARKS.md, 27B Speed table, 'NVFP4/FP8 baseline (native)' row",
+        "date": "2026-07-18",
+        "gpu": "single NVIDIA GB10 / DGX Spark, Blackwell sm_121",
+        "measured_quantity": "TTFT(1400) of the native baseline arm, 0.746 s",
+        "units": "s",
+        "derivation": "definitional: this arm IS the arena reference route, so its relative cost is exactly 1.0",
+        "detail": "The published baseline artifact is a MIXED NVFP4/FP8 assignment (format-speed-policy.md §5), so this row prices 'the native arm', not 'pure NVFP4 everywhere'."
+      }
+    },
+    {
+      "format_family": "FP8_E4M3",
+      "phase": "prefill",
+      "m_regime": "dense_prefill_1400",
+      "lane": "native",
+      "relative_unit_cost": 1.0,
+      "provenance": {
+        "source": "gridbook docs/BENCHMARKS.md, 27B Speed table, 'NVFP4/FP8 baseline (native)' row",
+        "date": "2026-07-18",
+        "gpu": "single NVIDIA GB10 / DGX Spark, Blackwell sm_121",
+        "measured_quantity": "TTFT(1400) of the native baseline arm, 0.746 s",
+        "units": "s",
+        "derivation": "definitional: the reference artifact is a mixed NVFP4/FP8 assignment, so both native families sit on the arena reference at 1.0",
+        "detail": "Not evidence that a pure-FP8 native artifact would measure 0.746 s; it is evidence about the mixed arm that was measured."
+      }
+    },
+    {
+      "format_family": "FP8_CB",
+      "phase": "prefill",
+      "m_regime": "dense_prefill_1400",
+      "lane": "fallback",
+      "relative_unit_cost": 1.44,
+      "provenance": {
+        "source": "gridbook docs/BENCHMARKS.md, 27B Speed table, 'CB (ours)' row, and docs/audits/ultraplan_perf_2026-08-01.md §1 gap table",
+        "date": "2026-07-18",
+        "gpu": "single NVIDIA GB10 / DGX Spark, Blackwell sm_121",
+        "measured_quantity": "TTFT(1400) of the FP8-CB arm, 1.075 s, against the native arm's 0.746 s in the same table",
+        "units": "s",
+        "derivation": "published ratio '~1.44x the native baseline (1.075 s vs 0.746 s)', quoted at the published precision",
+        "detail": "The residual is the transient-expand path's doubled HBM traffic. This is the audit's headline dense-prefill tax and the whole reason P5c exists."
+      },
+      "detail": "lane=fallback because at M~1400 the FP8-CB fused mid-M kernel is out of range (9 <= M <= 128) and the rung takes cb_expand_fp8 -> cutlass_scaled_mm regardless of whether the pinned runtime backs it."
+    },
+    {
+      "format_family": "BF16",
+      "phase": "prefill",
+      "m_regime": "dense_prefill_1400",
+      "lane": "native",
+      "relative_unit_cost": 1.701,
+      "provenance": {
+        "source": "gridbook docs/BENCHMARKS.md, 27B Speed table, 'BF16' row",
+        "date": "2026-07-18",
+        "gpu": "single NVIDIA GB10 / DGX Spark, Blackwell sm_121",
+        "measured_quantity": "TTFT(1400) of the BF16 reference arm, 1.269 s, against the native arm's 0.746 s in the same table",
+        "units": "s",
+        "derivation": "1.269 s / 0.746 s = 1.7011, quoted to four significant figures",
+        "detail": "Both numbers come from the same table, same harness, same session, so the ratio is a division of two co-measured wall times rather than a composition across sessions."
+      }
+    },
+    {
+      "format_family": "NVFP4",
+      "phase": "decode",
+      "m_regime": "decode_batch1",
+      "lane": "native",
+      "relative_unit_cost": 1.0,
+      "provenance": {
+        "source": "gridbook docs/BENCHMARKS.md, 27B Speed table, 'NVFP4/FP8 baseline (native)' row",
+        "date": "2026-07-18",
+        "gpu": "single NVIDIA GB10 / DGX Spark, Blackwell sm_121",
+        "measured_quantity": "batch-1 decode throughput of the native baseline arm, 10.26 tok/s",
+        "units": "tok/s",
+        "derivation": "definitional: this arm IS the arena reference route, so its relative cost is exactly 1.0"
+      }
+    },
+    {
+      "format_family": "FP8_E4M3",
+      "phase": "decode",
+      "m_regime": "decode_batch1",
+      "lane": "native",
+      "relative_unit_cost": 1.0,
+      "provenance": {
+        "source": "gridbook docs/BENCHMARKS.md, 27B Speed table, 'NVFP4/FP8 baseline (native)' row",
+        "date": "2026-07-18",
+        "gpu": "single NVIDIA GB10 / DGX Spark, Blackwell sm_121",
+        "measured_quantity": "batch-1 decode throughput of the native baseline arm, 10.26 tok/s",
+        "units": "tok/s",
+        "derivation": "definitional: the reference artifact is a mixed NVFP4/FP8 assignment, so both native families sit on the arena reference at 1.0"
+      }
+    },
+    {
+      "format_family": "FP8_CB",
+      "phase": "decode",
+      "m_regime": "decode_batch1",
+      "lane": "fallback",
+      "relative_unit_cost": 0.999,
+      "provenance": {
+        "source": "gridbook docs/BENCHMARKS.md, 27B Speed table, 'CB (ours)' row; corroborated by docs/audits/ultraplan_perf_2026-08-01.md §1 ('Dense decode is at parity')",
+        "date": "2026-07-18",
+        "gpu": "single NVIDIA GB10 / DGX Spark, Blackwell sm_121",
+        "measured_quantity": "batch-1 decode throughput of the FP8-CB arm, published as the band 10.27-10.30 tok/s, against the native arm's 10.26 tok/s",
+        "units": "tok/s",
+        "derivation": "time ratio 10.26 / 10.27 = 0.9990, quoted to three decimals; the SLOWEST end of the published CB band is used so the row cannot flatter CB",
+        "detail": "Decode is bandwidth-bound at batch 1, which is why the smaller byte stream lands at parity rather than ahead. Not a claim about batched or speculative decode."
+      }
+    },
+    {
+      "format_family": "BF16",
+      "phase": "decode",
+      "m_regime": "decode_batch1",
+      "lane": "native",
+      "relative_unit_cost": 2.235,
+      "provenance": {
+        "source": "gridbook docs/BENCHMARKS.md, 27B Speed table, 'BF16' row",
+        "date": "2026-07-18",
+        "gpu": "single NVIDIA GB10 / DGX Spark, Blackwell sm_121",
+        "measured_quantity": "batch-1 decode throughput of the BF16 reference arm, 4.59 tok/s, against the native arm's 10.26 tok/s",
+        "units": "tok/s",
+        "derivation": "time ratio 10.26 / 4.59 = 2.2353, quoted to four significant figures",
+        "detail": "Both numbers come from the same table and session; the ratio is a division of two co-measured throughputs."
+      }
+    },
+    {
+      "format_family": "FP8_CB",
+      "phase": "prefill",
+      "m_regime": "dense_mid_m_32",
+      "lane": "fallback",
+      "relative_unit_cost": 1.0,
+      "provenance": {
+        "source": "gridbook docs/KERNELS.md, 'FP8-CB fused decode-in-prologue (the 1× fix)'",
+        "date": "2026-08-01",
+        "gpu": "NVIDIA GB10 / DGX Spark, Blackwell sm_121",
+        "measured_quantity": "the transient expand+GEMM route at M=32 - the denominator of the published 1.04x speedup",
+        "units": "dimensionless speed ratio",
+        "derivation": "definitional: this route IS the arena reference"
+      }
+    },
+    {
+      "format_family": "FP8_CB",
+      "phase": "prefill",
+      "m_regime": "dense_mid_m_32",
+      "lane": "fused_mid_m",
+      "relative_unit_cost": 0.9615,
+      "provenance": {
+        "source": "gridbook docs/KERNELS.md, 'FP8-CB fused decode-in-prologue (the 1× fix)'",
+        "date": "2026-08-01",
+        "gpu": "NVIDIA GB10 / DGX Spark, Blackwell sm_121",
+        "measured_quantity": "fused decode-in-prologue kernel vs transient expand+GEMM at M=32, published as a 1.04x speedup",
+        "units": "dimensionless speed ratio",
+        "derivation": "reciprocal of the published 1.04x speedup: 1/1.04 = 0.9615",
+        "detail": "The fused kernel is bit-exact against the transient path, so this is a pure kernel substitution with no activation-contract change - which is why the mid-M lane shipped as DEFAULT."
+      }
+    },
+    {
+      "format_family": "FP8_CB",
+      "phase": "prefill",
+      "m_regime": "dense_mid_m_64",
+      "lane": "fallback",
+      "relative_unit_cost": 1.0,
+      "provenance": {
+        "source": "gridbook docs/KERNELS.md, 'FP8-CB fused decode-in-prologue (the 1× fix)'",
+        "date": "2026-08-01",
+        "gpu": "NVIDIA GB10 / DGX Spark, Blackwell sm_121",
+        "measured_quantity": "the transient expand+GEMM route at M=64 - the denominator of the published 1.26x speedup",
+        "units": "dimensionless speed ratio",
+        "derivation": "definitional: this route IS the arena reference"
+      }
+    },
+    {
+      "format_family": "FP8_CB",
+      "phase": "prefill",
+      "m_regime": "dense_mid_m_64",
+      "lane": "fused_mid_m",
+      "relative_unit_cost": 0.7937,
+      "provenance": {
+        "source": "gridbook docs/KERNELS.md, 'FP8-CB fused decode-in-prologue (the 1× fix)'",
+        "date": "2026-08-01",
+        "gpu": "NVIDIA GB10 / DGX Spark, Blackwell sm_121",
+        "measured_quantity": "fused decode-in-prologue kernel vs transient expand+GEMM at M=64, published as a 1.26x speedup",
+        "units": "dimensionless speed ratio",
+        "derivation": "reciprocal of the published 1.26x speedup: 1/1.26 = 0.7937"
+      }
+    },
+    {
+      "format_family": "FP8_CB",
+      "phase": "prefill",
+      "m_regime": "dense_mid_m_128",
+      "lane": "fallback",
+      "relative_unit_cost": 1.0,
+      "provenance": {
+        "source": "gridbook docs/KERNELS.md, 'FP8-CB fused decode-in-prologue (the 1× fix)'",
+        "date": "2026-08-01",
+        "gpu": "NVIDIA GB10 / DGX Spark, Blackwell sm_121",
+        "measured_quantity": "the transient expand+GEMM route at M=128 - the denominator of the published 1.45x speedup",
+        "units": "dimensionless speed ratio",
+        "derivation": "definitional: this route IS the arena reference"
+      }
+    },
+    {
+      "format_family": "FP8_CB",
+      "phase": "prefill",
+      "m_regime": "dense_mid_m_128",
+      "lane": "fused_mid_m",
+      "relative_unit_cost": 0.6897,
+      "provenance": {
+        "source": "gridbook docs/KERNELS.md, 'FP8-CB fused decode-in-prologue (the 1× fix)'",
+        "date": "2026-08-01",
+        "gpu": "NVIDIA GB10 / DGX Spark, Blackwell sm_121",
+        "measured_quantity": "fused decode-in-prologue kernel vs transient expand+GEMM at M=128, published as a 1.45x speedup",
+        "units": "dimensionless speed ratio",
+        "derivation": "reciprocal of the published 1.45x speedup: 1/1.45 = 0.6897"
+      }
+    },
+    {
+      "format_family": "FP8_CB",
+      "phase": "prefill",
+      "m_regime": "dense_large_m_1400_gemm",
+      "lane": "fallback",
+      "relative_unit_cost": 1.0,
+      "provenance": {
+        "source": "gridbook docs/KERNELS.md, 'FP8-CB fused decode-in-prologue (the 1× fix)'",
+        "date": "2026-08-01",
+        "gpu": "NVIDIA GB10 / DGX Spark, Blackwell sm_121",
+        "measured_quantity": "the transient expand+GEMM route at M~1400 - the denominator of the published 0.22x figure",
+        "units": "dimensionless speed ratio",
+        "derivation": "definitional: this route IS the arena reference"
+      }
+    },
+    {
+      "format_family": "FP8_CB",
+      "phase": "prefill",
+      "m_regime": "dense_large_m_1400_gemm",
+      "lane": "fused_mid_m",
+      "relative_unit_cost": 4.545,
+      "provenance": {
+        "source": "gridbook docs/KERNELS.md, 'FP8-CB fused decode-in-prologue (the 1× fix)'",
+        "date": "2026-08-01",
+        "gpu": "NVIDIA GB10 / DGX Spark, Blackwell sm_121",
+        "measured_quantity": "fused decode-in-prologue kernel vs transient expand+GEMM at M~1400, published as ~0.22x (a loss)",
+        "units": "dimensionless speed ratio",
+        "derivation": "reciprocal of the published ~0.22x figure: 1/0.22 = 4.545",
+        "detail": "Structural, not a bug: every M-tile CTA re-decodes the same B tiles. This row is the boundary evidence for gating the fused lane at M <= 128; it is NOT reachable in practice because the lane's declared m_range is 9..128."
+      }
+    },
+    {
+      "format_family": "NVFP4_CB",
+      "phase": "prefill",
+      "m_regime": "moe_grouped_w13_bf16",
+      "lane": "fallback",
+      "relative_unit_cost": 1.2104,
+      "provenance": {
+        "source": "gridbook docs/BENCHMARKS.md, '2026-08-01 DSV4-shaped grouped-BF16 bridge microbenchmark', w13 row",
+        "date": "2026-08-01",
+        "gpu": "one GB10 (sm_121), Torch 2.11.0+cu130, CUDA 13.0, vllm-node:latest image ID d0840ff0e0ba",
+        "measured_quantity": "Gridbook's owned CUTLASS grouped BF16 bridge, warm, 6.471 ms, against the segmented BF16 reference's 5.346 ms; published as reference/grouped = 0.826x",
+        "units": "ms",
+        "derivation": "6.471 ms / 5.346 ms = 1.2104 (the reciprocal of the published 0.826x reference/grouped warm speed ratio), quoted to five significant figures",
+        "detail": "The default NVFP4-CB quality path expands to BF16 and feeds exactly this kernel (audit §2b), so its prefill GEMM cost is this row. Synthetic DSV4 shapes and a synthetic router: not a served measurement, and not this producer's model."
+      },
+      "detail": "lane=fallback because the fp4-CB serving_lanes block declares an EMPTY backed fused mid-M set at every pinned runtime version - the true-W4A4 fused kernel is behind PRISMAQUANT_CB_FUSED_FP4 and its six reconsideration gates."
+    },
+    {
+      "format_family": "NVFP4_CB",
+      "phase": "prefill",
+      "m_regime": "moe_grouped_w2_bf16",
+      "lane": "fallback",
+      "relative_unit_cost": 1.0868,
+      "provenance": {
+        "source": "gridbook docs/BENCHMARKS.md, '2026-08-01 DSV4-shaped grouped-BF16 bridge microbenchmark', w2 row",
+        "date": "2026-08-01",
+        "gpu": "one GB10 (sm_121), Torch 2.11.0+cu130, CUDA 13.0, vllm-node:latest image ID d0840ff0e0ba",
+        "measured_quantity": "Gridbook's owned CUTLASS grouped BF16 bridge, warm, 2.792 ms, against the segmented BF16 reference's 2.569 ms; published as reference/grouped = 0.920x",
+        "units": "ms",
+        "derivation": "2.792 ms / 2.569 ms = 1.0868 (the reciprocal of the published 0.920x reference/grouped warm speed ratio), quoted to five significant figures",
+        "detail": "Same caveats as the w13 row."
+      }
+    }
+  ]
+}

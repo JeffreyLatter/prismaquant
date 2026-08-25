@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import torch
 import torch.nn as nn
 
@@ -9,7 +11,6 @@ from prismaquant.model_profiles.gemma4 import Gemma4Profile
 from prismaquant.model_profiles.qwen3 import Qwen3Profile
 from prismaquant.model_profiles.qwen3_5 import Qwen3_5Profile
 from prismaquant.model_profiles.qwen3_5_dense import Qwen3_5DenseProfile
-from prismaquant.model_profiles.qwen3_moe import Qwen3MoeProfile
 from prismaquant.model_profiles.registry import profile_from_config
 from prismaquant.model_profiles.structure import (
     ModelStructureSpec,
@@ -185,6 +186,10 @@ def test_default_profile_common_fused_groups_are_profile_owned():
         "k_proj",
         "v_proj",
     )
+    assert profile.fused_sibling_leaf_mapping()["in_proj_ba"] == (
+        "in_proj_b",
+        "in_proj_a",
+    )
     assert (
         profile.fused_sibling_group("model.layers.0.self_attn.q_proj")
         == "model.layers.0.self_attn.qkv_proj"
@@ -192,6 +197,10 @@ def test_default_profile_common_fused_groups_are_profile_owned():
     assert (
         profile.fused_sibling_group("model.layers.0.mlp.gate_proj")
         == "model.layers.0.mlp.gate_up_proj"
+    )
+    assert (
+        profile.fused_sibling_group("model.layers.0.linear_attn.in_proj_b")
+        == "model.layers.0.linear_attn.in_proj_ba"
     )
 
 
@@ -229,7 +238,7 @@ def test_qwen_graph_exposes_fused_sibling_optimization_units():
     assert down.scope == "tensor"
 
 
-def test_qwen3_dense_and_moe_profiles_are_config_backed():
+def test_qwen3_dense_and_moe_configs_share_contract_profile():
     dense = profile_from_config({
         "model_type": "qwen3",
         "architectures": ["Qwen3ForCausalLM"],
@@ -240,13 +249,17 @@ def test_qwen3_dense_and_moe_profiles_are_config_backed():
     })
 
     assert isinstance(dense, Qwen3Profile)
-    assert not isinstance(dense, Qwen3MoeProfile)
-    assert isinstance(moe, Qwen3MoeProfile)
+    assert isinstance(moe, Qwen3Profile)
     assert dense.structure_spec().id == "qwen3"
-    assert moe.structure_spec().id == "qwen3_moe"
+    assert moe.structure_spec().id == "qwen3"
     assert dense.serving_profile_id() == "vllm_packed_moe"
     assert moe.serving_profile_id() == "vllm_packed_moe"
-    assert dense.packed_expert_param_names() == frozenset()
+    # Family-wide declarations are inert on dense modules, which have no 3-D
+    # packed expert Parameters.
+    assert dense.packed_expert_param_names() == frozenset({
+        "gate_up_proj",
+        "down_proj",
+    })
     assert moe.packed_expert_param_names() == frozenset({
         "gate_up_proj",
         "down_proj",
@@ -276,6 +289,9 @@ def test_qwen3_dense_and_moe_profiles_are_config_backed():
     assert split_group == moe.packed_expert_format_group(
         "model.layers.0.mlp.experts.7.down_proj"
     )
+    assert split_group == moe.packed_expert_format_group(
+        "model.layers.0.mlp.experts.9.down_proj"
+    )
     assert split_group != packed_group
 
 
@@ -296,7 +312,7 @@ def test_qwen3_dense_graph_marks_linears_and_fused_groups():
 
 
 def test_qwen3_moe_graph_marks_packed_experts_without_multimodal_rewrite():
-    graph = Qwen3MoeProfile().build_model_graph(_Qwen3MoeToy())
+    graph = Qwen3Profile().build_model_graph(_Qwen3MoeToy())
     by_recipe = graph.by_recipe_name()
 
     packed = by_recipe["model.layers.0.mlp.experts.gate_up_proj"]
@@ -327,13 +343,11 @@ def test_probe_packed_expert_detection_respects_profile_spec():
 
     experts = _PackedExperts()
 
-    assert _is_packed_experts_module(experts, Qwen3MoeProfile()) is True
-    assert _packed_experts_param_names(experts, Qwen3MoeProfile()) == [
+    assert _is_packed_experts_module(experts, Qwen3Profile()) is True
+    assert _packed_experts_param_names(experts, Qwen3Profile()) == [
         "down_proj",
         "gate_up_proj",
     ]
-    assert _is_packed_experts_module(experts, Qwen3Profile()) is False
-    assert _packed_experts_param_names(experts, Qwen3Profile()) == []
 
 
 def test_packed_expert_format_group_uses_declared_projection_splits():
@@ -367,6 +381,9 @@ def test_packed_expert_format_group_uses_declared_projection_splits():
     assert split_group == spec.packed_expert_format_group(
         "model.layers.0.mlp.experts.7.w2"
     )
+    assert split_group == spec.packed_expert_format_group(
+        "model.layers.0.mlp.experts.9.w2"
+    )
     assert split_group != packed_group
 
 
@@ -381,7 +398,20 @@ def test_qwen35_dense_profile_uses_dense_structure_spec():
     assert profile.serving_profile_id() == "vllm_packed_moe"
     assert profile.packed_expert_param_names() == frozenset()
     assert profile.per_expert_moe_regex() is None
+    # `*ForCausalLM` is the TEXT-ONLY class, which vLLM builds under `model.`
+    # — this assertion used to read `language_model.model.…` because the spec
+    # had a single naming block written for the multimodal wrapper. The
+    # declared architecture decides; see tests/test_qwen3_5_text_only_namespace.py.
     assert profile.to_vllm_internal_name("model.layers.0.mlp.gate_proj") == (
+        "model.layers.0.mlp.gate_proj"
+    )
+
+    wrapper = profile_from_config({
+        "model_type": "qwen3_5",
+        "architectures": ["Qwen3_5ForConditionalGeneration"],
+    })
+    assert wrapper.structure_spec().id == "qwen3_5_dense"
+    assert wrapper.to_vllm_internal_name("model.layers.0.mlp.gate_proj") == (
         "language_model.model.layers.0.mlp.gate_proj"
     )
 
@@ -436,6 +466,11 @@ def test_gemma_structure_collapses_live_moe_and_injects_vllm_moe_prefix():
     ) == profile.packed_expert_format_group(
         "model.layers.0.experts.3.down_proj"
     )
+    assert profile.packed_expert_format_group(
+        "model.layers.0.experts.3.gate_proj"
+    ) == profile.packed_expert_format_group(
+        "model.layers.0.experts.9.down_proj"
+    )
     assert profile.source_passthrough_prefixes() == (
         "model.vision_tower.",
         "model.audio_tower.",
@@ -457,6 +492,45 @@ def test_gemma_structure_collapses_live_moe_and_injects_vllm_moe_prefix():
     assert profile.visual_layer_prefix() == (
         "model.vision_tower.vision_model.encoder.layers"
     )
+
+
+def test_gemma4_shared_kv_pass_state_uses_layer_indexes():
+    profile = Gemma4Profile()
+    key = torch.randn(1, 2, 3, requires_grad=True)
+    value = torch.randn(1, 2, 3, requires_grad=True)
+
+    captured = profile.capture_forward_pass_state({
+        "shared_kv_states": {3: (key, value)},
+    })
+
+    assert set(captured) == {3}
+    assert captured[3][0].device.type == "cpu"
+    assert captured[3][1].device.type == "cpu"
+    assert captured[3][0].requires_grad is False
+    assert captured[3][1].requires_grad is False
+
+    layer = SimpleNamespace(
+        self_attn=SimpleNamespace(
+            is_kv_shared_layer=True,
+            kv_shared_layer_index=3,
+            layer_type="full_attention",
+        )
+    )
+    pass_state = profile.isolated_layer_pass_state(captured, layer)
+
+    assert set(pass_state["shared_kv_states"]) == {3}
+    assert pass_state["shared_kv_states"][3] == captured[3]
+
+
+def test_gemma4_shared_kv_capture_rejects_malformed_entries():
+    profile = Gemma4Profile()
+
+    try:
+        profile.capture_forward_pass_state({"shared_kv_states": {3: object()}})
+    except RuntimeError as exc:
+        assert "shared_kv_states[3]" in str(exc)
+    else:  # pragma: no cover - assert path keeps compatibility without pytest.raises
+        raise AssertionError("malformed shared_kv_states entry was accepted")
 
 
 def test_gemma_graph_marks_packed_experts_under_recipe_experts():

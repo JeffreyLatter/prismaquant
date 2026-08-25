@@ -1,6 +1,8 @@
 {
   "schema": "prismaquant.model_structure.v1",
   "id": "qwen3_5_dense",
+  "priority": 100,
+  "supported_lanes": ["compressed-tensors", "nvfp4_cb"],
   "default_serving_profile": "vllm_packed_moe",
   "runtime_requirements": {
     "fast_kernel_packages": [
@@ -16,7 +18,8 @@
   },
   "match": {
     "model_type": ["qwen3_5", "qwen3_6"],
-    "architectures": ["Qwen3_5For*", "Qwen3.5For*", "Qwen3_6For*", "Qwen3.6For*"]
+    "architectures": ["Qwen3_5For*", "Qwen3.5For*", "Qwen3_6For*", "Qwen3.6For*"],
+    "architectures_exclude": ["*Moe*"]
   },
   "staging": {
     "text_only_strip_keys": [
@@ -89,6 +92,29 @@
       }
     ]
   },
+  "naming_variants": [
+    {
+      "when": {
+        "architectures": [
+          "Qwen3_5ForCausalLM", "Qwen3_6ForCausalLM",
+          "Qwen3.5ForCausalLM", "Qwen3.6ForCausalLM"
+        ],
+        "architectures_exclude": ["*Moe*"]
+      },
+      "naming": {
+        "recipe_to_vllm": [
+          { "prefix": "mtp.", "replace": "mtp.", "stop": true },
+          { "exact": "lm_head", "replace": "lm_head", "stop": true },
+          {
+            "prefix": "model.language_model.",
+            "replace": "model.",
+            "stop": true
+          },
+          { "prefix": "model.", "replace": "model.", "stop": true }
+        ]
+      }
+    }
+  ],
   "fused_groups": [
     {
       "target": "self_attn.qkv_proj",

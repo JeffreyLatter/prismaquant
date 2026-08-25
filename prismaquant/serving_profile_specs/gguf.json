@@ -1,0 +1,39 @@
+{
+  "schema": "prismaquant.serving_profile.v1",
+  "id": "gguf",
+  "runtime": "llama_cpp_or_vllm_gguf",
+  "supports_per_role_expert_schemes": true,
+  "description": "GGUF container lane: llama.cpp-native serving, plus vLLM via the in-tree (<=0.19) or vllm-gguf-plugin (>=0.23) GGUF path. One container, one kernel family: only ggml tensor types are expressible, so the non-GGUF quantized formats are structurally unavailable rather than policy-denied.",
+  "export_lane": {
+    "id": "gguf",
+    "exporter": "prismaquant.export_gguf_direct",
+    "codec_formats_from": ["prismaquant.gguf_formats:GGUF_BLOCK_BYTES"],
+    "passthrough_formats": ["BF16"],
+    "reason": "exporter_cannot_emit",
+    "detail": "GGUF tensors carry a ggml quantization type; both GGUF exporters gate emission on membership in gguf_formats.GGUF_BLOCK_BYTES (the block/type_size table that also drives the byte packers). BF16 is the container passthrough (written as an F16/F32 tensor). Nothing else -- NVFP4, the MX family, FP8_E4M3/FP8_SOURCE -- has a ggml type, so it cannot be expressed in this container at all."
+  },
+  "format_rules": [
+    {
+      "id": "gguf_container_formats",
+      "allow_formats": ["Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "Q8_0", "IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ3_XXS", "IQ3_S", "IQ4_XS", "IQ4_NL", "BF16"],
+      "reason": "profile_mismatch",
+      "detail": "GGUF artifacts can only carry ggml tensor types; K-quants Q2_K..Q6_K + Q8_0 have CUDA MMQ/MMVQ/fused-MoE kernels in both llama.cpp and the vLLM GGUF path, BF16 is the unquantized passthrough (written as BF16/F16 tensor). The IQ family (IQ2_XXS 2.06 .. IQ4_NL 4.5 bpw) is decoded by llama.cpp and the vLLM GGUF path; its prefill uses MMVQ/Triton (no CUDA MMQ), so it stays a research/candidate rung until it clears a serving perf gate, but it is allowed here so the allocator can reach the sub-Q2_K regime."
+    }
+  ],
+  "shape_rules": [
+    {
+      "id": "kquant_superblock_shape",
+      "formats": ["Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ3_XXS", "IQ3_S", "IQ4_XS"],
+      "in_features_multiple_of": 256,
+      "reason": "kernel_shape",
+      "detail": "GGUF k-quants and 256-superblock IQ types pack 256-element superblocks along the input dim"
+    },
+    {
+      "id": "block32_shape",
+      "formats": ["Q8_0", "IQ4_NL"],
+      "in_features_multiple_of": 32,
+      "reason": "kernel_shape",
+      "detail": "Q8_0 and IQ4_NL pack 32-element blocks along the input dim; IQ4_NL is the only IQ rung usable when in_features % 256 != 0"
+    }
+  ]
+}

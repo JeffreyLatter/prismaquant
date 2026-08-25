@@ -4,12 +4,11 @@ Date: 2026-05-17
 Branch: `clado-plugin-integration`
 Run: `/home/rob/dq-runs/qwen36-27b-smrf-standard-20260517T000000Z`
 
-Status: 27B was validated before 35B. The low-budget SMRF point is now
-a credible 5.24 bpp candidate, but SMRF should not be promoted as a
-general 27B/default method. A stronger n=256 in-place KL rerun favored
-the low-bpp SMRF point over matched PQ, vLLM ToolEvalBench tied matched
-PQ, and held-out WikiText PPL slightly favored matched PQ. High-bpp SMRF
-still lost to standard PQ.
+Status: archived. SMRF/PrismaSCOUT remains research-only and should not be
+used as a live allocator or export path. Earlier low-budget points had
+interesting KL wins, but held-out WikiText PPL favored matched PQ, high-bpp
+SMRF lost to standard PQ, and the 2026-05-23 post-NVFP4-fix revival did not
+beat the current fixed 5.5-bit PQ artifact under exact full-vocab vLLM KL.
 
 ## Inputs
 
@@ -297,8 +296,7 @@ identical:
 
 ## Conclusion
 
-Do not promote SMRF as a general/default Qwen3.6-27B method yet, but keep
-the low-budget 5.24 bpp SMRF point alive as a serious candidate.
+Do not promote SMRF as a general/default Qwen3.6-27B method.
 
 At the low-budget point, SMRF improved n=256 KL by 0.002403 absolute
 against matched PQ, or about 11.23% relative. Its held-out WikiText PPL
@@ -307,15 +305,13 @@ the 32k regression was 0.29%, both below the usual 0.5% preservation
 tolerance. ToolEvalBench tied matched PQ exactly at 87 / 100 and
 129 / 148 points.
 
-That is enough evidence to say the low-budget SMRF point is competitive.
-It is not enough evidence to say SMRF is globally better: the high-bpp
-SMRF point lost to matched PQ and to a lower-bpp standard PQ point, and
-both low-budget artifacts still failed the same critical sleeper-injection
-ToolEvalBench case. Before 35B, use corrected standard PQ as the default
-baseline and treat low-budget SMRF as a candidate arm that must be
-validated with the full standard suite: n=256-or-stronger KL, PPL/mean
-NLL, log-likelihood downstream tasks, ToolEvalBench, and vLLM eager/graph
-materialization checks.
+That was enough evidence to keep the low-budget SMRF point as a research
+checkpoint at the time, but not enough to keep it live after the later FP4
+fixes and standard-PQ reruns. Corrected standard PQ is the default baseline.
+Any future SMRF revival should be treated as a new archived research effort
+and must clear exact vLLM KL, held-out PPL/mean NLL, log-likelihood
+downstream tasks, ToolEvalBench, and vLLM eager/graph materialization checks
+before export is considered.
 
 ## Refined solver rerun
 
@@ -492,15 +488,14 @@ All-NVFP4 improves PPL slightly versus mixed SMRF, but still trails PQ by
 0.014311 PPL, a 0.17% relative regression. That is under the usual 0.5%
 preservation tolerance, but it is directionally worse despite better KL.
 
-Recommendation: do not promote SMRF as a default allocator replacement yet.
-The low-budget SMRF neighborhood remains viable because all-NVFP4 beats PQ
-on n=256 KL at lower bpp and no longer has a material steady-state runtime
-problem. The next useful SMRF step is validation-guided local search around
-the old mixed `smrf_003`, the all-NVFP4 ablation, and matched `pq_003`,
-with a gate that considers both repeat-stable KL and held-out PPL. The
-allocator should also keep serving-kernel mix as an explicit runtime cost or
-constraint rather than treating MXFP8 and NVFP4 as interchangeable once both
-are shape-legal.
+Recommendation: keep SMRF archived. The low-budget neighborhood was
+interesting before the FP4 fixes, but the current fixed standard-PQ artifact
+is the stronger baseline. If this line of work is revived, the next useful
+step is not another surrogate-only SMRF sweep; it is validation-guided local
+search around the fixed PQ allocation with exact vLLM KL and held-out PPL as
+acceptance gates. The allocator should also keep serving-kernel mix as an
+explicit runtime cost or constraint rather than treating MXFP8 and NVFP4 as
+interchangeable once both are shape-legal.
 
 ## MXFP8 subset search
 
@@ -616,3 +611,30 @@ For low-budget 27B, the most defensible SMRF artifact remains the
 all-NVFP4 ablation as a research checkpoint: it keeps lower bpp and a KL
 edge over matched PQ without the extra MXFP8 serving path, but it still does
 not beat PQ on held-out PPL.
+
+## Post-NVFP4-fix revival check
+
+Date: 2026-05-23
+Run: `/home/rob/dq-runs/qwen36-27b-smrf-review-20260523T202318Z`
+
+After the NVFP4 renderer/export fixes, SMRF was briefly revived against the
+current fixed 27B 5.5-bit PQ artifact. The archived solver was not promoted
+or moved back into the live pipeline; it was used only to generate narrow
+candidate deltas around the fixed PQ allocation.
+
+Exact full-vocab vLLM KL results against the BF16 teacher:
+
+| artifact | bpp | local output MSE | exact vLLM KL |
+|---|---:|---:|---:|
+| current fixed 5.5 PQ | 5.4998 | 0.0961 | 0.0344416 |
+| shipped 5.5 | - | - | 0.0474975 |
+| fixed PQ + six layer54/56/58 NVFP4-to-FP8 moves | 5.5000 | 0.0862 | 0.0436522 |
+| same + layer60 gate/up FP8-to-NVFP4 offset | 5.4744 | 0.0871 | 0.0463870 |
+| prior full SMRF-like candidate | 5.4742 | 0.0888 | 0.0594489 |
+
+The best isolated SMRF-derived move improved the local MSE surrogate and beat
+the shipped 5.5 artifact, but it did not beat the current fixed 5.5 PQ
+artifact. Adding the SMRF offsetting demotion worsened exact KL. This closes
+the post-fix revival: SMRF remains archived and should not be used as a
+shipping candidate generator without a new deployment-validated research
+plan.

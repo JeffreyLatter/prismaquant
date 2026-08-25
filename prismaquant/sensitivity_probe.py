@@ -36,9 +36,14 @@ accumulated `||grad_W||²_F` by total tokens recovers the per-token
 Fisher trace estimator directly.
 
 Other features:
-  - route-aware MoE scaling (discover routers by walking module tree;
-    divide each expert's H_trace by observed routing probability so
-    sparse experts' Fisher is comparable to dense layers')
+  - route-aware MoE normalization (discover routers by walking module
+    tree; each expert's H_trace is divided by its ROUTED token count,
+    i.e. the per-routed-token mean — the single implicit ÷token-fraction
+    convention. This matches `incremental_probe`, the production
+    backend: the two backends now agree on expert h_trace. The observed
+    routing probability is recorded as `route_prob` metadata only; it is
+    no longer applied as a second division, which used to make this
+    backend disagree with the incremental one by ~1/p_e — audit M4.)
   - per-token importance weighting (harder tokens count more); this
     reweights the loss but preserves the per-token-Fisher units when
     used with sum reduction
@@ -60,6 +65,7 @@ from __future__ import annotations
 
 import atexit
 import json
+import os
 import pickle
 import random
 import re
@@ -69,37 +75,48 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
+import numpy as np
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-# ---------------------------------------------------------------------------
-# Model staging — temporary symlink trees
-# ---------------------------------------------------------------------------
-# A staging dir is a symlink tree mirroring the source checkpoint plus a
-# rewritten config.json. It is only needed while the model loads, but an
-# OOM-killed or interrupted run never reaches teardown, so the dirs pile up
-# in $TMPDIR (302 found in one 9-day window). Two defenses:
-#   1. atexit removes the dir this process created — covers normal exit and
-#      unhandled exceptions (not SIGKILL).
-#   2. On each new staging dir, sweep sibling dirs older than the staleness
-#      window so SIGKILL-orphaned dirs from earlier runs do not accumulate.
-#      The age gate keeps a concurrently-running probe's fresh dir safe.
+_STAGED_TEMP_DIRS: list[Path] = []
+
+
+def _prismaquant_temp_parent() -> Path:
+    root = (
+        os.environ.get("PRISMAQUANT_TMPDIR")
+        or os.environ.get("TMPDIR")
+    )
+    parent = Path(root) if root else Path.cwd() / ".prismaquant_tmp"
+    parent.mkdir(parents=True, exist_ok=True)
+    return parent
+
+
 _STAGING_STALE_SECONDS = 6 * 3600
 
 
-def _new_staging_dir(prefix: str) -> Path:
-    """mkdtemp a staging dir, sweeping stale siblings and registering the
-    new dir for removal at interpreter exit.
+def _mk_stage_dir(prefix: str) -> Path:
+    """mkdtemp a staging dir under `_prismaquant_temp_parent()`, sweeping
+    stale (`_STAGING_STALE_SECONDS`+ old) sibling dirs first and registering
+    the new dir for removal at interpreter exit via `_STAGED_TEMP_DIRS`.
 
-    rmtree on a symlink tree removes the links, never their targets, so the
-    HuggingFace cache the links point into is left untouched.
+    A staging dir is a symlink tree mirroring the source checkpoint plus a
+    rewritten config.json. It is only needed while the model loads, but an
+    OOM-killed or interrupted run never reaches teardown, so the dirs pile up
+    (302 found in one 9-day window). The staleness sweep catches
+    SIGKILL-orphaned dirs from earlier runs, which the atexit cleanup below
+    cannot (it never fires on SIGKILL); the age gate keeps a
+    concurrently-running probe's fresh dir safe. rmtree on a symlink tree
+    removes the links, never their targets, so the HuggingFace cache the
+    links point into is left untouched.
     """
-    tmp_root = Path(tempfile.gettempdir())
+    parent = _prismaquant_temp_parent()
     cutoff = time.time() - _STAGING_STALE_SECONDS
     try:
-        for old in tmp_root.glob(f"{prefix}*"):
+        for old in parent.glob(f"{prefix}*"):
             try:
                 if old.is_dir() and old.stat().st_mtime < cutoff:
                     shutil.rmtree(old, ignore_errors=True)
@@ -107,9 +124,17 @@ def _new_staging_dir(prefix: str) -> Path:
                 pass
     except OSError:
         pass
-    staged = Path(tempfile.mkdtemp(prefix=prefix))
-    atexit.register(shutil.rmtree, staged, ignore_errors=True)
+    staged = Path(tempfile.mkdtemp(prefix=prefix, dir=str(parent)))
+    _STAGED_TEMP_DIRS.append(staged)
     return staged
+
+
+def _cleanup_stage_dirs() -> None:
+    for path in reversed(_STAGED_TEMP_DIRS):
+        shutil.rmtree(path, ignore_errors=True)
+
+
+atexit.register(_cleanup_stage_dirs)
 
 
 # ---------------------------------------------------------------------------
@@ -194,7 +219,7 @@ def stage_text_only(model_path: str) -> str:
             a.replace("ForConditionalGeneration", "ForCausalLM") for a in archs
         ]
 
-    staged = _new_staging_dir("prismaquant_stage_")
+    staged = _mk_stage_dir("prismaquant_stage_")
     skip = {"config.json", "preprocessor_config.json",
             "video_preprocessor_config.json", "processor_config.json"}
     for p in src.iterdir():
@@ -240,7 +265,7 @@ def stage_multimodal(model_path: str) -> str:
                                   "speech_config")):
         return str(src)
 
-    staged = _new_staging_dir("prismaquant_mm_stage_")
+    staged = _mk_stage_dir("prismaquant_mm_stage_")
     for p in src.iterdir():
         if p.name == "config.json":
             continue
@@ -449,32 +474,324 @@ def load_multimodal_calibration(
     return triples[:n_samples]
 
 
-class _GradNormCapture(torch.autograd.Function):
-    """Identity in forward; in backward, accumulates packed-expert Fisher
-    statistics at up to three granularities and returns None for the
-    weight gradient — which tells autograd to NOT accumulate to the leaf
-    parameter's .grad.
+_ALLOW_SUMSQ_PACKED_FISHER_ENV = "PRISMAQUANT_ALLOW_SUMSQ_PACKED_FISHER"
 
-    Three accumulators, all optional:
-      - `scalar_accumulator`: scalar Frobenius-norm of per-weight grad^2
-        (the classic `h_trace`). Always cheap. ~1 float per packed param.
-      - `channel_accumulator`: per-expert per-output-channel diagonal
-        [E, M] — the `sum over in-features of grad^2`. ~1 MB per packed
-        param at 256 experts × 1024 out rows.
-      - `full_accumulator`: full per-weight Fisher [E, M, N] accumulated
-        in fp32 on CPU. ~5 GB per packed param at 256 experts ×
-        1024 × 1536. Chunked by expert so GPU peak stays ~20 MB per
-        expert rather than materializing the whole squared tensor at
-        once. Enables full per-weight predicted-dloss at inference-
-        model-export time: the extra cost is one-time and well worth
-        the fidelity for models that will be served many times.
 
-    Why return None? With 40 MoE layers × 2 packed params × ~5 GB of
-    bf16 grads = 400 GB if .grad were retained per leaf. By returning
-    None we tell autograd "this input doesn't need a stored gradient";
-    .grad stays None on the leaf and only the transient grad_output
-    (one per backward node, freed in topological order) is alive at
-    any one time.
+def h_detail_blob(h_raw: torch.Tensor, global_tokens: int, name: str, *,
+                  kind: str = "linear",
+                  g2_per_token: torch.Tensor | None = None) -> dict:
+    """Normalize a token-SUMMED Fisher diagonal accumulator to per-token
+    units and wrap it in the canonical h-detail blob schema.
+
+    ``global_tokens`` must be the GLOBAL calibration token count — the
+    same denominator `finalize_fisher_stats` applies to the scalar
+    ``h_trace`` — never a per-row routed-token count. v4 pins this:
+    passing an unpacked expert Linear's own ``n_tokens_seen`` here left
+    the detail blob (global/routed)× hotter than the scalar it must
+    agree with, so `predicted_dloss` fallback rows priced expert rows on
+    a different scale than the rest of the knapsack.
+
+    Every h-detail writer (this module's `FisherAccumulator.finalize` and
+    `incremental_probe`'s two writer sites) goes through this helper so
+    the on-disk units are per-token everywhere and stamped with an
+    explicit ``units: "per_token"`` marker (audit M9 — the incremental
+    writer used to save the raw token-summed ``H``, leaving the consumer
+    `HDetailIndex.h_diag_from_blob` ~n_tokens× off depending on which
+    probe produced the directory). ``g2_per_token`` is already a
+    per-token vector and is stored as-is.
+    """
+    tokens = max(int(global_tokens), 1)
+    h = h_raw.detach().to("cpu", torch.float32) / tokens
+    blob = {
+        "h_diag": h,
+        "name": name,
+        "kind": kind,
+        "shape": list(h.shape),
+        "units": "per_token",
+        # v3: unit marker; no route_prob term (M4).
+        # v4: denominator is the GLOBAL calib token count for every row
+        #     (v3 unpacked-expert blobs were per-ROUTED-token).
+        "h_detail_version": 4,
+        "norm_tokens": tokens,
+    }
+    if g2_per_token is not None:
+        blob["g2_per_token"] = g2_per_token
+    return blob
+
+
+def finalize_fisher_stats(merged_stats: dict, global_tokens: int) -> None:
+    """Normalize raw Fisher accumulators into ``h_trace`` (etc.), in place.
+
+    Fisher normalization must share ONE denominator across every row: the
+    global calibration token count (nsamples x seqlen). Dense trunk Linears
+    accumulate exactly that many tokens in ``n_tokens_seen``, so their
+    values are unchanged by dividing by the global count. Per-expert
+    Linears, however, only see their ROUTED tokens; a per-row
+    ``h_trace_raw / n_tokens_seen`` inflates a rarely-routed expert's
+    Fisher by (global/routed) — exactly inverted importance weighting (the
+    least-used experts look the most sensitive). Tokens never routed to an
+    expert contribute zero gradient, so the empirical Fisher over the
+    calibration set divides by the GLOBAL count for every row.
+
+    HISTORY — this deliberately REVERSES a documented convention. Audit M4
+    removed an explicit ÷route_prob on the grounds that dividing by the
+    routed-token count was "the one implicit ÷token-fraction the MoE
+    convention prescribes", and both backends then shipped per-routed-token
+    as the single normalization (pinned by the original
+    tests/test_packed_expert_per_token_fisher.py). M4's *agreement* goal
+    stands — one division, both backends, route_prob as metadata only —
+    but per-routed-token was the wrong denominator for the mean-Δloss
+    objective the allocator optimizes: it is the same 1/p_e inflation M4
+    removed, merely implicit. CLAUDE.md §3 records the same reversal.
+
+    ``n_tokens_seen`` stays raw (routed count, metadata). Every h-detail
+    blob is normalized by the SAME global count (`h_detail_blob` v4) so
+    scalar and per-weight detail Fisher share one denominator.
+    """
+    for s in merged_stats.values():
+        s["h_trace"] = s.get("h_trace_raw", 0.0) / global_tokens
+        s["h_w2_sum"] = s.get("h_w2_sum_raw", 0.0) / global_tokens
+        # Per-expert Fisher trace (only present on packed-3D stat entries;
+        # dense Linears have no per-expert dimension). Normalize by the
+        # same token count so it shares units with `h_trace`.
+        per = s.get("h_trace_per_expert_raw")
+        if per is not None:
+            s["h_trace_per_expert"] = [float(v) / global_tokens for v in per]
+        s["h_trace_norm_tokens"] = global_tokens
+
+
+def _scalar_acc_add(acc: dict, name: str, value: torch.Tensor) -> None:
+    """Add a 0-dim fp32 tensor into `acc[name]`, keeping the running total
+    device-resident so the backward hot path never forces a CUDA→CPU sync.
+    Consumers flush with `float(acc[name])` (works for float and tensor)."""
+    cur = acc.get(name)
+    if cur is None:
+        acc[name] = value.detach().to(torch.float32).clone()
+    elif torch.is_tensor(cur):
+        cur.add_(value.detach().to(cur.device, torch.float32))
+    else:
+        # Legacy float entry (e.g. written by the env-gated sum-sq
+        # fallback) — keep the float representation.
+        acc[name] = float(cur) + float(value)
+
+
+def _accumulate_packed_per_token_fisher(
+    name: str,
+    expert_idx: int,
+    num_experts: int,
+    x: torch.Tensor,
+    gy: torch.Tensor,
+    scalar_acc: dict,
+    channel_acc: dict | None,
+    full_acc: dict | None,
+    marginal_acc: dict | None = None,
+) -> None:
+    """Per-token-summed empirical Fisher moments for one expert's Linear
+    application inside a packed [E, M, N] MoE parameter.
+
+    For expert e with routed tokens t (x_t = input row, gy_t = grad of the
+    expert's output row), the per-token outer-product identities give:
+
+      scalar  : Σ_t ‖gy_t‖²·‖x_t‖²          (= Σ_t ‖∇_t W_e‖²_F)
+      channel : [E, M] row e += Σ_t gy_{t,m}²·‖x_t‖²
+      full    : [E, M, N] slice e += (gy²)ᵀ @ (x²)
+                                             (= Σ_t gy_{t,m}²·x_{t,n}²)
+
+    This is the same per-token estimator the nn.Linear paths use
+    (`FisherAccumulator._make_bwd`, incremental_probe's resident/deferred
+    hooks) — NOT the sum-then-square ‖Σ_t ∇_t‖² that the packed path used
+    to compute from the token-summed weight gradient (audit M3: inflated
+    by the cross-token gradient covariance, 5-50× on correlated
+    sequences, and non-convergent as calibration grows).
+
+    Mixed precision matches the nn.Linear paths: square in the incoming
+    dtype (bf16 squaring is safe — bf16 shares fp32's exponent range),
+    reduce/accumulate in fp32. Scalar and channel accumulators stay
+    device-resident (flushed once by the consumers); the full [E, M, N]
+    accumulator stays on CPU, receiving one [M, N] fp32 slice per routed
+    expert per backward, so GPU memory stays bounded.
+    """
+    gy2 = gy.detach().reshape(-1, gy.size(-1))   # (T_e, M)
+    x2 = x.detach().reshape(-1, x.size(-1))      # (T_e, N)
+    gy_sq = gy2.pow(2)                           # incoming dtype
+    x_sq = x2.pow(2)
+    x_norm = x_sq.sum(dim=1, dtype=torch.float32)          # (T_e,) fp32
+    if channel_acc is not None:
+        # Σ_t gy_{t,m}² · ‖x_t‖²  → (M,) fp32
+        per_ch = gy_sq.float().t().mv(x_norm)
+        ch = channel_acc.get(name)
+        if ch is None:
+            ch = torch.zeros(num_experts, per_ch.numel(),
+                             dtype=torch.float32, device=per_ch.device)
+            channel_acc[name] = ch
+        ch[expert_idx].add_(per_ch.to(ch.device))
+        trace = per_ch.sum()
+    else:
+        gy_norm = gy_sq.sum(dim=1, dtype=torch.float32)    # (T_e,)
+        trace = (gy_norm * x_norm).sum()
+    _scalar_acc_add(scalar_acc, name, trace)
+    if full_acc is not None:
+        cur = full_acc.get(name)
+        if cur is None:
+            cur = torch.zeros(num_experts, gy2.size(1), x2.size(1),
+                              dtype=torch.float32, device="cpu")
+            full_acc[name] = cur
+        chunk_h = (gy_sq.t() @ x_sq).float()               # (M, N) fp32
+        cur[expert_idx].add_(chunk_h.to("cpu", torch.float32))
+        del chunk_h
+
+    if marginal_acc is not None:
+        # AQUA A-side marginals for THIS expert slice. Both are pure
+        # reductions of tensors the Fisher path already materialized, so
+        # they add no matmul and no extra device→host sync (the flush is
+        # batched by the caller, exactly like `h_trace_per_expert_raw`).
+        #
+        #   g_sq_sum [E, M] : Σ_{t routed to e} gy_{t,m}²   -- RAW sum.
+        #   act_sq_sum [E, N]: Σ_{t routed to e} x_{t,n}²   -- RAW sum.
+        #   act_absmax [E, N]: max_t |x_{t,n}|              -- a BOUND.
+        #   tokens [E]      : |{t routed to e}|             -- see below.
+        #
+        # `tokens` is the piece with no dense analogue and it is not
+        # optional. The two raw sums feed two DIFFERENT normalizations
+        # downstream and only one of them is global:
+        #
+        #   * g_sq_sum is divided by the GLOBAL token count, because that
+        #     is what carries an expert's share of the mean-Δloss
+        #     objective (a rarely-routed expert SHOULD price low). This is
+        #     the PR #14 convention `finalize_fisher_stats` already
+        #     enforces for h_trace.
+        #   * act_sq_sum is divided by this expert's ROUTED count, because
+        #     it is fitting the per-token noise magnitude of the rows that
+        #     actually flow through the expert. Dividing it globally too
+        #     would discount a rare expert TWICE -- once correctly in g,
+        #     once wrongly in the variance -- which is PR #14's inverted
+        #     importance weighting in mirror image.
+        #
+        # The packed stat entry's `n_tokens_seen` is the layer's global
+        # count, so the routed denominator has to be recorded here.
+        slot = marginal_acc.get(name)
+        if slot is None:
+            slot = {
+                "expert_g_sq_sum": torch.zeros(
+                    num_experts, gy2.size(1), dtype=torch.float32,
+                    device=gy2.device),
+                "expert_act_sq_sum": torch.zeros(
+                    num_experts, x2.size(1), dtype=torch.float32,
+                    device=x2.device),
+                "expert_act_absmax": torch.zeros(
+                    num_experts, x2.size(1), dtype=torch.float32,
+                    device=x2.device),
+                "expert_tokens": torch.zeros(
+                    num_experts, dtype=torch.float64, device=x2.device),
+            }
+            marginal_acc[name] = slot
+        slot["expert_g_sq_sum"][expert_idx].add_(
+            gy_sq.sum(dim=0, dtype=torch.float32))
+        slot["expert_act_sq_sum"][expert_idx].add_(
+            x_sq.sum(dim=0, dtype=torch.float32))
+        torch.maximum(
+            slot["expert_act_absmax"][expert_idx],
+            x2.abs().amax(dim=0).to(torch.float32),
+            out=slot["expert_act_absmax"][expert_idx])
+        slot["expert_tokens"][expert_idx].add_(float(x2.size(0)))
+
+
+def _packed_expert_slice_index(weight: torch.Tensor,
+                               param: torch.Tensor) -> int | None:
+    """Expert index e such that `weight` is `param[e]` — a dim-0 select
+    view of the packed [E, M, N] parameter. Returns None when `weight`
+    is not such a slice (the caller then falls back to the plain linear
+    and `_PackedWeightGradFallback` catches the weight gradient)."""
+    if weight.dim() != 2 or param.dim() != 3:
+        return None
+    if weight.device.type == "meta" or param.device.type == "meta":
+        return None
+    if tuple(weight.shape) != tuple(param.shape[1:]):
+        return None
+    if tuple(weight.stride()) != tuple(param.stride()[1:]):
+        return None
+    stride0 = param.stride(0)
+    if stride0 <= 0:
+        return None
+    try:
+        if (weight.untyped_storage().data_ptr()
+                != param.untyped_storage().data_ptr()):
+            return None
+    except Exception:
+        return None
+    off = weight.storage_offset() - param.storage_offset()
+    if off < 0 or off % stride0 != 0:
+        return None
+    e = off // stride0
+    if e >= param.shape[0]:
+        return None
+    return int(e)
+
+
+class _PackedLinearPerTokenFisher(torch.autograd.Function):
+    """`F.linear` on one expert's [M, N] slice of a packed [E, M, N] MoE
+    parameter, with per-token empirical-Fisher capture in backward.
+
+    Forward is exactly `orig_linear(x, weight, bias)`. Backward returns
+    the exact input/bias gradients but None for the weight slice: the
+    packed leaf's `.grad` stays None (no [E, M, N] gradient tensor is
+    ever materialized) and the per-token-summed Fisher moments are
+    accumulated instead via `_accumulate_packed_per_token_fisher`.
+    """
+
+    @staticmethod
+    def forward(ctx, x, weight, bias, orig_linear, name, expert_idx,
+                num_experts, scalar_acc, channel_acc, full_acc,
+                marginal_acc=None):
+        ctx.name = name
+        ctx.expert_idx = expert_idx
+        ctx.num_experts = num_experts
+        ctx.scalar_acc = scalar_acc
+        ctx.channel_acc = channel_acc
+        ctx.full_acc = full_acc
+        ctx.marginal_acc = marginal_acc
+        ctx.has_bias = bias is not None
+        ctx.set_materialize_grads(False)
+        ctx.save_for_backward(x, weight)
+        return orig_linear(x, weight, bias)
+
+    @staticmethod
+    def backward(ctx, gy):
+        if gy is None:
+            return (None,) * 12
+        x, w = ctx.saved_tensors
+        _accumulate_packed_per_token_fisher(
+            ctx.name, ctx.expert_idx, ctx.num_experts, x, gy,
+            ctx.scalar_acc, ctx.channel_acc, ctx.full_acc,
+            ctx.marginal_acc)
+        grad_x = gy.matmul(w) if ctx.needs_input_grad[0] else None
+        grad_b = None
+        if ctx.has_bias and ctx.needs_input_grad[2]:
+            grad_b = gy.reshape(-1, gy.size(-1)).sum(dim=0)
+        return (grad_x, None, grad_b) + (None,) * 9
+
+
+class _PackedWeightGradFallback(torch.autograd.Function):
+    """Identity wrapper on the packed [E, M, N] parameter (formerly
+    `_GradNormCapture`). Returns None for the weight gradient so the
+    leaf's `.grad` is never populated (40 MoE layers × 2 packed params ×
+    ~5 GB of grads = 400 GB if retained).
+
+    With the per-token `F.linear` interception in `patched_forward`
+    (see `install_packed_expert_hooks`) covering every use of the packed
+    weight, no gradient ever reaches this node — the interception
+    returns None for the weight slice, so autograd prunes the path here.
+
+    If this backward DOES run, the experts module consumed the packed
+    weight through an op the interception does not cover (bmm /
+    grouped-mm / einsum / a non-view slice). The only quantity available
+    at this boundary is the token-SUMMED weight gradient, whose square
+    is the ‖Σ_t ∇_t‖² sum-then-square estimator — the exact 5-50×
+    cross-token-covariance inflation documented at the nn.Linear per-token
+    path (audit M3). Rather than silently feed the allocator inflated
+    expert rows, fail fast; PRISMAQUANT_ALLOW_SUMSQ_PACKED_FISHER=1 opts
+    into the biased estimator (mirrors the KV-shared Fisher guard,
+    MINOR-M33).
     """
 
     @staticmethod
@@ -484,13 +801,28 @@ class _GradNormCapture(torch.autograd.Function):
         ctx.scalar_acc = scalar_accumulator
         ctx.channel_acc = channel_accumulator
         ctx.full_acc = full_accumulator
+        ctx.set_materialize_grads(False)
         return weight
 
     @staticmethod
     def backward(ctx, grad_output):
         if grad_output is None:
             return None, None, None, None, None
+        if os.environ.get(_ALLOW_SUMSQ_PACKED_FISHER_ENV, "0") == "0":
+            raise RuntimeError(
+                f"[probe] packed-expert param {ctx.name!r} received a "
+                "token-summed weight gradient: its expert compute was not "
+                "intercepted at an F.linear(x, packed[e]) boundary, so a "
+                "faithful per-token Fisher cannot be captured for it. "
+                "Squaring this gradient would be the sum-then-square "
+                "estimator (audit M3: 5-50× cross-token-covariance "
+                "inflation, layer-non-uniform). Set "
+                f"{_ALLOW_SUMSQ_PACKED_FISHER_ENV}=1 to accept the biased "
+                "estimator for this module, or extend the interception in "
+                "install_packed_expert_hooks to cover its compute pattern."
+            )
         g = grad_output.detach()
+        # --- env-gated legacy sum-then-square path (biased; see above) ---
         # Scalar Frobenius-norm squared — streamed to avoid materializing
         # the full squared tensor for very large packed params.
         flat = g.reshape(-1)
@@ -498,7 +830,9 @@ class _GradNormCapture(torch.autograd.Function):
         total = 0.0
         for i in range(0, flat.numel(), chunk):
             total += float(flat[i:i + chunk].float().pow(2).sum().item())
-        ctx.scalar_acc[ctx.name] = ctx.scalar_acc.get(ctx.name, 0.0) + total
+        cur = ctx.scalar_acc.get(ctx.name, 0.0)
+        ctx.scalar_acc[ctx.name] = (
+            float(cur) if not torch.is_tensor(cur) else float(cur)) + total
         # Per-expert per-output-channel diagonal: reduce along the
         # in-feature axis (the last dim). For a [E, M, N] packed param,
         # result is [E, M]. Accumulated across backward samples.
@@ -514,14 +848,9 @@ class _GradNormCapture(torch.autograd.Function):
                 if cur is None:
                     ctx.channel_acc[ctx.name] = per_ch.cpu()
                 else:
-                    cur.add_(per_ch.cpu())
+                    cur.add_(per_ch.to(cur.device))
         # Full per-weight Fisher: chunk along the expert dim so CPU peak
-        # stays bounded even on 128-256 expert packed params. Upcast +
-        # square happen on CPU per-chunk (bf16 transfer is cheaper than
-        # fp32 transfer, and the transient fp32 lives for exactly one
-        # chunk before being added into the persistent accumulator).
-        # Chunk size 16 gives ~1-2 GB CPU transient at 3000-column width
-        # — scales cleanly to 256+ experts at 397B+ without retuning.
+        # stays bounded even on 128-256 expert packed params.
         if ctx.full_acc is not None and g.dim() >= 2:
             name = ctx.name
             cur = ctx.full_acc.get(name)
@@ -609,6 +938,7 @@ def _packed_expert_projection_candidate_names(profile=None) -> tuple[str, ...]:
 _PRISMAQUANT_PATCH_SENTINEL = "_prismaquant_packed_expert_patch"
 _PRISMAQUANT_CHANNEL_SENTINEL = "_prismaquant_packed_expert_channel_patch"
 _PRISMAQUANT_FULL_SENTINEL = "_prismaquant_packed_expert_full_patch"
+_PRISMAQUANT_MARGINAL_SENTINEL = "_prismaquant_packed_expert_marginal_patch"
 
 
 def install_packed_expert_hooks(
@@ -616,18 +946,28 @@ def install_packed_expert_hooks(
     accumulator: dict,
     channel_accumulator: dict | None = None,
     full_accumulator: dict | None = None,
+    marginal_accumulator: dict | None = None,
     profile=None,
 ) -> dict[str, dict]:
-    """Patch every packed-experts module's forward so its 3D parameters
-    route through `_GradNormCapture` before each use.
+    """Patch every packed-experts module's forward so each expert-slice
+    `F.linear(x, packed[e])` call inside it routes through
+    `_PackedLinearPerTokenFisher`, which captures the per-token-summed
+    empirical Fisher (Σ_t ‖∇_t‖², the same estimator as the nn.Linear
+    paths — NOT the sum-then-square ‖Σ_t ∇_t‖² of the token-summed
+    weight gradient; audit M3). The 3D parameters are additionally
+    wrapped by `_PackedWeightGradFallback`, which fail-fasts if any
+    packed-weight use escapes the interception (env-gated sum-sq
+    fallback via PRISMAQUANT_ALLOW_SUMSQ_PACKED_FISHER=1).
 
-    `accumulator` collects the scalar Frobenius-norm squared (matches
-    the nn.Linear `h_trace_raw`). `channel_accumulator` collects the
-    per-expert per-output-channel diagonal as [E, M] CPU tensors (for
-    the full per-weight Fisher cost model). The channel accumulator is
-    optional for backward compatibility; when None, packed experts
-    contribute only their scalar trace and the allocator falls back to
-    the scalar proxy for those entries.
+    `accumulator` collects the scalar Fisher trace (matches the
+    nn.Linear `h_trace_raw`; values may be device-resident 0-dim fp32
+    tensors — flush with `float(...)`). `channel_accumulator` collects
+    the per-expert per-output-channel diagonal as [E, M] fp32 tensors
+    (device-resident on the compute device; for the full per-weight
+    Fisher cost model). The channel accumulator is optional for backward
+    compatibility; when None, packed experts contribute only their
+    scalar trace and the allocator falls back to the scalar proxy for
+    those entries.
 
     Returns a metadata dict keyed by `<module_qname>.<param_name>` with
     the same shape/role information stored for nn.Linear modules in
@@ -652,6 +992,21 @@ def install_packed_expert_hooks(
         if not param_names:
             continue
 
+        # transformers 5.x dispatches the packed-experts forward through an
+        # MoE interface (`config._experts_implementation`, e.g. batched_mm /
+        # grouped_mm) that consumes the packed weight via an advanced-index
+        # gather + a batched matmul — there is no per-expert `F.linear(x,
+        # packed[e])` boundary, so the per-token Fisher interception below
+        # never sees the weight and the fail-fast guard in
+        # `_PackedWeightGradFallback` trips (audit M3). Force the reference
+        # "eager" per-expert implementation for the probe forward: it is the
+        # same math, just the interceptable kernel, so the captured Fisher is
+        # faithful. No-op on transformers builds without the MoE interface
+        # (older per-expert layouts) — the attribute is simply absent.
+        _cfg = getattr(module, "config", None)
+        if _cfg is not None and hasattr(_cfg, "_experts_implementation"):
+            _cfg._experts_implementation = "eager"
+
         # Idempotent re-bind path. The sentinel holds a reference to the
         # mutable accumulator dict that patched_forward writes to. We
         # rebind it (clear contents and adopt the new dict's identity by
@@ -665,6 +1020,7 @@ def install_packed_expert_hooks(
             setattr(module, _PRISMAQUANT_PATCH_SENTINEL, accumulator)
             setattr(module, _PRISMAQUANT_CHANNEL_SENTINEL, channel_accumulator)
             setattr(module, _PRISMAQUANT_FULL_SENTINEL, full_accumulator)
+            setattr(module, _PRISMAQUANT_MARGINAL_SENTINEL, marginal_accumulator)
             # Still report metadata so callers can refresh their stats dict.
             for pn in param_names:
                 p_existing = module._parameters.get(pn)
@@ -741,13 +1097,16 @@ def install_packed_expert_hooks(
                 "_packed_param": pn,
             }
 
-        # Patch forward to wrap each packed param with _GradNormCapture.
-        # The original forward uses self.<pn>; we shadow those attributes
-        # with the wrapped tensors for the duration of the call. nn.Module
-        # __getattribute__ checks _parameters before __dict__, so we have
-        # to temporarily move the param out of _parameters and shadow via
-        # __dict__ to make the wrapped tensor visible to the original
-        # forward.
+        # Patch forward to (a) wrap each packed param with the
+        # _PackedWeightGradFallback sentinel and (b) intercept F.linear
+        # calls whose weight is a dim-0 slice of a packed param, routing
+        # them through _PackedLinearPerTokenFisher for per-token Fisher
+        # capture. The original forward uses self.<pn>; we shadow those
+        # attributes with the wrapped tensors for the duration of the
+        # call. nn.Module __getattribute__ checks _parameters before
+        # __dict__, so we have to temporarily move the param out of
+        # _parameters and shadow via __dict__ to make the wrapped tensor
+        # visible to the original forward.
         original_forward = module.forward
         ns = list(param_names)
         full_names = [f"{qname}.{pn}" if qname else pn for pn in ns]
@@ -760,25 +1119,52 @@ def install_packed_expert_hooks(
         setattr(mod_ref, _PRISMAQUANT_PATCH_SENTINEL, accumulator)
         setattr(mod_ref, _PRISMAQUANT_CHANNEL_SENTINEL, channel_accumulator)
         setattr(mod_ref, _PRISMAQUANT_FULL_SENTINEL, full_accumulator)
+        setattr(mod_ref, _PRISMAQUANT_MARGINAL_SENTINEL, marginal_accumulator)
 
         def patched_forward(*args, _ns=ns, _full=full_names, _orig=original_forward,
                             _mod=mod_ref, **kwargs):
             acc = getattr(_mod, _PRISMAQUANT_PATCH_SENTINEL, None)
             ch_acc = getattr(_mod, _PRISMAQUANT_CHANNEL_SENTINEL, None)
             fu_acc = getattr(_mod, _PRISMAQUANT_FULL_SENTINEL, None)
+            mg_acc = getattr(_mod, _PRISMAQUANT_MARGINAL_SENTINEL, None)
             if acc is None:
                 # Should not happen, but degrade gracefully.
                 return _orig(*args, **kwargs)
             saved_params = {}
             wrapped = {}
+            # Identity map for the F.linear interception: a dim-0 slice
+            # `wrapped[e]` is an autograd view whose ._base is the
+            # original Parameter (the wrapped tensor itself is a view of
+            # the param); key on both identities to be robust to either
+            # aliasing convention.
+            slice_targets: dict[int, tuple[str, torch.Tensor]] = {}
             for pn, fn in zip(_ns, _full):
                 saved_params[pn] = _mod._parameters.pop(pn)
-                wrapped[pn] = _GradNormCapture.apply(
+                wrapped[pn] = _PackedWeightGradFallback.apply(
                     saved_params[pn], fn, acc, ch_acc, fu_acc)
                 _mod.__dict__[pn] = wrapped[pn]
+                slice_targets[id(saved_params[pn])] = (fn, saved_params[pn])
+                slice_targets[id(wrapped[pn])] = (fn, saved_params[pn])
+            orig_linear = F.linear
+
+            def _intercepting_linear(input, weight, bias=None):
+                base = weight._base if weight._is_view() else weight
+                hit = slice_targets.get(id(base))
+                if hit is not None:
+                    fn, param = hit
+                    e = _packed_expert_slice_index(weight, param)
+                    if e is not None:
+                        return _PackedLinearPerTokenFisher.apply(
+                            input, weight, bias, orig_linear, fn, e,
+                            int(param.shape[0]), acc, ch_acc, fu_acc,
+                            mg_acc)
+                return orig_linear(input, weight, bias)
+
+            F.linear = _intercepting_linear
             try:
                 return _orig(*args, **kwargs)
             finally:
+                F.linear = orig_linear
                 for pn in _ns:
                     _mod.__dict__.pop(pn, None)
                     _mod._parameters[pn] = saved_params[pn]
@@ -936,6 +1322,66 @@ def discover_moe_structure(
     return expert_info
 
 
+def discover_moe_routers(
+    model: nn.Module,
+    profile=None,
+) -> dict[str, int]:
+    """Return router module qnames and expert counts for all MoE blocks.
+
+    ``discover_moe_structure`` intentionally describes *per-expert Linear*
+    layouts.  Packed Qwen3.5/3.6 experts instead keep their projections as
+    3-D parameters, so that function has no Linear leaves to return even
+    though the sibling router is fully observable.  Coverage accounting only
+    needs the router module itself; discover it independently from either a
+    numbered expert container or a profile-declared packed 3-D parameter.
+    """
+    if profile is None:
+        try:
+            from .model_profiles import profile_from_model
+            profile = profile_from_model(model)
+        except Exception:
+            profile = None
+    packed_names = _packed_expert_param_name_set(profile)
+    routers: dict[str, int] = {}
+
+    def _matches(child: nn.Module, num_experts: int) -> bool:
+        if isinstance(child, nn.Linear) and child.out_features == num_experts:
+            return True
+        weight = getattr(child, "weight", None)
+        return bool(
+            isinstance(weight, torch.Tensor)
+            and weight.ndim >= 1
+            and int(weight.shape[0]) == num_experts
+        )
+
+    for parent_qname, parent in model.named_modules():
+        for attr in ("experts", "block_sparse_moe_experts",
+                     "moe_experts", "expert_layer"):
+            experts = getattr(parent, attr, None)
+            if not isinstance(experts, nn.Module):
+                continue
+            numeric = [name for name, _child in experts.named_children()
+                       if name.isdigit()]
+            num_experts = len(numeric)
+            if not num_experts:
+                for name, param in experts.named_parameters(recurse=False):
+                    if (name in packed_names and isinstance(param, torch.Tensor)
+                            and param.ndim == 3 and int(param.shape[0]) > 0):
+                        num_experts = int(param.shape[0])
+                        break
+            if not num_experts:
+                continue
+            for child_name, child in parent.named_children():
+                if child is experts:
+                    continue
+                if _matches(child, num_experts):
+                    qname = (f"{parent_qname}.{child_name}"
+                             if parent_qname else child_name)
+                    routers[qname] = num_experts
+                    break
+    return routers
+
+
 def read_top_k(model: nn.Module, default: int = 2) -> int:
     cfg = getattr(model, "config", None)
     if cfg is None:
@@ -951,6 +1397,281 @@ def read_top_k(model: nn.Module, default: int = 2) -> int:
             if isinstance(v, int) and v > 0:
                 return v
     return default
+
+
+# ---------------------------------------------------------------------------
+# The KV-cotangent path: Fisher cotangents for cross-layer SHARED state
+# ---------------------------------------------------------------------------
+def kv_cotangent_path_enabled() -> bool:
+    """Whether the reverse sweep routes shared-state cotangents back to the
+    producing layer (default: yes).
+
+    `PRISMAQUANT_KV_COTANGENT=0` restores the pre-fix severed-cotangent
+    behavior for an A/B — and, because that reintroduces the under-count, it
+    also re-arms `incremental_probe.kv_shared_fisher_block_reason`. One
+    definition, read by both the probe sweeps and that guard, so the flag can
+    never mean two different things."""
+    raw = os.environ.get("PRISMAQUANT_KV_COTANGENT")
+    if raw is None:
+        return True
+    return raw not in ("0", "", "false", "False", "FALSE", "no", "NO")
+
+
+class SharedStateCotangents:
+    """Route the Fisher cotangent of cross-layer SHARED forward state back to
+    the layer that PRODUCED it.
+
+    **The measurement gap.** Some architectures share activations across layers
+    within one forward pass: Gemma4's KV-sharing layers reuse the K/V computed
+    by an earlier *storing* layer, threaded through the ``shared_kv_states``
+    dict that ``ModelProfile.new_forward_pass_state`` declares. The Fisher
+    probe's phase-3 forwards each layer in ISOLATION and hands a sharing layer
+    the phase-1 *capture* of that K/V, which is necessarily detached (it is a
+    CPU snapshot taken from a ``torch.no_grad()`` pass). A sharing layer's
+    backward therefore stops dead at the borrowed K/V, and ``h_trace`` for the
+    storing layer's ``k_proj``/``v_proj`` counts only its OWN layer's gradient
+    — it misses the gradient flowing through every layer that consumes its
+    K/V. The under-count lands precisely on the layers that feed other layers,
+    i.e. exactly the ones the allocator should be most careful with. It also
+    truncates the chained ``grad_out`` handed to every layer BELOW the storing
+    layer, since that input gradient is missing the same paths.
+
+    **The fix, in one reverse pass.** ``graft`` replaces each borrowed tensor
+    with a grad-enabled LEAF clone. After that consumer's backward, ``harvest``
+    reads ``leaf.grad`` — exactly the cotangent this consumer contributes to
+    the producer's shared tensor — and sums it per (kwarg, source key,
+    position); gradients from several consumers of one source add, which is
+    what the sum is. When the sweep later reaches the producing layer,
+    ``produced_roots`` returns the tensors that layer wrote into the container
+    paired with those accumulated gradients, so the caller can drive one
+    ``torch.autograd.backward([out, *roots], [grad_out, *grads])``. Autograd
+    accumulates both contributions at the producer's K/V node before its
+    ``grad_fn`` runs, so each Linear's full-backward hook still fires ONCE,
+    with the total — the same gy an end-to-end backward would have delivered.
+
+    **Why one pass suffices.** A consumer always comes AFTER its producer in
+    the forward order (Gemma4 derives ``kv_shared_layer_index`` from the layers
+    strictly BEFORE the sharing point), and phase-3 sweeps in REVERSE, so every
+    consumer has been harvested by the time its producer is forwarded.
+
+    Bookkeeping rules that keep this honest:
+
+    - A borrowed leaf is never seeded as a root. It has no ``grad_fn`` (and its
+      identity is tracked), so a source whose cotangent is still accumulating
+      cannot be fed back into a later consumer and double-counted.
+    - A seeded key is POPPED. Two layers writing one key would otherwise each
+      collect the same consumers' cotangent; the sweep-end ``pending_keys``
+      diagnostic reports anything never consumed.
+    - Accumulation is promoted to at least fp32, so many bf16 consumer
+      cotangents don't lose the small ones; the seed is cast back to the
+      producer tensor's dtype.
+    - ``graft`` of an empty/absent pass state returns the caller's own object
+      and records nothing, so architectures that declare no shared state take
+      byte-for-byte the same path they did before this class existed.
+    """
+
+    def __init__(self, *, enabled: bool = True):
+        self.enabled = bool(enabled)
+        # (kwarg, source key, position) -> summed cotangent (>= fp32).
+        self._acc: dict[tuple, torch.Tensor] = {}
+        # Per-layer: grafted leaves awaiting harvest, and the containers this
+        # layer may have written into.
+        self._live: list[tuple[tuple, torch.Tensor]] = []
+        self._live_ids: set[int] = set()
+        self._containers: list[tuple[str, dict]] = []
+        # Diagnostics (reported at sweep end; never used to make a decision).
+        self.n_grafted = 0
+        self.n_harvested = 0
+        self.n_seeded = 0
+        self.n_no_grad = 0
+        self.nondifferentiable: list[str] = []
+
+    # -- consumer side ----------------------------------------------------
+    def graft(self, pass_state):
+        """Return `pass_state` with every borrowed tensor replaced by a
+        grad-enabled leaf clone, recording the leaves for `harvest` and the
+        containers for `produced_roots`. Hand the RESULT to the layer call."""
+        if not self.enabled or not pass_state:
+            return pass_state
+        grafted: dict = {}
+        tracked = False
+        for kwarg, container in pass_state.items():
+            if not isinstance(container, dict):
+                # Not a keyed shared-state container; pass through untouched
+                # rather than guess at its structure.
+                grafted[kwarg] = container
+                continue
+            fresh = {
+                key: self._graft_value(kwarg, key, value)
+                for key, value in container.items()
+            }
+            grafted[kwarg] = fresh
+            self._containers.append((kwarg, fresh))
+            tracked = True
+        return grafted if tracked else pass_state
+
+    def _graft_value(self, kwarg, key, value):
+        if isinstance(value, torch.Tensor):
+            return self._leaf(kwarg, key, None, value)
+        if isinstance(value, (tuple, list)):
+            out = [
+                self._leaf(kwarg, key, pos, item)
+                if isinstance(item, torch.Tensor) else item
+                for pos, item in enumerate(value)
+            ]
+            return tuple(out) if isinstance(value, tuple) else out
+        return value
+
+    def _leaf(self, kwarg, key, pos, tensor: torch.Tensor) -> torch.Tensor:
+        if not (tensor.is_floating_point() or tensor.is_complex()):
+            # Integer/bool shared state carries no cotangent at all — the
+            # producer's Fisher genuinely cannot be recovered through it.
+            self.nondifferentiable.append(f"{kwarg}[{key!r}][{pos}]:{tensor.dtype}")
+            return tensor
+        try:
+            slot = (kwarg, key, pos)
+            hash(slot)
+        except TypeError:
+            self.nondifferentiable.append(f"{kwarg}[{key!r}]:unhashable-key")
+            return tensor
+        leaf = tensor.detach().clone().requires_grad_(True)
+        self._live.append((slot, leaf))
+        self._live_ids.add(id(leaf))
+        self.n_grafted += 1
+        return leaf
+
+    def harvest(self) -> int:
+        """Fold this layer's leaf gradients into the per-source accumulator and
+        end the layer. Call AFTER the backward; returns the number folded."""
+        folded = 0
+        for slot, leaf in self._live:
+            grad = leaf.grad
+            if grad is None:
+                # The layer never used the borrowed tensor on a path that
+                # reaches its output (or the cotangent was structurally zero).
+                self.n_no_grad += 1
+                continue
+            acc_dtype = torch.promote_types(grad.dtype, torch.float32)
+            contrib = grad.detach().to(acc_dtype)
+            prev = self._acc.get(slot)
+            if prev is None:
+                self._acc[slot] = contrib.clone()
+            else:
+                prev.add_(contrib)
+            leaf.grad = None
+            folded += 1
+        self.n_harvested += folded
+        self._live.clear()
+        self._live_ids.clear()
+        self._containers.clear()
+        return folded
+
+    # -- producer side ----------------------------------------------------
+    def produced_roots(self) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        """`(tensors, grads)` — extra backward roots for the layer just
+        forwarded: the shared tensors IT produced, paired with the cotangent
+        its consumers accumulated. Call after the forward, before the
+        backward. Empty when this layer produced nothing consumers wanted."""
+        if not self.enabled or not self._acc:
+            return [], []
+        order: list[int] = []
+        by_id: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        for kwarg, container in self._containers:
+            for key, value in list(container.items()):
+                for pos, tensor in self._iter_positions(value):
+                    slot = (kwarg, key, pos)
+                    grad = self._acc.get(slot)
+                    if grad is None:
+                        continue
+                    if id(tensor) in self._live_ids or tensor.grad_fn is None:
+                        # A tensor this layer BORROWED, not produced: it is a
+                        # leaf clone with no graph. Seeding it would inject
+                        # other consumers' cotangent into this layer's harvest.
+                        continue
+                    self._acc.pop(slot)
+                    seed = grad.to(device=tensor.device, dtype=tensor.dtype)
+                    if id(tensor) in by_id:
+                        # Same object written at two positions (Gemma4's
+                        # `value_states = key_states` k_eq_v layers): one root,
+                        # summed grad — duplicate roots would be legal but this
+                        # is unambiguous.
+                        prev_t, prev_g = by_id[id(tensor)]
+                        by_id[id(tensor)] = (prev_t, prev_g + seed)
+                    else:
+                        by_id[id(tensor)] = (tensor, seed)
+                        order.append(id(tensor))
+                    self.n_seeded += 1
+        roots = [by_id[i][0] for i in order]
+        grads = [by_id[i][1] for i in order]
+        return roots, grads
+
+    @staticmethod
+    def _iter_positions(value):
+        if isinstance(value, torch.Tensor):
+            yield None, value
+        elif isinstance(value, (tuple, list)):
+            for pos, item in enumerate(value):
+                if isinstance(item, torch.Tensor):
+                    yield pos, item
+
+    # -- diagnostics ------------------------------------------------------
+    def pending_keys(self) -> list[tuple]:
+        """Accumulated cotangents no producer ever claimed. Non-empty means the
+        sweep never forwarded the producing layer (or it stopped writing the
+        key), so that producer's Fisher is still under-counted."""
+        return sorted(self._acc, key=repr)
+
+    def summary(self) -> str:
+        pending = self.pending_keys()
+        parts = [
+            f"enabled={self.enabled}",
+            f"grafted={self.n_grafted}",
+            f"harvested={self.n_harvested}",
+            f"seeded={self.n_seeded}",
+        ]
+        if self.n_no_grad:
+            parts.append(f"no_grad={self.n_no_grad}")
+        if self.nondifferentiable:
+            parts.append(f"nondifferentiable={len(self.nondifferentiable)}")
+        if pending:
+            parts.append(f"UNCLAIMED={[repr(k) for k in pending]}")
+        return "kv_cotangent[" + " ".join(parts) + "]"
+
+
+def _streaming_visual_layer_kwargs(
+    profile,
+    *,
+    input_ids=None,
+    pass_state: dict | None = None,
+    captured_pass_state=None,
+    layer=None,
+    cotangents: "SharedStateCotangents | None" = None,
+) -> dict:
+    """Resolve the profile kwargs for one layer call in the streaming visual
+    probe: per-layer `extra_layer_kwargs` plus the per-pass SHARED state —
+    either the live dict threaded through the forward pass (`pass_state`, one
+    object for the whole pass) or, for the isolated reverse-sweep forwards,
+    the slice rebuilt from what that pass captured (`captured_pass_state`).
+
+    Merging goes through `merge_pass_state_kwargs` so the shallow-merge /
+    no-op-when-empty / raise-on-collision rule has one definition shared with
+    `_call_layer`.
+
+    `cotangents` (reverse sweep only) grafts grad-enabled leaves over the
+    borrowed tensors so the producing layer's Fisher gets its consumers'
+    cotangent — see `SharedStateCotangents`. Grafting happens on the isolated
+    slice, before the merge, so only declared shared containers are touched."""
+    from .layer_streaming import merge_pass_state_kwargs
+
+    ctx = type(layer).__name__ if layer is not None else "streaming layer"
+    kwargs = dict(profile.extra_layer_kwargs(input_ids=input_ids))
+    kwargs = merge_pass_state_kwargs(kwargs, pass_state, context=ctx)
+    if captured_pass_state is not None and layer is not None:
+        isolated = profile.isolated_layer_pass_state(captured_pass_state, layer)
+        if cotangents is not None:
+            isolated = cotangents.graft(isolated)
+        kwargs = merge_pass_state_kwargs(kwargs, isolated, context=ctx)
+    return kwargs
 
 
 # ---------------------------------------------------------------------------
@@ -1083,9 +1804,15 @@ class FisherAccumulator:
         self._input_row_indices: dict[str, list[torch.Tensor]] = defaultdict(list)
         self._input_token_offsets: dict[str, int] = defaultdict(int)
         self._rows_got: dict[str, int] = defaultdict(int)
-        # Packed expert grad-norm accumulator: written by _GradNormCapture
-        # during backward, read in finalize().
-        self._packed_grad_acc: dict[str, float] = {}
+        # Packed expert Fisher-trace accumulator: written by
+        # _PackedLinearPerTokenFisher during backward (per-token-summed;
+        # values may be device-resident 0-dim fp32 tensors), read in
+        # finalize().
+        self._packed_grad_acc: dict[str, float | torch.Tensor] = {}
+        # AQUA per-expert A-side marginals, same estimator and same merge
+        # rules as the incremental backend (the two backends agree on the
+        # packed path or a card built by one mis-prices under the other).
+        self._packed_marginal_acc: dict[str, dict[str, torch.Tensor]] = {}
         # Per-(experts module qname) sample count (one per backward),
         # populated by the experts forward hook below.
         self._packed_sample_count: dict[str, int] = defaultdict(int)
@@ -1165,12 +1892,19 @@ class FisherAccumulator:
         # set of Linear qnames that will be deferred (handled by the block).
         def _scan_moe_blocks() -> set[str]:
             deferred: set[str] = set()
+            # Per-expert module attribute names come from the model profile so
+            # families whose experts expose gate/up/down_proj (e.g. DSv4) are
+            # detected instead of silently no-opping the batched path. The
+            # default ('w1','w2','w3') keeps Qwen3/Qwen3.5 behavior unchanged.
+            _proj = getattr(
+                self.model_profile, "unpacked_expert_projection_names", None)
+            w_attrs = tuple(_proj()) if callable(_proj) else ("w1", "w2", "w3")
             for block_name, block in model.named_modules():
                 children = list(block.named_children())
                 if not children or len(children) < 2:
                     continue
-                # Each child must look like a MoE expert with w1/w2/w3 Linear
-                w_attrs = ("w1", "w2", "w3")
+                # Each child must look like a MoE expert with per-projection
+                # nn.Linear attributes named by w_attrs (above).
                 ok = True
                 for _, child in children:
                     for w in w_attrs:
@@ -1276,6 +2010,7 @@ class FisherAccumulator:
                 model,
                 accumulator=self._packed_grad_acc,
                 channel_accumulator=self._h_packed_channel,
+                marginal_accumulator=self._packed_marginal_acc,
                 profile=self.model_profile,
             )
             for full_name, meta in packed_meta.items():
@@ -1385,9 +2120,11 @@ class FisherAccumulator:
                 max_T = max(it[4] for it in items)
                 n_e = len(items)
                 device = items[0][2].device
-                # Pad-stacked tensors. Float32 because Fisher accumulates
-                # need fp32 precision (bf16 squared would underflow common
-                # gradient magnitudes after the multiply).
+                # Pad-stacked tensors in float32 for accumulation
+                # precision (mantissa) in the bmm reductions below. Note
+                # bf16 squaring itself would NOT underflow — bf16 shares
+                # fp32's exponent range; the incremental path's
+                # bf16-square + fp32-accumulate is equally sound.
                 X_pad = torch.zeros(n_e, max_T, in_dim,
                                     dtype=torch.float32, device=device)
                 gy_pad = torch.zeros(n_e, max_T, out_dim,
@@ -1536,7 +2273,7 @@ class FisherAccumulator:
             self.stats[name]["n_tokens_seen"] += T
         return hook
 
-    def finalize(self, tracker: RouterTracker | None):
+    def finalize(self, tracker: RouterTracker | None, global_tokens: int):
         # Flush GPU-resident scalar accumulators (h_trace, h_w2_sum) into
         # the stats dict. Single sync per Linear here costs one CUDA stall
         # per name, vs. thousands during the backward sweep without it.
@@ -1554,6 +2291,13 @@ class FisherAccumulator:
                 self.stats[full_name]["h_trace_raw"] += float(raw)
                 self.stats[full_name]["n_tokens_seen"] = int(
                     self._packed_sample_count.get(full_name, 0))
+        for full_name, slot in self._packed_marginal_acc.items():
+            entry = self.stats.get(full_name)
+            if entry is None:
+                continue
+            for key, tensor in slot.items():
+                entry[key] = tensor.detach().to("cpu").numpy().astype(
+                    np.float64 if key == "expert_tokens" else np.float32)
 
         if tracker is not None:
             for name, s in self.stats.items():
@@ -1561,14 +2305,23 @@ class FisherAccumulator:
                     s["route_prob"] = tracker.prob(
                         s["router_path"], s["expert_id"])
 
-        for s in self.stats.values():
-            tokens = max(s["n_tokens_seen"], 1)
-            if s["route_prob"] is not None and s["route_prob"] > 0:
-                s["h_trace"] = (s["h_trace_raw"] / tokens) / s["route_prob"]
-                s["h_w2_sum"] = (s["h_w2_sum_raw"] / tokens) / s["route_prob"]
-            else:
-                s["h_trace"] = s["h_trace_raw"] / tokens
-                s["h_w2_sum"] = s["h_w2_sum_raw"] / tokens
+        # Single normalization convention (matches incremental_probe, the
+        # production backend): ONE shared denominator for every row — the
+        # GLOBAL calibration token count.
+        #
+        # HISTORY: this deliberately reverses the per-`n_tokens_seen`
+        # division that audit M4 documented as "the one implicit
+        # ÷token-fraction the MoE convention prescribes" (the explicit
+        # ÷route_prob was removed then precisely because the implicit
+        # per-routed-token division already applied it). That reading was
+        # wrong for the mean-Δloss objective: tokens never routed to an
+        # expert contribute zero gradient, so dividing an unpacked expert
+        # row by its ROUTED count inflates it by (global/routed) — the
+        # very 1/p_e overweighting M4 set out to remove, merely implicit.
+        # See finalize_fisher_stats for the full derivation + history.
+        # `route_prob` stays in the stats as metadata only.
+        global_tokens = max(int(global_tokens), 1)
+        finalize_fisher_stats(self.stats, global_tokens)
 
         if self.cache_dir is not None:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -1609,13 +2362,15 @@ class FisherAccumulator:
             for name, acc in self._h_full.items():
                 if name not in self.stats:
                     continue
-                tokens = max(self.stats[name]["n_tokens_seen"], 1)
-                rp = self.stats[name].get("route_prob")
-                # Apply the same normalization as the scalar trace.
-                if rp is not None and rp > 0:
-                    h = acc.to(torch.float32).cpu() / (tokens * rp)
-                else:
-                    h = acc.to(torch.float32).cpu() / tokens
+                # Same denominator as the scalar trace: the GLOBAL calib
+                # token count (v4). A v3-era revision divided by this
+                # row's own n_tokens_seen — per-ROUTED-token for unpacked
+                # expert Linears, (global/routed)× hotter than the scalar
+                # — and a pre-v3 revision additionally divided expert
+                # entries by route_prob (audit M4). h-detail dirs from
+                # either era are in different units on expert rows and
+                # must be regenerated.
+                #
                 # Per-token gradient² (g²_t) — concatenate the chunk vectors
                 # collected during the hook. This is the per-token Fisher
                 # weight, used by archived/research Fisher-weighted GPTQ
@@ -1623,27 +2378,24 @@ class FisherAccumulator:
                 ptl = self._per_token_grad_norm.get(name, [])
                 g2_per_token = (torch.cat(ptl, dim=0) if ptl
                                 else torch.empty(0, dtype=torch.float32))
-                if rp is not None and rp > 0:
-                    g2_per_token = g2_per_token / rp
                 fname = sub.sub("__", name) + ".pt"
-                torch.save({
-                    "h_diag": h, "name": name, "kind": "linear",
-                    "shape": list(h.shape),
-                    "g2_per_token": g2_per_token,    # (n_tokens,)
-                    "h_detail_version": 2,           # bump → invalidate v1 caches
-                }, self.h_detail_dir / fname)
+                torch.save(
+                    h_detail_blob(acc, global_tokens, name, kind="linear",
+                                  g2_per_token=g2_per_token),
+                    self.h_detail_dir / fname)
                 self.stats[name]["h_detail_path"] = fname
             for full_name, ch in self._h_packed_channel.items():
                 if full_name not in self.stats:
                     continue
-                tokens = max(self.stats[full_name]["n_tokens_seen"], 1)
                 # Packed experts don't carry a router_path — routing is
                 # baked into the Fisher signal via how often each expert
-                # was selected. Normalize by token count only.
-                h = ch.to(torch.float32) / tokens
+                # was selected. Normalize by the global token count, same
+                # as the scalar. (The channel accumulator may be
+                # device-resident; h_detail_blob lands it on CPU for the
+                # saved blob.)
                 fname = sub.sub("__", full_name) + ".pt"
-                torch.save({"h_diag": h, "name": full_name, "kind": "packed",
-                            "shape": list(h.shape)},
+                torch.save(h_detail_blob(ch, global_tokens, full_name,
+                                         kind="packed"),
                            self.h_detail_dir / fname)
                 self.stats[full_name]["h_detail_path"] = fname
 
@@ -1659,12 +2411,33 @@ class FisherAccumulator:
 # Calibration data
 # ---------------------------------------------------------------------------
 def load_calibration(tokenizer, source: str, n_samples: int,
-                     seqlen: int) -> torch.Tensor:
+                     seqlen: int, *, calib_seed: int = 42) -> torch.Tensor:
     """Load calibration from a HuggingFace dataset id, a local .jsonl, or
     a local .txt file. JSONL rows can have either {"text": ...} or
     {"messages": [...]} for chat-style data.
     """
     import os
+
+    # A local-file source that does not exist must NOT fall through to the
+    # HuggingFace loader. It used to: the `.jsonl`/`.txt` branches were guarded
+    # by os.path.exists, so a missing file skipped to the generic `else` and
+    # HF reported `Dataset '/home/.../diverse-v1.jsonl' doesn't exist on the
+    # Hub` -- an error that names a filesystem path as a dataset id and sends
+    # the reader looking for something to download. Nothing is downloadable;
+    # the file is simply absent.
+    if (source.endswith((".jsonl", ".txt")) or os.sep in source) \
+            and not os.path.exists(source):
+        raise FileNotFoundError(
+            f"calibration file not found: {source}\n"
+            "This is a local path, not a HuggingFace dataset id, so there is "
+            "nothing to download. Either:\n"
+            "  * build the default corpus:  python tools/"
+            "build_diverse_calibration.py --output <path> --tokenizer <model>\n"
+            "  * point DATASET at your own .jsonl ({\"text\": ...} or "
+            "{\"messages\": [...]} rows) or .txt (one sample per line)\n"
+            "  * point DATASET at a HuggingFace dataset id "
+            "(e.g. ultrachat_200k)"
+        )
 
     texts: list[str] = []
     if source.endswith(".jsonl") and os.path.exists(source):
@@ -1799,7 +2572,13 @@ def load_calibration(tokenizer, source: str, n_samples: int,
     #   2) fallback packs multiple short samples together (separated by
     #      EOS) to reach seqlen. This makes SFT/chat datasets with short
     #      turns (tulu-3, glaive) usable without lowering seqlen.
-    random.seed(42)
+    # calib_seed controls (a) which subset of dataset texts is tried (shuffle)
+    # and (b) where within each text the seqlen window starts. Default 42 is
+    # the historical value and is byte-stable.
+    if calib_seed != 42:
+        rng_shuffle = random.Random(calib_seed)
+        rng_shuffle.shuffle(texts)
+    random.seed(calib_seed)
     samples = []
     for t in texts:
         ids = tokenizer(t, return_tensors="pt", truncation=False).input_ids
@@ -1965,8 +2744,11 @@ def run_probe_pass(model: nn.Module,
         # of independence across token positions.
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = ids[..., 1:].contiguous()
+        # .float() before log_softmax: matches the sibling Fisher CE
+        # sites (incremental phase-2, per_token_ce) — bf16 log_softmax
+        # loses ~0.4% rel on the CE gradient for no memory win here.
         lp = F.log_softmax(
-            shift_logits.reshape(-1, shift_logits.size(-1)), dim=-1)
+            shift_logits.reshape(-1, shift_logits.size(-1)).float(), dim=-1)
         gather = -lp.gather(1, shift_labels.reshape(-1, 1)).squeeze(1)
         if importance_weighting:
             with torch.no_grad():
@@ -1993,7 +2775,11 @@ def run_probe_pass(model: nn.Module,
         del out, loss, ids, embed, logits
         acc._saved_inputs.clear()
 
-    acc.finalize(tracker)
+    # Global calib token count — must equal the meta nsamples×seqlen
+    # product below so the allocator's load-time renormalization is
+    # idempotent on probes written by this finalize.
+    fisher_norm_tokens = int(calib.size(0)) * int(seqlen)
+    acc.finalize(tracker, fisher_norm_tokens)
     acc.remove_hooks()
     if tracker is not None:
         tracker.remove_hooks()
@@ -2009,10 +2795,12 @@ def run_probe_pass(model: nn.Module,
             "expert_route_stats": dict(tracker.route_stats) if tracker else {},
             "expert_info": expert_info,
             "meta": {
+                "packed_fisher_estimator": "per_token_v2",
                 "model": model_name,
                 "dataset": dataset_name,
                 "nsamples": calib.size(0),
                 "seqlen": seqlen,
+                "fisher_norm_tokens": fisher_norm_tokens,
                 "dtype": dtype_name,
                 "device_map": str(load_device_map),
                 "execution_device": str(exec_device),
@@ -2183,8 +2971,10 @@ def run_multimodal_visual_probe_pass(
         t0 = time.time()
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = labels[..., 1:].contiguous()
+        # .float() before log_softmax: consistent with the sibling
+        # Fisher CE sites (visual phase-2 casts preds to fp32 first).
         lp = F.log_softmax(
-            shift_logits.reshape(-1, shift_logits.size(-1)), dim=-1)
+            shift_logits.reshape(-1, shift_logits.size(-1)).float(), dim=-1)
         valid = shift_labels.reshape(-1)
         mask = (valid >= 0) & (valid < shift_logits.size(-1))
         if not mask.any():
@@ -2204,7 +2994,13 @@ def run_multimodal_visual_probe_pass(
         del out, loss, logits
         acc._saved_inputs.clear()
 
-    acc.finalize(tracker)
+    # Global calib token budget. Multimodal samples vary in real token
+    # count, so nsamples×max_text_len is an upper bound — but it is ONE
+    # shared constant across every row (relative Fisher is what the
+    # knapsack prices) and it matches the meta nsamples×seqlen product
+    # the allocator renormalizes by, keeping that recompute idempotent.
+    fisher_norm_tokens = max(int(len(triples)) * int(max_text_len), 1)
+    acc.finalize(tracker, fisher_norm_tokens)
     acc.remove_hooks()
     if tracker is not None:
         tracker.remove_hooks()
@@ -2220,10 +3016,12 @@ def run_multimodal_visual_probe_pass(
             "expert_route_stats": dict(tracker.route_stats) if tracker else {},
             "expert_info": expert_info,
             "meta": {
+                "packed_fisher_estimator": "per_token_v2",
                 "model": model_path,
                 "dataset": dataset_name,
                 "nsamples": len(triples),
                 "seqlen": max_text_len,
+                "fisher_norm_tokens": fisher_norm_tokens,
                 "dtype": str(dtype),
                 "device_map": requested_device,
                 "execution_device": str(exec_device),
@@ -2296,9 +3094,10 @@ def run_streaming_multimodal_visual_probe_pass(
 
     from .layer_streaming import (
         _call_layer,
+        _compute_attention_mask,
         _compute_position_embeddings,
-        _make_causal_mask,
     )
+    from .model_profiles import DefaultProfile, profile_from_model
     from .streaming_model import _build_streaming_context
 
     try:
@@ -2351,6 +3150,10 @@ def run_streaming_multimodal_visual_probe_pass(
     layers_prefix = ctx.layers_prefix
     visual_module = ctx.visual_module
     visual_prefix = ctx.visual_prefix or ""
+    try:
+        model_profile = profile_from_model(model)
+    except Exception:
+        model_profile = DefaultProfile()
 
     # Enumerate tracked Linears: per-regex visual matches + any resident
     # Linears that the regex would pick up (usually none — visual regex
@@ -2444,6 +3247,11 @@ def run_streaming_multimodal_visual_probe_pass(
     prefetch_depth = 3
     total_fwd = total_bwd = 0.0
     successes = 0
+    # KV-cotangent path (on by default): route the Fisher cotangent of borrowed
+    # cross-layer state back to the layer that produced it. `=0` restores the
+    # severed-cotangent behavior for an A/B, and makes the KV-sharing Fisher
+    # guard fail loud again (`incremental_probe.kv_shared_fisher_block_reason`).
+    kv_cotangent_path = kv_cotangent_path_enabled()
 
     for i, sample in enumerate(triples):
         # Move inputs to device, casting pixel_values to dtype.
@@ -2497,9 +3305,11 @@ def run_streaming_multimodal_visual_probe_pass(
             # Save per-layer CPU activations for the reverse sweep.
             T = inputs_embeds.size(1)
             position_ids = torch.arange(T, device=device).unsqueeze(0)
-            causal_mask = _make_causal_mask(T, device, dtype)
-            position_embeddings = _compute_position_embeddings(
+            causal_mask = _compute_attention_mask(
                 base_model, inputs_embeds, position_ids)
+            position_embeddings = _compute_position_embeddings(
+                base_model, inputs_embeds, position_ids, model_profile)
+            pass_state = model_profile.new_forward_pass_state()
 
             activations_cpu: list[torch.Tensor] = [inputs_embeds.detach().cpu()]
             hidden = inputs_embeds
@@ -2514,10 +3324,17 @@ def run_streaming_multimodal_visual_probe_pass(
                         position_embeddings=position_embeddings,
                         attention_mask=causal_mask,
                         position_ids=position_ids,
+                        **_streaming_visual_layer_kwargs(
+                            model_profile,
+                            input_ids=input_ids,
+                            pass_state=pass_state,
+                        ),
                     )
                 hidden = out
                 activations_cpu.append(hidden.detach().cpu())
                 ctx.unload(L)
+            shared_pass_state = model_profile.capture_forward_pass_state(
+                pass_state)
 
             # ---- Phase 2: final norm + lm_head + CE --------------------
             final_hidden = (activations_cpu[-1].to(device).to(dtype)
@@ -2546,6 +3363,10 @@ def run_streaming_multimodal_visual_probe_pass(
 
             # ---- Phase 3: streaming reverse sweep ----------------------
             grad_out = grad_at_tail
+            # KV-cotangent path, scoped to THIS sample's sweep: a fresh
+            # accumulator per pass, exactly like the shared state it mirrors,
+            # so sample N never seeds sample N-1's cotangent.
+            kv_cotangents = SharedStateCotangents(enabled=kv_cotangent_path)
             for d in range(prefetch_depth):
                 ctx.schedule_prefetch(num_layers - 1 - d)
             for L in reversed(range(num_layers)):
@@ -2558,11 +3379,31 @@ def run_streaming_multimodal_visual_probe_pass(
                     position_embeddings=position_embeddings,
                     attention_mask=causal_mask,
                     position_ids=position_ids,
+                    **_streaming_visual_layer_kwargs(
+                        model_profile,
+                        input_ids=input_ids,
+                        captured_pass_state=shared_pass_state,
+                        layer=layers[L],
+                        cotangents=kv_cotangents,
+                    ),
                 )
-                out.backward(grad_out)
+                # Drive the backward with this layer's output cotangent AND
+                # the cotangent its consumers accumulated on the shared state
+                # it produced. One backward, so each Linear's hook still fires
+                # once with the summed gy.
+                kv_roots, kv_grads = kv_cotangents.produced_roots()
+                if kv_roots:
+                    torch.autograd.backward([out, *kv_roots],
+                                            [grad_out, *kv_grads])
+                else:
+                    out.backward(grad_out)
+                kv_cotangents.harvest()
                 grad_out = x_in.grad.detach().clone()
                 ctx.unload(L)
                 del x_in, out
+            if kv_cotangents.pending_keys():
+                print(f"[probe/mm-stream] sample {i}: "
+                      f"{kv_cotangents.summary()}", flush=True)
 
             total_fwd += (time.time() - t0)
 
@@ -2595,7 +3436,11 @@ def run_streaming_multimodal_visual_probe_pass(
                   f"fwd_avg={total_fwd / max(successes, 1):.2f}s "
                   f"bwd_avg={total_bwd / max(successes, 1):.2f}s", flush=True)
 
-    acc.finalize(tracker)
+    # Same convention as the non-streaming multimodal pass: an upper-bound
+    # but SHARED global token constant, equal to the meta nsamples×seqlen
+    # product so the allocator's renormalization is idempotent.
+    fisher_norm_tokens = max(int(successes) * int(max_text_len), 1)
+    acc.finalize(tracker, fisher_norm_tokens)
     acc.remove_hooks()
     if tracker is not None:
         tracker.remove_hooks()
@@ -2611,10 +3456,12 @@ def run_streaming_multimodal_visual_probe_pass(
             "expert_route_stats": dict(tracker.route_stats) if tracker else {},
             "expert_info": expert_info,
             "meta": {
+                "packed_fisher_estimator": "per_token_v2",
                 "model": model_path,
                 "dataset": dataset_name,
                 "nsamples": successes,
                 "seqlen": max_text_len,
+                "fisher_norm_tokens": fisher_norm_tokens,
                 "dtype": str(dtype),
                 "device_map": requested_device,
                 "execution_device": str(device),

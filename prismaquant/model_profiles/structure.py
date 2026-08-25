@@ -10,14 +10,113 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, field
-from importlib import resources
+from dataclasses import dataclass, field, replace
+from fnmatch import fnmatchcase
+from pathlib import Path
 from typing import Any
 
 import torch.nn as nn
 
 
 SCHEMA = "prismaquant.model_structure.v1"
+
+# ---------------------------------------------------------------------------
+# Detection vocabulary
+# ---------------------------------------------------------------------------
+#
+# `match` is the declarative form of `ModelProfile.matches()`.  It is
+# deliberately tiny: the nine in-tree profiles are predicates over
+# `(model_type in set, architecture glob)`, and the two non-prefix cases
+# (`qwen3.py`'s exact architectures and `qwen3_5_dense.py`'s "not a Moe" veto)
+# need exactly the glob and the negative list below.  Anything richer belongs
+# in Python, not in JSON.
+MATCH_KEYS = frozenset({
+    "model_type",             # exact strings
+    "architectures",          # fnmatch globs (an exact name is a valid glob)
+    "architectures_exclude",  # fnmatch globs; any hit vetoes the whole match
+})
+
+# `priority` orders detection: LOWER is consulted first, like a sort rank.
+# Built-in profiles declare 100..199 in `registry.py`'s historical list order;
+# `ModelProfile.priority` defaults to 0 so a third-party `register_profile()`
+# still wins outright (the documented insert-at-front contract).  A spec that
+# declares no priority resolves after every Python profile.
+SPEC_DEFAULT_PRIORITY = 1000
+
+# ---------------------------------------------------------------------------
+# Export lanes (EXPORT_CONTAINER vocabulary)
+# ---------------------------------------------------------------------------
+EXPORT_LANES = ("compressed-tensors", "nvfp4_cb", "gguf")
+DEFAULT_EXPORT_LANE = "compressed-tensors"
+# The serving-profile side spells the native lane with an underscore
+# (`serving_profile_specs/vllm_packed_moe.json` -> export_lane.id
+# "compressed_tensors"); EXPORT_CONTAINER uses the hyphen. One alias, declared.
+_EXPORT_LANE_ALIASES = {"compressed_tensors": "compressed-tensors"}
+
+
+def canonical_export_lane(name: str) -> str:
+    """Canonical EXPORT_CONTAINER spelling for a lane id.
+
+    Raises on an unknown lane: a typo in a spec must fail at parse time, not
+    silently declare an architecture eligible for a lane that does not exist.
+    """
+    lane = _EXPORT_LANE_ALIASES.get(str(name), str(name))
+    if lane not in EXPORT_LANES:
+        raise ValueError(
+            f"unknown export lane {name!r}; known lanes: {list(EXPORT_LANES)}"
+        )
+    return lane
+
+
+@dataclass(frozen=True)
+class SpecMatch:
+    """Declarative detection predicate — the spec form of ``matches()``.
+
+    Verdict: an ``architectures_exclude`` hit vetoes unconditionally; otherwise
+    the profile claims the config when ``model_type`` matches exactly OR any
+    declared architecture glob matches any declared architecture.
+    """
+
+    model_type: tuple[str, ...] = ()
+    architectures: tuple[str, ...] = ()
+    architectures_exclude: tuple[str, ...] = ()
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any] | None) -> "SpecMatch":
+        payload = payload or {}
+        unknown = sorted(set(payload) - MATCH_KEYS)
+        if unknown:
+            raise ValueError(
+                f"unsupported model-structure match keys: {unknown}; "
+                f"vocabulary is {sorted(MATCH_KEYS)}"
+            )
+        return cls(
+            model_type=tuple(str(v) for v in payload.get("model_type", ())),
+            architectures=tuple(str(v) for v in payload.get("architectures", ())),
+            architectures_exclude=tuple(
+                str(v) for v in payload.get("architectures_exclude", ())
+            ),
+        )
+
+    @property
+    def declared(self) -> bool:
+        return bool(self.model_type or self.architectures)
+
+    def claims(
+        self,
+        model_type: str | None,
+        architectures: Iterable[str] | None,
+    ) -> bool:
+        archs = [str(a) for a in (architectures or ())]
+        for pattern in self.architectures_exclude:
+            if any(fnmatchcase(arch, pattern) for arch in archs):
+                return False
+        if model_type and str(model_type) in self.model_type:
+            return True
+        for pattern in self.architectures:
+            if any(fnmatchcase(arch, pattern) for arch in archs):
+                return True
+        return False
 
 
 @dataclass(frozen=True)
@@ -140,20 +239,90 @@ class PackageRequirement:
 
 
 @dataclass(frozen=True)
+class NamingVariant:
+    """A naming block that applies only to some of a family's architectures.
+
+    Several families ship a multimodal wrapper class and a text-only carve-out
+    that share every structural rule *except* the namespace their serving
+    runtime uses.  Qwen3.5/3.6 is the canonical case: the wrapper builds the
+    body under `language_model.model.` and the head at `language_model.lm_head`,
+    while `Qwen3_5ForCausalLM` builds `model.` and a bare `lm_head` (its
+    `hf_to_vllm_mapper` strips `model.language_model.` instead of adding it).
+    One `naming` block cannot be right for both, and picking the wrong one
+    emits `config_groups` targets that match no module: the unit loads
+    unquantized and its orphaned scale kills the load.
+
+    Only the keys a variant declares are overridden; the rest inherit the base
+    `naming` block, so a variant states the difference and nothing else.
+    """
+
+    when: SpecMatch = field(default_factory=SpecMatch)
+    live_to_recipe: tuple[NameRewriteRule, ...] | None = None
+    recipe_to_source: tuple[NameRewriteRule, ...] | None = None
+    recipe_to_vllm: tuple[NameRewriteRule, ...] | None = None
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "NamingVariant":
+        unknown = sorted(set(payload) - {"when", "naming"})
+        if unknown:
+            raise ValueError(
+                f"unsupported naming_variants keys: {unknown}; "
+                "vocabulary is ['when', 'naming']"
+            )
+        when = SpecMatch.from_dict(payload.get("when"))
+        if not when.declared:
+            raise ValueError(
+                "a naming variant must declare `when.model_type` or "
+                "`when.architectures`; an unconditional variant is just `naming`"
+            )
+        naming = payload.get("naming") or {}
+        unknown_naming = sorted(
+            set(naming) - {"live_to_recipe", "recipe_to_source", "recipe_to_vllm"}
+        )
+        if unknown_naming:
+            raise ValueError(
+                f"unsupported naming keys in a variant: {unknown_naming}"
+            )
+        if not naming:
+            raise ValueError("a naming variant must declare at least one map")
+        return cls(
+            when=when,
+            live_to_recipe=(
+                _rules(naming["live_to_recipe"])
+                if "live_to_recipe" in naming else None
+            ),
+            recipe_to_source=(
+                _rules(naming["recipe_to_source"])
+                if "recipe_to_source" in naming else None
+            ),
+            recipe_to_vllm=(
+                _rules(naming["recipe_to_vllm"])
+                if "recipe_to_vllm" in naming else None
+            ),
+        )
+
+
+@dataclass(frozen=True)
 class ModelStructureSpec:
     """Declarative model decomposition contract for one architecture family."""
 
     id: str
     schema: str = SCHEMA
-    match: dict[str, Any] = field(default_factory=dict)
+    match: SpecMatch = field(default_factory=SpecMatch)
+    priority: int = SPEC_DEFAULT_PRIORITY
+    supported_lanes: tuple[str, ...] = ()
+    preferred_lane: str | None = None
     live_to_recipe: tuple[NameRewriteRule, ...] = ()
     recipe_to_source: tuple[NameRewriteRule, ...] = ()
     recipe_to_vllm: tuple[NameRewriteRule, ...] = ()
+    naming_variants: tuple[NamingVariant, ...] = ()
     fused_groups: tuple[FusedGroupSpec, ...] = ()
     packed_experts: PackedExpertSpec = field(default_factory=PackedExpertSpec)
+    unpacked_expert_projection_names: tuple[str, ...] = ()
     per_expert_moe_regex: str | None = None
     per_expert_mtp_regex: str | None = None
     default_serving_profile: str | None = None
+    bypass_hf_fp8_module_rewrite: bool = False
     fast_kernel_requirements: tuple[PackageRequirement, ...] = ()
     probe_skip_module_class_names: tuple[str, ...] = ()
     passthrough_prefixes: tuple[str, ...] = ()
@@ -162,10 +331,12 @@ class ModelStructureSpec:
     stage_text_only_promote_inner_model_type: bool | None = None
     body_layer_prefix: str | None = None
     mtp_layer_prefix: str | None = None
+    mtp_source_prefix: str | None = None
     mtp_extra_linear_names: tuple[str, ...] = ()
     visual_layer_prefix: str | None = None
     visual_config_key: str | None = None
     lm_head_name: str | None = None
+    embedding_name: str | None = None
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "ModelStructureSpec":
@@ -179,13 +350,31 @@ class ModelStructureSpec:
         probe = payload.get("probe") or {}
         staging = payload.get("staging") or {}
         shard_regexes = payload.get("shard_regexes") or {}
+        supported_lanes = tuple(
+            canonical_export_lane(v) for v in payload.get("supported_lanes", ())
+        )
+        preferred_lane = _optional_str(payload.get("preferred_lane"))
+        if preferred_lane is not None:
+            preferred_lane = canonical_export_lane(preferred_lane)
+            if supported_lanes and preferred_lane not in supported_lanes:
+                raise ValueError(
+                    f"{payload['id']}: preferred_lane {preferred_lane!r} is not "
+                    f"in supported_lanes {list(supported_lanes)}"
+                )
         return cls(
             id=str(payload["id"]),
             schema=schema,
-            match=dict(payload.get("match") or {}),
+            match=SpecMatch.from_dict(payload.get("match")),
+            priority=int(payload.get("priority", SPEC_DEFAULT_PRIORITY)),
+            supported_lanes=supported_lanes,
+            preferred_lane=preferred_lane,
             live_to_recipe=_rules(naming.get("live_to_recipe")),
             recipe_to_source=_rules(naming.get("recipe_to_source")),
             recipe_to_vllm=_rules(naming.get("recipe_to_vllm")),
+            naming_variants=tuple(
+                NamingVariant.from_dict(entry)
+                for entry in payload.get("naming_variants", ())
+            ),
             fused_groups=tuple(
                 FusedGroupSpec.from_dict(entry)
                 for entry in payload.get("fused_groups", ())
@@ -194,9 +383,15 @@ class ModelStructureSpec:
                 packed_payload or {},
                 declared=packed_payload is not None,
             ),
+            unpacked_expert_projection_names=tuple(
+                str(v) for v in moe.get("unpacked_expert_projection_names", ())
+            ),
             per_expert_moe_regex=_optional_str(moe.get("per_expert_regex")),
             per_expert_mtp_regex=_optional_str(moe.get("per_expert_mtp_regex")),
             default_serving_profile=_optional_str(payload.get("default_serving_profile")),
+            bypass_hf_fp8_module_rewrite=bool(
+                staging.get("bypass_hf_fp8_module_rewrite", False)
+            ),
             fast_kernel_requirements=tuple(
                 PackageRequirement.from_dict(entry)
                 for entry in runtime.get("fast_kernel_packages", ())
@@ -218,13 +413,40 @@ class ModelStructureSpec:
             ),
             body_layer_prefix=_optional_str(shard_regexes.get("body_layer_prefix")),
             mtp_layer_prefix=_optional_str(shard_regexes.get("mtp_layer_prefix")),
+            mtp_source_prefix=_optional_str(shard_regexes.get("mtp_source_prefix")),
             mtp_extra_linear_names=tuple(
                 str(v) for v in shard_regexes.get("mtp_extra_linear_names", ())
             ),
             visual_layer_prefix=_optional_str(shard_regexes.get("visual_layer_prefix")),
             visual_config_key=_optional_str(shard_regexes.get("visual_config_key")),
             lm_head_name=_optional_str(shard_regexes.get("lm_head_name")),
+            embedding_name=_optional_str(shard_regexes.get("embedding_name")),
         )
+
+    def for_config(
+        self,
+        model_type: str | None,
+        architectures: Iterable[str] | None,
+    ) -> "ModelStructureSpec":
+        """Return the spec specialized to one checkpoint's declared config.
+
+        Variants are consulted in declaration order; the first whose `when`
+        claims the config wins.  With no variants — every spec but
+        `qwen3_5_dense` today — this is `self`, so the specialization is a
+        no-op everywhere it is not explicitly declared.
+        """
+        if not self.naming_variants:
+            return self
+        for variant in self.naming_variants:
+            if not variant.when.claims(model_type, architectures):
+                continue
+            overrides: dict[str, Any] = {}
+            for attr in ("live_to_recipe", "recipe_to_source", "recipe_to_vllm"):
+                rules = getattr(variant, attr)
+                if rules is not None:
+                    overrides[attr] = rules
+            return replace(self, naming_variants=(), **overrides)
+        return self
 
     def rewrite_live_to_recipe(self, name: str) -> str:
         return apply_name_rewrites(name, self.live_to_recipe)
@@ -292,7 +514,7 @@ class ModelStructureSpec:
             parent = ".".join(parts[:experts_idx + 1])
         elif len(tail) == 2 and tail[0].isdigit():
             leaf = tail[1]
-            parent = ".".join(parts[:experts_idx + 2])
+            parent = ".".join(parts[:experts_idx + 1])
             split_per_expert = True
         else:
             return None
@@ -421,14 +643,39 @@ class ModelGraph:
 def load_structure_spec(profile_name: str) -> ModelStructureSpec | None:
     """Load ``model_profiles/specs/<profile_name>.json`` if it exists."""
 
-    resource = resources.files("prismaquant.model_profiles").joinpath(
-        "specs", f"{profile_name}.json"
+    resource = (
+        Path(__file__).resolve().parent
+        / "specs"
+        / f"{profile_name}.json"
     )
     try:
         text = resource.read_text(encoding="utf-8")
     except FileNotFoundError:
         return None
     return ModelStructureSpec.from_dict(json.loads(text))
+
+
+def structure_spec_ids() -> tuple[str, ...]:
+    """Every ``specs/<id>.json`` shipped with the package, sorted by id."""
+
+    specs_dir = Path(__file__).resolve().parent / "specs"
+    out: list[str] = []
+    for entry in specs_dir.iterdir():
+        name = entry.name
+        if name.endswith(".json") and not name.startswith("_"):
+            out.append(name[: -len(".json")])
+    return tuple(sorted(out))
+
+
+def iter_structure_specs() -> tuple[ModelStructureSpec, ...]:
+    """Load every shipped structure spec, sorted by id."""
+
+    specs = []
+    for spec_id in structure_spec_ids():
+        spec = load_structure_spec(spec_id)
+        if spec is not None:
+            specs.append(spec)
+    return tuple(specs)
 
 
 def apply_name_rewrites(name: str, rules: Iterable[NameRewriteRule]) -> str:

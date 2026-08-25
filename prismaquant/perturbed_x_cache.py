@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import sys
 import tempfile
@@ -92,6 +93,51 @@ def _maybe_clip_activations(
     return x.clamp(-float(max_abs), float(max_abs))
 
 
+
+def _served_nvfp4_act_qdq_enabled() -> bool:
+    """Opt-in serve-faithful NVFP4 activation emulation (default OFF).
+
+    When on, NVFP4 activation quantization in the emulation hooks models
+    the SERVED two-level semantics (static input_global_scale + FP8 snap
+    of the per-16-group block scale, via
+    format_registry.nvfp4_activation_qdq_served) instead of the dynamic
+    exact-fp32-scale RTN. Closes the M18-residual/C1 measurement gap the
+    2026-07-02 audit flagged; default-off pending a served correlation
+    study (the dynamic path is the long-standing screen baseline)."""
+    return os.environ.get(
+        "PRISMAQUANT_NVFP4_ACT_EMULATE_SERVED_SCALES", "0") == "1"
+
+
+def _activation_qdq(
+    x: torch.Tensor,
+    act_spec,
+    activation_max_abs: dict,
+    param_name: str | None,
+) -> torch.Tensor:
+    """Shared activation quantize-dequantize for the emulation hooks.
+
+    Default: act-clip to the calibrated max_abs then dynamic per-group
+    RTN (the historical screen semantics). With
+    PRISMAQUANT_NVFP4_ACT_EMULATE_SERVED_SCALES=1 and an NVFP4 act spec
+    whose calibrated max_abs is known, use the serve-faithful two-level
+    quantizer instead — NO clamp (serving does not clamp; the static
+    scale itself clips blocks above the calibration amax)."""
+    if (
+        _served_nvfp4_act_qdq_enabled()
+        and fr.canonical_format_name(act_spec.name) == "NVFP4"
+        and x.shape[-1] % 16 == 0
+    ):
+        max_abs = _activation_max_abs_lookup(activation_max_abs, param_name)
+        if max_abs is not None and max_abs > 0:
+            from prismaquant.export_native_compressed import (
+                _nvfp4_input_global_scale_from_max_abs,
+            )
+            g = _nvfp4_input_global_scale_from_max_abs(float(max_abs))
+            return fr.nvfp4_activation_qdq_served(x, g)
+    x = _maybe_clip_activations(x, activation_max_abs, param_name)
+    return act_spec.activation_quantize_dequantize(x)
+
+
 def activation_cache_filename(name: str) -> str:
     return _FNAME_SUB.sub("__", name) + ".pt"
 
@@ -165,24 +211,42 @@ def fused_subsample_group(name: str, profile=None) -> str:
 
 
 class SharedRowSubsampler:
+    """Deterministic, sibling-coherent row sampling for activation capture.
+
+    Fused siblings (q/k/v, gate/up) must snapshot the SAME rows so their
+    caches stay row-aligned for joint solvers.  ``batch_priorities``
+    returns the per-row random reservoir priorities for one capture
+    batch, keyed by the fused-sibling *group* and the batch index —
+    every sibling observing the same batch therefore draws identical
+    priorities, and the reservoir's keep/replace decisions match
+    row-for-row across the whole calibration stream (the cross-batch
+    analogue of the historical shared per-call ``randperm``).
+
+    Seeding follows the existing convention: ``_seed_from(cal_hash, key)``
+    so a fixed calibration set reproduces the same sample run-to-run."""
+
     def __init__(self, input_rows: int, cal_hash: str, profile=None):
         self.input_rows = int(input_rows)
         self.cal_hash = cal_hash
         self.profile = profile
-        self._indices: dict[tuple[str, int, int], torch.Tensor] = {}
 
-    def select(self, name: str, flat: torch.Tensor, need: int) -> torch.Tensor:
-        if need <= 0 or flat.size(0) <= need:
-            return flat
+    def batch_priorities(
+        self,
+        name: str,
+        batch_index: int,
+        n_rows: int,
+    ) -> torch.Tensor:
+        """Random priorities for the ``batch_index``-th capture of ``name``.
+
+        Regenerated deterministically per (group, batch) instead of cached:
+        zero retained state, and siblings that consume the same batch at
+        different times still agree exactly."""
         group = fused_subsample_group(name, self.profile)
-        key = (group, int(flat.size(0)), int(need))
-        idx = self._indices.get(key)
-        if idx is None:
-            g = torch.Generator(device="cpu")
-            g.manual_seed(_seed_from(self.cal_hash, group))
-            idx = torch.randperm(flat.size(0), generator=g)[:need]
-            self._indices[key] = idx
-        return flat.index_select(0, idx.to(flat.device))
+        g = torch.Generator(device="cpu")
+        g.manual_seed(
+            _seed_from(self.cal_hash, f"{group}#batch{int(batch_index)}")
+        )
+        return torch.rand(int(n_rows), generator=g, dtype=torch.float32)
 
 
 @dataclass
@@ -205,6 +269,46 @@ class _ModulePlan:
     @property
     def cache_names(self) -> list[str]:
         return [p.name for p in self.params]
+
+
+def _module_input_member_name(plan: _ModulePlan, x: torch.Tensor) -> str | None:
+    """Pick the plan member whose calibrated scale describes ``x``.
+
+    Dense Linears have one ``weight`` param — trivially it. A packed-MoE
+    experts module carries one plan with SEVERAL per-projection params
+    (``gate_up_proj`` + ``down_proj``); their calibrated ``max_abs`` were
+    measured on DIFFERENT tensors (module input vs routed post-SwiGLU
+    intermediates), and this hook only ever sees the module input, so the
+    clip scale must come from the projection that consumes it. Select
+    structurally: the param whose in-dim (last weight axis, [E, out, in])
+    equals ``x``'s feature dim. Falling back to ``params[0]`` (the old
+    behavior) made the clip depend on assignment-dict ordering.
+    """
+    member_name = next(
+        (p.name for p in plan.params if p.attr == "weight"), None)
+    if member_name is not None or not plan.params:
+        return member_name
+    in_dim = int(x.size(-1))
+    matches = []
+    for p in plan.params:
+        tensor = getattr(plan.module, p.attr, None)
+        shape = getattr(tensor, "shape", None)
+        if shape is not None and len(shape) >= 1 and int(shape[-1]) == in_dim:
+            matches.append(p)
+    if not matches:
+        return plan.params[0].name
+    if len(matches) > 1:
+        # Degenerate square case (intermediate == hidden): the shape test
+        # cannot separate the projections, so break the tie by role — the
+        # down projection (down_proj / w2) consumes the internal
+        # intermediate, never the module input.
+        non_down = [
+            p for p in matches
+            if p.attr.rsplit(".", 1)[-1] not in ("down_proj", "w2")
+        ]
+        if non_down:
+            return non_down[0].name
+    return matches[0].name
 
 
 def build_quantizable_map(
@@ -262,7 +366,7 @@ def _build_module_plans(
         low_act = {
             p.spec.name: p.spec
             for p in plan.params
-            if p.spec.act_bits is not None and p.spec.act_bits < 16
+            if p.spec.act_quant_changes_input
         }
         if len(low_act) == 1:
             plan.act_spec = next(iter(low_act.values()))
@@ -335,7 +439,8 @@ class PerturbedActivationCache:
         # clamp activations to ±max_abs before per-group RTN, matching
         # the export's act-clip behavior.  See production_weight_cache.py
         # for the convention note (we store max_abs directly; the export's
-        # vLLM-facing metadata convention is 6.0 / max_abs).
+        # vLLM-facing metadata is derived via
+        # export_native_compressed._nvfp4_input_global_scale_from_max_abs).
         if production_weight_cache is not None and (
             production_weight_cache.activation_max_abs
             or production_weight_cache.activation_scales
@@ -347,8 +452,12 @@ class PerturbedActivationCache:
             self._activation_scales: dict[str, float] = dict(src)
         else:
             self._activation_scales = {}
-        self._snaps: dict[str, list[torch.Tensor]] = defaultdict(list)
-        self._rows_got: dict[str, int] = defaultdict(int)
+        # Bounded uniform row reservoirs (M8): per name, at most
+        # `input_rows` CPU rows + their float32 priorities, plus a batch
+        # counter that keys the shared per-batch priorities.
+        self._snap_rows: dict[str, torch.Tensor] = {}
+        self._snap_priorities: dict[str, torch.Tensor] = {}
+        self._snap_batches: dict[str, int] = defaultdict(int)
         self.max_abs: dict[str, float] = {}
         self._handles = []
         self._frozen_weight_cache: OrderedDict[
@@ -379,6 +488,7 @@ class PerturbedActivationCache:
         for plan in self.plans:
             if self._try_install_nvfp4_fused_forward(plan):
                 continue
+            self._install_packed_expert_activation_quant(plan)
             self._handles.append(
                 plan.module.register_forward_pre_hook(
                     self._make_pre_hook(plan),
@@ -454,10 +564,22 @@ class PerturbedActivationCache:
                     dtype=param.dtype,
                 ).contiguous()
             else:
+                from .nvfp4_cb_footprint import is_cb_format
+
+                if is_cb_format(fmt):
+                    raise RuntimeError(
+                        f"production_weight_cache is required for CB fallback "
+                        f"({param_plan.name!r}, {fmt!r}); the registry path is "
+                        "unweighted legacy rendering and cannot represent the "
+                        "stamped production serialization contract"
+                    )
                 if (
                     self._production_weight_cache is not None
                     and fmt != "BF16"
-                    and _env_truthy("PRISMAQUANT_STRICT_PRODUCTION_CACHE")
+                    and _env_truthy(
+                        "PRISMAQUANT_STRICT_PRODUCTION_CACHE",
+                        default=True,
+                    )
                 ):
                     raise RuntimeError(
                         f"production_weight_cache miss for "
@@ -611,12 +733,74 @@ class PerturbedActivationCache:
             mx = float(flat.abs().max().item())
             if mx > self.max_abs.get(name, 0.0):
                 self.max_abs[name] = mx
-            need = self.input_rows - self._rows_got[name]
-            if need <= 0:
+            if self.input_rows <= 0:
                 continue
-            selected = self.subsampler.select(name, flat, need)
-            self._snaps[name].append(selected.to("cpu"))
-            self._rows_got[name] += int(selected.size(0))
+            self._reservoir_update(name, flat)
+
+    def _reservoir_update(self, name: str, flat: torch.Tensor) -> None:
+        """Fold one capture batch into ``name``'s bounded uniform reservoir.
+
+        M8 fix: the old path kept the FIRST ``input_rows`` rows of the
+        calibration stream (``need = input_rows - rows_got``; all later
+        batches skipped), so with default sizes the entire perturbed-X
+        second moment came from calibration document #1.  This is the
+        same priority-reservoir scheme as
+        ``activation_sampling.update_priority_reservoir`` — uniform
+        without replacement over ALL rows seen, storage bounded at
+        ``input_rows`` — with two deltas that matter here:
+
+          * priorities come from ``SharedRowSubsampler.batch_priorities``
+            (keyed by fused-sibling group + batch index), so gate/up and
+            q/k/v siblings keep IDENTICAL row sets across the whole
+            stream, not just within one call;
+          * only surviving rows are copied device→CPU
+            (``update_priority_reservoir`` concatenates the full incoming
+            batch onto the CPU reservoir first, which would move every
+            calibration activation over the bus per module per batch).
+        """
+        limit = self.input_rows
+        batch_index = self._snap_batches[name]
+        self._snap_batches[name] = batch_index + 1
+        new_pri = self.subsampler.batch_priorities(
+            name, batch_index, int(flat.size(0))
+        )
+        cur_rows = self._snap_rows.get(name)
+        cur_pri = self._snap_priorities.get(name)
+        n_cur = 0 if cur_rows is None else int(cur_rows.size(0))
+        merged_pri = (
+            new_pri if n_cur == 0 else torch.cat([cur_pri, new_pri], dim=0)
+        )
+        if int(merged_pri.numel()) <= limit:
+            incoming = flat.to("cpu")
+            if incoming is flat:
+                # `.to("cpu")` is a no-op for CPU inputs; clone so the
+                # reservoir never aliases live activation storage.
+                incoming = incoming.clone()
+            self._snap_rows[name] = (
+                incoming
+                if cur_rows is None
+                else torch.cat([cur_rows, incoming], dim=0)
+            )
+            self._snap_priorities[name] = merged_pri
+            return
+        keep = torch.topk(merged_pri, k=limit, largest=True, sorted=False).indices
+        # Ascending order keeps retained rows in stream order and makes
+        # the old-rows/new-rows concatenation below line up with the
+        # reordered priorities (old indices < n_cur <= new indices).
+        keep = torch.sort(keep).values
+        keep_old = keep[keep < n_cur]
+        keep_new = keep[keep >= n_cur] - n_cur
+        parts: list[torch.Tensor] = []
+        if keep_old.numel():
+            parts.append(cur_rows.index_select(0, keep_old))
+        if keep_new.numel():
+            parts.append(
+                flat.index_select(0, keep_new.to(flat.device)).to("cpu")
+            )
+        self._snap_rows[name] = (
+            parts[0] if len(parts) == 1 else torch.cat(parts, dim=0)
+        )
+        self._snap_priorities[name] = merged_pri.index_select(0, keep)
 
     def _apply_weight_quant(self, plan: _ModulePlan) -> None:
         plan.active_originals.clear()
@@ -657,7 +841,10 @@ class PerturbedActivationCache:
                     ).contiguous()
                 elif (
                     fmt_canon != "BF16"
-                    and _env_truthy("PRISMAQUANT_STRICT_PRODUCTION_CACHE")
+                    and _env_truthy(
+                        "PRISMAQUANT_STRICT_PRODUCTION_CACHE",
+                        default=True,
+                    )
                 ):
                     raise RuntimeError(
                         f"production_weight_cache miss for "
@@ -666,6 +853,15 @@ class PerturbedActivationCache:
                         f"RTN fallback."
                     )
             if q is None:
+                from .nvfp4_cb_footprint import is_cb_format
+
+                fmt_canon = fr.canonical_format_name(param_plan.spec.name)
+                if is_cb_format(fmt_canon):
+                    raise RuntimeError(
+                        f"production_weight_cache is required for CB fallback "
+                        f"({param_plan.name!r}, {fmt_canon!r}); refusing an "
+                        "unweighted legacy registry render"
+                    )
                 q = param_plan.spec.quantize_dequantize(original)
             if q is None:
                 continue
@@ -678,7 +874,7 @@ class PerturbedActivationCache:
         low_act = {
             p.spec.name: p.spec
             for p in plan.params
-            if p.spec.act_bits is not None and p.spec.act_bits < 16
+            if p.spec.act_quant_changes_input
         }
         if len(low_act) == 1:
             return next(iter(low_act.values()))
@@ -786,10 +982,9 @@ class PerturbedActivationCache:
             # shipped artifact sees at runtime.  `Q(x/s)*s == Q(x)` for
             # purely dynamic Q, so the previous "pre-scale + post-multiply"
             # formulation was a no-op (codex round-3).
-            x = _maybe_clip_activations(
-                x, self._activation_scales, param_plan.name,
+            x = _activation_qdq(
+                x, act_spec, self._activation_scales, param_plan.name,
             )
-            x = act_spec.activation_quantize_dequantize(x)
         weight = self._weight_for_reference_forward(plan, param_plan)
         return F.linear(x, weight, plan.module.bias)
 
@@ -831,7 +1026,10 @@ class PerturbedActivationCache:
                     source = w_dq.to(
                         device=param.device, dtype=param.dtype,
                     ).contiguous()
-                elif _env_truthy("PRISMAQUANT_STRICT_PRODUCTION_CACHE"):
+                elif _env_truthy(
+                    "PRISMAQUANT_STRICT_PRODUCTION_CACHE",
+                    default=True,
+                ):
                     raise RuntimeError(
                         f"production_weight_cache miss for "
                         f"({param_plan.name!r}, 'NVFP4') on the fused "
@@ -1053,27 +1251,113 @@ class PerturbedActivationCache:
             param.data.copy_(original.to(device=param.device, dtype=param.dtype))
         plan.active_originals.clear()
 
+    def _packed_act_plan(self, plan: _ModulePlan) -> list[_ParamPlan] | None:
+        """The per-projection params of a packed-experts plan, or None.
+
+        A packed-experts module owns several 3-D projection parameters and is
+        not an ``nn.Linear``, so the module-level pre-hook can only ever see
+        ONE of their inputs -- the module input, which is gate_up's. down_proj
+        consumes the post-SwiGLU intermediate produced INSIDE the forward, and
+        no hook on the module boundary can reach it.
+
+        That is not a cosmetic gap. vLLM's ``CompressedTensorsW4A4Nvfp4MoEMethod``
+        registers BOTH ``w13_input_global_scale`` and ``w2_input_global_scale``:
+        the served runtime quantizes both activations. A gate that emulates only
+        one of them measures a cheaper model than the one that ships, on the
+        half of the MoE FLOPs it left alone -- and it is the selecting gate, so
+        the error goes straight into which assignment is chosen.
+        """
+        if not self.include_activation_quant or len(plan.params) < 2:
+            return None
+        if isinstance(plan.module, nn.Linear):
+            return None
+        members = [
+            p for p in plan.params
+            if getattr(p.spec, "act_quant_changes_input", False)
+            and getattr(getattr(plan.module, p.attr, None), "ndim", 0) == 3
+        ]
+        return members or None
+
+    def _install_packed_expert_activation_quant(self, plan: _ModulePlan) -> None:
+        """Quantize each expert-slice ``F.linear`` input with ITS OWN spec.
+
+        Same interception the probe uses to capture packed-expert Fisher
+        (``sensitivity_probe.install_packed_expert_hooks``): swap ``F.linear``
+        for the duration of the experts-module forward and dispatch on whether
+        the weight is a dim-0 slice of one of this plan's packed parameters.
+        Eval-time only -- no autograd Function, no gradient path.
+
+        Each projection uses its own calibrated activation scale, keyed by its
+        own param name. The module-level pre-hook's act-qdq is suppressed for
+        these plans (see ``_make_pre_hook``) so gate_up's input is quantized
+        exactly once, here, rather than once there and once again inside.
+        """
+        members = self._packed_act_plan(plan)
+        if members is None:
+            return
+        from prismaquant.sensitivity_probe import _packed_expert_slice_index
+
+        module = plan.module
+        original_forward = module.forward
+        owner = self
+
+        def _forward(*args, **kwargs):
+            targets: dict[int, _ParamPlan] = {}
+            params: dict[int, torch.Tensor] = {}
+            for member in members:
+                param = getattr(module, member.attr, None)
+                if not isinstance(param, torch.Tensor) or param.ndim != 3:
+                    continue
+                targets[id(param)] = member
+                params[id(param)] = param
+            if not targets:
+                return original_forward(*args, **kwargs)
+            orig_linear = F.linear
+
+            def _intercepting_linear(input, weight, bias=None):
+                base = weight._base if weight._is_view() else weight
+                member = targets.get(id(base))
+                if member is not None and isinstance(input, torch.Tensor):
+                    if _packed_expert_slice_index(
+                            weight, params[id(base)]) is not None:
+                        input = _activation_qdq(
+                            input, member.spec, owner._activation_scales,
+                            member.name)
+                return orig_linear(input, weight, bias)
+
+            F.linear = _intercepting_linear
+            try:
+                return original_forward(*args, **kwargs)
+            finally:
+                F.linear = orig_linear
+
+        module.forward = _forward
+        self._fused_forward_originals.append((module, original_forward))
+
     def _make_pre_hook(self, plan: _ModulePlan):
         def _pre_hook(_module, args, kwargs):
             where, key, x = _first_tensor_location(args, kwargs)
             if isinstance(x, torch.Tensor):
                 self._capture(plan, x)
-                member_name = next(
-                    (p.name for p in plan.params if p.attr == "weight"),
-                    plan.params[0].name if plan.params else None,
-                )
+                member_name = _module_input_member_name(plan, x)
                 x_runtime = x
                 act_spec = self._active_activation_spec(plan)
+                if self._packed_act_plan(plan) is not None:
+                    # Handled per projection inside the forward, where
+                    # down_proj's input is reachable and each projection gets
+                    # its own calibrated scale. Quantizing here too would put
+                    # gate_up's input through the quantizer twice.
+                    act_spec = None
                 if act_spec is not None:
                     # MED-3: act-clip to the calibrated max_abs before the
                     # quantizer, so outliers don't dominate per-group
                     # scales.  See ``_maybe_clip_activations`` for the
                     # math; pre-scale + post-multiply was a no-op (codex
                     # round-3 caught Q(x/s)*s == Q(x)).
-                    x_in = _maybe_clip_activations(
-                        x_runtime, self._activation_scales, member_name,
+                    x_runtime = _activation_qdq(
+                        x_runtime, act_spec, self._activation_scales,
+                        member_name,
                     )
-                    x_runtime = act_spec.activation_quantize_dequantize(x_in)
                 if x_runtime is not x:
                     args, kwargs = _replace_tensor_input(
                         args, kwargs, where, key, x_runtime,
@@ -1093,11 +1377,10 @@ class PerturbedActivationCache:
     def finalize(self) -> dict:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         written: list[str] = []
-        for name, snaps in self._snaps.items():
-            if not snaps:
+        for name, rows in self._snap_rows.items():
+            if rows is None or rows.size(0) == 0:
                 continue
-            x = torch.cat(snaps, dim=0)[:self.input_rows]
-            x = x.to(torch.bfloat16).contiguous()
+            x = rows[:self.input_rows].to(torch.bfloat16).contiguous()
             torch.save(
                 {"inputs": x, "name": name, "source": "perturbed_x"},
                 self.cache_dir / activation_cache_filename(name),

@@ -1,0 +1,60 @@
+{
+  "schema": "prismaquant.model_structure.v1",
+  "id": "minimax_m2",
+  "priority": 160,
+  "default_serving_profile": "vllm_packed_moe",
+  "match": {
+    "model_type": ["minimax_m2", "minimax-m2", "minimax_m2.7"],
+    "architectures": ["MiniMaxM2*", "MiniMax-M2*"]
+  },
+  "staging": {
+    "bypass_hf_fp8_module_rewrite": true
+  },
+  "naming": {
+    "live_to_recipe": [],
+    "recipe_to_source": [],
+    "recipe_to_vllm": [
+      {
+        "regex": "\\.block_sparse_moe\\.experts\\.([0-9]+)\\.w1(?=$|[.])",
+        "replace": ".mlp.experts.\\1.gate_proj"
+      },
+      {
+        "regex": "\\.block_sparse_moe\\.experts\\.([0-9]+)\\.w2(?=$|[.])",
+        "replace": ".mlp.experts.\\1.down_proj"
+      },
+      {
+        "regex": "\\.block_sparse_moe\\.experts\\.([0-9]+)\\.w3(?=$|[.])",
+        "replace": ".mlp.experts.\\1.up_proj"
+      },
+      {
+        "regex": "block_sparse_moe",
+        "replace": "mlp"
+      }
+    ]
+  },
+  "fused_groups": [
+    {
+      "target": "self_attn.qkv_proj",
+      "members": ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"]
+    }
+  ],
+  "packed_experts": {
+    "param_names": ["gate_proj", "up_proj", "down_proj"],
+    "module_class_names": ["MiniMaxM2Experts"],
+    "projection_splits": {
+      "gate_up_proj": ["gate_proj", "up_proj"],
+      "down_proj": ["down_proj"]
+    },
+    "format_groups": [
+      ["gate_proj", "up_proj", "down_proj"]
+    ]
+  },
+  "moe": {
+    "per_expert_regex": "re:^model[.]layers[.][0-9]+[.]mlp[.]experts[.][0-9]+[.](gate|up|down)_proj$",
+    "unpacked_expert_projection_names": ["w1", "w2", "w3"]
+  },
+  "pinned_names": ["lm_head"],
+  "_naming_rationale": "The scheme-dispatch rename is not cosmetic. MiniMaxM2DecoderLayer.__init__ hard-codes prefix=f'{prefix}.mlp' when constructing the MoE submodule even though the HF attribute is `block_sparse_moe`, and vLLM's MoE weight loader translates w1/w2/w3 -> gate_proj/down_proj/up_proj via ckpt_*_proj_name kwargs at load time -- but scheme lookup runs FIRST and never sees those kwargs, so config_groups must already be in the mlp.*_proj form. The trailing bare `block_sparse_moe` -> `mlp` rule is the defensive tail for non-expert submodules (routing gates) that vLLM also places under mlp.*.",
+  "_packed_experts_rationale": "MiniMax's expert weights are per-expert 2D w1/w2/w3 on disk; the packed param names here are the UNFUSED vLLM leafs the exporter emits, which is why gate_proj/up_proj/down_proj appear as `param_names` rather than the usual gate_up_proj/down_proj pair. The single format_group is the vLLM FusedMoE coupling constraint: all three projections of one expert bank must carry one scheme. `projection_splits` declares the gate_up/down ROLE buckets (which projections would share a stacked tensor on a lane that keys expert schemes per projection) -- the same declaration lfm2_moe makes for w1/w3/w2; it is what `packed_expert_role_group` reads and it reproduces the legacy fallback answer exactly.",
+  "_staging_rationale": "transformers 5.x rewrites native-FP8 modules before load; for MiniMax's ModuleList-of-256-experts it swaps in FP8Experts and then tries to set experts.0.w1, which that container does not support. PrismaQuant's streaming loader reads the source FP8 bytes and applies each 128x128 weight_scale_inv block itself in _read_layer_to_device, so it never needs the rewrite."
+}

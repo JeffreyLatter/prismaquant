@@ -75,6 +75,10 @@ _QWEN3_NEXT_FALLBACK_PACKED_MODULES = {
 
 class Qwen3NextProfile(ModelProfile):
 
+    # Detection priority (lower = consulted first): distinct model_type
+    # "qwen3_next", must precede the Qwen3/Qwen3.5 siblings (100/110/120).
+    priority = 90
+
     @classmethod
     def matches(cls, model_type: str, architectures: list[str]) -> bool:
         if model_type == "qwen3_next":

@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 
 from prismaquant.layer_state_cache import LayerHiddenStateCache
+from prismaquant.production_weight_cache import ProductionWeightCache
 
 
 class _LinearBlock(nn.Module):
@@ -122,7 +123,14 @@ def test_layer_state_cache_last_token_logits_skips_full_sequence_lm_head():
     full_logits = model(calib_ids).logits
     last_logits = cache.replay_from(2, last_token_only=True)
 
-    torch.testing.assert_close(last_logits, full_logits[:, -1:, :], rtol=0, atol=0)
+    # Bit-identical on the reference box, where both calls hit the same kernel.
+    # On CPU the BLAS dispatches a different matmul for (B,1,H)@(H,V) than for
+    # (B,S,H)@(H,V), so fp32 accumulation order differs by ~4e-09. The claim
+    # under test is that the shortcut returns the SAME logits while skipping
+    # the full-sequence lm_head -- the shape assertion below is the load-bearing
+    # half; exact bit equality is a property of the BLAS, not of this code.
+    torch.testing.assert_close(last_logits, full_logits[:, -1:, :],
+                               rtol=1e-6, atol=1e-6)
     assert model.lm_head.last_input_shape == (2, 1, hidden)
 
 
@@ -164,6 +172,54 @@ def test_layer_state_cache_external_weight_management_skips_baseline_weight_clon
     assert cache._baseline_weight_values == {}
     replay_logits = cache.replay_from(0)
     torch.testing.assert_close(replay_logits, model(calib_ids).logits, rtol=0, atol=0)
+
+
+def test_layer_state_cache_production_cache_miss_is_strict_by_default(monkeypatch):
+    monkeypatch.delenv("PRISMAQUANT_STRICT_PRODUCTION_CACHE", raising=False)
+    model = _TinyCausalLM(layers=2, use_lm_head=False).eval()
+    calib_ids = _calib_ids(batch=1, seq=3)
+    cache = LayerHiddenStateCache(model)
+
+    with pytest.raises(RuntimeError, match="production_weight_cache miss"):
+        cache.populate(
+            {"model.layers.0.proj": "NVFP4"},
+            calib_ids,
+            device="cpu",
+            dtype=torch.float32,
+            production_weight_cache=ProductionWeightCache({}, levers={}),
+        )
+
+
+def test_layer_state_cache_strict_miss_escape_allows_rtn(monkeypatch):
+    monkeypatch.setenv("PRISMAQUANT_STRICT_PRODUCTION_CACHE", "0")
+    model = _TinyCausalLM(layers=2, use_lm_head=False).eval()
+    calib_ids = _calib_ids(batch=1, seq=3)
+    cache = LayerHiddenStateCache(model)
+
+    cache.populate(
+        {"model.layers.0.proj": "NVFP4"},
+        calib_ids,
+        device="cpu",
+        dtype=torch.float32,
+        production_weight_cache=ProductionWeightCache({}, levers={}),
+    )
+
+    assert len(cache.layer_inputs) == 2
+
+
+def test_layer_state_cache_never_uses_unweighted_cb_rtn_fallback(monkeypatch):
+    monkeypatch.setenv("PRISMAQUANT_STRICT_PRODUCTION_CACHE", "0")
+    model = _TinyCausalLM(layers=2, use_lm_head=False).eval()
+    cache = LayerHiddenStateCache(model)
+
+    with pytest.raises(RuntimeError, match="required for CB fallback"):
+        cache.populate(
+            {"model.layers.0.proj": "NVFP4_CB_K16"},
+            _calib_ids(batch=1, seq=3),
+            device="cpu",
+            dtype=torch.float32,
+            production_weight_cache=ProductionWeightCache({}, levers={}),
+        )
 
 
 def test_layer_state_cache_invalidate_clears_state():

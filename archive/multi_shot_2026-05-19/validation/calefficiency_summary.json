@@ -1,0 +1,41 @@
+{
+  "eval_calibration": "N=32 T=1024 \u00d7 4 reps",
+  "mean_gap_closed_pct": -42.52573127162846,
+  "rows": [
+    {
+      "budget": 5.0,
+      "delta_2shot_pct": -7.632492745829083,
+      "delta_2shot_vs_smallcal_base": -0.010861045028824012,
+      "gap_closed_by_2shot": 0.010861045028824012,
+      "gap_closed_pct": 24.322032639169837,
+      "gap_to_prod": 0.04465517002609665,
+      "prod_baseline_kl": 0.0976449328434309,
+      "smallcal_baseline_kl": 0.14230010286952754,
+      "smallcal_multishot_kl": 0.13143905784070353
+    },
+    {
+      "budget": 5.5,
+      "delta_2shot_pct": 23.80521539400169,
+      "delta_2shot_vs_smallcal_base": 0.028343984199580313,
+      "gap_closed_by_2shot": -0.028343984199580313,
+      "gap_closed_pct": -153.69235341600339,
+      "gap_to_prod": 0.01844202627495778,
+      "prod_baseline_kl": 0.10062425281748966,
+      "smallcal_baseline_kl": 0.11906627909244744,
+      "smallcal_multishot_kl": 0.14741026329202775
+    },
+    {
+      "budget": 6.0,
+      "delta_2shot_pct": -0.3725309358156084,
+      "delta_2shot_vs_smallcal_base": -0.0004617141887603704,
+      "gap_closed_by_2shot": 0.0004617141887603704,
+      "gap_closed_pct": 1.793126961948171,
+      "gap_to_prod": 0.02574910748420925,
+      "prod_baseline_kl": 0.09819071720431138,
+      "smallcal_baseline_kl": 0.12393982468852063,
+      "smallcal_multishot_kl": 0.12347811049976026
+    }
+  ],
+  "schema": "prismaquant.multi_shot.calibration_efficiency.v1",
+  "smallcal_pipeline_calibration": "N=8 T=512"
+}

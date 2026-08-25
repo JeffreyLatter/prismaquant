@@ -56,9 +56,15 @@ except ModuleNotFoundError:
         del recurse
         return module
 
+from .autoscale import (
+    _PACKED_BYTE_DTYPES,
+    declared_expert_dtype_covers,
+    declared_fp4_expert_dtype,
+)
 from .layer_streaming import (
     _build_fp8_scale_inv_map,
     LayerCache,
+    _build_expert_packer,
     _build_install_resolver,
     _build_weight_map,
     _fast_install,
@@ -71,30 +77,40 @@ from .layer_streaming import (
     _unload,
     set_module_tensor_to_device,
 )
+from .tied_embeddings import resolve_tied_output_embedding
 
 
-def _minimax_native_fp8_checkpoint(model_path: str) -> bool:
-    """True for MiniMax native-FP8 checkpoints with block scales.
+def _bypass_hf_fp8_module_rewrite(model_path: str) -> bool:
+    """True when HF's FP8 pre-load module rewrite must be skipped here.
 
-    MiniMax-M2/M2.7 exposes 256 experts as a ModuleList. Transformers
-    5.x's FP8 pre-load rewrite currently replaces that ModuleList with
-    FP8Experts, then tries to set `experts.0.w1`, which fails because
-    FP8Experts is not integer-indexable. The streaming path does not
-    need HF's module rewrite: `_read_layer_to_device` reads the source
-    fp8 bytes and applies `.weight_scale_inv` inline.
+    Two independent conditions, and they belong in different places:
+
+      - the **checkpoint** is native FP8 with block scales — a per-checkpoint
+        fact, read from `quantization_config` right here;
+      - the **architecture**'s expert container breaks under that rewrite — a
+        static architecture property, so it is declared in the model profile
+        (`staging.bypass_hf_fp8_module_rewrite`) rather than pattern-matched
+        on the model name. MiniMax-M2/M2.7 exposes 256 experts as a
+        `ModuleList`; transformers 5.x replaces it with `FP8Experts` and then
+        tries to set `experts.0.w1`, which that container does not support.
+
+    The streaming path never needs the rewrite anyway: `_read_layer_to_device`
+    reads the source fp8 bytes and applies `.weight_scale_inv` inline.
     """
     try:
         with open(os.path.join(model_path, "config.json")) as f:
             cfg = json.load(f)
     except Exception:
         return False
-    model_type = str(cfg.get("model_type", "")).replace("-", "_").lower()
-    archs = [str(a) for a in cfg.get("architectures", [])]
     qc = cfg.get("quantization_config") or {}
-    return (
-        model_type.startswith("minimax_m2")
-        or any(a.startswith("MiniMaxM2") for a in archs)
-    ) and qc.get("quant_method") == "fp8" and "weight_block_size" in qc
+    if qc.get("quant_method") != "fp8" or "weight_block_size" not in qc:
+        return False
+    try:
+        from .model_profiles import profile_from_config
+
+        return bool(profile_from_config(cfg).bypass_hf_fp8_module_rewrite())
+    except Exception:
+        return False
 
 
 @contextmanager
@@ -115,6 +131,47 @@ def _mask_cuda_queries_during_meta_init(log_prefix: str):
     if not enabled or torch.cuda.is_initialized():
         yield
         return
+
+    # Prime transformers' lru_cached fla / causal-conv1d availability checks
+    # with CUDA visible BEFORE masking it. Several modeling files
+    # (Qwen3.5/3.6 MoE, Qwen3-Next, OLMo-hybrid) bind their gated-delta-rule
+    # FAST PATH at *module import time* behind
+    # `if is_flash_linear_attention_available():`. That check is
+    # `@lru_cache`d and CUDA-gated, so if the module is first imported inside
+    # this mask it caches `False`, the fla ops are never imported, and the
+    # fast path is silently lost for the whole process — falling back to the
+    # slow torch gated-delta-rule path (issue #4). Re-priming the caches here
+    # pins them to the real CUDA state so the subsequent masked import still
+    # binds the fast path. No-op when the packages aren't installed; the
+    # availability call is a lightweight `torch.cuda.is_available()` (set
+    # PRISMAQUANT_MASK_CUDA_DURING_META_INIT=0 to skip the mask entirely on a
+    # pathologically-wedged UVM where even that probe is slow).
+    try:
+        from transformers.utils import import_utils as _tiu
+        for _avail in ("is_flash_linear_attention_available",
+                       "is_causal_conv1d_available"):
+            _f = getattr(_tiu, _avail, None)
+            if _f is None:
+                continue
+            if hasattr(_f, "cache_clear"):
+                _f.cache_clear()
+            _f()  # prime with CUDA visible (result cached for the process)
+    except Exception:
+        pass
+
+    # Pin fla's OWN module-level device detection too. fla.utils computes
+    # `device`/`device_platform`/`device_torch_lib` from triton's driver target
+    # at import; if that first import lands inside this mask it caches CPU and
+    # the gated-delta-rule autocast wrapper later crashes on `torch.cpu.device`
+    # (the linear-attn fast path on Qwen3.5/3.6). Import it here, CUDA visible,
+    # so the detection caches the real device for the process. Needs a writable
+    # TRITON_CACHE_DIR — /home/rob/.triton/cache can be root-owned from docker
+    # runs, which makes triton's compile cache unwritable and silently rolls fla
+    # back to CPU; point TRITON_CACHE_DIR at a user-owned dir if so.
+    try:
+        import fla.utils  # noqa: F401  (device detection cached at import)
+    except Exception:
+        pass
 
     old_is_available = torch.cuda.is_available
     old_device_count = torch.cuda.device_count
@@ -157,7 +214,8 @@ def _init_rotary_inplace(base_model: nn.Module, device: torch.device,
     # init (DSv4 multi-layer-type pattern), exit. Otherwise fall through.
     try:
         from .model_profiles import profile_from_model
-        if profile_from_model(base_model).init_rotaries(rotary, cfg, device, dtype):
+        if profile_from_model(base_model).init_rotaries(
+                rotary, cfg, device, dtype, base_model=base_model):
             return
     except Exception:
         # Defensive: fall through to default if profile dispatch breaks.
@@ -181,25 +239,31 @@ def _init_rotary_inplace(base_model: nn.Module, device: torch.device,
 
 
 def _safetensors_cache_dtype_bytes(dtype_name: str,
-                                   target_dtype: torch.dtype) -> int:
-    """Bytes a safetensors tensor will occupy in the layer cache.
+                                   target_dtype: torch.dtype,
+                                   *, fp4_packed: bool = False) -> int:
+    """Bytes a safetensors tensor will occupy in the layer cache,
+    per *on-disk* element (safetensors counts packed bytes as elements).
 
     Floating checkpoint tensors are cast to the requested execution dtype
     by `_read_layer_to_device` before caching. Native FP8 source weights
     therefore cache as bf16/fp16/fp32 after block dequant.
 
-    DSv4-Flash stores NVFP4 (E2M1) routed-expert weights as packed I8 with
-    two fp4 codes per byte — so each I8 byte expands to *two* target-dtype
-    elements after the FP4 dequant in `_apply_fp8_dequant_inplace`. The I8
-    branch therefore returns ``2 * target_dtype.element_size()``. Plain
-    int8 weights (no paired `.scale` sibling) would over-estimate by 4×,
-    but no current architecture ships those, and erring high keeps the
-    prefetch lookahead conservative — the wrong direction would OOM.
+    Declared MXFP4/NVFP4 nibble-packs (`fp4_packed=True`, checkpoint-declared
+    membership — `declared_fp4_expert_dtype` / `declared_expert_dtype_covers`
+    — never a dtype/shape heuristic) price at double: one packed I8/U8 byte
+    dequants to TWO logical elements of the execution dtype, and sizing it
+    as the verbatim 1 byte undercounts the resident tensor 4x, so
+    `prepare_for_load()` under-evicts and prefetch refuses layers that would
+    actually fit. An undeclared I8/U8 tensor is priced verbatim — the
+    declaration is the only trigger (never dtype alone): a plain int8
+    tensor with no FP4 declaration is not silently assumed to be a packed
+    nibble-pair just because DSv4-Flash's routed experts happen to also be
+    I8-stored when they are declared.
     """
     dtype_name = str(dtype_name).upper()
     if dtype_name.startswith("F") or dtype_name == "BF16":
         return torch.empty((), dtype=target_dtype).element_size()
-    if dtype_name == "I8":
+    if fp4_packed and dtype_name in _PACKED_BYTE_DTYPES:
         return 2 * torch.empty((), dtype=target_dtype).element_size()
     return {
         "BOOL": 1,
@@ -217,10 +281,17 @@ def _estimate_layer_cache_bytes(
     layers_prefix: str,
     num_layers: int,
     target_dtype: torch.dtype,
+    fp4_experts: bool = False,
 ) -> tuple[int, list[int]]:
-    """Estimate dequanted cache bytes per decoder layer without loading data."""
+    """Estimate dequanted cache bytes per decoder layer without loading data.
+
+    `fp4_experts` is the checkpoint's explicit packed-FP4 expert
+    declaration (`declared_fp4_expert_dtype`): expert I8/U8 tensors —
+    routed and shared alike, see `declared_expert_dtype_covers` — then
+    price as MXFP4 nibble-packs (2 logical elements/byte at the execution
+    dtype) instead of verbatim int8."""
     pat = re.compile(rf"^{re.escape(layers_prefix)}(?P<idx>\d+)\.")
-    by_shard: dict[str, list[tuple[int, str]]] = {}
+    by_shard: dict[str, list[tuple[int, str, bool]]] = {}
     for model_name, shard in weight_shard.items():
         m = pat.match(model_name)
         if m is None:
@@ -228,19 +299,23 @@ def _estimate_layer_cache_bytes(
         idx = int(m.group("idx"))
         if idx < 0 or idx >= num_layers:
             continue
-        by_shard.setdefault(shard, []).append((idx, weight_ckpt[model_name]))
+        by_shard.setdefault(shard, []).append((
+            idx, weight_ckpt[model_name],
+            bool(fp4_experts and declared_expert_dtype_covers(model_name)),
+        ))
 
     sizes = [0 for _ in range(num_layers)]
     try:
         for shard, pairs in by_shard.items():
             with safe_open(shard, framework="pt") as f:
-                for idx, ckpt_name in pairs:
+                for idx, ckpt_name, fp4_packed in pairs:
                     sl = f.get_slice(ckpt_name)
                     n = 1
                     for dim in sl.get_shape():
                         n *= int(dim)
                     sizes[idx] += n * _safetensors_cache_dtype_bytes(
-                        sl.get_dtype(), target_dtype)
+                        sl.get_dtype(), target_dtype,
+                        fp4_packed=fp4_packed)
     except Exception:
         return 0, sizes
     nonzero = [s for s in sizes if s > 0]
@@ -332,7 +407,8 @@ class StreamingContext:
                  estimated_layer_bytes: int = 0,
                  prefetch_workers: int = 3,
                  prefetch_min_available_bytes: int = 0,
-                 profile: Any | None = None):
+                 profile: Any | None = None,
+                 expert_packer=None):
         self.model = model
         self.base_model = base_model
         self.layers = layers
@@ -356,6 +432,7 @@ class StreamingContext:
         self.visual_prefix = visual_prefix
         self.multimodal = multimodal
         self.estimated_layer_bytes = int(estimated_layer_bytes or 0)
+        self.max_cache_slots = layer_cache.max_entries
         self.prefetch_workers = int(prefetch_workers)
         self.prefetch_min_available_bytes = int(prefetch_min_available_bytes or 0)
         self.prefetch_memory_skips = 0
@@ -370,6 +447,22 @@ class StreamingContext:
         # (e.g. Qwen3Next) before _fast_install. None for profiles with no
         # checkpoint-to-model tensor layout mismatch.
         self.profile = profile
+        # Optional per-expert -> packed-3D bridge for checkpoints that ship
+        # MoE experts unfused while the live module is packed. None for
+        # every other checkpoint/model (zero behavior change). Built once
+        # in `_build_streaming_context` from the model profile's spec.
+        #
+        # A profile that overrides `pack_checkpoint_expert_tensors` (e.g.
+        # Qwen3Next's gate+up concat-then-stack fusion) takes precedence
+        # over the generic packer, which does not know about that fusion —
+        # suppress it here so the two can never both fire on the same
+        # layer and double-pack.
+        if profile is not None:
+            from .model_profiles import ModelProfile
+            if (type(profile).pack_checkpoint_expert_tensors
+                    is not ModelProfile.pack_checkpoint_expert_tensors):
+                expert_packer = None
+        self.expert_packer = expert_packer
         self._inflight: dict[int, Any] = {}
         self._inflight_lock = threading.Lock()
         self.configure_runtime_pressure_floor()
@@ -423,19 +516,26 @@ class StreamingContext:
         prefix = f"{self.layers_prefix}{L}."
         tensors = _read_layer_to_device(
             prefix, self.weight_shard, self.weight_ckpt, self.dtype,
-            self.device, fp8_scale_inv_map=self.fp8_scale_inv_map)
+            self.device, fp8_scale_inv_map=self.fp8_scale_inv_map,
+            pack_experts=self.expert_packer)
         if self.profile is not None:
             tensors = self.profile.pack_checkpoint_expert_tensors(prefix, tensors)
         # v20 fix #5: prefetch path doesn't force-insert. If the layer
         # exceeds effective budget, the put returns False and the
         # tensors fall out of scope here — ensure_loaded will re-load
         # synchronously when actually needed.
-        self.layer_cache.put(L, tensors, force=False)
+        self.layer_cache.put(L, tensors, force=False, pinned_until_read=True)
         with self._inflight_lock:
             self._inflight.pop(L, None)
         return tensors
 
     def schedule_prefetch(self, L: int):
+        # A one-slot policy is used by the DSv4 anchored-AURA campaign on a
+        # unified-memory Spark.  Speculative loading while the current layer
+        # is installed would create a second live source-weight plane even if
+        # the eventual cache insertion evicted back to one entry.
+        if self.max_cache_slots == 1:
+            return None
         if L < 0 or L >= self.num_layers:
             return None
         if self.layer_cache.peek(L):
@@ -475,7 +575,8 @@ class StreamingContext:
         prefix = f"{self.layers_prefix}{L}."
         tensors = _read_layer_to_device(
             prefix, self.weight_shard, self.weight_ckpt, self.dtype,
-            self.device, fp8_scale_inv_map=self.fp8_scale_inv_map)
+            self.device, fp8_scale_inv_map=self.fp8_scale_inv_map,
+            pack_experts=self.expert_packer)
         if self.profile is not None:
             tensors = self.profile.pack_checkpoint_expert_tensors(prefix, tensors)
         self.layer_cache.put(L, tensors)
@@ -588,17 +689,25 @@ class StreamingContext:
         }
 
     def suggest_prefetch_lookahead(self) -> int:
+        if self.max_cache_slots == 1:
+            return 0
         if self.estimated_layer_bytes <= 0:
-            return 3
+            if self.max_cache_slots is None:
+                return 3
+            return min(3, max(0, self.max_cache_slots - 1))
         cache_slots = max(
             1, int(self.layer_cache.max_bytes // self.estimated_layer_bytes))
+        if self.max_cache_slots is not None:
+            cache_slots = min(cache_slots, self.max_cache_slots)
         # Queue at most what the cache can plausibly retain. More than
         # this tends to turn prefetch into churn on memory-constrained
         # runs, especially when backward has become fast.
         # Leave one cache slot for the currently installed layer's live
         # tensors. `install()` drops cache ownership, but the model still
         # owns that layer until the caller unloads it after forward/bwd.
-        return max(1, min(12, cache_slots - 1))
+        if self.max_cache_slots is None:
+            return max(1, min(12, cache_slots - 1))
+        return max(0, min(12, cache_slots - 1))
 
     def prefetch_summary(self) -> str:
         with self._inflight_lock:
@@ -608,6 +717,7 @@ class StreamingContext:
         cache_evict_gb = self.memory_pressure_floor_bytes() / (1024 ** 3)
         return (f"Prefetch: workers={self.prefetch_workers} "
                 f"inflight={inflight} est_layer={est_gb:.1f}GB "
+                f"max_cache_slots={self.max_cache_slots} "
                 f"prefetch_floor={prefetch_floor_gb:.1f}GB "
                 f"cache_evict_floor={cache_evict_gb:.1f}GB "
                 f"mem_skips={self.prefetch_memory_skips}")
@@ -629,6 +739,192 @@ def _resolve_declared_model_cls(config, default_cls):
     return default_cls
 
 
+def _auto_causal_lm_can_resolve(config) -> bool:
+    """Would `AutoModelForCausalLM.from_config(config)` find a class?
+
+    Asks the same two questions `_BaseAutoModelClass.from_config` asks
+    itself (transformers 5.6, `auto_factory.py`): is there remote code
+    (`config.auto_map["AutoModelForCausalLM"]`), or is `type(config)` a
+    key of `AutoModelForCausalLM._model_mapping`? Deriving the answer
+    from the mapping the call itself consults — rather than from a list
+    of known-wrapper class names — means anything PrismaQuant registered
+    (`prismaquant/vendored`) or any config class transformers gains later
+    is handled without an edit here.
+
+    Config-only: resolves nothing and instantiates nothing.
+    """
+    from transformers import AutoModelForCausalLM
+
+    auto_map = getattr(config, "auto_map", None) or {}
+    if "AutoModelForCausalLM" in auto_map:
+        # from_config takes its dynamic-module branch; the static mapping
+        # is irrelevant there.
+        return True
+    try:
+        # `_model_mapping` is `MODEL_FOR_CAUSAL_LM_MAPPING`; going through
+        # the class attribute is what `from_config` does, so the answer
+        # cannot drift from the call.
+        return type(config) in AutoModelForCausalLM._model_mapping
+    except Exception:
+        return False
+
+
+def _config_rebuilt_as(config_cls, config):
+    """Rebuild `config_cls` from the TOP-LEVEL keys of a staged config.
+
+    `stage_text_only` lifts every `text_config` key to the top level,
+    drops the nested multimodal sub-configs, and rewrites
+    `architectures`; after it runs, the top level *is* the text model's
+    authoritative schema (that lift is exactly why `Gemma4TextConfig`
+    loads correctly for the families whose profile promotes the inner
+    `model_type`). The nested sub-config object still hanging off a
+    wrapper config at that point is *default-constructed* and must not be
+    used as a value source — verified on an Ovis2-shaped staged config,
+    where `config.text_config.hidden_size` reads 4096 (the class default)
+    while the checkpoint's real 64 sits at the top level.
+
+    Sub-config keys and `model_type` are dropped (the target class owns
+    its own `model_type`); derived fields such as `layer_types` are left
+    out of the input so the target class recomputes them from the real
+    `num_hidden_layers` instead of inheriting a default-length list.
+    """
+    raw = config.to_dict()
+    for sub_key in set(getattr(type(config), "sub_configs", None) or {}):
+        raw.pop(sub_key, None)
+    raw.pop("model_type", None)
+    return config_cls.from_dict(raw)
+
+
+def _resolve_text_only_skeleton(config, *, log_prefix: str = "[streaming]"):
+    """Return `(config, model_cls)` for a top-level config that
+    `AutoModelForCausalLM` cannot resolve — i.e. a vision-language
+    *wrapper* config on the TEXT-ONLY path (issue #12: MiniMax-M3's
+    `MiniMaxM3VLConfig` is rejected while the accepted list in the very
+    same error names `MiniMaxM3VLTextConfig`).
+
+    Preference order, and why:
+
+    1. **The config's own text sub-config class.** Text-only means we
+       want the body and nothing else: only the `multimodal=True` branch
+       of `_build_streaming_context` reads tower tensors onto the device
+       (`_find_visual_module` → `_read_layer_to_device` →
+       `visual_module.to(device)`), so building the declared VL
+       architecture here would wire a tower of never-materialized meta
+       tensors into the module tree — which the "head buffers left on
+       meta" sweep in `_build_streaming_context` is right to reject —
+       and would cost tower memory the moment anything did materialize
+       it. The text sub-config produces exactly the module tree the
+       plain-text path produces.
+    2. **The declared architecture** (`config.architectures[0]`, the
+       mechanism the multimodal branch already trusts), built against
+       *its own* `config_class` rather than the wrapper config. This is
+       the answer when staging's `ForConditionalGeneration →
+       ForCausalLM` rewrite lands on a real text-only class that simply
+       is not registered under the wrapper config class. Note it is
+       frequently a dead end for VL wrappers, because the rewritten name
+       does not exist (`Ovis2ForCausalLM`, verified absent from
+       transformers 5.6) — which is the second reason it is not first.
+
+    A registered `ModelProfile` can pre-empt all of this at staging time
+    by promoting the inner `model_type`
+    (`stage_text_only_promote_inner_model_type`, as Gemma 4 does), in
+    which case `AutoConfig` hands back the text config class directly and
+    this function is never reached.
+
+    Raises `RuntimeError` naming every attempt when nothing resolves.
+    """
+    from transformers import AutoModelForCausalLM
+
+    wrapper = type(config).__name__
+    tried: list[str] = []
+
+    # 1. text sub-config class
+    text_cfg_cls = None
+    try:
+        sub = config.get_text_config()
+        if sub is not None and sub is not config:
+            text_cfg_cls = type(sub)
+    except Exception as e:  # get_text_config() raises on ambiguity
+        tried.append(f"{wrapper}.get_text_config() raised {e!r}")
+    if text_cfg_cls is None:
+        text_cfg_cls = (getattr(type(config), "sub_configs", None)
+                        or {}).get("text_config")
+    if text_cfg_cls is None:
+        tried.append(f"{wrapper} exposes no text sub-config")
+    else:
+        try:
+            text_cfg = _config_rebuilt_as(text_cfg_cls, config)
+        except Exception as e:
+            tried.append(f"rebuilding {text_cfg_cls.__name__} from the "
+                         f"staged top-level config raised {e!r}")
+        else:
+            if _auto_causal_lm_can_resolve(text_cfg):
+                print(f"{log_prefix} {wrapper} is not a CausalLM config; "
+                      f"building the text-only skeleton from its text "
+                      f"sub-config {text_cfg_cls.__name__} "
+                      f"(no visual tower on the text-only path)",
+                      flush=True)
+                return text_cfg, AutoModelForCausalLM
+            tried.append(f"text sub-config {text_cfg_cls.__name__} is also "
+                         "absent from AutoModelForCausalLM's mapping")
+
+    # 2. declared architecture, built against its own config class
+    declared = _resolve_declared_model_cls(config, None)
+    if declared is None:
+        tried.append("declared architectures "
+                     f"{list(getattr(config, 'architectures', None) or [])} "
+                     "are not importable from transformers")
+    else:
+        decl_cfg_cls = getattr(declared, "config_class", None)
+        if decl_cfg_cls is None or isinstance(config, decl_cfg_cls):
+            decl_cfg = config
+        else:
+            try:
+                decl_cfg = _config_rebuilt_as(decl_cfg_cls, config)
+            except Exception as e:
+                tried.append(f"rebuilding {decl_cfg_cls.__name__} for "
+                             f"declared {declared.__name__} raised {e!r}")
+                decl_cfg = None
+        if decl_cfg is not None:
+            print(f"{log_prefix} {wrapper} is not a CausalLM config; "
+                  f"building the text-only skeleton from declared "
+                  f"architecture {declared.__name__} "
+                  f"(config {type(decl_cfg).__name__})", flush=True)
+            return decl_cfg, declared
+
+    raise RuntimeError(
+        f"{log_prefix} cannot build a text-only skeleton: "
+        f"AutoModelForCausalLM has no model class for {wrapper} "
+        f"(model_type={getattr(config, 'model_type', None)!r}), and no "
+        "fallback resolved either. Tried: " + "; ".join(tried) + ". "
+        "Fix by registering a ModelProfile whose "
+        "stage_text_only_promote_inner_model_type()/"
+        "stage_text_only_strip_keys() stage a config this transformers "
+        "build can load as a text CausalLM.")
+
+
+def _skeleton_config_and_class(config, *, multimodal: bool,
+                               log_prefix: str = "[streaming]"):
+    """Pick the `(config, model_cls)` pair `_build_streaming_context`
+    instantiates the empty skeleton from.
+
+    `model_cls is AutoModelForCausalLM` means "let the auto class
+    resolve it" — the historical path, returned unchanged (same config
+    object) for every config the auto class can resolve, which is every
+    plain text model.
+    """
+    from transformers import AutoModelForCausalLM
+
+    if multimodal:
+        # Declared arch so the visual tower materializes — unchanged.
+        return config, _resolve_declared_model_cls(config,
+                                                   AutoModelForCausalLM)
+    if _auto_causal_lm_can_resolve(config):
+        return config, AutoModelForCausalLM
+    # Text-only path, wrapper (e.g. vision-language) top-level config.
+    return _resolve_text_only_skeleton(config, log_prefix=log_prefix)
+
+
 def _find_visual_module(model) -> tuple[Any | None, str]:
     """Return (visual_module, dotted_prefix) if the model has a visual
     tower; (None, '') otherwise. Handles the v5 multimodal umbrella
@@ -647,10 +943,21 @@ def _find_visual_module(model) -> tuple[Any | None, str]:
     return None, ""
 
 
+def _module_has_meta_tensors(module: nn.Module) -> bool:
+    return any(
+        getattr(t, "is_meta", False)
+        for t in (
+            *module.parameters(recurse=True),
+            *module.buffers(recurse=True),
+        )
+    )
+
+
 def _build_streaming_context(model_path: str, *,
                              device: torch.device, dtype: torch.dtype,
                              offload_folder: str,
                              cache_headroom_gb: float | None = None,
+                             max_cache_slots: int | None = None,
                              prefetch_workers: int | str | None = None,
                              prefetch_min_available_gb: float | str | None = None,
                              log_prefix: str = "[streaming]",
@@ -673,7 +980,21 @@ def _build_streaming_context(model_path: str, *,
         every visual Linear's weight so Fisher backward hooks fire when
         `run_multimodal_visual_probe_pass` drives the combined forward
         (pixel_values → visual_tower → merged inputs_embeds → streamed
-        body → lm_head → CE)."""
+        body → lm_head → CE).
+
+    When `multimodal=False` (the default) the skeleton comes from
+    `AutoModelForCausalLM.from_config` exactly as before, except that a
+    top-level config the auto class cannot resolve at all — a
+    vision-language *wrapper* config — falls back to
+    `_resolve_text_only_skeleton` instead of raising. No visual tower is
+    materialized on this path either way."""
+    if max_cache_slots is not None:
+        if (
+            isinstance(max_cache_slots, bool)
+            or not isinstance(max_cache_slots, int)
+            or max_cache_slots < 1
+        ):
+            raise ValueError("max_cache_slots must be an integer >= 1 or None")
     import psutil
     from transformers import AutoConfig, AutoModelForCausalLM
 
@@ -694,7 +1015,7 @@ def _build_streaming_context(model_path: str, *,
     if multimodal:
         staged = stage_multimodal(model_path)
     else:
-        bypass_hf_fp8_rewrite = _minimax_native_fp8_checkpoint(model_path)
+        bypass_hf_fp8_rewrite = _bypass_hf_fp8_module_rewrite(model_path)
         staged = stage_text_only(model_path)
         if bypass_hf_fp8_rewrite:
             print(f"{log_prefix} manual meta streaming load avoids HF fp8 "
@@ -702,10 +1023,8 @@ def _build_streaming_context(model_path: str, *,
                   "during layer loads", flush=True)
     config = AutoConfig.from_pretrained(staged, trust_remote_code=True)
 
-    if multimodal:
-        model_cls = _resolve_declared_model_cls(config, AutoModelForCausalLM)
-    else:
-        model_cls = AutoModelForCausalLM
+    config, model_cls = _skeleton_config_and_class(
+        config, multimodal=multimodal, log_prefix=log_prefix)
 
     with _mask_cuda_queries_during_meta_init(log_prefix):
         with init_empty_weights():
@@ -766,9 +1085,55 @@ def _build_streaming_context(model_path: str, *,
         dtype,
         fp8_scale_inv_map=fp8_scale_inv_map,
     )
+    # Weight tying: a `tie_word_embeddings` checkpoint ships no
+    # `lm_head.weight`, so `_materialize` above has nothing to install and
+    # the head stays on meta — the first `model.lm_head(...)` (probe
+    # Phase-2 CE) or `m.weight.to(device)` (cost stage) then dies with
+    # "Cannot copy out of meta tensor". Resolve the alias through
+    # transformers' own embedding accessors (no name hardcoded: the VL
+    # wrapper's `model.language_model.embed_tokens` resolves like the
+    # plain `model.embed_tokens`).
+    resolve_tied_output_embedding(model, log_prefix=log_prefix)
     _init_rotary_inplace(base_model, device, dtype)
     print(f"{log_prefix} head materialized ({loaded_head} tensors, "
           f"rotary re-init) in {time.time()-t0:.1f}s", flush=True)
+
+    # Constructor-derived NON-PERSISTENT head buffers (e.g. gemma4_unified's
+    # `embed_scale = sqrt(hidden)`) are absent from the checkpoint, so
+    # `_materialize` never assigns them and they stay on `meta` — and
+    # PrismaQuant globally no-ops `_initialize_weights` (prismaquant/__init__),
+    # so the modeling's `_init_weights` that would set them never runs. The
+    # first forward op (`embed_tokens(ids)` multiplies by `embed_scale`) then
+    # faults "Tensor on device meta". Re-create such buffers on `device` from
+    # the owning module's retained python scalar (`scalar_<attr>`). Generic
+    # (any arch following this pattern); scoped to non-`layers` modules since
+    # streaming decoder buffers load per shard. Persistent buffers (e.g.
+    # `layer_scalar`) come from the checkpoint and are untouched.
+    _meta_fixed = 0
+    for _bname, _buf in list(base_model.named_buffers(recurse=True)):
+        if _buf is None or not _buf.is_meta or _bname.split(".", 1)[0] == "layers":
+            continue
+        _mod_name, _, _attr = _bname.rpartition(".")
+        _owner = base_model.get_submodule(_mod_name) if _mod_name else base_model
+        if _attr not in getattr(_owner, "_non_persistent_buffers_set", set()):
+            continue  # persistent buffers are loaded from the checkpoint
+        _scalar = getattr(_owner, "scalar_" + _attr, None)
+        if _scalar is None:
+            continue
+        _owner.register_buffer(
+            _attr, torch.tensor(_scalar, device=device, dtype=_buf.dtype),
+            persistent=False)
+        _meta_fixed += 1
+    _stuck = [n for n, b in base_model.named_buffers(recurse=True)
+              if b is not None and b.is_meta and n.split(".", 1)[0] != "layers"]
+    if _stuck:
+        raise RuntimeError(
+            f"{log_prefix} head buffers left on meta after materialization "
+            f"(no scalar_ init source): {_stuck[:8]} — extend the "
+            f"non-persistent-buffer sweep in _build_streaming_context")
+    if _meta_fixed:
+        print(f"{log_prefix} materialized {_meta_fixed} non-persistent head "
+              f"buffer(s) off meta (e.g. embed_scale)", flush=True)
 
     # Locate the visual module on the meta skeleton. When multimodal is
     # set, fully materialize the visual tower onto `device`; body
@@ -787,8 +1152,17 @@ def _build_streaming_context(model_path: str, *,
                 fp8_scale_inv_map=fp8_scale_inv_map)
             print(f"{log_prefix} materializing visual tower: "
                   f"{len(tensors)}/{len(vis_keys)} tensors -> {device}", flush=True)
+            if _module_has_meta_tensors(visual_module):
+                visual_module.to_empty(device=device, recurse=True)
             for model_name, t in tensors.items():
-                set_module_tensor_to_device(model, model_name, device, value=t)
+                install_dtype = t.dtype if t.is_floating_point() else None
+                set_module_tensor_to_device(
+                    model, model_name, device, value=t, dtype=install_dtype)
+            # Some visual towers carry non-checkpoint buffers initialized by
+            # the module constructor. Keep them colocated with checkpoint
+            # tensors before the multimodal streaming probe calls visual
+            # helpers such as get_image_features.
+            visual_module.to(device=device, dtype=dtype)
             if visual_requires_grad:
                 # Enable grad on every Linear's weight + bias so backward
                 # hooks fire on the reverse sweep. Embeddings and norms
@@ -839,7 +1213,10 @@ def _build_streaming_context(model_path: str, *,
                 resolved_headroom_gb = 75.0
     cache_bytes = max(int(free_bytes) - int(resolved_headroom_gb * 1024 ** 3),
                       8 * 1024 ** 3)
-    layer_cache = LayerCache(max_bytes=cache_bytes)
+    layer_cache = LayerCache(
+        max_bytes=cache_bytes,
+        max_entries=max_cache_slots,
+    )
     # v20 step 3+4: enable dynamic budget with the same headroom reserve
     # used to size the static max. The cache shrinks when host memory
     # tightens (other processes growing, gradient transients) and grows
@@ -861,9 +1238,13 @@ def _build_streaming_context(model_path: str, *,
         layers_prefix=layers_prefix,
         num_layers=num_layers,
         target_dtype=dtype,
+        fp4_experts=declared_fp4_expert_dtype(model_path),
     )
     worker_count, worker_src = _auto_prefetch_workers(
         cache_bytes, estimated_layer_bytes, requested=prefetch_workers)
+    if max_cache_slots is not None:
+        worker_count = min(worker_count, max_cache_slots)
+        worker_src = f"{worker_src}, capped by max_cache_slots"
     min_available_bytes, min_available_src = _auto_prefetch_min_available_bytes(
         estimated_layer_bytes, requested=prefetch_min_available_gb,
         workers=worker_count)
@@ -877,6 +1258,7 @@ def _build_streaming_context(model_path: str, *,
             0, int((free_bytes - min_available_bytes) // estimated_layer_bytes))
     print(f"{log_prefix} prefetch auto: workers={worker_count} "
           f"({worker_src}), cache_slots={cache_slots}, "
+          f"max_cache_slots={max_cache_slots}, "
           f"memory_slots={memory_slots}, "
           f"est_layer={estimated_layer_bytes/(1024**3):.1f} GB, "
           f"min_avail={min_available_bytes/(1024**3):.1f} GB "
@@ -900,4 +1282,5 @@ def _build_streaming_context(model_path: str, *,
         prefetch_workers=worker_count,
         prefetch_min_available_bytes=min_available_bytes,
         profile=_profile,
+        expert_packer=_build_expert_packer(model, weight_ckpt),
     )

@@ -3,10 +3,12 @@
   "id": "research",
   "runtime": "generic_gpu_kernel",
   "description": "Research/default profile: no serving format menu restrictions, but keep known runtime kernel shape constraints out of allocator candidates.",
+  "emulation_only": true,
+  "_emulation_only_rationale": "Deliberately declares NO export_lane, so its menu is not bounded by any exporter. This profile exists to keep research rungs with no served path measurable end-to-end in the emulation harness (MXFP6_E3M2/E2M3, INT8_W8A16, INT4_W4A16_g128, the weight-only A16 family) -- bounding it by an exporter would delete exactly the comparisons the format menu is researched with. Nothing selected under `research` is shippable: run-pipeline's export stages resolve a real serving profile (vllm_packed_moe / gguf), whose lane bound then applies.",
   "runtime_shape_validators": [
     {
       "id": "flashinfer_mxfp8_problem_size",
-      "formats": ["MXFP8", "MXFP8_E4M3", "MXFP8_E5M2"],
+      "formats": ["MXFP8_E4M3", "MXFP8_E5M2"],
       "callable": "prismaquant.runtime_shape_validators:flashinfer_mxfp8_problem_size_accepts",
       "optional": true,
       "reason": "kernel_shape"
@@ -15,12 +17,12 @@
   "shape_rules": [
     {
       "id": "mxfp8_cutlass_shape",
-      "formats": ["MXFP8", "MXFP8_E4M3", "MXFP8_E5M2"],
+      "formats": ["MXFP8_E4M3", "MXFP8_E5M2"],
       "min_in_features": 128,
       "min_out_features": 128,
       "in_features_multiple_of": 32,
-      "out_features_multiple_of": 128,
-      "reason": "kernel_shape"
+      "reason": "kernel_shape",
+      "detail": "vLLM/FlashInfer MXFP8 GEMM requires K >= 128, N >= 128, and K divisible by the 32-value MX block size; swizzled scale layouts pad N internally"
     },
     {
       "id": "nvfp4_cutlass_shape",

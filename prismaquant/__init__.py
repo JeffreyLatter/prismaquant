@@ -3,15 +3,28 @@
 Current production path:
     1. incremental_probe.py              stream Fisher and activation shards
     2. incremental_measure_quant_cost.py build per-Linear format costs
-    3. kl_sensitivity_probe.py           build measured per-Linear frontiers
-    4. allocator.py                      choose the layer-format assignment
-    5. polish_from_assignment.py         run production-faithful local polish
-    6. export_native_compressed.py       write compressed-tensors artifacts
+    3. allocator.py                      choose Pareto layer-format assignments
+    4. validate_assignments_kl.py        measure held-out KL for candidates
+    5. export_native_compressed.py       write compressed-tensors artifacts
+    6. validate_native_export.py         run vLLM load/generation smoke
+    7. validate_quantized_model.py       run downstream quality checks
 
 Older cross-layer allocators are archived under archive/cross_layer_2026-05-09
 for artifact replay and comparison.
 """
 from .format_registry import FormatSpec, REGISTRY, register_format
+
+# Resolved from installed metadata rather than duplicated here, so
+# pyproject.toml stays the single source of truth (the release pipeline asserts
+# the git tag matches the built version). A source checkout that was never
+# installed has no metadata; report that honestly instead of guessing a number.
+try:  # pragma: no cover - trivial metadata lookup
+    from importlib.metadata import PackageNotFoundError, version as _pkg_version
+
+    __version__ = _pkg_version("prismaquant")
+except PackageNotFoundError:  # pragma: no cover
+    __version__ = "0.0.0+unknown"
+del _pkg_version, PackageNotFoundError
 
 
 def _ensure_triton_cache_writable() -> None:

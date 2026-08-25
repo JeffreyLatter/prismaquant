@@ -1,0 +1,86 @@
+{
+  "schema": "prismaquant.cost_surrogate_calibration_anchors.v1",
+  "anchors": [
+    {
+      "name": "qwen36_27b_grouped_no_fp8_5p5",
+      "model": "/home/rob/.cache/huggingface/qwen36-27b-bf16",
+      "source_doc": "archive/grouped_kl_2026-05-28/docs/grouped_kl_allocator_results_2026-05-20.md",
+      "source_section": "Prior No-FP8 Reproduction / Recorded 27B PPL",
+      "target_bpp": 5.5,
+      "achieved_bpp": 5.496609,
+      "formats": ["NVFP4", "MXFP8_E4M3", "BF16"],
+      "calibration_contract": {
+        "dataset": "not recorded in prior no-FP8 reproduction doc",
+        "sequence_length": null,
+        "seed": null
+      },
+      "expected": {
+        "predicted_dloss": 0.115344731,
+        "ppl_wikitext": 7.130786632
+      },
+      "tolerance": {
+        "predicted_dloss_rel": 0.02,
+        "ppl_wikitext_rel": 0.005
+      },
+      "logs": [
+        "/home/rob/dq-runs/qwen36-27b-grouped-validation-20260519T192416-27b/logs/ppl_grouped_5.5.log"
+      ]
+    },
+    {
+      "name": "qwen36_27b_grouped_fp8_menu_5p5",
+      "model": "/home/rob/.cache/huggingface/qwen36-27b-bf16",
+      "source_doc": "archive/grouped_kl_2026-05-28/docs/grouped_kl_allocator_results_2026-05-20.md",
+      "source_section": "Fresh FP8-Menu Run",
+      "target_bpp": 5.5,
+      "achieved_bpp": 5.499,
+      "formats": ["NVFP4", "MXFP8_E4M3", "FP8_E4M3", "BF16"],
+      "calibration_contract": {
+        "dataset": "/home/rob/dq-runs/calibration/diverse-v1.jsonl",
+        "sequence_length": 1024,
+        "seed": 42,
+        "samples": 8
+      },
+      "expected": {
+        "predicted_dloss": 0.13786,
+        "ppl_wikitext": 7.686406763
+      },
+      "tolerance": {
+        "predicted_dloss_rel": 0.02,
+        "ppl_wikitext_rel": 0.005
+      },
+      "logs": [
+        "/home/rob/dq-runs/qwen36-27b-grouped-fp8-validation-20260520T2202/logs/ppl_grouped_fp8_5.5.log"
+      ]
+    },
+    {
+      "name": "qwen36_27b_shipped_5p5_vllm_exact",
+      "model": "/home/rob/.cache/huggingface/rdtand-Qwen3.6-27B-PrismaQuant-5.5bit-vllm",
+      "source_doc": "archive/grouped_kl_2026-05-28/docs/grouped_kl_allocator_results_2026-05-20.md",
+      "source_section": "Shipped 5.5 Comparison (2026-05-21)",
+      "target_bpp": 5.5,
+      "achieved_bpp": 5.5,
+      "formats": ["NVFP4", "MXFP8_E4M3", "BF16"],
+      "calibration_contract": {
+        "dataset": "WikiText train",
+        "sequence_length": 512,
+        "seed": 42,
+        "samples": 8,
+        "starts": [466956, 104902, 1153556, 1027150, 936213, 585264, 429895, 2287433]
+      },
+      "expected": {
+        "end_kl": 0.047497515,
+        "ppl_wikitext": 9.498281855,
+        "mean_nll": 2.251110925
+      },
+      "tolerance": {
+        "end_kl_rel": 0.05,
+        "ppl_wikitext_rel": 0.005,
+        "mean_nll_rel": 0.005
+      },
+      "logs": [
+        "/home/rob/dq-runs/qwen3p6-27b-rerun/kl_shipped_5p5_20260503T012223Z/shipped_5p5_kl.json",
+        "/home/rob/dq-runs/qwen36-27b-grouped-5p5-vs-shipped-20260521T134058Z/logs/vllm_ppl_shipped_5p5_from_ids_retry_combined_aot_lm_only.log"
+      ]
+    }
+  ]
+}

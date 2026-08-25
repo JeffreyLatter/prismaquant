@@ -18,9 +18,9 @@ Checks, in order:
      (NaN/repetition loops/nonsense) before wasting on stats.
   3. **Perplexity / NLL** — logprobs over a diverse held-out
      prompt suite. Hard thresholds: `ppl < MAX_PPL` and
-     `p99 per-prompt NLL < MAX_P99_NLL`. p99 catches the 27B
-     failure mode where 80% of prompts scored NLL~10 while
-     2/10 scored normally — mean alone missed it.
+     worst per-prompt NLL < `MAX_P99_NLL` (legacy flag name).
+     The worst-prompt guard catches the 27B failure mode where
+     80% of prompts scored NLL~10 while 2/10 scored normally.
   4. **MTP acceptance** — if spec-decode is on, per-position
      acceptance > `MIN_MTP_ACCEPT_P0` at position 0.
 
@@ -65,7 +65,8 @@ Design notes:
   - Thresholds are calibrated: MAX_PPL=25 catches catastrophic
     breakage but tolerates normal 4-bit quant degradation
     (BF16 baseline ~3-5, 4-bit ~4-8). MAX_P99_NLL=6 is ~2σ above
-    BF16 average.
+    BF16 average; the implementation also reports the actual p99
+    separately from the max prompt NLL.
 """
 from __future__ import annotations
 
@@ -122,6 +123,15 @@ DEFAULT_MIN_MTP_ACCEPT_P0 = 0.60       # position-0 accept fraction
 # -----------------------------------------------------------------
 # Data classes
 # -----------------------------------------------------------------
+class SpecDecodeUndetermined(RuntimeError):
+    """The spec-decode guard could not read /metrics.
+
+    Distinct from "spec-decode is off": the perplexity check refuses on this
+    rather than proceeding, because the failure mode it guards against
+    (publishing the DRAFT model's NLL as the target's) is silent.
+    """
+
+
 @dataclass
 class CheckResult:
     name: str
@@ -159,9 +169,33 @@ def _get_text(url: str, timeout: float = 30.0) -> str:
         return resp.read().decode("utf-8")
 
 
+def _server_root(base_url: str) -> str:
+    """Server root for the operational endpoints, from the OpenAI API root.
+
+    `/health` and `/metrics` are mounted at the SERVER root; the completions
+    endpoints live under `/v1`.  ``--base-url`` names the latter, so appending
+    `/health` to it yields `/v1/health`, which vLLM answers with 404.
+
+    Measured 2026-08-14 on the Qwen3.8-27B ship gate: `wait_for_ready` polled
+    `/v1/health` for 11 minutes and would have timed out at 900 s without
+    sending a single prompt, while `/metrics` failed the same way and made the
+    spec-decode guard fail OPEN (see `_spec_decode_on`).
+
+    Only a trailing `/v1` is stripped, so a serve behind `--root-path /foo`
+    (`http://h:8000/foo/v1`) resolves to `http://h:8000/foo` rather than being
+    flattened to the bare host.
+    """
+    root = base_url.rstrip("/")
+    if root.endswith("/v1"):
+        root = root[: -len("/v1")]
+    return root
+
+
 def _health_ok(base_url: str) -> bool:
     try:
-        with urllib.request.urlopen(f"{base_url}/health", timeout=5.0) as r:
+        with urllib.request.urlopen(
+            f"{_server_root(base_url)}/health", timeout=5.0
+        ) as r:
             return r.status == 200
     except Exception:
         return False
@@ -180,11 +214,24 @@ def _spec_decode_on(base_url: str) -> bool:
     the NLL values returned are the 1-layer MTP head's logprobs,
     NOT the target model's. Those are not usable for target-model
     perplexity measurement. Detecting the condition lets the
-    validator refuse to silently mis-report."""
+    validator refuse to silently mis-report.
+
+    THIS GUARD FAILS CLOSED.  It used to swallow every fetch error and
+    return False, which reads as "spec-decode is off" — so an unreachable
+    `/metrics` produced a confident all-clear from the one check whose job is
+    to stop a draft-model NLL being published.  Until 2026-08-14 the URL was
+    also wrong (`/v1/metrics`, 404), so on the standard `--base-url .../v1`
+    invocation the guard could never fire at all.  An indeterminate answer is
+    now an exception, not a False.
+    """
     try:
-        text = _get_text(f"{base_url}/metrics")
-    except Exception:
-        return False
+        text = _get_text(f"{_server_root(base_url)}/metrics")
+    except Exception as exc:  # noqa: BLE001 - re-raised as a refusal below
+        raise SpecDecodeUndetermined(
+            f"cannot read {_server_root(base_url)}/metrics ({exc}); refusing "
+            "to certify perplexity, because a guard that cannot see the "
+            "server must not report 'no spec-decode'"
+        ) from exc
     return "vllm:spec_decode" in text
 
 
@@ -256,14 +303,27 @@ def check_generation_sanity(base_url: str, model_name: str,
 
 def check_perplexity(base_url: str, model_name: str,
                      max_ppl: float, max_p99_nll: float,
-                     max_mean_nll: float) -> CheckResult:
+                     max_mean_nll: float,
+                     bos_token: str | None = None,
+                     add_special_tokens: bool = True) -> CheckResult:
     """Compute per-token NLL across the eval prompt suite.
 
-    Hard fails when mean NLL exceeds threshold OR when p99 per-prompt
-    NLL exceeds threshold. p99 catches bimodal-failure where the model
-    has "quality pockets" (see 27B session: 2/10 prompts normal, 8/10
-    catastrophic at NLL~10). Mean alone would have flagged, but p99
-    is the more diagnostic signal.
+    **BOS sensitivity (Gemma et al.):** models that key on a leading BOS
+    return ~ln(vocab_size) (uniform-random) per-token NLL when the prompt is
+    teacher-forced without one. Some exports ship ``add_bos_token=false`` in
+    their tokenizer_config, so ``add_special_tokens=True`` alone does NOT add
+    it — pass ``bos_token`` (e.g. ``"<bos>"``) to prepend it explicitly. When
+    ``bos_token`` is given the request uses ``add_special_tokens=False`` to
+    avoid a double-BOS. NOTE: raw-text PPL is also a weak quant-quality signal
+    on heavily instruction-tuned models (the off-distribution penalty swamps
+    the quantization delta); prefer KL-vs-BF16 for quant A/Bs there.
+
+    Hard fails when mean NLL exceeds threshold OR when the worst
+    per-prompt average NLL exceeds threshold. The max guard catches
+    bimodal-failure where the model has "quality pockets" (see 27B
+    session: 2/10 prompts normal, 8/10 catastrophic at NLL~10). Mean
+    alone would have flagged, but the tail prompt is the more
+    diagnostic signal.
 
     **Hard-fails with a diagnostic if spec-decode is detected on the
     serve.** vLLM routes /v1/completions echo+logprobs through the
@@ -275,7 +335,16 @@ def check_perplexity(base_url: str, model_name: str,
     without --speculative-config; see the module docstring for the
     standard two-serve workflow.
     """
-    if _spec_decode_on(base_url):
+    try:
+        spec_on = _spec_decode_on(base_url)
+    except SpecDecodeUndetermined as exc:
+        return CheckResult(
+            name="perplexity",
+            passed=False,
+            detail=str(exc),
+            metrics={"spec_decode_detected": None, "skipped": True},
+        )
+    if spec_on:
         return CheckResult(
             name="perplexity",
             passed=False,
@@ -291,16 +360,19 @@ def check_perplexity(base_url: str, model_name: str,
     total_tokens = 0
     total_nll = 0.0
     for i, prompt in enumerate(EVAL_PROMPTS, 1):
+        req_prompt = (bos_token + prompt) if bos_token else prompt
         try:
             r = _post_json(
                 f"{base_url}/v1/completions",
                 {
                     "model": model_name,
-                    "prompt": prompt,
+                    "prompt": req_prompt,
                     "max_tokens": 1,
                     "temperature": 0.0,
                     "logprobs": 1,
                     "echo": True,
+                    # manual BOS already prepended -> don't let the server add another
+                    "add_special_tokens": False if bos_token else add_special_tokens,
                 },
             )
         except Exception as e:
@@ -326,17 +398,27 @@ def check_perplexity(base_url: str, model_name: str,
     mean_nll = total_nll / max(total_tokens, 1)
     ppl = math.exp(mean_nll)
     per_prompt_avg_nll.sort()
-    k = max(0, int(0.99 * len(per_prompt_avg_nll)) - 1)
-    p99 = per_prompt_avg_nll[-1] if len(per_prompt_avg_nll) <= 2 else per_prompt_avg_nll[k]
-    # Actually for small N, "p99" is basically "max" — use max for clarity.
-    p99 = per_prompt_avg_nll[-1]
+    if len(per_prompt_avg_nll) == 1:
+        p99 = per_prompt_avg_nll[0]
+    else:
+        rank = 0.99 * (len(per_prompt_avg_nll) - 1)
+        lo = int(math.floor(rank))
+        hi = int(math.ceil(rank))
+        frac = rank - lo
+        p99 = (
+            per_prompt_avg_nll[lo] * (1.0 - frac)
+            + per_prompt_avg_nll[hi] * frac
+        )
+    max_nll = per_prompt_avg_nll[-1]
 
     metrics = {
         "perplexity": ppl,
         "mean_nll_per_tok": mean_nll,
         "p99_nll_per_tok": p99,
+        "max_nll_per_tok": max_nll,
         "per_prompt_avg_nll": per_prompt_avg_nll,
         "n_tokens": total_tokens,
+        "spec_decode_detected": False,
     }
 
     reasons = []
@@ -344,8 +426,8 @@ def check_perplexity(base_url: str, model_name: str,
         reasons.append(f"ppl={ppl:.2f} > {max_ppl}")
     if mean_nll > max_mean_nll:
         reasons.append(f"mean_nll={mean_nll:.3f} > {max_mean_nll}")
-    if p99 > max_p99_nll:
-        reasons.append(f"max(per-prompt avg NLL)={p99:.3f} > {max_p99_nll} "
+    if max_nll > max_p99_nll:
+        reasons.append(f"max(per-prompt avg NLL)={max_nll:.3f} > {max_p99_nll} "
                        f"(bimodal failure)")
     return CheckResult(
         name="perplexity",
@@ -360,7 +442,7 @@ def check_mtp_acceptance(base_url: str, min_p0: float) -> CheckResult:
     position-0 acceptance fraction exceeds `min_p0`. If no spec-decode
     metrics are exposed (spec-decode not enabled), passes with 'skipped'."""
     try:
-        text = _get_text(f"{base_url}/metrics")
+        text = _get_text(f"{_server_root(base_url)}/metrics")
     except Exception as e:
         return CheckResult(
             name="mtp_acceptance",
@@ -404,7 +486,17 @@ def run_validation(
     min_gen_len: int = DEFAULT_MIN_GEN_LEN,
     min_mtp_accept_p0: float = DEFAULT_MIN_MTP_ACCEPT_P0,
     wait_seconds: float = 900.0,
+    bos_token: str | None = None,
+    add_special_tokens: bool = True,
 ) -> ValidationReport:
+    # `base_url` is the SERVER root, not the OpenAI API root: this module
+    # appends `/v1/completions` itself and reads `/health` and `/metrics` off
+    # the root. Callers naturally pass the OpenAI root instead (the lane spec
+    # published `http://127.0.0.1:8000/v1`), which silently yields
+    # `/v1/v1/completions` and `/v1/health` — all 404, so the run waits out its
+    # full 900 s timeout having sent no prompt. Normalizing here rather than at
+    # each call site keeps the two spellings from diverging again.
+    base_url = _server_root(base_url)
     rep = ValidationReport(
         artifact=model_name,
         base_url=base_url,
@@ -415,6 +507,8 @@ def run_validation(
             "max_p99_nll": max_p99_nll,
             "min_gen_len": min_gen_len,
             "min_mtp_accept_p0": min_mtp_accept_p0,
+            "bos_token": bos_token,
+            "add_special_tokens": add_special_tokens,
         },
     )
 
@@ -433,6 +527,8 @@ def run_validation(
     rep.checks.append(check_perplexity(
         base_url, model_name,
         max_ppl=max_ppl, max_p99_nll=max_p99_nll, max_mean_nll=max_mean_nll,
+        bos_token=bos_token,
+        add_special_tokens=add_special_tokens,
     ))
     rep.checks.append(check_mtp_acceptance(base_url, min_mtp_accept_p0))
     return rep
@@ -465,6 +561,74 @@ def format_report_md(rep: ValidationReport) -> str:
 
 
 # -----------------------------------------------------------------
+# Ship record (R13)
+# -----------------------------------------------------------------
+def _resolve_artifact_dir(args, card_model_dir: str | None) -> str | None:
+    """Which directory this verdict is about.
+
+    The validator drives an HTTP endpoint, so it cannot see what the server
+    loaded; the honest fallback order is explicit flag, then --model-name if it
+    happens to be a local path, then the directory the shipcard was opened on.
+    """
+    if args.artifact_dir:
+        return args.artifact_dir
+    if args.model_name and os.path.isdir(args.model_name):
+        return args.model_name
+    return card_model_dir
+
+
+def _fill_shipcard(args, rep: "ValidationReport") -> None:
+    if not getattr(args, "shipcard", None):
+        return
+    from .shipcard import (
+        compute_model_sha, fill_if_requested, git_provenance, load_shipcard,
+        make_record,
+    )
+
+    try:
+        card = load_shipcard(args.shipcard)
+    except Exception as exc:
+        print(f"[shipcard] WARN {args.shipcard} unreadable: {exc!r}")
+        return
+    model_dir = _resolve_artifact_dir(args, card.get("model_dir"))
+    try:
+        model_sha = compute_model_sha(model_dir) if model_dir else None
+    except Exception:
+        model_sha = None
+
+    ppl_check = next((c for c in rep.checks if c.name == "perplexity"), None)
+    spec_detected = None
+    if ppl_check is not None:
+        spec_detected = bool(ppl_check.metrics.get("spec_decode_detected", False))
+    metrics = {c.name: {"passed": c.passed, **c.metrics} for c in rep.checks}
+    perplexity = metrics.get("perplexity")
+    if isinstance(perplexity, dict):
+        # Make the replayable evidence self-contained. ValidationReport already
+        # owns the threshold decision; the shipcard additionally needs the
+        # exact number of scored tokens to reject a fabricated empty pass.
+        if "n_tokens" not in perplexity:
+            perplexity["n_tokens"] = 0
+    record = make_record(
+        slot="ship_gate",
+        tool="validate_quantized_model.py",
+        passed=bool(rep.passed),
+        model_sha=model_sha,
+        metrics=metrics,
+        detail="; ".join(
+            f"{c.name}={'pass' if c.passed else 'FAIL'}" for c in rep.checks),
+        spec_decode_detected=spec_detected,
+        git_commit=git_provenance().get("commit"),
+        extra={
+            "base_url": rep.base_url,
+            "served_model_name": rep.model_name,
+            "thresholds": rep.thresholds,
+            "model_sha_source": model_dir,
+        },
+    )
+    fill_if_requested(args.shipcard, "ship_gate", record)
+
+
+# -----------------------------------------------------------------
 # CLI
 # -----------------------------------------------------------------
 def main() -> int:
@@ -484,10 +648,29 @@ def main() -> int:
     ap.add_argument("--min-gen-len", type=int, default=DEFAULT_MIN_GEN_LEN)
     ap.add_argument("--min-mtp-accept-p0", type=float,
                     default=DEFAULT_MIN_MTP_ACCEPT_P0)
+    ap.add_argument("--bos-token", default=None,
+                    help="Optional literal BOS string to prepend before "
+                         "perplexity prompts for BOS-sensitive tokenizers "
+                         "(for example '<bos>'). When set, the server "
+                         "request disables add_special_tokens to avoid a "
+                         "double BOS.")
+    ap.add_argument("--no-add-special-tokens", dest="add_special_tokens",
+                    action="store_false", default=True,
+                    help="Pass add_special_tokens=false on perplexity "
+                         "requests when --bos-token is not used.")
     ap.add_argument("--wait-seconds", type=float, default=900.0,
                     help="Max time to wait for /health 200 before giving up")
     ap.add_argument("--report", default=None,
                     help="Optional path to write the markdown report")
+    ap.add_argument("--shipcard", default=None,
+                    help="Path to the artifact's shipcard.json; this run's "
+                         "verdict is appended to the ship_gate slot "
+                         "(see python -m prismaquant.shipcard_cli).")
+    ap.add_argument("--artifact-dir", default=None,
+                    help="Local directory of the artifact being served, used "
+                         "to stamp model_sha on the shipcard record. Defaults "
+                         "to --model-name when that is a directory, then to "
+                         "the shipcard's own model_dir.")
     args = ap.parse_args()
 
     rep = run_validation(
@@ -498,12 +681,15 @@ def main() -> int:
         min_gen_len=args.min_gen_len,
         min_mtp_accept_p0=args.min_mtp_accept_p0,
         wait_seconds=args.wait_seconds,
+        bos_token=args.bos_token,
+        add_special_tokens=args.add_special_tokens,
     )
     md = format_report_md(rep)
     print(md)
     if args.report:
         with open(args.report, "w") as f:
             f.write(md)
+    _fill_shipcard(args, rep)
     return 0 if rep.passed else 1
 
 

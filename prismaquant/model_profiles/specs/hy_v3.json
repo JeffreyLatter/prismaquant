@@ -1,0 +1,71 @@
+{
+  "schema": "prismaquant.model_structure.v1",
+  "id": "hy_v3",
+  "priority": 180,
+  "supported_lanes": ["compressed-tensors", "nvfp4_cb", "gguf"],
+  "preferred_lane": "gguf",
+  "default_serving_profile": "gguf",
+  "match": {
+    "model_type": ["hy_v3"],
+    "architectures": ["HYV3*"]
+  },
+  "staging": {
+    "promote_inner_model_type": false
+  },
+  "naming": {
+    "live_to_recipe": [],
+    "recipe_to_source": [
+      {
+        "regex": "^(model[.]layers[.][0-9]+[.]mlp)[.]gate[.]weight$",
+        "replace": "\\1.router.gate.weight",
+        "stop": true
+      },
+      {
+        "regex": "^(model[.]layers[.][0-9]+[.]mlp)[.]e_score_correction_bias$",
+        "replace": "\\1.expert_bias",
+        "stop": true
+      },
+      {
+        "regex": "^(model[.]layers[.][0-9]+[.]mlp)[.]shared_experts[.]",
+        "replace": "\\1.shared_mlp.",
+        "stop": true
+      }
+    ],
+    "recipe_to_vllm": []
+  },
+  "fused_groups": [
+    {
+      "target": "self_attn.qkv_proj",
+      "members": ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"]
+    },
+    {
+      "target": "mlp.gate_up_proj",
+      "members": ["mlp.gate_proj", "mlp.up_proj"]
+    },
+    {
+      "target": "mlp.shared_experts.gate_up_proj",
+      "members": [
+        "mlp.shared_experts.gate_proj",
+        "mlp.shared_experts.up_proj"
+      ]
+    }
+  ],
+  "packed_experts": {
+    "param_names": ["gate_up_proj", "down_proj"],
+    "module_class_names": ["HYV3Experts"],
+    "split_for_formats": ["*"],
+    "projection_splits": {
+      "gate_up_proj": ["gate_proj", "up_proj"]
+    },
+    "format_groups": [
+      ["gate_up_proj", "down_proj"],
+      ["gate_proj", "up_proj", "down_proj"],
+      ["w1", "w2", "w3"]
+    ]
+  },
+  "moe": {
+    "per_expert_regex": "re:^model[.]layers[.][0-9]+[.]mlp[.]experts[.][0-9]+[.](gate|up|down)_proj$"
+  },
+  "passthrough_prefixes": ["model.layers.80."],
+  "pinned_names": ["lm_head"]
+}

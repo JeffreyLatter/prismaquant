@@ -9,6 +9,29 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from numbers import Integral, Real
+from typing import NotRequired, TypedDict
+
+
+class CostEntry(TypedDict, total=False):
+    """Structural type for one per-format cost row.
+
+    Older artifacts are allowed to omit ``cost_source``; live producers should
+    set it when a cost was rewritten or comes from a non-default surrogate so
+    allocator logs can explain which objective priced the decision.
+    """
+
+    weight_mse: float
+    output_mse: float
+    rel_output_mse: float
+    predicted_dloss: float
+    fisher_output_mse: float
+    output_mse_measured: bool
+    cost_source: NotRequired[str]
+    weight_mse_per_expert: NotRequired[list[float]]
+    cost_source_per_expert: NotRequired[list[str]]
+    cb_minchain_identity_per_expert: NotRequired[list[dict]]
+    cb_minchain_interpolation: NotRequired[dict]
+    error: str
 
 
 class SchemaValidationError(ValueError):
@@ -157,10 +180,121 @@ def validate_cost_payload(payload, path: str | None = None):
             if "error" in entry:
                 continue
             has_signal = False
-            for field in ("weight_mse", "predicted_dloss", "output_mse"):
+            for field in (
+                "weight_mse",
+                "predicted_dloss",
+                "output_mse",
+                "fisher_output_mse",
+            ):
                 if field in entry:
                     _as_number(entry[field], path, f".costs[{name!r}][{fmt!r}].{field}")
                     has_signal = True
+            if "cost_source" in entry and not isinstance(entry["cost_source"], str):
+                _fail(
+                    path,
+                    f".costs[{name!r}][{fmt!r}].cost_source",
+                    "must be a string when present",
+                )
+            if "weight_mse_per_expert" in entry:
+                values = entry["weight_mse_per_expert"]
+                if (not isinstance(values, Sequence)
+                        or isinstance(values, (str, bytes))):
+                    _fail(
+                        path,
+                        f".costs[{name!r}][{fmt!r}].weight_mse_per_expert",
+                        "must be a sequence when present",
+                    )
+                for idx, value in enumerate(values):
+                    _as_number(
+                        value,
+                        path,
+                        f".costs[{name!r}][{fmt!r}]"
+                        f".weight_mse_per_expert[{idx}]",
+                    )
+            if "cost_source_per_expert" in entry:
+                values = entry["cost_source_per_expert"]
+                if (not isinstance(values, Sequence)
+                        or isinstance(values, (str, bytes))
+                        or not all(isinstance(value, str) for value in values)):
+                    _fail(
+                        path,
+                        f".costs[{name!r}][{fmt!r}].cost_source_per_expert",
+                        "must be a sequence of strings when present",
+                    )
+                mse_values = entry.get("weight_mse_per_expert")
+                if (isinstance(mse_values, Sequence)
+                        and not isinstance(mse_values, (str, bytes))
+                        and len(values) != len(mse_values)):
+                    _fail(
+                        path,
+                        f".costs[{name!r}][{fmt!r}].cost_source_per_expert",
+                        "must match weight_mse_per_expert length",
+                    )
+            if "cb_minchain_identity_per_expert" in entry:
+                identities = entry["cb_minchain_identity_per_expert"]
+                if (not isinstance(identities, Sequence)
+                        or isinstance(identities, (str, bytes))):
+                    _fail(
+                        path,
+                        f".costs[{name!r}][{fmt!r}]"
+                        ".cb_minchain_identity_per_expert",
+                        "must be a sequence when present",
+                    )
+                from .cb_minchain import validate_chain_identity
+
+                for idx, identity in enumerate(identities):
+                    try:
+                        validate_chain_identity(
+                            identity,
+                            where=(
+                                f".costs[{name!r}][{fmt!r}]"
+                                f".cb_minchain_identity_per_expert[{idx}]"
+                            ),
+                        )
+                    except ValueError as exc:
+                        _fail(path, "", str(exc))
+                mse_values = entry.get("weight_mse_per_expert")
+                if (isinstance(mse_values, Sequence)
+                        and not isinstance(mse_values, (str, bytes))
+                        and len(identities) != len(mse_values)):
+                    _fail(
+                        path,
+                        f".costs[{name!r}][{fmt!r}]"
+                        ".cb_minchain_identity_per_expert",
+                        "must match weight_mse_per_expert length",
+                    )
+            if "cb_minchain_interpolation" in entry:
+                interpolation = entry["cb_minchain_interpolation"]
+                if not _is_mapping(interpolation):
+                    _fail(
+                        path,
+                        f".costs[{name!r}][{fmt!r}]"
+                        ".cb_minchain_interpolation",
+                        "must be an object when present",
+                    )
+                if interpolation.get("semantic") != (
+                    "v2_accept_all_plus_per_layer_audit"
+                ):
+                    _fail(
+                        path,
+                        f".costs[{name!r}][{fmt!r}]"
+                        ".cb_minchain_interpolation.semantic",
+                        "has an unsupported interpolation semantic",
+                    )
+                if interpolation.get("layer_audit_pass") is not True:
+                    _fail(
+                        path,
+                        f".costs[{name!r}][{fmt!r}]"
+                        ".cb_minchain_interpolation.layer_audit_pass",
+                        "must be true for an interpolated row",
+                    )
+            if ("output_mse_measured" in entry
+                    and not isinstance(entry["output_mse_measured"], bool)):
+                _fail(
+                    path,
+                    f".costs[{name!r}][{fmt!r}].output_mse_measured",
+                    "must be a boolean when present",
+                )
             if not has_signal:
                 _fail(
                     path,
@@ -177,6 +311,12 @@ def validate_layer_config_payload(payload, path: str | None = None):
     for name, entry in payload.items():
         if not isinstance(name, str):
             _fail(path, "", "layer_config keys must be strings")
+        if name == "__prismaquant__":
+            # Reserved allocator-metadata block (layer_config.LAYER_CONFIG_META_KEY):
+            # travels with the assignment, is not a tensor entry.
+            if not _is_mapping(entry):
+                _fail(path, f"[{name!r}]", "reserved metadata must be an object")
+            continue
         where = f"[{name!r}]"
         if isinstance(entry, dict):
             dt = entry.get("data_type")
@@ -193,4 +333,3 @@ def validate_layer_config_payload(payload, path: str | None = None):
             continue
         _fail(path, where, "entry must be a format dict, string, or integer")
     return payload
-

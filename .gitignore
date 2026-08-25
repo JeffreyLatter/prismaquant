@@ -9,6 +9,7 @@ dist/
 .env
 *.pkl
 *.log
+.coverage
 
 # Local reference materials (third-party papers / code; copyrighted, not to publish)
 references/
@@ -17,11 +18,30 @@ scratch/
 # Personal / local-only state — entire .claude dir kept out of the repo
 .claude/
 
+# Session handovers are centralized here but stay local-only (session history,
+# not for the public repo); only the explanatory README is tracked
+docs/handovers/*
+!docs/handovers/README.md
+
+# Local model checkpoints downloaded into the repo root (e.g. Laguna FP8 source)
+fp8/
+/models/
+
 # Local sqlite + worktrees + scratch artifacts
 data/
+# but the GGUF IQ codebook tables are a checked-in runtime asset
+!prismaquant/data/
+!prismaquant/data/iq_grids.pt
 propagated-cost
 paper/scripts/gemini_review_stderr.txt
 dq-runs/
-dq-runs/
-dq-runs/
-dq-runs/
+tmp/
+.tmp/
+
+# Editor swapfiles
+.*.swp
+
+# Staging dirs the probe creates beside the repo when no root is given
+# (sensitivity_probe.py: Path.cwd() / ".prismaquant_tmp"). Test runs leave
+# these behind, and they are never artifacts anyone means to track.
+.prismaquant_tmp/

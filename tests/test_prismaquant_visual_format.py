@@ -20,13 +20,16 @@ from __future__ import annotations
 import json
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 from safetensors.torch import save_file
 
 from prismaquant.allocator import (
     apply_visual_format_override,
+    discover_visual_linear_stats_from_source,
     discover_visual_linears_from_source,
+    validate_source_visual_passthrough_contract,
     _is_visual_linear,
 )
 from prismaquant.export_native_compressed import (
@@ -115,6 +118,84 @@ class TestDiscoverVisualLinearsFromSource(unittest.TestCase):
             "model.visual.blocks.0.attn.qkv",
             "model.visual.blocks.1.mlp.fc1",
         })
+
+    def test_discovery_retains_exact_shape_and_source_dtype(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            name = "model.visual.blocks.0.attn.qkv"
+            save_file(
+                {f"{name}.weight": torch.zeros(
+                    48, 16, dtype=torch.bfloat16
+                )},
+                str(tmp / "model.safetensors"),
+            )
+            stats = discover_visual_linear_stats_from_source(str(tmp))
+        self.assertEqual(stats[name], {
+            "n_params": 48 * 16,
+            "out_features": 48,
+            "in_features": 16,
+            "source_dtype": "bf16",
+            "has_fp8_scale": False,
+            "_nvfp4_weight_only": True,
+        })
+        validate_source_visual_passthrough_contract(stats, "BF16")
+
+    def test_profile_mapping_marks_all_text_excluded_stock_targets_weight_only(self):
+        from prismaquant.allocator import _mark_weight_only_nvfp4_stats
+
+        class _Profile:
+            @staticmethod
+            def checkpoint_to_live_name(name, *, multimodal=False):
+                if name.startswith(("model.audio_tower.", "mtp.")):
+                    return None
+                return name
+
+        stats = {
+            "model.layers.0.mlp.down_proj": {"n_params": 1},
+            "model.audio_tower.proj": {"n_params": 1},
+            "mtp.layers.0.mlp.down_proj": {"n_params": 1},
+        }
+        marked = _mark_weight_only_nvfp4_stats(stats, _Profile())
+        self.assertNotIn(
+            "_nvfp4_weight_only",
+            marked["model.layers.0.mlp.down_proj"],
+        )
+        self.assertTrue(
+            marked["model.audio_tower.proj"]["_nvfp4_weight_only"]
+        )
+        self.assertTrue(
+            marked["mtp.layers.0.mlp.down_proj"]["_nvfp4_weight_only"]
+        )
+
+    def test_non_bf16_source_cannot_receive_bf16_passthrough_budget(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            name = "model.visual.blocks.0.attn.qkv"
+            save_file(
+                {f"{name}.weight": torch.zeros(
+                    48, 16, dtype=torch.float32
+                )},
+                str(tmp / "model.safetensors"),
+            )
+            stats = discover_visual_linear_stats_from_source(str(tmp))
+        with self.assertRaisesRegex(
+            ValueError, "passthrough contract.*incompatible source dtype/scale"
+        ):
+            validate_source_visual_passthrough_contract(stats, "BF16")
+
+    def test_fp8_source_passthrough_requires_scale_sibling(self):
+        stats = {
+            "model.visual.blocks.0.attn.qkv": {
+                "source_dtype": "fp8",
+                "has_fp8_scale": False,
+            },
+        }
+        with self.assertRaisesRegex(
+            ValueError, "passthrough contract.*incompatible source dtype/scale"
+        ):
+            validate_source_visual_passthrough_contract(stats, "FP8_SOURCE")
 
     def test_discover_returns_empty_when_no_visual(self):
         import tempfile
@@ -224,6 +305,20 @@ class TestApplyVisualRecipeQuant(unittest.TestCase):
                                          device=torch.device("cpu"))
         self.assertIn("mtp.fc.weight", out)
         self.assertIs(out["mtp.fc.weight"], src_extra["mtp.fc.weight"])
+
+    def test_quant_failure_raises_instead_of_bf16_passthrough(self):
+        name = "model.visual.blocks.0.attn.qkv"
+        src_extra = {f"{name}.weight": torch.randn(48, 32, dtype=torch.bfloat16)}
+        with patch(
+            "prismaquant.export_native_compressed._quantize_2d",
+            side_effect=ValueError("shape mismatch"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "visual quant failed"):
+                _apply_visual_recipe_quant(
+                    src_extra,
+                    {name: "NVFP4"},
+                    device=torch.device("cpu"),
+                )
 
 
 class TestAllocatorVisualEndToEnd(unittest.TestCase):

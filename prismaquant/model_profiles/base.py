@@ -12,8 +12,8 @@ Each profile captures three kinds of knowledge:
      whether the architecture has MTP heads.
 
   3. **MTP construction**: how to stand up an HF-module replica of the
-     architecture's MTP forward (for Fisher probing), and how to load
-     `mtp.*` safetensors into it.
+     architecture's MTP forward (for Fisher probing), which checkpoint
+     prefix its tensors live under, and how to load them into it.
 
 Profiles are picked per-run by `registry.detect_profile(model_path)`
 from HF config + architectures. Unknown architectures fall back to
@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import re
 from abc import ABC, abstractmethod
+from collections.abc import Iterable
 from pathlib import Path
 
 import torch.nn as nn
@@ -41,6 +42,13 @@ class ModelProfile(ABC):
     `packed_modules_mapping` and `hf_to_vllm_mapper` class attributes.
     """
 
+    #: Detection order — **lower is consulted first**, like a sort rank.
+    #: Built-in profiles declare 100..199 in `registry.py` (the list order that
+    #: used to live in a comment: subsets before supersets). The default 0
+    #: keeps a third-party `register_profile()` ahead of every built-in,
+    #: preserving that function's documented insert-at-front contract.
+    priority: int = 0
+
     def __init__(self) -> None:
         # Lazy-compiled derivations from the vLLM class. Computed on
         # first access so profile construction stays cheap.
@@ -50,6 +58,44 @@ class ModelProfile(ABC):
         self._name_remapper = None
         self._structure_spec = None
         self._structure_spec_loaded = False
+        # What the checkpoint itself declared. Set by `registry._resolve`
+        # right after construction; empty for a hand-built profile, which
+        # keeps every profile's pre-declaration behavior byte-identical.
+        self._declared_model_type: str | None = None
+        self._declared_architectures: tuple[str, ...] = ()
+
+    def declare_config(
+        self,
+        model_type: str | None,
+        architectures: Iterable[str] | None,
+    ) -> None:
+        """Record the `model_type` / `architectures` this checkpoint declares.
+
+        A profile family can cover more than one serving class (a multimodal
+        wrapper and its text-only carve-out), and those classes do not share a
+        namespace. The profile cannot ask the model — it is resolved from a
+        config, before anything loads — so the declaration is handed to it, and
+        `structure_spec()` / `vllm_architecture_class()` may specialize on it.
+        """
+        self._declared_model_type = str(model_type) if model_type else None
+        self._declared_architectures = tuple(
+            str(a) for a in (architectures or ())
+        )
+        # Anything derived from the declaration must be recomputed. A spec
+        # already in hand is re-specialized rather than dropped: `SpecMatchProfile`
+        # injects the exact spec it was built from and must not fall back to a
+        # name-keyed lookup that could bind a different file.
+        if self._structure_spec is not None and self._structure_spec.naming_variants:
+            self._structure_spec = self._structure_spec.for_config(
+                self._declared_model_type, self._declared_architectures
+            )
+        self._vllm_cls = None
+        self._vllm_cls_loaded = False
+        self._name_remapper = None
+        self._fused_matcher = None
+
+    def declared_architectures(self) -> tuple[str, ...]:
+        return self._declared_architectures
 
     # ------------------------------------------------------------
     # Identity + match
@@ -198,6 +244,18 @@ class ModelProfile(ABC):
             return tuple(spec.pinned_names)
         return ("lm_head",)
 
+    def probe_linear_exclude_extra(self) -> str:
+        """Extra regex fragment OR'd into the probe's Linear exclusion.
+
+        For ``nn.Linear`` leaves that exist in the live model but are
+        outside the serving contract's quantizable set (the exporter
+        ships their source bytes on the immutable floor), the probe must
+        not put them in its inventory: on a source-dtype-masked menu
+        they would carry zero legal candidates and trip the allocator's
+        coverage refusal. Empty string means no extra exclusion.
+        """
+        return ""
+
     def is_pinned_name(self, qname: str) -> bool:
         """Return True when ``qname`` is covered by this profile's pins."""
         name = str(qname)
@@ -282,30 +340,153 @@ class ModelProfile(ABC):
         and quantize."""
         return False
 
+    def mtp_source_prefix(self) -> str | None:
+        """Prefix of this architecture's MTP tensors **as keyed in the
+        source checkpoint**, including the trailing dot.
+
+        This is deliberately distinct from `mtp_layer_prefix()` (which
+        keys shard regexes over *recipe* names) because the two can
+        disagree: Qwen3.5/3.6 store the sidecar under `mtp.`, while
+        body-indexed layouts (hy_v3's `model.layers.80.`, DSv4's nextn
+        block) have no `mtp.*` namespace at all. Return None when the
+        architecture has no prefix-keyed MTP sidecar — those families
+        set `has_mtp() -> False` and ship the block through
+        `source_passthrough_prefixes()` instead.
+
+        Spec-expressible as `shard_regexes.mtp_source_prefix`."""
+        spec = self.structure_spec()
+        if spec is not None and spec.mtp_source_prefix is not None:
+            return spec.mtp_source_prefix
+        return "mtp."
+
     def build_mtp_module(self, text_config) -> nn.Module | None:
         """Construct an HF-module replica of the MTP forward (mirrors
         what vLLM's MTP class does at inference time). Return None if
         `has_mtp()` is False.
 
-        The returned module must be wrappable — after `load_state_dict`
-        with the stripped-prefix MTP weights it should forward a hidden
-        state + next-token embed into the MTP block exactly as vLLM does."""
+        **Naming contract.** The returned module's `named_modules()` /
+        `named_parameters()` names, once the module is wrapped in a
+        parent module named `mtp`, must equal the recipe names the
+        allocator assigned — i.e. `mtp.fc.weight`,
+        `mtp.layers.0.self_attn.q_proj.weight`, ... Probe, cost and
+        export all wrap it exactly that way and then key straight into
+        `assignment` / probe stats by the resulting qualified name, so a
+        layout that does not satisfy this silently measures and exports
+        nothing. Two corollaries: the top-level attribute holding the
+        decoder blocks must be `layers` (an `nn.ModuleList`), and the
+        checkpoint keys with `mtp_source_prefix()` stripped must load
+        into it via `load_mtp_state_dict()` below.
+
+        The returned module must also be forwardable — after loading it
+        should take a hidden state + next-token embed and run the MTP
+        block exactly as vLLM does, so Fisher hooks see real gradients."""
         return None
+
+    def read_mtp_source_state_dict(self, model_path: str) -> dict:
+        """Return every source tensor under `mtp_source_prefix()`, with
+        that prefix stripped so keys match `build_mtp_module()`'s layout.
+
+        Generic across architectures: only the shards that actually hold
+        MTP keys are opened, so this stays cheap on a 100-shard
+        checkpoint. Returns `{}` (rather than raising) when the
+        architecture declares MTP but the checkpoint carries no such
+        tensors — some Qwen3.5/3.6 finetunes inherit
+        `num_nextn_predict_layers` from the base config while stripping
+        the weights, and callers detect the empty dict and emit an empty
+        shard artifact. See PR #1."""
+        import torch  # local: keep profile import cost off the CLI path
+
+        prefix = self.mtp_source_prefix()
+        if not prefix:
+            return {}
+        src = Path(model_path)
+        idx_path = src / "model.safetensors.index.json"
+        if not idx_path.exists():
+            raise RuntimeError(f"no safetensors index at {idx_path}")
+        with open(idx_path) as f:
+            weight_map = json.load(f)["weight_map"]
+        mtp_files = sorted({v for k, v in weight_map.items()
+                            if k.startswith(prefix)})
+        if not mtp_files:
+            print(f"[mtp] no {prefix}* weights in safetensors index; "
+                  "returning empty state dict", flush=True)
+            return {}
+        from safetensors.torch import safe_open
+        out: dict[str, torch.Tensor] = {}
+        for fn in mtp_files:
+            with safe_open(str(src / fn), framework="pt") as sf:
+                for key in sf.keys():
+                    if not key.startswith(prefix):
+                        continue
+                    out[key[len(prefix):]] = sf.get_tensor(key)
+        return out
 
     def load_mtp_state_dict(self, mtp_module: nn.Module,
                             raw: dict) -> tuple[list[str], list[str]]:
-        """Load raw `mtp.*` tensors (with `mtp.` stripped) into
+        """Load MTP tensors (source prefix already stripped) into
         `mtp_module`. Return `(unmatched_keys, module_params_without_weight)`.
 
-        Default implementation uses `mtp_module.load_state_dict(raw, strict=False)`."""
-        mapped: dict = {}
-        for k, v in raw.items():
-            mapped[k] = v
+        Exact-name keys go through `load_state_dict(..., strict=False)`.
+        Per-expert checkpoint keys are additionally folded into the
+        module's packed 3D expert Parameters, which is how HF stores a
+        MoE decoder layer and how the checkpoint does not:
+
+            layers.N.mlp.experts.{e}.gate_proj.weight -> ...experts.gate_up_proj[e, :I]
+            layers.N.mlp.experts.{e}.up_proj.weight   -> ...experts.gate_up_proj[e, I:]
+            layers.N.mlp.experts.{e}.down_proj.weight -> ...experts.down_proj[e]
+
+        Dense MTP blocks simply never match that pattern and fall
+        through to the exact-name path."""
         sd = mtp_module.state_dict()
-        mapped_filtered = {k: v for k, v in mapped.items() if k in sd}
-        missing = [k for k in mapped if k not in sd]
-        extra = [k for k in sd if k not in mapped_filtered]
-        mtp_module.load_state_dict(mapped_filtered, strict=False)
+        params = dict(mtp_module.named_parameters())
+        mapped: dict = {}
+        missing: list[str] = []
+        loaded_module_keys: set[str] = set()
+        packed_pat = re.compile(
+            r"^(layers\.\d+\.mlp\.experts)\.(\d+)\."
+            r"(gate_proj|up_proj|down_proj)\.weight$"
+        )
+
+        for k, v in raw.items():
+            if k in sd:
+                mapped[k] = v
+                loaded_module_keys.add(k)
+                continue
+
+            m = packed_pat.match(k)
+            if m is None:
+                missing.append(k)
+                continue
+
+            prefix, expert_id_s, proj = m.groups()
+            expert_id = int(expert_id_s)
+            if proj == "down_proj":
+                packed_name = f"{prefix}.down_proj"
+                packed = params.get(packed_name)
+                if packed is None:
+                    missing.append(k)
+                    continue
+                packed.data[expert_id].copy_(
+                    v.to(device=packed.device, dtype=packed.dtype))
+                loaded_module_keys.add(packed_name)
+                continue
+
+            packed_name = f"{prefix}.gate_up_proj"
+            packed = params.get(packed_name)
+            if packed is None:
+                missing.append(k)
+                continue
+            rows = v.shape[0]
+            start = 0 if proj == "gate_proj" else rows
+            packed.data[expert_id, start:start + rows].copy_(
+                v.to(device=packed.device, dtype=packed.dtype)
+            )
+            loaded_module_keys.add(packed_name)
+
+        # Load exact-name tensors through state_dict for everything that
+        # isn't a packed expert tensor filled manually above.
+        mtp_module.load_state_dict(mapped, strict=False)
+        extra = [k for k in sd if k not in loaded_module_keys]
         return missing, extra
 
     def mtp_objective_example(self) -> str:
@@ -424,7 +605,7 @@ class ModelProfile(ABC):
             misses the 3D-only explode path and fails to route onto
             the fused `w13_weight` / `w2_weight` params.
 
-        Default: split for every non-BF16 format (NVFP4, MXFP8, etc.)
+        Default: split for every non-BF16 format (NVFP4, MXFP8_E4M3, etc.)
         and keep packed for BF16. Profiles can override when their
         vLLM loader has different expectations — for instance, Qwen
         3.5/3.6 would be free to split even at BF16, though there's
@@ -477,6 +658,60 @@ class ModelProfile(ABC):
             return projection_name
         return None
 
+    def vllm_fused_moe_scheme_projection_names(
+        self, param_name: str
+    ) -> tuple[str, ...]:
+        """Per-expert projection names vLLM's FusedMoE scheme detection
+        (`get_moe_method`) and ignore-matching probe at load time.
+
+        vLLM builds synthetic per-expert names ``experts.0.gate_proj`` /
+        ``up_proj`` / ``down_proj`` to look up the FusedMoE quant scheme,
+        regardless of the checkpoint's actual projection names. So
+        compressed-tensors ``config_groups`` targets and ``ignore`` regexes
+        for packed experts must use THESE canonical names — not
+        :meth:`packed_expert_projection_names`, which names the on-disk
+        weights (e.g. LFM2.5's ``w1``/``w3``/``w2``). Using the on-disk
+        names makes vLLM mis-resolve the scheme (it loses the input-
+        activation spec → builds the weight-only NVFP4A16 variant, or marks
+        BF16 experts un-ignored) and the artifact fails to load. The weights
+        themselves still load via the model's expert mapping
+        (``gate_proj``=w1, ``up_proj``=w3, ``down_proj``=w2)."""
+        if param_name == "gate_up_proj":
+            return ("gate_proj", "up_proj")
+        if param_name == "down_proj":
+            return ("down_proj",)
+        if param_name in ("gate_proj", "up_proj", "down_proj"):
+            return (param_name,)
+        # Unknown packed param: fall back to the on-disk projection names.
+        return self.packed_expert_projection_names(param_name)
+
+    def unpacked_expert_projection_names(self) -> tuple[str, ...]:
+        """Per-expert *module attribute* names for UNPACKED MoE experts.
+
+        Applies only to architectures where each routed expert is its own
+        ``nn.Module`` exposing per-projection ``nn.Linear`` attributes (the
+        MiniMax-M2 / Qwen3 / Qwen3.5 MoE layout, e.g. ``.w1``/``.w2``/``.w3``).
+        The batched-Fisher MoE-block detector and the fast-MoE forward swap in
+        the probes use these names to recognize an expert container; if the
+        names don't match, those optimizations silently no-op (probe speed
+        only — per-Linear Fisher still accumulates via the regular hooks).
+
+        Architectures whose live topology is packed into 3D
+        ``gate_up_proj`` / ``down_proj`` tensors have no such attributes and
+        never match the consumers of this accessor, so the default is harmless
+        for them. A declarative structure spec may override via an
+        ``unpacked_expert_projection_names`` field; otherwise the default is
+        the Qwen3/Qwen3.5 standard ``('w1', 'w2', 'w3')``. Profiles whose
+        unpacked experts use different attribute names should override this.
+        """
+        spec = self.structure_spec()
+        declared = getattr(spec, "unpacked_expert_projection_names", None)
+        if declared:
+            names = declared() if callable(declared) else declared
+            if names:
+                return tuple(names)
+        return ("w1", "w2", "w3")
+
     def _fallback_packed_expert_format_groups(self) -> tuple[tuple[str, ...], ...]:
         """Common legacy packed-MoE coupling groups for profiles without specs.
 
@@ -490,6 +725,100 @@ class ModelProfile(ABC):
             ("gate_proj", "up_proj", "down_proj"),
             ("w1", "w2", "w3"),
         )
+
+    def _fallback_packed_expert_role_parents(self) -> dict[str, str]:
+        """Legacy per-expert projection leaf -> packed 3D parent parameter.
+
+        Same role (and same caveat) as
+        :meth:`_fallback_packed_expert_format_groups`: it keeps profiles that
+        declare only the coupled *group* (``w1,w2,w3``) — or no spec at all —
+        answering role questions without moving expert-naming knowledge back
+        into the solver. The map is the standard MoE convention: ``w1`` = gate,
+        ``w3`` = up (both halves of the packed ``gate_up_proj``), ``w2`` = down.
+        New model families should declare ``packed_experts.projection_splits``
+        in the JSON structure spec, which is consulted first.
+        """
+        return {
+            "gate_proj": "gate_up_proj",
+            "up_proj": "gate_up_proj",
+            "w1": "gate_up_proj",
+            "w3": "gate_up_proj",
+            "down_proj": "down_proj",
+            "w2": "down_proj",
+        }
+
+    @staticmethod
+    def _packed_expert_projection_leaf(
+        qname: str,
+    ) -> tuple[str, str, bool] | None:
+        """Split a packed-expert qname into ``(parent, leaf, per_expert)``.
+
+        Accepts both representations the pipeline uses: the packed recipe form
+        ``<parent>.experts.gate_up_proj`` and the split per-expert export form
+        ``<parent>.experts.7.gate_proj``. Returns None for anything that is not
+        an expert projection. Kept identical to the spec-side matcher in
+        ``structure.ModelStructureSpec.packed_expert_format_group`` so a name
+        the spec groups is a name this profile can also name a role for.
+        """
+        parts = str(qname).split(".")
+        try:
+            experts_idx = len(parts) - 1 - list(reversed(parts)).index("experts")
+        except ValueError:
+            return None
+        tail = parts[experts_idx + 1:]
+        parent = ".".join(parts[:experts_idx + 1])
+        if len(tail) == 1:
+            return parent, tail[0], False
+        if len(tail) == 2 and tail[0].isdigit():
+            return parent, tail[1], True
+        return None
+
+    def packed_expert_role_group(self, qname: str) -> str | None:
+        """Serving-ROLE bucket for one packed-expert projection.
+
+        The bucket is the name of the packed 3D parameter the projection is a
+        part of — ``gate_up_proj`` for gate/up (``w1``/``w3``) leaves,
+        ``down_proj`` for down (``w2``) leaves. It is the profile-side answer
+        to "which projections of this MoE layer share a stacked tensor", which
+        is what a serving lane with per-projection expert schemes (GGUF) can
+        give distinct formats. The allocator asks for this instead of parsing
+        expert leaf names itself (see
+        :meth:`_fallback_packed_expert_format_groups` on that boundary).
+
+        Returns None when ``qname`` is not an expert projection at all, and
+        also when it is one whose parent this profile cannot name — a new
+        architecture with unfamiliar expert leaf names. Those two Nones are
+        distinguishable at the only call site that matters: it asks
+        :meth:`packed_expert_format_group` first, so a None here on a name that
+        HAS a packed group key means "role undeclared", which the caller turns
+        into a hard error rather than silently dropping the role split.
+        """
+        parsed = self._packed_expert_projection_leaf(qname)
+        if parsed is None:
+            return None
+        leaf = parsed[1]
+        spec = self.structure_spec()
+        if spec is not None and spec.packed_experts.declared:
+            parent = spec.packed_expert_parent_for_projection(leaf)
+            if parent is not None:
+                return parent
+        if spec is not None and spec.packed_experts.declared:
+            # A leaf that is itself a declared role bucket is its own role.
+            # This is not the same as the packed-parameter case below: an
+            # architecture whose on-disk experts are the unfused leaves
+            # (MiniMax) declares `gate_up_proj` as a role parent in
+            # `projection_splits` without it ever being a real tensor.
+            for parent, _projections in spec.packed_experts.projection_splits:
+                if leaf == parent:
+                    return parent
+        fallback = self._fallback_packed_expert_role_parents().get(leaf)
+        if fallback is not None:
+            return fallback
+        if leaf in self.packed_expert_param_names():
+            # A leaf that IS a packed parameter (unsplit recipe form) is its
+            # own role.
+            return leaf
+        return None
 
     def _packed_expert_group_matches_representation(
         self,
@@ -521,22 +850,10 @@ class ModelProfile(ABC):
         spec = self.structure_spec()
         if spec is not None:
             return spec.packed_expert_format_group(qname)
-        parts = str(qname).split(".")
-        try:
-            experts_idx = len(parts) - 1 - list(reversed(parts)).index("experts")
-        except ValueError:
+        parsed = self._packed_expert_projection_leaf(qname)
+        if parsed is None:
             return None
-        tail = parts[experts_idx + 1:]
-        if len(tail) == 1:
-            parent = ".".join(parts[:experts_idx + 1])
-            leaf = tail[0]
-            split_per_expert = False
-        elif len(tail) == 2 and tail[0].isdigit():
-            parent = ".".join(parts[:experts_idx + 2])
-            leaf = tail[1]
-            split_per_expert = True
-        else:
-            return None
+        parent, leaf, split_per_expert = parsed
 
         for group in self._fallback_packed_expert_format_groups():
             if leaf not in group:
@@ -567,6 +884,70 @@ class ModelProfile(ABC):
         if spec is not None:
             return spec.default_serving_profile
         return None
+
+    # ------------------------------------------------------------
+    # Export-lane eligibility
+    # ------------------------------------------------------------
+    def supported_export_lanes(self) -> tuple[str, ...]:
+        """`EXPORT_CONTAINER` lanes this architecture is actually wired for.
+
+        Lane eligibility is a per-architecture fact, not an operator
+        preference: the CB lane needs the pinned external Gridbook runtime to
+        declare the arch's expert layout in its packaged runtime contract, and the GGUF lane needs
+        a llama.cpp-side arch. Where that wiring is missing the run still
+        *completes* and the artifact serves uninitialised memory — coherent
+        garbage, not a crash (commit `9a79963`, Laguna). So the honest lane
+        set has to be declared where the rest of the architecture's facts
+        live, and this is the reader for it.
+
+        Undeclared architectures get the native compressed-tensors lane only,
+        which is what every one of them has ever shipped through.
+        """
+        from .structure import DEFAULT_EXPORT_LANE
+
+        spec = self.structure_spec()
+        if spec is not None and spec.supported_lanes:
+            return spec.supported_lanes
+        return (DEFAULT_EXPORT_LANE,)
+
+    def preferred_export_lane(self) -> str:
+        """The lane this architecture ships through by default.
+
+        Resolution: the spec's `preferred_lane` if declared; else the native
+        lane when it is supported; else the first declared lane.
+        """
+        from .structure import DEFAULT_EXPORT_LANE
+
+        spec = self.structure_spec()
+        if spec is not None and spec.preferred_lane:
+            return spec.preferred_lane
+        lanes = self.supported_export_lanes()
+        if DEFAULT_EXPORT_LANE in lanes:
+            return DEFAULT_EXPORT_LANE
+        return lanes[0] if lanes else DEFAULT_EXPORT_LANE
+
+    def bypass_hf_fp8_module_rewrite(self) -> bool:
+        """Skip transformers' FP8 pre-load module rewrite for this arch.
+
+        transformers 5.x rewrites a native-FP8 checkpoint's modules before
+        loading. For a `ModuleList`-of-experts MoE (MiniMax-M2/M2.7) that
+        replaces the list with an `FP8Experts` container and then tries to set
+        `experts.0.w1`, which the container does not support. PrismaQuant's
+        streaming loader does not need the rewrite at all: it reads the source
+        FP8 bytes and applies each `weight_scale_inv` block itself in
+        `_read_layer_to_device`, so the live Linear still sees true dequanted
+        bf16 for Fisher/cost math.
+
+        Whether that rewrite breaks is a static property of the architecture's
+        expert container, so it is declared (`staging.bypass_hf_fp8_module_rewrite`)
+        rather than pattern-matched on the model name. The *checkpoint* half of
+        the condition — native FP8 with block scales — stays a config read at
+        the call site (`streaming_model.py`), because it varies per checkpoint.
+        """
+        spec = self.structure_spec()
+        if spec is not None:
+            return bool(spec.bypass_hf_fp8_module_rewrite)
+        return False
 
     def stage_text_only_strip_keys(self) -> tuple[str, ...]:
         """HF config keys to drop when creating a text-only staged
@@ -705,6 +1086,28 @@ class ModelProfile(ABC):
             return spec.lm_head_name
         return "lm_head"
 
+    def embedding_name(self) -> str:
+        """Qualified LIVE name of the input embedding table.
+
+        The twin of :meth:`lm_head_name`, and it exists for the same reason:
+        a consumer that has to single out one structural tensor must ask the
+        profile rather than pattern-match a name. The read-traffic ledger
+        (:mod:`prismaquant.read_traffic`) is the caller — the embedding is the
+        one weight a decode step does NOT stream (it gathers one row per
+        token), so it is the one tensor excluded from per-token read bytes,
+        and "which tensor is the embedding" must be a declaration rather than
+        a substring test.
+
+        Override in ``shard_regexes.embedding_name`` for an architecture that
+        names it otherwise; the value is the live/allocator spelling, not the
+        on-disk one (DSv4 stores ``embed.weight`` but
+        ``checkpoint_to_live_name`` maps it to ``model.embed_tokens.weight``).
+        """
+        spec = self.structure_spec()
+        if spec is not None and spec.embedding_name is not None:
+            return spec.embedding_name
+        return "model.embed_tokens"
+
     def mtp_layer_count(self, cfg: dict) -> int:
         """Count of MTP layers from the HF config. Fall back to
         scanning the safetensors index via `_count_mtp_layers_from_safetensors`
@@ -800,7 +1203,8 @@ class ModelProfile(ABC):
         Default: empty."""
         return []
 
-    def init_rotaries(self, rotary, cfg, device, dtype) -> bool:
+    def init_rotaries(self, rotary, cfg, device, dtype,
+                      base_model=None) -> bool:
         """Optionally populate rotary buffers on a meta-built skeleton.
         Return True if the profile fully handled init (the caller skips
         its default path), or False to fall through to the standard
@@ -809,6 +1213,12 @@ class ModelProfile(ABC):
         DSv4 / Gemma3 return True after registering per-layer-type
         `<name>_inv_freq` buffers (the rotary has a `layer_types` tuple
         like `("main", "compress")`).
+
+        ``base_model`` is the whole skeleton, for architectures whose
+        submodules own additional rotary instances (DSv4's faithful
+        compressor/indexer each carry a ``rotary_emb`` — they RoPE at
+        the compress theta with per-call positions, so the buffers
+        cannot live on the model-level rotary alone).
 
         Default: False (single-rope path)."""
         return False
@@ -820,6 +1230,31 @@ class ModelProfile(ABC):
         (``"main"`` for the top-level layer call) because it carries
         separate ``main_/compress_inv_freq`` buffers. Default: empty."""
         return {}
+
+    def rope_axis_for_layer_type(self, layer_type: str) -> str | None:
+        """Map an attention-schedule layer type to a rope-table key.
+
+        A multi-rope model exposes `rotary.layer_types`, and the streamed
+        per-layer driver selects one table per layer. On Gemma3/Gemma4 those
+        keys ARE attention layer types (`sliding_attention` /
+        `full_attention`), so the lookup is direct and this hook returns None.
+
+        On DSv4-Flash they are not: the rotary's keys are rope AXES
+        (`main` / `compress`) while `config.layer_types` names an attention
+        schedule (`sliding_attention` / `compressed_sparse_attention` /
+        `heavily_compressed_attention`). Two namespaces that never intersect,
+        so a direct lookup misses every layer — and the streamed driver used to
+        answer that miss by silently substituting `main`, which handed 41 of
+        V4-Flash's 46 layers a rope on base 10000 with YaRN disabled where the
+        model's own forward uses 160000 with YaRN. The resulting BF16 teacher
+        scored perplexity 262 and was used to grade a 9.05-PPL student.
+
+        A profile that overrides this MUST resolve the answer from the model's
+        own definition rather than restating the rule, so the streamed pass
+        cannot drift from the forward it reproduces.
+
+        Default: None (rope keys are already attention layer types)."""
+        return None
 
     def expand_hidden_for_layers(self, hidden, base_model):
         """Optionally reshape the post-embedding hidden state before
@@ -842,6 +1277,50 @@ class ModelProfile(ABC):
         (which the layer's `**kwargs` absorbs)."""
         return {}
 
+    # ------------------------------------------------------------------
+    # Cross-layer shared forward state (e.g. Gemma4 KV sharing).
+    #
+    # Some architectures share activations ACROSS layers within one forward
+    # pass — Gemma4's last `num_kv_shared_layers` reuse the K/V computed by
+    # the last non-shared layer of their type (those layers have no v_proj).
+    # PrismaQuant's phase-1 forward is sequential (so a shared dict threaded
+    # through it works), but phase-3 Fisher / cost re-forward each layer in
+    # ISOLATION — a shared layer then has no source for its borrowed state.
+    # These hooks let a profile (a) create per-pass mutable state threaded
+    # through phase-1, (b) snapshot it for reuse, and (c) reconstruct the
+    # per-layer slice for an isolated forward. Defaults are no-ops.
+    # ------------------------------------------------------------------
+    def new_forward_pass_state(self) -> dict:
+        """Mutable kwargs created ONCE per sequential forward pass and
+        threaded into every layer call (so later layers see earlier layers'
+        contributions). Default: none.
+
+        Two contracts an override must keep, because the streaming loops
+        rely on them (`_call_layer(..., pass_state=...)`):
+
+        - Return a FRESH container on every call. The loops call this once
+          per pass; a memoised or class-level dict would leak one
+          calibration batch's state into the next pass.
+        - The mutable containers are the VALUES (e.g. `{"shared_kv_states":
+          {}}`), so `_call_layer`'s shallow kwargs merge keeps them shared
+          by reference across the layers of one pass.
+
+        Default `{}` means no kwarg is added to the layer call at all, so
+        every architecture that doesn't override this is unaffected."""
+        return {}
+
+    def capture_forward_pass_state(self, pass_state: dict):
+        """Snapshot the per-pass state after a full sequential forward, in a
+        form cheap to store (e.g. tensors moved to CPU) and reuse later.
+        Default: nothing to capture."""
+        return None
+
+    def isolated_layer_pass_state(self, captured, layer) -> dict:
+        """Reconstruct the shared-state kwargs a single `layer` needs when
+        forwarded in isolation (phase-3 / cost), from `captured`. Default:
+        none."""
+        return {}
+
     def should_probe_linear(self, name: str, mod) -> bool:
         """Whether to register Fisher hooks on this Linear module.
         DSv4 returns False for `DeepseekV4GroupedLinear` (its weight
@@ -860,6 +1339,115 @@ class ModelProfile(ABC):
             if type(mod).__name__ in skipped:
                 return False
         return True
+
+    def walk_claim_rules(self):
+        """Claim rules for the discovery walker (`prismaquant.model_walk`).
+
+        The walker discovers every named tensor and every matmul-fed
+        parameter by traversal; these rules assign each discovered node one
+        disposition — ``decide``, ``pin(reason)``, or ``exclude(reason)``.
+        A matmul-fed node no rule matches fails the walk with the node named
+        and the op cited, which is the mechanism that keeps the next
+        architecture's ``wo_a`` from shipping silently. Reasons are
+        first-class output: they land on the shipcard, so write them for the
+        reader of a model card, not for grep.
+
+        The base rules, in match order:
+
+        1. **pin** — weights of module classes the profile's spec declares in
+           ``probe_skip_module_class_names``. The probe cannot price them, so
+           they are held at source precision as a *named* debt (this is
+           exactly the ``wo_a`` case: matmul-fed, discovered, unpriced).
+        2. **pin** — ``pinned_names()`` (``lm_head`` and friends).
+        3. **exclude** — the MTP sidecar (``mtp_source_prefix()``), read only
+           under spec decode; dispositioned by the MTP lane.
+        4. **exclude** — the visual/audio tower (``visual_layer_prefix()``),
+           outside the text graph this artifact serves.
+        5. **exclude** — ``nn.Embedding`` weights: consumed by row gather,
+           not by a GEMM; the exporter ships source bytes.
+        6. **exclude** — non-persistent buffers (rotary caches, derived
+           tables): never serialized, so not artifact bytes.
+        7. **exclude** — non-floating tensors (position ids, masks, integer
+           lookup tables): not weights.
+        8. **exclude** — 0-D/1-D floating tensors (norm scales, biases,
+           rotary frequency tables): never a GEMM multiplicand; immutable
+           floor bytes.
+        9. **decide** — every remaining ``nn.Linear`` weight (subclasses
+           included, matched through the MRO): the allocator's domain.
+
+        Override to extend, not to weaken: profiles append architecture
+        rules (or prepend more specific ones) and return the base list for
+        everything the architecture does not special-case. A profile that
+        removes rule 8 turns every Linear into a walk failure, which is loud
+        by design.
+        """
+        from prismaquant.model_walk import ClaimRule
+
+        rules = []
+        spec = self.structure_spec()
+        skip_classes = ()
+        if spec is not None:
+            skip_classes = tuple(spec.probe_skip_module_class_names)
+        for class_name in skip_classes:
+            rules.append(ClaimRule(
+                "pin",
+                f"weight of {class_name}, which the probe skips "
+                "(probe_skip_module_class_names): matmul-fed but unpriced, "
+                "held at source precision as a named debt",
+                module_class=class_name,
+            ))
+        rules.append(ClaimRule(
+            "pin",
+            "profile-pinned (pinned_names): held at source precision by "
+            "this architecture's serving contract",
+            predicate=lambda node: self.is_pinned_name(node.name),
+        ))
+        mtp_prefix = self.mtp_source_prefix()
+        if mtp_prefix:
+            rules.append(ClaimRule(
+                "exclude",
+                "MTP sidecar: read only under spec decode; dispositioned by "
+                "the MTP lane, outside this artifact's quantizable body",
+                name_regex=rf"^{re.escape(mtp_prefix)}",
+            ))
+        visual_prefix = self.visual_layer_prefix()
+        if visual_prefix:
+            rules.append(ClaimRule(
+                "exclude",
+                "visual tower: outside the text graph this artifact serves",
+                name_regex=rf"^{re.escape(visual_prefix)}",
+            ))
+        rules.append(ClaimRule(
+            "exclude",
+            "input embedding: consumed by per-token row gather "
+            "(F.embedding), not by a GEMM; source bytes ship verbatim",
+            module_class="Embedding",
+        ))
+        rules.append(ClaimRule(
+            "exclude",
+            "non-persistent buffer (rotary cache, derived table): never "
+            "serialized, so it is not artifact bytes",
+            kind="buffer",
+            persistent=False,
+        ))
+        rules.append(ClaimRule(
+            "exclude",
+            "non-floating tensor (ids, masks, lookup tables): not a weight",
+            floating=False,
+        ))
+        rules.append(ClaimRule(
+            "exclude",
+            "0-D/1-D tensor (norm scale, bias, rotary table): never a GEMM "
+            "multiplicand; immutable floor bytes",
+            max_ndim=1,
+        ))
+        rules.append(ClaimRule(
+            "decide",
+            "nn.Linear weight in the quantizable graph: allocator decision",
+            module_class="Linear",
+            leaf="weight",
+        ))
+        return rules
 
     def register_vendored_modeling(self) -> None:
         """Called once when this profile is instantiated by
@@ -882,7 +1470,15 @@ class ModelProfile(ABC):
         from .structure import load_structure_spec
 
         if not self._structure_spec_loaded:
-            self._structure_spec = load_structure_spec(self.name)
+            spec = load_structure_spec(self.name)
+            if spec is not None and spec.naming_variants:
+                # A family whose spec declares naming variants is specialized
+                # to whatever THIS checkpoint declared; every other spec is
+                # returned unchanged.
+                spec = spec.for_config(
+                    self._declared_model_type, self._declared_architectures
+                )
+            self._structure_spec = spec
             self._structure_spec_loaded = True
         return self._structure_spec
 

@@ -95,7 +95,16 @@ class TestIncrementalProbe(unittest.TestCase):
         ref = MiniMaxM2Experts()
         fast = MiniMaxM2Experts()
         fast.load_state_dict(ref.state_dict())
-        self.assertEqual(_set_minimax_fast_moe(fast, True, chunk_size=2), 1)
+        # `class_names` now comes from the model profile
+        # (`packed_expert_module_class_names()` -> the spec's
+        # `packed_experts.module_class_names`), replacing the literal
+        # "MiniMaxM2Experts" that used to live in incremental_probe.py.
+        self.assertEqual(
+            _set_minimax_fast_moe(
+                fast, True, chunk_size=2,
+                class_names=("MiniMaxM2Experts",)),
+            1,
+        )
 
         hidden_ref = torch.randn(11, 5, requires_grad=True)
         hidden_fast = hidden_ref.detach().clone().requires_grad_(True)
@@ -167,6 +176,12 @@ class TestPhase3GradCarry(unittest.TestCase):
             import tokenizers  # noqa: F401
         except Exception:
             self.skipTest("transformers/tokenizers not available")
+        if not torch.cuda.is_available():
+            # `incremental_probe.main()` calls `gpu_guard.require_cuda_hot_path`
+            # (GPU-or-bust, no override — see tests/test_gpu_guard.py). This
+            # test exercises the real CLI subprocess, so it needs a real CUDA
+            # device even though the model is tiny and the check is pure math.
+            self.skipTest("CUDA not available")
 
         import json
         import subprocess
@@ -193,7 +208,7 @@ class TestPhase3GradCarry(unittest.TestCase):
                     [sys.executable, "-m", "prismaquant.incremental_probe",
                      "--model", str(model_dir), "--dataset", str(calib),
                      "--nsamples", "4", "--seqlen", "32",
-                     "--device", "cpu", "--dtype", "bf16",
+                     "--device", "cuda", "--dtype", "bf16",
                      "--output", str(out / "probe.pkl"),
                      "--activation-cache-dir", str(out / "act"),
                      "--work-dir", str(out / "work"),

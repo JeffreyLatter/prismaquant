@@ -1,0 +1,88 @@
+{
+  "schema": "prismaquant.lane_spec.v1",
+  "id": "nvfp4_cb",
+  "export_container": "nvfp4_cb",
+  "runtime": "vllm+gridbook_plugin",
+  "description": "NVFP4-CB / FP8-CB codebook container, served by the separately released Gridbook plugin pinned in prismaquant/gridbook_runtime/gridbook_runtime_pin.json. PrismaQuant does not vendor the runtime. Load/generation validation is endpoint-driven and has separate eager and graph receipts because Gridbook is installed in an exact-pinned serving container rather than imported into the build environment.",
+  "serving_profiles": [
+    "nvfp4_cb"
+  ],
+  "endpoint": {
+    "kind": "openai",
+    "base_url": "http://127.0.0.1:8000/v1",
+    "health_path": "/health",
+    "metrics_path": "/metrics"
+  },
+  "serve": {
+    "scripts": [
+      "scripts/serve_dsv4_cb_validate.sh",
+      "scripts/serve_qwen27b_smoke.sh",
+      "scripts/serve_qwen38_cb_a_smoke.sh",
+      "scripts/serve_hy3_smoke.sh",
+      "scripts/serve_hy3_teb.sh",
+      "scripts/serve_laguna_smoke.sh"
+    ],
+    "command": [
+      "bash",
+      "${SERVE_SCRIPT}"
+    ]
+  },
+  "gates": [
+    {
+      "id": "load_generate.eager",
+      "runner": "MODEL=<artifact> scripts/serve_dsv4_cb_validate.sh eager",
+      "shipcard_slot": "native_export.eager",
+      "description": "Fresh exact-pinned Gridbook container, TP=1, fp8 KV, speculative decode off, --enforce-eager, then two identical non-empty greedy completions over the OpenAI endpoint. Fills the eager load/generation slot, then reuses that exact live nonce-bound session for the independently recorded numeric ship gate and refuses unless the current ship_gate slot replays. It makes no gold-quality or performance claim."
+    },
+    {
+      "id": "load_generate.graph",
+      "runner": "MODEL=<artifact> scripts/serve_dsv4_cb_validate.sh graph",
+      "shipcard_slot": "native_export.graph",
+      "description": "A second fresh exact-pinned Gridbook container with --enforce-eager absent, followed by the same endpoint proof and a distinct server-side fingerprint. Eager success cannot stand in for CUDA-graph load/capture/generation success."
+    },
+    {
+      "id": "ship_gate.ppl_p99nll",
+      "runner": "prismaquant.validate_quantized_model --base-url http://127.0.0.1:8000 --shipcard",
+      "shipcard_slot": "ship_gate",
+      "description": "Unchanged from the native lane: same validator, endpoint, and thresholds. For DSv4, serve_dsv4_cb_validate.sh eager invokes it before tearing down the exact nonce-bound server and explicitly verifies the resulting ship_gate slot."
+    },
+    {
+      "id": "gold.kl",
+      "runner": "tools/measure_vllm_full_kl.py --dsv4-gridbook-contract",
+      "shipcard_slot": "gold.kl",
+      "description": "Served KL-vs-BF16 in the plugin serving env. Its BF16 teacher is produced first by tools/build_streamed_full_kl_teacher.py --wikitext-inputs <gold-inputs.json>. Match extension residency across A/B arms: loading a CUDA extension shifts allocator addresses and moves confident-KL by up to 17%."
+    },
+    {
+      "id": "gold.ppl",
+      "runner": "tools/measure_vllm_wikitext_ppl.py --dsv4-gridbook-contract --wikitext-inputs <gold-inputs.json>",
+      "shipcard_slot": "gold.ppl",
+      "description": "Direct WikiText PPL on the served CB artifact using the exact CPU-materialized, value-closed offline token payload."
+    },
+    {
+      "id": "perf.matched_budget_parity",
+      "runner": "python -m prismaquant.validate_cb_performance --shipcard <artifact>/shipcard.json --manifest <paired-manifest.json>",
+      "shipcard_slot": "perf.matched_budget_parity",
+      "description": "Blocking paired single-Spark proof over the predeclared prefill, decode, and mixed matrix. The candidate must meet the strict phase-specific speed floor against the exact inventory-bound container this release displaces under the same whole-artifact byte budget and serving stack. The manifest states this release-comparison scope explicitly; it does not claim that the displaced container is globally fastest. A native-only infeasibility certificate remains independent and does not substitute for served parity."
+    }
+  ],
+  "kl_evaluator": {
+    "kind": "validate_assignments_kl",
+    "entrypoint": "prismaquant.validate_assignments_kl:main",
+    "note": "Reachable on this lane since CB Milestone C (R3): the production cache renders CB rungs imatrix-weighted via --col-weights, so a frontier KL measures the bytes the exporter ships. Selection on this lane is still SURROGATE by default \u2014 validated-frontier CB selection is enabled, not promoted."
+  },
+  "served_activation_quantization": {
+    "executes": [
+      "NVFP4_CB_*",
+      "FP8_CB_*"
+    ],
+    "rationale": "BOTH CB families execute their activation grid on every served route. NVFP4_CB: gridbook QDQs activations to E2M1 at group-16 amax/6 scale before every GEMM -- linear.py `xq = fp4_act_qdq_or_codec(x)` (dense), moe.py `fp4_act_qdq` at all three routed call sites, moe_mixed.py for split-bank stacks, all through codec.py `fp4_group16_act_qdq`, whose docstring says 'W4A4 activation bucket: RTN to E2M1 at group-16 amax/6 scale (mirrors format_registry _make_rtn(fp4_e2m1, 16))'. The 'exact native BF16 bridge' is a GEMM-SCHEDULE statement, not an activation-precision one: the BF16 operand has already been rounded onto the E2M1 grid, and nvfp4_activation_contract.bridge_contract documents that every quality route consumes the exact native QDQ the decode path uses, differing only in GEMM schedule. FP8_CB is genuinely W8A8: linear.py feeds quantized `xq` with per-token dynamic scales into native_cutlass_scaled_mm, and moe.py declares _FP8_GROUPED_CONTRACT = 'fp8_per_token_dynamic'. Source passthrough (FP8_BLOCK_UE8M0_SOURCE) is W8A16 -- fp8_source_w8a16.py: 'Raw block128 FP8 weights with unquantized BF16 activations' -- so it stays absent, as do BF16 and the *_SOURCE verbatim families (their declared act grid is >= 16 bit and prices to zero anyway). History: on 2026-08-17 this entry briefly declared NVFP4_CB's A-side zero by misreading 'exact bridge' as 'activations left exact'; retracted the same day (the runtime was never ambiguous). The shipped DSv4 92 GB body and the shipped Qwen3.8 13 GB artifact were priced with BOTH A-sides and are correct.",
+    "why_this_matters": "This one glob list moves whole-artifact allocations, and fresh cost cards consume it SILENTLY: dense_anchored_cb resolves lane_id='nvfp4_cb' with no flag and no refusal as long as the list is non-empty. The A-side term is what prices the NVFP4_CB-vs-FP8_CB family split (A4 error vs A8 error); under the retracted zero-A4 entry a DSv4 reprice would have moved a 96.8% nvfp4_cb body toward FP8 and crushed the bulk rung K16 -> K12 against no real serving contract, and a fresh Qwen3.8 card would have reproduced the cancelled base-only arm (0.0518 vs the shipped 0.0735 predicted_dloss).",
+    "if_this_changes": "Principle 14: this value states what the serving runtime executes, so it should be DERIVED, not hand-asserted. Gridbook computes per-scheme activation contracts (nvfp4_activation_contract.bridge_contract) but does not yet package them in runtime_contract.json; when it does, add a preflight equality assert against the pinned contract and stop maintaining this list by hand. Until then any edit must cite the runtime call sites the way this entry does. Never edit this to silence a refusal."
+  },
+  "advisory_gates": true,
+  "notes": [
+    "Required CI compares the producer profiles declared CB-eligible with the pinned Gridbook consumer contract; the preflight refuses any mismatch (R6).",
+    "Single-GPU only: the pinned Gridbook contract has no qualified TP path.",
+    "The DSv4 driver pins the Spark image by digest and vLLM commit, installs the tracked released Gridbook commit independently in each arm, refuses speculative decode, enforces a post-load memory floor plus watchdog, and records the server-side serve fingerprint."
+  ]
+}

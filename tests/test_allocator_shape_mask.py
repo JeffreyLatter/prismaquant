@@ -8,7 +8,7 @@ serving-profile shape rules gate each format candidate before the DP sees it.
 These tests pin the known rules so silent kernel changes don't
 regress the shape-mask:
 
-  - CUTLASS mm_mxfp8: N ≥ 128, K ≥ 128, K % 32 == 0
+  - CUTLASS mm_mxfp8: N >= 128, K >= 128, K % 32 == 0
   - CUTLASS mm_nvfp4: K % 16 == 0 (group_size)
   - BF16: no shape constraint
 
@@ -47,6 +47,11 @@ def test_mxfp8_rejects_k_not_divisible_by_32():
 def test_mxfp8_accepts_standard_attention():
     # (5120, 10240) — DeltaNet in_proj_qkv
     assert _format_kernel_supports_shape("MXFP8_E4M3", 5120, 10240) is True
+
+
+def test_mxfp8_accepts_non_multiple_out_features_when_large_enough():
+    # FlashInfer's swizzled scale layout pads N internally; N need not be 128-aligned.
+    assert _format_kernel_supports_shape("MXFP8_E4M3", 5120, 160) is True
 
 
 def test_mxfp8_accepts_mlp_shapes():

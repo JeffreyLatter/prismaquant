@@ -29,6 +29,7 @@ from prismaquant.perturbed_x_cache import (
     calibration_data_hash,
     iter_calibration_forwards,
 )
+from prismaquant.sensitivity_probe import _prismaquant_temp_parent
 
 
 def _unify_fused_max_abs(
@@ -182,6 +183,7 @@ def measure_production_activation_max_abs(
     preload_max_workers: int = 4,
     require_preload: bool = False,
     progress: bool = True,
+    temp_parent: str | Path | None = None,
 ) -> dict[str, float]:
     """Measure activation max-abs under quantized upstream weights.
 
@@ -207,7 +209,12 @@ def measure_production_activation_max_abs(
             require=require_preload,
             progress=progress,
         )
-    with tempfile.TemporaryDirectory(prefix="prismaquant_recache_") as tmp:
+    tmp_parent = Path(temp_parent) if temp_parent is not None else _prismaquant_temp_parent()
+    tmp_parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        prefix="prismaquant_recache_",
+        dir=str(tmp_parent),
+    ) as tmp:
         builder = PerturbedActivationCache(
             model,
             assignment,
@@ -251,16 +258,60 @@ def apply_activation_max_abs_to_cache(
     *,
     metadata: Mapping[str, object] | None = None,
 ) -> None:
-    """Update a ProductionWeightCache with re-fitted activation ranges."""
+    """Update a ProductionWeightCache with re-fitted activation ranges.
+
+    PACKED-expert scales (3-D tensors: several projection params on ONE
+    module plan) are PRESERVED from the cache, never replaced: the recache
+    replay's ``_capture`` records max|module INPUT| under every param name of
+    a module plan, so a packed experts module would record the hidden-state
+    max for BOTH ``gate_up_proj`` and ``down_proj`` — but ``down_proj``'s
+    real input is the routed post-SwiGLU intermediate, a different tensor
+    entirely. The render-time per-projection scales calibrated by
+    ``fill_packed_expert_cache_entries`` (routed rows, correct tensor per
+    projection) are the ones the frontier's real KL validated; silently
+    swapping them at recache would ship a served ``down_proj`` W4A4 input
+    scale selection never measured (principle #8: export must ship the
+    bytes/scales selection rode on). Per-expert-INDEXED names
+    (``...experts.5.down_proj`` — plain nn.Linear modules, DSv4/MiniMax
+    layouts) are NOT preserved: each is its own module plan, so the replay
+    capture is the correct per-projection tensor and the re-fit is the whole
+    point of this stage.
+    """
+    from prismaquant.production_weight_cache import (
+        is_packed_expert_param_qname,
+    )
+
     previous = dict(getattr(production_weight_cache, "activation_max_abs", {}) or {})
-    values = {str(k): float(v) for k, v in activation_max_abs.items() if v > 0}
+    values = {
+        str(k): float(v)
+        for k, v in activation_max_abs.items()
+        if v > 0 and not is_packed_expert_param_qname(str(k))
+    }
+    preserved_expert_scales = 0
+    for key, prev in previous.items():
+        if is_packed_expert_param_qname(str(key)):
+            values[str(key)] = float(prev)
+            preserved_expert_scales += 1
     production_weight_cache.activation_max_abs = values or None
     production_weight_cache.activation_scales = production_weight_cache.activation_max_abs
     meta = dict(getattr(production_weight_cache, "metadata", {}) or {})
     recache_meta = dict(metadata or {})
     recache_meta.setdefault("status", "applied")
     recache_meta.setdefault("n_activation_max_abs", len(values))
-    delta = activation_max_abs_delta_summary(previous, values)
+    if preserved_expert_scales:
+        recache_meta.setdefault(
+            "n_packed_expert_scales_preserved", preserved_expert_scales)
+    # Delta over the RE-FITTED subset only — preserved packed-expert keys are
+    # identical by construction and would dilute the summary to ~1.0 ratios.
+    refit_prev = {
+        k: v for k, v in previous.items()
+        if not is_packed_expert_param_qname(str(k))
+    }
+    refit_new = {
+        k: v for k, v in values.items()
+        if not is_packed_expert_param_qname(str(k))
+    }
+    delta = activation_max_abs_delta_summary(refit_prev, refit_new)
     if delta:
         recache_meta.setdefault("activation_max_abs_delta", delta)
     meta["activation_recache"] = recache_meta
@@ -337,6 +388,7 @@ def recache_production_weight_cache(
     require_preload: bool = False,
     progress: bool = True,
     write_sidecar: bool = True,
+    temp_parent: str | Path | None = None,
 ) -> dict[str, float]:
     """Measure and apply production-faithful activation max-abs values."""
     max_abs = measure_production_activation_max_abs(
@@ -352,6 +404,7 @@ def recache_production_weight_cache(
         preload_max_workers=preload_max_workers,
         require_preload=require_preload,
         progress=progress,
+        temp_parent=temp_parent,
     )
     apply_activation_max_abs_to_cache(
         production_weight_cache,
@@ -366,7 +419,15 @@ def recache_production_weight_cache(
     cache_dir = getattr(production_weight_cache, "cache_dir", None)
     if write_sidecar and cache_dir:
         sidecar = Path(cache_dir) / "activation_max_abs.json"
-        sidecar.write_text(json.dumps(max_abs, indent=2))
+        # Write the APPLIED scales (post packed-expert preservation), not the
+        # raw replay captures — the raw dict carries the wrong-tensor
+        # module-input max under packed down_proj names, and a later
+        # shard-resume rebuild merges this sidecar back into the cache
+        # wholesale ("sidecar wins"). Persisting the rejected values would
+        # re-open the exact resurrection path the apply step closes.
+        applied = dict(
+            getattr(production_weight_cache, "activation_max_abs", {}) or {})
+        sidecar.write_text(json.dumps(applied, indent=2))
         delta = (
             getattr(production_weight_cache, "metadata", {}) or {}
         ).get("activation_recache", {}).get("activation_max_abs_delta")
@@ -434,7 +495,7 @@ def main(argv: list[str] | None = None) -> int:
     from transformers import AutoTokenizer
 
     from prismaquant.calibration_data import _dtype_from_name
-    from prismaquant.model_profiles import DefaultProfile, detect_profile
+    from prismaquant.model_profiles import detect_profile_with_warning
     from prismaquant.perturbed_x_cache import load_text_model_under_work_root
     from prismaquant.sensitivity_probe import load_calibration
 
@@ -478,10 +539,16 @@ def main(argv: list[str] | None = None) -> int:
         args.calib_seqlen,
     )
     assignment = _load_assignment(args.layer_config)
-    try:
-        profile = detect_profile(args.model)
-    except Exception:
-        profile = DefaultProfile()
+    profile = detect_profile_with_warning(
+        args.model,
+        entrypoint="production-recache",
+    )
+    # Per-expert-on-disk MoE loaded via a text-only modeling class leaves the
+    # packed experts zero-initialized (from_pretrained can't pack them); restore
+    # from source so the activation max-abs recapture (incl. the down_proj input
+    # scale) reflects the real routed-expert output. No-op if already loaded.
+    from .layer_streaming import fill_packed_experts_from_source
+    fill_packed_experts_from_source(model, args.model, profile, progress=True)
     max_abs = recache_production_weight_cache(
         model,
         calib_ids,
@@ -498,6 +565,7 @@ def main(argv: list[str] | None = None) -> int:
         require_preload=args.production_cache_prefetch == "require",
         progress=True,
         write_sidecar=not args.no_write_sidecar,
+        temp_parent=work_root,
     )
     compacted = (
         cache.compact_for_pickle()

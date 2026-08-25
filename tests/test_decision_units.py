@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import pytest
 
 from prismaquant import format_registry as fr
 from prismaquant.decision_units import discover_units
 from prismaquant.model_profiles.qwen3 import Qwen3Profile
-from prismaquant.model_profiles.qwen3_moe import Qwen3MoeProfile
 
 
 class _QwenMlp(nn.Module):
@@ -81,6 +81,15 @@ def test_discover_units_uses_model_graph_fused_groups():
     assert down.member_qnames == ("model.layers.0.mlp.down_proj",)
 
 
+def test_discover_units_rejects_cb_without_artifact_wide_accountant():
+    with pytest.raises(ValueError, match="cannot price CB formats"):
+        discover_units(
+            _QwenToy(),
+            Qwen3Profile(),
+            [fr.get_format("NVFP4_CB_K16"), fr.get_format("BF16")],
+        )
+
+
 def test_discover_units_uses_configured_serving_profile_by_default():
     formats = [
         fr.get_format("MXFP4"),
@@ -117,7 +126,7 @@ def test_discover_units_groups_packed_experts_for_cooptimization():
 
     blocks, singletons, n_params = discover_units(
         _QwenMoeToy(),
-        Qwen3MoeProfile(),
+        Qwen3Profile(),
         formats,
     )
     units = _units_by_name(blocks)

@@ -1,12 +1,19 @@
 import pickle
+import os
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 import torch
 import torch.nn as nn
 
-from prismaquant.incremental_measure_quant_cost import merge_cost_pickles
+from prismaquant.incremental_measure_quant_cost import (
+    _run_cost_measurement,
+    _scheduled_probe_targets,
+    cost_shard_is_reusable,
+    merge_cost_pickles,
+)
 from prismaquant.measure_quant_cost import (
     ActivationIndex,
     HDetailIndex,
@@ -79,6 +86,138 @@ class TestIncrementalMeasureQuantCost(unittest.TestCase):
             self.assertEqual(merged["formats"], ["NVFP4"])
             self.assertEqual(merged["meta"]["n_shards"], 2)
 
+    def test_scheduled_probe_targets_scopes_optional_regions(self):
+        stats = {
+            "model.layers.0.self_attn.q_proj": {},
+            "model.layers.0.mlp.experts": {},
+            "model.layers.1.self_attn.q_proj": {},
+            "mtp.layers.0.mlp.experts.down_proj": {},
+            "model.visual.blocks.0.attn.qkv": {},
+        }
+
+        got = _scheduled_probe_targets(
+            stats,
+            [r"model\.layers\.0\."],
+        )
+
+        self.assertEqual(
+            got,
+            {
+                "model.layers.0.self_attn.q_proj",
+                "model.layers.0.mlp.experts",
+            },
+        )
+
+    def test_nonempty_cb_cost_shard_resume_is_fail_closed(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "cb.pkl"
+            payload = {
+                "costs": {
+                    "layer.0": {
+                        "NVFP4_CB_K16": {"output_mse": 1.0},
+                    },
+                },
+                "formats": ["NVFP4_CB_K16"],
+                "meta": {"incremental_shard": {"kind": "body"}},
+            }
+            with path.open("wb") as fh:
+                pickle.dump(payload, fh)
+
+            expected = {"formats": ["NVFP4_CB_K16"]}
+            self.assertFalse(cost_shard_is_reusable(path, expected))
+
+            payload["costs"] = {}
+            with path.open("wb") as fh:
+                pickle.dump(payload, fh)
+            self.assertTrue(cost_shard_is_reusable(path, expected))
+
+    def test_merge_cb_cost_shards_preserves_exact_value_identity(self):
+        from prismaquant.nvfp4_cb_footprint import CBSerializationContext
+        from prismaquant.production_weight_cache import (
+            bind_cb_render_identity_source_weights,
+            build_production_cache_cb_render_identity,
+        )
+
+        fmt = "NVFP4_CB_K16"
+        context = CBSerializationContext.production()
+        col_weights = {
+            "layer.0": torch.arange(256, dtype=torch.float32),
+            "layer.1": torch.arange(256, dtype=torch.float32) + 1,
+        }
+        source_weights = {
+            "layer.0": torch.arange(512, dtype=torch.float32).reshape(2, 256),
+            "layer.1": torch.arange(512, dtype=torch.float32).reshape(2, 256) + 2,
+        }
+
+        def identity(name):
+            value = build_production_cache_cb_render_identity(
+                {name: [fmt]},
+                cb_serialization_context=context,
+                col_weights=col_weights,
+                render_levers={"weighted_vq": True},
+                render_mechanism_plan=[],
+            )
+            return bind_cb_render_identity_source_weights(
+                value,
+                {name: source_weights[name]},
+            )
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            col_path = root / "col.pkl"
+            with col_path.open("wb") as fh:
+                pickle.dump(col_weights, fh)
+            paths = []
+            for index, name in enumerate(("layer.0", "layer.1")):
+                value = identity(name)
+                path = root / f"{index}.pkl"
+                with path.open("wb") as fh:
+                    pickle.dump({
+                        "costs": {name: {fmt: {"output_mse": 1.0}}},
+                        "formats": [fmt],
+                        "provenance": {
+                            "cb_serialized_payload": value[
+                                "cb_serialized_payload"
+                            ],
+                            "cb_render_identity": value,
+                        },
+                        "meta": {},
+                    }, fh)
+                paths.append(path)
+            out = root / "merged.pkl"
+            settings = {
+                "CB_SCALE_CODING": "two_tier",
+                "CB_CODEBOOK_SOURCE": "lattice",
+                "CB_SCALE_SWEEP": "1",
+                "PRISMAQUANT_CB_LDLQ": "0",
+                "PRISMAQUANT_CB_ENCODE_TIER": "balanced",
+                "PRISMAQUANT_CB_COL_WEIGHTS": str(col_path),
+            }
+            with patch.dict(os.environ, settings, clear=False), patch(
+                "prismaquant.measure_quant_cost._CB_CW_CACHE",
+                None,
+            ):
+                merge_cost_pickles(paths, out)
+            with out.open("rb") as fh:
+                merged = pickle.load(fh)
+            render_identity = merged["provenance"]["cb_render_identity"]
+            self.assertEqual(
+                render_identity["col_weights_qnames"],
+                ["layer.0", "layer.1"],
+            )
+            self.assertTrue(render_identity["source_weights_complete"])
+
+            changed = dict(col_weights)
+            changed["layer.1"] = changed["layer.1"].clone()
+            changed["layer.1"][0] += 7.0
+            with col_path.open("wb") as fh:
+                pickle.dump(changed, fh)
+            with patch.dict(os.environ, settings, clear=False), patch(
+                "prismaquant.measure_quant_cost._CB_CW_CACHE",
+                None,
+            ), self.assertRaisesRegex(ValueError, "col_weights identity differs"):
+                merge_cost_pickles(paths, root / "changed.pkl")
+
     def test_batched_cost_matches_unbatched_for_grouped_linears(self):
         torch.manual_seed(0)
 
@@ -111,6 +250,10 @@ class TestIncrementalMeasureQuantCost(unittest.TestCase):
                         "H": torch.rand(4, 16),
                         "g2_per_token": torch.linspace(0.25, 2.0, steps=7),
                         "name": name,
+                        # Audit M9: incremental-style blobs must carry the
+                        # per-token unit marker; unmarked raw "H" blobs are
+                        # refused by HDetailIndex.h_diag_from_blob.
+                        "units": "per_token",
                     },
                     h_dir / safe,
                 )
@@ -215,6 +358,57 @@ class TestIncrementalMeasureQuantCost(unittest.TestCase):
         expected = float((y_err_sq * weights.unsqueeze(1)).mean().item())
         self.assertAlmostEqual(got["fisher_output_mse"], expected, places=6)
 
+    def test_production_render_path_uses_production_renderer(self):
+        model = nn.Module()
+        model.a = nn.Linear(2, 1, bias=False)
+        with torch.no_grad():
+            model.a.weight.copy_(torch.tensor([[1.0, -2.0]]))
+
+        target_names = {"a"}
+        spec = fr.get_format("FP8_E4M3")
+        X = torch.tensor([[0.5, -0.25], [1.0, 2.0]], dtype=torch.float32)
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            act_dir = root / "act"
+            act_dir.mkdir()
+            safe = ActivationIndex._FNAME_SUB.sub("__", "a") + ".pt"
+            torch.save({"inputs": X, "name": "a"}, act_dir / safe)
+            act_cache = ActivationIndex(act_dir, target_names)
+
+            calls = []
+
+            def fake_render(weight, fmt, *, qname, activations, levers, **kwargs):
+                calls.append((fmt, qname, sorted(activations), dict(levers)))
+                return torch.zeros_like(weight)
+
+            with patch(
+                "prismaquant.production_weight_cache.render_production_weight",
+                side_effect=fake_render,
+            ):
+                got = _run_cost_measurement(
+                    model,
+                    act_cache=act_cache,
+                    target_names=target_names,
+                    specs=[spec],
+                    device="cpu",
+                    dtype=torch.float32,
+                    mode="unbatched",
+                    chunk_size=1,
+                    h_detail=None,
+                    log_prefix="[test]",
+                    render_path="production",
+                )["a"][spec.name]
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], "FP8_E4M3")
+        self.assertEqual(calls[0][1], "a")
+        self.assertEqual(calls[0][2], ["a"])
+        self.assertTrue(calls[0][3]["gptq"])
+        self.assertTrue(calls[0][3]["static_act_order"])
+        self.assertEqual(got["render_path"], "production")
+        self.assertGreater(got["output_mse"], 0.0)
+
     def test_fisher_accumulator_writes_mtp_h_detail_and_row_indices(self):
         class TinyMtpWrapper(nn.Module):
             def __init__(self):
@@ -247,7 +441,7 @@ class TestIncrementalMeasureQuantCost(unittest.TestCase):
                 )
                 loss = model(x).pow(2).sum()
                 loss.backward()
-                acc.finalize(tracker=None)
+                acc.finalize(tracker=None, global_tokens=3)
             finally:
                 acc.remove_hooks()
 

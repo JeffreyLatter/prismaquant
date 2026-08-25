@@ -1,9 +1,16 @@
 """DeepSeek-V4-Flash / -Flash-Base profile.
 
 Covers:
-  - DeepseekV4ForCausalLM (671 B params total, 256 routed + 1 shared expert,
-    top-k=6, hybrid HCA/CSA attention with compressor + indexer, MTP head,
-    hyper-connections, hash-routed first 3 MoE blocks).
+  - DeepseekV4ForCausalLM as released in DeepSeek-V4-Flash-0731: ~285 B params
+    total by checkpoint arithmetic, of which 281,263,734,784 are quantizable
+    across 33,325 probeable Linears (probe-measured 2026-08-02, 16x512
+    diverse-v1); 43 layers, 256 routed + 1 shared expert, top-k=6, hybrid
+    HCA/CSA attention with compressor + indexer, MTP head, hyper-connections,
+    hash-routed first 3 MoE blocks. The 671 B figure that previously stood
+    here is the DeepSeek-V3-family headline total and does not describe
+    Flash; the DeepSeek family ships several differently-sized generations
+    and variants, so size claims in this profile are per-checkpoint from the
+    probe inventory, never the family headline.
 
 The DSv4 checkpoint uses a non-standard naming convention compared to the
 transformers `DeepseekV4Model` live module names. PrismaQuant must bridge
@@ -17,8 +24,9 @@ both directions:
   | model.layers.N.self_attn.X              | layers.N.attn.X                      |
   | model.layers.N.self_attn.compressor.X   | layers.N.attn.compressor.X           |
   | model.layers.N.mlp.gate.weight          | layers.N.ffn.gate.weight             |
-  | model.layers.N.mlp.experts.gate_up_proj | layers.N.ffn.experts.{0..255}.{w1,w3}|
-  | model.layers.N.mlp.experts.down_proj    | layers.N.ffn.experts.{0..255}.w2     |
+  | model.layers.N.mlp.experts.E.gate_proj  | layers.N.ffn.experts.E.w1            |
+  | model.layers.N.mlp.experts.E.up_proj    | layers.N.ffn.experts.E.w3            |
+  | model.layers.N.mlp.experts.E.down_proj  | layers.N.ffn.experts.E.w2            |
   | model.layers.N.mlp.shared_experts.X     | layers.N.ffn.shared_experts.X        |
   | model.layers.N.attn_hc.{base,fn,scale}  | layers.N.hc_attn_{base,fn,scale}     |
   | model.layers.N.ffn_hc.{base,fn,scale}   | layers.N.hc_ffn_{base,fn,scale}      |
@@ -27,9 +35,10 @@ both directions:
 Also:
   - shared experts use HF-style `gate_proj`/`up_proj`/`down_proj` in live, but
     the checkpoint stores them as `w1`/`w2`/`w3` (Mixtral convention)
-  - routed experts are PACKED into `gate_up_proj` (E, 2*I, H) and
-    `down_proj` (E, H, I) in the live module; checkpoint stores
-    per-expert separately
+  - the vendored probe topology exposes routed experts as per-expert
+    `nn.Linear` gate/up/down projections, matching the separately stored
+    checkpoint rows; the serving/export profile groups and virtual-packs them
+    as `gate_up_proj` (E, 2*I, H) and `down_proj` (E, H, I)
 
 Important: vLLM main landed DSv4 support today (PR #40860). Once the
 container is rebuilt, set `vllm_architecture_class()` to `"DeepseekV4ForCausalLM"`
@@ -40,12 +49,13 @@ from __future__ import annotations
 
 import re
 
-import torch.nn as nn
-
 from .base import ModelProfile
 
 
 class DeepseekV4Profile(ModelProfile):
+
+    # Detection priority (lower = consulted first): disjoint.
+    priority = 170
 
     @classmethod
     def matches(cls, model_type: str, architectures: list[str]) -> bool:
@@ -78,24 +88,24 @@ class DeepseekV4Profile(ModelProfile):
         )
 
     # ------------------------------------------------------------
-    # MTP — DSv4-Flash has 1 nextn-predict block
+    # MTP — DSv4-Flash has 1 nextn-predict block, NOT quantized (yet)
     # ------------------------------------------------------------
     def has_mtp(self) -> bool:
-        return True
-
-    def build_mtp_module(self, text_config) -> nn.Module | None:
-        # DSv4-Flash's MTPBlock is structurally novel vs. Qwen3.5/3.6's MTP
-        # (multi-stream HC input, separate e_proj/h_proj projections, own
-        # hc_head_{fn,base,scale} collapse params — see the reference
-        # inference/model.py:MTPBlock in the source checkpoint). Until that
-        # block has its own HF-side replica + per-architecture loader, MTP
-        # weights pass through at BF16 via `source_passthrough_prefixes()`
-        # (the "mtp." entry). The probe + cost runners detect the None
-        # return value and write empty shard pickles, so the allocator sees
-        # no mtp.* qnames and `--mtp-format BF16` (the production default)
-        # keeps MTP unquantized end-to-end. Replace this stub with a real
-        # DeepseekV4MtpModule when Fisher-driven MTP quantization is needed.
-        return None
+        # The hy_v3 route (audit R12, 2026-07-30). Until DSv4's nextn
+        # block is actually quantized, PrismaQuant does not probe, cost
+        # or render it: `checkpoint_to_live_name` already drops `mtp.*`
+        # so probe/cost/allocator never see it, and the export ships it
+        # VERBATIM via `passthrough_prefixes` (`"mtp."`, declared in
+        # specs/deepseek_v4.json) so vLLM's nextn spec decode still
+        # loads.
+        #
+        # This replaces a latent contradiction: `has_mtp -> True` with
+        # `build_mtp_module -> None` meant the three production MTP
+        # sites, which imported the Qwen3.5-specific module directly,
+        # would have handed DSv4 a Qwen3.5 decoder layer. Standing up a
+        # real DSv4 MTP module is a `build_mtp_module()` override plus
+        # flipping this back to True — nothing else has to change.
+        return False
 
     # ------------------------------------------------------------
     # Streaming-probe adapters (refactor #32)
@@ -103,6 +113,22 @@ class DeepseekV4Profile(ModelProfile):
     # Centralizes all DSv4-specific streaming logic that was previously
     # scattered across layer_streaming / streaming_model / incremental_probe.
     # ------------------------------------------------------------
+
+    def probe_linear_exclude_extra(self) -> str:
+        # The faithful vendored forward (2026-08-09) instantiates and
+        # loads the compressor + indexer, so their `nn.Linear` leaves
+        # (`self_attn.compressor.{wkv,wgate}`,
+        # `self_attn.indexer.{wkv,wgate,wq_b,weights_proj}` and the
+        # indexer's inner compressor) are now visible to the probe's
+        # enumeration. They stay OUT of the inventory: the gridbook D0.1
+        # serve contract keeps them source-format (weights_proj is read
+        # via `.weight` directly; no CB loader exists for these leaves),
+        # the exporter charges them to the immutable floor, and on this
+        # FP8-source checkpoint BF16 is masked model-wide, so an
+        # inventory row here would carry zero legal candidates and trip
+        # the allocator's coverage refusal. This restores the 33,325
+        # selectable-Linear inventory the byte accounting assumes.
+        return r"self_attn\.(?:compressor|indexer)\."
 
     def checkpoint_to_live_name(self, k: str, *,
                                 multimodal: bool = False) -> str | None:
@@ -164,10 +190,36 @@ class DeepseekV4Profile(ModelProfile):
                 leaf_proj = {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}[leaf_w]
                 return f"model.layers.{layer_idx}.mlp.experts.{exp_idx}.{leaf_proj}{suffix}"
 
-            # Compressor + indexer: drop entirely (modeling patch sets
-            # self.compressor = None for all layers in probe mode).
-            if leaf.startswith("attn.compressor.") or leaf.startswith("attn.indexer."):
-                return None
+            # --- PATCH 02: Compressor + indexer — KEEP (faithful) ---
+            # Prior drop (return None) was tied to modeling:608-625 probe_mode skip.
+            # Faithful forward needs these weights live (model.py:285-440).
+            # Proven mapping per port: local_checkpoint_to_live_name (port:138-148):
+            #   layers.N.attn.compressor.{wkv,wgate,ape,norm.weight}
+            #     → model.layers.N.self_attn.compressor.{wkv,wgate,position_bias,kv_norm.weight}
+            #   layers.N.attn.indexer.{wqb,weights_proj} + inner compressor
+            # This mirrors DESIGN_NOTES §9 weight-map variant.
+            if leaf.startswith("attn.compressor."):
+                # ape in checkpoint is position_bias in live (modeling:428)
+                rest = leaf[len("attn.compressor."):]
+                rest = rest.replace("ape", "position_bias").replace("norm.weight", "kv_norm.weight")
+                return f"model.layers.{layer_idx}.self_attn.compressor." + rest
+            if leaf.startswith("attn.indexer."):
+                # The vendored DeepseekV4Indexer lives on the CSA
+                # compressor (`DeepseekV4CSACompressor.__init__`:
+                # `self.indexer = DeepseekV4Indexer(config)`), NOT on
+                # the attention module — checkpoint indexer keys exist
+                # only for CSA layers. And the checkpoint's
+                # `indexer.compressor.{wkv,wgate,ape,norm.weight}`
+                # tensors live FLAT on the Indexer as
+                # `{wkv,wgate,position_bias,kv_norm.weight}` (the
+                # indexer runs its own scaled-down pooling inline; it
+                # has no inner compressor submodule).
+                sub = leaf[len("attn.indexer."):]
+                if sub.startswith("compressor."):
+                    sub = sub[len("compressor."):]
+                    sub = sub.replace("ape", "position_bias").replace("norm.weight", "kv_norm.weight")
+                return (f"model.layers.{layer_idx}"
+                        f".self_attn.compressor.indexer." + sub)
 
             # `attn.attn_sink` → `self_attn.sinks` (PR #45643's per-head
             # bias buffer attribute name).
@@ -212,7 +264,10 @@ class DeepseekV4Profile(ModelProfile):
 
         Used by both `fp8_scale_pairs` (F8_* filter, for allocator's
         FP8_SOURCE gating) and `nvfp4_scale_pairs` (int8 filter, for
-        load-time NVFP4 dequant)."""
+        load-time NVFP4 dequant). Body weights route through
+        `checkpoint_to_live_name`; deliberately probe-excluded `mtp.*`
+        weights retain their physical checkpoint key so the separate
+        DSpark sidecar producer can decode their source values."""
         import json as _json
         import os as _os
         from collections import defaultdict
@@ -238,6 +293,18 @@ class DeepseekV4Profile(ModelProfile):
             base = ck_key[: -len(".scale")]
             weight_ck = base + ".weight"
             if weight_ck not in weight_keys:
+                # ``mtp.*.scale`` is exclusively the serialized scale
+                # sibling of ``mtp.*.weight``.  The body scanner keeps its
+                # historical best-effort behaviour for unrelated standalone
+                # scales, but an MTP scale without its physical weight would
+                # make the sidecar source undecodable.  Refuse that malformed
+                # namespace at map construction rather than silently dropping
+                # the only scale that can decode a native-FP8 weight later.
+                if ck_key.startswith("mtp."):
+                    raise RuntimeError(
+                        f"DeepSeek-v4 MTP scale {ck_key!r} has no serialized "
+                        f"weight sibling {weight_ck!r}"
+                    )
                 continue
             by_shard[shard].append((ck_key, weight_ck))
 
@@ -255,37 +322,51 @@ class DeepseekV4Profile(ModelProfile):
                         continue
                     weight_live = self.checkpoint_to_live_name(weight_ck)
                     if weight_live is None:
-                        continue
+                        # MTP intentionally stays outside the body/probe
+                        # namespace: ``checkpoint_to_live_name`` must
+                        # continue to drop it while ``has_mtp()`` is false.
+                        # CB sidecar source decode operates on the physical
+                        # checkpoint namespace, however, so retain the
+                        # canonical physical key for an otherwise valid MTP
+                        # weight/scale sibling pair.
+                        if weight_ck.startswith("mtp."):
+                            weight_live = weight_ck
+                        else:
+                            continue
                     out[weight_live] = (
                         _os.path.join(model_path, shard), ck_key)
         return out
 
     def fp8_scale_pairs(self, model_path: str
                         ) -> dict[str, tuple[str, str]] | None:
-        """Live-qname → (shard, scale_ckpt_key) map for *FP8_SOURCE-
-        compatible* weights only (dtype F8_E4M3 / F8_E5M2).
-
-        DSv4-Flash uses `.scale` siblings for two distinct source
-        formats — FP8_E4M3 attention/shared AND NVFP4-packed routed
-        experts (dtype = int8, two fp4 codes per byte). Copying an
-        int8-packed NVFP4 tensor verbatim under the FP8_SOURCE export
-        path would corrupt the output. The NVFP4 packed weights are
-        reported separately via `nvfp4_scale_pairs` so the streaming
-        loader can dequant them while the allocator's FP8_SOURCE
-        manifest stays clean."""
-        return self._scale_pairs_for_dtype(
-            model_path, lambda dt: dt.startswith("F8_"))
+        """Live-qname → (shard, scale_ckpt_key) map for every weight that
+        has a serialized `.scale` sibling the dequant pass must read —
+        DSv4's block-FP8 body AND its NVFP4/MXFP4-packed routed experts
+        alike. Deliberately dtype-agnostic: this answers "does this weight
+        need its scale sibling read", not "which fp8 contract are the
+        bytes" — callers that need to distinguish the two (e.g. the
+        allocator's FP8_SOURCE-vs-MXFP4 source-kind classification in
+        `allocator_candidates.py`) derive that from the checkpoint's own
+        declared dtypes directly, not from membership here. See
+        `nvfp4_scale_pairs` for the I8/U8-only subset."""
+        return self._scale_pairs_for_dtype(model_path, lambda dt: True)
 
     def nvfp4_scale_pairs(self, model_path: str
                           ) -> dict[str, tuple[str, str]] | None:
-        """Live-qname → (shard, scale_ckpt_key) map for NVFP4-packed
-        weights (int8 storage with E8M0 block scales). DSv4-Flash's
+        """Live-qname → (shard, scale_ckpt_key) map for NVFP4/MXFP4-packed
+        weights (int8 or uint8 storage with E8M0 block scales — both
+        spellings hold the same nibble-pack bit pattern, and the packed
+        grid + scale format are validated by shape/config downstream, not
+        by which signedness the checkpoint happened to pick). DSv4-Flash's
         routed experts (`layers.*.ffn.experts.*.w[123].weight`) ship in
-        this format. `_apply_fp8_dequant_inplace`'s NVFP4 detection
-        branch (int8 + scale shape `(out, in*2/32)`) unpacks these at
-        load time."""
+        this format. `_apply_fp8_dequant_inplace`'s NVFP4 detection branch
+        (int8 + scale shape `(out, in*2/32)`) unpacks these at load time;
+        declared-MXFP4 membership (`_declared_mxfp4_names`) additionally
+        needs every scale-paired candidate name visible here regardless of
+        storage dtype, or a uint8-packed declared expert silently drops out
+        of `mxfp4_names` and never reaches the nibble decode."""
         return self._scale_pairs_for_dtype(
-            model_path, lambda dt: dt == "I8")
+            model_path, lambda dt: dt in ("I8", "U8"))
 
     def head_resident_extra_prefixes(self, root) -> list[str]:
         """DSv4 has a HyperHead module at `model.hc_head` that collapses
@@ -297,10 +378,12 @@ class DeepseekV4Profile(ModelProfile):
             return ["hc_head."]
         return []
 
-    def init_rotaries(self, rotary, cfg, device, dtype) -> bool:
-        """DSv4 uses Gemma3's multi-layer-type rotary pattern: separate
-        `main_inv_freq` and `compress_inv_freq` buffers + matching
-        `<name>_attention_scaling` attributes."""
+    @staticmethod
+    def _init_one_rotary(rotary, cfg, device) -> bool:
+        """Register per-layer-type `<name>_inv_freq` buffers on ONE
+        DeepseekV4RotaryEmbedding instance (Gemma3's multi-layer-type
+        pattern: `main_inv_freq` / `compress_inv_freq` + matching
+        `<name>_attention_scaling`)."""
         import torch as _torch
         layer_types = getattr(rotary, "layer_types", None)
         if not (layer_types and getattr(cfg, "rope_parameters", None) is not None):
@@ -338,6 +421,53 @@ class DeepseekV4Profile(ModelProfile):
         Mirrors upstream ``DeepseekV4Model.forward``."""
         return {"layer_type": "main"}
 
+    def init_rotaries(self, rotary, cfg, device, dtype,
+                      base_model=None) -> bool:
+        """DSv4 multi-layer-type rotary init — for the MODEL-level
+        rotary AND every nested instance. The faithful forward gives
+        each compressor and indexer its own `rotary_emb` (they RoPE
+        pool keys / queries at the compress theta with per-call
+        positions), and a meta-built skeleton leaves their inv_freq
+        buffers on meta: "Cannot copy out of meta tensor" at the first
+        CSA forward (probe attempt 4, 2026-08-09). Walk the skeleton
+        and materialize them all."""
+        handled = self._init_one_rotary(rotary, cfg, device)
+        if not handled:
+            return False
+        if base_model is not None:
+            rotary_cls_name = type(rotary).__name__
+            for _name, mod in base_model.named_modules():
+                if mod is rotary:
+                    continue
+                if type(mod).__name__ == rotary_cls_name:
+                    self._init_one_rotary(mod, cfg, device)
+        return True
+
+    def rope_axis_for_layer_type(self, layer_type: str) -> str | None:
+        """Resolve DSv4's attention schedule to one of its two rope tables.
+
+        Delegates to the vendored model so the mapping has exactly one
+        definition: `DeepseekV4Model.forward` selects the axis through the
+        same staticmethod, and a streamed per-layer pass therefore cannot
+        drift from the forward it reproduces. See
+        `DeepseekV4RotaryEmbedding.rope_axis_for_layer_type` for why that
+        matters -- feeding `main` rope to a compressed layer rotates it on
+        base 10000 with YaRN off instead of 160000 with YaRN, an error that
+        grows with position."""
+        # Import through the REGISTERED name: the vendored package's own
+        # `__init__` does `from ...utils import _LazyModule`, a
+        # Transformers-relative import that only resolves once the arch is
+        # installed into `transformers.models`, so importing it by its
+        # `prismaquant.vendored...` path raises ModuleNotFoundError on
+        # `prismaquant.utils`.
+        import importlib
+
+        self.register_vendored_modeling()
+        modeling = importlib.import_module(
+            "transformers.models.deepseek_v4.modeling_deepseek_v4")
+        return modeling.DeepseekV4RotaryEmbedding.rope_axis_for_layer_type(
+            layer_type)
+
     def expand_hidden_for_layers(self, hidden, base_model):
         """Expand single-stream `[B, T, H]` to multi-stream
         `[B, T, hc_mult, H]` (mirrors `DeepseekV4Model.forward`)."""
@@ -365,3 +495,50 @@ class DeepseekV4Profile(ModelProfile):
         sqrtsoftplus ACT2FN, per-expert experts swap)."""
         from ..vendored import register_deepseek_v4
         register_deepseek_v4()
+
+    def walk_claim_rules(self):
+        """DSv4 has four matmul-fed families the base rules cannot claim —
+        every one a bare Parameter (or an out-of-inventory Linear) on a
+        module class the probe's enumeration skips, which is the exact
+        `wo_a` failure class the walker exists to surface. Each is pinned
+        with the reason it ships at source precision; the GroupedLinear
+        (`wo_a`) pin itself comes from the base rules via the spec's
+        `probe_skip_module_class_names`."""
+        from prismaquant.model_walk import ClaimRule
+
+        rules = [
+            ClaimRule(
+                "pin",
+                "MoE router gate: matmul-fed but never priced — a route "
+                "flip is not a smooth cost; held at source precision",
+                module_class="DeepseekV4TopKRouter",
+            ),
+            ClaimRule(
+                "pin",
+                "MoE router gate (hash-routed layer): matmul-fed but never "
+                "priced; held at source precision",
+                module_class="DeepseekV4HashRouter",
+            ),
+            ClaimRule(
+                "pin",
+                "mHC hyper-connection mixer: bare Parameter fed to "
+                "F.linear on a class the probe skips; unpriced, held at "
+                "source precision as a named debt",
+                module_class="DeepseekV4HyperConnection",
+            ),
+            ClaimRule(
+                "pin",
+                "mHC hyper head mixer: bare Parameter fed to F.linear on a "
+                "class the probe skips; unpriced, held at source precision "
+                "as a named debt",
+                module_class="DeepseekV4HyperHead",
+            ),
+            ClaimRule(
+                "pin",
+                "compressor/indexer Linear: the gridbook D0.1 serve "
+                "contract keeps these leaves source-format; charged to the "
+                "immutable floor (see probe_linear_exclude_extra)",
+                name_regex=self.probe_linear_exclude_extra(),
+            ),
+        ]
+        return rules + super().walk_claim_rules()

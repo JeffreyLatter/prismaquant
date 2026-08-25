@@ -75,9 +75,28 @@ def test_cost_payload_rejects_usable_entry_without_error_or_signal():
         validate_cost_payload(payload, "cost.pkl")
 
 
+def test_cost_payload_validates_cost_source_metadata():
+    payload = _cost_payload()
+    payload["costs"]["model.layers.0.mlp.experts.gate_up_proj"]["NVFP4"] = {
+        "predicted_dloss": 0.001,
+        "cost_source": 17,
+    }
+    with pytest.raises(SchemaValidationError, match="cost_source"):
+        validate_cost_payload(payload, "cost.pkl")
+
+
+def test_cost_payload_validates_output_mse_measured_metadata():
+    payload = _cost_payload()
+    payload["costs"]["model.layers.0.mlp.experts.gate_up_proj"]["NVFP4"] = {
+        "output_mse": 0.0,
+        "output_mse_measured": "false",
+    }
+    with pytest.raises(SchemaValidationError, match="output_mse_measured"):
+        validate_cost_payload(payload, "cost.pkl")
+
+
 def test_layer_config_rejects_malformed_dict_entry():
     payload = _layer_config_payload()
     payload["model.layers.0.self_attn.q_proj"] = {"bits": 4}
     with pytest.raises(SchemaValidationError, match="data_type"):
         validate_layer_config_payload(payload, "layer.json")
-

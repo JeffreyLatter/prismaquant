@@ -1,199 +1,216 @@
 # PrismaQuant
 
-**Mixed-precision quantization for large language models, selected on real, end-to-end KL.**
+**Mixed-precision LLM quantization that chooses the right format for every weight matrix, selected on real end-to-end KL — shipped as artifacts that stock inference engines serve on an unforked runtime.**
 
-PrismaQuant generates per-Linear format assignments cheaply with surrogate cost models (Fisher-weighted MSE under a multi-choice knapsack), then **selects the shipping artifact by measuring real KL on a held-out calibration split**. The output is a standard `compressed-tensors` checkpoint that vLLM serves natively — no patches, no custom kernels, no forked runtime.
+PrismaQuant's allocator is **AURA** (*Production-Faithful KL–Fisher Allocation*): a per-Linear cost model built from KL-Fisher probes of the full model multiplied against the *production-rendered* weight error — the exact bytes that ship — solved as a multi-choice knapsack, and gated by real KL measured on a held-out split before anything is published. Three output containers:
 
-```
-vllm serve $WORK_DIR/exported --quantization compressed-tensors
-```
+- **`compressed-tensors`** — vanilla vLLM serves it natively (`vllm serve $WORK_DIR/exported`), no custom kernels. NVFP4 / FP8 / BF16 per Linear, CUTLASS kernels on Blackwell.
+- **GGUF** — llama.cpp *and* vLLM (via the GGUF plugin) serve the same file, again with no PrismaQuant kernels. Full k-quant + IQ menu, per-tensor mixed, imatrix-weighted. This is how a 295B MoE fits on one 128 GB box.
+- **Codebook (`NVFP4-CB` / `FP8-CB`)** — served by **gridbook**, our out-of-tree vLLM quantization plugin, using native CUDA/CUTLASS kernels only. Still an unforked vLLM: install the exact commit in `prismaquant/gridbook_runtime/gridbook_runtime_pin.json`, no core patches; a missing required native operation fails closed. See below.
 
 ---
 
 ## Headlines
 
-**Qwen3.6-27B (PrismaSCOUT) — 11% smaller, 68% lower KL than the previous PrismaQuant ship.**
+All quality numbers below are **served-artifact measurements** (exact vLLM KL-vs-BF16 on held-out text, or deterministic benchmark runs on the served endpoint) — never local screens.
 
-| Artifact | Size | bpp | Held-out KL ($8\!\times\!512$) |
-|---|---:|---:|---:|
-| PrismaQuant v1 (5.5 bpp) | 22.67 GB | 5.50 | 0.0475 |
-| **PrismaSCOUT** (5.31 bpp) | **20.17 GB** | **5.31** | **0.0151** |
-| Change | **−2.5 GB (−11%)** | −0.19 | **−0.0324 (−68%)** |
+**Qwen3.6-27B PrismaAURA 5.5 bpp — tool-use fidelity above full precision.**
 
-Same source weights, same per-tensor toolkit (GPTQ damp sweep, scale sweep, block-output match). Only the selection routine changed. Public artifact: [`rdtand/Qwen3.6-27B-PrismaSCOUT-Blackwell-NVFP4-BF16-vllm`](https://huggingface.co/rdtand/Qwen3.6-27B-PrismaSCOUT-Blackwell-NVFP4-BF16-vllm) (DOI `10.57967/hf/8656`).
+| Artifact | ToolEvalBench (hardmode, temp 0, same seed) |
+|---|---:|
+| **Qwen3.6-27B PrismaAURA 5.5 (23 GB)** | **91 / 100** |
+| Qwen3.6-27B BF16 (full precision) | 86 / 100 |
+| Qwen3.6-27B prior flagship (5.31 bpp) | 85 / 100 |
 
-**Production-faithful polish — provisional, calibration re-measurement in flight.**
+Served KL-vs-BF16 0.0342 — a −40.9% reduction over the prior AURA build at the same bpp, from adding the FP8 middle rung to the menu plus render/export fidelity fixes. [`rdtand/Qwen3.6-27B-PrismaAURA-5.5bit-vllm`](https://huggingface.co/rdtand/Qwen3.6-27B-PrismaAURA-5.5bit-vllm)
 
-A second selection-only upgrade evaluates candidate format flips against the export-aligned per-Linear weight path (joint NVFP4 sibling-coherent input global scales, GPTQ reconstruction, scale sweep, and calibrated activation clip; block-output match remains on the export-only side). On Qwen3.6-27B it drops the polish-time KL from `0.0151` to `0.0054` at `5.39` bpp, on a matched 2×128 token calibration. **A re-measurement on the larger 8×512 split is in flight; treat the 0.0054 number as a polish-time signal until that completes.**
+**Ornith-1.0-35B-A3B PrismaAURA 4.75 bpp — 70 GB → 23 GB, KL 0.0143.**
 
-**Qwen3.6-35B-A3B at 4.75 bpp — wins 8 of 9 zero-shot metrics vs uniform NVFP4.**
+Served confident KL-vs-BF16 **0.0143** (top-1 agreement 98.6%), with a grafted MTP head for speculative decoding (91.3% acceptance at position 0). [`rdtand/Ornith-1.0-35B-PrismaAURA-4.75bit-vllm-MTP`](https://huggingface.co/rdtand/Ornith-1.0-35B-PrismaAURA-4.75bit-vllm-MTP)
 
-| Task | BF16 | **PrismaQuant** | RedHatAI NVFP4 | Δ vs RedHat |
-|---|---:|---:|---:|---:|
-| arc_easy | 81.23 | **80.72** | 77.61 | **+3.11** (2.6σ) |
-| arc_challenge | 54.86 | **54.35** | 51.79 | **+2.56** |
-| piqa | 82.21 | **81.94** | 80.79 | **+1.14** |
-| hellaswag (norm) | 83.47 | **82.91** | 82.21 | **+0.70** |
-| winogrande | 75.69 | **73.48** | 70.80 | **+2.68** |
+**Qwen3.6-35B-A3B 4.75 bpp — wins 8 of 9 zero-shot metrics vs uniform NVFP4.**
 
-Mean Δ vs BF16: **−0.56 pp** for PrismaQuant, **−2.21 pp** for uniform NVFP4 (~4× closer to BF16). Ships 2 GB smaller. The over-aggression failure mode of uniform NVFP4 — collapsing the ~5% of genuinely sensitive Linears — shows up directly in numbers.
+Against RedHatAI's uniform NVFP4 quantization (342 hand-picked BF16 ignores), the measured allocation ships **2 GB smaller with ~90 fewer Linears in BF16** and lands ~4× closer to BF16 on mean zero-shot delta (−0.56 pp vs −2.21 pp). Uniform precision collapses the ~5% of genuinely sensitive Linears; measurement finds them. [`rdtand/Qwen3.6-35B-A3B-PrismaQuant-4.75bit-vllm`](https://huggingface.co/rdtand/Qwen3.6-35B-A3B-PrismaQuant-4.75bit-vllm)
+
+**Tencent Hy3 295B-A21B → 103.7 GB GGUF — serves on a single DGX Spark.**
+
+A 295B/21B-active MoE quantized from the BF16 source to 2.80 bpp by measured allocation over the GGUF k-quant + IQ menu (streaming probe — the model never fits in memory; byte-budget selection targets the box, not a curve heuristic). **No quality claims** — models at this scale can't be KL-validated against their BF16 teacher on the target hardware; validation is load + coherent-generation smokes and bit-exact packing. [`rdtand/Hy3-295B-A21B-PrismaQuant-2.8bit-gguf-vllm`](https://huggingface.co/rdtand/Hy3-295B-A21B-PrismaQuant-2.8bit-gguf-vllm), plus a [5.3-bit `compressed-tensors` variant with MTP for two Sparks](https://huggingface.co/rdtand/Hy3-295B-A21B-PrismaQuant-5.3bit-2xSpark-vllm).
+
+The artifact family is at **~400k downloads** on Hugging Face ([`rdtand`](https://huggingface.co/rdtand)).
 
 ---
 
 ## Quick start
 
+**compressed-tensors lane (vLLM):**
+
 ```bash
-export MODEL_PATH=/path/to/Qwen3.6-35B-A3B
-export WORK_DIR=./dq-runs/qwen36
-export FORMATS=NVFP4,MXFP8_E4M3,BF16
+export MODEL_PATH=/path/to/model
+export WORK_DIR=./dq-runs/mymodel
+export FORMATS=NVFP4,FP8_DYNAMIC,BF16   # the production menu — FP8 belongs in every recipe
 export TARGET_BITS=4.75
+# COST_MODE=aura is the DEFAULT since 2026-07-30 (KL-Fisher x production-rendered dW);
+# set COST_MODE=production-render-score to reproduce pre-flip artifacts.
+export SELECTION_MODE=validated-surrogate  # real-KL frontier selection (default: surrogate)
+
+./prismaquant/run-pipeline.sh
+vllm serve $WORK_DIR/exported --quantization compressed-tensors
+```
+
+**GGUF lane (llama.cpp + vLLM):**
+
+```bash
+export EXPORT_CONTAINER=gguf TARGET_PROFILE=gguf COST_MODE=local
+export PRODUCTION_CACHE=0 PRODUCTION_RECACHE=0
+export FORMATS=IQ2_XS,IQ3_XXS,IQ4_XS,Q4_K,Q5_K,Q6_K,Q8_0
+export TARGET_BITS=2.9
 
 ./prismaquant/run-pipeline.sh
 ```
 
-Runs `probe → cost → allocator → native export` end-to-end; produces a `compressed-tensors` checkpoint at `$WORK_DIR/exported/`. Serve:
+Every stage is also runnable on its own; the allocator takes the same menu as a
+flag, so a re-solve against existing probe/cost artifacts needs no re-measurement:
 
 ```bash
-vllm serve $WORK_DIR/exported \
-  --quantization compressed-tensors \
-  --trust-remote-code \
-  --kv-cache-dtype fp8 \
-  --attention-backend flashinfer \
-  --enable-prefix-caching \
-  --speculative-config '{"method":"mtp","num_speculative_tokens":3}'
+python -m prismaquant.allocator --formats NVFP4,FP8_DYNAMIC,BF16 \
+  --probe      $WORK_DIR/artifacts/probe.pkl \
+  --costs      $WORK_DIR/artifacts/cost.pkl \
+  --layer-config $WORK_DIR/artifacts/layer_config.json \
+  --pareto-csv $WORK_DIR/artifacts/pareto.csv \
+  --target-bits 4.75
 ```
 
-For models too large to fit in RAM (200B+ MoE), PrismaQuant has a streaming layer-by-layer path that keeps peak memory bounded — no full-model load is ever required. Used in production for MiniMax M2.7 (228B) and DeepSeek-V4-Flash (671B).
-
-For PrismaSCOUT-style validated-frontier selection on a probed model:
-
-```bash
-python -m prismaquant.iterate_perturbed_allocation --help
-```
-
-For production-faithful polish around a chosen assignment:
-
-```bash
-python -m prismaquant.polish_from_assignment \
-  --model /path/to/source --payload payload.json \
-  --assignment chosen_knee.json --output polished.json \
-  --production-weight-cache prod.pkl \
-  --delta-quantize \
-  --n-calib-samples 8 --calib-seqlen 512
-```
+The pipeline runs probe → cost → allocator → export → serve-smoke end-to-end, with fail-fast gates on any configuration that would break the measurement contract (it will tell you exactly why and what to set). Models too large for memory (200B+ MoE) run the streaming layer-by-layer path — peak memory is bounded by ~1 layer + a tunable cache.
 
 ---
 
-## How it works
+## How AURA works
 
-Mixed-precision quantization decomposes naturally into two questions: **how should each Linear be rounded** (per-tensor toolkit — GPTQ, AutoRound, scale sweep) and **how many bits should each Linear get** (allocator). The first question is well-studied; the second is where PrismaQuant operates.
+Mixed-precision quantization splits into two orthogonal questions:
 
-The classical answer is to assign a per-Linear sensitivity score and pack a multi-choice knapsack under a total-bit budget. This is the v1 PrismaQuant pipeline:
+- **Local (well-studied):** given a fixed format, how do you round this one Linear best? GPTQ, scale search, activation ordering — the per-tensor toolkit runs *under* whatever format is chosen.
+- **Global (PrismaQuant's contribution):** how many bits should each Linear get, and in which hardware format? A per-Linear allocation of a total bit budget across the format menu.
 
-$$\Delta\mathrm{loss} \approx \tfrac{1}{2} \cdot H_\mathrm{trace} \cdot \mathrm{MSE}_W$$
+AURA answers the global question with three commitments:
 
-`H_trace` is the empirical Fisher diagonal trace (one calibration pass), `MSE_W` is the measured per-format round-trip error on the actual weights, and the knapsack is solved in seconds. **Each bit goes where it buys the most likelihood.**
+**1. A KL-faithful per-Linear cost.** The classical additive cost is `½ · H_trace · MSE_W` — a Fisher-diagonal trace times weight round-trip error. AURA replaces both halves: the sensitivity comes from KL-Fisher probes of the full model (the adjoint of the end-to-end KL objective, not a layer-local proxy), and the error term is measured on the **production-rendered** weights — GPTQ, joint scale optimization, activation ordering, the exact render that ships — not a raw round-trip. On served A/Bs at matched bpp this cost beats the strong `h_trace × output_mse` baseline by **−38% KL on a 4B model and −17.9% on 27B** (replicated across two calibration corpora).
 
-The structural problem with that pipeline, observed across the mixed-precision allocation literature: per-Linear sensitivity scores are **biased estimators of joint quantization error**. When the allocator commits many flips at once, the additive surrogate's predicted loss systematically overshoots the measured KL by 30–50%. **CLADO** (Deng et al. 2023, [arXiv:2307.05657](https://arxiv.org/abs/2307.05657)) is the foundational treatment of this: it measures the residual pairwise quantization-error coupling between Linears on a small data subset and solves the resulting integer quadratic program directly. HAWQ-V3 uses second-order ILP; CoopQ takes a cooperative-game view. PrismaSCOUT takes a different tack:
+**2. Production-faithfulness as an invariant.** The cost the allocator measures, the KL the validator measures, and the bytes the exporter ships all come from **one weight cache** — no rendering confound anywhere in the loop. On the GGUF lane the same contract holds through the imatrix: the calibration weighting used to measure a format's cost is byte-identical to the weighting used to pack it (enforced bit-exact against gguf-py, the llama.cpp reference decoder).
 
-> **Surrogates generate, real KL selects.**
+**3. Surrogates generate, real KL selects.** The additive surrogate is a candidate generator, never the ship decision. The allocator renders a Pareto sweep of candidates, each is measured with **real end-to-end KL on a held-out split** (disjoint from everything the cost stage saw), and the shipping point is picked on the measured `(bpp, KL)` frontier. Outside the surrogate's trust region, bpp order ≠ KL order: on the 27B, the surrogate's own knee picks 5.86 bpp / KL 0.056 while validated selection picks 5.31 bpp / KL 0.015 — smaller *and* 3.7× better, which is what end-to-end measurement buys over trusting the model of the cost.
 
-PrismaSCOUT keeps the additive surrogate as a cheap candidate generator but routes every shipping decision through a real, end-to-end KL measurement on a held-out calibration split. The selection algorithm is a multi-level cost cascade:
+**MoE hybrid.** Smooth per-Linear costs are structurally blind to router flips: quantizing a routed expert can change *which* experts fire, and no local error term sees that. AURA therefore allocates non-expert weights from the smooth cost and packed routed experts from **measured empirical unit-KL** (each expert-tier choice scored end-to-end), merged into one knapsack.
 
-- **L1 — probe.** Fisher-weighted MSE per `(Linear, format)`. Solve additive DP at the target budget. CPU-seconds.
-- **L2 — perturbed-X fixed point.** Install activation hooks under the L1 assignment, cache calibration activations, re-measure per-`(Linear, format)` MSE under the perturbed activation distribution, re-solve the DP. Iterate to weighted-Hamming convergence. ~3 passes.
-- **L3 — propagated end-KL.** Select a bounded neighborhood of uncertain Linears, measure paired BF16/candidate end-KL on each, solve a frozen DP over the L3 measurements at the budget.
+**What we measured and dropped.** The cross-layer-interaction literature (CLADO's pairwise IQP, HAWQ-V3's second-order ILP, cooperative-game formulations) models the coupling between Linears. We built the full L2 perturbed-activation cascade and ran the head-to-head on the served metric: cross-layer modeling bought **−1.5%**; AURA's better per-Linear cost bought **−38.5%** on the same A/B. Per-Linear cost fidelity was the lever; interaction modeling was not. That experiment — and the rest of the rejected-methods catalog (pairwise QUBO, Lagrangian λ-bisection as a selector, top-K Hessian covering, polish DPs that regress under the real-KL gate) — is documented in the paper. Negative results are recorded with their durable lesson; we don't re-litigate them silently.
 
-A **validated-frontier kneedle** runs the cascade at multiple anchor budgets, validates each candidate on the held-out split, filters by `η`-dominance, and selects the elbow on measured `(bpp, KL)`. A **monotone coordinate-descent polish** then perturbs the chosen assignment locally and accepts only flips that strictly improve real KL — provably non-regressive on the polish-time evaluator.
-
-The **production-faithful polish** is the most recent refinement: instead of evaluating polish flips on RTN-quantized proxy weights (which the v1 polish did), it evaluates on the export-aligned per-Linear weight path (joint NVFP4 sibling-coherent input global scales, GPTQ, scale sweep, calibrated activation clip; block-output match remains export-only). The polish move set is a set of **Block-CLADO decision units** — fused-sibling Linears (e.g., `q/k/v` in attention, `gate_up/down` in MoE) grouped into atomic flip targets, following the structural framing of CLADO (Deng et al. 2023). A delta-quantize `WeightSession` swaps one decision unit's weight in place per trial instead of cloning the model, which makes the polish tractable on a 27B model under a 121 GB UMA budget.
-
-For full method derivations, the `_GradNormCapture` MoE Fisher estimator, the L3 paired-baseline construction, the calibration-disjointness discipline, and the rejected detours we considered (Lagrangian λ-bisection, sandwich proximal recalibration, block-DP over architectural cliques, sparse pairwise QUBO, top-K Hessian covering): see [`paper/main.pdf`](paper/main.pdf) and the source comments in `prismaquant/`.
+Full derivations, the additivity/cancellation analysis, and the served evidence: [`paper/main.pdf`](paper/main.pdf).
 
 ---
 
 ## Pipeline
 
 ```
-sensitivity_probe ──► probe.pkl     (Fisher H_trace per Linear + router statistics)
+incremental_probe ──────► probe.pkl        (KL-Fisher sensitivity per Linear; streaming for 200B+)
         │
-measure_quant_cost ─► cost.pkl      (per-(Linear, format) MSE — L1)
+cost stage ─────────────► cost.pkl         (COST_MODE=aura: KL-Fisher × production-rendered dW;
+        │                                   MoE hybrid merges measured expert unit-KL)
+allocator ──────────────► layer_config.json + Pareto candidates
+        │                                  (multi-choice knapsack; fused-sibling & packed-MoE
+        │                                   format coherence via union-find promotion)
+validate_assignments_kl ► held-out real-KL per candidate
+select_validated_frontier► the shipping point, picked on measured (bpp, KL)
         │
-iterate_perturbed_allocation ─► validated_frontier.json   (L2 fixed point + L3 propagated KL,
-        │                                                  validated kneedle, leave-one-out guard)
+export ─────────────────► exported/        (compressed-tensors  OR  GGUF via export_gguf)
         │
-polish_from_assignment ─► polished.json   (production-faithful polish from a low-bpp floor
-        │                                  with delta-quantize WeightSession)
-        │
-export_native_compressed ─► exported/     (compressed-tensors checkpoint)
-        │
-validate_native_export   ─► vLLM forward + greedy decode + perplexity gate
+validate_native_export ─► engine load + greedy-decode smoke (eager and graph mode)
+validate_quantized_model► PPL / p99 per-prompt NLL / MTP-acceptance ship gate
 ```
 
-For models that don't fit in RAM, the probe and cost stages run in **incremental streaming mode**: layers are loaded from disk one at a time, hooked, measured, unloaded. Peak memory is bounded by `~1 layer + a tunable cache`. Multi-chunk calibration (run probe N times across calibration shards, merge) lets you trade wall time for signal.
+Every hot path is GPU-bound by design; the pipeline refuses to run on CPU.
 
 ---
 
-## Supported formats
+## Formats
 
-| Family | Formats |
-|--------|---------|
-| NVIDIA microscaling | NVFP4, NVFP4A16 |
-| MX (Open Compute) | MXFP4, MXFP6_E3M2, MXFP6_E2M3, MXFP8, MXFP8A16 |
-| Integer | INT8_W8A16, INT4_W4A16_g128 |
-| Native passthrough | BF16, FP8_SOURCE (preserves natively-FP8 source weights byte-exact) |
+**compressed-tensors container (vLLM-native):**
 
-Hardware support:
+| Format | Role |
+|---|---|
+| NVFP4 | W4A4, group-16 FP8 block scales; CUTLASS on Blackwell — the 4-bit workhorse |
+| FP8_DYNAMIC / FP8_E4M3 | the 8-bit rung — on the menu in every production recipe; it's what bends the rate-distortion curve into a knee |
+| BF16 | passthrough only (never synthesized from a quantized source) |
+| FP8_SOURCE | byte-exact passthrough of natively-FP8 checkpoints (lossless at ~8 bpp) |
+| MXFP4/6/8, INT4/INT8, NVFP4A16 | registry-supported research rungs, excluded from defaults where a served kernel or a Pareto case is missing |
 
-|              | Blackwell (SM100+) | Ampere/Ada | vLLM serving today |
-|--------------|:------------------:|:----------:|:------------------:|
-| NVFP4        | ✓ (CUTLASS)        | Marlin emu | ✓                  |
-| MXFP4        | ✓ (CUTLASS)        | Marlin emu | ✓                  |
-| MXFP6        | ✓ (native)         | —          | ✗ (kernel pending) |
-| MXFP8 / FP8  | ✓ (CUTLASS)        | ✓          | ✓                  |
-| INT4 / INT8  | all NV             | all NV     | ✓ (Marlin)         |
+**GGUF container (llama.cpp + vLLM GGUF plugin):**
 
-Recommended bundle for shipping today: `--formats NVFP4,MXFP8_E4M3,BF16`. The allocator is constraint-aware: it never picks a format vLLM can't serve.
+| Format | bpw |
+|---|---|
+| Q2_K / Q3_K / Q4_K / Q5_K / Q6_K / Q8_0 | 2.625 / 3.44 / 4.5 / 5.5 / 6.56 / 8.5 |
+| IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS / IQ3_S / IQ4_XS / IQ4_NL | 2.06 – 4.5 (E8-lattice codebooks; the sub-Q2_K regime) |
 
----
-
-## Supported architectures
-
-First-class profiles ship today:
-
-- **Qwen3.5 / Qwen3.6** (dense + packed-3D MoE + MTP heads)
-- **MiniMax M2 / M2.7** (nested per-expert MoE, native FP8 source)
-
-Active integration:
-
-- **DeepSeek-V3 / V3.1**
-- **DeepSeek-V4-Flash** (waiting on `transformers` class)
-- **GLM-4**
-
-Adding a new architecture is a `model_profiles/` registration: declare the layer module path, the MoE structure (nested vs packed), the fused-sibling groups, and any pre-staging quirks. Most architectures land in 100–200 LoC.
+GGUF quantizers are PrismaQuant's own GPU implementations (imatrix-weighted grid/least-squares search, exhaustive codeword search for IQ), validated bit-exact against gguf-py. GPTQ-under-frozen-scales is available for the k-quants as a research lever. The allocator is serving-profile-aware in both containers: it never picks a format the target engine can't serve at that tensor's shape.
 
 ---
 
-## Status
+## Codebook lane (gridbook)
 
-Active development. The 27B PrismaSCOUT ship is the current public artifact. Active workstreams:
+Below NVFP4's 4.5 bpw floor the vLLM-native menu runs out of rungs, and the GGUF IQ formats that fill the gap carry a large prefill tax on this hardware. The **NVFP4-CB / FP8-CB** product-codebook formats open measured 2–6 bpw rungs with a served kernel behind them: the resident weight is a packed k-bit index stream plus a tiny shared codebook. Native CUDA decodes small-M work directly; larger-M quality paths use only bounded per-layer transient expansion consumed by CUTLASS, so no dense `[N,K]` weight remains resident.
 
-- **Production-faithful polish on 27B** — export of the 5.39 bpp polished artifact in flight at time of writing; downstream task evals (validator perplexity, GSM8K, IFEval, MMLU, tool-eval-bench) and 8×512 KL re-measurement queued.
-- **MiniMax M2.7 at ~90 GB on Spark** — v22 throughput optimizations landed; probe + cost in flight.
-- **DeepSeek-V4-Flash** — blocked on transformers `DeepseekV4ForCausalLM`; mirror flow ready.
-- **Per-channel Fisher + per-channel weight MSE** — research; preserves the knapsack's optimal substructure at <10 MB extra storage per 35B model.
+Serving is the separately released [`gridbook`](https://github.com/RobTand/gridbook) package: an out-of-tree vLLM quantization plugin (registry key `gridbook`, legacy read alias `prismaquant`) with zero vLLM-core patches. PrismaQuant 0.8.0 pins Gridbook **0.8.0** at exact commit `9011a19228ddb96b8a49e11a20ac75c99c83998e`. That runtime JIT-builds its native CUDA support kernels and CUTLASS GEMM/grouped-GEMM kernels at model load, attests every required operation and shape before the first forward, and fails closed if the native path is unavailable. It has no Gridbook Triton dependency, dispatch arm, or serving fallback, and it bypasses vLLM's fallback-capable convenience wrappers. Export is `EXPORT_CONTAINER=nvfp4_cb` (`prismaquant/export_nvfp4_cb.py`). PrismaQuant contains no copy of the runtime: its only supported integration source is the immutable commit in `prismaquant/gridbook_runtime/gridbook_runtime_pin.json`, and CI compares producer profiles/rungs/layouts to that install's packaged `runtime_contract.json`. Gridbook may publish the same source as a release, but PrismaQuant serving and validation never replace the commit pin with a moving or merely version-matched package request. DeepSeek-V4/DSV4 remains absent from that consumer contract and is not qualified by this release.
 
-The full paper draft is at [`paper/main.pdf`](paper/main.pdf) — includes the methodology section on rejected detours (Lagrangian λ-bisection, sandwich proximal recalibration, block-DP, sparse pairwise QUBO, top-K Hessian covering, surrogate-only knee, probe-only knee predictor) and an honest accounting of downstream regressions on the shipped 27B artifact.
+Public artifact: [`rdtand/Hy3-295B-A21B-gridbook-2.9bit-vllm`](https://huggingface.co/rdtand/Hy3-295B-A21B-gridbook-2.9bit-vllm) — 295B/21B-active at 2.9 bpw on **one** DGX Spark, prefill 89 tok/s against the same model's GGUF IQ artifact at 42 tok/s. No directional quality claim at this scale, same as the GGUF lane. Lane record: [`docs/lanes/nvfp4-cb/`](docs/lanes/nvfp4-cb/).
 
 ---
 
-## Why PrismaQuant beats stronger algorithms with weaker scope
+## Architectures
 
-A common reaction: "AutoRound is a better rounding algorithm — why does PrismaQuant win?" Because that's the wrong comparison. AutoRound is a single-format rounder; PrismaQuant operates one level up.
+First-class profiles in-tree:
 
-PrismaQuant is a **format allocator** that composes on top of any rounding algorithm. The `FormatSpec` for each format carries its own `quantize_dequantize` function — drop in AutoRound's sign-gradient-descent rounding for the integer formats and you still get per-Linear mixed-precision selection on top. The bit budget goes farther at the same Pareto point, regardless of which rounding strategy fills each Linear.
+- **Qwen3 / 3.5 / 3.6** — original Qwen3 dense + 30B-A3B routed MoE under Gridbook producer id `qwen3`; 3.5/3.6 packed-3D MoE + MTP heads and Gated-DeltaNet hybrids
+- **Tencent Hy3** (`hy_v3`) — 295B/21B-active, 192-expert MoE + MTP sidecar
+- **DeepSeek-V4-Flash** (vendored transformer + profile) — ~285B total by checkpoint arithmetic, 281,263,734,784 probe-measured quantizable parameters (166.9 GB on disk), per-expert-Linear MoE. The 671B headline belongs to the DeepSeek-V3 family and does not describe Flash; size claims here are per-checkpoint from the probe inventory, never the family headline.
+- **MiniMax M2 / M2.7** — nested per-expert MoE, native-FP8 source
+- **Gemma4** — multi-layer-type rope, KV sharing, visual/text profiles
+- **LFM2.5** — per-expert MoE + short-conv layers
+- **poolside Laguna** (`laguna`) — 117B/256-expert sparse MoE, separate DFlash drafter as the MTP-analog
 
-The headline result against RedHatAI's `Qwen3.6-35B-A3B-NVFP4` (a uniform NVFP4 quantization with 342 hand-picked BF16 ignores) makes this concrete: **PrismaQuant ships 2 GB smaller, with 90 fewer Linears in BF16, and wins 8 of 9 zero-shot metrics**. The 90-Linear gap is exactly what end-to-end measurement buys over guessing.
+A new architecture is a `model_profiles/` registration (structure spec JSON + a small profile class); most of the fused-group and naming plumbing is auto-derived from the vLLM model class, so ports land in ~30–200 LoC.
+
+---
+
+## Published artifacts
+
+| Model | Artifact |
+|---|---|
+| Qwen3.6-27B | [PrismaAURA 5.5 bpp](https://huggingface.co/rdtand/Qwen3.6-27B-PrismaAURA-5.5bit-vllm) · [5.31 bpp prior flagship](https://huggingface.co/rdtand/Qwen3.6-27B-PrismaSCOUT-Blackwell-NVFP4-BF16-vllm) (DOI 10.57967/hf/8656) · [v1 5.5 bpp](https://huggingface.co/rdtand/Qwen3.6-27B-PrismaQuant-5.5bit-vllm) |
+| Qwen3.6-35B-A3B | [4.75 bpp](https://huggingface.co/rdtand/Qwen3.6-35B-A3B-PrismaQuant-4.75bit-vllm) |
+| Ornith-1.0-35B | [PrismaAURA 4.75 bpp + MTP](https://huggingface.co/rdtand/Ornith-1.0-35B-PrismaAURA-4.75bit-vllm-MTP) |
+| Tencent Hy3 295B-A21B | [2.8 bpp GGUF, single Spark](https://huggingface.co/rdtand/Hy3-295B-A21B-PrismaQuant-2.8bit-gguf-vllm) · [5.3 bpp CT + MTP, 2× Spark](https://huggingface.co/rdtand/Hy3-295B-A21B-PrismaQuant-5.3bit-2xSpark-vllm) |
+| Qwen3.5-122B-A10B | [4.75 bpp](https://huggingface.co/rdtand/Qwen3.5-122B-A10B-PrismaQuant-4.75bit-vllm) |
+| Mistral-Medium-3.5-128B | [4.75 bpp](https://huggingface.co/rdtand/Mistral-Medium-3.5-128B-PrismaQuant-4.75-vllm) |
+| MiniMax-M2.7 | [3.20 bpp](https://huggingface.co/rdtand/MiniMax-M2.7-PrismaQuant-3.20bit-vllm) |
+| Gemma4-31B-IT | [6 bpp](https://huggingface.co/rdtand/Gemma4-31B-IT-PrismaQuant-6bit-vllm) · [5.5 bpp](https://huggingface.co/rdtand/Gemma4-31B-IT-PrismaQuant-5.5bit-vllm) |
+| LFM2.5-8B-A1B | [6.5 bpp](https://huggingface.co/rdtand/LFM2.5-8B-A1B-PrismaQuant-6.5bit-vllm) |
+
+---
+
+## Method discipline
+
+The rules this project holds itself to, because low-bit quantization results are unusually easy to overstate:
+
+- **Promote on the serving metric, not the screen.** A win counts only when it holds on exact full-vocab vLLM KL-vs-BF16 and direct perplexity *on the served artifact* at matched bpp. We have watched local-PPL "wins" invert on the served A/B more than once; those methods are archived with the lesson, not quietly dropped.
+- **KL screens, it doesn't ship alone.** Lower mean KL can hide a heavier tail; candidates also clear direct PPL, p99 per-prompt NLL, and tool-use benchmarks before publication.
+- **Held-out means held-out.** Selection KL uses text the cost stage never saw.
+- **No hand-tuned bans.** If the allocator picks something that breaks, the cost model is wrong — fix the measurement, don't constrain the optimizer. The only constants allowed are ones derived from a dtype's numerical precision.
+- **No quality claims we can't back.** The 295B artifact ships with an explicit "no quality claims" section because its teacher can't be measured on the target hardware. Provenance (git commit, calibration hash, assignment hash) is baked into every artifact's metadata.
+
+---
+
+## Documentation
+
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — the system map: stages, contracts, containers, where each decision is actually made.
+- [`docs/README.md`](docs/README.md) — index of the rest: normative design rules and runtime flags (`docs/design/`), per-container lane records (`docs/lanes/`), dated results and audits, and the archive.
 
 ---
 
@@ -208,18 +225,8 @@ The headline result against RedHatAI's `Qwen3.6-35B-A3B-NVFP4` (a uniform NVFP4 
 }
 ```
 
-The full paper draft is at [`paper/main.pdf`](paper/main.pdf).
+The AURA paper (*AURA: Production-Faithful KL–Fisher Allocation*) is at [`paper/main.pdf`](paper/main.pdf) (source: [`paper/main.tex`](paper/main.tex)). Contact: robert.tand@icloud.com.
 
 ## Acknowledgements
 
-PrismaQuant builds on a decade of mixed-precision quantization research. The closed-form cost model, Fisher-diagonal sensitivity estimator, and multi-choice knapsack formulation are assembled from published ideas. Selected key influences:
-
-- **Cross-layer dependency in allocation (foundational)** — CLADO (Deng et al. 2023, [arXiv:2307.05657](https://arxiv.org/abs/2307.05657)) for the integer-quadratic-programming formulation over pairwise quantization-error coupling and the decision-unit framing PrismaQuant's Block-CLADO pipeline builds on
-- **Mixed-precision allocation** — HAWQ-V1/V2/V3 (Dong et al. 2019–2021), CoopQ (Zhao et al. 2025), AMQ (Lee et al. 2025)
-- **Post-training quantization** — GPTQ (Frantar et al. 2022), AutoRound (Cheng et al. 2023)
-- **Outlier handling** — SqueezeLLM (Kim et al. 2023), SpQR (Dettmers et al. 2023)
-- **Pareto-knee detection** — Kneedle (Satopaa et al. 2011)
-- **Foundation** — Cover & Thomas, *Elements of Information Theory* (2006), Chapter 13 on rate-distortion bit allocation
-- **Geometry-aware rounding** — Chen et al. 2026 (GPTQ as Babai's nearest plane algorithm)
-
-Full bibliography in [`paper/main.tex`](paper/main.tex).
+PrismaQuant is assembled on top of a decade of quantization research. Key influences: CLADO (Deng et al. 2023) for the cross-layer decision-unit framing (whose interaction-modeling half our head-to-head then retired); HAWQ-V1–V3 (Dong et al. 2019–2021), CoopQ, and AMQ on mixed-precision allocation; GPTQ (Frantar et al. 2022) and its Babai-nearest-plane interpretation (Chen et al. 2026) for rounding; the llama.cpp/ggml project for the GGUF formats and reference implementations; Kneedle (Satopää et al. 2011); and Cover & Thomas ch. 13 on rate-distortion bit allocation. Full bibliography in [`paper/main.tex`](paper/main.tex).

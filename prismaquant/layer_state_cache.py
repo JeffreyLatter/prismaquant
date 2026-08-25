@@ -474,10 +474,21 @@ class LayerHiddenStateCache:
                         dtype=param.dtype,
                     ).contiguous()
                 else:
+                    from .nvfp4_cb_footprint import is_cb_format
+
+                    if is_cb_format(canonical):
+                        raise RuntimeError(
+                            f"production_weight_cache is required for CB "
+                            f"fallback ({assignment_name!r}, {canonical!r}); "
+                            "refusing an unweighted legacy registry render"
+                        )
                     if (
                         self._production_weight_cache is not None
                         and canonical != "BF16"
-                        and _env_truthy("PRISMAQUANT_STRICT_PRODUCTION_CACHE")
+                        and _env_truthy(
+                            "PRISMAQUANT_STRICT_PRODUCTION_CACHE",
+                            default=True,
+                        )
                     ):
                         raise RuntimeError(
                             f"production_weight_cache miss for "
@@ -492,11 +503,7 @@ class LayerHiddenStateCache:
                         dtype=param.dtype,
                     ).contiguous()
                 self._baseline_weight_values[key] = (target, quantized)
-            if (
-                self.include_activation_quant
-                and spec.act_bits is not None
-                and spec.act_bits < 16
-            ):
+            if self.include_activation_quant and spec.act_quant_changes_input:
                 if id(target.module) in activation_conflicts:
                     continue
                 entry = activation_specs.get(id(target.module))

@@ -1,0 +1,21 @@
+Multi-shot validation analysis
+Run: multi-shot-validate-20260519T012202-low-budget
+Source: kl_comparison.json (mode=paired)
+
+Calibration: N=32 T=1024 × 4 repeats
+
+============================================================================================
+budget |           baseline KL |          multishot KL |         ΔKL     pct      z
+-------+-----------------------+-----------------------+------------ ------- ------
+  4.70 |    0.13577 ± 0.03617 |    0.13577 ± 0.03617 |    +0.00000  +0.00%  +0.00 ✗
+  4.85 |    0.13750 ± 0.02300 |    0.13750 ± 0.02300 |    +0.00000  +0.00%  +0.00 ✗
+
+Wins: 0/2  |  Mean ΔKL%: +0.00%  |  |z|≥2: 0/2
+
+Paired Δ (multishot − baseline per calibration repeat):
+  4.7: paired Δ = [+0.0000, +0.0000, +0.0000, +0.0000]  (wins: 0/4)
+  4.85: paired Δ = [+0.0000, +0.0000, +0.0000, +0.0000]  (wins: 0/4)
+
+Assignment movement (format counts):
+  4.7: BF16: 12→12 (+0)  NVFP4: 240→240 (+0)
+  4.85: BF16: 16→16 (+0)  MXFP8: 3→3 (+0)  NVFP4: 233→233 (+0)
