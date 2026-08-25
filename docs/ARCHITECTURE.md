@@ -1,7 +1,143 @@
 # PrismaQuant Architecture
 
-As of: 2026-08-21 · `merge/proven-rescues` — stamps follow, newest first, each recording
-its own branch and date. Re-stamped (2026-08-21, `merge/proven-rescues`) for the
+As of: 2026-08-23 · `merge/proven-rescues` — stamps follow, newest first, each recording
+its own branch and date. Re-stamped (2026-08-23, `merge/proven-rescues`) for
+**unit-sharded production-cache renders** (§5.4, D33): `PRISMAQUANT_UNIT_SHARD=i/N` splits a
+dense render across boxes on a deterministic layer-contiguous, exact-byte-balanced partition
+(`prismaquant/unit_sharding.py`), and `tools/merge_unit_shards.py` reassembles the shards into
+the same `ProductionWeightCache` under a fail-closed completeness gate. No default changes and
+`run-pipeline.sh` is untouched; unset is a byte-identical no-op, verified on Qwen3-0.6B. The
+substantive behaviour change is inside `_LinearActivationCollector`: row-priority reservoir
+values are now drawn for every hooked Linear rather than only for the ones a run stores, which
+also fixes resumed builds that did not reproduce a fresh build's sampled rows.
+(`--include-qnames-file` shrinks the hooked set itself, upstream of this fix, and still
+changes sampled rows — D33.) Each shard stamps the `(unit, format)` entries it owed, so the
+merge gate reads the shard's own debt instead of an operator-supplied layer config, and the
+merged `cache_dir` is byte-identical to an unsharded one. `production_render_cost`,
+`production_recache`, and packed-expert renders refuse the variable rather than pretending to
+shard. Previously re-stamped (2026-08-22,
+`walker/woa-grouped-fisher`) for
+**pricing the grouped operand `wo_a`** (§8.9): DSv4's grouped-BMM attention
+output projection — 17.9% of decode read traffic — was never an allocator
+decision because the probe skipped its class. The grouped Fisher accumulator
+(`prismaquant/sensitivity_probe.py`: exact per-group bmm reductions, flat-plane
+marginals, the ONE global-token normalization) landed FIRST; then
+`DeepseekV4GroupedLinear` moved from the spec's `probe_skip_module_class_names`
+to the new `probe.grouped_module_class_names`, which routes the probe to the
+grouped accumulator and lets the walk claim `wo_a` as an ordinary `decide`.
+Cost cells flow from probe keys with no new plumbing; the joint-output-MSE
+screen ships honestly unmeasured (`output_mse_measured=False`) for grouped
+units because the dense screen mis-models the contraction. No shipped artifact
+changes: the DSpark sidecar contract keeps all three `wo_a` bases on
+source-FP8 W8A16 (`dspark_cb_expected_physical_targets`), CB export still
+refuses grouped operands, and the W8A16 handoff's frozen source closure now
+names three drifted files (`model_profiles/base.py`,
+`model_profiles/deepseek_v4.py`, `specs/deepseek_v4.json`); Rob reviewed and
+signed off that re-freeze (2026-08-23), so `_FROZEN_EXPORT_SOURCE_SHA256`
+(`dsv4_w8a16_export_handoff.py`) is updated to those bytes in this same
+commit and the handoff verification passes again. Previously re-stamped
+(2026-08-22, `ox/gridbook-env-dense-r2`) for the
+**registry learning of gridbook's dense FP4-v2 round-2 arm**:
+`GRIDBOOK_ENVIRONMENT_REGISTRY` gained `PRISMAQUANT_CB_FP4V2_DENSE_R2`
+(execution, canonical `"0"`, `pq_env_bool01` strict boolean in
+`cb_gemv.cu`, unset/`0` = legacy arm — gridbook d4df36e's opt-in backport),
+and `_GRIDBOOK_EXPECTED_SOURCE_IDENTIFIERS` learned the name so source scans
+classify it as known ahead of any producer-pin advance. The closed gold
+measurement environment grows 31 → 32 names, execution 21 → 22; the 29-name
+historical projection still hashes to its original digest and the full map
+was re-digested (`test_gold_environment_grew_additively_over_the_historical_0_8_5_set`).
+Previously re-stamped (2026-08-22, `walker/consumer-cost`) for
+**the cost consumer migrating onto the shared name-projection layer** (§8.8.1):
+`_scan_source_dtype_manifest` lost its private checkpoint→live→recipe builders
+(`_strip_weight_suffix`, `_to_recipe_name`, `_packed_to_recipe_name`,
+`_per_expert_packed_recipe_name`) and now projects every source-kind row
+through `NameProjection.checkpoint_to_live` / `recipe_unit` /
+`packed_parent_of_expert_param` (`prismaquant/allocator_candidates.py`);
+`decision_units._recipe_name` is retired for
+`name_projection.strip_weight_leaf`, as is the inline leaf surgery in
+`production_render_cost.canonical_cost_name` (whose umbrella-infix half stays
+a total normalizer — render/cost payloads key costed MTP rows physically,
+which a declining projection must never drop) and `measure_quant_cost`'s
+act-cache candidate builder. Emitted values are UNCHANGED for existing
+profiles and artifacts — the manifest's profile=None convention now builds
+over the repo's declared generic baseline (`DefaultProfile`, the substitution
+`resolve_cost_target_name` always made) instead of inlined string surgery.
+One deliberate behavior change, fail-closed only: a profile accessor that
+RAISES now propagates `NameProjectionError` instead of silently skipping the
+row (the wo_a shape); MTP rows stay recipe-native verbatim by an explicit,
+commented short-circuit pending a profile declaration of recipe-native
+checkpoint prefixes. Probe, footprint, and read-traffic remain unmigrated.
+Previously re-stamped (2026-08-22, `walker/consumer-probe`) for **the probe
+consumer migrating onto the shared name-projection layer** (§8.8.1): `FisherAccumulator`
+now builds one `NameProjection`, and the probe holds no private name mapping — the
+packed-expert shard-scope filter reads its block id through `NameProjection.block_id`
+(previously a positional `[:3]` qname slice of its own; value-identical on every qname
+shape reachable at that site, pinned by `tests/test_consumer_probe_name_projection.py`),
+and the Fisher skip set keys its embedding clause on the profile's declared
+`ModelProfile.embedding_name()` (previously a hardcoded `"model.embed_tokens"` substring
+test). Probe stats keys, inventories, and shard regexes are untouched, and the regression
+baseline is byte-identical; the walk-edge-list migration itself stays open for all four
+consumers.
+Previously re-stamped (2026-08-22, `walker/consumer-footprint`) for **the
+second R5 consumer migration**: `footprint.py` holds no private name mapping anymore — its
+private `.weight` strips and its packed-expert parser (`packed_expert_alias` + the legacy
+parent fallback, now defined in `name_projection.py` and re-exported) are the shared
+layer's; `source_tensor_bytes_manifest` / `floor_bytes_for_model` accept a prebuilt
+`NameProjection` (keyword-only, mutually exclusive with the raw accessor kwargs), map
+checkpoint keys through `checkpoint_to_live`, keep the profile's DECLARED drops as raw-key
+floor entries (data, not exceptions), and propagate layer refusals instead of swallowing
+them. Emitted bytes are unchanged — projection/accessor parity is pinned test-side.
+Previously re-stamped (2026-08-22, `walker/consumer-readtraffic`) for
+**the first name-projection consumer migration: read-traffic**
+(`prismaquant/read_traffic.py`). Both entry points build one
+`NameProjection(profile)` and route every checkpoint→live question through
+it: the classifier's decline-to-map rule branches on
+`ProjectedName.outcome == declared_out_of_graph` (`excluded_non_text_graph`),
+the private `_strip_weight` leaf helper is deleted in favor of
+`strip_weight_leaf`, and a profile accessor that fails now refuses as
+`NameProjectionError` instead of silently passing the raw key through
+(previously it would have re-priced unmappable tensors at p=1). No emitted
+number moves; the class table, byte authorities, and refusals are pinned
+byte-identical by `tests/test_read_traffic.py`. Previously re-stamped
+(2026-08-22, `walker/name-projection`) for
+**the shared name-projection layer** (§8.8.1, `prismaquant/name_projection.py`):
+one profile-routed projection between the live/recipe/checkpoint/export/vLLM
+namespaces, fail-closed with structured refusal codes, explicit
+many→one/one→many shapes for fused siblings and packed experts, round-trip
+identity pinned where the profile's rules are total (Qwen3, Qwen3.5
+multimodal, DSv4 — including the surfaced `hc_head` inverse gap), and no
+rank/shard/degree anywhere in the API (the TP seam stays in
+`model_walk.per_device_bytes`). Consumers are not migrated; the module ships
+with its conformance tests only. Previously re-stamped (2026-08-22,
+`walker/r5-export-gate`) for
+**the discovery walker as a fail-closed export gate** (§8.8,
+`prismaquant/model_walk.py`): the R5 design contract's remaining open half —
+wiring the walk as an export gate — is closed; the probe/cost/footprint/
+read-traffic migration onto its edge list stays a separate workstream.
+`run-pipeline.sh` stage **[3d]** (`python3 -m prismaquant.model_walk`) runs
+before EVERY export lane (GGUF, CB, compressed-tensors) and refuses (`exit 2`)
+on an unclaimed matmul-fed node, an unresolved floating multiplicand, an
+unknown walk-failure kind, or a decided-but-unpriced contradiction, deciding
+from STRUCTURED fields only (`artifacts/model_walk.json`, gate schema
+`prismaquant.model_walk_gate.v1`). The explicit override
+(`PRISMAQUANT_WALK_GATE_OVERRIDE=<reason>`) excuses trace incompleteness ONLY
+(DSv4's data-dependent scalar aborts the fake trace) and is stamped; claim
+failures have no override — they are fixed by pinning with reasons in
+`ModelProfile.walk_claim_rules()`. Same commit: the walk became a cacheable
+artifact (`SCHEMA prismaquant.model_walk.v1`; envelope `{schema, provenance,
+result}`, atomic write, fail-closed reload on foreign schema / execution
+mismatch / claim-rule digest mismatch), carrying trace-time provenance
+(model+config identity, versions, input contract) and the serialized applied
+rule list; byte semantics are pinned as LOGICAL-TOTAL with the
+`per_device_bytes(total, tp_degree, policy)` seam for Tensor-Parallel
+(decision unit: whole logical tensor; dispositions are TP-invariant; the
+future group/shard misalignment refusal lands as an unknown-until-implemented
+walk-failure kind that already refuses). The R5 profile sweep's findings land
+here too: universal base rules now pin MoE router gates and decide packed
+expert stacks (six/seven profiles were unclaimed; gemma4's router was
+decided-but-never-priced — wrong polarity inside the claim table itself, now
+pinned like every other router), and the gate surfaces that contradiction
+class structurally. Previously re-stamped (2026-08-21, `merge/proven-rescues`) for the
 **Gridbook 0.8.11 PRODUCER pin**: the producer pin
 (`gridbook_runtime_pin.json`) advanced 0.8.5/v3 → 0.8.11/v4 at commit
 `187c721`, in lockstep with the serving pin, and a new test
@@ -1090,6 +1226,7 @@ which is what the rows touched since are keyed on.
 | **4/4 C** | Frontier point selection | `prismaquant.select_validated_frontier` (`1281-1288`) | overwrites `artifacts/layer_config.json`; `layer_config_validated_assignment.json`; `validated_frontier_selection.json` | none | validated-surrogate |
 | **4/4 D** | Production cache build / recache for the selected assignment | `production_recache` (`1331-1346`, `1399-1414`) or `build_production_cache --recache-layer-config` (`1379-1396`, `1423-1438`) | `production_weight_cache_frontier_<digest>_recached.pkl` (`1328`), `production_weight_cache_recached.pkl` / `…_raw.pkl` (`1102-1103`) | settings-hash `production-cache-recached` (`1404`), `frontier-recache` (`1360`), `production-cache-raw` (`1452`) | `PRODUCTION_CACHE=1` |
 | **3c** | AURA additivity report — `residual = measured_end_KL − Σ predicted_dloss`, stamped into `cost.pkl` `provenance["additivity"]` (§4.3) | `prismaquant.aura_additivity_gate` (+ optional `validate_assignments_kl` under `AURA_ADDITIVITY_GATE=measure`) | `artifacts/aura_additivity.json`, `aura_additivity_kl.json` (measure only); `logs/aura_additivity*.log` | none — non-blocking report, skip-if-exists on the KL half | `COST_MODE=aura`, `AURA_ADDITIVITY_GATE≠0` |
+| **3d** | Discovery-walker export gate (§8.8) — meta-load + one fake forward against the profile's claim rules; refuses the run before ANY export lane on an unclaimed matmul-fed node / unresolved floating multiplicand / unknown walk-failure kind / decided-but-unpriced contradiction, decided from structured fields only. Override env excuses trace incompleteness ONLY (stamped); claims have no override | `prismaquant.model_walk` (`python3 -m prismaquant.model_walk`) | `artifacts/model_walk.json`; `logs/model_walk.log` | none — always runs; it is the gate | every lane; knobs `WALK_GATE_SEQLEN=8`, `WALK_GATE_EXECUTION=fake`, `PRISMAQUANT_WALK_GATE_OVERRIDE=<reason>` |
 | **4/4 E-gguf** | GGUF skeleton + export + llama.cpp smoke | `convert_hf_to_gguf.py` (`1461-1464`), `prismaquant.export_gguf` (`1469-1493`), `llama-completion` (`1500-1516`) | `artifacts/skeleton.gguf`, `exported.gguf` | settings-hash `gguf-skeleton` (`1488`); export always runs | GGUF lane; **exits 0** |
 | **4/4 E-cb** | CB col-weights + codebook export | `harvest_cb_col_weights "[4/4]"`, `export_nvfp4_cb[_streaming]` | `exported_nvfp4_cb/` in **~1 GiB safetensors shards** (`EXPORT_SHARD_BYTES`, default `1073741824`) + `.pqcb` codebook sidecar | settings-hash `cb-col-weights`; export always runs | CB lane; no in-lane serving smoke; **exits 0** |
 | **4/4 E** | compressed-tensors export (§6) | `prismaquant.export_native_compressed` (`1665-1699`) | `exported/` in **~1 GiB safetensors shards** (`EXPORT_SHARD_BYTES`, default `1073741824`); `logs/export.log` | **none — always runs** | default lane |
@@ -2698,6 +2835,51 @@ at phase 50 with `before=("gptq",)` and no relation to each other, and
 (matching `pipeline.py`'s own stage list); `fisher_gptq` (50, archived); `scale_sweep` (60,
 after gptq). The production lever set is §3.3.
 
+**A unit shard is a lifetime mode of that same store too** (`prismaquant/unit_sharding.py`,
+2026-08-23). `PRISMAQUANT_UNIT_SHARD=i/N` makes `build_production_cache` render only shard `i`
+of a deterministic layer-contiguous partition of the units it already enumerates, balanced by
+exact source-tensor bytes with a min-max partition DP. Unset is a byte-identical no-op, and
+`run-pipeline.sh` does not set it. `tools/merge_unit_shards.py` puts the shards back into one
+`ProductionWeightCache` with the same layout — not a second store — and refuses unless every
+unit of the recomputed partition appears exactly once, under its owning shard. There is no
+force flag; missing, duplicate, and out-of-shard units all name the units and stop.
+
+The gate reads what each shard says it owed, not what an operator says it should have. Every
+shard stamps `owed_pairs` — the exact `(unit, format)` entries fixed at the moment its render
+map was built, from the same structure the render loop consumes — so a `--render-layer-config`
+that disagreed with the config a shard actually ran under can no longer under-expect a dropped
+unit into a clean merge. That flag survives only for stamps predating the field. The merged
+artifact is the unsharded artifact: `.pt` files, `render_scores.json` (through the stage's own
+`_write_render_score_sidecar`, whose `{"records": …}` envelope the resume loader requires) and
+`activation_max_abs.json` are written in the same order and shape, the render-gate summary is
+re-derived over every shard's records rather than inherited from shard 0, and the merged pickle
+differs from an unsharded one only by its `cache_dir` path and the `unit_shard_merge` block.
+
+Three properties make a shard's rendered bytes the unsharded run's bytes, and each is enforced
+rather than assumed. Layer atomicity keeps every fused-sibling group in one shard, so the joint
+NVFP4 global (`_compute_nvfp4_joint_global`, a max over the members present in the run) is
+computed over the same members; the stage asserts the grouping against the model profile and
+refuses a straddling group. The hooked activation set, the fused-sibling joint globals, and
+`activation_max_abs` are all computed over the FULL enumeration — only the render narrows. And
+`_LinearActivationCollector` now draws its row-priority reservoir values for **every** hooked
+Linear, not only for the ones this run stores (`production_weight_cache.py`). One generator
+feeds every Linear's reservoir, so drawing only for stored Linears made the surviving rows a
+function of which other Linears happened to be in the run — which also means a **resumed** build
+did not reproduce a fresh build's rows. That is a defect fix, not only shard plumbing; a fresh
+full build is unaffected byte-for-byte. `--include-qnames-file` is a different and still-open
+case: it filters the `qnames` list before the fill, so it shrinks the hooked set itself and the
+fix does not reach it (§12, D33).
+
+`production_render_cost` renders nothing, so it does not shard: it runs once on the merged
+cache and refuses a cache still carrying an unmerged shard stamp. `production_recache` and
+`--recache-layer-config` refuse the variable outright — the recache is a whole-model
+calibration replay, not a per-unit render. Packed-MoE expert renders refuse it too: their
+reservoir has the same shared-generator coupling and their enumeration is separate, so v1
+shards dense units only. `tools/cluster_render_sentinel.py` is the cross-box preflight: it
+renders K deterministically chosen units through this same fill path and byte-compares the
+manifests, refusing a match that was produced without `PRISMAQUANT_DETERMINISTIC=1`. Cross-box
+execution and the 4B repeat of the bit-identity acceptance remain open (§12).
+
 ### 5.5 Named invariants
 
 | Name | One line | Detail |
@@ -3471,8 +3653,9 @@ routed-expert stacks get `num_experts_per_tok / n_routed_experts` (exact as an
 expectation under the per-layer-uniform expert invariant §6.4 — routing skew changes
 *which* experts are read, not how many bytes); allocator-assigned always-active units
 (`dense`) and always-active tensors the allocator never decided (`held_fixed` — norms,
-biases, routers, a pinned `lm_head`, and grouped operands the probe skips such as DSv4's
-`attn.wo_a`) get `1.0`. Both `topk` and `E` are read from the architecture's own config
+biases, routers, a pinned `lm_head`; DSv4's grouped `attn.wo_a`, which the probe prices
+since the grouped Fisher accumulator landed and which sits here only while no
+assignment covers it) get `1.0`. Both `topk` and `E` are read from the architecture's own config
 declarations and **cross-checked against the tensors' measured stack depth**; an MoE
 model that declares neither is refused rather than defaulted (principle 2 — the
 `moe_imatrix` "assume 8" fallback would mis-price the largest term in the ledger).
@@ -3482,7 +3665,9 @@ embedding (one row is gathered per token, not the table), **indexed lookup table
 the MTP/draft sidecar (read every token under spec-decode and never without it — the honest
 default is excluded, and `excluded.mtp_bytes` lets a spec-decode serve add it back exactly),
 and anything the model profile's own `checkpoint_to_live_name` declines to map into the live
-text graph (vision/audio towers). `ModelProfile.embedding_name()` (`model_profiles/base.py`, spec key
+text graph (vision/audio towers) — read through the shared name-projection
+layer (§8.8.1), whose `declared_out_of_graph` outcome is what that rule
+branches on. `ModelProfile.embedding_name()` (`model_profiles/base.py`, spec key
 `shard_regexes.embedding_name`) is the twin of `lm_head_name()` and exists so "which
 tensor is the embedding" is a declaration rather than a substring test.
 
@@ -3975,9 +4160,9 @@ seed 0, eager execution, and log stats disabled; speculative decoding is off.
 `source_passthrough` or `per_expert_format_groups` assignment declares
 `mxfp4_e2m1_ue8m0_g32`. Menus, provenance strings, and other metadata cannot
 select that backend (`prismaquant.gridbook_assignment`). The closed relevant
-environment is the complete 31-name Gridbook-0.8.11 snapshot in
+environment is the complete 32-name Gridbook-0.8.11 snapshot in
 `prismaquant.gridbook_environment`, not a two-variable subset. Gold clears the namespace first,
-sets its 14 canonical values (including `VLLM_USE_DEEP_GEMM=0` and
+sets its 15 canonical values (including `VLLM_USE_DEEP_GEMM=0` and
 `PRISMAQUANT_PRELOAD_FUSED=0`), and carries all 17 required
 absences as explicit nulls. In particular retired `PRISMAQUANT_CB_DECODE` is absent, never
 inherited and `GRIDBOOK_MXFP8_DENSE` is absent so the direct W8A8 route cannot replace the
@@ -4816,9 +5001,12 @@ purpose), or `exclude(reason)` (outside the artifact's scope). Claims come
 from ordered `ClaimRule` lists supplied by the profile:
 `ModelProfile.walk_claim_rules()` (`model_profiles/base.py`) derives the base
 set from the profile's own declarations — spec
-`probe_skip_module_class_names` → pin (this is the `wo_a` rule: the spec
-already said the probe skips `DeepseekV4GroupedLinear`, so the walker turns
-that declaration into a named debt), `pinned_names` → pin, MTP/visual
+`probe_skip_module_class_names` → pin (the mechanism that held DSv4's
+grouped-BMM `attn.wo_a` as a named debt until it could be priced;
+2026-08-22 the grouped Fisher accumulator landed, `DeepseekV4GroupedLinear`
+moved to the spec's `probe_grouped_module_class_names`, and its weight
+became an ordinary `decide` — see §8.9),
+`pinned_names` → pin, MTP/visual
 prefixes and `nn.Embedding` weights and non-persistent buffers and
 non-floating or ≤1-D tensors → exclude with reasons, remaining `nn.Linear`
 weights → decide. **A matmul-fed node no rule matches fails the walk** with
@@ -4844,12 +5032,168 @@ the probe's enumeration. `DeepseekV4Profile.walk_claim_rules()` now pins each
 with its reason (plus the compressor/indexer Linears the serve contract keeps
 source-format).
 
-This build ships the API and the conformance surface only
-(`tests/test_model_walk.py`) — **no consumer is wired**. The intended end
-state per the design doc: the walker's edge list becomes the single
-enumeration the probe, cost, footprint, and read-traffic stages derive from,
-and the walk runs at new-architecture intake and again at export as a gate.
-Consumer migration is separate, deliberate work.
+The gate half of the contract is WIRED (2026-08-22, `walker/r5-export-gate`):
+`run-pipeline.sh` stage **[3d]** runs `python3 -m prismaquant.model_walk
+--model $MODEL_PATH` on a meta load immediately before EVERY export lane and
+refuses the run (`exit 2`, `set -e`) when :func:`evaluate_walk_gate` — the
+gate over :class:`WalkResult` in the same module, schema
+`prismaquant.model_walk_gate.v1` — reports an unclaimed matmul-fed node, an
+unresolved floating multiplicand, an unknown walk-failure kind, or a
+decided-but-unpriced node. The verdict is STRUCTURED: refusal kinds plus
+per-entry `(node, op, equation, module)` lists in
+`artifacts/model_walk.json`; prose (`detail`, `refusal_reason`) explains to
+humans and nothing branches on it. The per-run override
+(`PRISMAQUANT_WALK_GATE_OVERRIDE=<reason>`) excuses trace incompleteness only
+— DSv4's DSA scalar aborts the fake trace today — and is stamped into the
+report; claim failures have no override. Because identity and dispositions
+live on whole logical tensors, Tensor-Parallel degree cannot move the gate's
+universe; byte fields are pinned as logical totals behind the explicit
+`per_device_bytes(total, tp_degree, policy)` seam, and any future walk-failure
+kind (e.g. quantization-group vs shard-boundary misalignment) refuses on
+today's gate via the unknown-kind catch-all. Walks are also cacheable now:
+`save_walk`/`load_walk` wrap the payload in `{schema,
+prismaquant.model_walk.v1, provenance, result}` with fail-closed reload
+(foreign schema, execution mismatch, claim-rule digest mismatch) and
+trace-time provenance (model+config digest, versions, input contract, applied
+rule list). The same commit landed the R5 sweep's claim-table fixes: universal
+base rules pin router gates (hy_v3, qwen3_5, laguna, minimax_m2, qwen3-moe;
+DSv4 keeps its specific pins) and decide packed expert stacks (seven
+`*Experts` families), and gemma4's router — decided by rule 9 while the
+probe's own name exclusion made pricing impossible, i.e. wrong polarity
+inside the claim table — is pinned like every other router; the gate's
+`find_decided_but_unpriced` checker turns that contradiction class into a
+refusal so it cannot recur silently.
+
+Two distinct migrations are in play here, and only one has landed. The
+first wave is the shared **name-projection layer** (below), and as of
+2026-08-22 **all four consumers route their private NAME mappings through
+it**: read-traffic (`walker/consumer-readtraffic`), footprint
+(`walker/consumer-footprint`), probe (`walker/consumer-probe`) and cost
+(`walker/consumer-cost`). No consumer holds its own checkpoint→live→recipe
+string surgery any more. One deliberate exception remains and is not a
+projection: `production_render_cost.canonical_cost_name`'s umbrella-infix half
+stays a **total** normalizer, because render/cost payloads key costed MTP rows
+physically and a projection that may decline must never drop them.
+
+The **edge-list migration proper is still open for all four**, and is the
+larger of the two: every consumer's INVENTORY remains its own enumeration —
+the probe still builds its tracked set from `named_modules()` plus shard
+regexes — so the walker's edge list is not yet the single enumeration the
+stages derive from. Sharing a name projection is not the same as sharing a
+requirement set; the first makes the four agree on what a unit is *called*,
+the second would make them agree on which units *exist*.
+
+#### 8.8.1 The shared name-projection layer
+
+`prismaquant/name_projection.py` (2026-08-22, `walker/name-projection`)
+lands the ONE projection between the pipeline's parameter-name namespaces
+that the R5 consumer analyses each said they were re-deriving ad hoc: a
+Linear's live name (`WalkNode.name`), its allocator/probe recipe name,
+its source-checkpoint key, its exported-artifact key, and its vLLM
+scheme-dispatch qname (`NameProjection`, five `LIVE/RECIPE/CHECKPOINT/
+EXPORT/VLLM` constants). The contract, pinned by
+`tests/test_name_projection.py`:
+
+- **The profile owns the knowledge; the layer owns the discipline.**
+  Every mapping routes through existing `ModelProfile` accessors
+  (`checkpoint_to_live_name`, `live_to_recipe_name`,
+  `to_vllm_internal_name`, `source_tensor_name`, `export_tensor_name`,
+  `fused_sibling_group`, `packed_expert_format_group`) — no second
+  mapping lives anywhere, and consumers keep no private
+  `_recipe_name`/`_strip_weight` helpers (the leaf rule itself is
+  `strip_weight_leaf` here).
+- **Fail closed and loud.** An unmappable or ambiguous name raises
+  `NameProjectionError` with structured fields — `code`
+  (`unmapped_in_universe`, `ambiguous`, `no_universe_supplied`,
+  `malformed_profile_result`, `profile_accessor_failed`,
+  `unknown_namespace`, `unsupported_pair`, `uncovered_unit`),
+  source/target namespace, and what was tried. Unlike
+  `decision_units.fused_group_key`, nothing swallows a profile failure
+  into an identity fallback. The profile's DECLARED drops (visual/MTP/
+  scale keys) are data instead: `project()` returns a `ProjectedName`
+  whose `outcome == declared_out_of_graph`, so read-traffic can classify
+  `excluded_non_text_graph` by branching on a field.
+- **Non-totality is in the type.** Fused siblings and packed experts
+  surface as `ServingGroup(kind, key, members)` with packed precedence
+  over fused for expert stacks; reverse lookups refuse group KEYS rather
+  than returning an arbitrary member; the coverage index mirrors
+  footprint's dual-entry manifest convention so one logical tensor
+  covered by many split checkpoint spellings answers under either
+  naming (`checkpoint_keys_for` / `require_checkpoint_span`, the
+  coverage assertion footprint.md asked for).
+- **Round-trip property tested where the profile's rules are total**:
+  Qwen3 dense (identity), Qwen3.5 multimodal (umbrella-infix rewrite),
+  DSv4 flat naming — plus the recorded gap the round trip SURFACED:
+  DSv4's spec generates `hc_head.hc_*` source spellings while the real
+  checkpoint stores flat `hc_head_*`, so that family's inverse declines;
+  the layer reports it, it does not guess.
+- **TP seam held**: names are logical, whole-tensor facts; no rank,
+  shard index, or degree exists in any signature (a constructor-kwarg
+  refusal test pins this). Byte accounting stays in
+  `model_walk.per_device_bytes`.
+
+Still open per the design doc: migrating the consumers onto the walker's
+EDGE LIST. The first wave of that migration is the shared
+**name-projection layer** (below), and as of 2026-08-22 all four
+consumers route their NAME derivations through it — cost
+(`walker/consumer-cost`), probe (`walker/consumer-probe`), footprint
+(`walker/consumer-footprint`) and read-traffic
+(`walker/consumer-readtraffic`). Their INVENTORIES are still their own
+enumerations — the probe still builds its tracked set from
+`named_modules()` plus shard regexes — so the edge-list migration
+proper remains open for all four.
+
+### 8.9 Pricing a grouped operand: the `wo_a` accumulator (2026-08-22)
+
+DSv4's `attn.wo_a` — 33,554,432 parameters × 43 layers, 1.443 GB/token,
+17.9% of decode read traffic — is consumed by a view + per-group
+`torch.bmm` inside `DeepseekV4GroupedLinear` (`y[...,g,r] = Σ_d x[...,g,d]·W[g,r,d]`).
+The class sat in the probe's skip list because the dense accumulator cannot
+represent that consumption: its chunk_h comes out `[R, D]` against a `[G*R, D]`
+plane (the `chunk_h * w.pow(2)` broadcast), and flattening groups into the
+token axis destroys the per-channel marginals. The walker then held the weight
+as a named pin — correct polarity, real debt.
+
+The debt is closed by ONE grouped mechanism (`prismaquant/sensitivity_probe.py`,
+shared by both probe backends):
+
+- **Math.** The elementwise Fisher of a grouped operand is block-diagonal in
+  `g`, so the exact per-token-summed empirical Fisher (audit M3's estimator,
+  never sum-then-square) reduces over one batched matmul:
+  `chunk_h[g,r,d] = Σ_t gy²[t,g,r]·x²[t,g,d]`. Every scalar and marginal —
+  `h_trace`, `fisher_row[g*R+r]`, `fisher_col[d]`, `g_sq_sum`, `act_sq_sum`,
+  `act_absmax`, `h_trace_per_group_raw[g]` — reduces the SAME fp32
+  `chunk_h`, so `sum(fisher_row) == sum(fisher_col) == h_trace_raw` holds by
+  construction, which is the card's wiring check.
+- **Schema.** The unit stays the whole logical tensor in FLAT-PLANE
+  coordinates: `out_features = G*R`, `in_features = D`, `n_params` counts all
+  groups, and `num_groups` distinguishes it from a same-shape dense Linear —
+  deliberately NOT `num_experts`, which `_shape_from_stats` and
+  `_stats_indicates_packed_expert` read as a packed expert stack. TP note:
+  identity/dispositions/byte totals are logical; a future rowwise shard cuts
+  the plane's row axis and must not straddle a group boundary.
+- **Normalization.** Unchanged and global: rows stay raw token sums until
+  `finalize_fisher_stats` divides every row by the GLOBAL calibration token
+  count. Grouped operands are attention output projections — every group sees
+  every token — so the shared denominator is exact, not merely consistent;
+  `n_tokens_seen` counts tokens, not token-group pairs.
+- **Dispatch.** Explicit declaration only: spec field
+  `probe.grouped_module_class_names` (conformance-tested like every other
+  spec field). A declared class whose instance lacks `n_groups` fails fast;
+  nothing heuristic falls through to the dense accumulator.
+- **Cost cells.** They flow from probe keys with no new plumbing; the weight
+  render is exact on the flat plane for every menu format because row-wise
+  quantization never mixes rows. The joint-output-MSE screen ships honestly
+  UNMEASURED (`output_mse_measured=False`) for grouped units in both cost
+  paths: its `y = X @ W.T` model would score each group slice against all
+  `G*R` outputs, inflating the output term ~G-fold with cross-group error no
+  token sees.
+- **Serving unchanged.** Candidacy is not assignment: the DSpark sidecar
+  contract keeps all three `wo_a` bases on source-FP8 W8A16
+  (`dspark_source_metadata.dspark_cb_expected_physical_targets`), CB export
+  still refuses grouped-BMM semantics, and Gridbook's pinned contract declares
+  no grouped structure lane. "Priced, kept on FP8_SOURCE" is now an honest
+  allocator decision where silence used to be.
 
 ## 9. Serving lanes
 
@@ -5018,17 +5362,20 @@ honoured and the operator is CUTLASS, FlashInfer being only the wrapper. This
 matters for artifact A's recipe: a mixed CB artifact containing any stock NVFP4
 W4A4 Linear would otherwise have failed at load, after the export.
 
-**Closed Gridbook-0.8.11 measurement environment (31 names).** This is a PrismaQuant release-
+**Closed Gridbook-0.8.11 measurement environment (32 names).** This is a PrismaQuant release-
 evidence profile, not a second catalog of Gridbook's general runtime defaults. The authority is
 `prismaquant.gridbook_environment.GRIDBOOK_ENVIRONMENT_REGISTRY`, whose exact pin/source scan
 fails if the pinned version, its required W8A16 feature, or its environment namespace changes.
 It described 0.8.5 with 29 names until the 2026-08-21 producer-pin advance, which added the two
-0.8.9-era selectors marked below. Every snapshot includes values **and
+0.8.9-era selectors marked below; the 2026-08-22 registry update then added
+`PRISMAQUANT_CB_FP4V2_DENSE_R2` (canonical `0`, gridbook d4df36e's opt-in dense round-2 arm,
+default off) ahead of any pin advance so the source scan classifies it as known. Every
+snapshot includes values **and
 nulls** for all names:
 
 | Category | Count | Exact names |
 |---|---:|---|
-| execution | 21 | `GRIDBOOK_MXFP8_DENSE`, `PRISMAQUANT_CB_GEMV`, **`PRISMAQUANT_CB_FP8_GEMV_V2`**, `PRISMAQUANT_CB_FUSED_FP4`, `PRISMAQUANT_CB_FUSED_FP4_MOE`, `PRISMAQUANT_CB_BF16_SM120`, `PRISMAQUANT_CB_FP4_FUSED_MIDM`, `PRISMAQUANT_CB_MOE_PERSISTENT_B`, `PRISMAQUANT_CB_MOE_PERSISTENT_B_CFG`, **`PRISMAQUANT_CB_MOE_PERSISTENT_B_D2R`**, `PRISMAQUANT_CB_FUSED_MIDM`, `PRISMAQUANT_CB_GROUPED_TRIM`, `PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK`, `PRISMAQUANT_CB_PREFILL_CHUNK_BYTES`, `PRISMAQUANT_CB_DECODE_CONTRACT`, `PRISMAQUANT_CB_FP8_SCHED`, `PRISMAQUANT_CB_FP4V2_SCHED`, `PRISMAQUANT_CB_W2_SCHED`, `PRISMAQUANT_CB_W2_ROWS`, `PRISMAQUANT_CB_W2_WARPS`, `VLLM_USE_DEEP_GEMM` |
+| execution | 22 | `GRIDBOOK_MXFP8_DENSE`, `PRISMAQUANT_CB_GEMV`, **`PRISMAQUANT_CB_FP8_GEMV_V2`**, `PRISMAQUANT_CB_FUSED_FP4`, `PRISMAQUANT_CB_FUSED_FP4_MOE`, `PRISMAQUANT_CB_BF16_SM120`, `PRISMAQUANT_CB_FP4_FUSED_MIDM`, `PRISMAQUANT_CB_MOE_PERSISTENT_B`, `PRISMAQUANT_CB_MOE_PERSISTENT_B_CFG`, **`PRISMAQUANT_CB_MOE_PERSISTENT_B_D2R`**, `PRISMAQUANT_CB_FUSED_MIDM`, `PRISMAQUANT_CB_GROUPED_TRIM`, `PRISMAQUANT_CB_PREFILL_EXPERT_CHUNK`, `PRISMAQUANT_CB_PREFILL_CHUNK_BYTES`, `PRISMAQUANT_CB_DECODE_CONTRACT`, `PRISMAQUANT_CB_FP8_SCHED`, `PRISMAQUANT_CB_FP4V2_SCHED`, **`PRISMAQUANT_CB_FP4V2_DENSE_R2`**, `PRISMAQUANT_CB_W2_SCHED`, `PRISMAQUANT_CB_W2_ROWS`, `PRISMAQUANT_CB_W2_WARPS`, `VLLM_USE_DEEP_GEMM` |
 | correctness bypass | 1 | `PRISMAQUANT_SKIP_CB_CAST_CHECK` |
 | residency/build | 5 | `PRISMAQUANT_PRELOAD_FUSED`, `PRISMAQUANT_CB_EXT_DIR`, `PRISMAQUANT_CUTLASS_INCLUDE`, `CUDACXX`, `CXX` |
 | retired | 3 | `PRISMAQUANT_CB_DECODE`, `PRISMAQUANT_CB_EXPAND`, `PRISMAQUANT_CB_PREFILL` |
@@ -5036,26 +5383,28 @@ nulls** for all names:
 
 The canonical gold set leaves `GRIDBOOK_MXFP8_DENSE` **absent** and sets exactly
 `PRISMAQUANT_CB_GEMV=inherited`, `PRISMAQUANT_CB_BF16_SM120=0`,
-`PRISMAQUANT_CB_FP4_FUSED_MIDM=0`, `PRISMAQUANT_CB_MOE_PERSISTENT_B=0`,
+`PRISMAQUANT_CB_FP4_FUSED_MIDM=0`, `PRISMAQUANT_CB_FP4V2_DENSE_R2=0`, `PRISMAQUANT_CB_MOE_PERSISTENT_B=0`,
 `PRISMAQUANT_CB_MOE_PERSISTENT_B_CFG=0`,
 `PRISMAQUANT_CB_MOE_PERSISTENT_B_D2R=0`, `PRISMAQUANT_CB_FP8_GEMV_V2=0`,
 `PRISMAQUANT_CB_FUSED_MIDM=1`,
 `PRISMAQUANT_CB_GROUPED_TRIM=1`,
 `PRISMAQUANT_CB_PREFILL_CHUNK_BYTES=1073741824`,
 `PRISMAQUANT_CB_DECODE_CONTRACT=v1`, `VLLM_USE_DEEP_GEMM=0`,
-`PRISMAQUANT_SKIP_CB_CAST_CHECK=0`, and `PRISMAQUANT_PRELOAD_FUSED=0` — 14 set
+`PRISMAQUANT_SKIP_CB_CAST_CHECK=0`, and `PRISMAQUANT_PRELOAD_FUSED=0` — 15 set
 values; the other
 17 names must be absent. The two added in 2026-08-21 are pinned `0` for the
 same reason every other dispatch selector here is: 0.8.9 moved their unset
 default to `auto`, and the gold lane pins the kernel its evidence was measured
-on rather than following a runtime default. Absence is semantic: the MXFP8 override would select the distinct
+on rather than following a runtime default. The R2 arm joins them pinned `0`
+because it is opt-in whose unset default is the legacy kernel — the explicit
+off spelling cannot drift even if gridbook later flips its default. Absence is semantic: the MXFP8 override would select the distinct
 direct group-32 W8A8 lane; literal `0` is invalid for the two fused-FP4
 selectors and expert-chunk override, and the retired `PRISMAQUANT_CB_DECODE` must never
 reappear. Gold clears and applies that state before the first tokenizer/runtime import.
 Endpoint and matched-performance profiles change preload to `1` so compared arms have the
 same extension residency; the endpoint also sets
 `PRISMAQUANT_CB_EXT_DIR=/opt/gridbook/ext-cache`. Server manifests inspect the complete process
-tree using the same 31-name allowlist plus the two immutable runtime-pin transport variables,
+tree using the same 32-name allowlist plus the two immutable runtime-pin transport variables,
 `PYTHONSAFEPATH`, and `PYTHONPATH`; the last must be affirmatively absent, while the
 short-lived `/repo` fingerprint writer is not part of the inspected server process set.
 Every readable serving process must agree.
@@ -5075,7 +5424,7 @@ knob, a differing value/null, or a process-tree disagreement refuses. This later
 therefore evolve visibly without changing the semantics of the target-only authority. The
 regression digest is now stated on the scope it protects: the 29-name **historical
 projection** of the gold environment must still hash to its original literal, proving no
-pre-existing canonical value moved, and the full 31-name map carries its own digest
+pre-existing canonical value moved, and the full 32-name map carries its own digest
 (`test_gold_environment_grew_additively_over_the_historical_0_8_5_set`).
 
 The self-digesting runtime receipt binds image digest `sha256:58862b…869`, vLLM
@@ -5118,7 +5467,7 @@ profile/runtime receipt through only the paired-DSpark endpoint validator while 
 shared artifact, session, listener, launch, and residency checks. Every selected environment,
 package/capability/cache, launch, and route field has a mutation refusal test; a static digest
 test separately proves the old 0.8.5 environment is unchanged — since 2026-08-21 as the
-29-name historical projection of the grown 31-name map.
+29-name historical projection of the grown 32-name map.
 
 **One machine-readable contract, not parallel tables.** Gridbook packages
 `gridbook/runtime_contract.json`; it is authoritative for the runtime's quantization aliases,
@@ -5883,6 +6232,7 @@ New with the 2026-07-30 merge:
 | D30 | **The Sensitivity Card's non-scalar tiers are screening surrogates, and its probe wiring has two soft spots** (added 2026-08-14, §4.8). Four honest gaps, none of them closed: (1) **No served A/B.** The `MARGINAL` tier and AQUA-AURA have never been measured on exact full-vocab vLLM KL-vs-BF16 or direct WikiText PPL. `SCALAR` is a byte-identical reproduction of today's model and carries no such debt; the other two must not be cited as results (§2.5). (2) **The rank-1 reconstruction's error is unquantified on real layers.** `H = Σ_t outer(g_t², x_t²)` is exactly rank-1 only when one token dominates; `outer(row, col)/h_trace_raw` is provably exact in that case (`rtol=1e-10`) and an approximation of unknown magnitude everywhere else. Nothing has compared it against a materialized `H` on a real Linear. (3) **The marginal identity is exact only at the two streaming sites.** `sum(fisher_row) == sum(fisher_col) == h_trace_raw` holds by construction where `h_trace_raw` is literally `chunk_h.sum()` in fp32 (`incremental_probe.py:2520`, `:2751`). On the **resident** path `h_trace_raw` comes from the bf16 outer-product-norm identity `(gy2_sq.sum(1) · x2_sq.sum(1)).sum()` (`:1667-1668`) while the marginals reduce the fp32 `chunk_h`, so the two agree mathematically but not bitwise; `SensitivityUnit.validate`'s `rtol=1e-3` is what absorbs that, and nothing measures the actual spread. (4) **One accumulation site is dead on the shipping path and therefore untested.** The batched MoE block-flush hook (`:2276-2362`) fires only for blocks whose immediate children are per-expert containers exposing the profile's projection names as `nn.Linear` — the *unpacked*-expert layout. The shipping recipe's MoE models do not take it, and `tests/test_probe_marginals.py` covers the helpers and the two streaming sites but not that branch, so its marginal emission has never executed. A transposed axis or a wrong merge rule there would surface first on a new unpacked-expert architecture, which is exactly the class of silent-garbage failure §8.5 L3 is about. | §4.8; `prismaquant/sensitivity_card.py`, `format_cost_protocol.py`, `sensitivity_card_allocate.py`; `incremental_probe.py:97-199,1667-1672,2276-2360,2501-2520,2735-2751`; `tests/test_sensitivity_card.py`, `tests/test_probe_marginals.py`; `docs/design/sensitivity_card_contract.md` §8 | MED | (1)-(2) run the rank-agreement check against measured `output_mse` on Qwen3-0.6B and an allocation-churn check against a shipped `cost.pkl` before any tier but `SCALAR` is proposed for a default; (3) record the resident-vs-streaming identity spread on one real probe, or tighten the resident path to reduce `chunk_h` for both; (4) cover the MoE block flush with a synthetic unpacked-expert fixture, or state that the branch is retired. |
 | D31 | **Shipcard replay binds recorded evidence to the serving pin at HEAD** (added 2026-08-18). Every gate slot records the runtime that actually gated it (serve-manifest `gridbook_distribution`, endpoint-contract stack), but the replay compares those records against `load_gridbook_serving_runtime_pin()` at HEAD — so the 0.8.9 pin bump made the already-published DSv4 flagship unpublishable for a docs-only README update: six slot refusals, all "is not the tracked pin", on evidence that exactly matches the pin that was tracked when it was measured. Worked around honestly for the 0.8.9 card update by running the publisher from a worktree at `0266662` (the pre-bump commit; publisher and verifier code there are byte-identical to HEAD — the bump commit `6a883bc` touched pin data and docs only — so this verifies the card against the pin that gated it, with zero tool divergence). Recurs on every serving-pin bump for every historical artifact. | `prismaquant/shipcard.py:1225,2374,2521`; `tools/publish_artifact.py` dry-run refusal 2026-08-18 | MED | Decision for Robert: accept a declarative superseded-pins record in `gridbook_serving_runtime_pin.py` (version/commit/wheel of prior released pins; replay accepts recorded == current OR recorded ∈ superseded, and the verdict names which) — keeps fail-closed against unreviewed runtimes without rotting history — or rule that docs updates to historical artifacts always re-run the publisher at the artifact's pin era. |
 | D32 | **The Fisher probe is not bit-reproducible, and nothing in the tree said so** (added 2026-08-20). Two runs of `incremental_probe` with byte-identical calibration, the same commit and the same `--layers-per-shard` differ on **379/402 units**, median `|Δh_trace|/h_trace` **2.5e-4** (max 1.1e-2); `n_tokens_seen` and the per-expert Fisher *support* are bit-identical on every unit, so the forward and the routing are exactly deterministic and only the backward moves. Mechanism: 30 of Ornith-1.5-35B-A3B's 40 layers are Gated DeltaNet, whose `fla` Triton kernels reduce over chunks in a non-deterministic order. **Why it is debt rather than a bug:** the jitter is unbiased (signed mean +6.5e-5 against its own sd 5.7e-4) and three orders below the 23% cost CV that §9 records as producing 3% assignment churn and 0σ served — but a probe-side change gated on bit-identity refuses for reasons that have nothing to do with the change, and `--layers-per-shard auto` (sized from free RAM at launch) adds a second, *avoidable* source on top. **Consequence for provenance:** probe-derived artifacts (`cost_baseline.pkl`, `cost_aura.pkl`, `cost.pkl`, the sensitivity card) must be rebuilt together from one probe run rather than half-reused, or `cost.pkl`'s stamped provenance names a probe that produced only some of its numbers. | `incremental_probe.py`; `sensitivity_probe.py` `_accumulate_packed_per_token_fisher`; measured Ornith-1.5-35B-A3B 2026-08-20 | LOW | Gate probe changes on what is invariant (`n_tokens_seen`, per-expert support, an unbiased signed mean within a *measured* floor), never on bit-identity; pin `--layers-per-shard` for any A/B. |
+| D33 | **Unit-sharded renders are proven on 0.6B dense only, and the packed-expert half is unbuilt** (added 2026-08-23, §5.4). `PRISMAQUANT_UNIT_SHARD` splits a dense production-cache render across boxes and `tools/merge_unit_shards.py` gates completeness fail-closed, but four gaps are open. (1) **No cross-box run.** `tools/cluster_render_sentinel.py` exists and is unit-tested; it has never been executed on a second Spark, so the cross-box bit-identity the design assumes is untested. (2) **Packed-MoE experts do not shard.** `fill_packed_expert_cache_entries` enumerates its own modules and reservoir-samples them off a second shared `torch.Generator`, so every shard would render every expert; the stage refuses instead. The spec's motivating wall is an MoE cost stage, so v1 does not speed up the case that prompted it. (3) **`--include-qnames-file` still perturbs sampled rows.** It filters the `qnames` list before the fill, so it shrinks the hooked activation set itself, upstream of the reservoir fix; a partial render selected that way is not a slice of the full render. (4) **Bit-identity is measured at 0.6B, one calibration.** The A1 merge-versus-unsharded comparison ran on Qwen3-0.6B at 8x256 under `PRISMAQUANT_DETERMINISTIC=1`; the 4B repeat the spec asks for has not run, and nothing has measured whether the render is bit-identical with the determinism flag OFF. | `prismaquant/unit_sharding.py`; `prismaquant/production_weight_cache.py` `_LinearActivationCollector`; `tools/merge_unit_shards.py`; `tools/cluster_render_sentinel.py`; `tests/test_unit_sharding.py` | MED | Run the sentinel across both Sparks before any distributed campaign; repeat A1 at 4B; either give the packed-expert reservoir a per-module generator and shard it, or record that experts are permanently unsharded. |
 
 **Open items carried from session handovers.** Of the 41 items the handover census could not
 map to a verified closure, the prior FP4-CB fast-expander/Triton item is now closed by the

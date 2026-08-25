@@ -347,6 +347,60 @@ _PUBLISHED_FILES = frozenset({
 #     W8A16 lane assigns no CB rung, so the gate's per-unit loop sees no CB
 #     units on this lane; merge union with the R1 split-book gate reviewed
 #     line-by-line (both are additive parameters + calls at the same anchors).
+# RE-FROZEN 2026-08-22 (fifth time; the R5 discovery-walker merge), reviewed
+#     against THIS handoff rather than re-hashed:
+#   model_profiles/base.py -- `walk_claim_rules()` appended two ClaimRules
+#     between the ndim<=1 exclude and the final Linear-decide rule (a
+#     router-class pin and an `*Experts` packed-stack decide; docstring
+#     renumbered 9->11). Nothing else in the file moved. The method's only
+#     consumer is the R5 discovery walker (`prismaquant.model_walk`) and its
+#     tests -- grep over this closure finds no other caller, so exporter,
+#     completeness, decode-source, and namespace behavior cannot observe the
+#     change. On the DSv4 walk itself the rules are strictly shadowed or
+#     equivalent: DeepseekV4Profile prepends its own per-class router pins
+#     ahead of super(), first-match keeps the original disposition+reason for
+#     every node both rules match, and the R5 sweep verified every
+#     router-family node on the vendored topology was already pinned; the
+#     packed-expert decide matches owner classes containing "expert", but this
+#     lane swaps packed classes for per-expert nn.Linears before
+#     instantiation, whose weights the Linear rule already claimed with the
+#     same disposition. Net: byte-identical claims on the shipped DSv4
+#     topology; additional coverage only on architectures that previously had
+#     NO claim at all.
+# RE-FROZEN 2026-08-23 (sixth time; the R5 `wo_a` grouped-operand merge),
+# reviewed against THIS handoff rather than re-hashed. Rob signed off the
+# re-freeze after being shown that the change is deliberately consequential
+# for the ALLOCATOR (it is the point of the branch) and inert for THIS lane:
+#   specs/deepseek_v4.json -- data only: `DeepseekV4GroupedLinear` moves from
+#     `probe.skip_module_class_names` (now `[]`) to the new
+#     `probe.grouped_module_class_names`. No other key moves.
+#   model_profiles/deepseek_v4.py -- DOCSTRING ONLY. `walk_claim_rules()`
+#     re-describes `wo_a` as decided rather than pinned; not one statement
+#     changed. Verified by AST comparison with docstrings elided: identical.
+#   model_profiles/base.py -- two docstrings (`should_probe_linear`,
+#     `walk_claim_rules`) plus ONE new method, `probe_grouped_module_class_names()`,
+#     which returns the spec tuple and nothing else. Verified by per-method AST
+#     comparison with docstrings elided: 72 methods -> 73, ZERO existing
+#     bodies changed, none removed.
+# Why this lane cannot observe it: the changed declarations are read at
+# exactly four sites -- `model_profiles/structure.py` (spec parsing),
+# `base.py` itself (`should_probe_linear`, the new accessor, and
+# `walk_claim_rules`'s skip list), `sensitivity_probe.py`, and
+# `model_walk.py`. A grep over the whole closure finds NO exporter,
+# completeness, decode-source, footprint, output-safety, or namespace
+# consumer. `model_walk.py`, `sensitivity_probe.py`, and the allocator are
+# not members of this closure at all, so the disposition flip (`wo_a`: named
+# pin -> ordinary `decide`) lands entirely outside the frozen surface.
+# Independently, `dspark_source_metadata.dspark_cb_expected_physical_targets`
+# keeps all three `wo_a` bases on their released source-FP8 W8A16 route for a
+# STRUCTURAL reason this branch does not touch -- Gridbook's generic CB Linear
+# method does not implement the grouped-BMM algebra -- so the hybrid sidecar
+# CB surface stays nine physical bases per stage (27 for the released
+# three-stage topology).
+# What IS now true and was not before: a future DSv4 export may let the
+# allocator choose a format for `wo_a` instead of inheriting source precision.
+# That is the reviewed change. It means the 92 GB budget split (87.403 body +
+# 4.597 draft) must be re-checked on the next export rather than inherited.
 # RE-FROZEN 2026-08-25 (the gb10 branch merges upstream/main), reviewed
 # against THIS handoff rather than re-hashed. Seven files drifted, all from
 # folding the gb10 branch's GB10-hardware/DSv4 work into the already-current
@@ -411,6 +465,33 @@ _PUBLISHED_FILES = frozenset({
 #     3-way merge. Metadata-only, read by `export_native_compressed.py`'s
 #     production-cache coverage check, not by the W8A16 passthrough lane
 #     (which does not build or consult a production weight cache).
+# MERGE-FROZEN 2026-08-25 (second time): the gb10-onto-upstream/main merge
+# above and the proven-rescues line (R5 discovery-walker + `wo_a` grouped-
+# operand re-freezes, both already recorded above under their own 2026-08-22
+# / 2026-08-23 entries) merged. Both lines' per-file arguments are exactly
+# the union already written; four files carry both lines' changes and are
+# re-hashed for the merged tree, not re-reviewed line-by-line again:
+#   model_profiles/base.py -- gb10's `rotary_call_kwargs` hook (unreached for
+#     DSv4, see above) plus proven-rescues' `probe_grouped_module_class_names`
+#     accessor and the two new `walk_claim_rules` entries (router-gate pin,
+#     packed-expert-stack decide). Disjoint methods, clean auto-merge.
+#   model_profiles/deepseek_v4.py -- gb10's `_scale_pairs_for_dtype` /
+#     `nvfp4_scale_pairs` / dtype-agnostic `fp8_scale_pairs` (see above) plus
+#     proven-rescues' `walk_claim_rules` docstring update for the `wo_a`
+#     disposition flip (docstring only, no statement changed). Disjoint
+#     regions, clean auto-merge.
+#   model_profiles/specs/deepseek_v4.json -- gb10's `"mtp."` passthrough
+#     prefix (see above) plus proven-rescues' `DeepseekV4GroupedLinear`
+#     move from `probe.skip_module_class_names` to the new
+#     `probe.grouped_module_class_names`. Disjoint keys, clean auto-merge.
+#   production_weight_cache.py -- gb10's `eligible_qnames` metadata key (see
+#     above) plus proven-rescues' per-hook row-priority draw fix in
+#     `_LinearActivationCollector` (every hooked Linear now draws from the
+#     shared reservoir generator, not only the stored ones — the parallel-
+#     producer unit-sharding correctness fix). The draw fix changes WHICH
+#     rows a partial/sharded render stores, not the W8A16 lane: that lane
+#     builds no production weight cache at all, so `_LinearActivationCollector`
+#     is never instantiated on it.
 _FROZEN_EXPORT_SOURCE_SHA256 = {
     "prismaquant/export_nvfp4_cb_streaming.py": (
         "3380385f601623fc5d5b31147a226da15928b77b99dc15d2719e0ccb54232d1b"
@@ -428,16 +509,16 @@ _FROZEN_EXPORT_SOURCE_SHA256 = {
         "ebc676861843f7c7df65c8ec41afe23109918b62a10e210abc1240fe1227f6cf"
     ),
     "prismaquant/model_profiles/base.py": (
-        "e99f0d82cf084487db55aaf0fbcabf1576eaa9f11db3e2e104d66428cb8a3002"
+        "2b79f15f39f66f3b81ee894b29fbc0d586ebb9271fc41d59b4c088abf74656f4"
     ),
     "prismaquant/model_profiles/registry.py": (
         "f0d9ddd36e337fe19449e0b2510baef44051cee5aae466b4e11f9db761ce6b5f"
     ),
     "prismaquant/model_profiles/deepseek_v4.py": (
-        "016ec4d1e8dcfca2542ec1673c0804405b285f5e8659e04a3b989dc1d81acfae"
+        "93c6685c15c34450fd0376996c6f6ec99991de59fd3b2d7aa60a91011ff97ad7"
     ),
     "prismaquant/model_profiles/specs/deepseek_v4.json": (
-        "7e7801d58babb2f6bf36350f4a5f8450f04b2f3238141b32fd305286aaec9b11"
+        "dd438d9dab32c3a013ea042677c71b833461431ec1efc28553c98ed08567521c"
     ),
     "prismaquant/cb_source_decode.py": (
         "d9a06483d008bf2361b0522bc258ab291db870d1c2432f9d4cd8d7a8cbacefbe"
@@ -446,7 +527,7 @@ _FROZEN_EXPORT_SOURCE_SHA256 = {
         "a0e2d4b11d1d1932dbcb87a2d48f17106eb621d13a0e1b198bb3a78867e2ab58"
     ),
     "prismaquant/production_weight_cache.py": (
-        "79d5da3b6b273072c416b3a7cfb3063ed9eae04bca8b16e479399492ba583a56"
+        "033ed164ee32d332b57d0a310d03c0ab55b7de57060170abfb71903df46b69c7"
     ),
     "prismaquant/nvfp4_cb_footprint.py": (
         "68fa72cfb7274ceb8152db31940b2401e3d25485ea4b5a589ee8366b52997b93"

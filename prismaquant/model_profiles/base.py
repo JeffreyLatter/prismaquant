@@ -1323,10 +1323,13 @@ class ModelProfile(ABC):
 
     def should_probe_linear(self, name: str, mod) -> bool:
         """Whether to register Fisher hooks on this Linear module.
-        DSv4 returns False for `DeepseekV4GroupedLinear` (its weight
-        shape doesn't match the per-token Hessian-trace effective
-        output dim, so the chunk_h * w.pow(2) accumulator can't
-        broadcast). Default: True for any nn.Linear instance.
+        DSv4's `DeepseekV4GroupedLinear` used to be skipped here (its
+        grouped consumption broke the dense chunk_h * w.pow(2)
+        accumulator); since the grouped Fisher accumulator landed it is
+        probed through the grouped path instead, driven by the spec's
+        `probe_grouped_module_class_names`. The skip list itself remains
+        for classes with no accumulator at all. Default: True for any
+        nn.Linear instance.
 
         Profiles may also use this to skip e.g. router gates that
         shouldn't carry Fisher info."""
@@ -1339,6 +1342,27 @@ class ModelProfile(ABC):
             if type(mod).__name__ in skipped:
                 return False
         return True
+
+    def probe_grouped_module_class_names(self) -> tuple[str, ...]:
+        """Module classes whose forward consumes their weight through a
+        grouped/batched contraction over a leading GROUP axis (the
+        `wo_a` shape: `y[..., g, r] = sum_d x[..., g, d] * W[g, r, d]`,
+        stored as one `[G*R, D]` plane on an `nn.Linear` subclass).
+
+        Declared per family in the structure spec under
+        ``probe.grouped_module_class_names`` — the same one-declaration
+        discipline as ``probe_skip_module_class_names``, which these
+        classes previously lived in. The probe routes a declared class
+        to the grouped Fisher accumulator (`prismaquant.sensitivity_probe.
+        grouped_linear_groups`) instead of the dense one; an empty
+        declaration means the family has no such classes.
+
+        A declared class must expose its group count as `n_groups`;
+        anything else fails fast rather than silently dense-hooking."""
+        spec = self.structure_spec()
+        if spec is None:
+            return ()
+        return tuple(spec.probe_grouped_module_class_names)
 
     def walk_claim_rules(self):
         """Claim rules for the discovery walker (`prismaquant.model_walk`).
@@ -1356,8 +1380,13 @@ class ModelProfile(ABC):
 
         1. **pin** — weights of module classes the profile's spec declares in
            ``probe_skip_module_class_names``. The probe cannot price them, so
-           they are held at source precision as a *named* debt (this is
-           exactly the ``wo_a`` case: matmul-fed, discovered, unpriced).
+           they are held at source precision as a *named* debt. (This was
+           the ``wo_a`` rule until the grouped Fisher accumulator landed:
+           DSv4 declared ``DeepseekV4GroupedLinear`` here, and the walk
+           turned that declaration into a named pin. Grouped classes now
+           live under ``probe_grouped_module_class_names`` and are decided
+           like any other Linear; the mechanism stays for the next class
+           no accumulator covers.)
         2. **pin** — ``pinned_names()`` (``lm_head`` and friends).
         3. **exclude** — the MTP sidecar (``mtp_source_prefix()``), read only
            under spec decode; dispositioned by the MTP lane.
@@ -1372,8 +1401,17 @@ class ModelProfile(ABC):
         8. **exclude** — 0-D/1-D floating tensors (norm scales, biases,
            rotary frequency tables): never a GEMM multiplicand; immutable
            floor bytes.
-        9. **decide** — every remaining ``nn.Linear`` weight (subclasses
-           included, matched through the MRO): the allocator's domain.
+        9. **pin** — MoE router gates, matched by router-class family:
+           the routing logits are matmul-fed but never priced (a route flip
+           is not a smooth cost). DSv4's per-class pins predate this and
+           keep their own reasons; this rule covers every other family the
+           R5 sweep found (hy_v3, qwen3_5, laguna, minimax_m2, qwen3-moe)
+           plus name-excluded Linear routers (gemma4).
+        10. **decide** — packed expert stacks on an ``*Experts`` owner:
+            priced through the packed-expert Fisher path, so they are
+            allocator decisions like any other unit.
+        11. **decide** — every remaining ``nn.Linear`` weight (subclasses
+            included, matched through the MRO): the allocator's domain.
 
         Override to extend, not to weaken: profiles append architecture
         rules (or prepend more specific ones) and return the base list for
@@ -1440,6 +1478,32 @@ class ModelProfile(ABC):
             "0-D/1-D tensor (norm scale, bias, rotary table): never a GEMM "
             "multiplicand; immutable floor bytes",
             max_ndim=1,
+        ))
+        # Router gates, universal form (R5 sweep 2026-08-22): every packed-MoE
+        # family in current transformers carries its router as a bare
+        # Parameter (or a name-excluded Linear — gemma4's Gemma4TextRouter)
+        # whose routing logits are matmul-fed but never priced. DSv4 pinned
+        # exactly this slot per-class; the pattern is universal, so the base
+        # table claims it once by class-name family. A route flip is not a
+        # smooth cost: pin, with the debt named.
+        rules.append(ClaimRule(
+            "pin",
+            "MoE router gate: routing logits are matmul-fed but never "
+            "priced — a route flip is not a smooth cost; held at source "
+            "precision as a named debt",
+            predicate=lambda node: "router" in node.module_class.lower(),
+        ))
+        # Packed expert stacks (R5 sweep finding 2): one 3-D Parameter per
+        # stack on an `*Experts` module, priced through the packed-expert
+        # Fisher path (install_packed_expert_hooks), not by per-Linear
+        # enumeration. They ARE allocator decisions — so `decide`, not a pin.
+        rules.append(ClaimRule(
+            "decide",
+            "packed expert stack: priced through the packed-expert Fisher "
+            "path (install_packed_expert_hooks), not by per-Linear "
+            "enumeration",
+            predicate=lambda node: node.kind == "parameter"
+            and "expert" in node.module_class.lower(),
         ))
         rules.append(ClaimRule(
             "decide",
