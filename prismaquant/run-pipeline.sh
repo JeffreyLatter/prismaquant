@@ -6,10 +6,15 @@
 #   MODEL_PATH=/path/to/Qwen3.6-35B-A3B \
 #   WORK_DIR=./dq-runs/qwen36 \
 #   FORMATS=NVFP4,FP8_DYNAMIC,BF16 \
-#   TARGET_BITS=4.75 \
 #   VISUAL_FORMAT=BF16 \
 #   CALIBRATION_MODALITY=text-only \
 #   ./prismaquant/run-pipeline.sh
+#
+# TARGET_BITS defaults to `knee`: the allocator sweeps its full Pareto curve
+# and ships at whichever bpp its knee detector picks — the best measured
+# quality-vs-compression tradeoff, not a fixed number. Pass an explicit bpp
+# (e.g. TARGET_BITS=4.75) to pin a specific budget instead, or TARGET_BITS=
+# knee-ask to be prompted before switching. See the stage [3/4] comments.
 #
 # VISUAL_FORMAT accepts any format registry name allowed by the target
 # serving profile and applies to visual-encoder Linears on multimodal models.
@@ -37,13 +42,69 @@
 # MTP is folded into the incremental probe + cost as a built-in shard;
 # mtp.* tensors are measured in the same pass as the body and land in
 # the same probe/cost pickles. No separate MTP stages.
+#
+# CLUSTER_NODES (optional): space-separated SSH-reachable addresses of
+# additional boxes to render on. Empty/unset (the default) is exactly
+# today's single-box behavior. When set, the production-cache render
+# (stage [4/4]) splits into 1+N shards (PRISMAQUANT_UNIT_SHARD=i/N, see
+# prismaquant/unit_sharding.py) — this box is always shard 0 — and merges
+# back with tools/merge_unit_shards.py after a cross-box determinism
+# sentinel (tools/cluster_render_sentinel.py) passes. Use the address of
+# whichever NIC you want the model sync + shard dispatch to ride, not
+# necessarily the box's usual hostname — e.g. a ConnectX-7/RoCE address
+# rather than the management/VPN one. Every node needs the repo already
+# rsync'd once with a working `.venv` (`uv sync`); prismaquant/lib/
+# cluster_render.sh checks this up front and prints the exact one-line fix
+# if a node isn't ready rather than provisioning it automatically.
+#   CLUSTER_NODES="192.168.178.14" ./prismaquant/run-pipeline.sh
+#
+# AQUA (optional, default 0): merges an activation-quantization cost term
+# (prismaquant/aqua_activation_cost.py) into the weight-only cost table
+# stage [2] just produced (local or aura), before the allocator sees it —
+# "AURA + AQUA", the recipe RobTand's own shipped Qwen3.8-27B PrismaAQUA
+# model card lists. Off by default: zero behavior change unless AQUA=1.
+# When on: builds a Sensitivity Card from probe.pkl
+# (prismaquant/sensitivity_card_build.py), then merges the activation term
+# for AQUA_SERVING_LANE (default: compressed_tensors, matching the default
+# export). Still a research promotion (no served KL/PPL A/B against the
+# weight-only arm at matched bpp is in-tree yet); read
+# docs/ARCHITECTURE.md's AQUA section before shipping an AQUA=1 artifact.
+#   AQUA=1 ./prismaquant/run-pipeline.sh
 
 set -euo pipefail
 
 : "${MODEL_PATH:?Set MODEL_PATH to the source HF model directory}"
 : "${WORK_DIR:?Set WORK_DIR to a writable directory for artifacts}"
+: "${CLUSTER_NODES:=}"
+if [[ -n "$CLUSTER_NODES" ]]; then
+  # Every remote command below assumes MODEL_PATH/WORK_DIR resolve to the
+  # SAME path on every node (no shared filesystem — each node gets its own
+  # rsync'd copy at that path). A relative path would resolve against
+  # whatever cwd each SSH session happens to land in, which has no reason
+  # to match this shell's cwd — fail loudly instead of silently diverging.
+  case "$MODEL_PATH" in
+    /*) ;;
+    *) echo "[pipeline] ERROR: CLUSTER_NODES is set — MODEL_PATH must be an absolute path (got '$MODEL_PATH')." >&2; exit 2 ;;
+  esac
+  case "$WORK_DIR" in
+    /*) ;;
+    *) echo "[pipeline] ERROR: CLUSTER_NODES is set — WORK_DIR must be an absolute path (got '$WORK_DIR')." >&2; exit 2 ;;
+  esac
+fi
 : "${FORMATS:=NVFP4,FP8_DYNAMIC,BF16}"
-: "${TARGET_BITS:=4.75}"
+# TARGET_BITS defaults to `knee`, not a fixed number: automatically run the
+# allocator's own Pareto sweep first and ship at whichever PARETO_TARGETS
+# point pareto.knees.json's primary knee detector picked — the best quality-
+# vs-compression tradeoff the measured curve actually supports, rather than
+# a fixed historical bpp. An explicit numeric TARGET_BITS (or TARGET_DISK_GB)
+# always overrides this, same precedent as TARGET_PROFILE elsewhere in this
+# script. `knee-ask` is also accepted: same sweep, but PRINTS the knee vs
+# 4.75 and PROMPTS (via /dev/tty) before switching, refusing outright if no
+# interactive terminal is attached (e.g. under nohup) rather than hanging a
+# background run. Either sentinel costs one extra (DP-only, seconds)
+# allocator pre-pass before the real one at stage [3/4]; see that stage for
+# the resolution.
+: "${TARGET_BITS:=knee}"
 : "${PARETO_TARGETS:=4.5,4.6,4.7,4.75,4.85,5.0,5.25,5.5,6.0,7.0,8.25}"
 # TARGET_DISK_GB (re-vet R1, closes debt D12): the byte budget is the
 # CONSTRAINT and measured KL is the OBJECTIVE. When set it OVERRIDES
@@ -56,6 +117,14 @@ set -euo pipefail
 # that can fit, which is what keeps the extra KL evals cheap.
 : "${TARGET_DISK_GB:=}"
 : "${ARTIFACT_OVERHEAD_RESERVE_BYTES:=}"
+case "$TARGET_BITS" in
+  knee|knee-ask)
+    if [[ -n "$TARGET_DISK_GB" ]]; then
+      echo "[pipeline] ERROR: TARGET_BITS=$TARGET_BITS conflicts with TARGET_DISK_GB (TARGET_DISK_GB already overrides TARGET_BITS and picks its own ship point among the rungs that fit the byte budget — a bpp knee doesn't apply). Unset one." >&2
+      exit 2
+    fi
+    ;;
+esac
 # Calibration defaults. 4x256 was the historical minimum for correctness
 # validation; 32x1024 (N=32, T=1024 = 32768 tokens/sample, 32 samples)
 # produces ~7% lower PPL on the resulting quantized artifact at a
@@ -237,6 +306,9 @@ fi
 # PRISMAQUANT_CALIBRATION_DIR wherever you keep them, or set DATASET directly
 # to any .jsonl / .txt / HF dataset id.
 PIPELINE_SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "${PIPELINE_SCRIPT_DIR}/.." && pwd)"
+# shellcheck source=lib/cluster_render.sh
+source "${PIPELINE_SCRIPT_DIR}/lib/cluster_render.sh"
 : "${PRISMAQUANT_CALIBRATION_DIR:=${PIPELINE_SCRIPT_DIR%/}/../calibration}"
 : "${DATASET:=${PRISMAQUANT_CALIBRATION_DIR%/}/diverse-v1.jsonl}"
 # MINOR-M2: packed-MoE experts use a cross-domain held-out corpus for the
@@ -822,6 +894,20 @@ case "$COST_MODE" in
     ;;
 esac
 
+# AQUA activation-cost merge (opt-in; see the header comment). Runs after
+# whichever weight-only cost table COST_MODE above produced, before the
+# allocator. AQUA_SERVING_LANE must match the activation-quantization
+# contract the export actually ships (prismaquant/lane_specs/*.json "id");
+# compressed_tensors is the default export lane.
+: "${AQUA:=0}"
+: "${AQUA_SERVING_LANE:=compressed_tensors}"
+: "${AQUA_RENDER_BASIS:=rtn}"
+: "${AQUA_ACT_DIR:=${WORK_DIR}/act}"
+case "$AQUA" in
+  0|1) ;;
+  *) echo "[pipeline] ERROR: AQUA must be 0 or 1 (got '$AQUA')" >&2; exit 2 ;;
+esac
+
 case "${HADAMARD_DUQUANT:-}" in
   0|false|False|FALSE|no|No|NO|"") ;;
   *)
@@ -910,6 +996,16 @@ echo "  VALIDATED_FRONTIER_SKIP_CALIB=$VALIDATED_FRONTIER_SKIP_CALIB VALIDATED_F
 echo "  SELECTION_MODE=$SELECTION_MODE VALIDATED_FRONTIER_NSAMPLES=$VALIDATED_FRONTIER_NSAMPLES VALIDATED_FRONTIER_SEQLEN=$VALIDATED_FRONTIER_SEQLEN VALIDATED_FRONTIER_PICK=$VALIDATED_FRONTIER_PICK"
 echo
 
+# TARGET_BITS may still be the unresolved knee/knee-ask sentinel here (the
+# real value isn't knowable until the allocator's Pareto sweep runs at stage
+# [3/4], which needs cost.pkl — not ready yet). This spec write is a
+# documentary preflight, not the source of truth (layer_config.json's
+# achieved_bits is), so a placeholder is fine; it's re-resolved for real
+# before the allocator actually runs.
+case "$TARGET_BITS" in
+  knee|knee-ask) _target_bits_for_spec="${PARETO_TARGETS%%,*}" ;;
+  *) _target_bits_for_spec="$TARGET_BITS" ;;
+esac
 PIPELINE_SPEC_ARGS=(
   python3 -m prismaquant.pipeline
   --write-default-production "$PIPELINE_SPEC_PATH"
@@ -918,7 +1014,7 @@ PIPELINE_SPEC_ARGS=(
   --model-path "$MODEL_PATH"
   --work-dir "$WORK_DIR"
   --formats "$FORMATS"
-  --target-bits "$TARGET_BITS"
+  --target-bits "$_target_bits_for_spec"
   --target-profile "$TARGET_PROFILE_RESOLVED"
   --calibration-modality "$CALIBRATION_MODALITY"
   --selection-mode "$SELECTION_MODE"
@@ -1026,6 +1122,8 @@ STAGE_SETTINGS_ENV=(
   "VALIDATED_FRONTIER_CALIB_REPEATS=$VALIDATED_FRONTIER_CALIB_REPEATS"
   "VALIDATED_FRONTIER_CALIB_SKIP_FIRST=$VALIDATED_FRONTIER_CALIB_SKIP_FIRST"
   "VALIDATED_FRONTIER_KL_SCOPE=$VALIDATED_FRONTIER_KL_SCOPE"
+  "AQUA_SERVING_LANE=$AQUA_SERVING_LANE"
+  "AQUA_RENDER_BASIS=$AQUA_RENDER_BASIS"
   "${RENDER_ENV_SETTINGS[@]}"
 )
 STAGE_SETTINGS_ARGS=()
@@ -1288,21 +1386,19 @@ if [[ "$BASE_COST_REUSABLE" == "0" ]]; then
     export PRISMAQUANT_CB_COL_WEIGHTS="$CB_COL_WEIGHTS"
   fi
   echo "[pipeline] [2/4] measuring per-(layer, format) cost ..."
-  python3 -m prismaquant.incremental_measure_quant_cost \
+  run_cost_maybe_clustered "${BASE_COST_PATH}" "${WORK_DIR}/logs/cost.log" -- \
     --model "$MODEL_PATH" \
     --cost-mode "$COST_MODE" \
     --probe "${PROBE_PATH}" \
     --activation-cache-dir "${WORK_DIR}/act" \
     --formats "$FORMATS" \
-    --output "${BASE_COST_PATH}" \
     --work-dir "${WORK_DIR}/work" \
     --device "$DEVICE" --dtype bf16 \
     --mode batched --chunk-size 256 \
     --layers-per-shard "$LAYERS_PER_SHARD" \
     --skip-missing-activations \
     --no-include-lm-head \
-    --swap-grow-limit-mb "${SWAP_GROW_LIMIT_MB:-2048}" \
-    2>&1 | tee "${WORK_DIR}/logs/cost.log"
+    --swap-grow-limit-mb "${SWAP_GROW_LIMIT_MB:-2048}"
 else
   echo "[pipeline] [2/4] baseline cost exists, skipping"
 fi
@@ -1400,22 +1496,37 @@ PY
     "AURA_CACHE_FORMATS=$AURA_CACHE_FORMATS"
   if [[ ! -f "$PRODUCTION_RENDER_COST_CACHE_PATH" ]]; then
     echo "[pipeline] [2b/4] building format-menu production cache for AURA dW ..."
-    python3 -m prismaquant.build_production_cache \
-      --model "$MODEL_PATH" \
-      --output "$PRODUCTION_RENDER_COST_CACHE_PATH" \
-      --formats "$AURA_CACHE_FORMATS" \
-      --dataset "$DATASET" \
-      --n-calib-samples "$NSAMPLES" \
-      --calib-seqlen "$SEQLEN" \
-      --dtype bf16 \
-      --max-act-rows "$PRODUCTION_CACHE_MAX_ACT_ROWS" \
-      --enable "$PRODUCTION_CACHE_LEVERS" \
-      --disable "$PRODUCTION_CACHE_DISABLE_LEVERS" \
-      --cache-dir "$PRODUCTION_RENDER_COST_CACHE_DIR" \
-      --render-scope format-menu \
-      "${COST_CACHE_COL_WEIGHT_ARGS[@]+"${COST_CACHE_COL_WEIGHT_ARGS[@]}"}" \
-      $(if [[ "$SELECTION_MODE" == "validated-surrogate" ]]; then echo "--render-packed-experts"; fi) \
-      2>&1 | tee "${WORK_DIR}/logs/aura_dw_cache.log"
+    if [[ "$SELECTION_MODE" == "validated-surrogate" ]]; then
+      # --render-packed-experts: unit_sharding v1 doesn't support packed
+      # experts (same limitation as the [4/4] frontier cache), so this
+      # branch stays local regardless of CLUSTER_NODES.
+      python3 -m prismaquant.build_production_cache \
+        --model "$MODEL_PATH" \
+        --output "$PRODUCTION_RENDER_COST_CACHE_PATH" \
+        --formats "$AURA_CACHE_FORMATS" \
+        --dataset "$DATASET" \
+        --n-calib-samples "$NSAMPLES" \
+        --calib-seqlen "$SEQLEN" \
+        --dtype bf16 \
+        --max-act-rows "$PRODUCTION_CACHE_MAX_ACT_ROWS" \
+        --enable "$PRODUCTION_CACHE_LEVERS" \
+        --disable "$PRODUCTION_CACHE_DISABLE_LEVERS" \
+        --cache-dir "$PRODUCTION_RENDER_COST_CACHE_DIR" \
+        --render-scope format-menu \
+        "${COST_CACHE_COL_WEIGHT_ARGS[@]+"${COST_CACHE_COL_WEIGHT_ARGS[@]}"}" \
+        --render-packed-experts \
+        2>&1 | tee "${WORK_DIR}/logs/aura_dw_cache.log"
+    else
+      build_prod_cache_maybe_clustered \
+        "$PRODUCTION_RENDER_COST_CACHE_PATH" "$PRODUCTION_RENDER_COST_CACHE_DIR" \
+        "${WORK_DIR}/logs/aura_dw_cache.log" "$AURA_CACHE_FORMATS" -- \
+        --model "$MODEL_PATH" --formats "$AURA_CACHE_FORMATS" --dataset "$DATASET" \
+        --n-calib-samples "$NSAMPLES" --calib-seqlen "$SEQLEN" --dtype bf16 \
+        --max-act-rows "$PRODUCTION_CACHE_MAX_ACT_ROWS" \
+        --enable "$PRODUCTION_CACHE_LEVERS" --disable "$PRODUCTION_CACHE_DISABLE_LEVERS" \
+        --render-scope format-menu \
+        "${COST_CACHE_COL_WEIGHT_ARGS[@]+"${COST_CACHE_COL_WEIGHT_ARGS[@]}"}"
+    fi
   else
     echo "[pipeline] [2b/4] AURA dW production cache exists, skipping"
   fi
@@ -1426,10 +1537,11 @@ PY
   require_stage_settings "$AURA_COST_RAW" aura-cost
   if [[ ! -f "$AURA_COST_RAW" ]]; then
     echo "[pipeline] [2c/4] measuring AURA downstream-KL-adjoint cost ..."
-    python3 -m prismaquant.aura_cost \
+    run_aura_cost_maybe_clustered \
+      "$AURA_COST_RAW" "${WORK_DIR}/logs/aura_cost.log" \
+      "$PRODUCTION_RENDER_COST_CACHE_PATH" "$PRODUCTION_RENDER_COST_CACHE_DIR" -- \
       --model "$MODEL_PATH" \
       --cost-mode "$COST_MODE" \
-      --output "$AURA_COST_RAW" \
       --formats "$FORMATS" \
       --production-cache "$PRODUCTION_RENDER_COST_CACHE_PATH" \
       --require-production-cache \
@@ -1441,12 +1553,10 @@ PY
       --dataset "$DATASET" \
       --hook-harvest \
       --gradient-checkpointing \
-      --n-linear-chunks "$AURA_COST_LINEAR_CHUNKS" \
       --probe-microbatch "$AURA_COST_PROBE_MICROBATCH" \
       --min-free-gib "$AURA_COST_MIN_FREE_GIB" \
       --accurate-chunk-bytes \
-      --allow-packed-expert-omission \
-      2>&1 | tee "${WORK_DIR}/logs/aura_cost.log"
+      --allow-packed-expert-omission
   else
     echo "[pipeline] [2c/4] AURA cost exists, skipping"
   fi
@@ -1571,13 +1681,57 @@ PY
 fi
 
 # -----------------------------------------------------------------------
+# [2e] AQUA activation-cost merge (opt-in; AQUA=1). "AURA + AQUA" — the
+# recipe RobTand's shipped Qwen3.8-27B PrismaAQUA HF model card lists.
+# Prices activation-quantization error (E_a) on top of whichever weight-only
+# cost (E_w) COST_MODE above produced, via a Sensitivity Card built from the
+# probe. Runs after every COST_MODE/CB branch above so COST_PATH always
+# points at the finished weight-only table before AQUA reads it. No-op
+# (COST_PATH untouched) unless AQUA=1.
+# -----------------------------------------------------------------------
+if [[ "$AQUA" == "1" ]]; then
+  AQUA_CARD_PATH="${WORK_DIR}/artifacts/aqua_card.npz"
+  AQUA_COST_PATH="${WORK_DIR}/artifacts/cost_aqua.pkl"
+
+  require_stage_settings "$AQUA_CARD_PATH" aqua-sensitivity-card
+  if [[ ! -f "$AQUA_CARD_PATH" ]]; then
+    echo "[pipeline] [2e/4] building AQUA sensitivity card from probe ..."
+    python3 -m prismaquant.sensitivity_card_build \
+      "$PROBE_PATH" \
+      --out "$AQUA_CARD_PATH" \
+      --model-id "$MODEL_PATH" \
+      --render-basis "$AQUA_RENDER_BASIS" \
+      2>&1 | tee "${WORK_DIR}/logs/aqua_sensitivity_card.log"
+  else
+    echo "[pipeline] [2e/4] AQUA sensitivity card exists, skipping"
+  fi
+
+  require_stage_settings "$AQUA_COST_PATH" aqua-activation-cost
+  if ! cost_table_reusable "$AQUA_COST_PATH"; then
+    AQUA_ACT_DIR_ARGS=()
+    if [[ -d "$AQUA_ACT_DIR" ]]; then
+      AQUA_ACT_DIR_ARGS=(--act-dir "$AQUA_ACT_DIR")
+    fi
+    echo "[pipeline] [2e/4] merging AQUA activation-quantization cost (lane=${AQUA_SERVING_LANE}) into cost table ..."
+    python3 -m prismaquant.aqua_activation_cost \
+      --card "$AQUA_CARD_PATH" \
+      --model-path "$MODEL_PATH" \
+      --cost-in "$COST_PATH" \
+      --cost-out "$AQUA_COST_PATH" \
+      --formats "$FORMATS" \
+      --device "$DEVICE" \
+      --serving-lane "$AQUA_SERVING_LANE" \
+      "${AQUA_ACT_DIR_ARGS[@]+"${AQUA_ACT_DIR_ARGS[@]}"}" \
+      2>&1 | tee "${WORK_DIR}/logs/aqua_activation_cost.log"
+  else
+    echo "[pipeline] [2e/4] AQUA-merged cost exists, skipping"
+  fi
+  COST_PATH="$AQUA_COST_PATH"
+fi
+
+# -----------------------------------------------------------------------
 # 3. Allocator (multi-choice knapsack over per-layer formats)
 # -----------------------------------------------------------------------
-if [[ -n "$TARGET_DISK_GB" ]]; then
-  echo "[pipeline] [3/4] running allocator under a ${TARGET_DISK_GB}GB byte budget (overrides TARGET_BITS=${TARGET_BITS}) ..."
-else
-  echo "[pipeline] [3/4] running allocator at target=${TARGET_BITS} bpp ..."
-fi
 # Choose visual-sensitivity mode from calibration modality:
 #   text-only → uniform (Phase 1 --visual-format path, as before)
 #   multimodal → fisher (Phase 2: DP places visual Linears from real
@@ -1659,22 +1813,92 @@ if [[ "$EXPORT_CONTAINER" == "nvfp4_cb" ]]; then
     --cb-scale-sweep-scope "$CB_SCALE_SWEEP_SCOPE"
   )
 fi
+
+# Args shared by the knee pre-pass (if any) and the real allocator call —
+# everything except --target-bits, which the pre-pass needs a throwaway
+# value for and the real call needs the resolved one.
+ALLOCATOR_COMMON_ARGS=(
+  --probe "${PROBE_PATH}"
+  --costs "${COST_PATH}"
+  --formats "$FORMATS"
+  "${ALLOCATOR_PROFILE_ARGS[@]}"
+  "${ALLOCATOR_BUDGET_ARGS[@]+"${ALLOCATOR_BUDGET_ARGS[@]}"}"
+  "${ALLOCATOR_SERVE_ARGS[@]+"${ALLOCATOR_SERVE_ARGS[@]}"}"
+  "${ALLOCATOR_CB_ARGS[@]+"${ALLOCATOR_CB_ARGS[@]}"}"
+  --pareto-targets "$PARETO_TARGETS"
+  --visual-format "$VISUAL_FORMAT"
+  --visual-sensitivity "$VISUAL_SENSITIVITY"
+  --mtp-format "$MTP_FORMAT"
+  --layer-config "${WORK_DIR}/artifacts/layer_config.json"
+  --pareto-csv "${WORK_DIR}/artifacts/pareto.csv"
+  "${ALLOCATOR_PARETO_ARGS[@]}"
+)
+
+case "$TARGET_BITS" in
+  knee|knee-ask)
+    echo "[pipeline] [3/4] running allocator's Pareto sweep to locate the knee ..."
+    # Throwaway target for this pre-pass only (its own assignment is
+    # discarded) — the first PARETO_TARGETS entry, so it's always a value
+    # the operator already declared feasible for this FORMATS menu, unlike
+    # a hardcoded 4.75 that a customized PARETO_TARGETS might not support.
+    python3 -m prismaquant.allocator \
+      "${ALLOCATOR_COMMON_ARGS[@]}" \
+      --target-bits "${PARETO_TARGETS%%,*}" \
+      2>&1 | tee "${WORK_DIR}/logs/allocator_knee_scan.log"
+
+    KNEE_TARGET_BITS="$(python3 - "${WORK_DIR}/artifacts/pareto.knees.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1]) as fh:
+    doc = json.load(fh)
+primary = doc.get("primary")
+node = doc.get(primary) if primary else None
+bits = node.get("target_bits") if isinstance(node, dict) else None
+print(bits if bits is not None else "")
+PY
+)"
+    if [[ -z "$KNEE_TARGET_BITS" ]]; then
+      echo "[pipeline] ERROR: TARGET_BITS=$TARGET_BITS but ${WORK_DIR}/artifacts/pareto.knees.json has no usable primary knee. Set TARGET_BITS to an explicit number instead." >&2
+      exit 2
+    fi
+
+    if [[ "$TARGET_BITS" == "knee-ask" ]]; then
+      if [[ -r /dev/tty ]]; then
+        {
+          echo "[pipeline] Pareto knee detected at target_bits=${KNEE_TARGET_BITS} bpp (full curve: ${WORK_DIR}/artifacts/pareto.csv, detector detail: ${WORK_DIR}/artifacts/pareto.knees.json)."
+          printf '[pipeline] Ship at the knee (%s bpp) instead of 4.75? [Y/n] ' "$KNEE_TARGET_BITS"
+        } > /dev/tty
+        read -r KNEE_REPLY < /dev/tty
+        case "$KNEE_REPLY" in
+          n|N|no|No|NO)
+            TARGET_BITS=4.75
+            echo "[pipeline] keeping TARGET_BITS=4.75 (declined the knee)"
+            ;;
+          *)
+            TARGET_BITS="$KNEE_TARGET_BITS"
+            echo "[pipeline] switching to the knee: TARGET_BITS=$TARGET_BITS"
+            ;;
+        esac
+      else
+        echo "[pipeline] ERROR: TARGET_BITS=knee-ask needs an interactive terminal to ask (none attached — e.g. running under nohup/background). Use TARGET_BITS=knee to pick the knee automatically without asking, or set TARGET_BITS explicitly." >&2
+        exit 2
+      fi
+    else
+      TARGET_BITS="$KNEE_TARGET_BITS"
+      echo "[pipeline] TARGET_BITS=knee resolved automatically to ${TARGET_BITS} bpp (best measured quality/compression tradeoff; see ${WORK_DIR}/artifacts/pareto.knees.json)"
+    fi
+    ;;
+esac
+
+if [[ -n "$TARGET_DISK_GB" ]]; then
+  echo "[pipeline] [3/4] running allocator under a ${TARGET_DISK_GB}GB byte budget (overrides TARGET_BITS=${TARGET_BITS}) ..."
+else
+  echo "[pipeline] [3/4] running allocator at target=${TARGET_BITS} bpp ..."
+fi
 python3 -m prismaquant.allocator \
-  --probe "${PROBE_PATH}" \
-  --costs "${COST_PATH}" \
+  "${ALLOCATOR_COMMON_ARGS[@]}" \
   --target-bits "$TARGET_BITS" \
-  --formats "$FORMATS" \
-  "${ALLOCATOR_PROFILE_ARGS[@]}" \
-  "${ALLOCATOR_BUDGET_ARGS[@]+"${ALLOCATOR_BUDGET_ARGS[@]}"}" \
-  "${ALLOCATOR_SERVE_ARGS[@]+"${ALLOCATOR_SERVE_ARGS[@]}"}" \
-  "${ALLOCATOR_CB_ARGS[@]+"${ALLOCATOR_CB_ARGS[@]}"}" \
-  --pareto-targets "$PARETO_TARGETS" \
-  --visual-format "$VISUAL_FORMAT" \
-  --visual-sensitivity "$VISUAL_SENSITIVITY" \
-  --mtp-format "$MTP_FORMAT" \
-  --layer-config "${WORK_DIR}/artifacts/layer_config.json" \
-  --pareto-csv "${WORK_DIR}/artifacts/pareto.csv" \
-  "${ALLOCATOR_PARETO_ARGS[@]}" \
   2>&1 | tee "${WORK_DIR}/logs/allocator.log"
 
 # -----------------------------------------------------------------------
@@ -1945,46 +2169,76 @@ PY
     require_stage_settings "$PROD_CACHE_RECACHED" production-cache-recached \
       "ASSIGNMENT_DIGEST=$LC_DIGEST" \
       "${PRODUCTION_CACHE_CB_SETTINGS[@]+"${PRODUCTION_CACHE_CB_SETTINGS[@]}"}"
+    run_production_recache_step() {
+      echo "[pipeline] [4/4] re-fitting production activation scales ..."
+      python3 -m prismaquant.production_recache \
+        --model "$MODEL_PATH" \
+        --layer-config "${WORK_DIR}/artifacts/layer_config.json" \
+        --production-weight-cache "$PROD_CACHE_RAW" \
+        --output "$PROD_CACHE_RECACHED" \
+        --cache-dir-override "$PROD_CACHE_DIR" \
+        --dataset "$DATASET" \
+        --n-calib-samples "$NSAMPLES" \
+        --calib-seqlen "$SEQLEN" \
+        --dtype bf16 \
+        --device "$DEVICE" \
+        --production-cache-lru-gb "$PRODUCTION_CACHE_LRU_GB" \
+        --production-cache-prefetch "$PRODUCTION_CACHE_PREFETCH" \
+        --production-cache-prefetch-workers "$PRODUCTION_CACHE_PREFETCH_WORKERS" \
+        --microbatch-size "$PRODUCTION_RECACHE_MICROBATCH" \
+        2>&1 | tee "${WORK_DIR}/logs/production_recache.log"
+    }
     if [[ ! -f "$PROD_CACHE_RECACHED" ]]; then
       if [[ ! -f "$PROD_CACHE_RAW" ]]; then
-        echo "[pipeline] [4/4] building production cache + re-fitting activation scales ..."
-        python3 -m prismaquant.build_production_cache \
-          --model "$MODEL_PATH" \
-          --output "$PROD_CACHE_RECACHED" \
-          --formats "$CACHE_FORMATS" \
-          --dataset "$DATASET" \
-          --n-calib-samples "$NSAMPLES" \
-          --calib-seqlen "$SEQLEN" \
-          --dtype bf16 \
-          --max-act-rows "$PRODUCTION_CACHE_MAX_ACT_ROWS" \
-          --enable "$PRODUCTION_CACHE_LEVERS" \
-          --disable "$PRODUCTION_CACHE_DISABLE_LEVERS" \
-          --cache-dir "$PROD_CACHE_DIR" \
-          --render-scope "$PRODUCTION_CACHE_RENDER_SCOPE" \
-          --render-layer-config "${WORK_DIR}/artifacts/layer_config.json" \
-          --recache-layer-config "${WORK_DIR}/artifacts/layer_config.json" \
-          --recache-microbatch-size "$PRODUCTION_RECACHE_MICROBATCH" \
-          "${PRODUCTION_CACHE_CB_ARGS[@]+"${PRODUCTION_CACHE_CB_ARGS[@]}"}" \
-          ${EXPERT_GATE_DATASET:+--expert-gate-dataset "$EXPERT_GATE_DATASET"} \
-          2>&1 | tee "${WORK_DIR}/logs/production_cache.log"
+        if [[ -n "$CLUSTER_NODES" ]]; then
+          # unit_sharding refuses PRISMAQUANT_UNIT_SHARD combined with
+          # --recache-layer-config (recache is a whole-model calibration
+          # replay, not a per-unit render) — so clustering decomposes this
+          # into a sharded render (-> PROD_CACHE_RAW) followed by the same
+          # single-box recache step the "raw cache already exists" branch
+          # below uses. Solo-box keeps the single-call optimization as-is.
+          echo "[pipeline] [4/4] building production cache across cluster ..."
+          build_prod_cache_maybe_clustered \
+            "$PROD_CACHE_RAW" "$PROD_CACHE_DIR" "${WORK_DIR}/logs/production_cache.log" \
+            "$CACHE_FORMATS" -- \
+            --model "$MODEL_PATH" \
+            --formats "$CACHE_FORMATS" \
+            --dataset "$DATASET" \
+            --n-calib-samples "$NSAMPLES" \
+            --calib-seqlen "$SEQLEN" \
+            --dtype bf16 \
+            --max-act-rows "$PRODUCTION_CACHE_MAX_ACT_ROWS" \
+            --enable "$PRODUCTION_CACHE_LEVERS" \
+            --disable "$PRODUCTION_CACHE_DISABLE_LEVERS" \
+            --render-scope "$PRODUCTION_CACHE_RENDER_SCOPE" \
+            --render-layer-config "${WORK_DIR}/artifacts/layer_config.json" \
+            "${PRODUCTION_CACHE_CB_ARGS[@]+"${PRODUCTION_CACHE_CB_ARGS[@]}"}" \
+            ${EXPERT_GATE_DATASET:+--expert-gate-dataset "$EXPERT_GATE_DATASET"}
+          run_production_recache_step
+        else
+          echo "[pipeline] [4/4] building production cache + re-fitting activation scales ..."
+          python3 -m prismaquant.build_production_cache \
+            --model "$MODEL_PATH" \
+            --output "$PROD_CACHE_RECACHED" \
+            --formats "$CACHE_FORMATS" \
+            --dataset "$DATASET" \
+            --n-calib-samples "$NSAMPLES" \
+            --calib-seqlen "$SEQLEN" \
+            --dtype bf16 \
+            --max-act-rows "$PRODUCTION_CACHE_MAX_ACT_ROWS" \
+            --enable "$PRODUCTION_CACHE_LEVERS" \
+            --disable "$PRODUCTION_CACHE_DISABLE_LEVERS" \
+            --cache-dir "$PROD_CACHE_DIR" \
+            --render-scope "$PRODUCTION_CACHE_RENDER_SCOPE" \
+            --render-layer-config "${WORK_DIR}/artifacts/layer_config.json" \
+            --recache-layer-config "${WORK_DIR}/artifacts/layer_config.json" \
+            --recache-microbatch-size "$PRODUCTION_RECACHE_MICROBATCH" \
+            "${PRODUCTION_CACHE_CB_ARGS[@]+"${PRODUCTION_CACHE_CB_ARGS[@]}"}" \
+            ${EXPERT_GATE_DATASET:+--expert-gate-dataset "$EXPERT_GATE_DATASET"} \
+            2>&1 | tee "${WORK_DIR}/logs/production_cache.log"
+        fi
       else
-        echo "[pipeline] [4/4] re-fitting production activation scales ..."
-        python3 -m prismaquant.production_recache \
-          --model "$MODEL_PATH" \
-          --layer-config "${WORK_DIR}/artifacts/layer_config.json" \
-          --production-weight-cache "$PROD_CACHE_RAW" \
-          --output "$PROD_CACHE_RECACHED" \
-          --cache-dir-override "$PROD_CACHE_DIR" \
-          --dataset "$DATASET" \
-          --n-calib-samples "$NSAMPLES" \
-          --calib-seqlen "$SEQLEN" \
-          --dtype bf16 \
-          --device "$DEVICE" \
-          --production-cache-lru-gb "$PRODUCTION_CACHE_LRU_GB" \
-          --production-cache-prefetch "$PRODUCTION_CACHE_PREFETCH" \
-          --production-cache-prefetch-workers "$PRODUCTION_CACHE_PREFETCH_WORKERS" \
-          --microbatch-size "$PRODUCTION_RECACHE_MICROBATCH" \
-          2>&1 | tee "${WORK_DIR}/logs/production_recache.log"
+        run_production_recache_step
       fi
     else
       echo "[pipeline] [4/4] recached production cache exists, skipping"
@@ -1997,9 +2251,10 @@ PY
       "${PRODUCTION_CACHE_CB_SETTINGS[@]+"${PRODUCTION_CACHE_CB_SETTINGS[@]}"}"
     if [[ ! -f "$PROD_CACHE_RAW" ]]; then
       echo "[pipeline] [4/4] building production cache ..."
-      python3 -m prismaquant.build_production_cache \
+      build_prod_cache_maybe_clustered \
+        "$PROD_CACHE_RAW" "$PROD_CACHE_DIR" "${WORK_DIR}/logs/production_cache.log" \
+        "$CACHE_FORMATS" -- \
         --model "$MODEL_PATH" \
-        --output "$PROD_CACHE_RAW" \
         --formats "$CACHE_FORMATS" \
         --dataset "$DATASET" \
         --n-calib-samples "$NSAMPLES" \
@@ -2008,12 +2263,10 @@ PY
         --max-act-rows "$PRODUCTION_CACHE_MAX_ACT_ROWS" \
         --enable "$PRODUCTION_CACHE_LEVERS" \
         --disable "$PRODUCTION_CACHE_DISABLE_LEVERS" \
-        --cache-dir "$PROD_CACHE_DIR" \
         --render-scope "$PRODUCTION_CACHE_RENDER_SCOPE" \
         --render-layer-config "${WORK_DIR}/artifacts/layer_config.json" \
         "${PRODUCTION_CACHE_CB_ARGS[@]+"${PRODUCTION_CACHE_CB_ARGS[@]}"}" \
-        ${EXPERT_GATE_DATASET:+--expert-gate-dataset "$EXPERT_GATE_DATASET"} \
-        2>&1 | tee "${WORK_DIR}/logs/production_cache.log"
+        ${EXPERT_GATE_DATASET:+--expert-gate-dataset "$EXPERT_GATE_DATASET"}
     else
       echo "[pipeline] [4/4] production cache exists, skipping"
     fi

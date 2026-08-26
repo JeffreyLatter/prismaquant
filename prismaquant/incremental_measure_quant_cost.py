@@ -1157,6 +1157,20 @@ def main():
                          "per-(layer, format) predicted_dloss and "
                          "Fisher row-weighted fisher_output_mse alongside "
                          "weight_mse in cost.pkl.")
+    ap.add_argument("--shard-range", default=None,
+                    help="'i/N': compute only this box's contiguous slice "
+                         "of shard INDICES over the full (unrestricted) "
+                         "shard schedule, then exit before the merge step. "
+                         "Unlike --start-layer/--end-layer (which slices "
+                         "the schedule itself and renumbers from 0 — "
+                         "colliding filenames across boxes), this keeps "
+                         "the full schedule's global indexing so shard "
+                         "pickles from different boxes never collide. A "
+                         "cluster orchestrator dispatches N boxes each "
+                         "with a distinct i/N, syncs every shard pickle "
+                         "into one shard-dir, then reruns once with "
+                         "--shard-range unset so the existing skip-if-"
+                         "exists path performs the merge + coverage gate.")
     args = ap.parse_args()
     from prismaquant.gpu_guard import require_cuda_hot_path
     require_cuda_hot_path("incremental_measure_quant_cost", args.device)
@@ -1296,10 +1310,24 @@ def main():
         )
         for i, linear_include in enumerate(shard_regexes)
     ]
+    owned_indices: set[int] | None = None
+    if args.shard_range:
+        from .unit_sharding import parse_shard_spec
+        spec = parse_shard_spec(args.shard_range)
+        if spec is not None:
+            lo = spec.index * len(shard_regexes) // spec.count
+            hi = (spec.index + 1) * len(shard_regexes) // spec.count
+            owned_indices = set(range(lo, hi))
+            print(f"[incremental-cost] shard-range {spec.label}: computing "
+                  f"shard indices {sorted(owned_indices)} of "
+                  f"{len(shard_regexes)}, skipping the rest this run",
+                  flush=True)
+
+    check_range = owned_indices if owned_indices is not None else range(len(shard_regexes))
     all_reusable = all(
         shard_paths[i].exists()
         and cost_shard_is_reusable(shard_paths[i], expected_metas[i])
-        for i in range(len(shard_regexes))
+        for i in check_range
     )
 
     ctx: StreamingContext | None = None
@@ -1337,6 +1365,8 @@ def main():
             _ensure_ready()
 
         for shard_idx, linear_include in enumerate(shard_regexes):
+            if owned_indices is not None and shard_idx not in owned_indices:
+                continue
             shard_path = shard_paths[shard_idx]
             expected_meta = expected_metas[shard_idx]
             if shard_path.exists() and cost_shard_is_reusable(shard_path, expected_meta):
@@ -1440,6 +1470,13 @@ def main():
             ctx.shutdown()
         if mm_ctx is not None:
             mm_ctx.shutdown()
+
+    if owned_indices is not None:
+        print(f"[incremental-cost] shard-range {args.shard_range}: wrote "
+              f"{len(owned_indices)} shard(s); skipping merge (partial "
+              "run — rerun with --shard-range unset once every box's "
+              "shards are synced into this shard-dir)", flush=True)
+        return
 
     merge_cost_pickles(shard_paths, Path(args.output))
     # Coverage gate: every body layer the probe measured must appear in

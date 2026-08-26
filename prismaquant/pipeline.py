@@ -156,6 +156,20 @@ STAGE_SETTINGS_KEYS: dict[str, tuple[tuple[str, str], ...]] = {
         "EXPERT_SL<-AURA_EXPERT_SEQLEN",
         *_CB_SERIALIZATION_SETTINGS,
     ),
+    # --- AQUA activation-cost merge (opt-in, AQUA=1) ------------------------
+    # The card is a function of the probe's per-channel marginals, same
+    # inputs as the "probe" stage, plus the basis it renders sensitivities in.
+    "aqua-sensitivity-card": _key_pairs(
+        "MODEL_PATH", "DATASET", "NSAMPLES", "SEQLEN", "CALIBRATION_MODALITY",
+        "AQUA_RENDER_BASIS",
+    ),
+    # The merged cost table depends on which weight-only cost it started from
+    # (COST_MODE), which formats got priced, and which serving lane's
+    # activation contract was assumed.
+    "aqua-activation-cost": _key_pairs(
+        "MODEL_PATH", "FORMATS", "COST_MODE", "AQUA_SERVING_LANE",
+        *_CB_SERIALIZATION_SETTINGS,
+    ),
     # --- CB lane -----------------------------------------------------------
     # The imatrix harvest reads the probe's activation cache; key it on what
     # produced that cache. Minutes to rebuild, so keying is generous.

@@ -190,7 +190,11 @@ def test_core_recipe_defaults_are_pinned():
     script = _run_pipeline_script()
 
     assert _shell_default(script, "FORMATS") == "NVFP4,FP8_DYNAMIC,BF16"
-    assert _shell_default(script, "TARGET_BITS") == "4.75"
+    # TARGET_BITS defaults to the sentinel `knee`: the allocator's own
+    # Pareto sweep picks the best measured quality/compression tradeoff
+    # rather than a fixed bpp. See the TARGET_BITS/knee resolution block
+    # around stage [3/4] in run-pipeline.sh.
+    assert _shell_default(script, "TARGET_BITS") == "knee"
     # re-vet R1: SELECTION_MODE is conditional — surrogate by default,
     # validated-surrogate under a byte budget (an explicit value wins).
     assert ': "${SELECTION_MODE:=surrogate}"' in script

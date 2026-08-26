@@ -617,8 +617,14 @@ authority.
 The Sensitivity Card item changes exactly one shipping default, and it is
 probe-side: `incremental_probe.py` now emits five per-channel marginal vectors
 into `probe.pkl` unless told not to (§3.3, §4.1). The card and its three cost
-tiers remain additive modules with no `run-pipeline.sh` call site and no
-`COST_MODE` value.
+tiers remain additive modules with no `COST_MODE` value. As of 2026-08-26
+`run-pipeline.sh` gained an opt-in call site (`AQUA=1`, off by default): stage
+`[2e/4]` builds the card and merges the activation term into `COST_PATH`
+before the allocator runs, using `AQUA_SERVING_LANE` (default
+`compressed_tensors`) and `AQUA_ACT_DIR` (default `${WORK_DIR}/act`) —
+see `docs/design/runtime_flags.md`. This wires the recipe RobTand's shipped
+Qwen3.8-27B PrismaAQUA model card names ("PrismaQuant AURA + AQUA"); it does
+not itself change the research/promotion status below.
 
 **AQUA-AURA is no longer one of them.** As of 2026-08-14 its activation term
 reaches a production allocation: `aqua_activation_cost.py` prices the A-side off
@@ -1284,7 +1290,9 @@ history at all. The provenance stamp at the top of this file is the one place a 
 maintained.)
 
 ```
-FORMATS=NVFP4,FP8_DYNAMIC,BF16   TARGET_BITS=4.75
+FORMATS=NVFP4,FP8_DYNAMIC,BF16   TARGET_BITS=knee (auto-resolves to the
+                Pareto knee via one allocator pre-pass; knee-ask prompts,
+                an explicit bpp like 4.75 pins it and skips the pre-pass)
 PARETO_TARGETS=4.5,4.6,4.7,4.75,4.85,5.0,5.25,5.5,6.0,7.0,8.25
 NSAMPLES=32  SEQLEN=1024  DATASET=…/calibration/diverse-v1.jsonl
 EXPERT_GATE_DATASET=…/calibration/xdom-gate-v1.jsonl (cross-domain)
