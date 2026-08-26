@@ -23,6 +23,7 @@ from .qwen3 import Qwen3Profile
 from .qwen3_5 import Qwen3_5Profile
 from .qwen3_5_dense import Qwen3_5DenseProfile
 from .qwen3_next import Qwen3NextProfile
+from .qwen4_exp import Qwen4ExpProfile
 from .registry import (
     detect_profile,
     detect_profile_with_warning,
@@ -45,6 +46,7 @@ __all__ = [
     "DeepseekV4Profile",
     "Qwen3Profile",
     "Qwen3NextProfile",
+    "Qwen4ExpProfile",
     "Qwen3_5Profile",
     "Qwen3_5DenseProfile",
     "Gemma4Profile",

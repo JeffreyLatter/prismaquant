@@ -36,6 +36,7 @@ PROFILE_CLASSES = list(_registry._REGISTERED)
 # Today's literal `_REGISTERED` order. `priority` replaced the two ordering
 # comments that used to encode it; this list is what those comments meant.
 EXPECTED_ORDER = [
+    "Qwen4ExpProfile",
     "Qwen3NextProfile",
     "Qwen3_5DenseProfile",
     "Qwen3_5Profile",
@@ -53,6 +54,9 @@ EXPECTED_ORDER = [
 # each profile's own model_types and architecture prefixes, plus the
 # near-misses that make ordering load-bearing.
 CONFIGS: list[tuple[str, list[str]]] = [
+    # Qwen3.8-Flash-Next — distinct model_type, must precede everything else
+    ("qwen4_exp", ["Qwen4ExpForConditionalGeneration"]),
+    ("", ["Qwen4ExpForConditionalGeneration"]),
     # Qwen3-Coder-Next — distinct model_type, must precede the Qwen3 family
     ("qwen3_next", ["Qwen3NextForCausalLM"]),
     ("", ["Qwen3NextForCausalLM"]),

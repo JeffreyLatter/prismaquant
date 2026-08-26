@@ -492,6 +492,15 @@ _PUBLISHED_FILES = frozenset({
 #     rows a partial/sharded render stores, not the W8A16 lane: that lane
 #     builds no production weight cache at all, so `_LinearActivationCollector`
 #     is never instantiated on it.
+# RE-FROZEN 2026-08-26: registered `Qwen4ExpProfile` (Qwen3.8-Flash-Next,
+# `qwen4_exp` — an unrelated, brand-new architecture; see
+# model_profiles/qwen4_exp.py) at priority 85, ahead of `Qwen3NextProfile`.
+# Same shape as the already-reviewed Qwen3NextProfile registration above:
+#   model_profiles/__init__.py + registry.py -- new import + `__all__` entry
+#     + one new `_REGISTERED` list line. `DeepseekV4Profile` stays at its
+#     existing priority/position; `qwen4_exp`'s model_type/architecture
+#     prefix ("Qwen4Exp*") is disjoint from every DSv4 identifier, so this
+#     cannot re-route DSv4-Flash detection either.
 _FROZEN_EXPORT_SOURCE_SHA256 = {
     "prismaquant/export_nvfp4_cb_streaming.py": (
         "3380385f601623fc5d5b31147a226da15928b77b99dc15d2719e0ccb54232d1b"
@@ -506,13 +515,13 @@ _FROZEN_EXPORT_SOURCE_SHA256 = {
         "94fac4b16922f381cffe989d7b9b1d00f211bb93d9479dfde30eb0c02ef167f7"
     ),
     "prismaquant/model_profiles/__init__.py": (
-        "ebc676861843f7c7df65c8ec41afe23109918b62a10e210abc1240fe1227f6cf"
+        "a93f4f5e71dafe0d69ca690b200170be069e47402ffd4a28b522a5edd14e78cc"
     ),
     "prismaquant/model_profiles/base.py": (
         "2b79f15f39f66f3b81ee894b29fbc0d586ebb9271fc41d59b4c088abf74656f4"
     ),
     "prismaquant/model_profiles/registry.py": (
-        "f0d9ddd36e337fe19449e0b2510baef44051cee5aae466b4e11f9db761ce6b5f"
+        "f6972f5afabb6d3814b1461cb249161201353c60f6b37b086eab2ba3ac7e0e0b"
     ),
     "prismaquant/model_profiles/deepseek_v4.py": (
         "93c6685c15c34450fd0376996c6f6ec99991de59fd3b2d7aa60a91011ff97ad7"
